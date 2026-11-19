@@ -68,6 +68,8 @@ break-budget-no-overrun = []
 break-budget-keep-level = []
 break-budget-keep-slot = []
 break-budget-no-free = []
+# Deliberate breakage: a peek of another CPU's log ring leaves the `seen` cursor.
+break-log-seen = []
 break-budget-child-free = []
 break-budget-forgive-overrun = []
 break-budget-skip-boosted = []

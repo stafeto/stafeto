@@ -21,6 +21,9 @@ pub enum Command<'a> {
     Bench,
     Trace,
     CrashUart,
+    /// Feature `log-burst`: LOG_BURST lines into the kernel log.
+    #[cfg(feature = "log-burst")]
+    LogBurst,
     /// The line, without the spaces around it.
     Unknown(&'a [u8]),
 }
@@ -45,7 +48,20 @@ pub const HELP: &[&str] = &[
     "bench       the round trip of a request and the latencies",
     "trace       show kernel events since the last trace",
     "crash uart  crash the UART driver; init restarts it",
+    #[cfg(feature = "log-burst")]
+    "logburst    write a burst of lines into the kernel log",
 ];
+
+/// The lines `logburst` writes, in groups of LOG_BURST_GROUP, each group
+/// LOG_BURST_GAP_MS milliseconds after the one before: 2.5 lines a
+/// millisecond, under what the console's drivers take from a ring of 64
+/// records in their idle period (uart::log::IDLE_NS).
+#[cfg(feature = "log-burst")]
+pub const LOG_BURST: u32 = 150;
+#[cfg(feature = "log-burst")]
+pub const LOG_BURST_GROUP: u32 = 5;
+#[cfg(feature = "log-burst")]
+pub const LOG_BURST_GAP_MS: u64 = 2;
 
 /// The command `line` names (the rules above).
 pub fn parse(line: &[u8]) -> Command<'_> {
@@ -65,6 +81,8 @@ pub fn parse(line: &[u8]) -> Command<'_> {
         b"bench" => Command::Bench,
         b"trace" => Command::Trace,
         b"crash" if rest.iter().eq([&b"uart"[..]]) => Command::CrashUart,
+        #[cfg(feature = "log-burst")]
+        b"logburst" => Command::LogBurst,
         _ => Command::Unknown(line),
     }
 }
@@ -139,5 +157,18 @@ mod tests {
             unknown(b"reboot").concat(),
             b"shell: unknown command: reboot; type help for the commands\n"
         );
+    }
+
+    #[cfg(feature = "log-burst")]
+    #[test]
+    fn logburst_is_a_command_with_the_feature() {
+        assert_eq!(parse(b" logburst "), Command::LogBurst);
+        assert!(HELP.iter().any(|l| l.starts_with("logburst ")));
+    }
+
+    #[cfg(not(feature = "log-burst"))]
+    #[test]
+    fn logburst_is_unknown_without_the_feature() {
+        assert_eq!(parse(b"logburst"), Command::Unknown(b"logburst"));
     }
 }

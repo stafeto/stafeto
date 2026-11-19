@@ -185,11 +185,16 @@ type ImageProgram = (&'static str, &'static str, u32, &'static [&'static str]);
 /// The programs of the boot image of the normal build, of the test init's
 /// runs, of the runs of init's test table and of the two tables init
 /// refuses (spec 15.2). Init comes first (spec 13.1). The driver of the
-/// image that ships has the method CRASH in subproject 1 (spec 13.5).
+/// image that ships has the method CRASH in subproject 1 (spec 13.5). The
+/// shell of this image (`boot.img`, the image of the console dialog and of
+/// the runs of QEMU) has the command `logburst` (feature `log-burst`) for
+/// the probes of the console's drivers. The release images (`boot-base.img`,
+/// `boot-full.img`, `boot-aws.img`) are built from SHELL_SERVICES and hold a
+/// shell without it (`no_release_image_has_the_log_burst_shell`).
 const BOOT_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &[]),
     ("uart", "uart", UART_STACK_SIZE, &["crash"]),
-    ("shell", "shell", SHELL_STACK_SIZE, &[]),
+    ("shell", "shell", SHELL_STACK_SIZE, &["log-burst"]),
 ];
 /// The boot image of Apple VZ: init with its VZ table, the driver of the
 /// Virtio console with CRASH, as the image that ships on QEMU, and the shell.
@@ -484,7 +489,7 @@ const VZ_WATCH_PROGRAMS: [ImageProgram; 3] = [
         UART_STACK_SIZE,
         &["crash"],
     ),
-    ("shell", "shell", SHELL_STACK_SIZE, &[]),
+    ("shell", "shell", SHELL_STACK_SIZE, &["log-burst"]),
 ];
 /// The image of console-early-exit-vz: the first instance of the driver
 /// ends after BAR 1, with decoding off (`exit-before-decoding`).
@@ -1394,7 +1399,7 @@ const BROKEN: &str = "shell: uart is broken; no console left";
 const DRIVER_FAULT: &str = "process fault: data abort from EL0 (EC 0x24) ESR=0x";
 const UART_ENDED: &str = "init: uart ended: ";
 /// The lines of the shell's `help`, each whole (spec 13.6).
-const HELP_LINES: [&str; 8] = [
+const HELP_LINES: [&str; 9] = [
     "help        list the commands",
     "echo WORDS  print the words",
     "uptime      the time since boot",
@@ -1403,6 +1408,7 @@ const HELP_LINES: [&str; 8] = [
     "bench       the round trip of a request and the latencies",
     "trace       show kernel events since the last trace",
     "crash uart  crash the UART driver; init restarts it",
+    "logburst    write a burst of lines into the kernel log",
 ];
 /// The bytes of the line the console dialog types while `bench` runs:
 /// past the driver's ring of input (256 bytes), a READ (64) and the FIFO.
@@ -1784,10 +1790,11 @@ enum Variant {
     /// numbers of `service-budget breaks` are printed for information.
     LiftAgainNotice,
     LiftAgainReply,
+    LogSeenBreak,
 }
 
 impl Variant {
-    const ALL: [Variant; 76] = [
+    const ALL: [Variant; 77] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1863,6 +1870,7 @@ impl Variant {
         Variant::LiftAgainNoticeTest,
         Variant::LiftAgainNotice,
         Variant::LiftAgainReply,
+        Variant::LogSeenBreak,
         Variant::LiftAgainReplyTest,
     ];
 
@@ -1950,6 +1958,7 @@ impl Variant {
             Variant::LiftAgainReplyTest => Some("ktest,break-relift-reply"),
             Variant::LiftAgainNotice => Some("break-relift-notice"),
             Variant::LiftAgainReply => Some("break-relift-reply"),
+            Variant::LogSeenBreak => Some("break-log-seen"),
         }
     }
 
@@ -2050,6 +2059,7 @@ impl Variant {
             Variant::LiftAgainReplyTest => "stafeto-ktest-relift-reply",
             Variant::LiftAgainNotice => "stafeto-relift-notice",
             Variant::LiftAgainReply => "stafeto-relift-reply",
+            Variant::LogSeenBreak => "stafeto-log-seen-break",
         }
     }
 }
@@ -10530,6 +10540,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("init end off", init_end_off),
         job("init end reset", init_end_reset),
         job("power button", || power_button(&qemu::VIRT)),
+        job("power button seen break", power_button_seen_break),
         job("power button GICv3", || power_button(&qemu::VIRT_V3)),
         job("kernel tests 512M", || {
             kernel_tests(&qemu::VIRT, Variant::Test).map(drop)
@@ -11363,6 +11374,9 @@ fn dialog(run: &mut qemu::Run) -> Result<String, String> {
     let kept = "a".repeat(128 - "echo ".len());
     run.expect_line("the line typed ahead", |l| l == kept, DIALOG_STEP)?;
     run.expect(PROMPT, DIALOG_STEP)?;
+    // A burst of the kernel log, written while the driver is idle: every
+    // line comes, in order, with no mark of records lost.
+    log_burst(run)?;
     // Init writes its line into the kernel log once the shell started,
     // after the driver's first read: only the driver's timer shows it.
     run.expect_seen(SERVICES_STARTED, DIALOG_STEP)?;
@@ -11390,6 +11404,99 @@ fn dialog(run: &mut qemu::Run) -> Result<String, String> {
     run.expect(PROMPT, DIALOG_STEP)?;
     a_broken_driver_gives_the_port_back(run)?;
     Ok(line)
+}
+
+/// The lines `logburst` of the shell writes (apps/shell, feature
+/// `log-burst`), the same count.
+const LOG_BURST: u32 = 150;
+
+/// The line number `n` of `logburst`.
+fn burst_line(n: u32) -> String {
+    format!("logburst {n:03} {}", "x".repeat(46))
+}
+
+/// The step of the console probes that sends `logburst`: the shell writes
+/// LOG_BURST lines into the kernel log at 2.5 lines a millisecond, while the
+/// driver of the console is idle (and has its ring of 64 records to
+/// empty in each period of uart::log::IDLE_NS). All lines come on the
+/// console, in order, each once, and no `[kernel log: N records lost]`
+/// comes with them (spec 13.5, 16.3). The shell's closing line comes among
+/// them, at a turn of the clients. Ends at a prompt with the driver's
+/// output empty (`settled`), where a step that kills or restarts the driver
+/// can start.
+pub(crate) fn log_burst(run: &mut qemu::Run) -> Result<(), String> {
+    let from = run.lines().len();
+    run.send("logburst")?;
+    // The shell's closing line is client output and goes out at a client's
+    // turn, in the middle of the burst (the log and the clients alternate at
+    // a line start): it is waited for before the last line of the burst.
+    let done = format!("shell: logburst: {LOG_BURST} lines");
+    run.expect_line(&done, |l| l == done, DIALOG_STEP)?;
+    let last = burst_line(LOG_BURST - 1);
+    run.expect_line("the last line of the burst", |l| l == last, DIALOG_STEP)?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    settled(run)?;
+    burst_whole(&run.lines()[from..])?;
+    // The driver says the largest backlog of the kernel's rings it saw once
+    // the backlog is out (a line of the driver's own, which may come a tick
+    // after the burst, or from the boot): printed for the record.
+    println!("{}", backlog_peak(run.lines()));
+    Ok(())
+}
+
+/// Waits until the console driver's rings are empty and its output is out,
+/// so that the step after a burst starts from an empty ring (a driver that
+/// dies with text in its ring loses it, and the line in flight is cut). The
+/// driver has put the notice of its backlog into its ring of the log within
+/// one idle period (uart::log::IDLE_NS, 20 ms) of the backlog going out;
+/// the probe waits a few periods, then sends `echo`: a client line goes
+/// after the log text queued before it (at most one batch of log at a line
+/// start), so its line and the prompt after it come out behind the notice.
+fn settled(run: &mut qemu::Run) -> Result<(), String> {
+    std::thread::sleep(Duration::from_millis(100));
+    run.send("echo burst settled")?;
+    run.expect("echo burst settled\r\n", DIALOG_STEP)?;
+    run.expect_line(
+        "the line after the burst",
+        |l| l == "burst settled",
+        DIALOG_STEP,
+    )?;
+    run.expect(PROMPT, DIALOG_STEP)
+}
+
+/// The last line in which a console driver said the largest backlog of the
+/// kernel's rings it saw (`log backlog peak N records`), or that it said none.
+fn backlog_peak(lines: &[String]) -> String {
+    lines
+        .iter()
+        .rfind(|l| l.contains(": log backlog peak "))
+        .map_or_else(
+            || "console driver: no backlog above one batch said".to_owned(),
+            |l| format!("console driver: {l}"),
+        )
+}
+
+/// The lines of a burst in `lines`: the LOG_BURST of them, each whole, in
+/// order, and no line of records lost.
+fn burst_whole(lines: &[String]) -> Result<(), String> {
+    if let Some(l) = lines.iter().find(|l| l.contains("[kernel log:")) {
+        return Err(format!("the burst lost records: {l}"));
+    }
+    let want: Vec<String> = (0..LOG_BURST).map(burst_line).collect();
+    let got: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("logburst ") && !l.starts_with("logburst:"))
+        .collect();
+    if got.len() != want.len() || got.iter().zip(&want).any(|(g, w)| *g != w) {
+        let missing: Vec<u32> = (0..LOG_BURST)
+            .filter(|&n| !lines.contains(&burst_line(n)))
+            .collect();
+        return Err(format!(
+            "{} lines of the burst came, {LOG_BURST} in order expected; missing {missing:?}",
+            got.len()
+        ));
+    }
+    Ok(())
 }
 
 /// `crash uart` with the driver restarting after init's `decision` (spec
@@ -12577,7 +12684,7 @@ const SMP_PROBE_LINES: [&str; 14] = [
     "smp: 4 CPUs, threads ran together on every CPU",
     "smp: service on CPU 2 worked at 30 for a client on CPU 1, then at 10",
     "smp: suspend and kill stopped the threads of the child on 4 CPUs",
-    "smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 twice",
+    "smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 three times",
     "smp: a client raised on CPU 1 raised its service on CPU 2 from 10 to 40",
     "smp: a timer armed on CPU 1 was let go from CPU 0, its deadline passed, the kernel went on",
     "smp: a client on CPU 1 ended with the reply from CPU 0 on its way, the kernel went on",
@@ -13417,8 +13524,27 @@ fn init_end_reset() -> Result<(), String> {
 /// on the GICv3 one; EC2 has a GICv3, but its line (39, level, a Graviton GIC) is covered only
 /// by the run on EC2.
 fn power_button(m: &qemu::Machine) -> Result<(), String> {
+    power_button_on(m, Variant::Normal)
+}
+
+/// The probe of the power button on the kernel that leaves the `seen` cursor of the log rings
+/// (`break-log-seen`): the end of the system prints again what the driver showed, and the probe
+/// must reject it.
+fn power_button_seen_break() -> Result<(), String> {
+    match power_button_on(&qemu::VIRT, Variant::LogSeenBreak) {
+        Err(e) => {
+            println!("power button seen break: caught by the probe ({e})");
+            Ok(())
+        }
+        Ok(()) => {
+            Err("the kernel that leaves the seen cursor passed the power button probe".into())
+        }
+    }
+}
+
+fn power_button_on(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
     const WITHIN: Duration = Duration::from_secs(60);
-    let kernel = build(Variant::Normal)?;
+    let kernel = build(variant)?;
     let image = build_boot_image(
         "boot-power-button.img",
         &POWER_BUTTON_PROGRAMS,
@@ -13426,6 +13552,9 @@ fn power_button(m: &qemu::Machine) -> Result<(), String> {
     )?;
     let scratch = gpu_probe::Scratch::new()?;
     let mut cmd = qemu::command(m, &kernel.image, Some(&image));
+    // Two CPUs: the driver of the console may run on another CPU than init, and reads its ring
+    // with a peek (the `seen` cursor of the ring).
+    cmd.args(["-smp", "2"]);
     cmd.args(["-display", "none", "-serial", "stdio", "-monitor"]);
     cmd.arg(format!(
         "unix:{},server=on,wait=off",
@@ -13472,6 +13601,10 @@ fn power_button(m: &qemu::Machine) -> Result<(), String> {
             m.name
         ));
     }
+    // The driver on the second CPU reads the ring of the first with a peek: the end path of the
+    // kernel must not print again what it showed.
+    qemu::expect_no_replay_at_the_end(&outcome.lines, "init: stopping uart")
+        .map_err(|e| format!("power button on {}: {e}", m.name))?;
     println!(
         "power button on {}: one press, the stop in order, one line off, no panic, powered off",
         m.name
@@ -14256,6 +14389,60 @@ fn ci_lints() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// The command `logburst` is for the probes: no release image list has
+    /// a program built with the feature `log-burst`.
+    #[test]
+    fn no_release_image_has_the_log_burst_shell() {
+        let lists: [(&str, &[super::ImageProgram]); 4] = [
+            (
+                "boot-base.img",
+                super::base_image::programs(super::base_image::BASE_IMAGE),
+            ),
+            (
+                "boot-full.img",
+                super::base_image::programs(super::base_image::FULL_IMAGE),
+            ),
+            ("boot-aws.img", super::aws_programs()),
+            ("SHELL_SERVICES", &super::SHELL_SERVICES),
+        ];
+        for (name, list) in lists {
+            for program in list {
+                assert!(
+                    !program.3.contains(&"log-burst"),
+                    "{name} holds {} built with log-burst",
+                    program.0
+                );
+            }
+        }
+        // The images that carry the probes' shell are the ones that say so.
+        assert!(
+            super::BOOT_PROGRAMS
+                .iter()
+                .any(|p| p.3.contains(&"log-burst"))
+        );
+    }
+
+    /// The check of the burst of the console probes: whole and in order
+    /// passes; a missing line, a swapped pair and a mark of lost records
+    /// fail.
+    #[test]
+    fn the_burst_check_wants_every_line_in_order_and_no_mark() {
+        let all: Vec<String> = (0..super::LOG_BURST).map(super::burst_line).collect();
+        assert!(burst_whole(&all).is_ok());
+        let mut with_noise = all.clone();
+        with_noise.insert(7, "uart: something else".into());
+        assert!(burst_whole(&with_noise).is_ok());
+        let mut gap = all.clone();
+        gap.remove(40);
+        assert!(burst_whole(&gap).unwrap_err().contains("missing [40]"));
+        let mut swapped = all.clone();
+        swapped.swap(3, 4);
+        assert!(burst_whole(&swapped).is_err());
+        let mut marked = all;
+        marked.insert(10, "[kernel log: 3 records lost]".into());
+        assert!(burst_whole(&marked).unwrap_err().contains("lost records"));
+    }
+
     #[test]
     fn a_ram_step_past_the_bound_fails_and_one_past_the_margin_only_warns() {
         let bound = super::net_probe::STEP_MAX;
@@ -15360,6 +15547,25 @@ mod tests {
         ]
         .map(String::from)
         .to_vec()
+    }
+
+    /// A driver that died with text in its ring (the console dialog's crash
+    /// right after a burst, before `settled`): its notice is cut and glued to
+    /// the kernel's line of the fault, and the shell's line of the crash never
+    /// came out. The judging names the missing line and does not pass it.
+    #[test]
+    fn a_crash_with_text_in_the_ring_is_not_passed() {
+        let run: Vec<String> = [
+            "stafeto> ",
+            "uart: log backlog peak 40 recoprocess fault: data abort from EL0 (EC 0x24) ESR=0x92000006 FAR=0x0 ELR=0x204630",
+            "init: uart ended: fault ESR=0x92000006 FAR=0x0 ELR=0x204630; restarts in 100 ms",
+            UART_LINE,
+            RECONNECTED,
+        ]
+        .map(String::from)
+        .to_vec();
+        let e = crash_lines(&run, "restarts in 100 ms").unwrap_err();
+        assert!(e.contains("0 lines of the shell's crashing"), "{e}");
     }
 
     /// Spec 13.6, 16.2: a `crash uart` passes with the kernel's line of the
