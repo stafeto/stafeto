@@ -56,14 +56,20 @@ impl StepLine<'_> {
     }
 }
 
+/// The services keep the longest raw time of each pair (kind, preemptions) for 0 to 7
+/// preemptions and one pair for 8 and more (`rt::service`'s step statistics). In one pair the
+/// greatest raw time is the greatest judged time at any charge, and the pair of 8 and more is
+/// judged with 8 preemptions: stricter than the true count of the line, which is the safe side.
+pub const PAIR_TOP: u64 = 8;
+
 /// The time less the measured charge of `preempts` preemptions (against 0.9 B).
 pub fn judged(ticks: u64, preempts: u64) -> u64 {
-    ticks.saturating_sub(preempts.saturating_mul(PREEMPT_CHARGE))
+    ticks.saturating_sub(preempts.min(PAIR_TOP).saturating_mul(PREEMPT_CHARGE))
 }
 
 /// The time less the least charge of `preempts` preemptions (against B).
 pub fn least(ticks: u64, preempts: u64) -> u64 {
-    ticks.saturating_sub(preempts.saturating_mul(PREEMPT_CHARGE_MIN))
+    ticks.saturating_sub(preempts.min(PAIR_TOP).saturating_mul(PREEMPT_CHARGE_MIN))
 }
 
 /// The first step of the service `tag` in `lines` (a line of a new longest or of the table) whose
@@ -378,6 +384,24 @@ mod tests {
         assert!(over_bound(&rows, "4", 20_410).is_none());
         // The gate of the probes reads through it.
         assert!(longest_warned(&rows, "14", 20_410).is_err());
+    }
+
+    #[test]
+    fn the_lines_of_the_pairs_of_a_kind_give_the_greatest_judged_one() {
+        // The services print a line for each pair (kind, preemptions) that grew: three steps now
+        // print three lines, and the judged maximum is the second, 16 700 (the raw maximum alone
+        // gave 14 907).
+        let rows = lines(&[
+            "service step: 17 kind 65 18807 ticks detail 0 preempts 3",
+            "service step: 17 kind 65 18000 ticks detail 1 preempts 1",
+            "service step: 17 kind 65 16400 ticks detail 2",
+        ]);
+        assert_eq!(longest(&rows, "17"), vec![(65, 16_700, 1)]);
+        assert!(longest(&rows[..1], "17")[0].1 == 14_907);
+        // The pair of 8 and more is judged with 8 preemptions, whatever the count of the line.
+        let many = lines(&["service step: 17 kind 65 20000 ticks detail 0 preempts 12"]);
+        assert_eq!(longest(&many, "17"), vec![(65, 20_000 - 8 * 1_300, 0)]);
+        assert_eq!(parse(&many[0]).unwrap().least(), 20_000 - 8 * 487);
     }
 
     #[test]

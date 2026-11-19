@@ -1,0 +1,210 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! The longest raw time of the steps of a loop for each pair (kind, preemptions P): P from 0 to 7
+//! each its own pair, and one pair for P of 8 and more (feature `step-stats`).
+//!
+//! Within one pair the greatest raw time is also the greatest time less the charge of the
+//! preemptions, at any charge, so a reader that gets the line of each pair that grew knows the
+//! exact greatest `N - P * c` of a kind without the service knowing c. The line of a kind alone,
+//! which grows with the raw time only, hid a step that was shorter raw and longer once the charge
+//! of its preemptions was taken off.
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// The pairs of a kind: P of 0 to 7, and the pair of 8 and more.
+pub const PAIRS: usize = 9;
+
+/// The pair a step with `preempts` preemptions is in.
+pub fn pair_of(preempts: u64) -> usize {
+    preempts.min(PAIRS as u64 - 1) as usize
+}
+
+/// The longest step of each pair of each of `KINDS` kinds: its raw time, its detail and, for the
+/// last pair, its count of preemptions (the other pairs have theirs in the pair's number).
+/// 9 x 8 bytes of time and 9 x 8 of detail for a kind, and 8 for the count: 152 bytes a kind, in
+/// the `.bss` of the images that turn the feature on and nowhere else.
+pub struct Pairs<const KINDS: usize> {
+    longest: [[AtomicU64; PAIRS]; KINDS],
+    detail: [[AtomicU64; PAIRS]; KINDS],
+    top_preempts: [AtomicU64; KINDS],
+}
+
+/// A pair's longest step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Longest {
+    pub ticks: u64,
+    pub detail: u64,
+    pub preempts: u64,
+}
+
+impl<const KINDS: usize> Pairs<KINDS> {
+    pub const fn new() -> Pairs<KINDS> {
+        Pairs {
+            longest: [const { [const { AtomicU64::new(0) }; PAIRS] }; KINDS],
+            detail: [const { [const { AtomicU64::new(0) }; PAIRS] }; KINDS],
+            top_preempts: [const { AtomicU64::new(0) }; KINDS],
+        }
+    }
+
+    /// Takes a step: true when its raw time is the greatest of its pair so far, which is when its
+    /// line is told.
+    pub fn record(&self, kind: usize, ticks: u64, detail: u64, preempts: u64) -> bool {
+        let pair = pair_of(preempts);
+        if ticks <= self.longest[kind][pair].fetch_max(ticks, Ordering::Relaxed) {
+            return false;
+        }
+        self.detail[kind][pair].store(detail, Ordering::Relaxed);
+        if pair == PAIRS - 1 {
+            self.top_preempts[kind].store(preempts, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// The longest step of `pair` of `kind`, None while the pair is empty.
+    pub fn get(&self, kind: usize, pair: usize) -> Option<Longest> {
+        let ticks = self.longest.get(kind)?.get(pair)?.load(Ordering::Relaxed);
+        if ticks == 0 {
+            return None;
+        }
+        let preempts = if pair == PAIRS - 1 {
+            self.top_preempts[kind].load(Ordering::Relaxed)
+        } else {
+            pair as u64
+        };
+        Some(Longest {
+            ticks,
+            detail: self.detail[kind][pair].load(Ordering::Relaxed),
+            preempts,
+        })
+    }
+
+    /// The next non-empty pair at or after the place `from` of the walk over all pairs (kind by
+    /// kind, P up by P), with the place after it.
+    pub fn next(&self, from: usize) -> Option<(usize, Longest, usize)> {
+        (from..KINDS * PAIRS).find_map(|at| {
+            self.get(at / PAIRS, at % PAIRS)
+                .map(|l| (at / PAIRS, l, at + 1))
+        })
+    }
+
+    /// The greatest raw time of a kind over its pairs, with the detail of that step.
+    pub fn maximum(&self, kind: usize) -> Option<(u64, u64)> {
+        let mut best: Option<Longest> = None;
+        for pair in 0..PAIRS {
+            if let Some(l) = self.get(kind, pair)
+                && best.is_none_or(|b| l.ticks > b.ticks)
+            {
+                best = Some(l);
+            }
+        }
+        match best {
+            Some(l) => Some((l.ticks, l.detail)),
+            None if kind < KINDS => Some((0, 0)),
+            None => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a kind prints: the lines of the pairs that grew, in the order the steps came (at
+    /// most eight of them in these tests).
+    fn told(steps: &[(u64, u64)]) -> Told {
+        let pairs = Pairs::<3>::new();
+        let mut out = Told([(0, 0); 8], 0);
+        for &(ticks, p) in steps {
+            if pairs.record(1, ticks, 0, p) {
+                out.0[out.1] = (ticks, p);
+                out.1 += 1;
+            }
+        }
+        out
+    }
+
+    struct Told([(u64, u64); 8], usize);
+
+    impl Told {
+        fn lines(&self) -> &[(u64, u64)] {
+            &self.0[..self.1]
+        }
+    }
+
+    #[test]
+    fn a_step_shorter_raw_and_longer_after_the_charge_is_told() {
+        // One maximum per kind printed the first only; a maximum per pair prints all three.
+        let steps = [(18_807, 3), (18_000, 1), (16_400, 0)];
+        assert_eq!(told(&steps).lines(), steps);
+        // Judged at a charge of 1 300 the second is 16 700, the greatest of the three.
+        let judged = |&(n, p): &(u64, u64)| n - p * 1_300;
+        assert_eq!(told(&steps).lines().iter().map(judged).max(), Some(16_700));
+    }
+
+    #[test]
+    fn a_pair_tells_again_only_when_its_own_maximum_grows() {
+        let steps = [
+            (100, 0),
+            (90, 0),
+            (100, 0),
+            (101, 0),
+            (50, 1),
+            (60, 1),
+            (55, 1),
+        ];
+        assert_eq!(told(&steps).lines(), [(100, 0), (101, 0), (50, 1), (60, 1)]);
+    }
+
+    #[test]
+    fn eight_and_more_share_a_pair_and_keep_their_count() {
+        let pairs = Pairs::<2>::new();
+        assert!(pairs.record(0, 500, 7, 8));
+        assert!(!pairs.record(0, 400, 7, 12));
+        assert!(pairs.record(0, 600, 9, 12));
+        let top = pairs.get(0, PAIRS - 1).unwrap();
+        assert_eq!(
+            top,
+            Longest {
+                ticks: 600,
+                detail: 9,
+                preempts: 12
+            }
+        );
+        assert_eq!(pair_of(7), 7);
+        assert_eq!(pair_of(8), 8);
+        assert_eq!(pair_of(70_000), 8);
+        assert!(pairs.get(0, 3).is_none());
+    }
+
+    #[test]
+    fn the_table_walks_every_non_empty_pair_in_the_order_of_kind_and_count() {
+        let pairs = Pairs::<4>::new();
+        pairs.record(2, 300, 0, 1);
+        pairs.record(1, 200, 5, 0);
+        pairs.record(2, 350, 0, 0);
+        pairs.record(2, 900, 0, 20);
+        let mut at = 0;
+        let mut seen = [(0, 0, 0); 8];
+        let mut count = 0;
+        while let Some((kind, l, next)) = pairs.next(at) {
+            seen[count] = (kind, l.ticks, l.preempts);
+            count += 1;
+            at = next;
+        }
+        assert_eq!(
+            seen[..count],
+            [(1, 200, 0), (2, 350, 0), (2, 300, 1), (2, 900, 20)]
+        );
+    }
+
+    #[test]
+    fn the_maximum_of_a_kind_is_the_greatest_raw_time_of_its_pairs() {
+        let pairs = Pairs::<2>::new();
+        assert_eq!(pairs.maximum(0), Some((0, 0)));
+        assert_eq!(pairs.maximum(5), None);
+        pairs.record(0, 300, 4, 2);
+        pairs.record(0, 200, 8, 0);
+        assert_eq!(pairs.maximum(0), Some((300, 4)));
+    }
+}

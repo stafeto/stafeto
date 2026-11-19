@@ -26,6 +26,8 @@ use abi::{CLIENT_GONE, Error, INLINE_MAX, MESSAGE_MAX, Rights, Source};
 use proto_init::{Connect, Method, RegisterReply, START_NAMES};
 use proto_wire::{HEADER_LEN, Header, Name, Reader, Status, Writer};
 
+#[cfg(any(feature = "step-stats", test))]
+mod pairs;
 #[cfg(feature = "step-stats")]
 mod sample;
 #[cfg(feature = "step-stats")]
@@ -690,15 +692,17 @@ mod steps {
     static BEATS: AtomicU64 = AtomicU64::new(0);
     static PREEMPTS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static WAITS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
-    static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
-    /// The preemptions of the step whose raw time is in `LONGEST`.
-    static LONGEST_PREEMPTS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    /// The longest raw step of each pair (kind, preemptions): 152 bytes a kind, 10 184 for the
+    /// 67 kinds, in `.bss` of the images with this feature only.
+    static LONGEST: super::pairs::Pairs<KINDS> = super::pairs::Pairs::new();
     /// The first count of steps from which the table of the longest steps goes out again at each
     /// power of two of the steps done (`table_steps`; 0 while it is off), and the steps done.
     static TABLE_FROM: AtomicU64 = AtomicU64::new(0);
     static DONE: AtomicU64 = AtomicU64::new(0);
-    /// The kind the table in progress goes on from (`KINDS` when no table is in progress).
-    static CURSOR: AtomicUsize = AtomicUsize::new(KINDS);
+    /// The place the table in progress goes on from, over the pairs of all kinds (`TABLE_END` when
+    /// no table is in progress).
+    static CURSOR: AtomicUsize = AtomicUsize::new(TABLE_END);
+    const TABLE_END: usize = KINDS * super::pairs::PAIRS;
     /// The widest gap, over a run, between the clock and the CPU time of a
     /// step less its waits: what ran in the middle (higher levels, the
     /// kernel's cleaning) and the step is not charged with.
@@ -706,7 +710,6 @@ mod steps {
     static FULL: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     /// The same for the steps of detail 16 (the terminal's Watch).
     static FULL_16: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
-    static DETAILS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static QUIET: AtomicBool = AtomicBool::new(false);
     /// The tag a new longest prints with: the service that asked (0: none).
     static REPORT: AtomicU8 = AtomicU8::new(0);
@@ -738,8 +741,9 @@ mod steps {
         TABLE_FROM.store(from.max(1), Ordering::Relaxed);
     }
 
-    /// The line of the next kind of the table, from the kind `CURSOR` is at: `service table: T
-    /// kind K N ticks detail D preempts P`, the longest step of that kind seen. The lines of a new
+    /// The line of the next non-empty pair of the table, from the place `CURSOR` is at: `service
+    /// table: T kind K N ticks detail D preempts P`, the longest step of that kind and count of
+    /// preemptions seen. The lines of a new
     /// longest are told once and the kernel log, which is bounded, loses records of a burst, so a
     /// reader that needs every kind takes them from the table, told after the burst. The table
     /// goes out one line after each step that follows (`end`), as the line of a new longest does:
@@ -747,14 +751,12 @@ mod steps {
     /// where the 15 to 35 lines of a whole table would hold it for some 90,000 ticks.
     fn print_table_line(tag: u8) {
         let from = CURSOR.load(Ordering::Relaxed);
-        let Some(kind) = (from..KINDS).find(|&k| LONGEST[k].load(Ordering::Relaxed) != 0) else {
-            CURSOR.store(KINDS, Ordering::Relaxed);
+        let Some((kind, longest, next)) = LONGEST.next(from) else {
+            CURSOR.store(TABLE_END, Ordering::Relaxed);
             return;
         };
-        CURSOR.store(kind + 1, Ordering::Relaxed);
-        let took = LONGEST[kind].load(Ordering::Relaxed);
-        let detail = DETAILS[kind].load(Ordering::Relaxed);
-        let preempts = LONGEST_PREEMPTS[kind].load(Ordering::Relaxed);
+        CURSOR.store(next, Ordering::Relaxed);
+        let (took, detail, preempts) = (longest.ticks, longest.detail, longest.preempts);
         crate::println!(
             "service table: {tag} kind {kind} {took} ticks detail {detail} preempts {preempts}"
         );
@@ -794,10 +796,7 @@ mod steps {
         QUIET.store(true, Ordering::Relaxed);
     }
     pub fn maximum(kind: usize) -> Option<(u64, u64)> {
-        Some((
-            LONGEST.get(kind)?.load(Ordering::Relaxed),
-            DETAILS[kind].load(Ordering::Relaxed),
-        ))
+        LONGEST.maximum(kind)
     }
 
     /// The longest step of `kind` whose detail was `detail` (32 or 16).
@@ -907,25 +906,20 @@ mod steps {
             // the step: the accounting is lost, and `xtask` fails the run.
             crate::println!("service wait cut: {tag} kind {kind} {counted} ticks of {whole}");
         }
-        // A line prints when the raw time of the kind grows, as it always did, and carries the
-        // preemptions of that step. The console is slow and a probe that reads it is
-        // sensitive to its volume, so a step whose raw time is not a new longest prints
-        // nothing, though its time less the charge may be longer than that of the line before:
-        // a reader that judges by the lines takes at most the charge of the preemptions of the
-        // longest raw step too little, and the warning of a raw time above the bound names it.
-        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
-            DETAILS[kind].store(detail, Ordering::Relaxed);
-            LONGEST_PREEMPTS[kind].store(n_preempt, Ordering::Relaxed);
-            if printing {
-                // The count is left out when it is 0 (most steps): a reader takes a missing
-                // count as 0, and the console, which is slow, has less to write.
-                if n_preempt == 0 {
-                    crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
-                } else {
-                    crate::println!(
-                        "service step: {tag} kind {kind} {took} ticks detail {detail} preempts {n_preempt}"
-                    );
-                }
+        // A line prints when the raw time grows in the pair (kind, preemptions) of the step
+        // (`pairs`): the greatest raw time of a pair is also its greatest time less the charge of
+        // its preemptions at any charge, so a reader of the lines has the exact longest of a kind
+        // without the service knowing the charge. The bookkeeping runs here, after the sample is
+        // taken and the interval of the step is closed, so that no step of the loop pays for it.
+        if LONGEST.record(kind, took, detail, n_preempt) && printing {
+            // The count is left out when it is 0 (most steps): a reader takes a missing count as
+            // 0, and the console, which is slow, has less to write.
+            if n_preempt == 0 {
+                crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
+            } else {
+                crate::println!(
+                    "service step: {tag} kind {kind} {took} ticks detail {detail} preempts {n_preempt}"
+                );
             }
         }
         // The table goes out after the reply and after the sample is taken, as the line of a new
@@ -937,7 +931,7 @@ mod steps {
             if done >= from && done.is_power_of_two() {
                 CURSOR.store(0, Ordering::Relaxed);
             }
-            if CURSOR.load(Ordering::Relaxed) < KINDS {
+            if CURSOR.load(Ordering::Relaxed) < TABLE_END {
                 print_table_line(tag);
             }
         }
