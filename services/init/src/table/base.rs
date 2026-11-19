@@ -9,7 +9,8 @@
 //! screen and the network, and has the larger quota of the two tables
 //! (`NET_COMMAND_QUOTA`) and waits for the package service to say READY before
 //! it starts the shell; the process service has the pool that init sizes at
-//! boot (`INIT_RESERVE_PAGES`, `POOL_MIN_PAGES`). The disk service and the package service close the table.
+//! boot (`INIT_RESERVE_PAGES`, `POOL_MIN_PAGES`). The disk service and the
+//! package service close the table.
 
 use super::doom;
 use super::net::{NET_COMMAND_QUOTA, NET_PROCESS_SERVICE, NETD};
@@ -57,10 +58,11 @@ pub const LAUNCHER: Record = Record {
 };
 
 /// The pages init keeps free after the services started (the line `init:
-/// free pages`): the restart of the heaviest record that restarts, `netd`,
-/// while its clients still hold the old instance, with the DMA objects a
-/// device that did not stop leaves behind. `cargo xtask init-reserve` checks
-/// that the largest such need of the image fits it, and `cargo xtask
+/// free pages`): the restarts of all the records that restart, each while its
+/// clients still hold the old instance, and the DMA objects one device that
+/// did not stop leaves behind (`Instance::keep_dma`). `cargo xtask
+/// init-reserve` checks that the sum of the restart needs of those records,
+/// plus the largest DMA leak of one of them, fits it, and `cargo xtask
 /// pkg-identity` that init's free pages stay at or above it. The EC2 table's
 /// memory budget (`aws.rs`) counts the same reserve.
 pub const INIT_RESERVE_PAGES: u64 = 16_384;

@@ -83,9 +83,10 @@ pub const VIRT: Machine = Machine {
     accel: "tcg",
 };
 
-/// The spec machine with 1 GiB: the machine of the full image, whose
-/// container of 54 MB leaves init 15 837 pages free on 512 MiB, under the
-/// 16 384 that the images keep (docs/packages.md, "Images on layers").
+/// The spec machine with 1 GiB: the machine of the full image. Init sizes the
+/// pool of the process service at boot, so the full image would fit a smaller
+/// machine too; 1 GiB is the release's choice (docs/packages.md, "Images on
+/// layers").
 pub const VIRT_1G: Machine = Machine {
     name: "1G",
     machine: "virt,gic-version=2,highmem-ecam=off",

@@ -8,12 +8,14 @@
 //! After the services of the base image and the full image started, init
 //! keeps `INIT_RESERVE_PAGES` of its own quota free and gives the pool of the
 //! process service everything above them (services/init/src/table/base.rs).
-//! The one use init has for free pages after the boot is the restart of a
+//! The use init has for free pages after the boot is the restart of a
 //! record with `Restart::Always` while its clients still hold the old
 //! instance: the instance takes its quota, the pages of its segments and
 //! stack, init's pools and the pages of its DMA objects once more
 //! (init::quota::need_with_dma). The check builds the programs of those
-//! records and fails when the largest of those needs is over the reserve.
+//! records, adds the needs of all of them, and adds the DMA pages one failed
+//! stop leaks for good (`Instance::keep_dma`, the largest of the records);
+//! it fails when the total is over the reserve.
 
 use init::quota::{dma_pages, need_with_dma};
 use init::table::Restart;
@@ -47,20 +49,44 @@ fn need_of(record: &init::table::Record, program: &bootimg::Program<'_>, stack_s
     }
 }
 
-/// The record with the largest need, and the error that names it when
-/// that need is over `reserve`.
-fn verdict(needs: &[(&str, Need)], reserve: u64) -> Result<(String, u64), String> {
-    let Some((name, worst)) = needs.iter().max_by_key(|(_, n)| n.total) else {
+/// What the check found: the sum of the restart needs, the largest DMA leak
+/// of one record and the record with the largest need.
+#[derive(Debug, PartialEq, Eq)]
+struct Found {
+    sum: u64,
+    leak: u64,
+    leaker: String,
+    largest: String,
+    largest_pages: u64,
+}
+
+/// The sum of the needs of all the records, plus the DMA pages one failed
+/// stop leaks (`Instance::keep_dma`: the largest of the records), against
+/// `reserve`; the error names the parts when they are over it.
+fn verdict(needs: &[(&str, Need)], reserve: u64) -> Result<Found, String> {
+    let (Some((largest, worst)), Some((leaker, leaky))) = (
+        needs.iter().max_by_key(|(_, n)| n.total),
+        needs.iter().max_by_key(|(_, n)| n.dma),
+    ) else {
         return Err("init-reserve: the base table has no record that restarts".to_owned());
     };
-    if worst.total > reserve {
+    let sum: u64 = needs.iter().map(|(_, n)| n.total).sum();
+    let found = Found {
+        sum,
+        leak: leaky.dma,
+        leaker: leaker.to_string(),
+        largest: largest.to_string(),
+        largest_pages: worst.total,
+    };
+    if sum + found.leak > reserve {
         return Err(format!(
-            "init-reserve: {name} needs {} pages at a restart (quota {}, segments {}, stack {}, \
-             DMA {}), over INIT_RESERVE_PAGES {reserve} in services/init/src/table/base.rs",
-            worst.total, worst.quota, worst.segments, worst.stack, worst.dma
+            "init-reserve: the restarts of all records need {sum} pages (largest {largest} with {}: \
+             quota {}, segments {}, stack {}, DMA {}) and a failed stop of {leaker} leaks {} \
+             pages of DMA, over INIT_RESERVE_PAGES {reserve} in services/init/src/table/base.rs",
+            worst.total, worst.quota, worst.segments, worst.stack, worst.dma, found.leak
         ));
     }
-    Ok((name.to_string(), worst.total))
+    Ok(found)
 }
 
 /// Builds the programs of the records of the base table that restart as the
@@ -123,9 +149,15 @@ pub fn check() -> Result<(), String> {
         );
         needs.push((record.name, need));
     }
-    let (name, total) = verdict(&needs, INIT_RESERVE_PAGES)?;
+    let found = verdict(&needs, INIT_RESERVE_PAGES)?;
     println!(
-        "init-reserve: the largest need is {name}, {total} pages, within INIT_RESERVE_PAGES {INIT_RESERVE_PAGES}"
+        "init-reserve: the restarts of all records need {} pages (largest {}, {}), a failed stop of {} leaks {} pages of DMA, {} in all within INIT_RESERVE_PAGES {INIT_RESERVE_PAGES}",
+        found.sum,
+        found.largest,
+        found.largest_pages,
+        found.leaker,
+        found.leak,
+        found.sum + found.leak
     );
     Ok(())
 }
@@ -144,23 +176,45 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_largest_need_within_the_reserve_passes() {
-        let needs = [("blk", need(150)), ("netd", need(10_400))];
-        assert_eq!(verdict(&needs, 16_384), Ok(("netd".to_owned(), 10_400)));
-        assert_eq!(verdict(&needs, 10_400), Ok(("netd".to_owned(), 10_400)));
+    fn need_dma(total: u64, dma: u64) -> Need {
+        Need { dma, ..need(total) }
     }
 
     #[test]
-    fn a_need_over_the_reserve_names_the_record_and_its_parts() {
-        let needs = [("blk", need(150)), ("netd", need(17_000))];
+    fn the_sum_and_the_leak_within_the_reserve_pass() {
+        let needs = [
+            ("blk", need_dma(150, 32)),
+            ("display", need_dma(659, 532)),
+            ("netd", need_dma(10_400, 264)),
+        ];
+        let found = verdict(&needs, 16_384).unwrap();
+        assert_eq!(
+            found,
+            Found {
+                sum: 11_209,
+                leak: 532,
+                leaker: "display".to_owned(),
+                largest: "netd".to_owned(),
+                largest_pages: 10_400
+            }
+        );
+        // Exactly the reserve passes; one page less does not.
+        assert!(verdict(&needs, 11_209 + 532).is_ok());
+        assert!(verdict(&needs, 11_209 + 531).is_err());
+    }
+
+    #[test]
+    fn a_sum_over_the_reserve_names_the_parts() {
+        // Each record alone is within the reserve; together with the leak they are not.
+        let needs = [("blk", need_dma(9_000, 32)), ("netd", need_dma(9_000, 264))];
         let error = verdict(&needs, 16_384).unwrap_err();
-        assert!(error.contains("netd needs 17000 pages"), "{error}");
+        assert!(error.contains("need 18000 pages"), "{error}");
+        assert!(error.contains("leaks 264 pages of DMA"), "{error}");
+        assert!(error.contains("INIT_RESERVE_PAGES 16384"), "{error}");
         assert!(
-            error.contains("quota 16900, segments 60, stack 30, DMA 10"),
+            error.contains("quota 8900, segments 60, stack 30, DMA"),
             "{error}"
         );
-        assert!(error.contains("INIT_RESERVE_PAGES 16384"), "{error}");
     }
 
     #[test]

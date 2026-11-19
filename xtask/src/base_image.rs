@@ -101,11 +101,10 @@ pub fn memory_machine_args() -> Vec<String> {
     args
 }
 
-/// The machine of an image: the full image runs on 1 GiB, because on 512 MiB
-/// its container of 54 MB leaves init's quota about 11 000 pages smaller than the base
-/// image's, which the pool of the process service is sized against
-/// (`INIT_RESERVE_PAGES`; the base image stays on 512 MiB); the archive of the full
-/// image names it in its `run.sh` (spec 5, release).
+/// The machine of an image: the full image runs on 1 GiB. Init sizes the pool
+/// of the process service at boot, so the full image would fit a smaller
+/// machine; 1 GiB is the release's choice, and the archive of the full image
+/// names it in its `run.sh` (spec 5, release). The base image runs on 512 MiB.
 pub fn machine(image: &str) -> &'static qemu::Machine {
     if image == FULL_IMAGE || packages::without_name(image).is_some() {
         &qemu::VIRT_1G

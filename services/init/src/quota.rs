@@ -38,9 +38,13 @@ pub fn need_pages(quota: u64, program: &Program<'_>) -> u64 {
 
 /// The pages of the DMA objects of a record, which init makes in its worker
 /// (`mem_create_contiguous`) and pays for from its own quota: apart from
-/// `need_pages`, since the objects are made after the program loaded.
+/// `need_pages`, since the objects are made after the program loaded. The
+/// kernel takes a block of 2^order frames for a contiguous object, so each
+/// object counts as its pages rounded up to a power of two.
 pub fn dma_pages(dma: &[Dma]) -> u64 {
-    dma.iter().map(|d| d.size.div_ceil(PAGE)).sum()
+    dma.iter()
+        .map(|d| d.size.div_ceil(PAGE).next_power_of_two())
+        .sum()
 }
 
 /// The pages of init's quota one instance takes in all: `need_pages` and the
@@ -209,12 +213,14 @@ mod tests {
         let objects = [dma(16 * PAGE), dma(256 * PAGE)];
         assert_eq!(dma_pages(&objects), 272);
         assert_eq!(dma_pages(&[dma(PAGE + 1)]), 2);
+        // The kernel charges 2^order frames: 24 pages take 32.
+        assert_eq!(dma_pages(&[dma(24 * PAGE)]), 32);
         assert_eq!(
             need_with_dma(20 * PAGE, &p, &objects),
             need_pages(20 * PAGE, &p) + 272
         );
         assert_eq!(need_with_dma(20 * PAGE, &p, &[]), need_pages(20 * PAGE, &p));
-        // A restart with `need_pages` free but not the DMA objects must wait.
+        // A restart that has `need_pages` free and lacks the pages of its DMA objects waits.
         let need = need_with_dma(20 * PAGE, &p, &objects);
         let free = need_pages(20 * PAGE, &p);
         assert!(!fits(free, need));
