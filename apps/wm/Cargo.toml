@@ -1,0 +1,29 @@
+[package]
+name = "wm"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The window manager of stafeto: a client of the compositor's manager session that focuses new windows and switches windows on a key chord"
+
+# What the manager decides, apart from the calls it makes: tested on the
+# host.
+[lib]
+bench = false
+
+[[bin]]
+name = "wm"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-comp = { path = "../../proto/comp" }
+proto-gpu = { path = "../../proto/gpu" }
+proto-wire = { path = "../../proto/wire" }
+
+# The program alone runs on stafeto: the host tests of the library build
+# without rt.
+[target.'cfg(target_os = "none")'.dependencies]
+rt = { path = "../../lib/rt" }
