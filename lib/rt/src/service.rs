@@ -547,6 +547,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 // of a service would take the label for a client's).
                 (Source::Session, proto_init::STOP_NOTICE, _) => {
                     if proto_init::wants_stop(notice.bits) {
+                        steps::stopping();
                         service.stop()
                     }
                 }
@@ -746,6 +747,27 @@ mod steps {
         TABLE_FROM.store(from.max(1), Ordering::Relaxed);
     }
 
+    /// The stop notice came: the service ends within the step, so the changed pairs go out now.
+    pub fn stopping() {
+        let tag = REPORT.load(Ordering::Relaxed);
+        if tag != 0 && !QUIET.load(Ordering::Relaxed) {
+            flush_changed(tag);
+        }
+    }
+
+    /// The `service table:` lines of the pairs that changed since the last table: as many lines
+    /// as pairs changed, none when none did. Told once, at an ordered stop (`stopping`).
+    fn flush_changed(tag: u8) {
+        let mut at = 0;
+        while let Some((kind, longest, next)) = LONGEST.next_changed(at) {
+            at = next;
+            let (took, detail, preempts) = (longest.ticks, longest.detail, longest.preempts);
+            crate::println!(
+                "service table: {tag} kind {kind} {took} ticks detail {detail} preempts {preempts}"
+            );
+        }
+    }
+
     /// The line of the next non-empty pair of the table, from the place `CURSOR` is at: `service
     /// table: T kind K N ticks detail D preempts P`, the longest step of that kind and count of
     /// preemptions seen. The lines of a new
@@ -938,6 +960,7 @@ mod steps {
             let done = DONE.fetch_add(1, Ordering::Relaxed) + 1;
             if done >= from && done.is_power_of_two() {
                 CURSOR.store(0, Ordering::Relaxed);
+                LONGEST.clear_changed();
             }
             if CURSOR.load(Ordering::Relaxed) < TABLE_END {
                 print_table_line(tag);
@@ -975,6 +998,7 @@ mod steps {
     pub fn report(_: u8) {}
     pub fn after(_: fn()) {}
     pub fn table(_: u64) {}
+    pub fn stopping() {}
 }
 
 /// Makes the loop of this service print each new longest step (feature
