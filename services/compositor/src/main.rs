@@ -409,6 +409,7 @@ fn main(_: u64) -> u64 {
         // read and write, SCREEN_BYTES of its 256 pages; nothing else holds it.
         let fb = unsafe { slice::from_raw_parts_mut(FB_AT as *mut u8, SCREEN_BYTES as usize) };
         service.raster.calibrate(fb);
+        service.raster.calibrate_layers(fb);
     }
     // The devices' focus is the compositor's, once the screen is.
     service.take_own(Which::Keys);
