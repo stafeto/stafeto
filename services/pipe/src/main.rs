@@ -251,6 +251,7 @@ fn main(_: u64) -> u64 {
     #[cfg(feature = "steps")]
     {
         rt::service::report_steps(4);
+        rt::service::step_after(steps_parts::after);
         rt::service::table_steps();
     }
     #[cfg(feature = "quiet-steps")]
@@ -580,7 +581,7 @@ impl PipeService {
                     .sum(),
                 _ => 0,
             };
-            steps_parts::print(turn, live, waiting);
+            steps_parts::turn(turn, live, waiting);
         }
         true
     }
@@ -901,7 +902,9 @@ impl PipeService {
 
     fn watch_start(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         #[cfg(feature = "steps")]
-        let (t_begin, ran_begin) = (rt::time::now(), steps_parts::times());
+        let t_begin = rt::time::now();
+        #[cfg(feature = "watch-readout")]
+        let times_begin = steps_parts::times();
         let set = match proto_pipe::WatchSet::parse(r.body()) {
             Ok(set) if r.handles.is_empty() => set,
             _ => return Answer::Status(Status::BadSize),
@@ -987,7 +990,8 @@ impl PipeService {
             steps_parts::record(
                 [t_parse, t_ready, t_insert, rt::time::now()],
                 t_begin,
-                ran_begin,
+                #[cfg(feature = "watch-readout")]
+                times_begin,
             );
         }
         long_answer(r, long::Reply::Wait(key))
@@ -2077,18 +2081,34 @@ impl Service<0> for PipeService {
 }
 
 /// The parts of a request step of a Watch of more than 16 elements, in
-/// counter ticks (wall time), the thread's own time and its kernel part over
-/// the request, and the line the next turn of the service's own prints for
-/// them (`steps` builds only).
+/// counter ticks (wall time), and the longest continuation turn: what the
+/// function that runs after each step prints, so that the line is no part of
+/// any step (`steps` builds only). A request's parts go out when its step is a
+/// new longest of kind 14, with the figure of that step. With the feature
+/// `watch-readout` the thread's own time and its kernel part over the request
+/// (two calls into the kernel, which lengthen the step) go with them.
 #[cfg(feature = "steps")]
 mod steps_parts {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    static PARTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    const PARTS: usize = if cfg!(feature = "watch-readout") {
+        6
+    } else {
+        4
+    };
+    static REQUEST: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
+    static LONGEST_STEP: AtomicU64 = AtomicU64::new(0);
+    /// The latest continuation turn: its ticks, the places in use and the
+    /// operations waiting at the set's queues.
+    static TURN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static LONGEST_TURN: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(feature = "watch-readout")]
     static OWN: AtomicU64 = AtomicU64::new(0);
 
     /// The thread's own time (`ran`) and its kernel part, as the step
     /// tables read them (object_info THREAD_STATE x5 and x6).
+    #[cfg(feature = "watch-readout")]
     pub fn times() -> (u64, u64) {
         let mut raw = OWN.load(Ordering::Relaxed);
         if raw == 0
@@ -2104,25 +2124,61 @@ mod steps_parts {
     }
 
     /// `at` are the counter at the parsed set, at the checked readiness, at
-    /// the insertion and at the kick.
-    pub fn record(at: [u64; 4], begin: u64, times_begin: (u64, u64)) {
-        let (ran, kernel) = times();
+    /// the insertion and at the end of the handler.
+    pub fn record(
+        at: [u64; 4],
+        begin: u64,
+        #[cfg(feature = "watch-readout")] times_begin: (u64, u64),
+    ) {
         let mut from = begin;
-        for (part, &now) in PARTS.iter().zip(&at) {
+        for (part, &now) in REQUEST.iter().zip(&at) {
             part.store(now - from, Ordering::Relaxed);
             from = now;
         }
-        PARTS[4].store(ran - times_begin.0, Ordering::Relaxed);
-        PARTS[5].store(kernel - times_begin.1, Ordering::Relaxed);
+        #[cfg(feature = "watch-readout")]
+        {
+            let (ran, kernel) = times();
+            REQUEST[4].store(ran - times_begin.0, Ordering::Relaxed);
+            REQUEST[5].store(kernel - times_begin.1, Ordering::Relaxed);
+        }
     }
 
-    pub fn print(turn: u64, live: usize, waiting: usize) {
-        let [parse, ready, insert, kick, ran, kernel] =
-            [0, 1, 2, 3, 4, 5].map(|i| PARTS[i].swap(0, Ordering::Relaxed));
-        if parse | ready | insert | kick != 0 {
+    pub fn turn(ticks: u64, live: usize, waiting: usize) {
+        TURN[0].store(ticks, Ordering::Relaxed);
+        TURN[1].store(live as u64, Ordering::Relaxed);
+        TURN[2].store(waiting as u64, Ordering::Relaxed);
+    }
+
+    /// Runs after each step (`rt::service::step_after`).
+    pub fn after() {
+        let ticks = TURN[0].swap(0, Ordering::Relaxed);
+        if ticks > LONGEST_TURN.load(Ordering::Relaxed) {
+            LONGEST_TURN.store(ticks, Ordering::Relaxed);
             rt::println!(
-                "pipe: watch parts parse {parse} ready {ready} insert {insert} kick {kick} ran {ran} kernel {kernel} turn {turn} records {live} waiting {waiting}"
+                "pipe: watch turn {ticks} records {} waiting {}",
+                TURN[1].load(Ordering::Relaxed),
+                TURN[2].load(Ordering::Relaxed)
             );
         }
+        let parse = REQUEST[0].swap(0, Ordering::Relaxed);
+        if parse == 0 {
+            return;
+        }
+        let [ready, insert, handler] = [1, 2, 3].map(|i| REQUEST[i].swap(0, Ordering::Relaxed));
+        let step = rt::service::step_maximum(14).map_or(0, |(ticks, _)| ticks);
+        if step <= LONGEST_STEP.load(Ordering::Relaxed) {
+            return;
+        }
+        LONGEST_STEP.store(step, Ordering::Relaxed);
+        #[cfg(feature = "watch-readout")]
+        let (ran, kernel) = (
+            REQUEST[4].swap(0, Ordering::Relaxed),
+            REQUEST[5].swap(0, Ordering::Relaxed),
+        );
+        #[cfg(not(feature = "watch-readout"))]
+        let (ran, kernel) = (0, 0);
+        rt::println!(
+            "pipe: watch parts parse {parse} ready {ready} insert {insert} handler {handler} ran {ran} kernel {kernel} step {step}"
+        );
     }
 }
