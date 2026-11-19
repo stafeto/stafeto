@@ -290,4 +290,22 @@ mod tests {
         assert!(!should_wake(2, false));
         assert!(!should_wake(0, false));
     }
+
+    /// The sequence the probe met: the frame of a post ended before the post
+    /// returned, so the post's drain took the bit. The mask says the buffer
+    /// is free at once, and the bit still waits for the next wait: a program
+    /// that looks at the mask alone leaves it uncollected, and one that waits
+    /// first gets it.
+    #[test]
+    fn a_bit_taken_by_a_post_makes_the_mask_free_and_still_waits_for_a_wait() {
+        let mut b = Buffers::new(2);
+        b.take(0).unwrap();
+        b.take(1).unwrap();
+        b.bits(1);
+        assert_eq!(b.free() & 1, 1);
+        assert!(b.has_pending());
+        assert_eq!(b.take_pending() & 1, 1);
+        assert!(!b.has_pending());
+        assert_eq!(b.free() & 1, 1);
+    }
 }
