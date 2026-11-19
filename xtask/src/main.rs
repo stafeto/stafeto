@@ -5835,14 +5835,43 @@ fn posix_pty_probe_in(steps: bool) -> Result<(), String> {
 /// The most a step of the terminal service's Watch takes with 16 elements.
 const WATCH_FULL_MAX: u64 = 18_000;
 
+/// The most a step of the pipe or terminal service may take besides the
+/// signal of life (kind 64): 0.9 of term B. The rest of B is the room for
+/// the interrupts that land in a step without a switch (1,310 ticks seen
+/// between two builds) and for the shift of phases between builds.
+const WATCH_STEP_MAX: u64 = TERM_B * 9 / 10;
+
+/// The most a step of the pipe service's WatchStart (tag 4, kind 14) may
+/// take: term B. The step's own work is about 12,900 ticks, and the longest
+/// steps observed carry 4,000 to 6,000 ticks more of a budget overrun
+/// episode, which is no work of the service (the request thread's budget is
+/// 4,687 ticks of each 5 ms and a step crosses it). This exception goes away
+/// when stafeto/stafeto#498 closes, and kind 14 is then held to
+/// `WATCH_STEP_MAX` like the other steps.
+const WATCH_START_MAX: u64 = TERM_B;
+
+/// The bound of a step of the pipe (tag "4") or terminal service: the signal
+/// of life (kind 64) is held to term B, the pipe service's WatchStart (kind
+/// 14) to `WATCH_START_MAX`, every other step to `WATCH_STEP_MAX`.
+fn watch_bound(tag: &str, kind: usize) -> u64 {
+    if kind == 64 {
+        RAM_STEP_MAX
+    } else if tag == "4" && kind == 14 {
+        WATCH_START_MAX
+    } else {
+        WATCH_STEP_MAX
+    }
+}
+
 fn check_watch_steps(lines: &[String]) -> Result<(), String> {
     for (tag, methods) in [("4", [14, 15, 16]), ("5", [25, 26, 27])] {
         check_waits(lines, &[tag], "watch steps")?;
         let steps = longest_steps(lines, tag);
         for &(kind, ticks, _) in &steps {
-            if ticks == 0 || ticks > RAM_STEP_MAX {
+            let bound = watch_bound(tag, kind);
+            if ticks == 0 || ticks > bound {
                 return Err(format!(
-                    "watch service {tag}, kind {kind} exceeded {RAM_STEP_MAX}: {ticks}"
+                    "watch service {tag}, kind {kind} exceeded {bound}: {ticks}"
                 ));
             }
         }
@@ -5852,9 +5881,10 @@ fn check_watch_steps(lines: &[String]) -> Result<(), String> {
             .map(|line| line.replacen("service case:", "service step:", 1))
             .collect();
         let full = longest_steps(&cases, tag);
-        for &(_, ticks, _) in &full {
-            if ticks == 0 || ticks > RAM_STEP_MAX {
-                return Err(format!("watch full case exceeded {RAM_STEP_MAX}: {ticks}"));
+        for &(kind, ticks, _) in &full {
+            let bound = watch_bound(tag, kind);
+            if ticks == 0 || ticks > bound {
+                return Err(format!("watch full case exceeded {bound}: {ticks}"));
             }
         }
         // The pipe service's Watch holds 32 elements, the terminal's 16
@@ -15557,6 +15587,85 @@ mod tests {
             let mut worse = lines.clone();
             worse.push(bad.into());
             assert!(super::check_watch_steps(&worse).is_err(), "{bad}");
+        }
+    }
+
+    /// Each step of the pipe and terminal services but the signal of life
+    /// (kind 64) is held to 0.9 of term B.
+    #[test]
+    fn watch_steps_are_held_to_nine_tenths_of_b() {
+        let mut lines = Vec::new();
+        for (tag, methods, full) in [(4, [14, 15, 16], 32), (5, [25, 26, 27], 16)] {
+            for method in methods {
+                lines.push(format!(
+                    "service case: {tag} kind {method} 14000 ticks detail {full}"
+                ));
+            }
+            for kind in [64, 65] {
+                lines.push(format!(
+                    "service step: {tag} kind {kind} 1000 ticks detail 0"
+                ));
+            }
+        }
+        assert!(super::check_watch_steps(&lines).is_ok());
+        let limit = WATCH_STEP_MAX;
+        assert_eq!(limit, TERM_B * 9 / 10);
+        assert_eq!(WATCH_START_MAX, TERM_B);
+        for (bad, ok) in [
+            // WatchStart of the pipe service: held to term B.
+            (
+                "service step: 4 kind 14 18888 ticks detail 32".to_string(),
+                true,
+            ),
+            (
+                format!("service step: 4 kind 14 {TERM_B} ticks detail 32"),
+                true,
+            ),
+            (
+                format!("service step: 4 kind 14 {} ticks detail 32", TERM_B + 1),
+                false,
+            ),
+            (
+                format!("service case: 4 kind 14 {} ticks detail 32", TERM_B + 1),
+                false,
+            ),
+            (
+                "service case: 4 kind 14 18888 ticks detail 32".to_string(),
+                true,
+            ),
+            // Every other step is held to nine tenths of B.
+            (
+                "service step: 4 kind 15 18888 ticks detail 32".to_string(),
+                false,
+            ),
+            (
+                format!("service step: 4 kind 15 {limit} ticks detail 32"),
+                true,
+            ),
+            (
+                "service case: 4 kind 16 18888 ticks detail 32".to_string(),
+                false,
+            ),
+            (
+                "service step: 5 kind 14 18888 ticks detail 0".to_string(),
+                false,
+            ),
+            (
+                format!("service step: 5 kind 26 {} ticks detail 16", limit + 1),
+                false,
+            ),
+            (
+                format!("service step: 4 kind 65 {} ticks detail 0", limit + 1),
+                false,
+            ),
+            (
+                format!("service step: 4 kind 64 {} ticks detail 0", limit + 1),
+                true,
+            ),
+        ] {
+            let mut probe = lines.clone();
+            probe.push(bad.clone());
+            assert_eq!(super::check_watch_steps(&probe).is_ok(), ok, "{bad}");
         }
     }
     use super::*;
