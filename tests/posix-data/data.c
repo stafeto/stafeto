@@ -416,16 +416,21 @@ static int fork_shares_position(void) {
     return 0;
 }
 
-static int spawn_child(const char *role, int fd, long offset, long count, int *code) {
+static int spawn_file(const char *file, const char *role, int fd, long offset, long count,
+                      int *code) {
     char fdtext[16], offtext[24], counttext[24];
     snprintf(fdtext, sizeof fdtext, "%d", fd);
     snprintf(offtext, sizeof offtext, "%ld", offset);
     snprintf(counttext, sizeof counttext, "%ld", count);
     char *argv[] = {"posix-data", (char *)role, fdtext, offtext, counttext, NULL};
     pid_t pid = 0;
-    if (posix_spawn(&pid, "/bin/posix-data", NULL, NULL, argv, environ) != 0) return -1;
+    if (posix_spawn(&pid, file, NULL, NULL, argv, environ) != 0) return -1;
     *code = wait_ok(pid);
     return 0;
+}
+
+static int spawn_child(const char *role, int fd, long offset, long count, int *code) {
+    return spawn_file("/bin/posix-data", role, fd, offset, count, code);
 }
 
 static int spawn_keeps_descriptor(void) {
@@ -468,6 +473,53 @@ static int cloexec_is_closed(void) {
     DATA_CHECK(code == 0);
     DATA_CHECK(read_up_to(fd, buf, 8) == 8 && pattern_is(buf, 0, 8, 1)); /* ours is still open */
     DATA_CHECK(close(fd) == 0);
+    return 0;
+}
+
+/* A descriptor marked FD_CLOFORK is not the child's. */
+static int clofork_stays_with_the_parent(void) {
+    unsigned char buf[8];
+    int fd = open("/data/pub", O_RDONLY);
+    DATA_CHECK(fd >= 0 && fcntl(fd, F_SETFD, FD_CLOFORK) == 0);
+    pid_t pid = fork();
+    DATA_CHECK(pid >= 0);
+    if (pid == 0) {
+        errno = 0;
+        _exit(read(fd, buf, sizeof buf) == -1 && errno == EBADF ? 0 : 1);
+    }
+    DATA_CHECK(wait_ok(pid) == 0);
+    DATA_CHECK(read_up_to(fd, buf, 8) == 8 && pattern_is(buf, 0, 8, 1));
+    DATA_CHECK(close(fd) == 0);
+    return 0;
+}
+
+/* A set-ID program (the file is owned by user 1000, mode 4755) gets the descriptor and reads it:
+ * the loader passes the session of the data service when it is the genuine one. */
+static int setid_program_reads_descriptor(void) {
+    unsigned char buf[100];
+    int code = -9;
+    int fd = open("/data/pub", O_RDONLY);
+    DATA_CHECK(fd >= 0 && read_up_to(fd, buf, 100) == 100);
+    DATA_CHECK(spawn_file("/bin/posix-data-suid", "child-read", fd, 100, 50, &code) == 0);
+    DATA_CHECK(code == 0);
+    DATA_CHECK(lseek(fd, 0, SEEK_CUR) == 150);
+    DATA_CHECK(close(fd) == 0);
+    return 0;
+}
+
+/* After seteuid the real identity still opens the way (access) and the effective one is refused
+ * (faccessat with AT_EACCESS). */
+static int real_and_effective_access(void) {
+    pid_t pid = fork();
+    DATA_CHECK(pid >= 0);
+    if (pid == 0) {
+        if (seteuid(1000) != 0) _exit(1);
+        if (access("/data/secret", R_OK) != 0) _exit(2);
+        errno = 0;
+        if (faccessat(AT_FDCWD, "/data/secret", R_OK, AT_EACCESS) != -1 || errno != EACCES) _exit(3);
+        _exit(0);
+    }
+    DATA_CHECK(wait_ok(pid) == 0);
     return 0;
 }
 
@@ -599,6 +651,9 @@ static int first(void) {
     run_check("spawn keeps the descriptor", spawn_keeps_descriptor);
     run_check("exec keeps the descriptor", exec_keeps_descriptor);
     run_check("cloexec closed", cloexec_is_closed);
+    run_check("clofork stays with the parent", clofork_stays_with_the_parent);
+    run_check("set-ID program reads the descriptor", setid_program_reads_descriptor);
+    run_check("real and effective access", real_and_effective_access);
     run_check("writes refused", writes_are_refused);
     run_check("datax is the RAM service", datax_is_the_ram_service);
     run_check("errno for bad paths", errno_for_bad_paths);

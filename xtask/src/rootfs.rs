@@ -2452,6 +2452,28 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        "boot-data-posix.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/posix-data", 0o755, ROOT, "posix-data"),
+                // Owned by another user, set-ID: a spawn of it runs with a real ID that differs from
+                // the effective one, and the loader passes the data session of its caller only if it
+                // is the genuine one.
+                of(
+                    "/bin/posix-data-suid",
+                    0o4755,
+                    (1000, 100),
+                    Source::Variant {
+                        program: "posix-data",
+                        tag: "setid",
+                        extra: 4096,
+                    },
+                ),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
         "boot-posix-window.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -3379,6 +3401,7 @@ mod tests {
             "boot-posix-random-limit.img",
             "boot-posix-random-rejoin-steps.img",
             "boot-posix-display.img",
+            "boot-data-posix.img",
             "boot-posix-window.img",
             "boot-pkg-slot.img",
             "boot-display.img",
