@@ -58,11 +58,15 @@ pub const PER_CONTEXT: usize = 4;
 /// decide.
 pub const BAND_ROWS: u32 = 16;
 
-/// What a band costs the service in ticks (`Scene::tile`): at most
-/// BAND_TICKS in all. The step of a band is its work and a part of about
-/// 2 400 ticks of the step itself, and the gate of a band is 16 328, so a
-/// band of 15 000 leaves the tenth of a step for the interrupts.
-pub const BAND_TICKS: u32 = 15_000;
+/// The work of a band by the model (`Scene::tile`): the calls, the lines, the
+/// points, the term of each layer after the first and the fixed term of a band
+/// come to at most BAND_TICKS. The step of the band is that work and the cost of
+/// the step around it (the entry, the notice of the next band, the reply to the
+/// loop), which the probes measure at up to about 2 400 ticks, so the work and
+/// the cost stay under the gate of a band, 16 328 ticks. 15 000 left the longest
+/// step of seven translucent windows over a copy at 16 433, 105 over the gate,
+/// and 14 000 leaves it near 15 400.
+pub const BAND_TICKS: u32 = 14_000;
 
 /// The price of one kind of operation (the black a band starts with, a layer
 /// copied, a layer laid over others): what one operation costs is
@@ -2934,10 +2938,10 @@ mod tests {
         };
         let (w8, h8) = width_of(8);
         assert_eq!(h8, 1, "eight layers make a part of a line");
-        // By the measured terms eight layers get 96 points of a line (a frame of the
-        // 320 by 200 windows is 4 bands a line, 800 in all; 151 points and 600
-        // bands before the terms).
-        assert_eq!(w8, 96);
+        // By the measured terms and 14 000 ticks eight layers get 71 points of a line
+        // (a frame of the 320 by 200 windows is 5 bands a line, 1 000 in all; 151
+        // points and 600 bands before the terms).
+        assert_eq!(w8, 71);
         let (w4, _) = width_of(4);
         assert!(w8 < w4);
         // Without the term of a layer the band would be this wide: the term is
