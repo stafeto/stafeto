@@ -44,6 +44,13 @@ This is what a POSIX program gets from the data volume: the directory `/data`, w
 
 Removal, writes, truncation and changes of mode and times are never refused by the two caps. Every file takes at least 4 KiB (inline data is off). A volume holds about 20,000 to 30,000 files with names up to 32 bytes and about 6,000 with names of 255 bytes. A creation near the cap recounts the pairs, which takes 1.5 to 2 s on an EBS gp3 volume, and one removal takes up to about 2 s there; a tree of a thousand directories takes about 18 minutes to remove (3.3 million reads at 3,000 reads a second).
 
+## Remaining risks
+
+- **The queue of the root.** Every SESSION request of every process arrives with the one label of the root, and the requests over the tree's share of jobs wait in a queue of 32 in the order they came. A process that keeps a thread for every one of the 32 places can still make the sessions of other processes wait. A label of the root for each process tree is planned for 0.7.
+- **Trust in the vouchers.** A service that asks the process service who a client is (the pipe, network, IPC and data services) holds a copy of the client's identity session that can be duplicated, and could present it to another such service. The services are trusted with it. A copy that serves Vouch alone needs a right of the kernel that does not exist.
+- **Atomicity.** A write is atomic per message of 1,012 bytes (a pwrite 1,004): a larger write, and a larger read of a file another process rewrites in place, can be mixed with other processes' bytes. The transfer through a memory object that removes this is planned after 0.6.
+- **A misstated kind in SCM_RIGHTS.** A pass travels with the kind of its service. If the kind of a pass is misstated, the service that is handed the pass does not know it and refuses it with BAD_HANDLE, and the pass is gone: the description the sender exported is lost to the sender. A layer that states kinds as built here never does this.
+
 ## When the data service restarts
 
 A descriptor opened before the restart answers EIO to every call but `close`, which succeeds. The first call by path takes a session with the new instance; a call that meets the end of the old session goes on at once with the new one. The current directory is opened again from its string. Names made before the restart are there, files written and not synced are as the last sync left them.
