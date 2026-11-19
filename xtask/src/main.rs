@@ -821,7 +821,7 @@ const POSIX_FIFO_STEPS_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_FIFO_PROGRAMS;
     // `fifo-steps` makes the probe wait idle for three seconds after its last check.
     programs[5].3 = &["fifo-probe", "fifo-steps"];
-    programs[1].3 = &["steps"];
+    programs[1].3 = &["steps", "audit-readout"];
     programs[2].3 = &["steps"];
     programs
 };
