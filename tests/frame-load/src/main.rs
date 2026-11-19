@@ -49,6 +49,8 @@ const MAP_AT: usize = 0x20_0000_0000;
 const MAP_STEP: usize = 0x100_0000;
 /// The retry period for a service that is being set up, and the longest wait.
 const RETRY_NS: u64 = 5_000_000;
+/// The lateness of a wake-up at a phase start that fails the run.
+const WAKE_LATE_NS: u64 = 100_000_000;
 const WAIT_NS: u64 = 60_000_000_000;
 /// How long after the last phase the conductor says `done`.
 const DONE_AFTER_NS: u64 = 2_000_000_000;
@@ -179,6 +181,22 @@ impl Env<'_> {
         Ok(())
     }
 
+    /// The program that keeps time has to wake at the start of a phase: a
+    /// load that keeps it off the processor for longer than this has spoiled
+    /// the phase, and the run fails with the lateness named.
+    fn woke_in_time(&self, who: &str, phase: Phase) -> Result<(), Fail> {
+        let late = now().saturating_sub(self.schedule.start_of(phase));
+        if late > WAKE_LATE_NS {
+            rt::println!(
+                "frame-load: {who} woke {} ms late for the phase {}",
+                late / 1_000_000,
+                phase.name()
+            );
+            return Err("woke late for a phase");
+        }
+        Ok(())
+    }
+
     // ---- ctl ----
 
     fn conduct(&self) -> Result<(), Fail> {
@@ -187,6 +205,7 @@ impl Env<'_> {
         self.on_time("ctl")?;
         for phase in ORDER {
             self.sleep_until(self.schedule.start_of(phase));
+            self.woke_in_time("ctl", phase)?;
             let before = Self::describe(&display).map_err(say("DESCRIBE"))?;
             self.sleep_until(self.schedule.end_of(phase));
             let after = Self::describe(&display).map_err(say("DESCRIBE"))?;
@@ -314,6 +333,7 @@ impl Env<'_> {
         for phase in ORDER {
             let scene = phase.scene();
             self.sleep_until(self.schedule.start_of(phase));
+            self.woke_in_time("draw", phase)?;
             let Some(rect) = paint::window_of(scene) else {
                 // No window in this scene: the one of the phase before goes.
                 open = None;
@@ -390,6 +410,7 @@ impl Env<'_> {
                 continue;
             }
             self.sleep_until(self.schedule.start_of(phase));
+            self.woke_in_time("legacy", phase)?;
             let open = proto_gpu::Method::Open.header().bytes();
             let end = now() + WAIT_NS;
             let mut reply = loop {

@@ -100,13 +100,18 @@ const COMPOSITOR: Record = Record {
     ..comp::COMPOSITOR
 };
 
-/// What every load is: a client at 30 with a session of one service.
+/// What every program of the image is: a client at 31 with a session of one
+/// service. The clients that must run on time (the conductor, the paced
+/// client, the client of the first revision) stand at 31, above the loads at
+/// 30: a load that never sleeps (the CPU loop) would otherwise keep them off
+/// the processor, since a higher number runs first and the service at 32
+/// stands above both.
 const LOAD: Record = Record {
     name: "frame-load",
     program: "frame-load",
     kind: Kind::Client,
-    priority: 30,
-    ceiling: 30,
+    priority: 31,
+    ceiling: 31,
     quota: 64 * PAGE,
     handle_limit: 32,
     restart: Restart::Never,
@@ -153,12 +158,12 @@ pub const LEGACY: Record = Record {
     ..LOAD
 };
 
-/// The CPU load: a loop at 31, with no session.
+/// The CPU load: a loop at 30, with no session.
 pub const CPU: Record = Record {
     name: "frame-cpu",
     args: b"cpu",
-    priority: 31,
-    ceiling: 31,
+    priority: 30,
+    ceiling: 30,
     connects: &[],
     ..LOAD
 };
@@ -168,6 +173,8 @@ pub const FILES: Record = Record {
     name: "frame-files",
     program: "data-probe",
     args: b"load",
+    priority: 30,
+    ceiling: 30,
     connects: &["datafs"],
     waits: &[Wait {
         service: "datafs",
@@ -181,6 +188,8 @@ pub const NET: Record = Record {
     name: "frame-net",
     program: "net-probe",
     args: b"L",
+    priority: 30,
+    ceiling: 30,
     connects: &[NET_SERVICE],
     ..LOAD
 };
@@ -289,7 +298,17 @@ mod tests {
         assert_eq!(named("gpu").cpus, SCREEN_CPUS);
         assert_eq!(named("display").cpus, SCREEN_CPUS);
         assert_ne!(named(NET_SERVICE).budgets[0].cpu, 1);
-        assert!(named("frame-cpu").priority == 31 && named("frame-cpu").ceiling == 31);
+        // The clients that keep time stand above the loads, and the service
+        // of the screen above both: a loop that never sleeps must not keep
+        // the paced client off the processor.
+        let level = |n: &str| (named(n).priority, named(n).ceiling);
+        for timed in ["frame-load", "frame-draw", "frame-legacy"] {
+            assert_eq!(level(timed), (31, 31), "{timed}");
+        }
+        for load in ["frame-cpu", "frame-files", "frame-net"] {
+            assert_eq!(level(load), (30, 30), "{load}");
+        }
+        assert!(named("gpu").priority > 31);
     }
 
     /// The conductor is the one input session; the others have none.
