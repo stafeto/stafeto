@@ -131,8 +131,9 @@ pub fn loads_verdict(lines: &[String]) -> Result<String, String> {
     }) {
         return Err(failed.clone());
     }
-    let has = |text: &str| lines.iter().any(|l| l == text);
-    if !has("frame-load: done") {
+    // The console is shared: a long line of another service written while the conductor
+    // wrote its last line can cut it, which leaves the line at the end of the cut one.
+    if !lines.iter().any(|l| l.ends_with("frame-load: done")) {
         return Err("the conductor never said done".to_owned());
     }
     let mut said = Vec::new();
@@ -275,6 +276,24 @@ mod tests {
         lines.push("data-probe: load ops 120 bytes 2031616".to_owned());
         lines.push("frame-load: done".to_owned());
         lines
+    }
+
+    /// The last line of the conductor written in the middle of another service's long line
+    /// (the console is shared) still says done; a run that never said it fails.
+    #[test]
+    fn a_done_line_cut_into_another_line_still_says_done() {
+        let mut lines = good();
+        let last = lines.len() - 1;
+        lines[last] =
+            "service band histogram: 17 layers 2+ [5265, 20service band floor: frame-load: done"
+                .to_owned();
+        assert!(loads_verdict(&lines).is_ok());
+        lines.pop();
+        assert!(
+            loads_verdict(&lines)
+                .unwrap_err()
+                .contains("never said done")
+        );
     }
 
     #[test]
