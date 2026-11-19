@@ -403,14 +403,38 @@ pub mod calibration {
         }
     }
 
-    /// The shapes of each class, width by height.
-    const CALL: [(u32, u32); 4] = [(1, 1), (2, 1), (4, 1), (8, 1)];
-    const ROW: [(u32, u32); 6] = [(8, 8), (8, 16), (16, 8), (16, 16), (4, 32), (12, 24)];
-    const POINT: [(u32, u32); 5] = [(152, 8), (128, 16), (64, 32), (150, 16), (76, 16)];
+    /// The shapes, width by height, with the class each tells: 0 the call, 1 the
+    /// row, 2 the point, 3 only the fit (wider than 8 points, in one row). The
+    /// pairs of one width and two heights give the cost of a row at that width.
+    const SHAPES: [(u32, u32, u8); 23] = [
+        (1, 1, 0),
+        (2, 1, 0),
+        (4, 1, 0),
+        (8, 1, 0),
+        (16, 1, 3),
+        (32, 1, 3),
+        (64, 1, 3),
+        (8, 8, 1),
+        (8, 16, 1),
+        (16, 8, 1),
+        (16, 16, 1),
+        (4, 16, 1),
+        (4, 32, 1),
+        (12, 8, 1),
+        (12, 24, 1),
+        (152, 8, 2),
+        (152, 16, 2),
+        (76, 16, 2),
+        (76, 32, 2),
+        (64, 16, 2),
+        (64, 32, 2),
+        (150, 8, 2),
+        (150, 16, 2),
+    ];
     const REPEAT: u32 = 3;
 
-    /// One operation of a kind at offsets (`dx`, `sx`): its ticks, or None when
-    /// a higher level preempted the thread in the middle of it.
+    /// One operation of a kind: its ticks, or None when a higher level
+    /// preempted the thread in the middle of it.
     fn timed(thread: &rt::handle::Handle<rt::handle::Thread>, run: impl FnOnce()) -> Option<u64> {
         let before = rt::sys::thread_ran_preempts(thread).ok()?;
         let began = rt::time::now();
@@ -420,8 +444,8 @@ pub mod calibration {
         (after.1 == before.1).then(|| ended - began)
     }
 
-    /// Makes the operations of every class of one kind (0 black, 1 copy, 2
-    /// over) and tells the line.
+    /// Makes the operations of every shape of one kind (0 black, 1 copy, 2
+    /// over) and tells a line for each shape and one for the classes.
     fn kind(
         px: &mut Pixman,
         which: usize,
@@ -431,13 +455,15 @@ pub mod calibration {
         let (mut call, mut row, mut point) = (Spread::new(), Spread::new(), Spread::new());
         let mut preempted = 0u32;
         let (mut call_g, mut row_g) = (0u64, 0u64);
-        for class in 0..3 {
-            let shapes: &[(u32, u32)] = match class {
-                0 => &CALL,
-                1 => &ROW,
-                _ => &POINT,
-            };
-            for &(w, h) in shapes {
+        // The calls first, then the rows, then the points: each class takes off
+        // the greatest of those before it.
+        for order in [0u8, 1, 2] {
+            for &(w, h, class) in &SHAPES {
+                let tells = if class == 3 { 0 } else { class };
+                if tells != order {
+                    continue;
+                }
+                let (mut least, mut greatest, mut n) = (u64::MAX, 0u64, 0u64);
                 for dx in 0..4u32 {
                     for sx in 0..4u32 {
                         // One warm-up, which makes the images pixman keeps.
@@ -485,6 +511,9 @@ pub mod calibration {
                                 preempted += 1;
                                 continue;
                             };
+                            least = least.min(ticks);
+                            greatest = greatest.max(ticks);
+                            n += 1;
                             let points = u64::from(w) * u64::from(h);
                             match class {
                                 0 => {
@@ -497,14 +526,20 @@ pub mod calibration {
                                     row.add(v, (w, h));
                                     row_g = row_g.max(v);
                                 }
-                                _ => {
+                                2 => {
                                     let rows = row_g * u64::from(h) / 100;
                                     let net = ticks.saturating_sub(call_g + rows);
                                     point.add(net * 100 / points, (w, h));
                                 }
+                                _ => {}
                             }
                         }
                     }
+                }
+                if n > 0 {
+                    rt::println!(
+                        "service shape: 17 {name} {w} {h} least {least} greatest {greatest} n {n}"
+                    );
                 }
             }
         }
