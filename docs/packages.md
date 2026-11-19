@@ -137,6 +137,44 @@ them for the licence notes of the image.
   links FreeType carry in `/usr/share/licenses/<name>/freetype/`; the notes of a
   release that holds such a package quote it. FTL is not compatible with
   GPL-2.0-only, so a GPL-2.0-only program (BusyBox) must not link FreeType.
+- LVGL (`packages/lvgl.toml`, MIT with the font under OFL-1.1, 9.6.0) is an
+  optional package of the image kind `games` that names FreeType in
+  `build_depends`, so its notice directory carries FreeType's licence text and
+  credit line in `/usr/share/licenses/lvgl/freetype/`. `tools/build-lvgl.py`
+  fetches the release archive of the tag (111 MB, kept in `target/lvgl-src/`,
+  SHA-256 checked), unpacks only `src`, `include`, `lvgl.h`, `lv_version.h` and
+  `LICENCE.txt` into `target/lvgl/lvgl-9.6.0`, compiles every C file of `src`
+  with `ports/lvgl/lv_conf.h` (one thread, integer drawing into XRGB8888, only
+  the widgets of the demo, FreeType for text, no file system, no monitors, no
+  drivers) but `src/osal/lv_linux.c` (the load figure of the system monitor,
+  which reads `/proc/stat` through stdio), and archives `target/lvgl/liblvgl.a`.
+  It runs `tools/build-freetype.py` first and compiles against its headers.
+  The flags include `-funsigned-char` (the `char` of AArch64 Linux, on the host
+  build too), `-fwrapv` and `-ffp-contract=off`; `--host` builds the same files
+  with the compiler of the host into `target/lvgl/host/`. The font
+  `LiberationSans-Regular.ttf` and its licence text come out of the archive into
+  `target/lvgl/`. After the build the script stops when the compiler's macros
+  differ from the settings that fix what is drawn (the defaults of LVGL
+  included: a part that is on by default and should be off is found), when an
+  object leaves undefined a name that is neither a function of
+  `libfreetype.a` nor one of the exact list of the C library's functions the
+  library calls (`abort`, `memcmp`, `memcpy`, `memmove`, `memset`, `strcat`,
+  `strchr`, `strcmp`, `strcpy`, `strlen`, `strncat`, `strncmp`, `strncpy`,
+  `strnlen` and the two names of the stack protector), when relibc's `libc.a`
+  does not define one of those, when the library calls a thread, loader, mapper
+  or floating-point function of libm, or when it calls `FT_Property_Set`,
+  `FT_Set_Default_Properties`, `FT_Library_SetLcdFilter` or `getenv`.
+  `python3 -I tools/test_build_lvgl.py` checks the configuration file and these
+  rules on samples; its header records one real run of the planted fault
+  (`LV_USE_OS` set to `LV_OS_PTHREAD`, through `STAFETO_LVGL_PORT_DIR`), which
+  the build refuses with the `pthread_*` names. The package installs no file
+  yet: the program `lvgl-demo` and the installed font come with the later steps
+  of the stage, and until then `xtask/src/packages.rs` lists it in
+  `SERVICE_LIBRARIES`. The archive of the tag is pinned by its SHA-256; if
+  GitHub ever changes its bytes, the fallback is to pin the commit of the tag
+  (`80ca777e37a2b176770726a02e07a6fb79ef0b39`) and fetch only `src` and
+  `include` of it with a sparse shallow checkout, as `tools/build-relibc.py`
+  fetches relibc.
 - F-Stack (`packages/f-stack.toml`, the TCP/IP stack of FreeBSD 15 in user
   space, BSD-2-Clause and BSD-3-Clause with files under BSD-4-Clause,
   RSA-MD, Beerware, MIT-CMU, ISC and MIT) is an optional package of the image kind `fstack` that installs only its

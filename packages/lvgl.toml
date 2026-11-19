@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# LVGL: the widget library of the demo of stage G4. tools/build-lvgl.py builds
+# the static library target/lvgl/liblvgl.a from the pinned release archive
+# (the tag v9.6.0, commit 80ca777e37a2b176770726a02e07a6fb79ef0b39) with the
+# configuration of ports/lvgl, and links the FreeType of the package freetype
+# for its text. The font of the demo, Liberation Sans Regular (SIL Open Font
+# License 1.1), is a file of the archive: the build copies it and its licence
+# text to target/lvgl/, and the notices of the package carry the licence text.
+# The program of the package (lvgl-demo) and the installed font come with the
+# later steps of the stage; until then the package installs no file and
+# SERVICE_LIBRARIES in xtask/src/packages.rs lists it.
+# Format: docs/packages.md.
+
+name = "lvgl"
+version = "9.6.0"
+kind = "optional"
+image = "games"
+release = "1"
+summary = "LVGL widget library with FreeType text, for the graphics demo"
+url = "https://github.com/lvgl/lvgl/archive/refs/tags/v9.6.0.tar.gz"
+sha256 = "b20ee3acc1bba13c62d854f9ebd62e4c51e0b443b1e0225892e86442defa84df"
+license = "MIT AND OFL-1.1"
+license_file = "LICENCE.txt"
+build_depends = ["freetype"]
+needs = ["display", "input"]
+notices = ["LiberationSans-LICENSE.txt = target:lvgl/LiberationSans-LICENSE.txt"]
+build = "tools/build-lvgl.py"
+files = []
