@@ -376,13 +376,20 @@ extern "C" fn work(_: u64) -> ! {
             None
         }
     };
+    let mut volume = volume;
+    let mut clock = Clock::new();
+    if !clock.attach(&view::<Channel>(PARENT), &process) {
+        rt::println!("datafs: no clock service, the times of files are the count since boot");
+    }
+    mount_work(&mut volume, &mut clock);
+    // A volume of a later format is refused: every request answers NOT_READY.
     READY.store(volume.is_some(), Release);
     STARTING.store(false, Release);
     #[cfg(feature = "crash")]
     ARMED.store(true, Release);
     let wake = view::<Channel>(WAKE);
     let _ = sys::notify(&wake, 1);
-    serve(volume, &wake)
+    serve(volume, clock, &wake)
 }
 
 fn open_volume(disk: Disk) -> Option<Volume> {
@@ -440,13 +447,20 @@ fn say_foreign(found: &Found) {
     );
 }
 
-/// The loop of the thread: wait for a kick, run the queued jobs in order, say each is done.
-fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
-    // The mount work, before the first request: the hidden directory of the orphans, what a stop or
-    // a cut left in it, and the epoch of this instance, a count kept on the volume (the handles of
-    // an earlier instance answer STALE). Without a volume the epoch is the clock's.
+/// The mount work, before READY and so before the first request: the clock, the hidden directory of
+/// the orphans, what a stop or a cut left in it, the attributes of the volume (`Server::mount_work`:
+/// a volume of version 2 gets its records, a later format is refused) and the epoch of this instance,
+/// a count kept on the volume (the handles of an earlier instance answer STALE). The server starts
+/// with nothing remembered of directories. Without a volume the epoch is the clock's. A conversion
+/// of the volume of the first release is a few commits (three entries); READY waits for them, and
+/// no request has been taken yet.
+fn mount_work(volume: &mut Option<Volume>, clock: &mut Clock) {
+    // SAFETY: the server is the worker's alone and lives for the life of the process.
+    let server: &mut Server = unsafe { &mut *SERVER.get() };
     let mut epoch = (rt::time::now() >> 4) as u32;
     if let Some(fs) = volume.as_mut() {
+        // The time of the first job, and of the records the mount work writes, is not 0.
+        server.set_now(clock.now_ns());
         if datafs::server::ensure_orphans(fs).is_err() {
             rt::println!("datafs: the directory of the orphans could not be made");
         }
@@ -460,31 +474,12 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
             ),
             Err(_) => rt::println!("datafs: the orphans could not be dealt with"),
         }
-        match datafs::server::bump_epoch(fs) {
-            Ok(count) => epoch = count,
-            Err(_) => rt::println!("datafs: the epoch could not be kept, the clock's is used"),
-        }
-    }
-    // SAFETY: the server is the worker's alone and lives for the life of the process.
-    let server: &mut Server = unsafe { &mut *SERVER.get() };
-    server.set_epoch(epoch);
-    // The clock, the notary session and the identity copies of the bound sessions. The clock and
-    // the volume's attributes (`Server::mount_work`) are set up before the first request: the
-    // requests that came meanwhile wait in the table of jobs, which the main thread fills.
-    let mut clock = Clock::new();
-    let parent = view::<Channel>(PARENT);
-    let process = view::<Process>(PROCESS);
-    if !clock.attach(&parent, &process) {
-        rt::println!("datafs: no clock service, the times of files are the count since boot");
-    }
-    let mut notary = Notary::new();
-    let mut identities = Identities::new();
-    if let Some(fs) = volume.as_mut() {
-        server.set_now(clock.now_ns());
         match server.mount_work(fs) {
-            Ok(done) if done.refused => rt::println!(
-                "datafs: the volume's format is above this service's, left alone and refused"
-            ),
+            Ok(done) if done.refused => {
+                rt::println!(
+                    "datafs: the volume's format is newer than this service's: left alone and refused"
+                )
+            }
             Ok(done) if done.converted > 0 || !done.complete => rt::println!(
                 "datafs: {} entries got attributes{}",
                 done.converted,
@@ -497,7 +492,23 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
             Ok(_) => {}
             Err(_) => rt::println!("datafs: the attributes of the volume could not be made"),
         }
+        match datafs::server::bump_epoch(fs) {
+            Ok(count) => epoch = count,
+            Err(_) => rt::println!("datafs: the epoch could not be kept, the clock's is used"),
+        }
     }
+    server.set_epoch(epoch);
+}
+
+/// The loop of the thread: wait for a kick, run the queued jobs in order, say each is done.
+fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -> ! {
+    // SAFETY: as in `mount_work`.
+    let server: &mut Server = unsafe { &mut *SERVER.get() };
+    // The notary session and the identity copies of the bound sessions.
+    let parent = view::<Channel>(PARENT);
+    let process = view::<Process>(PROCESS);
+    let mut notary = Notary::new();
+    let mut identities = Identities::new();
     let kicks = Handle::<Channel>::borrowed(abi::Handle(JOBS_CHANNEL.load(Acquire)));
     // The idle work: the first walk after READY, and the walk that finds the blocks removals gave
     // back. A timer on the kick channel wakes the thread when the queue has been empty for
@@ -843,16 +854,8 @@ fn identity_job(
     let root = p::is_root(owner);
     match method {
         // The root channel takes SESSION and VERIFY_SESSION and nothing else; a session takes
-        // neither (the server answers it, so only the root gets here with them).
-        Some(Method::Session | Method::VerifySession) if !root => status(p::IS_ROOT),
-        Some(Method::Session | Method::VerifySession) => {
-            if method == Some(Method::VerifySession) {
-                return if server.is_live(aux) {
-                    proto_wire::reply(Status::Ok)
-                } else {
-                    status(p::BAD_HANDLE)
-                };
-            }
+        // neither. VERIFY_SESSION is answered by the request thread.
+        Some(Method::Session) if root => {
             vouch_and_bind(server, identities, ready, notary, true, aux, carried)
         }
         Some(Method::Bind) if !root => {

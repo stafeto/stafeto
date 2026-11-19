@@ -32,6 +32,10 @@ pub const JOBS: usize = 12;
 /// The jobs one session may have in flight at once: no session fills the table alone.
 pub const SESSION_JOBS: usize = 4;
 
+/// The jobs only the sessions of native clients may take: the last of the table, so that the
+/// sessions of the process trees (many, each with its share) never leave `datakey` with no job.
+pub const NATIVE_JOBS: usize = 4;
+
 pub const FREE: u8 = 0;
 pub const QUEUED: u8 = 1;
 pub const DONE: u8 = 2;

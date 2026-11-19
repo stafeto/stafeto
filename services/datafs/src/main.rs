@@ -290,6 +290,12 @@ impl Datafs {
             // SAFETY: the owner is written before the job is QUEUED and stays until it is FREE.
             .filter(|&j| unsafe { (*job(j)).owner } == owner)
             .count();
+        let free = (0..JOBS)
+            .filter(|&j| state(j).load(Acquire) == FREE && self.pending[j].is_none())
+            .count();
+        if !admit::leaves_for_native(free, proto_data::is_service(owner), NATIVE_JOBS) {
+            return None;
+        }
         admit::job_for(self.free_job(), mine, SESSION_JOBS)
     }
 
@@ -348,12 +354,32 @@ impl Datafs {
                 Ok(made) => Ok((made.0, (Some((Held::Made, made.1)), Some(brought)))),
                 Err(e) => Err(Answer::Status(Status::Kernel(e))),
             },
-            _ => {
-                let Ok(label) = sys::copy_label(&self.channel, &brought) else {
-                    return Err(Answer::Status(proto_data::code(proto_data::BAD_HANDLE)));
-                };
-                Ok((label, (Some((Held::Offered, brought.erase())), None)))
+            _ => Err(Answer::Status(proto_data::code(proto_data::INVALID))),
+        }
+    }
+
+    /// VERIFY_SESSION (rule 15, root channel only): the offered session itself comes back when it is
+    /// a live session of this service, BAD_HANDLE with no handle otherwise. A handle of this
+    /// service's channel has a label here (`copy_label` fails for any other channel), and a handle
+    /// held is a channel that lives; the root channel is not a session.
+    fn verify_session(&mut self, r: &mut Request<'_>) -> Answer {
+        if !proto_data::is_root(r.label()) {
+            return Answer::Status(proto_data::code(proto_data::IS_ROOT));
+        }
+        if r.handles.len() != 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        let Ok(offered) = r.handles.take::<Channel>(0) else {
+            return Answer::Status(proto_data::code(proto_data::BAD_HANDLE));
+        };
+        match sys::copy_label(&self.channel, &offered) {
+            Ok(label) if !proto_data::is_root(label) => {
+                if r.reply().u32(0).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply([offered.erase()].into())
             }
+            _ => Answer::Status(proto_data::code(proto_data::BAD_HANDLE)),
         }
     }
 
@@ -409,6 +435,11 @@ impl Service<0> for Datafs {
         if Method::from_number(r.method()) == Some(Method::Adopt) {
             return self.adopt(r);
         }
+        // VERIFY_SESSION needs no disk and no table of the volume: the kernel says whether the
+        // offered handle is a session of this service.
+        if Method::from_number(r.method()) == Some(Method::VerifySession) {
+            return self.verify_session(r);
+        }
         let owner = r.label();
         let Some(i) = self.job_for(owner) else {
             return Answer::Status(busy());
@@ -425,12 +456,10 @@ impl Service<0> for Datafs {
             },
             // BIND, SESSION and VERIFY_SESSION bring one handle: the identity session of the caller
             // (a copy for the worker to vouch for) or the session offered for verification.
-            Some(Method::Bind | Method::Session | Method::VerifySession) => {
-                match self.identity_call(r) {
-                    Ok(made) => made,
-                    Err(answer) => return answer,
-                }
-            }
+            Some(Method::Bind | Method::Session) => match self.identity_call(r) {
+                Ok(made) => made,
+                Err(answer) => return answer,
+            },
             _ => (0, (None, None)),
         };
         let Some(pending) = r.defer() else {

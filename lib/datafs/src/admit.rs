@@ -13,6 +13,15 @@ pub fn job_for(free: Option<usize>, mine: usize, limit: usize) -> Option<usize> 
     free.filter(|_| mine < limit)
 }
 
+/// Whether a request of a session may take a job when `free` jobs are free: a session of a native
+/// client may take any, every other session leaves the last `reserve` for the native clients. The
+/// sessions of one process tree are many (up to 32 for a root, 4 jobs each, more than the table), and
+/// the request thread does not know the trees, so the table keeps a share for `datakey` and the
+/// other native clients that no tree can use up.
+pub fn leaves_for_native(free: usize, native: bool, reserve: usize) -> bool {
+    native || free > reserve
+}
+
 /// What a reply's status is: whether it is a success (the status word is zero).
 pub fn said_yes(reply: &[u8]) -> bool {
     reply.get(..4) == Some(&[0; 4][..])
@@ -31,9 +40,6 @@ pub enum Held {
     /// The pass a client spent in ADOPT: it goes back to the client when the service refused for a
     /// limit that the client can lift (the pass was not spent), and closes otherwise.
     Spent,
-    /// The session a client offered to VERIFY_SESSION: it goes back in the reply when the service
-    /// says it is a live session of its own, and closes otherwise.
-    Offered,
 }
 
 /// What becomes of a held handle once the worker has answered with `reply`: true when it goes to
@@ -41,8 +47,7 @@ pub enum Held {
 pub fn carries(held: Held, reply: &[u8]) -> bool {
     matches!(
         (held, status_of(reply)),
-        (Held::Made | Held::Offered, Some(0))
-            | (Held::Spent, Some(p::TOO_MANY_OPEN | p::TABLE_FULL))
+        (Held::Made, Some(0)) | (Held::Spent, Some(p::TOO_MANY_OPEN | p::TABLE_FULL))
     )
 }
 
@@ -138,6 +143,17 @@ mod tests {
     }
 
     #[test]
+    fn the_last_jobs_are_kept_for_the_native_clients() {
+        assert!(leaves_for_native(5, false, 4));
+        assert!(!leaves_for_native(4, false, 4));
+        assert!(!leaves_for_native(1, false, 4));
+        assert!(
+            leaves_for_native(1, true, 4),
+            "a native client takes the last one"
+        );
+    }
+
+    #[test]
     fn a_made_handle_goes_with_a_yes_and_closes_with_anything_else() {
         assert!(carries(Held::Made, &reply(0)));
         assert!(!carries(Held::Made, &reply(p::BAD_HANDLE)));
@@ -157,14 +173,6 @@ mod tests {
         assert!(!carries(Held::Spent, &reply(p::BAD_HANDLE)));
         assert!(!carries(Held::Spent, &reply(p::IO)));
         assert!(!carries(Held::Spent, &[]));
-    }
-
-    #[test]
-    fn an_offered_session_goes_back_with_a_yes_and_closes_with_anything_else() {
-        assert!(carries(Held::Offered, &reply(0)));
-        assert!(!carries(Held::Offered, &reply(p::BAD_HANDLE)));
-        assert!(!carries(Held::Offered, &reply(p::TABLE_FULL)));
-        assert!(!carries(Held::Offered, &[]));
     }
 
     #[test]

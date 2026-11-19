@@ -264,4 +264,43 @@ mod tests {
         assert_eq!(look(&mut server, 1000), Looked::Renewed);
         assert_eq!(stat(&mut server, &mut fs), Err(p::code(p::ACCESS)));
     }
+
+    #[test]
+    fn after_exec_the_old_copy_vouches_for_nothing_and_the_inherited_description_still_reads() {
+        let (mut server, mut fs) = rig();
+        const ROOT: u64 = p::SERVICE | 1;
+        call(&mut server, &mut fs, ROOT, |w| p::mkdir(b"/d", 0o777, w)).unwrap();
+        server
+            .bind_new(70, vouched_from(&who(30, 7, 1, 1000)))
+            .unwrap();
+        let h = call(&mut server, &mut fs, 70, |w| {
+            p::open(b"/d/f", p::READ | p::WRITE | p::CREATE, 0o644, w)
+        })
+        .unwrap();
+        let h = u32::from_le_bytes(h[..4].try_into().unwrap());
+        call(&mut server, &mut fs, 70, |w| p::write(h, b"kept", w)).unwrap();
+        call(&mut server, &mut fs, 70, |w| p::seek(h, 0, p::SEEK_SET, w)).unwrap();
+        // exec: the process keeps its pid, its record's generation moves, and Vouch with the copy of
+        // the old image's identity session gives no answer.
+        assert_eq!(before_job(&mut server, 70, |_| 2, || None), Looked::Lapsed);
+        assert_eq!(
+            call(&mut server, &mut fs, 70, |w| p::path_call(
+                p::Method::Stat,
+                b"/d/f",
+                w
+            ))
+            .err(),
+            Some(p::code(p::NOT_BOUND))
+        );
+        // The description it holds still reads; a write needs a binding again.
+        let read = call(&mut server, &mut fs, 70, |w| p::read(h, 10, w)).unwrap();
+        assert_eq!(&read[4..], b"kept");
+        assert_eq!(
+            call(&mut server, &mut fs, 70, |w| p::write(h, b"x", w)).err(),
+            Some(p::code(p::NOT_BOUND))
+        );
+        // The new image binds again with its own copy.
+        server.bind(70, vouched_from(&who(30, 7, 2, 1000))).unwrap();
+        assert!(call(&mut server, &mut fs, 70, |w| p::write(h, b"x", w)).is_ok());
+    }
 }
