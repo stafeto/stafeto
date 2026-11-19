@@ -13,6 +13,15 @@ pub fn job_for(free: Option<usize>, mine: usize, limit: usize) -> Option<usize> 
     free.filter(|_| mine < limit)
 }
 
+/// Whether a request of a session may take a job when `free` jobs are free: a session of a native
+/// client may take any, every other session leaves the last `reserve` for the native clients. The
+/// sessions of one process tree are many (up to 32 for a root, 4 jobs each, more than the table), and
+/// the request thread does not know the trees, so the table keeps a share for `datakey` and the
+/// other native clients that no tree can use up.
+pub fn leaves_for_native(free: usize, native: bool, reserve: usize) -> bool {
+    native || free > reserve
+}
+
 /// What a reply's status is: whether it is a success (the status word is zero).
 pub fn said_yes(reply: &[u8]) -> bool {
     reply.get(..4) == Some(&[0; 4][..])
@@ -131,6 +140,17 @@ mod tests {
         assert_eq!(job_for(Some(3), 3, 4), Some(3));
         assert_eq!(job_for(Some(3), 4, 4), None);
         assert_eq!(job_for(None, 0, 4), None);
+    }
+
+    #[test]
+    fn the_last_jobs_are_kept_for_the_native_clients() {
+        assert!(leaves_for_native(5, false, 4));
+        assert!(!leaves_for_native(4, false, 4));
+        assert!(!leaves_for_native(1, false, 4));
+        assert!(
+            leaves_for_native(1, true, 4),
+            "a native client takes the last one"
+        );
     }
 
     #[test]

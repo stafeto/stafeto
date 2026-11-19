@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dist  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
 PACKAGE = b"signed package bytes"
 
 
@@ -165,6 +166,43 @@ class Pack(unittest.TestCase):
         self.assertEqual(listed, [name for names, _ in dist.release_files("1.2.3") for name in names])
         self.assertNotIn("stafeto-1.2.3-aarch64-virt.tar.xz", text)
         self.assertIn("`stafeto-1.2.3-INDEX`, `stafeto-1.2.3-INDEX.sig`", text)
+
+    def release_notes(self):
+        spec = importlib.util.spec_from_file_location("release_notes", HERE / "release-notes.py")
+        notes = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(notes)
+        return notes
+
+    def test_the_release_notes_carry_the_freetype_credit(self):
+        notes = self.release_notes()
+        credit = ("Portions of this software are copyright \u00a9 2026 The FreeType Project "
+                  "(https://freetype.org). All rights reserved.")
+        self.assertEqual(notes.credits(), [credit])
+        text = notes.notes("1.2.3", "v1.2.3", None)
+        self.assertIn("## Credits\n\n" + credit + "\n", text)
+        # The credit comes from the file the package's record names.
+        self.assertEqual(credit + "\n", (ROOT / "ports/freetype/CREDIT.txt").read_text())
+
+    def test_the_credit_is_there_only_when_a_package_under_ftl_is(self):
+        notes = self.release_notes()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "packages").mkdir()
+            (root / "ports").mkdir()
+            (root / "ports/credit.txt").write_text("Credit line.\n")
+            record = 'name = "{n}"\nlicense = "{l}"\n{extra}'
+            (root / "packages/a.toml").write_text(
+                record.format(n="a", l="MIT", extra='notices = ["CREDIT = tree:ports/credit.txt"]\n'))
+            self.assertEqual(notes.credits(root), [])
+            (root / "packages/b.toml").write_text(
+                record.format(n="b", l="FTL", extra='notices = ["CREDIT = tree:ports/credit.txt"]\n'))
+            self.assertEqual(notes.credits(root), ["Credit line."])
+            # Two packages with the same line give it once; an FTL package with
+            # no credit file named gives nothing.
+            (root / "packages/c.toml").write_text(
+                record.format(n="c", l="MIT AND FTL", extra='notices = ["CREDIT = tree:ports/credit.txt"]\n'))
+            (root / "packages/d.toml").write_text(record.format(n="d", l="FTL", extra=""))
+            self.assertEqual(notes.credits(root), ["Credit line."])
 
     def test_the_archives_that_run(self):
         self.pack()

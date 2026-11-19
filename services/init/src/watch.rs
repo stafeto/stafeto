@@ -116,6 +116,11 @@ impl Watched {
     pub fn suspect(&self) -> bool {
         self.suspect
     }
+
+    /// The late second expiries in a row that re-armed the deadline so far.
+    pub fn late(&self) -> u32 {
+        u32::from(self.late)
+    }
 }
 
 #[cfg(test)]

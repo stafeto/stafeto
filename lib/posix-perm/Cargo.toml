@@ -1,0 +1,11 @@
+[package]
+name = "posix-perm"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The POSIX file permission rules of stafeto as pure functions, shared by the file services (access classes, creation, sticky directories, chmod, chown, utimensat, access)"
+
+[lib]
+bench = false

@@ -30,7 +30,9 @@ break-datafs-relocate-order = []
 littlefs = { path = "../../third-party/littlefs" }
 proto-data = { path = "../../proto/data" }
 proto-wire = { path = "../../proto/wire" }
+proto-process = { path = "../../proto/process" }
 abi = { path = "../abi" }
+posix-perm = { path = "../posix-perm" }
 
 [build-dependencies]
 cc = "1"

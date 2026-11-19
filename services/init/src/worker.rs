@@ -540,17 +540,22 @@ mod observed {
 static KEPT: [AtomicU64; init::overrun::SLOTS] =
     [const { AtomicU64::new(0) }; init::overrun::SLOTS];
 
-/// The overruns the kernel counts for the latest budget of the record at
-/// `place` under its budget `index`, when init has it. A copy that the worker
-/// closes at that moment gives an error and None.
-pub fn kernel_overruns(place: usize, index: usize) -> Option<u64> {
+/// What the kernel says of the latest budget of the record at `place` under its budget `index`,
+/// when init has it. A copy that the worker closes at that moment gives an error and None.
+pub fn kernel_budget(place: usize, index: usize) -> Option<abi::BudgetInfo> {
     let raw = KEPT.get(place * table::START_DATA_MAX + index)?;
     let raw = raw.load(Ordering::Acquire);
     if raw == 0 {
         return None;
     }
     let budget = Handle::<Budget>::borrowed(abi::Handle(raw));
-    sys::budget_info(&budget).ok().map(|info| info.overruns)
+    sys::budget_info(&budget).ok()
+}
+
+/// The overruns the kernel counts for the latest budget of the record at
+/// `place` under its budget `index`, when init has it.
+pub fn kernel_overruns(place: usize, index: usize) -> Option<u64> {
+    kernel_budget(place, index).map(|info| info.overruns)
 }
 
 /// The budget `b` made with a place for the notifications of its overruns on

@@ -187,7 +187,7 @@ impl Data {
     }
 
     fn open(&self, path: &[u8], flags: u32) -> Result<u32, Status> {
-        Ok(self.call(|w| p::open(path, flags, w))?.word(0))
+        Ok(self.call(|w| p::open(path, flags, 0o600, w))?.word(0))
     }
 
     fn close(&self, handle: u32) -> Result<(), Status> {
@@ -230,7 +230,7 @@ impl Data {
 
     /// The key written as `.tmp`, synced, and renamed to its name.
     fn save(&self, key: &Key) -> Result<(), Status> {
-        match self.call(|w| p::path_call(Method::Mkdir, DATA_DIR, w)) {
+        match self.call(|w| p::mkdir(DATA_DIR, 0o700, w)) {
             Ok(_) | Err(Status::Unknown(p::EXISTS)) => {}
             Err(status) => return Err(status),
         }

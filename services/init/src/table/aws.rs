@@ -489,7 +489,7 @@ pub const TABLE: &[Record] = &[
     super::pkg::MEMBLK,
     super::pkg::PKGD,
     DATADISK,
-    super::pkg::DATAFS,
+    super::pkg::DATAFS_CLOCKED,
     super::pkg::DATAKEY,
     POWER,
 ];
@@ -512,7 +512,7 @@ pub const QEMU_TABLE: &[Record] = &[
     super::pkg::MEMBLK,
     super::pkg::PKGD,
     super::pkg::NVME_QEMU_DATA,
-    super::pkg::DATAFS,
+    super::pkg::DATAFS_CLOCKED,
     super::pkg::DATAKEY,
 ];
 
@@ -859,9 +859,12 @@ mod tests {
         let held = pages_held(TABLE);
         // The segments of the programs are paid at the load besides the quotas, and the 96 MiB of
         // the image are the files; the zeroed statics are not in them. The data file service's
-        // allocator window is the one that grew with the volume: 128 KiB for a volume of 4 GiB.
-        const DATAFS_WINDOW_PAGES: u64 = 32;
-        let need = held + IMAGE_PAGES + KERNEL_PAGES + INIT_FREE + DATAFS_WINDOW_PAGES;
+        // statics: the memory of the volume (`datafs::Storage`, 252 KiB: the caches of 24 open
+        // files, the allocator's window of 128 KiB for a volume of 4 GiB), 49 pages more than the
+        // first release's 56 KiB, and the server's tables (about 65 KiB, with the 16 KiB table of
+        // a walk of a path), 21 pages.
+        const DATAFS_STATICS_PAGES: u64 = 49 + 21;
+        let need = held + IMAGE_PAGES + KERNEL_PAGES + INIT_FREE + DATAFS_STATICS_PAGES;
         assert!(
             need <= T4G_SMALL_PAGES,
             "the table holds {held} pages and with the image, the kernel and init's free pages {need} of the {T4G_SMALL_PAGES} of a t4g.small"
@@ -995,7 +998,7 @@ mod tests {
         let left = found.skipped.iter().flatten().next().unwrap();
         assert_eq!(left.record, "datadisk");
         let datafs = found.table.iter().find(|r| r.name == "datafs").unwrap();
-        assert!(datafs.connects.is_empty());
+        assert_eq!(datafs.connects, &["clock"]);
         assert!(found.table.iter().any(|r| r.name == "datakey"));
         assert!(crate::table::check(found.table).is_ok());
     }

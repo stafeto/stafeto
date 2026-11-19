@@ -164,6 +164,24 @@ REFERENCE = HOST_DIR / "lvgl-ref"
 REFERENCE_SOURCES = ("demo.c", "schedule.c", "keys.c", "crc.c")
 
 
+# The font as the reference opens it. LVGL keeps the font's path in its pool,
+# so the string must be as long as the guest's (`DEMO_FONT_PATH` in
+# ports/lvgl/scene.h, 43 bytes) for the pool's largest use to be the same in
+# the guest and on the host: the reference runs in REFERENCE_CWD, where the
+# font lies under a relative path of that length (the doubled slash makes it).
+REFERENCE_CWD = HOST_DIR / "image"
+REFERENCE_FONT = "usr/share/fonts//LiberationSans-Regular.ttf"
+
+
+def place_reference_font() -> None:
+    """Put the font where REFERENCE_FONT names it, under REFERENCE_CWD."""
+    target = REFERENCE_CWD / "usr" / "share" / "fonts" / "LiberationSans-Regular.ttf"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source = HOST_DIR / SOURCE_DIR / FONT
+    if not target.exists() or target.read_bytes() != source.read_bytes():
+        shutil.copy(source, target)
+
+
 def reference_flags(port_dir: Path) -> list[str]:
     """The flags of the host build of the library and the reference: the char
     of AArch64 Linux, wrapping overflow, no fused multiply-add."""
@@ -183,6 +201,7 @@ def build_reference(port_dir: Path = PORT_DIR, output: Path = REFERENCE,
     ft = ROOT / "target" / "freetype-host" / "libfreetype.a"
     if not library.exists() or not ft.exists():
         raise SystemExit("build the libraries first: tools/build-lvgl.py --host")
+    place_reference_font()
     sources = [port_dir / name for name in REFERENCE_SOURCES] + [main]
     headers = sorted(port_dir.glob("*.h"))
     text = sha256(b"".join(p.read_bytes() for p in sources + headers + [library, ft, Path(__file__)])
