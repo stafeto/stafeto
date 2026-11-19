@@ -339,7 +339,15 @@ band (`BAND_GATE`, 16 328 ticks of 16 ns, 0.8 of term B, the same number as the 
 gate of the probes), which is 47 bands at 60 Hz (`frame::band_cap`, the one function the
 service and the probes use). The service then takes at most 47 bands at their gates and
 three steps of 18 369 ticks, 822 523 ticks or about 79 % of a period, and the levels
-below it keep the rest. The cap is not in the free run. The bands the cap puts off go on at the start of the
+below it keep the rest. The cap is not in the free run. The band that reaches the cap only says so: the arming of the timer for the next
+start is a step of its own (the service's own bit `ARM`), because the kernel call of
+`timer_set` would make the longest band longer than its gate. The steps of the service
+say what they are in their detail: 1000 plus the images made for a band, 2000 the
+taking of a frame, 3000 the commit after the last band, 4000 the end of a frame, 5000
+a step of the housekeeping and 6000 the arming after the cap. Between the band and the
+arming step nothing takes a frame (a taking needs an expiry, and the timer is not armed
+until the step) and a request that comes arms nothing (the bands are put off); a start
+that has gone by when the arming step runs is armed as it is and the bands go on at once. The bands the cap puts off go on at the start of the
 next period, so a large frame spans several periods and the clients' requests,
 and the service's own steps, pass between its bands as before.
 
