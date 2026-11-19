@@ -460,8 +460,10 @@ fn main(_: u64) -> u64 {
     let _ = sys::irq_ack(&driver.irq);
     // The loop is this thread: it works under its budget from here on. A budget the kernel
     // refuses is told in a line (`rt::budget::bind`) and the driver serves with none: a system
-    // with no console is worse than a console driver with no budget, and the line "virtio-console: serve
-    // runs under its budget" is not printed then, so the probes that require it still fail.
+    // with no console is worse than a console driver with no budget. The line "virtio-console: serve
+    // runs under its budget" is not printed then. xtask fails the run for the refusal line in
+    // any probe (`Run::end`, `refused_budget`), and the probes that require the boot line fail
+    // for its absence.
     let _ = rt::budget::bind("virtio-console", "serve", budget, &s.thread);
     let heartbeat = Heartbeat {
         to: &s.parent,

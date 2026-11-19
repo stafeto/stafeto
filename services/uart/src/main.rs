@@ -309,8 +309,10 @@ fn main(_: u64) -> u64 {
     };
     // The loop is this thread: it works under its budget from here on. A budget the kernel
     // refuses is told in a line (`rt::budget::bind`) and the driver serves with none: a system
-    // with no console is worse than a console driver with no budget, and the line "uart: serve
-    // runs under its budget" is not printed then, so the probes that require it still fail.
+    // with no console is worse than a console driver with no budget. The line "uart: serve
+    // runs under its budget" is not printed then. xtask fails the run for the refusal line in
+    // any probe (`Run::end`, `refused_budget`), and the probes that require the boot line fail
+    // for its absence.
     let _ = rt::budget::bind("uart", "serve", budget, &s.thread);
     // The tag of the driver's lines of steps (`service table: 18 kind K ...`): kind 65 is the tick
     // of the log that found no record (the idle tick), kind 64 is the other notices, and the
