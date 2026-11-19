@@ -30,9 +30,10 @@ pub const PROCESS_LEVEL: u8 = 52;
 pub const SERVICE_FREE: u8 = 31;
 
 /// The period of the budgets of the three services, 5 ms: the longest line of budgets of
-/// services one after the other above the network service is the sum of their C, 0.4 ms,
-/// under the period of its switch (1 ms for 0.4) and well inside the ring that takes the
-/// frames meanwhile.
+/// services one after the other above the network service is the sum of their C, 0.4 ms, and
+/// with the console driver's piece (0.15 ms of each 10 ms) 0.55 ms, with the switch's own 0.4 ms
+/// 0.95 ms of its period of 1 ms (1 ms for 0.4) and inside the ring that takes the frames
+/// meanwhile.
 const SERVICE_PERIOD_NS: u64 = 5 * MS;
 
 /// Whether the RAM service has its budget: the one line to change (to `false`) for an image
@@ -88,17 +89,21 @@ pub const TTY_BUDGETS: &[Budget] = &[Budget {
     low: SERVICE_LOW,
 }];
 
-/// The budget of the console driver's request thread (`serve`, which also takes the log): 75 us
-/// of each 5 ms (1.5 % of CPU 0), at `low` 32 after that. The tick of the log that finds nothing
-/// (about 30 us under -icount) fits in one chunk; the tick that takes records and a long output
-/// spend it, and the rest of the work goes on at 32, above the POSIX processes and below the
-/// network. A request of the terminal service in the background lends the time to the terminal
-/// service's budget.
+/// The budget of the console driver's request thread (`serve`, which also takes the log): 150 us
+/// of each 10 ms (1.5 % of CPU 0), at `low` 32 after that. The tick of the log that finds nothing
+/// measured 4,157 ticks of its own under -icount (66 us, once 7,732) and about 110 us with the
+/// kernel's entries and exits, `timer_set` and the notice that the budget charges too, so one idle
+/// tick has to fit one piece of the budget: a piece of 75 us (the share in 5 ms) was spent by nearly
+/// every idle tick, which overran about 55 times a second with the timer events and a notice to
+/// init each time. A tick that takes records (12,900 ticks, 206 us) and a long output spend the
+/// piece, and the rest of the work goes on at 32, above the POSIX processes and below the network.
+/// A request of the terminal service in the background lends the time to the terminal service's
+/// budget.
 pub const CONSOLE_BUDGETS: &[Budget] = &[Budget {
     name: "serve",
     cpu: 0,
-    c_ns: 75_000,
-    t_ns: SERVICE_PERIOD_NS,
+    c_ns: 150_000,
+    t_ns: 10 * MS,
     low: SERVICE_LOW,
 }];
 
@@ -1107,7 +1112,7 @@ pub const TTY_STEPS_TABLE: &[Record] = &[
 pub const SERVICE_BUDGET_TABLE: &[Record] = &[
     Record {
         // The stub of the console driver has the budget of the real driver, `CONSOLE_BUDGETS`
-        // (75 us of each 5 ms at its own level 60, then 32), and the free level of its record,
+        // (150 us of each 10 ms at its own level 60, then 32), and the free level of its record,
         // so that the probe's account of the terminal phase holds the driver to what the table
         // gives it: the probe reads what the stub ran (`BudgetInfo::ran`) for the figures it
         // prints, and bounds the driver's part of the loss by its budget. The stub binds it to

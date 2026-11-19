@@ -296,12 +296,16 @@ impl Sources {
 /// the 18,369 a service step may take, and the cost of a record is what dominates, so the fixed
 /// part of a batch is no reason to take two); one batch is about 12,900 ticks, 71 % of that
 /// bound, and xtask posix-tty-steps checks the longest tick. The driver also has a budget of
-/// 75 us of each 5 ms (4,687 ticks): a tick of 12 records is 206 us, so while a backlog lasts the
-/// tick overruns it in every period, and its rest runs at level 32, which the CPU gives it only
-/// when no level from 33 to 59 runs. With those levels saturated the driver moves about 4.4
-/// records in 5 ms, 0.87 a millisecond, and a burst of 2.5 records a millisecond loses the
-/// records the ring of 64 cannot hold, 27 to 49 of 150 in the model (the lost count of the next
-/// batch tells it).
+/// 150 us of each 10 ms (9,375 ticks): the idle tick (about 110 us with the kernel's entries) fits
+/// one piece of it, a tick of 12 records (206 us) does not, so while a backlog lasts the first of
+/// the four ticks of a period (one each 2.5 ms) is cut at 150 us (0.73 of a tick) and the rest
+/// of it and of the other three run at level 32, which the CPU gives the driver only when no level
+/// from 33 to 59 runs. With those levels saturated the driver moves about 8.7 records in 10 ms,
+/// 0.87 a millisecond, and a burst of 2.5 records a millisecond loses the records the ring of 64
+/// cannot hold, the number the model of `run_saturated` gives (the lost count of the next batch
+/// tells it). With one batch a tick the driver can also lose a few records of the kernel's own
+/// trace burst in the trace dialog (three in the measured run), counted, within the rule that a
+/// log line never waits.
 pub const STEP_BATCHES: usize = 1;
 
 /// The period of the reads while the driver holds log text it has not put
@@ -734,18 +738,18 @@ mod tests {
 
     /// What the log tick costs under -icount, in ticks of the counter (xtask posix-tty-steps, the
     /// table of tag 18): the tick that finds nothing about 3,200 and a record about 800 (a tick
-    /// of 24 records took 22,600 to 23,100), and the budget of the driver, 75 us of each 5 ms,
-    /// 4,687 ticks.
+    /// of 24 records took 22,600 to 23,100), and the budget of the driver, 150 us of each 10 ms,
+    /// 9,375 ticks.
     const TICK_FIXED: u64 = 3_200;
     const PER_RECORD: u64 = 808;
-    const BUDGET_TICKS: u64 = 4_687;
+    const BUDGET_TICKS: u64 = 9_375;
     /// What the model gives for the burst of 150 records over the phases of the first tick: the
     /// ring of 64 and the records taken while the burst lasts leave this many overwritten.
-    const SATURATED_LOST_MIN: u64 = 27;
+    const SATURATED_LOST_MIN: u64 = 26;
     const SATURATED_LOST_MAX: u64 = 49;
 
     /// The driver when levels 33 to 59 never leave the CPU: it works at its own level only for its
-    /// budget (refilled to 4,687 ticks every 5 ms), and a tick the budget cuts goes on in the next
+    /// budget (refilled to 9,375 ticks every 10 ms), and a tick the budget cuts goes on in the next
     /// period. A tick takes its records when it starts, at the first moment the tick of the last
     /// one is done and the period (DRAIN_NS while records are left, IDLE_NS otherwise) has passed.
     /// `pushes` records arrive evenly in `span_ms`. Gives the records lost and delivered.
@@ -768,7 +772,7 @@ mod tests {
                 kernel.push(sent);
                 sent += 1;
             }
-            if t % 10 == 0 {
+            if t % 20 == 0 {
                 credit = BUDGET_TICKS;
             }
             if !busy && t >= next_at {
@@ -798,8 +802,8 @@ mod tests {
 
     #[test]
     fn the_burst_with_levels_33_to_59_saturated_loses_records_and_counts_them() {
-        // The records a period takes under the budget: 4,687 ticks of a tick that costs 3,200 and
-        // 808 a record, 4.4 records in 5 ms, 0.87 a millisecond, against the 2.5 of the burst.
+        // The records a period takes under the budget: 9,375 ticks of a tick that costs 3,200 and
+        // 808 a record, 8.7 records in 10 ms, 0.87 a millisecond, against the 2.5 of the burst.
         // Whatever the phase of the first tick, the ring (64) overflows and the kernel counts what
         // it overwrote; every record is delivered or counted.
         let mut worst = (u64::MAX, 0);

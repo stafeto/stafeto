@@ -724,8 +724,9 @@ fn main(_: u64) -> u64 {
 /// (`budget-hog`); the cost of one timer event is measured (`control_budget`).
 const C_US: [u64; 3] = [250, 75, 75];
 const B_K_US: u64 = 150;
-/// The budget of the console driver (`CONSOLE_BUDGETS` of init's table): 75 us of each 5 ms.
-const DRIVER_C_US: u64 = 75;
+/// The budget of the console driver (`CONSOLE_BUDGETS` of init's table): 150 us of each 10 ms.
+const DRIVER_C_US: u64 = 150;
+const DRIVER_T_US: u64 = 10_000;
 /// The period T of the three budgets, microseconds.
 const T_US: u64 = 5_000;
 /// One round trip of a call (C_ipc, about 2 000 ticks; the comment above `CALL_WAIT_MAX` in
@@ -1166,7 +1167,7 @@ fn starve(
     // The console driver's part of the terminal's loss is bounded by its own budget, the bound
     // of the kernel for the driver's C and T over the whole window.
     let driver_term = if which == 2 {
-        terms::service_us(DRIVER_C_US, T_US, B_K_US, w.l)
+        terms::service_us(DRIVER_C_US, DRIVER_T_US, B_K_US, w.l)
     } else {
         0
     };

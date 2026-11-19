@@ -16,7 +16,7 @@
 //! E = 2 e (k + 1)                 k the overruns of the budget in the window
 //! I                               the allowance of init for the service
 //! D = n_d C_d + min(C_d, l - n_d T_d) + B   the console driver's budget, for the terminal phase
-//!                                 (`service_us` with the driver's C and T: 75 us of each 5 ms)
+//!                                 (`service_us` with the driver's C and T: 150 us of each 10 ms)
 //! E_d = 2 e (k_d + 1)             the events of the driver's budget, k_d its overruns in the window
 //! ```
 //!
@@ -252,11 +252,11 @@ mod tests {
         // The old remainder was below the floor of the awake account, which is the double count.
         assert!(left_us(630, 205, 538, e, 5) < left_floor_us(e, 5));
         assert_eq!(left_floor_us(e, 5), -240);
-        // The bound is taken over l. The driver's term is the bound of its own budget (75 us of
-        // each 5 ms) and no longer the time it ran: 375 us for this window, 163 under the 538 it
+        // The bound is taken over l. The driver's term is the bound of its own budget (150 us of
+        // each 10 ms) and no longer the time it ran: 450 us for this window, under the 538 it
         // ran in all (its sleeps in the window included).
-        let driver = service_us(75, T, B, 11_008);
-        assert_eq!(driver, 375);
+        let driver = service_us(150, 10_000, B, 11_008);
+        assert_eq!(driver, 450);
         let bound = bound_us(
             service_us(75, T, B, 11_008),
             events_us(e, 5),
@@ -264,11 +264,12 @@ mod tests {
             driver,
             0,
         );
-        assert_eq!(bound, 375 + 480 + 20 + 70 + 375);
+        assert_eq!(bound, 375 + 480 + 20 + 70 + 450);
+        assert_eq!(bound, 1_395);
         // The loss of 630 us over the 8005 us the victim ran is inside it, with the share the
         // bound promises under what the victim kept (927 per mille).
         assert!(over_bound(630, bound) < 0);
-        assert_eq!(share_bound_permille(8005, bound), 858);
+        assert_eq!(share_bound_permille(8005, bound), 851);
         assert!(927 >= share_bound_permille(8005, bound));
     }
 
@@ -279,22 +280,25 @@ mod tests {
         // each chunk with its two timer events (e 40): 2 * 40 * 4 = 320 us more of bound.
         let e = 40;
         assert_eq!(events_us(e, 3), 320);
-        let base = bound_us(service_us(75, T, B, 11_008), events_us(e, 5), INIT, 375, 0);
+        let base = bound_us(service_us(75, T, B, 11_008), events_us(e, 5), INIT, 450, 0);
         let with = bound_us(
             service_us(75, T, B, 11_008),
             events_us(e, 5),
             INIT,
-            375,
+            450,
             events_us(e, 3),
         );
         assert_eq!(with - base, 320);
-        // A loss between the two bounds is inside only the second: 1,500 us against 1,320 and 1,640.
-        assert_eq!((base, with), (1_320, 1_640));
+        // A loss between the two bounds is inside only the second: 1,500 us against 1,395 and 1,715.
+        assert_eq!((base, with), (1_395, 1_715));
         assert!(over_bound(1_500, base) > 0 && over_bound(1_500, with) < 0);
         // No overruns still count one chunk: 2 e.
         assert_eq!(events_us(e, 0), 80);
     }
 
+    /// The terminal window of run abf7dedc is pinned with the driver's budget of 150 us of each
+    /// 10 ms (D = 450 us for its l of 11,098 us, bound 1,395 us, share 851; with the budget of
+    /// 75 us of each 5 ms it was 375 us, 1,320 us and 858).
     /// The bound of each phase for the worst windows of two probe runs, pinned: run bd07a002
     /// (the probe of the awake spans, before the driver's budget) and run abf7dedc (the same
     /// formula, after it). Each row: R, l, the overruns of the service's budget over l, the
@@ -373,10 +377,10 @@ mod tests {
                 8005,
                 11_098,
                 5,
-                375,
+                450,
                 Some(1),
-                1_320,
-                858,
+                1_395,
+                851,
                 799,
             ),
         ];
