@@ -347,8 +347,9 @@ pub fn bump_epoch<D: Device>(fs: &mut Fs<'_, D>) -> Result<u32, Error> {
 
 /// Whether the request may take blocks from the allocator: a write, a new directory, a file made or
 /// grown, a rename (which may split a directory). With an empty window such a request walks the
-/// whole volume to find its blocks; the worker answers it with the stop status instead while the
-/// service stops (`services/datafs`), where a walk would not fit in the time of the stop.
+/// whole volume to find its blocks; while the service stops, the worker answers it with the stop
+/// status and does not walk the volume inside the stop (`services/datafs`), where a walk would
+/// not fit in the time of the stop.
 pub fn needs_blocks(request: &[u8]) -> bool {
     let mut r = Reader::new(request);
     let Ok(header) = Header::read(&mut r) else {

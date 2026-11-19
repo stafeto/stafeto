@@ -1927,8 +1927,8 @@ fn a_failed_read_at_every_point_of_ordinary_reads_leaves_a_volume_that_works() {
 #[test]
 fn free_blocks_make_no_walk_for_a_window_the_checkpoint_cut_short() {
     // A wrap of the allocator inside a request fills the window as long as the checkpoint allowed:
-    // shorter than the volume, not empty. STATFS counts its bits and walks only for an empty
-    // window; `window_short` tells the worker a walk in the idle would fill it whole.
+    // shorter than the volume and still holding bits. STATFS counts its bits and walks only when the
+    // window is empty; `window_short` tells the worker a walk in the idle would fill it whole.
     let mut fs = fresh(1024, Win::Whole);
     let mut m = Meter::new(&mut fs);
     put(&mut fs, &mut m, "/a", 100 << 10).unwrap();

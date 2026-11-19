@@ -57,7 +57,7 @@ int datafs_dirs(void) { return DATAFS_DIRS; }
 // device, and keeps the label when the read fails, so the next read of that block would take the
 // stale bytes of the cache for the block. When a read fails, the caches that carry its block lose
 // the label: the cache of the volume, and the cache of an open file that is reading (a file that is
-// writing keeps its cache: that holds data not yet written). Every entry point of this file that
+// writing keeps its cache: that holds data waiting to be written). Every entry point of this file that
 // reads goes through here, so a failed read (a device that failed, a walk stopped on purpose, a
 // stop notice) leaves a state that can be used on.
 static void forget_failed_read(struct datafs *d, lfs_block_t block)
@@ -169,7 +169,7 @@ void datafs_window_state(const struct datafs *d, uint32_t *out)
     out[2] = d->lfs.lookahead.size;
 }
 
-// The blocks of the window that are free and not yet handed out (the zero bits from `next` to the
+// The blocks of the window that are free and still to be handed out (the zero bits from `next` to the
 // end of the window), read from memory with no device access. With a window as large as the volume
 // that is the free count of the volume as of the last walk, less what has been given out since.
 int64_t datafs_window_free(const struct datafs *d)
@@ -185,7 +185,7 @@ int64_t datafs_window_free(const struct datafs *d)
 
 // Walks the file system once and fills the allocator's window from it, at a point where no
 // operation is half done (littlefs counts the blocks of the open files in the walk, so a file that
-// is written and not yet synced keeps its blocks). The window is dropped first, so the walk is made
+// is written and awaits its sync keeps its blocks). The window is dropped first, so the walk is made
 // whether or not the window was full. lfs_fs_gc compacts no metadata here (`compact_thresh` is
 // off), so the walk only reads.
 int datafs_walk(struct datafs *d, void *ctx)

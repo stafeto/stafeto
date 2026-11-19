@@ -1054,7 +1054,7 @@ mod tests {
                 assert_eq!(record.broken_after, None, "{}", record.name);
             }
         }
-        // The allocator's window of 32 pages is a segment of the program, not part of the quota.
+        // The allocator's window of 32 pages is a segment of the program, paid at load; the quota does not hold it.
         assert_eq!(DATAFS.quota, 512 * PAGE);
         assert_eq!(DATAKEY_PROBE_TABLE[2].name, "datadisk");
         assert!(DATA_PROBE_TABLE.iter().any(|r| r.name == "datadisk"));
