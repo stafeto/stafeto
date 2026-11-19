@@ -6398,33 +6398,26 @@ fn check_lock_steps(
             ));
         }
     }
-    // Every step of the service stays under 0.9 of term B (the bound of the netd probes) and
-    // the lock request under the margin; the three longest kinds and a warning for each kind
-    // above the margin go to the console.
+    // Every step of the service stays under 0.9 of term B (the bound of the netd probes); the
+    // three longest kinds and a warning for each kind above the margin go to the console.
     net_probe::say_margin(name, steps);
     ram_step_verdict(name, steps)
 }
 
-/// The longest step the guard allows for a kind of the RAM file service: 0.9 of term B, and for
-/// the lock request (kind 50) the margin 16 500 as well, which the work per lock of an inode
-/// with 64 locks stays under.
-fn ram_step_limit(kind: usize) -> u64 {
-    if kind == 50 {
-        net_probe::STEP_MARGIN
-    } else {
-        net_probe::STEP_MAX
-    }
+/// The longest step the guard allows for any kind of the RAM file service, the lock request
+/// (kind 50) included: 0.9 of term B, the project's bound. The tenth of term B left above it is
+/// the allowance for interrupts and phase shifts. The margin (`net_probe::STEP_MARGIN`) only
+/// warns, through `say_margin`.
+fn ram_step_limit() -> u64 {
+    net_probe::STEP_MAX
 }
 
 /// Fails when a step of the RAM file service passes its limit (`ram_step_limit`).
 fn ram_step_verdict(name: &str, steps: &[(usize, u64, u64)]) -> Result<(), String> {
-    match steps
-        .iter()
-        .find(|(kind, ticks, _)| *ticks > ram_step_limit(*kind))
-    {
+    match steps.iter().find(|(_, ticks, _)| *ticks > ram_step_limit()) {
         Some((kind, ticks, detail)) => Err(format!(
             "{name}: the RAM step of kind {kind} takes {ticks} ticks (detail {detail}), past its limit ({}): {steps:?}",
-            ram_step_limit(*kind)
+            ram_step_limit()
         )),
         None => Ok(()),
     }
@@ -11345,6 +11338,16 @@ fn host_tests() -> Result<(), String> {
         "virtio-net",
         "--features",
         "virtio-net/ffi",
+    ]))?;
+    // The tests of the runtime library: its manifest sets `test = false` for the library, so
+    // only an explicit `--lib` runs them, and the feature keeps its panic handler off the host.
+    run_cmd(cargo().args([
+        "test",
+        "--package",
+        "rt",
+        "--features",
+        "host-tests",
+        "--lib",
     ]))
 }
 
@@ -14904,7 +14907,7 @@ mod tests {
         let bound = super::net_probe::STEP_MAX;
         let margin = super::net_probe::STEP_MARGIN;
         assert_eq!((margin, bound), (16_500, 18_369));
-        let at_bound = [(65, bound, 3), (50, margin, 0)];
+        let at_bound = [(65, bound, 3), (50, bound, 0)];
         assert!(super::ram_step_verdict("pages", &at_bound).is_ok());
         let past = [(65, bound + 1, 3), (50, 9_000, 0)];
         let error = super::ram_step_verdict("pages", &past).unwrap_err();
@@ -14912,12 +14915,20 @@ mod tests {
             error.contains("kind 65") && error.contains("18369"),
             "{error}"
         );
-        // The lock request is held to the margin: above it the guard fails.
+        // The lock request passes with a warning above the margin and fails above the bound.
         let request = [(65, 100, 0), (50, margin + 1, 0)];
+        assert!(super::ram_step_verdict("pages", &request).is_ok());
+        let request = [(65, 100, 0), (50, bound + 1, 0)];
         let error = super::ram_step_verdict("pages", &request).unwrap_err();
         assert!(
-            error.contains("kind 50") && error.contains("16500"),
+            error.contains("kind 50") && error.contains("18369"),
             "{error}"
+        );
+        let lines = super::net_probe::margin_lines("pages", &[(65, 100, 0), (50, margin + 1, 0)]);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("warning:") && l.contains("kind 50"))
         );
         let warned =
             super::net_probe::margin_lines("pages", &[(65, margin + 1, 3), (50, margin, 0)]);

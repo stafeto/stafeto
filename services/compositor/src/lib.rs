@@ -38,6 +38,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod fit;
+
 use proto_comp::{
     BUFFERS, BUTTON, CLOSE, CREATE, Event, FOCUS_IN, FOCUS_OUT, KEY, MAX_RECTS, MOVE, RING, Rect,
     union,
@@ -50,17 +52,160 @@ pub const MAX_WINDOWS: usize = 8;
 const _: () = assert!(MAX_WINDOWS <= 8);
 pub const PER_CONTEXT: usize = 4;
 /// The most lines of one band of a frame (`Scene::tile` makes a band
-/// shorter where its layers cost more).
-pub const BAND_ROWS: u32 = 8;
-/// What a band costs the service in ticks (`Scene::tile`): at most
-/// BAND_TICKS in all, CALL_TICKS for each layer's call of pixman, and a tick
-/// count a point: a copy (measured 2.7), a layer laid over others (about 25)
-/// and the black (about 4). The step stays under 16 500.
-pub const BAND_TICKS: u32 = 15_000;
-pub const CALL_TICKS: u32 = 1_500;
-pub const OPAQUE_TICKS: u32 = 3;
-pub const OVER_TICKS: u32 = 25;
-pub const FILL_TICKS: u32 = 4;
+/// shorter where its layers cost more). A copy band over the whole width
+/// holds nine lines at the prices below, so the limit leaves the prices to
+/// decide.
+pub const BAND_ROWS: u32 = 16;
+
+/// The work of a band by the model (`Scene::tile`): the calls, the lines, the
+/// points, the term of each layer after the first and the fixed term of a band
+/// come to at most BAND_TICKS. The step of the band is that work and the cost of
+/// the step around it (the entry, the notice of the next band, the reply to the
+/// loop), which the probes measure at up to about 2 400 ticks, so the work and
+/// the cost stay under the gate of a band, 16 328 ticks. 15 000 left the longest
+/// step of seven translucent windows over a copy at 16 433, 105 over the gate,
+/// and 14 000 leaves it near 15 400.
+pub const BAND_TICKS: u32 = 14_000;
+
+/// The price of one kind of operation (the black a band starts with, a layer
+/// copied, a layer laid over others): what one operation costs is
+/// `call + rows * row + points * point`. The call is what pixman does
+/// whatever the size, the row what it does for each line (the entry of the
+/// loop of a line and the edges before the aligned points), the point what it
+/// does for each point. There are no prices by alignment or by the format of
+/// the source: the edges fall on the row, and a window of XRGB8888 is always a
+/// copy and one of ARGB8888 always a layer laid over others.
+///
+/// A `_measured` is the greatest figure of the probes under -icount (the line
+/// `service raster` of `px::cost`, class by class: the call over operations of
+/// one row and 8 points or fewer, the row over operations at most 16 points
+/// wide and at least 8 rows, the point over operations of 1 024 points or
+/// more, the call and the rows taken off), and the constant the scene charges
+/// is the measure with the margin of MARGIN_PERCENT, rounded up. A call is in
+/// ticks, a row and a point in hundredths of a tick. `*_estimate` marks a
+/// price no probe has measured: a figure scaled from the cost before the NEON
+/// paths of pixman (a copy 2.7 ticks a point, a layer laid over others 25) or
+/// a guess (the row), kept high on purpose until the probe's line gives it,
+/// and the table takes that. The test
+/// `the_constants_cover_the_measures_with_the_margin` holds every constant to
+/// its measure.
+///
+/// What the fit showed (the same in both probes). The cost of a row at a width
+/// is the price of a row plus the width's points where the width is 64 points or
+/// more (copy: 144 ticks at 64 wide, 265 at 152, a slope of 1.38 a point and a
+/// row of 55), and cheaper at the narrow widths (4 to 12 wide: 16 to 30 ticks
+/// for a copy): the narrow rows do not cost more a point than the model says,
+/// so three terms suffice, and the model overstates a narrow tall shape (4 by
+/// 32: by 273 ticks for the black, 1 090 for a copy, 3 189 for a layer laid over
+/// others), which only makes a band of a narrow damage smaller than it could be.
+/// The shapes of the width of the screen are in the fit (a copy of 640 by 13:
+/// 12 438 to 12 945 ticks, a layer laid over others 36 345 to 38 620, the black
+/// 3 459 to 3 641), and the model with the constants is above their greatest.
+/// The widths of the shapes go up to 152 points and include 640 (the width of
+/// the screen: 640 by 1, 8 and 13 lines), the width of the main band of the
+/// table. Under -icount the time is instructions: there is no cold cache, no
+/// miss of a translation, no first touch of a buffer (the buffers are mapped in
+/// advance), and the one cache of the service that can be cold, pixman's table of
+/// fast paths, is warmed at the start (`px::Pixman::warm`: the three
+/// combinations of operation and formats the service uses); the bounds of the
+/// bands under -icount therefore hold no cold cache, and on HVF and on a board it
+/// is in the measures of the hour and of the stage of the board. The lines
+/// `service raster` are wall time: a 640 by 8 copy shown there at 3.64 ticks a
+/// point is about 18 600 ticks, while the step of the band that holds it is at
+/// most 10 528 of the thread's own time, so the greatest of those lines holds the
+/// levels above that ran in the middle and the interrupts; only the lines of the
+/// steps judge a band.
+/// The alignment of the target and of the source changes an operation by up to
+/// half (a layer laid over others 64 by 32: 9 932 to 15 532 ticks), and the
+/// greatest is what the fit takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Price {
+    pub kind: &'static str,
+    pub call_measured: u32,
+    pub call: u32,
+    /// Hundredths of a tick a row.
+    pub row_measured: u32,
+    pub row: u32,
+    pub row_estimate: bool,
+    /// Hundredths of a tick a point.
+    pub point_measured: u32,
+    pub point: u32,
+    pub point_estimate: bool,
+}
+
+/// The margin over a measure, in percent.
+pub const MARGIN_PERCENT: u32 = 15;
+
+/// The constant that covers `measured` with the margin: rounded up.
+pub const fn with_margin(measured: u32) -> u32 {
+    (measured * (100 + MARGIN_PERCENT)).div_ceil(100)
+}
+
+const fn price(
+    kind: &'static str,
+    call_measured: u32,
+    row_measured: u32,
+    row_estimate: bool,
+    point_measured: u32,
+    point_estimate: bool,
+) -> Price {
+    Price {
+        kind,
+        call_measured,
+        call: with_margin(call_measured),
+        row_measured,
+        row: with_margin(row_measured),
+        row_estimate,
+        point_measured,
+        point: with_margin(point_measured),
+        point_estimate,
+    }
+}
+
+/// The prices: black, copy, over, each the upper fit of the model over the
+/// greatest ticks of 26 shapes of operations, the widths 1 to 152 and 640
+/// (`compositor::fit`, `px::calibration`),
+/// measured under -icount, the same in `comp-probe` and in `focus-probe`
+/// (the run is deterministic). Every entry is a measure.
+pub const PRICES: [Price; 3] = [
+    price("black", 209, 2_400, false, 38, false),
+    price("copy", 780, 5_480, false, 138, false),
+    price("over", 785, 18_981, false, 427, false),
+];
+/// What each layer after the first costs a band beyond its operation (ticks,
+/// for each window the band lays after the first layer and for the pointer's
+/// picture): the work of `compose` around the call of a layer (the window's place
+/// and buffer, the clip) and what pixman does when the source changes from one
+/// call to the next. The probes measure a whole band of one, two, four and eight
+/// layers on the same rows (`px::calibration`, the lines `service shape` of
+/// the kinds `layers1` to `layers8`) and the term is the greatest excess of a
+/// shape of L layers over the shape of one, for each layer added; a band of
+/// eight windows on one place cost 18 460 ticks as a step where its operations
+/// were 13 000 by the table.
+/// The probes' greatest excess of a layer added is 172 ticks at 2 layers, 190 at
+/// 4 and 226 at 8 (both probes, the same run under -icount): it grows a little
+/// with the count, and the service has at most 9 layers (8 windows and the
+/// pointer's picture), so the greatest, at 8, is the measure; the margin of 15 %
+/// (260) is over the 235 the growth gives at 9.
+pub const LAYER_MEASURED: u32 = 226;
+pub const LAYER: u32 = with_margin(LAYER_MEASURED);
+
+/// What every band costs beyond its layers (ticks, once for each band): the
+/// work of `compose` around the band (its place, the clip, the choice of the
+/// buffers), which depends on neither the layers nor the operation. A wide band
+/// hides it inside the overstatement of the fit of its operation; a narrow one
+/// does not: a band of one layer 16 points wide and one line is 1 565 ticks in
+/// the probes against 1 477 by the prices and the term of a layer, 88 ticks
+/// short, and 64 by 1 is 53 short (the bands of 8 by 8 and of 150 points or
+/// wider are over their measure). The measure is the greatest shortfall of a
+/// band of one layer under the prices over all the shapes the calibration
+/// measures (`px::calibration`, the kind `layers1`), and the constant is the
+/// measure with the margin. `band_size` takes it off BAND_TICKS with the calls.
+pub const BAND_FIXED_MEASURED: u32 = 88;
+pub const BAND_FIXED: u32 = with_margin(BAND_FIXED_MEASURED);
+pub const FILL: Price = PRICES[0];
+pub const OPAQUE: Price = PRICES[1];
+pub const OVER: Price = PRICES[2];
 
 /// Linux's key codes the scene knows: the Super keys (the manager's
 /// modifier: Doom binds Alt, Ctrl and Shift, so a program of the first
@@ -1321,14 +1466,14 @@ impl Scene {
     }
 
     /// The size of the next band of a frame over `damage`, as columns and
-    /// lines. A band costs a call for every layer it makes (each shown window
-    /// that touches the damage, the pointer's picture when it does, and the
-    /// black the band starts with when no window covers the damage) and
-    /// ticks for every point of each: OPAQUE_TICKS for a copy, OVER_TICKS for
-    /// a layer with an alpha or the pointer, FILL_TICKS for the black. The band
-    /// holds as many points as BAND_TICKS leaves after the calls, at least
-    /// one. The estimate counts every window that touches the damage, the
-    /// ones under a covering window too, so it never falls short.
+    /// lines. A band costs, for every layer it makes (each shown window that
+    /// touches the damage, the pointer's picture when it does, and the black
+    /// the band starts with when no window covers the damage), a call, a price
+    /// for each of its lines and a price for each of its points (`PRICES`), and
+    /// holds as many lines of the damage's width as BAND_TICKS leaves after the
+    /// calls (at most BAND_ROWS), or a part of one line, at least one point. The
+    /// estimate counts every window that touches the damage, the ones under a
+    /// covering window too, so it never falls short.
     fn tile(&self, damage: Rect) -> (u32, u32) {
         let touches = |r: Rect| {
             r.x < damage.x + damage.w
@@ -1359,19 +1504,59 @@ impl Scene {
                 && w.rect.y + w.rect.h >= damage.y + damage.h
         });
         let fill = u32::from(!covered);
-        let calls = opaque + over + fill;
-        let per_point = OPAQUE_TICKS * opaque + OVER_TICKS * over + FILL_TICKS * fill;
-        let Some(points) = BAND_TICKS
-            .saturating_sub(CALL_TICKS * calls)
-            .checked_div(per_point)
-        else {
-            // Nothing to draw: the damage is black or untouched.
-            return (damage.w, BAND_ROWS);
-        };
-        let points = points.max(1);
-        let w = damage.w.min(points).max(1);
-        (w, (points / w).clamp(1, BAND_ROWS))
+        // What the layers cost: the calls, a price for each line of each, a
+        // price for each point of each (hundredths of a tick where it is a
+        // line or a point).
+        let calls = OPAQUE.call * opaque
+            + OVER.call * over
+            + FILL.call * fill
+            + LAYER * (opaque + over).saturating_sub(1);
+        let per_row = OPAQUE.row * opaque + OVER.row * over + FILL.row * fill;
+        let per_point = OPAQUE.point * opaque + OVER.point * over + FILL.point * fill;
+        band_size(calls, per_row, per_point, damage.w)
     }
+}
+
+/// The size of a band of a damage `damage_w` wide: the layers cost `calls` ticks
+/// in all, `per_row` hundredths of a tick for each line and `per_point`
+/// hundredths for each point. The lines of the damage's width that BAND_TICKS
+/// leaves after the calls (at most BAND_ROWS), or one line's part, at least one
+/// point. Nothing to price (no row and no point) is a band of BAND_ROWS lines.
+pub fn band_size(calls: u32, per_row: u32, per_point: u32, damage_w: u32) -> (u32, u32) {
+    if per_row + per_point == 0 {
+        return (damage_w, BAND_ROWS);
+    }
+    let budget = u64::from(BAND_TICKS.saturating_sub(calls + BAND_FIXED)) * 100;
+    let one_row = u64::from(per_row) + u64::from(damage_w) * u64::from(per_point);
+    let rows = budget / one_row;
+    if rows >= 1 {
+        // The width of the damage, as many lines as the ticks allow.
+        return (damage_w, rows.min(u64::from(BAND_ROWS)) as u32);
+    }
+    // Not even one line of the whole width: a part of a line.
+    let room = budget.saturating_sub(u64::from(per_row));
+    let w = room.checked_div(u64::from(per_point)).unwrap_or(0);
+    (w.clamp(1, u64::from(damage_w)) as u32, 1)
+}
+
+/// The bands a frame of one copy over the whole screen takes by the prices of
+/// `PRICES` (a window of XRGB8888 that covers the screen, nothing above it): the
+/// figure the probes print, and the one that must stay at 45 or fewer for the
+/// frame to fit a period of 60 Hz under -icount without load.
+pub fn full_screen_bands() -> u32 {
+    let mut s = Scene::new();
+    let screen = Rect::SCREEN;
+    let Ok(a) = s.create(1, 1, screen, true, 0) else {
+        return u32::MAX;
+    };
+    if s.flush(a, screen).is_err() {
+        return u32::MAX;
+    }
+    let Some(d) = s.begin() else {
+        return u32::MAX;
+    };
+    s.end(true);
+    HEIGHT.div_ceil(s.tile(d).1)
 }
 
 /// Where the pixels of a window's buffer are.
@@ -1430,7 +1615,22 @@ pub fn compose(
     src: &impl Source,
     raster: &mut impl Raster,
 ) -> Band {
-    let (width, rows) = scene.tile(damage);
+    let size = scene.tile(damage);
+    compose_sized(scene, damage, at, size, fb, src, raster)
+}
+
+/// `compose` for a band of `size` (columns and lines) that the caller names:
+/// the calibration measures the bands of its own shapes.
+pub fn compose_sized(
+    scene: &Scene,
+    damage: Rect,
+    at: Band,
+    size: (u32, u32),
+    fb: &mut [u8],
+    src: &impl Source,
+    raster: &mut impl Raster,
+) -> Band {
+    let (width, rows) = size;
     let y0 = at.row.max(damage.y);
     let y1 = (y0 + rows).min(damage.y + damage.h);
     let x0 = damage.x + at.col;
@@ -1872,11 +2072,11 @@ mod tests {
         while at.row < d.y + d.h {
             let next = compose(&s, d, at, &mut fb, &src, &mut Plain);
             assert_eq!(next.col, 0);
-            assert_eq!(next.row, (at.row + 7).min(HEIGHT));
+            assert_eq!(next.row, (at.row + 12).min(HEIGHT));
             at = next;
             bands += 1;
         }
-        assert_eq!(bands, HEIGHT.div_ceil(7));
+        assert_eq!(bands, HEIGHT.div_ceil(12));
         assert_eq!(at.row, HEIGHT);
         // A band past the damage is a no-op that says the frame is done.
         let done = Band {
@@ -2460,18 +2660,19 @@ mod tests {
         s.post(a, 0, &[]).unwrap();
         s.post(b, 0, &[]).unwrap();
         // A frame with an alpha window in it is made in bands of
-        // OVER_POINTS points of the layers: 30 wide, one layer, so 4 lines
-        // at most.
+        // the points the prices allow the layers: 30 wide, a copy and a
+        // layer over it, so the most lines of a band.
         let d = s.begin().unwrap();
         assert_eq!(d, rect(0, 0, 30, 30));
         let first = compose(&s, d, Band::default(), &mut fb, &src, &mut Plain);
         assert_eq!(
             first,
             Band {
-                row: BAND_ROWS,
+                row: s.tile(d).1,
                 col: 0
             }
         );
+        assert_eq!(first.row, BAND_ROWS);
         draw(&s, d, &mut fb, &src);
         s.end(true);
         // Only a: 0x80. Over a: 0x40 + 0x80 * 0x7F / 255 = 0x80.
@@ -2493,14 +2694,22 @@ mod tests {
     /// calls and the ticks the model of `Scene::tile` gives them.
     #[derive(Default)]
     struct Cost {
+        /// Ticks of the calls.
         calls: u32,
-        ticks: u32,
+        /// Hundredths of a tick.
+        centi: u32,
+    }
+
+    impl Cost {
+        fn ticks(&self) -> u32 {
+            self.centi.div_ceil(100)
+        }
     }
 
     impl Raster for Cost {
         fn black(&mut self, _: &mut [u8], r: Rect) {
-            self.calls += 1;
-            self.ticks += FILL_TICKS * r.w * r.h;
+            self.calls += FILL.call;
+            self.centi += FILL.row * r.h + FILL.point * r.w * r.h;
         }
 
         fn blit(
@@ -2515,8 +2724,9 @@ mod tests {
             area: (u32, u32),
             over: bool,
         ) {
-            self.calls += 1;
-            self.ticks += if over { OVER_TICKS } else { OPAQUE_TICKS } * area.0 * area.1;
+            let p = if over { OVER } else { OPAQUE };
+            self.calls += p.call;
+            self.centi += p.row * area.1 + p.point * area.0 * area.1;
         }
     }
 
@@ -2528,7 +2738,7 @@ mod tests {
         while at.row < d.y + d.h {
             let mut cost = Cost::default();
             at = compose(s, d, at, &mut fb, src, &mut cost);
-            worst = worst.max(cost.calls * CALL_TICKS + cost.ticks);
+            worst = worst.max(cost.calls + cost.ticks());
             bands += 1;
         }
         (worst, bands)
@@ -2542,13 +2752,15 @@ mod tests {
         let d = s.begin().unwrap();
         s.end(true);
         // One window that covers the damage: lines of the width.
-        // (the copy of a point is 3 in the model: 7 lines of 640).
-        assert_eq!(s.tile(d), (640, 7));
-        // The pointer over it: a layer laid over others costs 25 a point.
+        // (a copy of a point is 1.58 in the model, with a call of 897, a fixed
+        // term of 102 and a row of 63: 12 lines of 640; 13 lines would cost 15 026).
+        assert_eq!(s.tile(d), (640, 12));
+        // The pointer over it: a layer laid over others costs more a point and
+        // a line, so the band holds fewer lines of the width.
         s.pointer_to(5, 5);
         let (w, rows) = s.tile(d);
-        assert_eq!(rows, 1);
-        assert!(w < 640 && w * OVER_TICKS + 2 * CALL_TICKS <= BAND_TICKS + 3 * w);
+        assert_eq!(w, 640);
+        assert!((1..13).contains(&rows), "{rows}");
         // A damage nothing covers starts black: fewer lines.
         let mut t = Scene::new();
         let b = t.create(1, 1, rect(10, 10, 50, 50), true, 0).unwrap();
@@ -2556,6 +2768,242 @@ mod tests {
         t.begin().unwrap();
         assert_eq!(t.tile(rect(10, 10, 50, 50)).1, BAND_ROWS);
         assert!(t.tile(rect(0, 0, 640, 400)).1 < BAND_ROWS);
+    }
+
+    /// The windows of the overload: eight of ARGB8888, 320 by 200 on one place,
+    /// two contexts of four.
+    fn eight_windows(s: &mut Scene, n: usize) {
+        for i in 0..n {
+            let r = rect(100, 100, 320, 200);
+            let w = s.create(i as u64 + 1, 1 + (i / PER_CONTEXT) as u64, r, false, 0);
+            let w = w.unwrap();
+            s.set_format(w, Format::Argb);
+            s.attach(w, 2, 320 * 4).unwrap();
+            s.post(w, 0, &[]).unwrap();
+        }
+        let _ = s.begin().unwrap();
+        s.end(true);
+    }
+
+    /// What the model charges for a band of the size `tile` gives: the layers'
+    /// calls, rows and points, the term of each layer after the first, and the
+    /// black.
+    fn band_cost(s: &Scene, d: Rect, over: u32) -> u64 {
+        let (w, h) = s.tile(d);
+        // The prices of a row and of a point are hundredths of a tick: the sum
+        // is in hundredths, which the band's size is made in.
+        let price = |p: Price| {
+            u64::from(p.call) * 100
+                + u64::from(p.row) * u64::from(h)
+                + u64::from(p.point) * u64::from(w) * u64::from(h)
+        };
+        (u64::from(over) * price(OVER)
+            + price(FILL)
+            + u64::from(BAND_FIXED) * 100
+            + u64::from(LAYER) * 100 * u64::from(over.saturating_sub(1)))
+        .div_ceil(100)
+    }
+
+    #[test]
+    fn a_band_of_eight_windows_on_one_place_is_under_the_limit_by_the_model() {
+        for n in 1..=8usize {
+            let mut s = Scene::new();
+            eight_windows(&mut s, n);
+            let d = rect(100, 100, 320, 200);
+            let cost = band_cost(&s, d, n as u32);
+            assert!(cost <= u64::from(BAND_TICKS), "{n} windows: {cost}");
+        }
+        // The band is narrower with more layers: the term and the calls of each.
+        let width_of = |n: usize| {
+            let mut s = Scene::new();
+            eight_windows(&mut s, n);
+            s.tile(rect(100, 100, 320, 200))
+        };
+        let (w8, h8) = width_of(8);
+        assert_eq!(h8, 1, "eight layers make a part of a line");
+        // By the measured terms and 14 000 ticks eight layers get 71 points of a line
+        // (a frame of the 320 by 200 windows is 5 bands a line, 1 000 in all; 151
+        // points and 600 bands before the terms).
+        assert_eq!(w8, 71);
+        let (w4, _) = width_of(4);
+        assert!(w8 < w4);
+        // Without the term of a layer the band would be this wide: the term is
+        // charged.
+        let calls = OVER.call * 8 + FILL.call;
+        let no_term = band_size(
+            calls,
+            OVER.row * 8 + FILL.row,
+            OVER.point * 8 + FILL.point,
+            320,
+        );
+        assert!(w8 < no_term.0, "{w8} {}", no_term.0);
+    }
+
+    /// The bands of layers the probes measured under -icount (the greatest
+    /// ticks of a whole band as `compose` makes it: the black and the layers
+    /// laid over each other on the same rows): the model with the term of a layer
+    /// is at or above every one.
+    #[test]
+    fn the_model_with_the_term_covers_the_measured_bands_of_layers() {
+        // (layers, width, height, greatest ticks).
+        let measured = [
+            (1u32, 150u32, 1u32, 2_187u64),
+            (1, 150, 4, 4_913),
+            (1, 16, 1, 1_565),
+            (1, 64, 1, 1_787),
+            (1, 76, 8, 5_689),
+            (1, 8, 8, 1_647),
+            (2, 150, 1, 3_980),
+            (2, 150, 4, 9_195),
+            (2, 76, 8, 10_647),
+            (4, 150, 1, 7_620),
+            (4, 150, 4, 17_813),
+            (4, 76, 8, 20_617),
+            (8, 150, 1, 15_116),
+            (8, 150, 4, 35_265),
+            (8, 16, 1, 10_483),
+            (8, 64, 1, 12_133),
+            (8, 76, 8, 40_773),
+            (8, 8, 8, 10_733),
+        ];
+        let price = |p: Price, w: u32, h: u32| {
+            u64::from(p.call)
+                + (u64::from(p.row) * u64::from(h)
+                    + u64::from(p.point) * u64::from(w) * u64::from(h))
+                .div_ceil(100)
+        };
+        let mut short = 0u64;
+        for (n, w, h, ticks) in measured {
+            let model = price(FILL, w, h)
+                + u64::from(n) * price(OVER, w, h)
+                + u64::from(LAYER) * u64::from(n - 1);
+            // A band of one layer 16 or 64 points wide is under its measure by 88
+            // and 53 ticks by the prices alone: the fixed term of a band covers it.
+            assert!(
+                model + u64::from(BAND_FIXED) >= ticks,
+                "{n} layers {w}x{h}: {model} + {BAND_FIXED} < {ticks}"
+            );
+            // The greatest shortfall under the prices is the measure of the fixed
+            // term, and the constant covers it with the margin.
+            short = short.max(ticks.saturating_sub(model));
+        }
+        assert_eq!(short, u64::from(BAND_FIXED_MEASURED));
+        assert_eq!(BAND_FIXED, with_margin(BAND_FIXED_MEASURED));
+    }
+
+    /// The term of a layer covers its measure with the margin.
+    #[test]
+    fn the_term_of_a_layer_covers_its_measure_with_the_margin() {
+        assert_eq!(LAYER, with_margin(LAYER_MEASURED));
+        assert!(u64::from(LAYER) * 100 >= u64::from(LAYER_MEASURED) * 115);
+    }
+
+    /// Every constant covers its measure with the margin, and the table says
+    /// which: a measure above its constant (a margin of nothing, an old
+    /// constant) fails here.
+    #[test]
+    fn the_constants_cover_the_measures_with_the_margin() {
+        let covers = |constant: u32, measured: u32| {
+            u64::from(constant) * 100 >= u64::from(measured) * u64::from(100 + MARGIN_PERCENT)
+        };
+        for p in PRICES {
+            assert!(covers(p.call, p.call_measured), "{} call", p.kind);
+            assert!(covers(p.row, p.row_measured), "{} row", p.kind);
+            assert!(covers(p.point, p.point_measured), "{} point", p.kind);
+            assert_eq!(p.call, with_margin(p.call_measured), "{}", p.kind);
+            assert_eq!(p.row, with_margin(p.row_measured), "{}", p.kind);
+            assert_eq!(p.point, with_margin(p.point_measured), "{}", p.kind);
+        }
+        // Every entry is a measure of the fit, the same in both probes, and the
+        // costs of the large operations of the probes' scenes (the least all-in
+        // figures: a copy 1.56 to 1.62 a point at 3 840 to 5 120 points, a layer
+        // laid over others 5.78 at 480 points, the black 0.44 to 0.46) are under
+        // the model with the constants: the model errs only high.
+        assert!(PRICES.iter().all(|p| !p.row_estimate && !p.point_estimate));
+        let model = |p: Price, w: u32, h: u32| -> u64 {
+            u64::from(p.call)
+                + (u64::from(p.row) * u64::from(h)
+                    + u64::from(p.point) * u64::from(w) * u64::from(h))
+                .div_ceil(100)
+        };
+        // (kind, width, height, ticks a hundred points of the live least).
+        for (p, w, h, per_hundred) in [
+            (OPAQUE, 640u32, 8u32, 156u32),
+            (OPAQUE, 640, 6, 162),
+            (OVER, 480, 1, 578),
+            (OVER, 160, 3, 578),
+            (FILL, 640, 8, 46),
+            (FILL, 640, 8, 44),
+        ] {
+            let live = u64::from(per_hundred) * u64::from(w) * u64::from(h) / 100;
+            assert!(
+                model(p, w, h) >= live,
+                "{} {w}x{h}: {} < {live}",
+                p.kind,
+                model(p, w, h)
+            );
+        }
+        // The shapes of the width of the screen, the greatest of each over the
+        // four offsets (the refit of the probes): the model is above them.
+        for (p, w, h, greatest) in [
+            (OPAQUE, 640u32, 1u32, 1_715u64),
+            (OPAQUE, 640, 8, 8_265),
+            (OPAQUE, 640, 13, 12_945),
+            (OVER, 640, 13, 38_620),
+            (FILL, 640, 13, 3_641),
+        ] {
+            assert!(
+                model(p, w, h) >= greatest + greatest * 15 / 100,
+                "{} {w}x{h}: {} below {greatest} with the margin",
+                p.kind,
+                model(p, w, h)
+            );
+        }
+        // The margin of nothing would leave a measure above the constant.
+        assert!(with_margin(190) > 190);
+    }
+
+    /// Eight windows with an alpha over the whole screen, the worst case of a
+    /// band: by the model no band costs more than BAND_TICKS, and a frame of
+    /// the whole screen of one copy is made in the bands the constants give.
+    #[test]
+    fn eight_translucent_windows_make_bands_within_the_band_ticks() {
+        let mut s = Scene::new();
+        let mut src = flat(&[]);
+        for k in 0..MAX_WINDOWS {
+            let i = s
+                .create(k as u64 + 1, 1 + (k / PER_CONTEXT) as u64, SCREEN, false, 0)
+                .unwrap();
+            s.set_format(i, Format::Argb);
+            s.attach(i, 1, 2560).unwrap();
+            src.0[i * BUFFERS] = vec![0x10; 2560 * 400];
+            s.post(i, 0, &[]).unwrap();
+        }
+        s.begin().unwrap();
+        s.end(true);
+        let (worst, bands) = worst_band(&s, SCREEN, &src);
+        assert!(
+            worst <= BAND_TICKS,
+            "a band of {worst} ticks by the model, {bands} bands"
+        );
+    }
+
+    #[test]
+    fn a_frame_of_one_copy_of_the_whole_screen_is_made_in_few_bands() {
+        let mut s = Scene::new();
+        let a = s.create(1, 1, SCREEN, true, 0).unwrap();
+        s.flush(a, SCREEN).unwrap();
+        let d = s.begin().unwrap();
+        s.end(true);
+        let src = flat(&[(a, 0, 0x10, (STRIDE * HEIGHT) as usize)]);
+        let (worst, bands) = worst_band(&s, d, &src);
+        assert!(worst <= BAND_TICKS, "{worst}");
+        // The bands of the whole screen, by the prices: loud when it passes 45.
+        assert!(bands <= 45, "{bands} bands: the full phase is no promise");
+        assert_eq!(bands, full_screen_bands());
+        // With the fixed term of a band a copy over the whole width is 12 lines
+        // (13 cost 15 026 by the prices): 34 bands.
+        assert_eq!(bands, 34);
     }
 
     use proto_gpu::{PIPELINE_CURSOR, SOURCE_CURSOR};
@@ -2600,7 +3048,7 @@ mod tests {
         let mut s = settled(true);
         s.pointer_to(5, 5);
         // The tile of a frame over the pointer is that of a copy alone.
-        assert_eq!(s.tile(SCREEN), (640, 7));
+        assert_eq!(s.tile(SCREEN), (640, 12));
         s.add_damage(SCREEN);
         let d = s.begin().unwrap();
         let src = flat(&[(0, 0, 0x80, 640 * 4 * 400)]);
@@ -3126,14 +3574,15 @@ mod tests {
         s.end(true);
         let damage = rect(0, 0, 600, 100);
         let (w, rows) = s.tile(damage);
-        assert!(w < 600 && rows == 1, "{w} x {rows}");
+        assert!(w <= 600 && (1..100).contains(&rows), "{w} x {rows}");
         let src = flat(&[
             (a, 0, 7, (STRIDE * HEIGHT) as usize),
             (b, 0, 0x10, 2400 * 100),
         ]);
         let mut fb = screen();
         let first = compose(&s, damage, Band::default(), &mut fb, &src, &mut Plain);
-        assert_eq!(first, Band { row: 0, col: w });
+        // The band is the whole width and a few lines.
+        assert_eq!((w, first), (600, Band { row: rows, col: 0 }));
         let (worst, _) = worst_band(&s, damage, &src);
         assert!(worst <= 16_500);
     }

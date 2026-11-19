@@ -291,21 +291,36 @@ megabyte at most.
 
 A frame takes the posted buffer of every window at its start, is made in
 bands, a step each (the compositor's own bit starts the next band, so requests
-of clients pass between bands). A band that only copies is eight lines of the
-damage's width under a window that covers the damage, and four where it starts
-black (pixman's fill costs about twice its copy). A band that lays something
+of clients pass between bands). A band that only copies is twelve lines of the
+damage's width under a window that covers the damage (at most 16 lines), and
+fewer where it starts black. A band that lays something
 over others (a window with an alpha, the pointer's picture) holds fewer points:
-each shown window that touches the damage is a call of pixman (about 1 500 ticks)
-and a number of ticks a point (3 for a copy, 25 for a layer laid over others, 4
-for the black), and a band holds the points that 15 000 ticks leave after its
-calls, down the damage and across it, so that eight windows in one band stay
-under the bound, and then goes to the driver
+each shown window that touches the damage is a call of pixman, a price for each
+of its lines and a price for each of its points (`compositor::PRICES`: the call
+in ticks, the line and the point in hundredths of a tick, for a copy, a layer
+laid over others and the black; the upper fit of the model over the greatest
+ticks measured on 23 shapes of operations under -icount, with a margin of 15 %:
+the model errs only high), and a band holds the lines of the damage's width that
+14 000 ticks (`BAND_TICKS`, the work of a band by the model: the step around it costs up to about 2 400 ticks more, under the gate of 16 328) leave after its calls, a fixed term for every band (`BAND_FIXED`,
+102 ticks: the work of `compose` around a band, which a narrow band does not hide)
+and a term for each layer after the first (`LAYER`, 260 ticks), down the damage and across it, so that eight windows in one band stay
+under the bound (the shapes measured go up to the width of the screen), and then goes to the driver
 as COMMIT of the changed rectangle. COMMIT is proto_gpu's second revision:
 SUBSCRIBE gives the driver the compositor's channel once, COMMIT answers as
 soon as the commands are in the device's queue, and the driver says
 `FRAME_SHOWN` (or `FRAME_FAILED`) on that channel when the device is done.
 FLUSH of the first revision still waits inside the driver, for the programs
 that speak to the driver directly (the image of `gpu-probe`).
+
+The prices are measured under -icount, where time is instructions: there is no
+cold cache, no miss of a translation and no first touch of a buffer (the buffers
+are mapped in advance), and pixman's table of fast paths, the one cache that can
+be cold, is warmed at the start with the three combinations the service uses. On
+HVF and on a board a cold cache shows in the measures. The lines `service raster`
+of the probes are wall time, and the greatest of them holds the levels above that
+ran in the middle and the interrupts (a 640 by 8 copy shown at 3.64 a point is
+about 18 600 ticks, while the band step that holds it is at most 10 528 of the
+thread's own time): only the lines of the steps judge a band.
 
 ## The direct frame
 
@@ -464,8 +479,7 @@ what else it compares and how.
 
 ## Not yet
 
-The period of a frame and its counters, a window's resize, the constants of
-the bands set from the NEON costs (the probes report them), the window manager
+The period of a frame and its counters, a window's resize, the window manager
 and the keyboard in the base image (the manager's image is the probe's), the
 pointer in the base image, the layers of the display
 controller, a window of the second revision shown directly (the flag `SCANOUT`

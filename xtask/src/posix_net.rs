@@ -232,10 +232,87 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
 
 /// The check `wait-churn` on two CPUs, where the answers to a wait come late
 /// from the other CPU (stafeto-design#569).
+///
+/// Interim measure for stafeto#503: on two CPUs the terminal service sometimes sends no sign of
+/// life after `tty: ready` and init's watchdog ends it. That failure, and no other, gets one more
+/// run (`FLICKER_503_RETRIES`); the lines of the first run are printed whole and saved, and ci
+/// reports the retry (`flicker_503_notes`). Delete the retry with the fix of #503.
 pub fn wait_churn_smp() -> Result<(), String> {
-    qemu::on_cpus(2, || {
-        probe_only(&qemu::VIRT, false, Some("wait-churn".to_owned()))
-    })
+    let run = || {
+        qemu::on_cpus(2, || {
+            probe_run(&qemu::VIRT, false, Some("wait-churn".to_owned()))
+        })
+    };
+    retrying(run, note_flicker_503).map_err(|failed| failed.error)
+}
+
+/// `run`, and once more after a failure that qualifies (`silent_service`), `note` told of the
+/// first run's lines; the second result stands, whatever it is.
+fn retrying(
+    mut run: impl FnMut() -> Result<(), Failed>,
+    mut note: impl FnMut(&[String]),
+) -> Result<(), Failed> {
+    let mut result = run();
+    for _ in 0..FLICKER_503_RETRIES {
+        let Err(failed) = &result else { break };
+        if !silent_service(&failed.lines) {
+            break;
+        }
+        note(&failed.lines);
+        result = run();
+    }
+    result
+}
+
+/// How many more runs the step `posix-net wait-churn smp 2` gets after a silent service
+/// (stafeto#503, to be deleted with the fix).
+const FLICKER_503_RETRIES: usize = 1;
+
+/// Whether the lines are those of a run in which init's watchdog ended a service: init's line
+/// `went silent` and its lines `silent service` (init::serve::describe_silence).
+fn silent_service(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .any(|l| l.contains("init: ") && l.contains(" went silent, "))
+        && lines
+            .iter()
+            .any(|l| l.contains("init: ") && l.contains("silent service at"))
+}
+
+/// The retries of stafeto#503 this run made: the line each leaves for the summary of ci.
+static FLICKER_503: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The note of a retry: the first run's lines go to the console whole and to
+/// `target/measure/flicker-503.txt`.
+fn note_flicker_503(lines: &[String]) {
+    println!(
+        "== flicker stafeto#503: a silent service in the first run of posix-net wait-churn smp 2; its lines follow"
+    );
+    for line in lines {
+        println!("{line}");
+    }
+    println!("== flicker stafeto#503: end of the first run's lines; running the step once more");
+    let dir = crate::target_dir().join("measure");
+    let saved = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(dir.join("flicker-503.txt"), lines.join("\n") + "\n"));
+    if let Err(e) = saved {
+        println!("flicker stafeto#503: the lines are not saved: {e}");
+    }
+    FLICKER_503
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(FLICKER_503_NOTE.to_owned());
+}
+
+const FLICKER_503_NOTE: &str =
+    "flicker stafeto#503: posix-net wait-churn smp 2 was retried after a silent service";
+
+/// The lines of the summary of ci for the retries made (empty in a run that needed none).
+pub fn flicker_503_notes() -> Vec<String> {
+    FLICKER_503
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// The check `instances` on two CPUs: the stack of the service has an instance on each, and one
@@ -249,6 +326,35 @@ fn probe_only(
     steps: bool,
     only: Option<String>,
 ) -> Result<(), String> {
+    probe_run(machine, steps, only).map_err(|failed| failed.error)
+}
+
+/// A run that failed: the error and the lines of its console (empty when the run did not start).
+struct Failed {
+    error: String,
+    lines: Vec<String>,
+}
+
+impl From<String> for Failed {
+    fn from(error: String) -> Failed {
+        Failed {
+            error,
+            lines: Vec::new(),
+        }
+    }
+}
+
+impl From<&str> for Failed {
+    fn from(error: &str) -> Failed {
+        Failed::from(error.to_owned())
+    }
+}
+
+fn probe_run(
+    machine: &'static qemu::Machine,
+    steps: bool,
+    only: Option<String>,
+) -> Result<(), Failed> {
     if machine.is_hvf() {
         crate::hvf_host().map_err(|why| format!("hvf needs macOS on Apple Silicon: {why}"))?;
     }
@@ -293,7 +399,12 @@ fn probe_only(
     })();
     let output = run.stop();
     symbolize::backtrace(&output.lines, &kernel.elf);
-    talked?;
+    if let Err(error) = talked {
+        return Err(Failed {
+            error,
+            lines: output.lines,
+        });
+    }
     if output.lines.iter().any(|line| {
         line.contains("process fault:")
             || line.contains("KERNEL PANIC")
@@ -309,7 +420,8 @@ fn probe_only(
             return Err(format!(
                 "the pipe service: a step past 0.9 of term B ({}): {row:?}",
                 net_probe::STEP_MAX
-            ));
+            )
+            .into());
         }
         let worst_pipe = pipe.iter().max_by_key(|r| r.1).copied().unwrap_or_default();
         println!(
@@ -457,6 +569,113 @@ fn steps_verdict(lines: &[String], whole: bool) -> Result<Vec<(usize, u64, u64)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lines(text: &[&str]) -> Vec<String> {
+        text.iter().map(|l| (*l).to_owned()).collect()
+    }
+
+    fn silent_lines() -> Vec<String> {
+        lines(&[
+            "init: tty silent service at 1666.399 ms, expiry 2.050 ms late, late 0 times in a row",
+            "init: uart console driver: thread receiving",
+            "init: tty went silent, killed from level 50; restarts in 100 ms",
+        ])
+    }
+
+    fn failure(text: &[&str]) -> Result<(), Failed> {
+        Err(Failed {
+            error: "no prompt".to_owned(),
+            lines: lines(text),
+        })
+    }
+
+    #[test]
+    fn only_a_silent_service_with_its_lines_qualifies_for_the_retry() {
+        assert!(silent_service(&silent_lines()));
+        // The line `went silent` alone, the lines `silent service` alone, other failures.
+        assert!(!silent_service(&silent_lines()[2..]));
+        assert!(!silent_service(&silent_lines()[..2]));
+        assert!(!silent_service(&lines(&["posix-net: limits ok"])));
+        assert!(!silent_service(&lines(&["init: net ended: fault"])));
+        assert!(!silent_service(&[]));
+    }
+
+    #[test]
+    fn a_silent_service_gets_one_more_run_and_a_second_failure_stands() {
+        let (mut runs, mut noted) = (0, 0);
+        let silent = silent_lines();
+        let result = retrying(
+            || {
+                runs += 1;
+                Err(Failed {
+                    error: format!("run {runs}"),
+                    lines: silent.clone(),
+                })
+            },
+            |first| {
+                noted += 1;
+                assert_eq!(first, silent.as_slice());
+            },
+        );
+        assert_eq!((runs, noted), (2, 1), "one retry, however it ends");
+        assert_eq!(result.err().unwrap().error, "run 2");
+    }
+
+    #[test]
+    fn a_passing_second_run_passes_and_a_first_pass_runs_once() {
+        let (mut runs, mut noted) = (0, 0);
+        let silent = silent_lines();
+        let result = retrying(
+            || {
+                runs += 1;
+                if runs == 1 {
+                    Err(Failed {
+                        error: "silent".to_owned(),
+                        lines: silent.clone(),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            |_| noted += 1,
+        );
+        assert!(result.is_ok() && (runs, noted) == (2, 1));
+        let mut runs = 0;
+        assert!(
+            retrying(
+                || {
+                    runs += 1;
+                    Ok(())
+                },
+                |_| panic!("no failure, no note")
+            )
+            .is_ok()
+        );
+        assert_eq!(runs, 1);
+    }
+
+    #[test]
+    fn another_failure_gets_no_retry() {
+        for text in [
+            &["init: net ended: fault"][..],
+            &[
+                "posix-net: limits ok",
+                "init: tty went silent, killed from level 50",
+            ][..],
+            &[][..],
+        ] {
+            let mut runs = 0;
+            let result = retrying(
+                || {
+                    runs += 1;
+                    failure(text)
+                },
+                |_| panic!("no note for {text:?}"),
+            );
+            assert!(result.is_err());
+            assert_eq!(runs, 1, "{text:?}");
+        }
+    }
 
     /// The checks xtask expects are those the program runs, in its order.
     #[test]

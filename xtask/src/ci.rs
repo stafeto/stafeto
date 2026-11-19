@@ -779,7 +779,7 @@ fn execute(steps: Vec<Step>) -> Vec<Report> {
     reports
 }
 
-fn summary(label: &str, reports: &[Report]) -> String {
+fn summary(label: &str, reports: &[Report], notes: &[String]) -> String {
     let mut text = format!("ci summary ({label}):\n");
     for r in reports {
         let line = match &r.outcome {
@@ -800,7 +800,18 @@ fn summary(label: &str, reports: &[Report]) -> String {
         text.push_str(&line);
         text.push('\n');
     }
+    for note in notes {
+        text.push_str(&format!("  {note}\n"));
+    }
     text
+}
+
+/// The annotations GitHub shows for the notes of the run (the retries of stafeto#503).
+fn warnings(label: &str, notes: &[String]) -> Vec<String> {
+    notes
+        .iter()
+        .map(|note| format!("::warning title=ci {label}: flicker stafeto#503::{note}"))
+        .collect()
 }
 
 struct Options {
@@ -862,7 +873,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let began = Instant::now();
     let steps = select(all_steps(options.jobs), options.group.as_deref());
     let reports = execute(steps);
-    let mut text = summary(&label, &reports);
+    let notes = crate::posix_net::flicker_503_notes();
+    let mut text = summary(&label, &reports, &notes);
     text.push_str(&format!("  total {:.0} s\n", began.elapsed().as_secs_f64()));
     println!("{text}");
     if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
@@ -880,6 +892,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
         .filter(|r| matches!(r.outcome, Outcome::Failed(_)))
         .collect();
     if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        for line in warnings(&label, &notes) {
+            println!("{line}");
+        }
         for r in &failed {
             if let Outcome::Failed(e) = &r.outcome {
                 println!("::error title=ci {label}: {}::{}", r.name, first_line(e));
@@ -1044,10 +1059,24 @@ mod tests {
         assert!(matches!(reports[0].outcome, Outcome::Failed(_)));
         assert!(matches!(reports[1].outcome, Outcome::Skipped("build")));
         assert!(matches!(reports[2].outcome, Outcome::Ok));
-        let text = summary("t", &reports);
+        let text = summary("t", &reports, &[]);
         assert!(text.contains("skipped because of build"));
         assert!(text.contains("build: broken"));
         assert!(!text.contains("more"));
+    }
+
+    #[test]
+    fn a_retry_of_the_flicker_shows_in_the_summary_and_as_a_warning() {
+        let reports = execute(vec![step("a", "ok", &[], || Ok(()))]);
+        let notes = ["flicker stafeto#503: a step was retried".to_owned()];
+        let text = summary("t", &reports, &notes);
+        assert!(text.contains("  flicker stafeto#503: a step was retried\n"));
+        assert!(!summary("t", &reports, &[]).contains("flicker"));
+        assert_eq!(
+            warnings("t", &notes),
+            ["::warning title=ci t: flicker stafeto#503::flicker stafeto#503: a step was retried"]
+        );
+        assert!(warnings("t", &[]).is_empty());
     }
 
     #[test]
