@@ -75,13 +75,7 @@ jobs:
         id: version
         env:
           SERIES_INPUT: ${{ inputs.series }}
-          EVENT: ${{ github.event_name }}
-          TAG: ${{ github.ref_name }}
         run: |
-          if [ "$EVENT" = push ] && [ "$(git cat-file -t "refs/tags/$TAG")" != tag ]; then
-            echo "::error::$TAG is a lightweight tag; set an annotated one (git tag -a)"
-            exit 1
-          fi
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           series=$(echo "$version" | cut -d. -f1,2)
           if [ -n "$SERIES_INPUT" ] && [ "$SERIES_INPUT" != "$series" ]; then

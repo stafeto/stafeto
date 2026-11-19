@@ -571,10 +571,3 @@ fn the_check_with_both_roots_is_in_the_dry_run_alone() {
         }
     }
 }
-
-#[test]
-fn the_build_job_of_an_update_wants_an_annotated_tag() {
-    let build = code(&jobs(&workflow("packages-update.yml"))["build"]);
-    assert!(build.contains("git cat-file -t \"refs/tags/$TAG\""));
-    assert!(build.contains("annotated"));
-}
