@@ -4446,6 +4446,7 @@ mod tests {
         tables.push(pkg::DATA_PROBE_TABLE);
         tables.push(pkg::DATAKEY_PROBE_TABLE);
         tables.push(shutdown::STOP_TABLE);
+        tables.push(frame::TABLE);
         tables
     }
 

@@ -175,9 +175,12 @@ pub const CPU: Record = Record {
     ..LOAD
 };
 
-/// The file load: the mode `load` of the data probe, on the data file service.
+/// The file load: the mode `load` of the data probe, on the data file service. The
+/// record has the program's name: init marks the session of a native client of the
+/// data file service by the name of its record (`DATA_SERVICE_CLIENTS`), and a
+/// session without the mark has no identity and its writes are refused.
 pub const FILES: Record = Record {
-    name: "frame-files",
+    name: "data-probe",
     program: "data-probe",
     args: b"load",
     priority: 30,
@@ -296,7 +299,7 @@ mod tests {
             ("frame-draw", &["gpu"]),
             ("frame-legacy", &["gpu"]),
             ("frame-cpu", &[]),
-            ("frame-files", &["datafs"]),
+            ("data-probe", &["datafs"]),
             ("frame-net", &["net"]),
         ] {
             assert_eq!(named(load).connects, connects, "{load}");
@@ -312,7 +315,7 @@ mod tests {
         for timed in ["frame-load", "frame-draw", "frame-legacy"] {
             assert_eq!(level(timed), (31, 31), "{timed}");
         }
-        for load in ["frame-files", "frame-net"] {
+        for load in ["data-probe", "frame-net"] {
             assert_eq!(level(load), (30, 30), "{load}");
         }
         assert_eq!(level("frame-cpu"), (29, 29));
