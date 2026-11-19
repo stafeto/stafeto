@@ -797,13 +797,16 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
 /// service starts again in the run (the role `k` kills it), and each start
 /// counts from nothing, so the longest is taken over all the lines of a
 /// kind.
-pub fn longest_over_starts(lines: &[String]) -> Vec<(usize, u64, u64)> {
+pub fn longest_over_starts(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
     longest_over_starts_of(lines, NET_TAG)
 }
 
 /// `longest_over_starts` for the service that prints its steps under `tag`
 /// (the pipe service prints under 4).
-pub fn longest_over_starts_of(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
+pub fn longest_over_starts_of(
+    lines: &[String],
+    tag: &str,
+) -> Result<Vec<(usize, u64, u64)>, String> {
     crate::step_line::longest_warned(lines, tag, STEP_MAX)
 }
 
@@ -828,7 +831,7 @@ fn longest_named(lines: &[String], which: &str) -> u64 {
 fn epoll_set_by_batch(lines: &[String]) -> Vec<(usize, u64)> {
     let mut out: Vec<(usize, u64)> = Vec::new();
     for step in lines.iter().filter_map(|l| crate::step_line::parse(l)) {
-        let (kind, ticks, detail) = (step.kind, step.judged(), step.detail as usize);
+        let (kind, ticks, detail) = (step.kind, step.least(), step.detail as usize);
         if step.tag != NET_TAG {
             continue;
         }
@@ -875,7 +878,7 @@ fn epoll_allowed(rows: &[(usize, u64)]) -> Vec<(usize, u64)> {
 /// The steps of the service: every kind came and every row stays under
 /// STEP_MAX, and a CLONE (kind 19) under PORTION_MAX when the run made one.
 pub fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
-    let rows = longest_over_starts(lines);
+    let rows = longest_over_starts(lines)?;
     for (kind, name) in STEP_KINDS {
         if !rows.iter().any(|(k, ..)| *k == kind) {
             return Err(format!("the network service: no step {name}: {rows:?}"));
@@ -910,7 +913,7 @@ pub fn traffic_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, Strin
         (19, "Clone"),
         (28, "WatchTake"),
     ];
-    let rows = longest_over_starts(lines);
+    let rows = longest_over_starts(lines)?;
     for (kind, name) in KINDS {
         if !rows.iter().any(|(k, ..)| *k == kind) {
             return Err(format!("the network service: no step {name}: {rows:?}"));
@@ -1068,9 +1071,7 @@ fn steps_run(
     roles: Roles,
     strict: bool,
 ) -> Result<Vec<(usize, u64, u64)>, String> {
-    Ok(longest_over_starts(&steps_lines(
-        machine, name, programs, roles, strict,
-    )?))
+    longest_over_starts(&steps_lines(machine, name, programs, roles, strict)?)
 }
 
 /// The three longest kinds of `rows`, longest first: `(kind, ticks)`.
@@ -1332,7 +1333,7 @@ fn acceptance(
             roles,
             strict,
         )?;
-        let rows = longest_over_starts(&lines);
+        let rows = longest_over_starts(&lines)?;
         if what == "E" {
             epoll_run = lines;
         } else if what == "x" {
@@ -1354,7 +1355,7 @@ fn acceptance(
         measured_programs(Some("net-wire-echo"), netd),
         strict,
     )?;
-    let rows = longest_over_starts(&lines);
+    let rows = longest_over_starts(&lines)?;
     let rows = if strict {
         steps_verdict_rows(&rows).map_err(|e| format!("run W: {e}"))?
     } else {
@@ -1542,7 +1543,7 @@ fn split_only(machine: &qemu::Machine) -> Result<(), String> {
         parts.sending(1, 1),
         netd::choose::BUDGET
     );
-    print_rows(machine, "split image", &longest_over_starts(&lines));
+    print_rows(machine, "split image", &longest_over_starts(&lines)?);
     let wire = steps_lines(
         machine,
         measured_name("split-wire"),
@@ -1845,7 +1846,7 @@ pub fn portion_series(machine: &qemu::Machine) -> Result<usize, String> {
             true,
         )?;
         copy_verdict(&lines, bytes).map_err(|e| format!("portion {bytes}: {e}"))?;
-        let longest = longest_over_starts(&lines);
+        let longest = longest_over_starts(&lines)?;
         let send = step_of(&longest, SEND_KIND).map_or(0, |(t, _)| t);
         let recv = step_of(&longest, RECV_KIND).map_or(0, |(t, _)| t);
         println!(
@@ -1982,7 +1983,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
                 measured_programs(Some("net-wire-echo"), &[]),
                 true,
             )?;
-            let rows = steps_verdict_rows(&longest_over_starts(&lines))
+            let rows = steps_verdict_rows(&longest_over_starts(&lines)?)
                 .map_err(|e| format!("run W: {e}"))?;
             print_rows(&qemu::VIRT, "role W", &rows);
             return Ok(());

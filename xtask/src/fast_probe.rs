@@ -701,7 +701,7 @@ pub fn crash(rest: &[String]) -> Result<(), String> {
 /// The longest step of each kind, judged against the bound; the steps of
 /// CLAIM, CLAIM_MORE and KICK must be among them.
 pub(crate) fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
-    let rows = net_probe::longest_over_starts(lines);
+    let rows = net_probe::longest_over_starts(lines)?;
     for (kind, name) in [
         (CLAIM_KIND, "CLAIM"),
         (CLAIM_MORE_KIND, "CLAIM_MORE"),

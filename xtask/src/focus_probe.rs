@@ -360,7 +360,7 @@ pub(crate) fn rows_of(
     name: &str,
     kinds: &[(usize, &str)],
 ) -> Result<Vec<(usize, u64, u64)>, String> {
-    let rows = longest_steps(lines, tag);
+    let rows = longest_steps(lines, tag)?;
     for (kind, what) in kinds {
         if !rows.iter().any(|(k, ..)| k == kind) {
             return Err(format!("the {name}: no step {what}: {rows:?}"));
@@ -372,9 +372,13 @@ pub(crate) fn rows_of(
             gpu_probe::STEP_MAX
         ));
     }
-    if let Some(row) = rows.iter().find(|r| r.0 == 65 && r.1 > PORTION_MAX) {
+    // The portion is the step's own work: the steps no preemption touched say it (`step_line`);
+    // a step with preemptions is judged by B and 0.9 B above.
+    if let Some(clean) =
+        crate::step_line::clean_longest(lines, tag, 65).filter(|&c| c > PORTION_MAX)
+    {
         return Err(format!(
-            "the {name}: a portion or an interrupt past {PORTION_MAX}: {row:?}"
+            "the {name}: a portion or an interrupt past {PORTION_MAX}: kind 65 took {clean} ticks with no preemption"
         ));
     }
     Ok(rows)

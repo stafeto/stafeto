@@ -466,7 +466,7 @@ pub fn probe(scenario: Scenario) -> Result<(), String> {
         return Err(format!("the service said {line:?}"));
     }
     if scenario == Scenario::Steps {
-        let rows = net_probe::longest_over_starts(&output.lines);
+        let rows = net_probe::longest_over_starts(&output.lines)?;
         if let Some(row) = rows.iter().find(|r| r.1 > net_probe::STEP_MAX) {
             return Err(format!(
                 "the network service: a step past 0.9 of term B ({}): {row:?}",

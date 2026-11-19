@@ -757,7 +757,7 @@ fn lost_records(lines: &[String]) -> Vec<u64> {
 
 /// The longest step of each kind of the NVMe service in a run: the table the service tells
 /// after the burst at the start and the lines of a new longest (`step_line::longest`).
-fn step_rows(lines: &[String]) -> Vec<(usize, u64, u64)> {
+fn step_rows(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
     longest_steps(lines, blk_probe::BLK_TAG)
 }
 
@@ -785,10 +785,15 @@ fn steps() -> Result<(), String> {
     expect(&lines, &measured(true, disk_lines(&layout)[..4].to_vec()))?;
     // The full scenario under the same measurement: every method of the service comes.
     let full = full_run(true)?;
-    let both = |tag: &str| merge(longest_steps(&lines, tag), longest_steps(&full, tag));
-    let pkgd = both(PKGD_TAG);
-    let blk = both(blk_probe::BLK_TAG);
-    let ram = both(RAM_TAG);
+    let both = |tag: &str| -> Result<_, String> {
+        Ok(merge(
+            longest_steps(&lines, tag)?,
+            longest_steps(&full, tag)?,
+        ))
+    };
+    let pkgd = both(PKGD_TAG)?;
+    let blk = both(blk_probe::BLK_TAG)?;
+    let ram = both(RAM_TAG)?;
     judge("pkgd", &pkgd, &PKGD_STEP_KINDS)?;
     judge("the disk service", &blk, &BLK_STEP_KINDS)?;
     // The file service: the layer calls the worker makes while the main thread answers.
@@ -1350,7 +1355,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     if steps {
         // Every method of the service came, and no step of it, the heartbeat's and the
         // interrupt's included, is past 0.9 of term B.
-        let mut blk = step_rows(&first);
+        let mut blk = step_rows(&first)?;
         // A line of a step is told only when it is a new longest of its kind, and with the lines
         // of the services glued together under -icount one may be lost: a kind that did not come
         // is looked for in a run on a fresh disk, two more at most, and the longest of each kind
@@ -1373,7 +1378,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
                 BOOT_TIMEOUT * 40,
             )?;
             expect_within(&again, &steady_lines(&world))?;
-            blk = merge(blk, step_rows(&again));
+            blk = merge(blk, step_rows(&again)?);
             lost.push(lost_records(&again));
             runs += 1;
         }
@@ -2873,7 +2878,7 @@ mod tests {
         let mut lines = console(&LOST_START);
         lines.push("[kernel log: 23 records lost]".to_owned());
         assert_eq!(lost_records(&lines), [16, 23]);
-        let rows = longest_steps(&lines, blk_probe::BLK_TAG);
+        let rows = longest_steps(&lines, blk_probe::BLK_TAG).unwrap();
         let kinds = [(1, "Info"), (2, "Read"), (5, "Buffer"), (6, "Take")];
         let why = judge("the NVMe service", &rows, &kinds).unwrap_err();
         assert!(why.contains("no step Info"), "{why}");
@@ -2889,13 +2894,13 @@ mod tests {
             "service table: 15 kind 6 5064 ticks detail 0 preempts 0",
             "service table: 15 kind 66 779 ticks detail 0 preempts 0",
         ]));
-        let rows = step_rows(&lines);
+        let rows = step_rows(&lines).unwrap();
         let kinds = [(1, "Info"), (2, "Read"), (5, "Buffer"), (6, "Take")];
         assert_eq!(judge("the NVMe service", &rows, &kinds), Ok(()));
         assert!(rows.contains(&(5, 8058, 0)));
         // A later line of a longer step wins over the table.
         lines.push("service step: 15 kind 5 9000 ticks detail 0".to_owned());
-        assert!(step_rows(&lines).contains(&(5, 9000, 0)));
+        assert!(step_rows(&lines).unwrap().contains(&(5, 9000, 0)));
     }
 
     #[test]
@@ -2903,7 +2908,7 @@ mod tests {
         let mut lines = console(&LOST_START);
         lines.push("service step: 15 kind 5 8058 ticks detail 0".to_owned());
         lines.push("service step: 15 kind 1 2192 ticks detail 0".to_owned());
-        let rows = longest_steps(&lines, blk_probe::BLK_TAG);
+        let rows = longest_steps(&lines, blk_probe::BLK_TAG).unwrap();
         let kinds = [(1, "Info"), (2, "Read"), (5, "Buffer"), (6, "Take")];
         assert_eq!(judge("the NVMe service", &rows, &kinds), Ok(()));
     }

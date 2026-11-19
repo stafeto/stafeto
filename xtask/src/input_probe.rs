@@ -153,7 +153,7 @@ pub fn verdict(lines: &[String]) -> Result<(), String> {
 /// The steps of the service: every kind came and every row stays under
 /// STEP_MAX.
 pub fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
-    let rows = longest_steps(lines, INPUT_TAG);
+    let rows = longest_steps(lines, INPUT_TAG)?;
     for (kind, name) in STEP_KINDS {
         if !rows.iter().any(|(k, ..)| *k == kind) {
             return Err(format!("the input service: no step {name}: {rows:?}"));

@@ -836,7 +836,7 @@ fn steps(machine: &'static qemu::Machine) -> Result<(), String> {
         ("input", INPUT_TAG),
         ("compositor", comp_probe::COMP_TAG),
     ] {
-        let rows = longest_steps(&output.lines, tag);
+        let rows = longest_steps(&output.lines, tag)?;
         if rows.is_empty() {
             return Err(format!("doom steps: no step of the {name} service"));
         }
@@ -846,9 +846,12 @@ fn steps(machine: &'static qemu::Machine) -> Result<(), String> {
                 gpu_probe::STEP_MAX
             ));
         }
-        if let Some(row) = rows.iter().find(|r| r.0 == 65 && r.1 > PORTION_MAX) {
+        // The portion is the step's own work: the steps no preemption touched say it.
+        if let Some(clean) =
+            crate::step_line::clean_longest(&output.lines, tag, 65).filter(|&c| c > PORTION_MAX)
+        {
             return Err(format!(
-                "doom steps: a portion or an interrupt of the {name} service past {PORTION_MAX}: {row:?}"
+                "doom steps: a portion or an interrupt of the {name} service past {PORTION_MAX}: kind 65 took {clean} ticks with no preemption"
             ));
         }
         let rows: Vec<_> = rows

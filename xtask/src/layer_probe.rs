@@ -397,7 +397,7 @@ fn run(steps: bool) -> Result<Vec<String>, String> {
 /// The steps of the layer methods under -icount (tag 2 is the RAM file service).
 fn steps() -> Result<(), String> {
     let lines = run(true)?;
-    let rows = longest_steps(&lines, "2");
+    let rows = longest_steps(&lines, "2")?;
     let mut worst = 0;
     for &(kind, ticks, detail) in &rows {
         let name = crate::RAM_STEP_KINDS

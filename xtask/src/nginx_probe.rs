@@ -1904,7 +1904,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
 /// kind of `STEP_KINDS` is there, none passes 0.9 of term B, and CLONE stays
 /// within its portion (0.8 of term B).
 fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
-    let rows = crate::net_probe::longest_over_starts(lines);
+    let rows = crate::net_probe::longest_over_starts(lines)?;
     for (kind, name) in STEP_KINDS {
         if !rows.iter().any(|(k, ..)| *k == kind) {
             return Err(format!("the network service: no step {name}: {rows:?}"));

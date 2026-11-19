@@ -242,7 +242,7 @@ pub fn trace_verdict(events: &[qemu::GpuTrace]) -> Result<(), String> {
 /// bounds): every kind came, every row stays under STEP_MAX, and the rows
 /// of the interrupt and of the portions under PORTION_MAX.
 pub fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
-    let rows = longest_steps(lines, GPU_TAG);
+    let rows = longest_steps(lines, GPU_TAG)?;
     for (kind, name) in STEP_KINDS {
         if !rows.iter().any(|(k, ..)| *k == kind) {
             return Err(format!("the display service: no step {name}: {rows:?}"));
