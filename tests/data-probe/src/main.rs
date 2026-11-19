@@ -700,10 +700,10 @@ fn measure_fill(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
     );
     let (_, low) = statfs(c)?;
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
-    sleep(level, 6_000_000_000);
+    sleep(level, 4_000_000_000);
     let (_, after) = statfs(c)?;
     rt::println!(
-        "data-probe: fill free blocks {before} before the removals, {low} right after, {after} after 6 s of quiet"
+        "data-probe: fill free blocks {before} before the removals, {low} right after, {after} after 4 s of quiet"
     );
     rt::println!("data-probe: fill done");
     Ok(())

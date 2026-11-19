@@ -154,6 +154,7 @@ pub struct Profile {
 
 impl Profile {
     /// The bytes of file data the profile writes.
+    #[cfg(test)]
     pub const fn data_bytes(&self) -> u64 {
         self.small_dirs as u64 * self.small_per as u64 * self.small_bytes as u64
             + self.big as u64 * self.big_bytes as u64
