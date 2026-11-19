@@ -389,6 +389,7 @@ dependencies = [
  "proto-comp",
  "proto-gpu",
  "proto-init",
+ "proto-input",
  "proto-wire",
  "rt",
 ]
@@ -1892,6 +1893,17 @@ dependencies = [
  "rt",
  "virtio-drivers",
  "virtio-pci",
+]
+
+[[package]]
+name = "wm"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-comp",
+ "proto-gpu",
+ "proto-wire",
+ "rt",
 ]
 
 [[package]]

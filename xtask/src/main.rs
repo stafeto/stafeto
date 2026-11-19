@@ -2292,9 +2292,11 @@ commands:
             of the compositor and the display driver under -icount; with --hvf under HVF
   focus-probe [--hvf] run the probe of focus and composition of two clients in QEMU: a window
             with an alpha over another, the screen after a click that raises one, after the
-            manager's Alt-Tab and after the second client ended, each compared with QEMU's
+            manager's Super-Tab and after the second client ended, each compared with QEMU's
             screenshot by CRC-32, the keys of the window with the focus alone, a click of
-            QEMU's tablet, and the steps of the services under -icount; with --hvf under HVF
+            QEMU's tablet, then the window manager program with a native client and one of
+            the first revision (the chord, the keys, the manager's end), and the steps of
+            the services under -icount; with --hvf under HVF
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
@@ -10683,9 +10685,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // revision, then the steps of the services under -icount.
         job("comp-probe", || comp_probe::probe(&qemu::VIRT)),
         // Focus and composition of two clients: a window with an alpha over
-        // another, a click and Alt-Tab that switch them, the keys of the
-        // window with the focus alone, a tablet's click, and the steps of
-        // the compositor and of the tablet's driver under -icount.
+        // another, a click and Super-Tab that switch them, the keys of the
+        // window with the focus alone, a tablet's click, the window manager
+        // program with a native client and one of the first revision, and
+        // the steps of the compositor and of the tablet's driver under
+        // -icount.
         job("focus-probe", || focus_probe::probe(&qemu::VIRT)),
         // The input service on virtio-input: keys from the monitor reach
         // the focus, then its steps under -icount.
@@ -10948,6 +10952,8 @@ fn host_tests() -> Result<(), String> {
         "virtio-gpu",
         "--package",
         "compositor",
+        "--package",
+        "wm",
         "--package",
         "proto-input",
         "--package",
@@ -13914,6 +13920,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "compositor",
         "--package",
+        "wm",
+        "--package",
         "virtio-input",
         "--package",
         "virtio-blk",
@@ -14097,6 +14105,8 @@ fn ci_lints() -> Result<(), String> {
         "virtio-gpu",
         "--package",
         "compositor",
+        "--package",
+        "wm",
         "--package",
         "gpu-probe",
         "--package",
@@ -16255,6 +16265,11 @@ mod entropy_in_images_tests {
             ("entropy::VZ_PROGRAMS", &crate::entropy::VZ_PROGRAMS),
             ("comp_probe::PROGRAMS", &crate::comp_probe::PROGRAMS),
             ("focus_probe::PROGRAMS", &crate::focus_probe::PROGRAMS),
+            ("focus_probe::WM_PROGRAMS", &crate::focus_probe::WM_PROGRAMS),
+            (
+                "focus_probe::WM_STEPS_PROGRAMS",
+                &crate::focus_probe::WM_STEPS_PROGRAMS,
+            ),
             (
                 "focus_probe::STEPS_PROGRAMS",
                 &crate::focus_probe::STEPS_PROGRAMS,

@@ -130,6 +130,9 @@ table-gpu = []
 table-comp = []
 # The probe of focus and composition of two clients (xtask focus-probe).
 table-focus = []
+# The probe of the window manager with a keyboard, a client of the first
+# revision and a native client (xtask focus-probe, its second image).
+table-focus-wm = []
 # The network service in the image of the shell, and the image of its probe
 # (xtask net-probe).
 table-net = []

@@ -12,14 +12,32 @@
 //! - `b`, a client with a window of 240 by 180 at (160, 100) whose points
 //!   have an alpha (a half, opaque, none), over the first window: it must see
 //!   the keys of the time it had the focus and no other, and no pointer.
-//! - `m`, the manager: it hears the Alt keys alone (the windows see none),
-//!   and on Alt and Tab it gives the focus and the top place to the window
+//! - `m`, the manager: it hears the Super keys alone (the windows see none),
+//!   and on Super and Tab it gives the focus and the top place to the window
 //!   that has neither.
 //! - `i`, the input: it injects the keys and the pointer of the scene and prints
 //!   the CRC-32 of the screen as it should look after each step (the overlap
 //!   with its transparency, a click that raises the first window, the
 //!   manager's switch, the screen after the second client ended), which xtask
 //!   compares with QEMU's screenshot; the pointer's picture is part of it.
+//!
+//! The image of the window manager (`focus::WM_TABLE`, the second run of
+//! xtask's focus-probe) has the program `wm` (apps/wm) as the manager, with a
+//! keyboard's driver in the image, and three roles of this program:
+//!
+//! - `p`, a native client with a window of 240 by 180 at (40, 40): the focus
+//!   the manager gives it when it is made, the focus it loses when the window
+//!   of the first revision is made, the chord that brings it back, the key
+//!   it gets while it has the focus, and the focus the compositor's own rule
+//!   gives it when the other client ends, must be exactly its list of events.
+//! - `o`, a client of the first revision (the window of the whole screen
+//!   OPEN gives, the keys of the session of focus OPEN gives): the keys it
+//!   reads are those of the time its window had the focus and no others.
+//! - `j`, the input: it injects the keys of the scene (a key to the window
+//!   of the first revision, the chord of Super and Tab, a key to the native
+//!   window, the chord again, a key to the first, the chord that ends the
+//!   manager, a key to the window that kept the focus, and a key to the other
+//!   once the first has ended), and tells when the manager is gone.
 //!
 //! Each check prints its line, and the last of a role says `focus-probe: ok`;
 //! xtask reads them.
@@ -37,6 +55,7 @@ use proto_comp::{
 };
 use proto_gpu::{HEIGHT, WIDTH};
 use proto_init::ServiceArgs;
+use proto_input::Event as KeyEvent;
 use proto_wire::{Status, Writer};
 use rt::handle::{Channel, Memory, Outgoing, Resource};
 use rt::sys::Received;
@@ -64,7 +83,12 @@ const KEY_S: u16 = 31;
 const KEY_D: u16 = 32;
 const KEY_F: u16 = 33;
 const KEY_TAB: u16 = 15;
-const KEY_ALT: u16 = 56;
+const KEY_B: u16 = 48;
+const KEY_C: u16 = 46;
+const KEY_E: u16 = 18;
+const KEY_H: u16 = 35;
+const KEY_Q: u16 = 16;
+const KEY_SUPER: u16 = 125;
 const BTN_LEFT: u16 = 0x110;
 
 /// The windows: the first opaque, the second with an alpha, both 240 by 180.
@@ -114,6 +138,9 @@ fn main(_: u64) -> u64 {
         b"m" => probe.manager(),
         b"i" => probe.input(),
         b"n" => probe.many(),
+        b"p" => probe.wm_new(),
+        b"o" => probe.wm_old(),
+        b"j" => probe.wm_input(),
         _ => Err("an unknown role"),
     };
     match result {
@@ -504,12 +531,40 @@ const B_WANTS: [Want; 7] = [
     (KEY, KEY_D, 1),
     (KEY, KEY_D, 0),
 ];
-/// The manager's: the Alt keys and the Tab under them.
+/// The native client of the window manager's image: the focus of its
+/// making, the focus the window of the first revision took, the chord that
+/// brought it back, its key, the focus the first one's end gave back, its
+/// key.
+const P_WANTS: [Want; 9] = [
+    (FOCUS_IN, 0, 0),
+    (FOCUS_OUT, 0, 0),
+    (FOCUS_IN, 0, 0),
+    (KEY, KEY_B, 1),
+    (KEY, KEY_B, 0),
+    (FOCUS_OUT, 0, 0),
+    (FOCUS_IN, 0, 0),
+    (KEY, KEY_F, 1),
+    (KEY, KEY_F, 0),
+];
+/// The keys the client of the first revision reads.
+const O_WANTS: [(u16, i32); 8] = [
+    (KEY_A, 1),
+    (KEY_A, 0),
+    // Held while the focus leaves: the compositor releases it, and the real
+    // release, made while the other window has the focus, comes to nobody.
+    (KEY_H, 1),
+    (KEY_H, 0),
+    (KEY_C, 1),
+    (KEY_C, 0),
+    (KEY_E, 1),
+    (KEY_E, 0),
+];
+/// The manager's: the Super keys and the Tab under them.
 const M_WANTS: [Want; 4] = [
-    (KEY, KEY_ALT, 1),
+    (KEY, KEY_SUPER, 1),
     (KEY, KEY_TAB, 1),
     (KEY, KEY_TAB, 0),
-    (KEY, KEY_ALT, 0),
+    (KEY, KEY_SUPER, 0),
 ];
 
 impl Probe<'_> {
@@ -549,7 +604,39 @@ impl Probe<'_> {
                 }
             }
             if n == 0 && !self.wait_bits(EVENTS_BIT) {
+                rt::println!("focus-probe: no event of a window in {WAIT_NS} ns");
                 return Err("the events never came");
+            }
+        }
+    }
+
+    /// Takes the events of a window that has no channel of its own to say
+    /// they came (the window of the first revision: OPEN gives none), by
+    /// asking again after a pause, until `each` says it has enough (true);
+    /// the events it saw are printed as they come, so that a failure shows
+    /// the last of them.
+    fn poll(
+        &self,
+        name: &str,
+        session: &Handle<Channel>,
+        mut each: impl FnMut(&Event) -> Result<bool, &'static str>,
+    ) -> Result<(), &'static str> {
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        loop {
+            let mut out = [Event::default(); MAX_EVENTS];
+            let (n, _) = self.events(session, &mut out).map_err(say("EVENTS"))?;
+            for e in &out[..n] {
+                rt::println!("focus-probe: {name}: event {e:?}");
+                if each(e)? {
+                    return Ok(());
+                }
+            }
+            if n == 0 {
+                if time::ticks_to_ns(time::now()) > end {
+                    rt::println!("focus-probe: {name}: no event in {WAIT_NS} ns");
+                    return Err("the events never came");
+                }
+                self.sleep(RETRY_NS);
             }
         }
     }
@@ -725,7 +812,7 @@ impl Probe<'_> {
             }
             Ok(seen == M_WANTS.len())
         })?;
-        rt::println!("focus-probe: the manager heard the Alt keys and the windows did not");
+        rt::println!("focus-probe: the manager heard the Super keys and the windows did not");
         if cfg!(feature = "quick") {
             // The manager runs while the many windows are made (the run under
             // -icount): they take no focus from it.
@@ -808,6 +895,14 @@ impl Probe<'_> {
                 return Ok(d);
             }
             if time::ticks_to_ns(time::now()) > end {
+                rt::println!(
+                    "focus-probe: {what}: the service said created {} open {} frames {} busy {} manager {}",
+                    d.created,
+                    d.open,
+                    d.frames,
+                    d.busy,
+                    d.flags & HAS_MANAGER != 0
+                );
                 return Err(what);
             }
             self.sleep(RETRY_NS);
@@ -932,8 +1027,8 @@ impl Probe<'_> {
         );
         self.sleep(SNAPSHOT_NS);
         self.key(&display, KEY_S)?;
-        // Alt and Tab are the manager's.
-        for (code, value) in [(KEY_ALT, 1), (KEY_TAB, 1), (KEY_TAB, 0), (KEY_ALT, 0)] {
+        // Super and Tab are the manager's.
+        for (code, value) in [(KEY_SUPER, 1), (KEY_TAB, 1), (KEY_TAB, 0), (KEY_SUPER, 0)] {
             self.inject(&display, Event::new(KEY, code, value))?;
         }
         self.until(&display, "the manager never switched the windows", |n| {
@@ -964,6 +1059,228 @@ impl Probe<'_> {
             self.wait_open(&display, 1)?;
         }
         // The focus passed to the first window.
+        self.key(&display, KEY_F)?;
+        rt::println!("focus-probe: the keys are injected");
+        Ok(())
+    }
+}
+
+// ------------------------------------------------------------ the window manager's image
+
+impl Probe<'_> {
+    /// The native client of the window manager's image.
+    fn wm_new(self) -> Result<(), &'static str> {
+        let display = self.display()?;
+        self.describe_when_ready(&display)?;
+        self.until(&display, "the manager never subscribed", |d| {
+            d.flags & HAS_MANAGER != 0
+        })?;
+        let (window, _) = self
+            .create_as(&display, A, FORMAT_XRGB8888)
+            .map_err(say("WINDOW_CREATE"))?;
+        let stride = A.w * 4;
+        let (objects, at) = self.buffers(1, u64::from(stride) * u64::from(A.h))?;
+        self.attach_as(&window, stride, &objects[..1], FORMAT_XRGB8888)
+            .map_err(say("ATTACH"))?;
+        for y in 0..A.h {
+            for x in 0..A.w {
+                // SAFETY: `buffers` mapped this object for writing at this
+                // address; the probe is the only user, in one thread.
+                unsafe {
+                    (at[0] as *mut u32)
+                        .add((y * A.w + x) as usize)
+                        .write(a_point(x, y))
+                };
+            }
+        }
+        self.post(&window, 0, &[]).map_err(say("POST"))?;
+        rt::println!("focus-probe: p window is up");
+        let mut seen = 0;
+        self.watch(&window, |e| {
+            rt::println!("focus-probe: p: event {e:?}");
+            let got = (e.kind, e.code, e.value);
+            if seen >= P_WANTS.len() || got != P_WANTS[seen] {
+                rt::println!("focus-probe: p: event {seen} is {got:?}");
+                return Err("an event of the native client is not the one expected");
+            }
+            seen += 1;
+            Ok(seen == P_WANTS.len())
+        })?;
+        rt::println!("focus-probe: p events are exactly the focus and the keys it had");
+        // The window stays until the end of the injector's scene would show a
+        // key it should not have: the last events come from the compositor
+        // at once, and a stray one would be in the ring by now.
+        self.sleep(200_000_000);
+        let mut out = [Event::default(); MAX_EVENTS];
+        let (n, _) = self.events(&window, &mut out).map_err(say("EVENTS"))?;
+        if n != 0 {
+            rt::println!("focus-probe: p: a late event {:?}", out[0]);
+            return Err("the native client got an event after its list");
+        }
+        Ok(())
+    }
+
+    /// The client of the first revision: OPEN, a pattern, FLUSH, and the
+    /// keys of its session of focus.
+    fn wm_old(self) -> Result<(), &'static str> {
+        let display = self.display()?;
+        self.describe_when_ready(&display)?;
+        // The native client's window is on the screen and the manager is
+        // there: this window is made after the first one.
+        self.until(&display, "the native window never came", |d| {
+            d.flags & HAS_MANAGER != 0 && d.created >= 1 && d.frames >= 1
+        })?;
+        let open = proto_gpu::Method::Open.header().bytes();
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        let (status, mut reply) = loop {
+            let (status, reply) = call(&display, &open).map_err(say("OPEN"))?;
+            if status != proto_gpu::code(proto_gpu::CLEARING) {
+                break (status, reply);
+            }
+            if time::ticks_to_ns(time::now()) > end {
+                return Err("OPEN says CLEARING for good");
+            }
+            self.sleep(RETRY_NS);
+        };
+        if status != Status::Ok {
+            return Err("OPEN gave no session of focus (the image has a keyboard)");
+        }
+        let (Ok(memory), Ok(owner), Ok(focus)) = (
+            reply.handles.take::<Memory>(0),
+            reply.handles.take::<Channel>(1),
+            reply.handles.take::<Channel>(2),
+        ) else {
+            return Err("OPEN's handles");
+        };
+        let at = MAP_AT + self.maps.get() * MAP_STEP;
+        self.maps.set(self.maps.get() + 1);
+        sys::mem_map(
+            self.process,
+            &memory,
+            0,
+            u64::from(proto_gpu::SCREEN_BYTES),
+            at,
+            Access::ReadWrite,
+        )
+        .map_err(say("map the buffer"))?;
+        // SAFETY: mapped for reading and writing just above; one thread.
+        let points = unsafe {
+            core::slice::from_raw_parts_mut(
+                at as *mut u32,
+                (proto_gpu::STRIDE / 4 * HEIGHT) as usize,
+            )
+        };
+        points.fill(0x0020_4060);
+        let mut w = Writer::new();
+        proto_gpu::Rect::SCREEN
+            .write(&mut w)
+            .map_err(say("FLUSH's bytes"))?;
+        plain(&owner, w.as_bytes()).map_err(say("FLUSH"))?;
+        // The window is shown. The manager answers its making with FOCUS: the
+        // window says so with FOCUS_IN in its ring.
+        self.poll("o", &owner, |e| Ok(e.kind == FOCUS_IN))?;
+        // A window made and closed again tells the injector that all of it
+        // happened: the windows made are three and the open ones two.
+        let (marker, _) = self
+            .create_as(
+                &display,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                },
+                FORMAT_XRGB8888,
+            )
+            .map_err(say("WINDOW_CREATE of the marker"))?;
+        drop(marker);
+        rt::println!("focus-probe: o window is up");
+        let mut seen = 0;
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        while seen < O_WANTS.len() {
+            let mut request = Writer::new();
+            proto_input::write_read(32, &mut request).map_err(say("READ's bytes"))?;
+            let reply = sys::send(&focus, request.as_bytes()).map_err(say("READ"))?;
+            let mut buffer = [0; MESSAGE_MAX];
+            let mut wrong = None;
+            let mut got = 0;
+            proto_input::read_events(reply.bytes(&mut buffer), |e: KeyEvent| {
+                rt::println!("focus-probe: o: key event {e:?}");
+                got += 1;
+                let key = (e.code, e.value);
+                if e.kind != proto_input::EV_KEY || seen >= O_WANTS.len() || key != O_WANTS[seen] {
+                    wrong.get_or_insert(e);
+                } else {
+                    seen += 1;
+                }
+            })
+            .map_err(say("READ's reply"))?;
+            if let Some(e) = wrong {
+                rt::println!("focus-probe: o: key event {seen} is {e:?}");
+                return Err("the client of the first revision read a key it should not");
+            }
+            if got == 0 {
+                if time::ticks_to_ns(time::now()) > end {
+                    rt::println!("focus-probe: o: {seen} of {} keys came", O_WANTS.len());
+                    return Err("the keys never came");
+                }
+                self.sleep(RETRY_NS);
+            }
+        }
+        rt::println!("focus-probe: o keys are exactly the keys it had");
+        Ok(())
+    }
+
+    /// The chord of Super and Tab, injected.
+    fn chord(&self, display: &Handle<Channel>, code: u16) -> Result<(), &'static str> {
+        for (key, value) in [(KEY_SUPER, 1), (code, 1), (code, 0), (KEY_SUPER, 0)] {
+            self.inject(display, Event::new(KEY, key, value))?;
+        }
+        Ok(())
+    }
+
+    /// The input of the window manager's image.
+    fn wm_input(self) -> Result<(), &'static str> {
+        let display = self.display()?;
+        self.describe_when_ready(&display)?;
+        // Both windows are on the screen, the manager answered the making of
+        // each, and the client of the first revision made and closed its
+        // marker window to say so (three windows made, two open).
+        self.until(&display, "the windows and the manager never came", |d| {
+            d.open == 2 && d.created == 3 && d.flags & HAS_MANAGER != 0
+        })?;
+        // The window of the first revision was made last: the manager gave
+        // it the focus, and the key is its.
+        self.key(&display, KEY_A)?;
+        // A key it holds while the focus leaves.
+        self.inject(&display, Event::new(KEY, KEY_H, 1))?;
+        // The chord: the focus passes to the native window, and the
+        // manager's FOCUS raises it, a frame.
+        let d = self.until(&display, "the screen never settled", |_| true)?;
+        self.chord(&display, KEY_TAB)?;
+        let d = self.until(&display, "the chord never switched the windows", |n| {
+            n.frames > d.frames
+        })?;
+        self.inject(&display, Event::new(KEY, KEY_H, 0))?;
+        self.key(&display, KEY_B)?;
+        // And back to the window of the first revision.
+        self.chord(&display, KEY_TAB)?;
+        self.until(&display, "the second chord never switched back", |n| {
+            n.frames > d.frames
+        })?;
+        self.key(&display, KEY_C)?;
+        rt::println!("focus-probe: the chords are injected");
+        // The manager ends on its chord; the compositor goes on.
+        self.chord(&display, KEY_Q)?;
+        self.until(&display, "the manager never ended", |n| {
+            n.flags & HAS_MANAGER == 0
+        })?;
+        rt::println!("focus-probe: the manager is gone and the compositor answers");
+        // The focus stays where it was: the key is the first client's, which
+        // ends on it; the focus then passes to the window on top by the
+        // compositor's rule.
+        self.key(&display, KEY_E)?;
+        self.until(&display, "the first client never went", |n| n.open == 1)?;
         self.key(&display, KEY_F)?;
         rt::println!("focus-probe: the keys are injected");
         Ok(())
