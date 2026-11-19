@@ -1209,6 +1209,9 @@ mod tests {
                 (152, 16),
                 (76, 16),
                 (76, 32),
+                (640, 1),
+                (640, 8),
+                (640, 13),
             ] {
                 let ticks =
                     call + (row * u64::from(h) + point * u64::from(w) * u64::from(h)).div_ceil(100);
@@ -1219,7 +1222,7 @@ mod tests {
             }
         }
         let shapes = shape_costs(&lines, COMP_TAG);
-        assert_eq!(shapes.len(), 39);
+        assert_eq!(shapes.len(), 48);
         let (fit, slack) = fit_of(&shapes, "copy").unwrap();
         assert!(fit.call >= 760 && fit.call <= 761, "{fit:?}");
         assert!(slack <= 2, "{slack}");

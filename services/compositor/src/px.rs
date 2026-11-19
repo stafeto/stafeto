@@ -351,11 +351,19 @@ pub mod calibration {
     use super::{Pixman, Px, Source, Target, composite, fill};
     use core::cell::UnsafeCell;
 
-    /// The scratch surfaces: 160 by 32 points each, in bss (10 pages of the two).
-    const WIDTH: u32 = 160;
-    const HEIGHT: u32 = 32;
-    const STRIDE: u32 = WIDTH * 4;
-    const BYTES: usize = (STRIDE * HEIGHT) as usize;
+    /// The scratch surfaces, in memory of the program (17 pages of the two): 648 by 13 points for
+    /// the shapes of the width of the screen (640 and the offset of up to 3
+    /// points), and the same memory as 160 by 32 points (stride of 640 bytes)
+    /// for the others.
+    const WIDE: u32 = 648;
+    const WIDE_HEIGHT: u32 = 13;
+    const WIDE_STRIDE: u32 = WIDE * 4;
+    const BYTES: usize = (WIDE_STRIDE * WIDE_HEIGHT) as usize;
+    const NARROW: u32 = 160;
+    const NARROW_HEIGHT: u32 = 32;
+    const NARROW_STRIDE: u32 = NARROW * 4;
+    const NARROW_BYTES: usize = (NARROW_STRIDE * NARROW_HEIGHT) as usize;
+    const _: () = assert!(NARROW_BYTES <= BYTES);
 
     #[repr(align(64))]
     struct Surface(UnsafeCell<[u8; BYTES]>);
@@ -406,7 +414,7 @@ pub mod calibration {
     /// The shapes, width by height, with the class each tells: 0 the call, 1 the
     /// row, 2 the point, 3 only the fit (wider than 8 points, in one row). The
     /// pairs of one width and two heights give the cost of a row at that width.
-    const SHAPES: [(u32, u32, u8); 23] = [
+    const SHAPES: [(u32, u32, u8); 26] = [
         (1, 1, 0),
         (2, 1, 0),
         (4, 1, 0),
@@ -430,6 +438,9 @@ pub mod calibration {
         (64, 32, 2),
         (150, 8, 2),
         (150, 16, 2),
+        (640, 1, 3),
+        (640, 8, 2),
+        (640, 13, 2),
     ];
     const REPEAT: u32 = 3;
 
@@ -470,12 +481,25 @@ pub mod calibration {
                         for turn in 0..=REPEAT {
                             // SAFETY: the main thread alone touches the scratch.
                             let (dst, src) = unsafe { (&mut *DST.0.get(), &*SRC.0.get()) };
+                            // The width of the screen on the wide surface, the
+                            // others on the narrow one (the same memory).
+                            let (dst, src, stride, width, height) = if w > 160 {
+                                (&mut dst[..], &src[..], WIDE_STRIDE, WIDE, WIDE_HEIGHT)
+                            } else {
+                                (
+                                    &mut dst[..NARROW_BYTES],
+                                    &src[..NARROW_BYTES],
+                                    NARROW_STRIDE,
+                                    NARROW,
+                                    NARROW_HEIGHT,
+                                )
+                            };
                             let mut target = Target {
                                 bytes: dst,
                                 format: Px::Xrgb8888,
-                                stride: STRIDE,
-                                width: WIDTH,
-                                height: HEIGHT,
+                                stride,
+                                width,
+                                height,
                             };
                             let from = Source {
                                 bytes: src,
@@ -484,9 +508,9 @@ pub mod calibration {
                                 } else {
                                     Px::Xrgb8888
                                 },
-                                stride: STRIDE,
-                                width: WIDTH,
-                                height: HEIGHT,
+                                stride,
+                                width,
+                                height,
                             };
                             let images = &mut px.images;
                             let ticks = timed(thread, || {

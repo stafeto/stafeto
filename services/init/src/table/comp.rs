@@ -56,7 +56,10 @@ pub const COMPOSITOR: Record = Record {
     }),
     priority: 32,
     ceiling: 32,
-    quota: 150 * PAGE,
+    // 150 pages held the plain program with 13 spare; the program of the steps build
+    // (the probes' images) holds the scratch surfaces of the calibration of the
+    // prices (17 pages, `px::calibration`) and needs 157, so the record has 164.
+    quota: 164 * PAGE,
     handle_limit: 128,
     restart: Restart::Always,
     console: true,

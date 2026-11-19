@@ -94,6 +94,20 @@ pub const BAND_TICKS: u32 = 15_000;
 /// so three terms suffice, and the model overstates a narrow tall shape (4 by
 /// 32: by 273 ticks for the black, 1 104 for a copy, 3 203 for a layer laid over
 /// others), which only makes a band of a narrow damage smaller than it could be.
+/// The widths of the shapes go up to 152 points and include 640 (the width of
+/// the screen: 640 by 1, 8 and 13 lines), the width of the main band of the
+/// table. Under -icount the time is instructions: there is no cold cache, no
+/// miss of a translation, no first touch of a buffer (the buffers are mapped in
+/// advance), and the one cache of the service that can be cold, pixman's table of
+/// fast paths, is warmed at the start (`px::Pixman::warm`: the three
+/// combinations of operation and formats the service uses); the bounds of the
+/// bands under -icount therefore hold no cold cache, and on HVF and on a board it
+/// is in the measures of the hour and of the stage of the board. The lines
+/// `service raster` are wall time: a 640 by 8 copy shown there at 3.64 ticks a
+/// point is about 18 600 ticks, while the step of the band that holds it is at
+/// most 10 528 of the thread's own time, so the greatest of those lines holds the
+/// levels above that ran in the middle and the interrupts; only the lines of the
+/// steps judge a band.
 /// The alignment of the target and of the source changes an operation by up to
 /// half (a layer laid over others 64 by 32: 9 932 to 15 532 ticks), and the
 /// greatest is what the fit takes.

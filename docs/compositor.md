@@ -303,13 +303,23 @@ ticks measured on 23 shapes of operations under -icount, with a margin of 15 %:
 the model errs only high), and a band holds the lines of the damage's width that
 15 000 ticks leave after its
 calls, down the damage and across it, so that eight windows in one band stay
-under the bound, and then goes to the driver
+under the bound (the shapes measured go up to the width of the screen), and then goes to the driver
 as COMMIT of the changed rectangle. COMMIT is proto_gpu's second revision:
 SUBSCRIBE gives the driver the compositor's channel once, COMMIT answers as
 soon as the commands are in the device's queue, and the driver says
 `FRAME_SHOWN` (or `FRAME_FAILED`) on that channel when the device is done.
 FLUSH of the first revision still waits inside the driver, for the programs
 that speak to the driver directly (the image of `gpu-probe`).
+
+The prices are measured under -icount, where time is instructions: there is no
+cold cache, no miss of a translation and no first touch of a buffer (the buffers
+are mapped in advance), and pixman's table of fast paths, the one cache that can
+be cold, is warmed at the start with the three combinations the service uses. On
+HVF and on a board a cold cache shows in the measures. The lines `service raster`
+of the probes are wall time, and the greatest of them holds the levels above that
+ran in the middle and the interrupts (a 640 by 8 copy shown at 3.64 a point is
+about 18 600 ticks, while the band step that holds it is at most 10 528 of the
+thread's own time): only the lines of the steps judge a band.
 
 ## The direct frame
 
