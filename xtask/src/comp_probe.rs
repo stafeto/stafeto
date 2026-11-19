@@ -334,11 +334,21 @@ pub fn raster_costs(lines: &[String], tag: &str) -> Vec<RasterCost> {
     out
 }
 
+/// The row of the compositor's table of prices of a kind of layer.
+fn price(kind: &str) -> compositor::Price {
+    compositor::PRICES
+        .iter()
+        .copied()
+        .find(|p| p.kind == kind)
+        .unwrap_or(compositor::PRICES[2])
+}
+
 /// The costs for the report of a probe: the ticks a point (mean, least and
 /// greatest over the big operations) and a small operation (least and
-/// greatest), against the constants of `Scene::tile`. The coordinator sets
-/// OPAQUE_TICKS (copy), OVER_TICKS (over), FILL_TICKS (black) and CALL_TICKS
-/// from the greatest of a point, rounded up, and BAND_TICKS stays.
+/// greatest), against the table of prices of `Scene::tile` (`compositor::PRICES`:
+/// the measure and the constant of each kind, hundredths of a tick a point). The
+/// greatest of a point goes into the table as the measure, and its constant
+/// follows with the margin; BAND_TICKS stays.
 pub fn raster_text(costs: &[RasterCost]) -> String {
     if costs.is_empty() {
         return "no cost lines (the log lost them, or the frames came too few)".to_owned();
@@ -348,13 +358,10 @@ pub fn raster_text(costs: &[RasterCost]) -> String {
         .map(|c| {
             let hundredths = |v: u64| format!("{}.{:02}", v / 100, v % 100);
             format!(
-                "{} (now {}): {} calls, {} points, a point mean {} least {} greatest {}, an operation of 8 points or fewer least {} greatest {}",
+                "{} (table: measure {} constant {}): {} calls, {} points, a point mean {} least {} greatest {}, an operation of 8 points or fewer least {} greatest {}",
                 c.kind,
-                match c.kind.as_str() {
-                    "black" => compositor::FILL_TICKS,
-                    "copy" => compositor::OPAQUE_TICKS,
-                    _ => compositor::OVER_TICKS,
-                },
+                hundredths(u64::from(price(&c.kind).measured)),
+                hundredths(u64::from(price(&c.kind).constant)),
                 c.calls,
                 c.points,
                 hundredths(c.mean_per_hundred()),
@@ -655,7 +662,7 @@ mod tests {
         assert_eq!(costs[1].big_worst, 2500);
         let text = raster_text(&costs);
         assert!(text.contains(
-            "copy (now 3): 6 calls, 1800 points, a point mean 2.77 least 2.70 greatest 3.30"
+            "copy (table: measure 1.90 constant 2.19): 6 calls, 1800 points, a point mean 2.77 least 2.70 greatest 3.30"
         ));
         assert!(raster_text(&[]).contains("no cost lines"));
     }

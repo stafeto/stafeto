@@ -291,13 +291,15 @@ megabyte at most.
 
 A frame takes the posted buffer of every window at its start, is made in
 bands, a step each (the compositor's own bit starts the next band, so requests
-of clients pass between bands). A band that only copies is eight lines of the
-damage's width under a window that covers the damage, and four where it starts
-black (pixman's fill costs about twice its copy). A band that lays something
+of clients pass between bands). A band that only copies is nine lines of the
+damage's width under a window that covers the damage (at most 16 lines), and
+fewer where it starts black. A band that lays something
 over others (a window with an alpha, the pointer's picture) holds fewer points:
-each shown window that touches the damage is a call of pixman (about 1 500 ticks)
-and a number of ticks a point (3 for a copy, 25 for a layer laid over others, 4
-for the black), and a band holds the points that 15 000 ticks leave after its
+each shown window that touches the damage is a call of pixman (1 495 ticks)
+and a price a point (`compositor::PRICES`: 2.19 ticks for a copy, 20.13 for a
+layer laid over others, 3.22 for the black; each is a measure of the layer on
+pixman's NEON paths with a margin of 15 %, and the table holds the measure
+beside its constant), and a band holds the points that 15 000 ticks leave after its
 calls, down the damage and across it, so that eight windows in one band stay
 under the bound, and then goes to the driver
 as COMMIT of the changed rectangle. COMMIT is proto_gpu's second revision:
@@ -459,8 +461,7 @@ under 16 328 ticks).
 
 ## Not yet
 
-The period of a frame and its counters, a window's resize, the constants of
-the bands set from the NEON costs (the probes report them), the window manager
+The period of a frame and its counters, a window's resize, the window manager
 and the keyboard in the base image (the manager's image is the probe's), the
 pointer in the base image, the layers of the display
 controller, a window of the second revision shown directly (the flag `SCANOUT`
