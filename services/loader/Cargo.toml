@@ -47,6 +47,7 @@ abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
 dynlink = { path = "../../lib/dynlink" }
 posix-random = { path = "../../lib/posix-random" }
+proto-data = { path = "../../proto/data" }
 proto-entropy = { path = "../../proto/entropy" }
 proto-fs = { path = "../../proto/fs" }
 proto-net = { path = "../../proto/net" }
