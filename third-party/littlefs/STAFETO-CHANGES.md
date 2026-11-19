@@ -37,12 +37,17 @@ trailing underscore, as the functions around them do. The attribute buffer is re
 The data file service (`lib/datafs`) keeps the owner, the mode, the times and the file number of
 every entry as one user attribute of 48 bytes, and a directory listing needs it for every
 entry. The release reads an attribute by path (`lfs_getattr`), which looks the path up again.
-Measured on the host (`lib/datafs/src/tests_scale.rs`, `tests_entry_attr.rs`), listing a directory
-of 1,000 entries costs 42 to 45 reads of the device, with the attribute of each entry by path
-about 24,500 reads (entries with no attribute) or 98,000 (entries with a 48-byte attribute), and
-with `lfs_dir_read_attr` 42 and 2,680 reads. A `stat` with its attribute at depth 2 costs 18 reads
-as two lookups and 9 as one. Without the change the service would limit a directory to a few
-hundred entries.
+Measured on the host (`lib/datafs/src/tests_entry_attr.rs`), with the read size of the data
+service, a block of 4096 bytes, and the device reads counted on a volume just mounted: listing a
+directory of 1,000 entries that have no attribute costs 42 reads, and with the attribute of each
+entry by path 24,492. For entries that carry the 48-byte attribute, as the service keeps them,
+the listing alone costs 140 reads (123 to 146 after the attributes were rewritten three times) and
+with `lfs_dir_read_attr` the same, where the attribute of each entry by path costs 72,602. A `stat`
+with its attribute at depth 2 costs 9 reads, the same as the stat alone, and 18 as two lookups.
+The cost depends on the layout of the pairs: with the read size of one sector of 512 bytes the
+listing of the same directory cost 1,791 reads (5,505 after three rewrites), and the iterator
+added about 0.9 read for each entry. The plan of the service caps a directory at 1,024 entries,
+which these figures cover.
 
 ## Against which release
 
@@ -58,7 +63,7 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 6dd74dfc58ac93589f8e002bb73c0830a59206912cfe8c951c07eb2bd5fccad0  SPEC.md
 2a8b3459d74b9fa8bdd947738522c46331739405b1fc3d70f057f636a1dea768  DESIGN.md
 dcbdc815892164b427b0835e6a1f06d7a240b0cf4d66814c9bfb1448442b3726  lfs.c (with the change)
-2afa00be8b8322d8ddef8ad8e4fa7c462c673424d3b1f730db1de4866bc7fbf8  lfs.h (with the change)
+361a9b1292e01e5ef48c918caceee14c585e77be3665b711575f0f1bed277953  lfs.h (with the change)
 ```
 
 `tools/check-littlefs.py` (run by `cargo xtask ci` as "littlefs sources") fails when a file of the

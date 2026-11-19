@@ -391,6 +391,8 @@ int datafs_stat(struct datafs *d, void *ctx, const char *path, uint8_t *type, ui
                 char *name)
 {
     struct lfs_info info;
+    // lfs_stat leaves the size of a directory and of the root as it was: start from zero.
+    memset(&info, 0, sizeof(info));
     d->ctx = ctx;
     int err = lfs_stat(&d->lfs, path, &info);
     if (err < 0) {
@@ -521,6 +523,7 @@ int datafs_stat_attr(struct datafs *d, void *ctx, const char *path, uint8_t *typ
 {
     struct lfs_info info;
     lfs_ssize_t found = LFS_ERR_NOATTR;
+    memset(&info, 0, sizeof(info));
     d->ctx = ctx;
     int err = lfs_stat_attr(&d->lfs, path, &info, attr, buffer, bufsize, &found);
     if (err < 0) {

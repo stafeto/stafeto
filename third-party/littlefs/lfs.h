@@ -704,6 +704,10 @@ int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info);
 // is the size of the attribute of the entry on disk, or LFS_ERR_NOATTR when
 // the entry has none: always for "." and "..", which are not entries of a
 // metadata pair.
+//
+// When reading the attribute fails with an error of the device, the iterator
+// has already advanced past the entry: a caller that wants to try again must
+// take lfs_dir_tell before the call and lfs_dir_seek back to it.
 int lfs_dir_read_attr(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info,
         uint8_t type, void *buffer, lfs_size_t size, lfs_ssize_t *res);
 

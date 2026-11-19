@@ -149,7 +149,7 @@ index c83c7e0b..dfaa0ca5 100644
      int err = LFS_LOCK(lfs->cfg);
      if (err) {
 diff --git a/third-party/littlefs/lfs.h b/third-party/littlefs/lfs.h
-index 8fbd5b47..98930ef1 100644
+index 8fbd5b47..34ab26be 100644
 --- a/third-party/littlefs/lfs.h
 +++ b/third-party/littlefs/lfs.h
 @@ -526,6 +526,16 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
@@ -169,7 +169,7 @@ index 8fbd5b47..98930ef1 100644
  // Get a custom attribute
  //
  // Custom attributes are uniquely identified by an 8-bit type and limited
-@@ -686,6 +696,17 @@ int lfs_dir_close(lfs_t *lfs, lfs_dir_t *dir);
+@@ -686,6 +696,21 @@ int lfs_dir_close(lfs_t *lfs, lfs_dir_t *dir);
  // or a negative error code on failure.
  int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info);
  
@@ -181,6 +181,10 @@ index 8fbd5b47..98930ef1 100644
 +// is the size of the attribute of the entry on disk, or LFS_ERR_NOATTR when
 +// the entry has none: always for "." and "..", which are not entries of a
 +// metadata pair.
++//
++// When reading the attribute fails with an error of the device, the iterator
++// has already advanced past the entry: a caller that wants to try again must
++// take lfs_dir_tell before the call and lfs_dir_seek back to it.
 +int lfs_dir_read_attr(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info,
 +        uint8_t type, void *buffer, lfs_size_t size, lfs_ssize_t *res);
 +

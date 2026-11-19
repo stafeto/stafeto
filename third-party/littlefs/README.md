@@ -31,7 +31,7 @@ With the change (`lfs.c` and `lfs.h` as they stand in this directory):
 
 ```
 dcbdc815892164b427b0835e6a1f06d7a240b0cf4d66814c9bfb1448442b3726  lfs.c
-2afa00be8b8322d8ddef8ad8e4fa7c462c673424d3b1f730db1de4866bc7fbf8  lfs.h
+361a9b1292e01e5ef48c918caceee14c585e77be3665b711575f0f1bed277953  lfs.h
 ```
 
 `SPEC.md` and `DESIGN.md` describe the on-disk format and the design, for the reader of

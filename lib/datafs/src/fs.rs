@@ -823,13 +823,11 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// The code littlefs gives for an entry with no attribute of the asked type.
-const NO_ATTRIBUTE: i32 = -61;
-
-/// The size of the attribute on disk, or None when the entry has none.
+/// The size of the attribute on disk, or None when the entry has none (the code of
+/// `Error::NoAttr`).
 fn attribute_size(found: i32) -> Res<Option<usize>> {
     match found {
-        NO_ATTRIBUTE => Ok(None),
+        n if n == Error::NoAttr.code() => Ok(None),
         n if n >= 0 => Ok(Some(n as usize)),
         n => Err(Error::from_code(n)),
     }
@@ -846,7 +844,7 @@ impl<D: Device> Fs<'_, D> {
         out: &mut [u8],
     ) -> Res<Option<(Entry, Option<usize>)>> {
         let (mut kind, mut size, mut name) = (0u8, 0u32, [0u8; NAME_MAX + 1]);
-        let mut found = NO_ATTRIBUTE;
+        let mut found = Error::NoAttr.code();
         let room = u32::try_from(out.len()).unwrap_or(u32::MAX);
         // SAFETY: as `readdir`; `out` holds `room` bytes and `found` is a word.
         let more = check(self.call(|d, ctx| unsafe {
@@ -886,7 +884,7 @@ impl<D: Device> Fs<'_, D> {
     ) -> Res<(Info, Option<usize>)> {
         let path = CPath::new(path)?;
         let (mut kind, mut size, mut name) = (0u8, 0u32, [0u8; NAME_MAX + 1]);
-        let mut found = NO_ATTRIBUTE;
+        let mut found = Error::NoAttr.code();
         let room = u32::try_from(out.len()).unwrap_or(u32::MAX);
         // SAFETY: as `stat`; `out` holds `room` bytes and `found` is a word.
         check(self.call(|d, ctx| unsafe {

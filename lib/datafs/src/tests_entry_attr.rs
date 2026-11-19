@@ -46,15 +46,19 @@ fn reads(fs: &mut Vol) -> u64 {
 }
 
 /// The attribute an entry of the working directory should have: none for every seventh entry, a
-/// short one for every eleventh, 48 bytes of the index for the others.
+/// short one for every eleventh, 48 bytes for the others. The first two bytes are the index and
+/// the others depend on it, so no two entries have the same bytes.
 fn attribute_of(i: usize) -> Option<Vec<u8>> {
     if i.is_multiple_of(7) {
-        None
-    } else if i.is_multiple_of(11) {
-        Some(std::vec![i as u8; 8])
-    } else {
-        Some(std::vec![(i >> 2) as u8; 48])
+        return None;
     }
+    let len = if i.is_multiple_of(11) { 8 } else { 48 };
+    let mut bytes = std::vec![0u8; len];
+    bytes[..2].copy_from_slice(&(i as u16).to_le_bytes());
+    for (k, byte) in bytes.iter_mut().enumerate().skip(2) {
+        *byte = (k as u8) ^ (i as u8);
+    }
+    Some(bytes)
 }
 
 fn name_of(i: usize) -> String {
@@ -237,11 +241,11 @@ fn a_directory_of_entries_with_no_attribute_is_read_with_its_attributes_for_abou
     assert!(attributed <= plain + 2 * ENTRIES as u64);
 }
 
-/// The directory as the service keeps it, every entry with its 48-byte attribute: the attributes
-/// make the pairs larger, so the listing alone costs more, and the iterator adds under one read
-/// for each entry where a getattr by path adds about a hundred.
+/// The directory as the service keeps it, every entry with its 48-byte attribute: the listing with
+/// the attributes costs the reads of the listing alone (no more than half a read for each entry),
+/// and a `getattr` of each path adds more than fifty times that.
 #[test]
-fn a_directory_of_entries_with_attributes_adds_under_two_reads_for_each_entry() {
+fn a_directory_of_entries_with_attributes_is_listed_with_them_for_the_reads_of_the_listing() {
     let mut fs = fresh();
     fs.mkdir(b"/w").unwrap();
     make_entries(&mut fs, 0, ENTRIES);
@@ -250,13 +254,40 @@ fn a_directory_of_entries_with_attributes_adds_under_two_reads_for_each_entry() 
         "1,000 entries with attributes: readdir {plain} reads; readdir_attr {attributed}; \
          readdir and getattr of each path {by_paths}"
     );
+    assert!(attributed <= ENTRIES as u64 / 2, "{attributed} reads");
     assert!(
-        attributed <= plain + 2 * ENTRIES as u64,
-        "{attributed} reads with the attributes, {plain} without"
+        attributed <= plain + 100,
+        "{attributed} reads against {plain}"
     );
     assert!(
-        by_paths > 10 * attributed,
+        by_paths > 50 * attributed,
         "{by_paths} against {attributed}"
+    );
+}
+
+/// The same after every attribute was rewritten three times, as updates of the times and `chmod`
+/// do: the log of each pair is longer, and the listing with the attributes still costs half a
+/// read for each entry at most.
+#[test]
+fn a_directory_whose_attributes_were_rewritten_three_times_is_listed_for_half_a_read_an_entry() {
+    let mut fs = fresh();
+    fs.mkdir(b"/w").unwrap();
+    make_entries(&mut fs, 0, ENTRIES);
+    for round in 1..=3u8 {
+        for i in 0..ENTRIES {
+            let path = format!("/w/{}", name_of(i));
+            fs.setattr(path.as_bytes(), ATTR, &[round ^ i as u8; 48])
+                .unwrap();
+        }
+    }
+    let (plain, attributed, _) = directory_costs(fs);
+    println!(
+        "1,000 entries rewritten three times: readdir {plain} reads; readdir_attr {attributed}"
+    );
+    assert!(attributed <= ENTRIES as u64 / 2, "{attributed} reads");
+    assert!(
+        attributed <= plain + 100,
+        "{attributed} reads against {plain}"
     );
 }
 
@@ -293,7 +324,50 @@ fn a_stat_with_its_attribute_at_depth_two_costs_no_more_than_the_stat() {
     // The attribute is in the pair the stat has just read: it costs nothing more, where a getattr
     // by path repeats the whole lookup.
     assert!(one <= plain, "{one} reads against {plain}");
+    // An absolute bound: a path of depth 2 costs 9 reads, a few more for each level.
+    assert!(one <= 12, "{one} reads");
     assert!(one * 3 <= two * 2, "{one} reads against {two}");
+}
+
+#[test]
+fn a_stat_with_its_attribute_at_depth_eight_costs_no_more_than_thirty_two_reads() {
+    let mut fs = fresh();
+    let mut path = String::new();
+    for d in 0..8 {
+        path.push_str(&format!("/d{d}"));
+        fs.mkdir(path.as_bytes()).unwrap();
+    }
+    path.push_str("/f");
+    let f = fs
+        .open(path.as_bytes(), Open::WRITE.with(Open::CREATE))
+        .unwrap();
+    fs.close(f).unwrap();
+    fs.setattr(path.as_bytes(), ATTR, &[5u8; 48]).unwrap();
+    let mut cold = restarted(fs);
+    let mut b = [0u8; 48];
+    let at = reads(&mut cold);
+    let (_, size) = cold.stat_attr(path.as_bytes(), ATTR, &mut b).unwrap();
+    let one = reads(&mut cold) - at;
+    assert_eq!(size, Some(48));
+    println!("stat with its attribute at depth 8: {one} reads");
+    assert!(one <= 32, "{one} reads");
+}
+
+/// The size of a directory is 0: littlefs's stat leaves the field of `info` as it was, and the
+/// wrappers start from a cleared one.
+#[test]
+fn the_size_of_a_directory_and_of_the_root_is_zero() {
+    let mut fs = fresh();
+    fs.mkdir(b"/w").unwrap();
+    let mut b = [0u8; 48];
+    for path in [&b"/"[..], b"/w"] {
+        assert_eq!(fs.stat(path).unwrap().size, 0);
+        let (info, size) = fs.stat_attr(path, ATTR, &mut b).unwrap();
+        assert_eq!(
+            (info.kind, info.size, size),
+            (crate::Kind::Directory, 0, None)
+        );
+    }
 }
 
 #[test]
@@ -328,4 +402,97 @@ fn removing_entries_while_iterating_keeps_each_attribute_with_its_entry() {
     }
     fs.closedir(d).unwrap();
     assert!(seen >= 100, "{seen} entries seen");
+}
+
+fn lap(fs: &mut Vol, at: &mut u64) -> u64 {
+    let now = reads(fs);
+    let d = now - *at;
+    *at = now;
+    d
+}
+
+/// The reads of the main jobs of the service on a volume just mounted, for the directory of `n`
+/// entries after `rewrites` rewrites of every attribute (what updates of the times and `chmod`
+/// do). Printed as a table row by `scale_the_read_size`.
+fn costs(n: usize, rewrites: usize) -> [u64; 8] {
+    let mut fs = fresh();
+    fs.mkdir(b"/w").unwrap();
+    make_entries(&mut fs, 0, n);
+    for round in 1..=rewrites {
+        for i in 0..n {
+            let path = format!("/w/{}", name_of(i));
+            fs.setattr(path.as_bytes(), ATTR, &[round as u8 ^ i as u8; 48])
+                .unwrap();
+        }
+    }
+    let mut deep = String::new();
+    for d in 0..8 {
+        deep.push_str(&format!("/d{d}"));
+        fs.mkdir(deep.as_bytes()).unwrap();
+    }
+    for path in ["/d0/d1/f", "/d0/d1/d2/d3/d4/d5/d6/d7/f"] {
+        let f = fs
+            .open(path.as_bytes(), Open::WRITE.with(Open::CREATE))
+            .unwrap();
+        fs.close(f).unwrap();
+        fs.setattr(path.as_bytes(), ATTR, &[3u8; 48]).unwrap();
+    }
+    let mut out = [0u64; 8];
+    let mut b = [0u8; 48];
+    // The reads of the mount: the device counts from its creation, and a restart keeps the count
+    // of the device it was given, so the mount is what `restarted` adds.
+    let before = reads(&mut fs);
+    let mut cold = restarted(fs);
+    out[0] = reads(&mut cold) - before;
+    let mut at = reads(&mut cold);
+    cold.used_blocks().unwrap();
+    out[1] = lap(&mut cold, &mut at);
+    let mut cold = restarted(cold);
+    at = reads(&mut cold);
+    cold.stat_attr(b"/d0/d1/f", ATTR, &mut b).unwrap();
+    out[2] = lap(&mut cold, &mut at);
+    let mut cold = restarted(cold);
+    at = reads(&mut cold);
+    cold.stat_attr(b"/d0/d1/d2/d3/d4/d5/d6/d7/f", ATTR, &mut b)
+        .unwrap();
+    out[3] = lap(&mut cold, &mut at);
+    let mut cold = restarted(cold);
+    at = reads(&mut cold);
+    let f = cold
+        .open(b"/w/new", Open::WRITE.with(Open::CREATE))
+        .unwrap();
+    cold.close(f).unwrap();
+    cold.setattr(b"/w/new", ATTR, &[1u8; 48]).unwrap();
+    out[4] = lap(&mut cold, &mut at);
+    let mut cold = restarted(cold);
+    at = reads(&mut cold);
+    let d = cold.opendir(b"/w").unwrap();
+    while cold.readdir(d).unwrap().is_some() {}
+    out[5] = lap(&mut cold, &mut at);
+    cold.closedir(d).unwrap();
+    let mut cold = restarted(cold);
+    at = reads(&mut cold);
+    let d = cold.opendir(b"/w").unwrap();
+    while cold.readdir_attr(d, ATTR, &mut b).unwrap().is_some() {}
+    out[6] = lap(&mut cold, &mut at);
+    cold.closedir(d).unwrap();
+    out[7] = cold.device().read_sectors;
+    out
+}
+
+/// Prints the table of the plan for the read size of the volume: run by name,
+/// `cargo test -p datafs --lib scale_the_read_size -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn scale_the_read_size() {
+    println!(
+        "| entries | rewrites | mount | first walk | stat_attr depth 2 | stat_attr depth 8 | create | readdir | readdir_attr |"
+    );
+    for (n, rewrites) in [(100, 0), (1000, 0), (100, 3), (1000, 3)] {
+        let c = costs(n, rewrites);
+        println!(
+            "| {n} | {rewrites} | {} | {} | {} | {} | {} | {} | {} |",
+            c[0], c[1], c[2], c[3], c[4], c[5], c[6]
+        );
+    }
 }

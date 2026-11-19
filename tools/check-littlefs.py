@@ -38,7 +38,7 @@ UPSTREAM = {
 # The two files the change touches, with the change.
 CHANGED = {
     "lfs.c": "dcbdc815892164b427b0835e6a1f06d7a240b0cf4d66814c9bfb1448442b3726",
-    "lfs.h": "2afa00be8b8322d8ddef8ad8e4fa7c462c673424d3b1f730db1de4866bc7fbf8",
+    "lfs.h": "361a9b1292e01e5ef48c918caceee14c585e77be3665b711575f0f1bed277953",
 }
 PATCH = "stafeto-changes.patch"
 DOCS = ("README.md", "STAFETO-CHANGES.md")
@@ -68,8 +68,8 @@ def check():
             for name in CHANGED:
                 shutil.copy(DIR / name, base / name)
             run = subprocess.run(
-                ["patch", "-R", "-p1", "-s", "-d", tmp, "-i", str(patch)],
-                capture_output=True, text=True)
+                ["patch", "-R", "-f", "-p1", "-s", "-d", tmp, "-i", str(patch)],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL)
             if run.returncode != 0:
                 problems.append(f"{PATCH} does not reverse on the tree: {run.stdout}{run.stderr}")
             else:
@@ -79,11 +79,13 @@ def check():
                             f"{name} with {PATCH} reversed is not the release: the change in the "
                             f"tree is not the change the patch states")
 
-    # No other source of the library.
-    known = set(UPSTREAM) | {PATCH, "build.rs", "Cargo.toml", "README.md", "STAFETO-CHANGES.md"}
-    for path in DIR.iterdir():
-        if path.is_file() and path.name not in known:
-            problems.append(f"{path.name}: a file that is neither the release nor the change")
+    # No other file in the directory or below it.
+    known = set(UPSTREAM) | {PATCH, "build.rs", "Cargo.toml", "README.md", "STAFETO-CHANGES.md",
+                             "src/lib.rs"}
+    for path in sorted(DIR.rglob("*")):
+        name = path.relative_to(DIR).as_posix()
+        if path.is_file() and name not in known:
+            problems.append(f"{name}: a file that is neither the release nor the change")
 
     # The documents name the same checksums.
     for doc in DOCS:
