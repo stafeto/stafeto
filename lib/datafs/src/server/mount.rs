@@ -61,6 +61,13 @@ pub struct Mounted {
     pub complete: bool,
 }
 
+/// What the work before READY did, each part with its own result (a failure of one leaves the others).
+pub struct StartWork {
+    pub recovered: Result<Recovered, Error>,
+    pub mounted: Result<Mounted, Error>,
+    pub epoch: Result<u32, Error>,
+}
+
 /// The depth of directories the conversion goes to.
 const CONVERT_DEPTH: usize = 32;
 
@@ -110,6 +117,25 @@ pub enum Step {
 }
 
 impl Server {
+    /// Everything the service does between the mount and READY: what a stop or a cut left under the
+    /// orphans, the mount work (the format mark and the count of pairs) and the count of the epoch. It
+    /// makes no commit that needs a block: the first allocation of a volume scans the allocator's
+    /// window, which traverses every file's blocks (about 100,000 reads for 760 MiB of files, 34 s
+    /// before READY in the first fill run), so the hidden directory of the orphans is made afterwards
+    /// (`ensure_orphans`, a job of the worker after READY) and `orphan` makes it when it is missing.
+    /// The reads of this are bounded by the pairs of the volume (two for each, for the count), and a
+    /// test holds it to a number on a volume full of files.
+    pub fn start_work<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> StartWork {
+        let recovered = recover_orphans(fs);
+        let mounted = self.mount_work(fs);
+        let epoch = bump_epoch(fs);
+        StartWork {
+            recovered,
+            mounted,
+            epoch,
+        }
+    }
+
     /// The work after the mount before READY, bounded and cheap: the orphans are dealt with by the
     /// caller, and this reads the format mark and counts the pairs and the directories. A volume whose
     /// format mark is above `VOLUME_FORMAT` is refused and left as it is. A volume with the mark 4

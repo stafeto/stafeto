@@ -529,10 +529,9 @@ fn mount_work(volume: &mut Option<Volume>, clock: &mut Clock) {
     if let Some(fs) = volume.as_mut() {
         // The time of the first job, and of the records the mount work writes, is not 0.
         server.set_now(clock.now_ns());
-        if datafs::server::ensure_orphans(fs).is_err() {
-            rt::println!("datafs: the directory of the orphans could not be made");
-        }
-        match datafs::server::recover_orphans(fs) {
+        // The directory of the orphans is made after READY (see `Server::start_work`).
+        let start = server.start_work(fs);
+        match start.recovered {
             Ok(done) if done.removed + done.restored + done.failed == 0 => {}
             Ok(done) => rt::println!(
                 "datafs: orphans: {} removed, {} put back, {} left",
@@ -542,7 +541,7 @@ fn mount_work(volume: &mut Option<Volume>, clock: &mut Clock) {
             ),
             Err(_) => rt::println!("datafs: the orphans could not be dealt with"),
         }
-        match server.mount_work(fs) {
+        match start.mounted {
             Ok(done) if done.refused => {
                 rt::println!(
                     "datafs: the volume's format is newer than this service's: left alone and refused"
@@ -554,7 +553,7 @@ fn mount_work(volume: &mut Option<Volume>, clock: &mut Clock) {
             Ok(_) => {}
             Err(_) => rt::println!("datafs: the attributes of the volume could not be made"),
         }
-        match datafs::server::bump_epoch(fs) {
+        match start.epoch {
             Ok(count) => epoch = count,
             Err(_) => rt::println!("datafs: the epoch could not be kept, the clock's is used"),
         }
@@ -579,6 +578,7 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
     let timer = sys::timer_create(&kicks, LEVEL).ok();
     let mut idle = Idle {
         first_pending: volume.is_some(),
+        orphans_pending: volume.is_some(),
         last_job: rt::time::ticks_to_ns(rt::time::now()),
         refresh_failed: false,
         tries: 0,
@@ -680,6 +680,20 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             loop {
                 let _ = sys::receive(&kicks);
             }
+        }
+        // The queue is empty. The first job after READY makes the hidden directory of the orphans: the
+        // commit takes a block, and the first allocation of a volume scans the allocator's window (a
+        // traversal of every file's blocks), which READY must not wait for.
+        if idle.orphans_pending
+            && !STOPPING.load(Acquire)
+            && let Some(fs) = volume.as_mut()
+        {
+            idle.orphans_pending = false;
+            if datafs::server::ensure_orphans(fs).is_err() {
+                rt::println!("datafs: the directory of the orphans could not be made");
+            }
+            tell_pairs();
+            continue;
         }
         // The queue is empty. The conversion job of the mount work goes first, one entry a step: the
         // loop above serves every job that has come before the next step, so a request waits for at
@@ -789,6 +803,8 @@ fn tell_pairs() {
 struct Idle {
     /// The first walk after the mount has not been made yet.
     first_pending: bool,
+    /// The hidden directory of the orphans is still to be made (the first job after READY).
+    orphans_pending: bool,
     /// The instant the last job ended, in nanoseconds.
     last_job: u64,
     /// A refresh walk failed: no more of them in this instance (the disk is not answering well).

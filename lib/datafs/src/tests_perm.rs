@@ -2800,3 +2800,85 @@ fn ready_does_not_wait_for_the_job_and_a_request_is_served_between_its_steps() {
         "a step read {longest} blocks: a request would wait for it"
     );
 }
+
+/// A volume made offline as the fill probe makes it: files of 1 MiB and small ones, no hidden
+/// directory of the orphans, no mark and no attribute.
+fn volume_full_of_files() -> (MemDevice, u64) {
+    let mut state = Storage::new();
+    let mut fs = Fs::new(MemDevice::new(131_072), &mut state).unwrap();
+    fs.format().unwrap();
+    fs.mount().unwrap();
+    let chunk = vec![0x5au8; 4096];
+    fs.mkdir(b"/big").unwrap();
+    for n in 0..30 {
+        let f = fs
+            .open(
+                std::format!("/big/b{n}").as_bytes(),
+                crate::Open::WRITE.with(crate::Open::CREATE),
+            )
+            .unwrap();
+        for _ in 0..256 {
+            fs.write(f, &chunk).unwrap();
+        }
+        fs.close(f).unwrap();
+    }
+    fs.mkdir(b"/small").unwrap();
+    for n in 0..200 {
+        let f = fs
+            .open(
+                std::format!("/small/s{n:03}").as_bytes(),
+                crate::Open::WRITE.with(crate::Open::CREATE),
+            )
+            .unwrap();
+        fs.write(f, &chunk[..2000]).unwrap();
+        fs.close(f).unwrap();
+    }
+    let used = fs.used_blocks().unwrap();
+    fs.unmount().unwrap();
+    (fs.into_device(), used)
+}
+
+/// The most reads the work before READY may take on a volume full of files made offline: the count of
+/// the pairs (about two reads each) and the reads of the mark, the epoch and the orphans' directory.
+const READY_READS_MAX: u64 = 1_500;
+
+#[test]
+fn the_work_before_ready_does_not_traverse_the_files_of_a_volume_full_of_them() {
+    let (device, used) = volume_full_of_files();
+    assert!(used > 7_000, "{used} blocks used");
+    let mut state = Storage::new();
+    let mut fs = Fs::new(device.clone(), &mut state).unwrap();
+    fs.mount().unwrap();
+    let reads = fs.device().reads;
+    let mut server = Server::new();
+    let start = server.start_work(&mut fs);
+    assert!(start.mounted.is_ok() && start.epoch.is_ok());
+    let spent = fs.device().reads - reads;
+    std::println!("the work before READY: {spent} reads on a volume of {used} blocks");
+    assert!(
+        spent <= READY_READS_MAX,
+        "{spent} reads before READY on a volume of {used} blocks: something allocated"
+    );
+    // The same volume with the hidden directory made at the mount (the earlier order): the first
+    // allocation scans the window, a traversal of every file's blocks.
+    let mut state = Storage::new();
+    let mut fs = Fs::new(device, &mut state).unwrap();
+    fs.mount().unwrap();
+    let reads = fs.device().reads;
+    server::ensure_orphans(&mut fs).unwrap();
+    let mut server = Server::new();
+    server.start_work(&mut fs);
+    let before = fs.device().reads - reads;
+    std::println!("with the directory of the orphans made first: {before} reads");
+    assert!(
+        before > used / 4,
+        "{before} reads: the test cannot tell the order apart"
+    );
+    // After READY the directory is made by its own job.
+    let mut state = Storage::new();
+    let mut fs = Fs::new(MemDevice::new(131_072), &mut state).unwrap();
+    fs.format().unwrap();
+    fs.mount().unwrap();
+    server::ensure_orphans(&mut fs).unwrap();
+    assert!(fs.stat(server::ORPHANS).is_ok());
+}

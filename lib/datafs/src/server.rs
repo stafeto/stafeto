@@ -37,7 +37,7 @@ use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 mod mount;
 mod names;
 
-pub use mount::{Mounted, Recovered, Step, bump_epoch, ensure_orphans, recover_orphans};
+pub use mount::{Mounted, Recovered, StartWork, Step, bump_epoch, ensure_orphans, recover_orphans};
 use names::{denied, entry_of, split, stat_record};
 
 /// The sessions of the table: the loop of the service holds as many.
