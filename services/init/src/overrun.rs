@@ -19,6 +19,13 @@
 //! stopped, once its window has passed. The totals run across the instances
 //! of a record: a restart makes new budgets under the same labels.
 //!
+//! The kernel counts an overrun for each exhausted piece of the budget. The
+//! queue of a budget holds up to `abi::SS_REPL_MAX` pieces, and each block of
+//! its thread splits the capacity, so a service that blocks often can exhaust
+//! up to four pieces in one period: a count above the number of periods is
+//! normal, and it does not measure the size of the excess. The share of the
+//! periods in which the budget ran out is the figure that compares services.
+//!
 //! The work for a flood of overruns is bounded: a notification costs one
 //! lookup in a table of `SLOTS` places and two additions, whatever its count
 //! is (init never loops over the overruns), the kernel posts at most
