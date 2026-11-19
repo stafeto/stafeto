@@ -653,6 +653,24 @@ fn measure_fill(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
         "rmdir",
     )?;
     rt::println!("data-probe: fill rmdir {} us", now_us() - at);
+    // The rest of the empty directories, the oldest first: a `rm -rf` of 199 directories, each of
+    // which looks the pair before it up in the list of every pair of the volume.
+    let begun = now_us();
+    for n in 1..200u32 {
+        let mut name = [0u8; 16];
+        name[..6].copy_from_slice(b"/rm/e");
+        let mut digits = [0u8; 4];
+        let d = decimal(n, &mut digits);
+        name[5..5 + d].copy_from_slice(&digits[..d]);
+        wire(
+            c.call(|w| p::path_call(Method::Rmdir, &name[..5 + d], w)),
+            "rmdir e",
+        )?;
+    }
+    rt::println!(
+        "data-probe: fill rm -rf 199 directories {} us",
+        now_us() - begun
+    );
     // A file of 8 MiB written in the largest writes: the longest call is the walk or the compaction
     // that the window and the pairs of the volume take inside one request.
     let handle = wire(

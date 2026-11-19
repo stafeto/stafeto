@@ -467,7 +467,8 @@ pub fn crash(args: &[String]) -> Result<(), String> {
 
 /// The lines of the service and of the probe that a measurement run reports, in the order they came.
 fn report(lines: &[String], what: &str) {
-    const WANTED: [&str; 11] = [
+    const WANTED: [&str; 12] = [
+        "datafs: pairs ",
         "datafs: walk own work",
         "datafs: ready after",
         "datafs: first walk",
@@ -590,10 +591,15 @@ struct Checked {
 }
 
 /// The reads a call needs by table 4.2 of the plan as amended by the review of step 5: RMDIR of the
-/// oldest directory at the cap of 1,024 pairs (about 3.2 reads for each pair), the listing of 1,000
-/// entries, and a write (the 393 reads of the creation and write of 1 MiB, rounded up).
-const RMDIR_READS: u64 = 3_300;
+/// oldest directory costs 3.2 reads for each pair of the volume (the pairs are read from the line
+/// `datafs: pairs N of 2048, directories M of 1024`), a `rm -rf` of D directories 1.6 reads for each
+/// pair for each directory (measured 1.53 on the host at 1,010 directories in 2,148 pairs), the
+/// listing of 1,000 entries, and a write (the 393 reads of the creation and write of 1 MiB, rounded
+/// up).
 const READDIR_READS: u64 = 197;
+/// The caps of the volume (`proto_data::PAIRS_MAX` and `DIRS_MAX`).
+const PAIRS_CAP: u64 = 2048;
+const DIRS_CAP: u64 = 1024;
 const WRITE_READS: u64 = 400;
 /// The first walk of a full volume takes at most this long (limit 4.3).
 const WALK_MS_LIMIT: u64 = 60_000;
@@ -637,15 +643,53 @@ fn fill_checks(settled: &[String], measured: &[String], cpus: usize) -> Result<C
         qemu::number_after(measured, prefix)
             .ok_or_else(|| format!("no number after {prefix:?} in the measuring boot"))
     };
-    let rmdir = number("data-probe: fill rmdir ")?;
-    let bound = allowed(RMDIR_READS);
-    if rmdir > bound {
+    // The pairs and the directories of the volume, from the count at the mount of the measuring boot.
+    let counts: Vec<(u64, u64)> = measured
+        .iter()
+        .filter_map(|l| {
+            let one = [l.clone()];
+            l.contains("datafs: pairs ")
+                .then(|| {
+                    Some((
+                        qemu::number_after(&one, "datafs: pairs ")?,
+                        qemu::number_after(&one, ", directories ")?,
+                    ))
+                })
+                .flatten()
+        })
+        .collect();
+    let &(pairs, dirs) = counts
+        .first()
+        .ok_or("no line `datafs: pairs N of 2048, directories M of 1024` in the measuring boot")?;
+    if pairs == 0 || pairs > PAIRS_CAP || dirs > DIRS_CAP {
         return Err(format!(
-            "RMDIR of the oldest directory took {rmdir} us, over {bound} us ({RMDIR_READS} reads of table 4.2 at {rate} a second, margin 1.5)"
+            "the volume has {pairs} pairs and {dirs} directories, over the caps of {PAIRS_CAP} and {DIRS_CAP}"
         ));
     }
     lines.push(format!(
-        "RMDIR {rmdir} us <= {bound} us ({RMDIR_READS} reads, table 4.2): ok"
+        "the volume has {pairs} pairs of {PAIRS_CAP} and {dirs} directories of {DIRS_CAP}: ok"
+    ));
+    let rmdir = number("data-probe: fill rmdir ")?;
+    let rmdir_reads = pairs * 32 / 10;
+    let bound = allowed(rmdir_reads);
+    if rmdir > bound {
+        return Err(format!(
+            "RMDIR of the oldest directory took {rmdir} us, over {bound} us (3.2 x {pairs} pairs = {rmdir_reads} reads of table 4.2 at {rate} a second, margin 1.5)"
+        ));
+    }
+    lines.push(format!(
+        "RMDIR {rmdir} us <= {bound} us (3.2 reads for each of {pairs} pairs, table 4.2): ok"
+    ));
+    let tree = number("data-probe: fill rm -rf 199 directories ")?;
+    let tree_reads = 199 * pairs * 16 / 10;
+    let bound = allowed(tree_reads);
+    if tree > bound {
+        return Err(format!(
+            "rm -rf of 199 directories took {tree} us, over {bound} us (1.6 x 199 x {pairs} = {tree_reads} reads at {rate} a second, margin 1.5)"
+        ));
+    }
+    lines.push(format!(
+        "rm -rf of 199 directories {tree} us <= {bound} us (1.6 reads for each pair for each directory): ok"
     ));
     let calls = number("data-probe: fill readdir 1002 entries in ")?;
     let total = number(&format!("{calls} calls, total "))?;
@@ -792,7 +836,9 @@ mod tests {
         let mut measured = lines(&[
             "data-probe: fill first call 90 us, 261888 blocks, 60000 free",
             "data-probe: fill readdir 1002 entries in 3 calls, total 30000 us, longest 20000 us",
-            "data-probe: fill rmdir 300000 us",
+            "data-probe: fill rmdir 150000 us",
+            "data-probe: fill rm -rf 199 directories 15000000 us",
+            "datafs: pairs 400 of 2048, directories 230 of 1024",
             "data-probe: fill write 8388608 bytes in 9000 calls, total 900000 us, longest call 90000 us",
             "data-probe: fill free blocks 60000 before the removals, 60040 right after, 158000 after 4 s of quiet",
             "datafs: refresh walk 100000 blocks used, about 98304 given back, 100000 reads, 10000 ms",
@@ -816,9 +862,14 @@ mod tests {
             let measured: Vec<String> = measured.iter().map(|l| l.replace(from, to)).collect();
             super::fill_checks(&settled, &measured, cpus)
         };
-        // RMDIR over 1.5 times 3,300 reads at 10,000 a second (495 ms).
-        assert!(slow("rmdir 300000 us", "rmdir 496000 us", 2).is_err());
-        assert!(slow("rmdir 300000 us", "rmdir 495000 us", 2).is_ok());
+        // RMDIR over 1.5 times 3.2 x 400 pairs = 1,280 reads at 10,000 a second (192 ms).
+        assert!(slow("rmdir 150000 us", "rmdir 192001 us", 2).is_err());
+        assert!(slow("rmdir 150000 us", "rmdir 192000 us", 2).is_ok());
+        // rm -rf of 199 directories: 1.5 times 1.6 x 199 x 400 = 127,360 reads (19.104 s).
+        assert!(slow("directories 15000000 us", "directories 19104001 us", 2).is_err());
+        assert!(slow("directories 15000000 us", "directories 19104000 us", 2).is_ok());
+        // Pairs over the cap, or no line of the count.
+        assert!(slow("pairs 400 of", "pairs 2049 of", 2).is_err());
         // The listing over 1.5 times 197 reads and 2 ms for each of 3 calls.
         assert!(slow("total 30000 us", "total 35550 us", 2).is_ok());
         assert!(slow("total 30000 us", "total 35551 us", 2).is_err());
