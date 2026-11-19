@@ -17,6 +17,7 @@ abi = { path = "../../lib/abi" }
 proto-comp = { path = "../../proto/comp" }
 proto-gpu = { path = "../../proto/gpu" }
 proto-init = { path = "../../proto/init" }
+proto-input = { path = "../../proto/input" }
 proto-wire = { path = "../../proto/wire" }
 rt = { path = "../../lib/rt" }
 

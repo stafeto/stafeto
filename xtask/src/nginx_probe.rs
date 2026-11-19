@@ -795,6 +795,43 @@ fn stat_numbers(line: &str) -> Option<(u32, u64)> {
     Some((sessions, kib))
 }
 
+/// The size of the pieces nginx sends a file in (`output_buffers 2 32k` of
+/// tools/nginx/nginx.conf, `sendfile off`).
+const SEND_PIECE: usize = 32 * 1024;
+
+/// Whether `grown` KiB (the difference of two readings of the counter) show
+/// that `answers` answers of `len` bytes went through the shared buffers.
+///
+/// A call of more than `proto_net::DATA_MAX` bytes goes through a cell and the
+/// counter takes every byte it carries; a call of at most that many goes in
+/// the message and the counter does not see it. nginx sends a file in pieces
+/// of `SEND_PIECE` on a non-blocking socket, so when the queue of the socket
+/// takes only a part of a piece, the call that sends the rest may be one of at
+/// most `DATA_MAX` bytes. The rest of a piece is smaller after each partial
+/// send, so at most one such call (of at most `DATA_MAX` bytes) falls to each
+/// piece, and the header of the answer goes in a message too. The counter also
+/// takes the bytes of the requests, which are read through a cell (a buffer of
+/// 1 KiB, more than `DATA_MAX`); that only raises it.
+///
+/// The readings are whole KiB, each rounded down, so two of them differ from
+/// the true growth by less than 1 KiB either way. The least growth that passes
+/// is the bytes of the answers less the most that messages may carry (a
+/// piece each) less 1 KiB for the rounding. A fall-back of the whole path
+/// leaves growth near zero and fails.
+fn through_buffers(grown: u64, answers: usize, len: usize) -> Result<(), String> {
+    let pieces = answers * len.div_ceil(SEND_PIECE);
+    let by_message = (pieces * proto_net::DATA_MAX).div_ceil(1024) as u64;
+    let total = (answers * len / 1024) as u64;
+    let least = total - by_message - 1;
+    if grown < least {
+        return Err(format!(
+            "the shared buffers carried {grown} KiB for {answers} answers of {} KiB (wanted {least} at least: {total} KiB less {by_message} KiB that messages may carry less 1 KiB of rounding): the answers did not go through them",
+            len / 1024
+        ));
+    }
+    Ok(())
+}
+
 /// Step 4: five answers of 256 KiB through the shared buffers, five of 10 KiB.
 fn large_files(run: &mut qemu::Run, address: SocketAddr) -> Result<(), String> {
     let (_, before) = buffered(run)?;
@@ -812,12 +849,7 @@ fn large_files(run: &mut qemu::Run, address: SocketAddr) -> Result<(), String> {
     let (sessions, after) = buffered(run)?;
     let answer = fetched.iter().sum::<Duration>() / LARGE_FETCHES as u32;
     let grown = after.wrapping_sub(before);
-    let wanted = (LARGE_FETCHES * WWW_256K_LEN / 1024) as u64;
-    if grown < wanted {
-        return Err(format!(
-            "the shared buffers carried {grown} KiB for {LARGE_FETCHES} answers of 256 KiB (wanted {wanted} at least): the answers did not go through them"
-        ));
-    }
+    through_buffers(grown, LARGE_FETCHES, WWW_256K_LEN)?;
     for n in 0..SMALL_FETCHES {
         let body = Connection::open(address, READ_WITHIN)
             .and_then(|mut c| c.get("/10k.bin"))
@@ -934,11 +966,12 @@ fn reload(run: &mut qemu::Run, address: SocketAddr, old: &[u32]) -> Result<(), S
         || single_page(address),
     )?;
     let grown = after.wrapping_sub(before);
-    if sessions as usize != WORKERS || grown < (WWW_256K_LEN / 1024) as u64 {
+    if sessions as usize != WORKERS {
         return Err(format!(
-            "after the reload {sessions} sessions hold a shared buffer (wanted {WORKERS}, one for each new worker) and an answer of 256 KiB carried {grown} KiB through them"
+            "after the reload {sessions} sessions hold a shared buffer (wanted {WORKERS}, one for each new worker)"
         ));
     }
+    through_buffers(grown, 1, WWW_256K_LEN).map_err(|e| format!("after the reload: {e}"))?;
     println!(
         "nginx-probe: after the reload {sessions} sessions hold a buffer ({} ms after the answer, on single connections), and 256 KiB went through them",
         answered.elapsed().as_millis()
@@ -2217,6 +2250,31 @@ status codes: 1000 2xx, 0 3xx, 0 4xx, 0 5xx
         assert!(
             master_and_workers(&[(40, 0), (41, 0), (42, 65534), (43, 65534), (44, 65534)]).is_err()
         );
+    }
+
+    #[test]
+    fn the_judging_of_the_buffers_takes_the_calls_of_messages_and_the_rounding() {
+        let len = 256 * 1024;
+        // The two readings that failed: 91358 to 91613 for one answer and
+        // 12922 to 14201 for five. A few calls of messages and the rounding
+        // explain both.
+        assert!(through_buffers(91613 - 91358, 1, len).is_ok());
+        assert!(through_buffers(14201 - 12922, 5, len).is_ok());
+        // The readings that passed.
+        for (grown, answers) in [(256, 1), (1280, 5), (1281, 5), (1282, 5)] {
+            assert!(through_buffers(grown, answers, len).is_ok());
+        }
+        // The edges: 8 pieces of 800 bytes are 7 KiB and 1 KiB of rounding.
+        assert!(through_buffers(248, 1, len).is_ok());
+        assert!(through_buffers(247, 1, len).is_err());
+        assert!(through_buffers(1247, 5, len).is_ok());
+        assert!(through_buffers(1246, 5, len).is_err());
+        // The whole path by messages leaves only the requests in the counter.
+        assert!(through_buffers(1, 1, len).is_err());
+        assert!(through_buffers(3, 5, len).is_err());
+        // Half of the bytes by messages fails.
+        assert!(through_buffers(128, 1, len).is_err());
+        assert!(through_buffers(640, 5, len).is_err());
     }
 
     #[test]

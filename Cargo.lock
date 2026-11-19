@@ -389,6 +389,7 @@ dependencies = [
  "proto-comp",
  "proto-gpu",
  "proto-init",
+ "proto-input",
  "proto-wire",
  "rt",
 ]
@@ -1895,11 +1896,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "wm"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-comp",
+ "proto-gpu",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "xtask"
 version = "0.5.1"
 dependencies = [
  "abi",
  "bootimg",
+ "compositor",
  "console-line",
  "datafs",
  "entries",

@@ -9,7 +9,9 @@
 //! share that channel with the methods of proto_gpu's first revision (1, 2,
 //! 3, 8) and keep their numbers apart from them (17 and up). It serves
 //! those too: OPEN gives a program that knows nothing of windows a window
-//! of the whole screen, whose buffer the service makes and FLUSH posts.
+//! of the whole screen, whose buffer the service makes and FLUSH posts, and
+//! whose keys (the session of focus OPEN gives, proto_input's READ) are
+//! those of its ring: they come while the window has the focus.
 //!
 //! | Method | Session | Request | Reply | Refusals |
 //! |---|---|---|---|---|
@@ -65,8 +67,10 @@
 //! `manager`, a label with MANAGER_MARK) lists the windows, moves them,
 //! raises them, shows and hides them, and gives one the focus (MANAGE with
 //! the ops below), and reads CREATE and CLOSE of every window in its own
-//! ring. While a manager has subscribed, the Alt keys and the keys pressed
-//! with Alt held go to it alone: the window with the focus never sees them.
+//! ring. While a manager has subscribed, the Super keys (Linux's
+//! KEY_LEFTMETA and KEY_RIGHTMETA) and the keys pressed with Super held go
+//! to it alone: the window with the focus never sees them. The Alt, Ctrl and
+//! Shift keys stay the windows' (a game of the first revision binds them).
 //!
 //! The input session (a label with INPUT_MARK, given by init to the probes)
 //! injects an event as if the device had made it: a KEY, a MOVE with the
@@ -97,7 +101,7 @@ pub const BUFFER_MAX: u64 = 1 << 20;
 /// The formats of a point: proto_gpu's XRGB8888, and ARGB8888 with the
 /// colour premultiplied by the alpha. 2 is no format (the probes refuse it).
 pub const FORMAT_XRGB8888: u32 = proto_gpu::FORMAT_XRGB8888;
-pub const FORMAT_ARGB8888: u32 = 3;
+pub const FORMAT_ARGB8888: u32 = proto_gpu::FORMAT_ARGB8888;
 
 /// The labels init gives a session of the manager and of the input
 /// (services/init `comp_mark`): bits the service's own labels never have
@@ -681,6 +685,13 @@ pub fn union(a: Option<Rect>, b: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_format_numbers_are_those_of_gpu() {
+        assert_eq!(FORMAT_XRGB8888, 1);
+        assert_eq!(FORMAT_ARGB8888, 3);
+        assert_eq!(proto_gpu::format_bit(2), 0, "2 is no format");
+    }
 
     #[test]
     fn the_methods_keep_their_numbers_apart_from_gpus() {

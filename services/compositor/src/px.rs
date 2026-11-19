@@ -29,6 +29,111 @@ const fn format(f: Format) -> Px {
     }
 }
 
+/// What each kind of layer costs, for the run of the probes under -icount
+/// (feature `steps`): `Pixman` times each of its operations with the
+/// counter, and the service tells the totals after a frame, for the
+/// constants of `compositor::Scene::tile` (OPAQUE_TICKS, OVER_TICKS,
+/// FILL_TICKS, CALL_TICKS) to be set from a run.
+#[cfg(feature = "steps")]
+pub mod cost {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    /// The kinds: the black of a band, a layer copied, a layer laid over
+    /// others (the pointer's picture too).
+    pub const BLACK: usize = 0;
+    pub const COPY: usize = 1;
+    pub const OVER: usize = 2;
+    const NAMES: [&str; 3] = ["black", "copy", "over"];
+    /// An operation of at least BIG points tells the cost of a point (its
+    /// call is a small part of it); one of at most SMALL points tells the
+    /// cost of a call.
+    const BIG: u64 = 64;
+    const SMALL: u64 = 8;
+
+    struct Kind {
+        calls: AtomicU64,
+        points: AtomicU64,
+        ticks: AtomicU64,
+        /// Ticks a hundred points, over the big operations.
+        big_best: AtomicU64,
+        big_worst: AtomicU64,
+        /// Ticks of an operation, over the small ones.
+        small_best: AtomicU64,
+        small_worst: AtomicU64,
+    }
+
+    static KINDS: [Kind; 3] = [const {
+        Kind {
+            calls: AtomicU64::new(0),
+            points: AtomicU64::new(0),
+            ticks: AtomicU64::new(0),
+            big_best: AtomicU64::new(u64::MAX),
+            big_worst: AtomicU64::new(0),
+            small_best: AtomicU64::new(u64::MAX),
+            small_worst: AtomicU64::new(0),
+        }
+    }; 3];
+    /// Frames done, and whether the one that just ended is yet to be told.
+    static FRAMES: AtomicU32 = AtomicU32::new(0);
+    static DUE: AtomicU32 = AtomicU32::new(0);
+
+    /// One operation of `points` points that took `ticks`.
+    pub fn record(kind: usize, points: u64, ticks: u64) {
+        let k = &KINDS[kind];
+        k.calls.fetch_add(1, Ordering::Relaxed);
+        k.points.fetch_add(points, Ordering::Relaxed);
+        k.ticks.fetch_add(ticks, Ordering::Relaxed);
+        if points >= BIG {
+            let per_hundred = ticks * 100 / points;
+            k.big_best.fetch_min(per_hundred, Ordering::Relaxed);
+            k.big_worst.fetch_max(per_hundred, Ordering::Relaxed);
+        } else if points <= SMALL {
+            k.small_best.fetch_min(ticks, Ordering::Relaxed);
+            k.small_worst.fetch_max(ticks, Ordering::Relaxed);
+        }
+    }
+
+    /// A frame ended.
+    pub fn frame_done() {
+        FRAMES.fetch_add(1, Ordering::Relaxed);
+        DUE.store(1, Ordering::Relaxed);
+    }
+
+    /// Runs after each step of the loop (rt::service::step_after): at the
+    /// 1st, 2nd, 4th, 8th... frame it tells the totals so far, a line for
+    /// each kind that has been drawn: `service raster: 17 KIND calls C
+    /// points P ticks T big B W small S L`, B and W the least and the
+    /// greatest ticks a hundred points of an operation of BIG points or more, S
+    /// and L the least and the greatest ticks of an operation of SMALL points or
+    /// fewer (0 when there was none). The greatest values include the
+    /// preemption of a higher level in the middle of an operation; the
+    /// least do not.
+    pub fn tell() {
+        if DUE.swap(0, Ordering::Relaxed) == 0 {
+            return;
+        }
+        if !FRAMES.load(Ordering::Relaxed).is_power_of_two() {
+            return;
+        }
+        let zero = |v: u64| if v == u64::MAX { 0 } else { v };
+        for (k, name) in KINDS.iter().zip(NAMES) {
+            let calls = k.calls.load(Ordering::Relaxed);
+            if calls == 0 {
+                continue;
+            }
+            rt::println!(
+                "service raster: 17 {name} calls {calls} points {} ticks {} big {} {} small {} {}",
+                k.points.load(Ordering::Relaxed),
+                k.ticks.load(Ordering::Relaxed),
+                zero(k.big_best.load(Ordering::Relaxed)),
+                k.big_worst.load(Ordering::Relaxed),
+                zero(k.small_best.load(Ordering::Relaxed)),
+                k.small_worst.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
 impl Pixman {
     /// Makes pixman build its tables of implementations now, in the
     /// start of the service and not in the step of its first band: one
@@ -91,9 +196,17 @@ impl Raster for Pixman {
             width: WIDTH,
             height: HEIGHT,
         };
+        #[cfg(feature = "steps")]
+        let began = rt::time::now();
         if !fill(&mut target, r.x, r.y, r.w, r.h, 0) {
             self.refuse("a fill");
         }
+        #[cfg(feature = "steps")]
+        cost::record(
+            cost::BLACK,
+            u64::from(r.w) * u64::from(r.h),
+            rt::time::now() - began,
+        );
     }
 
     fn blit(
@@ -122,8 +235,16 @@ impl Raster for Pixman {
             width: size.0,
             height: size.1,
         };
+        #[cfg(feature = "steps")]
+        let began = rt::time::now();
         if !composite(&mut self.images, over, &mut target, source, from, to, area) {
             self.refuse("a layer");
         }
+        #[cfg(feature = "steps")]
+        cost::record(
+            if over { cost::OVER } else { cost::COPY },
+            u64::from(area.0) * u64::from(area.1),
+            rt::time::now() - began,
+        );
     }
 }

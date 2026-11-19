@@ -3622,7 +3622,7 @@ mod tests {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     const FAKE: &str = r#"#!/bin/sh
-d="$(dirname "$0")"
+d="$(cat "$(dirname "$0")/datadir")"
 echo "$*" >> "$d/calls"
 case "$*" in
  *start-snapshot*)
@@ -3680,6 +3680,29 @@ esac
 exit 0
 "#;
 
+    /// The fake CLI is written and made executable once per test process, before any test
+    /// runs it, and is never opened for writing again. A test that wrote the script and ran
+    /// it while other test threads forked children could hit ETXTBSY on Linux: a child forked
+    /// meanwhile holds the write descriptor of the script across its exec. The script reads
+    /// the directory of the running test from the file `datadir` beside it (a data file, not
+    /// the executable), so each test still has files of its own.
+    fn fake_cli(data: &Path) -> PathBuf {
+        static SCRIPT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let script = SCRIPT.get_or_init(|| {
+            let bin =
+                std::env::temp_dir().join(format!("stafeto-fake-aws-bin-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&bin);
+            std::fs::create_dir_all(&bin).unwrap();
+            let script = bin.join("aws");
+            std::fs::write(&script, FAKE).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            script
+        });
+        std::fs::write(script.with_file_name("datadir"), data.display().to_string()).unwrap();
+        script.clone()
+    }
+
     /// A session of its own under the journals, and a fake `aws` that
     /// behaves as the files in its directory say; `f` runs with the lock.
     fn with_fake(flags: &[&str], f: impl FnOnce(&Session, &Path)) {
@@ -3687,10 +3710,7 @@ exit 0
         let dir = std::env::temp_dir().join(format!("stafeto-fake-aws-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("aws");
-        std::fs::write(&script, FAKE).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = fake_cli(&dir);
         for flag in flags {
             std::fs::write(dir.join(flag), "").unwrap();
         }

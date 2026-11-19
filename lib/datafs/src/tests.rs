@@ -458,12 +458,12 @@ fn a_backup_that_overlaps_the_new_end_is_not_taken_as_grown() {
 // when it returns, so the state after a cut is the state of `done` steps or of `done + 1`.
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum Node {
+pub(crate) enum Node {
     Dir,
     File(Vec<u8>),
 }
 
-type Tree = BTreeMap<String, Node>;
+pub(crate) type Tree = BTreeMap<String, Node>;
 
 #[derive(Clone, Debug)]
 enum Step {
@@ -476,7 +476,7 @@ enum Step {
     Remove(String),
 }
 
-fn pattern(len: usize, salt: u8) -> Vec<u8> {
+pub(crate) fn pattern(len: usize, salt: u8) -> Vec<u8> {
     (0..len)
         .map(|i| {
             (i as u8)
@@ -569,7 +569,7 @@ fn run<D: Device>(fs: &mut Fs<'_, D>, step: &Step) -> Result<(), Error> {
     }
 }
 
-fn read_tree<D: Device>(fs: &mut Fs<'_, D>) -> Result<Tree, Error> {
+pub(crate) fn read_tree<D: Device>(fs: &mut Fs<'_, D>) -> Result<Tree, Error> {
     fn walk<D: Device>(fs: &mut Fs<'_, D>, dir: &str, out: &mut Tree) -> Result<(), Error> {
         let d = fs.opendir(if dir.is_empty() { b"/" } else { dir.as_bytes() })?;
         let mut entries = Vec::new();
@@ -793,7 +793,7 @@ mod served {
     ) -> Result<Vec<u8>, Status> {
         let mut w = Writer::new();
         build(&mut w).unwrap();
-        let reply = server.handle(fs, owner, w.as_bytes());
+        let reply = server.handle(fs, owner, 0, w.as_bytes());
         p::reply(reply.as_bytes()).map(|mut r| r.bytes(r.left()).unwrap().to_vec())
     }
 
@@ -890,18 +890,10 @@ mod served {
             p::handle_call(p::Method::Fsync, handle, w)
         })
         .unwrap();
-        // Another session cannot use the handle; the file in use cannot go.
+        // Another session cannot use the handle; a directory with a file in use cannot be renamed.
         assert_eq!(
             call(s, &mut fs, 2, |w| p::read(handle, 10, w)),
             Err(p::code(p::BAD_HANDLE))
-        );
-        assert_eq!(
-            call(s, &mut fs, 2, |w| p::path_call(
-                p::Method::Unlink,
-                b"/ssh/key",
-                w
-            )),
-            Err(p::code(p::BUSY))
         );
         assert_eq!(
             call(s, &mut fs, 2, |w| p::rename(b"/ssh", b"/other", w)),

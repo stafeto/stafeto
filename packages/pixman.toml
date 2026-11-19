@@ -3,7 +3,7 @@
 #
 # pixman: the library of pixel operations the composition service
 # (services/compositor) puts its windows together with. The service links
-# its portable C paths statically (tools/build-pixman.py, with the shim of
+# its AArch64 NEON and portable C paths statically (tools/build-pixman.py, with the shim of
 # ports/pixman for a program with no C library); the package installs no
 # file of its own, and its licence notice is the one the distribution
 # carries for it. The SHA-256 is that of the archive; the release

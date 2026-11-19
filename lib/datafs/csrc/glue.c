@@ -322,3 +322,26 @@ int datafs_rewinddir(struct datafs *d, void *ctx, int slot)
     }
     return lfs_dir_rewind(&d->lfs, &d->dir[slot]);
 }
+
+// The user attribute `type` of the file or directory at `path` (the root is "/"): its size and the
+// bytes (at most `size`), or a negative error (LFS_ERR_NOATTR when there is none).
+int datafs_getattr(struct datafs *d, void *ctx, const char *path, uint8_t type, void *buffer,
+                   uint32_t size)
+{
+    d->ctx = ctx;
+    return lfs_getattr(&d->lfs, path, type, buffer, size);
+}
+
+// Sets the attribute in one commit of the directory that holds the entry.
+int datafs_setattr(struct datafs *d, void *ctx, const char *path, uint8_t type, const void *buffer,
+                   uint32_t size)
+{
+    d->ctx = ctx;
+    return lfs_setattr(&d->lfs, path, type, buffer, size);
+}
+
+int datafs_removeattr(struct datafs *d, void *ctx, const char *path, uint8_t type)
+{
+    d->ctx = ctx;
+    return lfs_removeattr(&d->lfs, path, type);
+}
