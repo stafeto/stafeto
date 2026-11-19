@@ -1004,6 +1004,9 @@ fn child() -> Result<(), &'static str> {
         // The child's session with the package service is the clone the
         // parent made.
         crate::packages::after_fork(handle(raw(Slot::Packages)));
+        // The child's session with the data file service is the clone the parent made when it
+        // held descriptions of `/data`; none otherwise.
+        crate::data::after_fork(handle(raw(Slot::Data)));
         // The instances of epoll are the parent's, whose set the parent's
         // session holds: the child's calls on them are EBADF.
         crate::epoll::after_fork();

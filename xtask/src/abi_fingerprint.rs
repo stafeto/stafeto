@@ -764,6 +764,8 @@ mod tests {
         let l = loader_lines();
         assert!(l.contains(&format!("VERSION {}", proto_loader::VERSION)));
         assert!(l.iter().any(|x| x.starts_with("slot Net ")));
+        // The data file service's slot is part of the fingerprint of the loader.
+        assert!(l.contains(&"slot Data 14".to_string()));
         assert!(l.iter().any(|x| x.starts_with("LIBRARY_PATH /lib/libc.so")));
         assert_eq!(version_of("a\npub const VERSION: u16 = 20;\nb"), Some(20));
         assert_eq!(version_of("const VERSION: u16 = 2;"), None);

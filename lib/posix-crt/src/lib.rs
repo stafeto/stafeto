@@ -369,6 +369,9 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
             }
             #[cfg(not(feature = "procfs"))]
             Names::Proc { .. } => continue,
+            // The layer has no target for the data file service yet: the description stays with the
+            // session in the slot Data, and the number is not inherited.
+            Names::Data { .. } => continue,
             Names::PendingTerminal(_) => continue,
         };
         *place = Inherited { fd: d.fd, target };
@@ -542,6 +545,10 @@ fn loaded_main() -> u64 {
                 .filter(|_| area.flags & SECURE == 0),
         )
     };
+    // The data session of a set-ID program is the service's, as the loader verified it with the
+    // service's root (the genuine one passes with its descriptions, a forged one leaves the slot
+    // empty); the service checks the identity only through the process service. SAFETY: as above.
+    unsafe { posix_abi::data::init(one(Slot::Data).map(Handle::from_raw)) };
     posix_abi::fork::at_child(forked);
     // SAFETY: the platform's umask takes any mask.
     unsafe { stafeto_umask(area.umask) };

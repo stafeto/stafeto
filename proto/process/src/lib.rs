@@ -167,13 +167,21 @@
 //! image and the ticket of its place (`LoaderOf`) only while it loads.
 //!
 //! Register of a root, through a notary session whose label has the mark of
-//! a root (TERMINAL with its notice, PIPE, NET or ENTROPY; init gives each
+//! a root (TERMINAL with its notice, PIPE, NET, ENTROPY or DATAFS; init gives each
 //! to the one entry of its table that is that service): one handle, a
 //! channel of the service with SEND and DUPLICATE (TERMINAL: the notice and
 //! that channel). The service keeps it, a later Register of the same mark
 //! replacing it (a restarted service registers again), and hands a copy to
 //! a loader that asks LoaderRoot with the root's number; the loader sends
 //! the root VerifySession. PERMISSION for a session with no such mark.
+//!
+//! TakeRoot (number 44), through the session of any record: body `LoaderRoot` (the root asked
+//! for, here `ROOT_DATA` alone), no handles. The reply is the status and a copy of the registered
+//! root of the data file service with SEND alone (no DUPLICATE and no TRANSFER), so that the
+//! process can send the root its two requests (SESSION and VERIFY_SESSION) and cannot pass it on.
+//! UNREGISTERED when the service has sent none, PERMISSION for any other root and for a session
+//! that is a loader's or a notary's. The work is one `handle_duplicate`: the process service
+//! never calls the data service for it.
 //!
 //! TtySignal, SetCtty and DropCtty, through a notary session whose label
 //! has TERMINAL (init gives it to the terminal service of its table; 5f):
@@ -217,6 +225,8 @@ pub mod lifetimes;
 pub mod retry;
 pub mod sporadic;
 
+/// Version 16: TakeRoot (number 44), the process's own request for the root of the data file
+/// service, and the mark DATAFS joins the marks of the services that send a root with Register.
 /// Version 15: Budget (number 42), the time budgets of POSIX threads under
 /// SCHED_SPORADIC (`sporadic`). Version 14: EntropyRejoin (number 4) gives a process that has no channel
 /// to init a new session with the entropy service after the service's
@@ -224,7 +234,7 @@ pub mod sporadic;
 /// had) names the slot whose root it asks for in a body, and the notary marks
 /// PIPE, NET and ENTROPY join TERMINAL as the marks of a service that sends
 /// its root with Register.
-pub const VERSION: u16 = 15;
+pub const VERSION: u16 = 16;
 
 /// The bytes of the name a record keeps for `ps` (the last component of
 /// the path of its program, cut to fit, with a terminating zero).
@@ -558,6 +568,9 @@ pub enum Method {
     GetLimit = 55,
     SetLimit = 56,
     GetGroups = 57,
+    /// The root of the data file service for the process (`take_root`): the body is a
+    /// `LoaderRoot` and the root can be `ROOT_DATA` alone. The number is the gap at 44.
+    TakeRoot = 44,
     /// The timers of the process (`TimerOp`): a body of the operation u32
     /// and its arguments. Numbers 64 and above name the service's own
     /// lines in the step log, so the methods stay below them.
@@ -772,8 +785,8 @@ const _: () = {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
-    29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 51, 52, 53,
-    54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+    29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
+    53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -809,6 +822,9 @@ pub const fn is_terminal(label: u64) -> bool {
 pub const PIPE: u64 = 1 << 59;
 pub const NET: u64 = 1 << 58;
 pub const ENTROPY: u64 = 1 << 57;
+/// The mark of the notary session of the data file service: bit 56, with NOTARY, which init gives
+/// only to the entry of its table that is that service.
+pub const DATAFS: u64 = 1 << 56;
 
 /// The roots the process service keeps for the loaders, by the slot they
 /// are the root of: a loader asks for one with LoaderRoot and sends it
@@ -817,10 +833,11 @@ pub const ROOT_TERMINAL: u32 = 0;
 pub const ROOT_PIPES: u32 = 1;
 pub const ROOT_NET: u32 = 2;
 pub const ROOT_ENTROPY: u32 = 3;
-pub const ROOTS: usize = 4;
+pub const ROOT_DATA: u32 = 4;
+pub const ROOTS: usize = 5;
 
 /// The marks of the roots, in the order of the roots.
-pub const ROOT_MARKS: [u64; ROOTS] = [TERMINAL, PIPE, NET, ENTROPY];
+pub const ROOT_MARKS: [u64; ROOTS] = [TERMINAL, PIPE, NET, ENTROPY, DATAFS];
 
 /// The root a notary label may register: the one whose mark it has, and
 /// none for a label with no mark or with two (init gives one at most).
@@ -2041,6 +2058,7 @@ mod tests {
             Method::AckCtty,
             Method::Budget,
             Method::LoaderRoot,
+            Method::TakeRoot,
             Method::LoaderClock,
             Method::Image,
             Method::SetGroups,
@@ -2084,7 +2102,7 @@ mod tests {
         assert!(METHODS.iter().all(|&m| m < 64));
         // The request is a header and no body.
         let header = Method::EntropyRejoin.header();
-        assert_eq!(header.version, 15);
+        assert_eq!(header.version, 16);
         assert_eq!(header.bytes().len(), 8);
         assert_eq!(Header::read(&mut Reader::new(&header.bytes())), Ok(header));
     }
@@ -2323,6 +2341,27 @@ mod tests {
         assert_eq!(Method::LoaderRoot as u16, 43);
     }
 
+    /// The data file service has the fifth root and a mark of its own, and TakeRoot has the number
+    /// of the gap at 44, below the step log, in the list of the methods.
+    #[test]
+    fn the_data_service_has_its_root_and_take_root_its_number() {
+        assert_eq!((ROOT_DATA, ROOTS), (4, 5));
+        assert_eq!(DATAFS, 1 << 56);
+        assert_eq!(ROOT_MARKS[ROOT_DATA as usize], DATAFS);
+        assert_eq!(root_of(NOTARY | DATAFS | 3), Some(ROOT_DATA));
+        assert_eq!(root_of(NOTARY | DATAFS | PIPE), None);
+        assert_eq!(Method::TakeRoot as u16, 44);
+        assert!(METHODS.contains(&44));
+        assert!(METHODS.iter().all(|&m| m < 64));
+        assert_eq!(VERSION, 16);
+        let mut w = Writer::new();
+        LoaderRoot { root: ROOT_DATA }.write(&mut w).unwrap();
+        assert_eq!(
+            LoaderRoot::read(Reader::new(w.as_bytes())),
+            Ok(LoaderRoot { root: ROOT_DATA })
+        );
+    }
+
     #[test]
     fn share_held_has_one_layout() {
         let ask = ShareHeld {
@@ -2384,7 +2423,7 @@ mod tests {
         long.push(0);
         assert_eq!(Held::read(&long), Err(Status::BadSize));
         assert_eq!(Held::Write.word(), HELD_WRITE);
-        assert_eq!(VERSION, 15);
+        assert_eq!(VERSION, 16);
     }
 
     #[test]
