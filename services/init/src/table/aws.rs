@@ -489,7 +489,7 @@ pub const TABLE: &[Record] = &[
     super::pkg::MEMBLK,
     super::pkg::PKGD,
     DATADISK,
-    super::pkg::DATAFS,
+    super::pkg::DATAFS_CLOCKED,
     super::pkg::DATAKEY,
     POWER,
 ];
@@ -512,7 +512,7 @@ pub const QEMU_TABLE: &[Record] = &[
     super::pkg::MEMBLK,
     super::pkg::PKGD,
     super::pkg::NVME_QEMU_DATA,
-    super::pkg::DATAFS,
+    super::pkg::DATAFS_CLOCKED,
     super::pkg::DATAKEY,
 ];
 
@@ -995,7 +995,7 @@ mod tests {
         let left = found.skipped.iter().flatten().next().unwrap();
         assert_eq!(left.record, "datadisk");
         let datafs = found.table.iter().find(|r| r.name == "datafs").unwrap();
-        assert!(datafs.connects.is_empty());
+        assert_eq!(datafs.connects, &["clock"]);
         assert!(found.table.iter().any(|r| r.name == "datakey"));
         assert!(crate::table::check(found.table).is_ok());
     }

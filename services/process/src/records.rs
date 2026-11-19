@@ -1292,6 +1292,50 @@ mod tests {
         assert_eq!(t.placed_cpu(99), None);
     }
 
+    /// The four calls that change what a service remembers of a process (setuid and setgid,
+    /// setgroups, and setrlimit of the file size) report a change at once, and the program raises
+    /// the generation of the record on each report before it answers (`generations.raise` after
+    /// `change_credentials`, and after `set_groups` and `set_limit` when they say `true`, in
+    /// main.rs): a service that stores a Vouch (datafs for its file size limit and its groups) asks
+    /// again at the next request. A call that changes nothing reports no change.
+    #[test]
+    fn the_calls_that_change_an_identity_report_the_change_that_moves_the_generation() {
+        let mut t = Records::<u32>::new();
+        let label = t.next_label().unwrap();
+        let index = t.insert(label, 0, None, Credentials::ROOT, 31, Join::NewSession);
+        let generation = 1;
+        assert_eq!(
+            t.change_credentials(index, proto_process::Change::Gid, 1000, generation),
+            Ok(())
+        );
+        assert_eq!(t.get(index).unwrap().credentials.gid, 1000);
+        let mut groups = proto_process::Groups::EMPTY;
+        groups.count = 2;
+        groups.ids[..2].copy_from_slice(&[10, 20]);
+        assert_eq!(t.set_groups(index, groups, generation), Ok(true));
+        assert_eq!(t.set_groups(index, groups, generation), Ok(false));
+        let limit = proto_process::Limit {
+            soft: 4096,
+            hard: 4096,
+        };
+        assert_eq!(
+            t.set_limit(index, proto_process::FSIZE, limit, generation),
+            Ok(true)
+        );
+        assert_eq!(
+            t.set_limit(index, proto_process::FSIZE, limit, generation),
+            Ok(false)
+        );
+        let record = t.get(index).unwrap();
+        assert_eq!(record.groups, groups);
+        assert_eq!(record.limits.values[proto_process::FSIZE], limit);
+        assert_eq!(
+            t.change_credentials(index, proto_process::Change::Uid, 7, generation),
+            Ok(())
+        );
+        assert_eq!(t.get(index).unwrap().credentials.uid, 7);
+    }
+
     #[test]
     fn renice_follows_the_effective_id_of_the_target() {
         // A caller of the user 7 may set the nice of a process whose
