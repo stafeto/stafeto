@@ -155,6 +155,11 @@ pub mod cost {
     /// the lines of the bands are told, whatever the frame (the bands of a long
     /// frame of the overload come after the frames the totals are told at).
     static BANDS_DUE: AtomicU32 = AtomicU32::new(0);
+    /// The count of bands of a count of layers from which the bands are told again at
+    /// each power of two: the console is shared with the other services, and a long
+    /// line written while another service writes is cut by its lines (a run's last
+    /// line of the conductor was lost so), so the lines of the bands are few.
+    const TELL_FROM: u64 = 256;
     /// The operations of the band in progress: their ticks and the layers (the
     /// operations other than the black).
     static BAND_OPS: AtomicU64 = AtomicU64::new(0);
@@ -180,7 +185,7 @@ pub mod cost {
         let s = &SPLIT[layers];
         let outside = compose.saturating_sub(ops);
         let n = s.n.fetch_add(1, Ordering::Relaxed) + 1;
-        if layers >= 2 && n.is_power_of_two() {
+        if layers >= 2 && n >= TELL_FROM && n.is_power_of_two() {
             BANDS_DUE.store(1, Ordering::Relaxed);
         }
         if total > u64::from(compositor::BAND_GATE) {
@@ -523,7 +528,9 @@ pub mod cost {
         }
         for (layers, s) in SPLIT.iter().enumerate() {
             let n = s.n.load(Ordering::Relaxed);
-            if n == 0 {
+            // The bands told by themselves (not with the frames) are those of two
+            // layers or more.
+            if n == 0 || (!frames && layers < 2) {
                 continue;
             }
             rt::println!(
@@ -536,7 +543,10 @@ pub mod cost {
             );
             // The floor of the count: the least band, with its compose and
             // operations, and the bands past the gate (a separate line, so that
-            // the line above keeps its fields).
+            // the line above keeps its fields), told when the bands are due.
+            if !bands {
+                continue;
+            }
             rt::println!(
                 "service band floor: 17 layers {layers} n {n} total least {} compose {} ops {} above-gate {}",
                 zero(s.total_least.load(Ordering::Relaxed)),
