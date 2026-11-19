@@ -124,6 +124,7 @@ pub const CONSOLE: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 /// The walk of bus 0 (tests/pci-walk): one window over the whole ECAM of

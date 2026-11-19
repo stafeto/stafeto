@@ -9,9 +9,15 @@
 
 #include "lfs.h"
 
+// The label of a cache that holds no block (littlefs's own LFS_BLOCK_NULL, which lfs.c keeps private).
+#define NO_BLOCK ((lfs_block_t)-1)
 #define BLOCK 4096u
 #define SECTOR 512u
-#define LOOKAHEAD 128u
+// The allocator's window holds one bit for every block of the volume, up to this many bytes (the
+// whole of a 4 GiB volume). With a window of the volume's size the allocator walks the file system
+// once for all the free space; a smaller window made it walk again after every 8 * size blocks,
+// dozens of times inside one call of the service on a volume half full.
+#define LOOKAHEAD_MAX (128u * 1024u)
 
 #ifndef DATAFS_FILES
 #define DATAFS_FILES 8
@@ -30,7 +36,7 @@ struct datafs {
     void *ctx;
     uint8_t read_cache[BLOCK];
     uint8_t prog_cache[BLOCK];
-    uint8_t lookahead[LOOKAHEAD];
+    uint8_t lookahead[LOOKAHEAD_MAX];
     lfs_file_t file[DATAFS_FILES];
     struct lfs_file_config file_cfg[DATAFS_FILES];
     uint8_t file_cache[DATAFS_FILES][BLOCK];
@@ -47,11 +53,35 @@ size_t datafs_state_align(void) { return _Alignof(struct datafs); }
 int datafs_files(void) { return DATAFS_FILES; }
 int datafs_dirs(void) { return DATAFS_DIRS; }
 
+// littlefs labels a read cache with the block, offset and size of a read before it calls the
+// device, and keeps the label when the read fails, so the next read of that block would take the
+// stale bytes of the cache for the block. When a read fails, the caches that carry its block lose
+// the label: the cache of the volume, and the cache of an open file that is reading (a file that is
+// writing keeps its cache: that holds data waiting to be written). Every entry point of this file that
+// reads goes through here, so a failed read (a device that failed, a walk stopped on purpose, a
+// stop notice) leaves a state that can be used on.
+static void forget_failed_read(struct datafs *d, lfs_block_t block)
+{
+    if (d->lfs.rcache.block == block) {
+        d->lfs.rcache.block = NO_BLOCK;
+    }
+    for (int i = 0; i < DATAFS_FILES; i++) {
+        if (d->file_used[i] && (d->file[i].flags & LFS_F_READING) &&
+            d->file[i].cache.block == block) {
+            d->file[i].cache.block = NO_BLOCK;
+        }
+    }
+}
+
 static int dev_read(const struct lfs_config *c, lfs_block_t block, lfs_off_t off, void *buffer,
                     lfs_size_t size)
 {
     struct datafs *d = c->context;
-    return datafs_rs_read(d->ctx, block, off, buffer, size);
+    int err = datafs_rs_read(d->ctx, block, off, buffer, size);
+    if (err) {
+        forget_failed_read(d, block);
+    }
+    return err;
 }
 
 static int dev_prog(const struct lfs_config *c, lfs_block_t block, lfs_off_t off,
@@ -96,7 +126,17 @@ void datafs_setup(struct datafs *d, uint32_t blocks)
     // A virtual disk wears no block out: no relocation by erase count.
     d->cfg.block_cycles = -1;
     d->cfg.cache_size = BLOCK;
-    d->cfg.lookahead_size = LOOKAHEAD;
+    // One bit for each block, a multiple of 8 bytes, at least 8 and at most LOOKAHEAD_MAX.
+    uint32_t window = ((blocks + 63u) / 64u) * 8u;
+    if (window < 8u) {
+        window = 8u;
+    }
+    if (window > LOOKAHEAD_MAX) {
+        window = LOOKAHEAD_MAX;
+    }
+    d->cfg.lookahead_size = window;
+    // lfs_fs_gc must not compact metadata: the walk of the allocator is all it is asked for.
+    d->cfg.compact_thresh = (lfs_size_t)-1;
     d->cfg.read_buffer = d->read_cache;
     d->cfg.prog_buffer = d->prog_cache;
     d->cfg.lookahead_buffer = d->lookahead;
@@ -114,11 +154,14 @@ void datafs_set_lookahead(struct datafs *d, uint8_t *buffer, uint32_t size)
     d->cfg.lookahead_buffer = buffer;
 }
 
+// The size of the window the volume was set up with, in blocks.
+uint32_t datafs_window_blocks(const struct datafs *d) { return d->cfg.lookahead_size * 8u; }
+
 // The erases littlefs has asked for since the setup.
 uint32_t datafs_erases(const struct datafs *d) { return d->erases; }
 
-// The host measurements only: the first block, the next block to hand out and the size in blocks
-// of the allocator's window. The next block goes back to 0 at each walk of the volume.
+// The first block, the next block to hand out and the size in blocks of the allocator's window.
+// The next block goes back to 0 at each walk of the volume.
 void datafs_window_state(const struct datafs *d, uint32_t *out)
 {
     out[0] = d->lfs.lookahead.start;
@@ -126,8 +169,9 @@ void datafs_window_state(const struct datafs *d, uint32_t *out)
     out[2] = d->lfs.lookahead.size;
 }
 
-// The host measurements only: the blocks of the window that are free and not yet handed out
-// (the zero bits from `next` to the end of the window), read from memory with no device access.
+// The blocks of the window that are free and still to be handed out (the zero bits from `next` to the
+// end of the window), read from memory with no device access. With a window as large as the volume
+// that is the free count of the volume as of the last walk, less what has been given out since.
 int64_t datafs_window_free(const struct datafs *d)
 {
     int64_t free_blocks = 0;
@@ -137,6 +181,26 @@ int64_t datafs_window_free(const struct datafs *d)
         }
     }
     return free_blocks;
+}
+
+// Walks the file system once and fills the allocator's window from it, at a point where no
+// operation is half done (littlefs counts the blocks of the open files in the walk, so a file that
+// is written and awaits its sync keeps its blocks). The window is dropped first, so the walk is made
+// whether or not the window was full. lfs_fs_gc compacts no metadata here (`compact_thresh` is
+// off), so the walk only reads.
+int datafs_walk(struct datafs *d, void *ctx)
+{
+    d->ctx = ctx;
+    d->lfs.lookahead.size = 0;
+    d->lfs.lookahead.next = 0;
+    d->lfs.lookahead.ckpoint = d->lfs.block_count;
+    int err = lfs_fs_gc(&d->lfs);
+    if (err) {
+        // A walk that failed (or was stopped) leaves the window empty (littlefs drops it) and
+        // no cache labelled with a block it did not load.
+        d->lfs.rcache.block = NO_BLOCK;
+    }
+    return err;
 }
 
 int datafs_format(struct datafs *d, void *ctx)

@@ -59,6 +59,7 @@ pub const TABLE: &[Record] = &[
         waits: &[],
         budgets: &[],
         free: 0,
+        broken_after: None,
     },
     // No heartbeat: it waits for input and has no periodic work (spec
     // 13.6); the console only for the message of its panic.
@@ -89,5 +90,6 @@ pub const TABLE: &[Record] = &[
         waits: &[],
         budgets: &[],
         free: 0,
+        broken_after: None,
     },
 ];

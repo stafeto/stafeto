@@ -197,6 +197,7 @@ pub const NETD: Record = Record {
     waits: &[],
     budgets: NETD_BUDGETS,
     free: 0,
+    broken_after: None,
 };
 
 /// The PCI devices of the network on VZ's bus 0 (services/netd/src/pci.rs).
@@ -659,6 +660,7 @@ pub const PROBE: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 // NET_TABLE copies the records of the shell's table by number: a table that

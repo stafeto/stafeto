@@ -17,8 +17,9 @@
 //! CARGO_PROFILE_DEV_OPT_LEVEL=3 cargo test -p datafs --lib tests_scale -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! The wide window of the allocator and the free count taken from its bits are test-only switches
-//! (`Fs::set_lookahead`, `Fs::window_free`); the service keeps its window of 128 bytes.
+//! The allocator's window is one bit for each block of the volume, which is what the service has; a
+//! window of 128 bytes (the first release's) is a test-only switch (`Fs::set_lookahead`, `Win::Narrow`)
+//! kept for the comparison.
 
 use crate::fs::{Fs, Open, Storage, Whence};
 use crate::mem::{MemDevice, Survive};
@@ -47,27 +48,18 @@ type Res<T> = Result<T, Error>;
 /// The size of the allocator's window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Win {
-    /// The 128 bytes the service has today: 1024 blocks.
-    Service,
-    /// One bit for every block of the volume, as the plan proposes.
+    /// The 128 bytes release 0.5.1 had: 1024 blocks (set by the test-only switch).
+    Narrow,
+    /// One bit for every block of the volume: the service's window now.
     Whole,
 }
 
 impl Win {
     fn name(self) -> &'static str {
         match self {
-            Win::Service => "128 B",
+            Win::Narrow => "128 B",
             Win::Whole => "whole",
         }
-    }
-}
-
-fn window_bytes(blocks: u64, win: Win) -> usize {
-    match win {
-        Win::Service => 128,
-        Win::Whole => (blocks.div_ceil(8) as usize)
-            .next_multiple_of(8)
-            .min(128 * 1024),
     }
 }
 
@@ -140,12 +132,11 @@ impl Meter {
 }
 
 fn attach(device: MemDevice, win: Win) -> Vol {
-    let blocks = device.sectors() / BLOCK_SECTORS;
     let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
     let mut fs = Fs::new(device, state).unwrap();
-    if win == Win::Whole {
-        let n = window_bytes(blocks, win);
-        fs.set_lookahead(Box::leak(vec![0u8; n].into_boxed_slice()));
+    if win == Win::Narrow {
+        // The window the first release had; the service's own is one bit for every block.
+        fs.set_lookahead(Box::leak(vec![0u8; 128].into_boxed_slice()));
     }
     fs
 }
@@ -303,7 +294,7 @@ fn row(job: &str, state: &str, win: &str, c: Cost, worst: Cost) {
 
 /// The reads of one `used_blocks` on a freshly mounted volume.
 fn traverse_cost(device: &MemDevice) -> (Cost, u64) {
-    let mut fs = mounted(device, Win::Service);
+    let mut fs = mounted(device, Win::Whole);
     let at = now(&mut fs);
     let used = fs.used_blocks().unwrap();
     let cost = now(&mut fs).since(at);
@@ -442,7 +433,7 @@ fn the_wide_window_walks_the_volume_once_where_the_service_window_walks_it_often
     // 4 MiB of new blocks; a window for the whole volume walks once.
     let blocks = 16384u64;
     let img = image(blocks, BIG_FILES, 0);
-    let mut narrow = mounted(&img, Win::Service);
+    let mut narrow = mounted(&img, Win::Narrow);
     let a = write_and_count(&mut narrow, 16 << 20, 1 << 20, "w");
     let mut wide = mounted(&img, Win::Whole);
     let b = write_and_count(&mut wide, 16 << 20, 1 << 20, "w");
@@ -464,7 +455,7 @@ fn a_small_window_crawls_through_a_used_region_in_one_call_and_a_wide_one_does_n
     let (mut crawl, mut narrow_reads, mut wide_reads) = (0, 0, 0);
     for percent in [40, 50, 60, 70] {
         let img = image(16384, BIG_FILES, percent);
-        let mut narrow = mounted(&img, Win::Service);
+        let mut narrow = mounted(&img, Win::Narrow);
         let a = write_and_count(&mut narrow, 4 << 20, 1 << 20, "w");
         let mut wide = mounted(&img, Win::Whole);
         let b = write_and_count(&mut wide, 4 << 20, 1 << 20, "w");
@@ -508,7 +499,7 @@ fn scale_allocator() {
         };
         for &percent in steps {
             let img = image(blocks, layout, percent);
-            for win in [Win::Service, Win::Whole] {
+            for win in [Win::Whole, Win::Narrow] {
                 let mut fs = mounted(&img, win);
                 let run = write_and_count(&mut fs, 64 << 20, 1 << 20, "w");
                 let mean = if run.scans == 0 {
@@ -544,14 +535,14 @@ fn scale_allocator() {
 fn free_blocks_from_the_window_agree_with_the_walk_and_read_nothing() {
     let blocks = 4096u64;
     let mut fs = fresh(blocks, Win::Whole);
-    // The first allocation fills the window.
     let mut m = Meter::new(&mut fs);
     put(&mut fs, &mut m, "/a", 300 << 10).unwrap();
     put(&mut fs, &mut m, "/b", 1 << 20).unwrap();
     fs.mkdir(b"/dir").unwrap();
     put(&mut fs, &mut m, "/dir/c", 5000).unwrap();
+    // The window was filled by the first allocation: the count reads no block.
     let at = now(&mut fs);
-    let free = fs.window_free();
+    let free = fs.free_blocks().unwrap();
     assert_eq!(
         now(&mut fs).since(at).reads,
         0,
@@ -563,19 +554,215 @@ fn free_blocks_from_the_window_agree_with_the_walk_and_read_nothing() {
         blocks - used,
         "the window counts what the walk counts"
     );
+    // After a mount the window is empty: the first count makes the walk, the next ones read nothing.
+    let mut fs = mounted(&settle(fs), Win::Whole);
+    let at = now(&mut fs);
+    let first = fs.free_blocks().unwrap();
+    let walk = now(&mut fs).since(at);
+    assert!(walk.reads > 0 && walk.programs == 0 && walk.erases == 0);
+    let at = now(&mut fs);
+    assert_eq!(fs.free_blocks().unwrap(), first);
+    assert_eq!(now(&mut fs).since(at).reads, 0);
+    assert_eq!(first, blocks - fs.used_blocks().unwrap());
     // Blocks freed after the last walk are not seen: fewer free than there are, never more.
     fs.remove(b"/b").unwrap();
-    let used = fs.used_blocks().unwrap();
-    assert!(fs.window_free() <= blocks - used);
-    assert!(
-        fs.window_free() < blocks - used,
-        "the freed blocks wait for the next walk"
-    );
+    let truth = blocks - fs.used_blocks().unwrap();
+    let seen = fs.free_blocks().unwrap();
+    assert!(seen <= truth, "{seen} free seen, {truth} free");
+    assert!(seen < truth, "the freed blocks wait for the next walk");
+    // The estimate of what was freed is the callers' (the server knows the size it removes).
+    fs.note_freed_file(1 << 20);
+    assert_eq!(fs.freed_estimate(), 256);
+    // A walk sees them and starts the estimate again.
+    fs.walk().unwrap();
+    assert_eq!(fs.freed_estimate(), 0);
+    assert_eq!(fs.free_blocks().unwrap(), truth);
     // The window of 128 bytes sees at most its 1024 blocks: it cannot answer for a larger volume.
-    let mut narrow = fresh(blocks, Win::Service);
+    let mut narrow = fresh(blocks, Win::Narrow);
     let mut m = Meter::new(&mut narrow);
     put(&mut narrow, &mut m, "/a", 4096).unwrap();
     assert!(narrow.window_free() <= 1024);
+}
+
+#[test]
+fn statfs_through_the_server_reads_nothing_after_the_first_walk() {
+    let mut fs = fresh(4096, Win::Whole);
+    let mut m = Meter::new(&mut fs);
+    put(&mut fs, &mut m, "/a", 200 << 10).unwrap();
+    let mut fs = mounted(&settle(fs), Win::Whole);
+    let mut server = crate::server::Server::with_epoch(1);
+    let mut statfs = |fs: &mut Vol| {
+        let mut w = proto_wire::Writer::new();
+        proto_data::statfs(&mut w).unwrap();
+        let reply = server.handle(fs, 1, 0, w.as_bytes());
+        let mut r = proto_data::reply(reply.as_bytes()).unwrap();
+        (r.u64().unwrap(), r.u64().unwrap(), r.u32().unwrap())
+    };
+    let (blocks, used, unit) = statfs(&mut fs);
+    assert_eq!((blocks, unit), (4096, 4096));
+    assert_eq!(used, 4096 - fs.free_blocks().unwrap());
+    let at = now(&mut fs);
+    for _ in 0..5 {
+        assert_eq!(statfs(&mut fs), (blocks, used, unit));
+    }
+    assert_eq!(now(&mut fs).since(at).reads, 0, "STATFS reads no block");
+    assert_eq!(used, fs.used_blocks().unwrap());
+}
+
+#[test]
+fn a_walk_only_reads_and_a_failed_one_leaves_a_volume_that_mounts() {
+    // The walk marks blocks in memory and reads the device; it never writes, so a cut of the power
+    // during a walk leaves the medium as it was. The medium is the same bytes after a walk, and a
+    // walk that fails on a dead device leaves nothing to repair.
+    let mut fs = fresh(1024, Win::Whole);
+    let mut m = Meter::new(&mut fs);
+    fs.mkdir(b"/d").unwrap();
+    put(&mut fs, &mut m, "/d/f", 100 << 10).unwrap();
+    let mut device = settle(fs);
+    let before = device.medium().to_vec();
+    let mut fs = mounted(&device, Win::Whole);
+    let at = now(&mut fs);
+    fs.walk().unwrap();
+    let c = now(&mut fs).since(at);
+    assert!(c.reads > 0);
+    assert_eq!(
+        (c.programs, c.erases, c.flushes),
+        (0, 0, 0),
+        "a walk writes nothing"
+    );
+    let mut after = fs.into_device();
+    after.flush().unwrap();
+    assert_eq!(after.medium(), &before[..], "the medium is as it was");
+
+    // The device dies (a write after a cut at 0 sectors), then the walk: it fails.
+    let mut fs = mounted(&device, Win::Whole);
+    fs.device().cut_after(Some(0));
+    assert!(fs.mkdir(b"/x").is_err());
+    assert!(fs.walk().is_err(), "a walk on a dead device fails");
+    let mut dead = fs.into_device();
+    dead.power_cycle(Survive::None);
+    let mut fs = attach(dead, Win::Whole);
+    fs.mount().unwrap();
+    assert_eq!(fs.stat(b"/d/f").unwrap().size, 100 << 10);
+    assert_eq!(fs.stat(b"/x"), Err(Error::NoEntry));
+    fs.walk().unwrap();
+    device.power_cycle(Survive::All);
+}
+
+fn served(
+    server: &mut crate::server::Server,
+    fs: &mut Vol,
+    build: &dyn Fn(&mut proto_wire::Writer),
+) -> Result<Vec<u8>, proto_wire::Status> {
+    let mut w = proto_wire::Writer::new();
+    build(&mut w);
+    let reply = server.handle(fs, 1, 0, w.as_bytes());
+    proto_data::reply(reply.as_bytes()).map(|mut r| r.bytes(r.left()).unwrap().to_vec())
+}
+
+/// A file made through the protocol, written in calls of 900 bytes and synced; closed unless
+/// `keep_open`, and the handle.
+fn made(
+    server: &mut crate::server::Server,
+    fs: &mut Vol,
+    path: &[u8],
+    len: usize,
+    keep_open: bool,
+) -> u32 {
+    use proto_data as p;
+    let h = served(server, fs, &|w| {
+        p::open(path, p::READ | p::WRITE | p::CREATE, w).unwrap()
+    })
+    .unwrap();
+    let h = u32::from_le_bytes(h[..4].try_into().unwrap());
+    let data = vec![7u8; 900];
+    let mut left = len;
+    while left > 0 {
+        let n = left.min(900);
+        served(server, fs, &|w| p::write(h, &data[..n], w).unwrap()).unwrap();
+        left -= n;
+    }
+    served(server, fs, &|w| {
+        p::handle_call(p::Method::Fsync, h, w).unwrap()
+    })
+    .unwrap();
+    if !keep_open {
+        served(server, fs, &|w| {
+            p::handle_call(p::Method::Close, h, w).unwrap()
+        })
+        .unwrap();
+    }
+    h
+}
+
+#[test]
+fn freed_blocks_are_counted_by_what_the_server_knows() {
+    use crate::server::Server;
+    use proto_data as p;
+    let mut fs = fresh(1024, Win::Whole);
+    let mut server = Server::with_epoch(1);
+    made(&mut server, &mut fs, b"/big", 40 << 10, false);
+    made(&mut server, &mut fs, b"/tiny", 100, false);
+    made(&mut server, &mut fs, b"/over", 20 << 10, false);
+    made(&mut server, &mut fs, b"/with", 1000, false);
+    assert_eq!(fs.freed_estimate(), 0);
+    // A file of 40 KiB is 10 blocks; an inline file owns none.
+    served(&mut server, &mut fs, &|w| {
+        p::path_call(p::Method::Unlink, b"/big", w).unwrap()
+    })
+    .unwrap();
+    assert_eq!(fs.freed_estimate(), 10);
+    served(&mut server, &mut fs, &|w| {
+        p::path_call(p::Method::Unlink, b"/tiny", w).unwrap()
+    })
+    .unwrap();
+    assert_eq!(fs.freed_estimate(), 10, "an inline file owns no block");
+    // A rename over a file gives the replaced file's blocks back (20 KiB: 5 blocks).
+    served(&mut server, &mut fs, &|w| {
+        p::rename(b"/with", b"/over", w).unwrap()
+    })
+    .unwrap();
+    assert_eq!(fs.freed_estimate(), 15);
+    // An open file that is unlinked gives its blocks back at the last close.
+    let h = made(&mut server, &mut fs, b"/open", 8192, true);
+    served(&mut server, &mut fs, &|w| {
+        p::path_call(p::Method::Unlink, b"/open", w).unwrap()
+    })
+    .unwrap();
+    assert_eq!(fs.freed_estimate(), 15);
+    served(&mut server, &mut fs, &|w| {
+        p::handle_call(p::Method::Close, h, w).unwrap()
+    })
+    .unwrap();
+    assert_eq!(fs.freed_estimate(), 17);
+    // A directory's pair, and a failed remove counts nothing.
+    served(&mut server, &mut fs, &|w| {
+        p::path_call(p::Method::Mkdir, b"/d", w).unwrap()
+    })
+    .unwrap();
+    served(&mut server, &mut fs, &|w| {
+        p::path_call(p::Method::Rmdir, b"/d", w).unwrap()
+    })
+    .unwrap();
+    assert_eq!(fs.freed_estimate(), 19);
+    assert!(
+        served(&mut server, &mut fs, &|w| p::path_call(
+            p::Method::Unlink,
+            b"/missing",
+            w
+        )
+        .unwrap())
+        .is_err()
+    );
+    assert_eq!(fs.freed_estimate(), 19);
+    // A truncation counts the blocks it cuts; a walk starts the estimate again.
+    made(&mut server, &mut fs, b"/t", 20 << 10, false);
+    let f = fs.open(b"/t", Open::READ_WRITE).unwrap();
+    fs.truncate(f, 4096).unwrap();
+    assert_eq!(fs.freed_estimate(), 19 + 4);
+    fs.close(f).unwrap();
+    fs.walk().unwrap();
+    assert_eq!(fs.freed_estimate(), 0);
 }
 
 #[test]
@@ -990,10 +1177,10 @@ fn a_stat_with_permissions_costs_a_few_reads() {
         .into_iter()
         .find(|j| j.name.starts_with("stat + getattr 48 B, depth 2"))
         .unwrap();
-    let (c, _) = run_job(&device, Win::Service, false, &stat);
+    let (c, _) = run_job(&device, Win::Whole, false, &stat);
     assert!(c.reads <= 24, "a stat of depth 8 reads {} times", c.reads);
     assert_eq!(c.programs, 0);
-    let (c, _) = run_job(&device, Win::Service, false, &both);
+    let (c, _) = run_job(&device, Win::Whole, false, &both);
     assert!(
         c.reads <= 24,
         "a stat with its attribute reads {} times",
@@ -1010,7 +1197,7 @@ fn an_attribute_costs_one_commit() {
         .into_iter()
         .find(|j| j.name.starts_with("setattr 48 B over"))
         .unwrap();
-    let (c, _) = run_job(&device, Win::Service, false, &set);
+    let (c, _) = run_job(&device, Win::Whole, false, &set);
     assert!(c.programs <= 3, "a setattr programs {} times", c.programs);
     assert!(c.flushes <= 2, "a setattr flushes {} times", c.flushes);
 }
@@ -1033,9 +1220,9 @@ fn scale_jobs() {
         for job in jobs() {
             if job.allocs {
                 for (win, warm) in [
-                    (Win::Service, false),
-                    (Win::Service, true),
                     (Win::Whole, false),
+                    (Win::Whole, true),
+                    (Win::Narrow, false),
                 ] {
                     let (c, w) = run_job(&device, win, warm, &job);
                     let label = format!(
@@ -1050,7 +1237,7 @@ fn scale_jobs() {
                     row(&label, state, win.name(), c, w);
                 }
             } else {
-                let (c, w) = run_job(&device, Win::Service, false, &job);
+                let (c, w) = run_job(&device, Win::Whole, false, &job);
                 row(job.name, state, "any", c, w);
             }
         }
@@ -1063,7 +1250,7 @@ fn scale_jobs() {
 
 #[test]
 fn an_attribute_given_at_the_creation_appears_only_after_the_sync() {
-    let mut fs = fresh(512, Win::Service);
+    let mut fs = fresh(512, Win::Whole);
     let f = fs
         .open_with_attr(b"/a", Open::WRITE.with(Open::CREATE), 0x70, &[5u8; 48])
         .unwrap();
@@ -1079,14 +1266,14 @@ fn an_attribute_given_at_the_creation_appears_only_after_the_sync() {
     fs.close(f).unwrap();
 
     // A cut of the power before the sync leaves the file with no attribute.
-    let mut fs = fresh(512, Win::Service);
+    let mut fs = fresh(512, Win::Whole);
     let f = fs
         .open_with_attr(b"/b", Open::WRITE.with(Open::CREATE), 0x70, &[6u8; 48])
         .unwrap();
     fs.write(f, b"data").unwrap();
     let mut device = fs.into_device();
     device.power_cycle(Survive::None);
-    let mut fs = attach(device, Win::Service);
+    let mut fs = attach(device, Win::Whole);
     fs.mount().unwrap();
     assert_eq!(fs.getattr(b"/b", 0x70, &mut buf), Err(Error::NoAttr));
     assert_eq!(fs.stat(b"/b").unwrap().size, 0);
@@ -1181,7 +1368,7 @@ fn lfs_remove_succeeds_on_a_volume_with_no_free_block() {
         let mut fs = fresh(1024, Win::Whole);
         let mut paths = fill_to_the_end(&mut fs, seed, name_len, max_file);
         // The removes run in a service that has just started, with the window of 128 bytes.
-        let mut fs = mounted(&settle(fs), Win::Service);
+        let mut fs = mounted(&settle(fs), Win::Whole);
         let free = fs.blocks() - fs.used_blocks().unwrap();
         assert!(free <= 2, "seed {seed}: {free} blocks free after the fill");
         // Every entry goes, in an order a generator picks. Not one remove asks for a block.
@@ -1226,7 +1413,7 @@ fn full_volume_table(
     let mut table = Vec::new();
 
     let mut run = |name: &'static str, body: &dyn Fn(&mut Vol, &[String], &mut Tally)| {
-        let mut fs = mounted(&device, Win::Service);
+        let mut fs = mounted(&device, Win::Whole);
         let mut t = Tally::default();
         body(&mut fs, &sample, &mut t);
         table.push((name, t));
@@ -1355,7 +1542,7 @@ fn scale_full() {
 #[test]
 fn a_rename_between_directories_survives_a_cut_at_every_sector() {
     let content: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
-    let mut base = fresh(512, Win::Service);
+    let mut base = fresh(512, Win::Whole);
     base.mkdir(b"/a").unwrap();
     base.mkdir(b"/b").unwrap();
     let mut m = Meter::new(&mut base);
@@ -1369,7 +1556,7 @@ fn a_rename_between_directories_survives_a_cut_at_every_sector() {
     medium.flush().unwrap();
 
     // How many sectors the rename writes when nothing stops it.
-    let mut probe = mounted(&medium, Win::Service);
+    let mut probe = mounted(&medium, Win::Whole);
     let before = probe.device().written;
     probe.rename(b"/a/x", b"/b/x").unwrap();
     let sectors = probe.device().written - before;
@@ -1383,12 +1570,12 @@ fn a_rename_between_directories_survives_a_cut_at_every_sector() {
             Survive::Prefix(1),
             Survive::Random(cut + 1),
         ] {
-            let mut fs = mounted(&medium, Win::Service);
+            let mut fs = mounted(&medium, Win::Whole);
             fs.device().cut_after(Some(cut));
             let _ = fs.rename(b"/a/x", b"/b/x");
             let mut device = fs.into_device();
             device.power_cycle(survive);
-            let mut fs = attach(device, Win::Service);
+            let mut fs = attach(device, Win::Whole);
             fs.mount().unwrap();
             let old = fs.stat(b"/a/x");
             let new = fs.stat(b"/b/x");
@@ -1446,25 +1633,25 @@ fn service_mount(device: MemDevice, win: Win) -> (Cost, Vol) {
 #[test]
 fn the_mount_after_a_cut_costs_a_bounded_number_of_calls() {
     let device = with_working_area(8192, BIG_FILES, 0, false);
-    let (clean, _) = service_mount(device.clone(), Win::Service);
+    let (clean, _) = service_mount(device.clone(), Win::Whole);
     assert!(
         clean.reads <= 200,
         "a clean mount reads {} times",
         clean.reads
     );
     // A cut at every sector of a rename between directories: the mount repairs the move.
-    let mut fs = mounted(&device, Win::Service);
+    let mut fs = mounted(&device, Win::Whole);
     let before = fs.device().written;
     fs.rename(b"/w/f1", b"/w/s/g1").unwrap();
     let sectors = fs.device().written - before;
     let mut worst = 0;
     for cut in 0..=sectors {
-        let mut fs = mounted(&device, Win::Service);
+        let mut fs = mounted(&device, Win::Whole);
         fs.device().cut_after(Some(cut));
         let _ = fs.rename(b"/w/f1", b"/w/s/g1");
         let mut d = fs.into_device();
         d.power_cycle(Survive::Random(cut + 3));
-        let (c, _) = service_mount(d, Win::Service);
+        let (c, _) = service_mount(d, Win::Whole);
         worst = worst.max(c.reads);
     }
     assert!(
@@ -1488,7 +1675,7 @@ fn scale_mount() {
     ];
     for (state, layout, percent) in states {
         let device = with_working_area(blocks, layout, percent, true);
-        for win in [Win::Service, Win::Whole] {
+        for win in [Win::Whole, Win::Narrow] {
             let (c, _) = service_mount(device.clone(), win);
             row("mount + recover_orphans, clean", state, win.name(), c, c);
         }
@@ -1513,7 +1700,7 @@ fn scale_mount() {
             }),
         ];
         for (name, script) in scripts {
-            let mut fs = mounted(&device, Win::Service);
+            let mut fs = mounted(&device, Win::Whole);
             let before = fs.device().written;
             script(&mut fs);
             let sectors = (fs.device().written - before).min(40);
@@ -1521,12 +1708,12 @@ fn scale_mount() {
             let (mut low, mut high): (Option<Cost>, Option<Cost>) = (None, None);
             let mut cut = 0;
             while cut <= sectors {
-                let mut fs = mounted(&device, Win::Service);
+                let mut fs = mounted(&device, Win::Whole);
                 fs.device().cut_after(Some(cut));
                 script(&mut fs);
                 let mut d = fs.into_device();
                 d.power_cycle(Survive::Random(cut + 11));
-                let (c, _) = service_mount(d, Win::Service);
+                let (c, _) = service_mount(d, Win::Whole);
                 if low.is_none_or(|l| c.ms() < l.ms()) {
                     low = Some(c);
                 }
@@ -1539,14 +1726,14 @@ fn scale_mount() {
             row(
                 &format!("mount after a cut in: {name} (cheapest)"),
                 state,
-                "128 B",
+                "whole",
                 low,
                 low,
             );
             row(
                 &format!("mount after a cut in: {name} (dearest)"),
                 state,
-                "128 B",
+                "whole",
                 high,
                 high,
             );
@@ -1592,7 +1779,7 @@ fn scale_2gib() {
     std::println!("|---|---:|---|---:|---:|---:|---:|---:|");
     for (layout, percent) in [(BIG_FILES, 0), (BIG_FILES, 25), (BIG_FILES, 50)] {
         let img = image(blocks, layout, percent);
-        for win in [Win::Service, Win::Whole] {
+        for win in [Win::Whole, Win::Narrow] {
             let mut fs = mounted(&img, win);
             let run = write_and_count(&mut fs, 64 << 20, 1 << 20, "w");
             std::println!(
@@ -1607,4 +1794,389 @@ fn scale_2gib() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A read that fails, at every point.
+// ---------------------------------------------------------------------------------------------
+
+/// The files a volume for the failed-read tests holds: a name, the length, and a byte pattern.
+const KEPT: [(&str, usize, u8); 5] = [
+    ("/a/small", 100, 1),
+    ("/a/mid", 5000, 2),
+    ("/a/b/big", 40_000, 3),
+    ("/top", 12_345, 4),
+    ("/a/b/c/deep", 9000, 5),
+];
+
+fn kept_device() -> MemDevice {
+    let mut fs = fresh(1024, Win::Whole);
+    for d in ["/a", "/a/b", "/a/b/c"] {
+        fs.mkdir(d.as_bytes()).unwrap();
+    }
+    for (path, len, salt) in KEPT {
+        let f = fs
+            .open(path.as_bytes(), Open::WRITE.with(Open::CREATE))
+            .unwrap();
+        let data: Vec<u8> = (0..len)
+            .map(|i| (i as u8).wrapping_mul(salt).wrapping_add(salt))
+            .collect();
+        assert_eq!(fs.write(f, &data).unwrap(), len);
+        fs.close(f).unwrap();
+    }
+    settle(fs)
+}
+
+/// Reads every kept file whole and checks its bytes, and lists the directories.
+fn read_everything(fs: &mut Vol) -> Res<()> {
+    for (path, len, salt) in KEPT {
+        let f = fs.open(path.as_bytes(), Open::READ)?;
+        let mut got = vec![0u8; len + 8];
+        let mut at = 0;
+        loop {
+            let n = fs.read(f, &mut got[at..]).inspect_err(|_| {
+                let _ = fs.close(f);
+            })?;
+            if n == 0 {
+                break;
+            }
+            at += n;
+        }
+        fs.close(f)?;
+        assert_eq!(at, len, "{path}");
+        for (i, b) in got[..len].iter().enumerate() {
+            assert_eq!(
+                *b,
+                (i as u8).wrapping_mul(salt).wrapping_add(salt),
+                "{path} byte {i}"
+            );
+        }
+    }
+    for d in ["/", "/a", "/a/b", "/a/b/c"] {
+        let dir = fs.opendir(d.as_bytes())?;
+        let mut names = 0;
+        while let Some(e) = fs.readdir(dir).inspect_err(|_| {
+            let _ = fs.closedir(dir);
+        })? {
+            if e.name() != b"." && e.name() != b".." {
+                names += 1;
+            }
+        }
+        fs.closedir(dir)?;
+        assert!(names >= 1, "{d}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_walk_stopped_at_every_read_leaves_a_volume_that_works() {
+    let device = kept_device();
+    let mut probe = mounted(&device, Win::Whole);
+    let at = now(&mut probe);
+    probe.walk().unwrap();
+    let reads = now(&mut probe).since(at).reads;
+    assert!(reads >= 10, "a walk of {reads} reads is too short to test");
+    for point in 0..reads {
+        let mut fs = mounted(&device, Win::Whole);
+        // Warm the read cache with the root, as a service that has served requests would have it.
+        fs.stat(b"/top").unwrap();
+        fs.device().fail_read_after(Some(point));
+        let stopped = fs.walk();
+        assert_eq!(stopped, Err(Error::Io), "point {point}");
+        // The volume is used on: every file reads back whole, a file is written, the walk works.
+        read_everything(&mut fs).unwrap_or_else(|e| panic!("point {point}: {e:?}"));
+        let mut m = Meter::new(&mut fs);
+        put(&mut fs, &mut m, "/new", 20_000).unwrap();
+        let f = fs.open(b"/new", Open::READ).unwrap();
+        let mut got = vec![0u8; 20_000];
+        assert_eq!(fs.read(f, &mut got).unwrap(), 20_000);
+        fs.close(f).unwrap();
+        assert_eq!(fs.stat(b"/new").unwrap().size, 20_000, "point {point}");
+        read_everything(&mut fs).unwrap();
+        fs.walk()
+            .unwrap_or_else(|e| panic!("point {point}: the next walk failed: {e:?}"));
+        assert_eq!(
+            fs.free_blocks().unwrap(),
+            1024 - fs.used_blocks().unwrap(),
+            "point {point}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_read_at_every_point_of_ordinary_reads_leaves_a_volume_that_works() {
+    let device = kept_device();
+    let mut probe = mounted(&device, Win::Whole);
+    let at = now(&mut probe);
+    read_everything(&mut probe).unwrap();
+    let reads = now(&mut probe).since(at).reads;
+    for point in 0..reads {
+        let mut fs = mounted(&device, Win::Whole);
+        fs.device().fail_read_after(Some(point));
+        // One of the reads fails somewhere in the reads, the opens or the listings.
+        let first = read_everything(&mut fs);
+        assert!(first.is_err(), "point {point}: no read failed");
+        read_everything(&mut fs)
+            .unwrap_or_else(|e| panic!("point {point}: after the failure {e:?}"));
+        let mut m = Meter::new(&mut fs);
+        put(&mut fs, &mut m, "/new", 3000).unwrap();
+        read_everything(&mut fs).unwrap();
+    }
+}
+
+#[test]
+fn free_blocks_make_no_walk_for_a_window_the_checkpoint_cut_short() {
+    // A wrap of the allocator inside a request fills the window as long as the checkpoint allowed:
+    // shorter than the volume and still holding bits. STATFS counts its bits and walks only when the
+    // window is empty; `window_short` tells the worker a walk in the idle would fill it whole.
+    let mut fs = fresh(1024, Win::Whole);
+    let mut m = Meter::new(&mut fs);
+    put(&mut fs, &mut m, "/a", 100 << 10).unwrap();
+    assert!(!fs.window_short());
+    // Go round the volume: 3 MiB written and removed, then 3 MiB again, so that the cursor wraps
+    // inside a request. (littlefs usually refills the window whole after the wrap; if the
+    // checkpoint cuts it short, the branch below holds.)
+    for round in 0..3 {
+        for n in 0..3 {
+            put(&mut fs, &mut m, &format!("/r{round}-{n}"), 1 << 20).unwrap();
+        }
+        for n in 0..3 {
+            fs.remove(format!("/r{round}-{n}").as_bytes()).unwrap();
+        }
+    }
+    let (_, _, size) = fs.window_state();
+    assert!(size != 0, "the window is filled");
+    if fs.window_short() {
+        // Its bits give a count that is low, and a STATFS reads nothing for it.
+        let at = now(&mut fs);
+        let seen = fs.free_blocks().unwrap();
+        assert_eq!(now(&mut fs).since(at).reads, 0);
+        assert!(seen <= 1024 - fs.used_blocks().unwrap());
+        fs.walk().unwrap();
+    }
+    assert!(!fs.window_short(), "a walk fills the window whole");
+    assert_eq!(fs.window_state().2 as u64, fs.blocks());
+}
+
+#[test]
+fn counts_agree_on_volumes_that_are_not_a_multiple_of_64_blocks() {
+    for blocks in [1000u64, 1025, 4097] {
+        let mut fs = fresh(blocks, Win::Whole);
+        let mut m = Meter::new(&mut fs);
+        put(&mut fs, &mut m, "/a", 150 << 10).unwrap();
+        fs.mkdir(b"/d").unwrap();
+        let mut fs = mounted(&settle(fs), Win::Whole);
+        assert_eq!(fs.window_state().2, 0);
+        let free = fs.free_blocks().unwrap();
+        assert_eq!(
+            fs.window_state().2 as u64,
+            blocks,
+            "{blocks}: the window holds the volume"
+        );
+        assert_eq!(free, blocks - fs.used_blocks().unwrap(), "{blocks} blocks");
+    }
+}
+
+#[test]
+fn a_volume_larger_than_the_window_counts_by_the_walk() {
+    // The fallback for a volume the window cannot cover (the service refuses such a volume; the
+    // volume layer keeps the count right all the same): a window of 128 bytes on 4096 blocks.
+    let mut fs = fresh(4096, Win::Narrow);
+    let mut m = Meter::new(&mut fs);
+    put(&mut fs, &mut m, "/a", 300 << 10).unwrap();
+    let at = now(&mut fs);
+    let free = fs.free_blocks().unwrap();
+    assert!(now(&mut fs).since(at).reads > 0, "the count walks the tree");
+    assert_eq!(free, 4096 - fs.used_blocks().unwrap());
+}
+
+#[test]
+fn a_disk_with_a_data_partition_over_4_gib_is_refused_and_not_written() {
+    use crate::volume::{self, Refusal};
+    use crate::{DeviceError, SECTOR};
+    // A disk of 6 GiB that reads as zeros and panics on a write.
+    struct Huge;
+    impl Device for Huge {
+        fn sectors(&self) -> u64 {
+            (6u64 << 30) / SECTOR as u64
+        }
+        fn read(&mut self, _: u64, out: &mut [u8]) -> Result<(), DeviceError> {
+            out.fill(0);
+            Ok(())
+        }
+        fn write(&mut self, sector: u64, _: &[u8]) -> Result<(), DeviceError> {
+            panic!("a write at sector {sector}")
+        }
+        fn flush(&mut self) -> Result<(), DeviceError> {
+            Ok(())
+        }
+    }
+    let mut state = Box::new(Storage::new());
+    let refused = volume::open(Huge, &mut state, 1).err();
+    assert_eq!(refused, Some(Refusal::TooLarge));
+    assert!(Refusal::TooLarge.text().contains("4 GiB"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// A walk that gives way to a queued job.
+// ---------------------------------------------------------------------------------------------
+
+/// The device as the worker's disk is to a walk: a read fails when a job is queued and the walk may
+/// give way to one (`Disk::read` in services/datafs).
+struct Yielding {
+    inner: MemDevice,
+    /// A job is queued: set by the test when its job "arrives".
+    queued: std::rc::Rc<std::cell::Cell<bool>>,
+    may_yield: std::rc::Rc<std::cell::Cell<bool>>,
+    /// The reads of the walk and of the jobs served meanwhile.
+    stopped: std::rc::Rc<std::cell::Cell<u32>>,
+}
+
+impl Device for Yielding {
+    fn sectors(&self) -> u64 {
+        self.inner.sectors()
+    }
+
+    fn read(&mut self, sector: u64, out: &mut [u8]) -> Result<(), crate::DeviceError> {
+        if self.may_yield.get() && self.queued.get() {
+            self.stopped.set(self.stopped.get() + 1);
+            return Err(crate::DeviceError);
+        }
+        self.inner.read(sector, out)
+    }
+
+    fn write(&mut self, sector: u64, data: &[u8]) -> Result<(), crate::DeviceError> {
+        self.inner.write(sector, data)
+    }
+
+    fn flush(&mut self) -> Result<(), crate::DeviceError> {
+        self.inner.flush()
+    }
+}
+
+#[test]
+fn a_job_during_a_walk_stops_it_is_served_in_a_few_reads_and_the_walk_completes_later() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let queued = Rc::new(Cell::new(false));
+    let may_yield = Rc::new(Cell::new(false));
+    let stopped = Rc::new(Cell::new(0));
+    let device = kept_device();
+    let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+    let gate = Yielding {
+        inner: device,
+        queued: queued.clone(),
+        may_yield: may_yield.clone(),
+        stopped: stopped.clone(),
+    };
+    let mut fs = Fs::new(gate, state).unwrap();
+    fs.mount().unwrap();
+    // The walk alone: how many reads it takes.
+    let before = fs.device().inner.reads;
+    fs.walk().unwrap();
+    let whole = fs.device().inner.reads - before;
+    assert!(whole >= 10);
+    // A walk that a job stops at its first read (the job was queued as the walk began).
+    may_yield.set(true);
+    queued.set(true);
+    assert_eq!(fs.walk(), Err(Error::Io));
+    assert_eq!(stopped.get(), 1);
+    // The job is served at once: the walk gave the device back at one read. The volume is whole.
+    queued.set(false);
+    may_yield.set(false);
+    let at = fs.device().inner.reads;
+    let mut buf = [0u8; 100];
+    let f = fs.open(b"/a/small", Open::READ).unwrap();
+    assert_eq!(fs.read(f, &mut buf).unwrap(), 100);
+    fs.close(f).unwrap();
+    let served = fs.device().inner.reads - at;
+    assert!(
+        served < whole && served <= 40,
+        "a read job took {served} reads, a walk {whole}"
+    );
+    // The walk is tried again when the queue is empty, and completes.
+    fs.walk().unwrap();
+    assert_eq!(fs.free_blocks().unwrap(), 1024 - fs.used_blocks().unwrap());
+}
+
+#[test]
+fn after_the_allowed_tries_a_walk_runs_to_its_end_though_jobs_keep_coming() {
+    use crate::idle::{MAX_YIELDS, may_yield};
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let queued = Rc::new(Cell::new(true));
+    let allowed = Rc::new(Cell::new(false));
+    let stopped = Rc::new(Cell::new(0));
+    let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+    let mut fs = Fs::new(
+        Yielding {
+            inner: kept_device(),
+            queued: queued.clone(),
+            may_yield: allowed.clone(),
+            stopped: stopped.clone(),
+        },
+        state,
+    )
+    .unwrap();
+    fs.mount().unwrap();
+    // A job is queued all the time: each try is stopped until the rule says the next one is not to
+    // be, and that one completes.
+    let mut tries = 0;
+    loop {
+        allowed.set(may_yield(tries));
+        match fs.walk() {
+            Ok(()) => break,
+            Err(Error::Io) => tries += 1,
+            Err(e) => panic!("{e:?}"),
+        }
+        assert!(tries <= MAX_YIELDS, "the walk never completes");
+    }
+    assert_eq!(tries, MAX_YIELDS);
+    assert_eq!(stopped.get(), MAX_YIELDS);
+    assert_eq!(fs.window_state().2 as u64, fs.blocks());
+}
+
+#[test]
+fn a_request_that_takes_blocks_is_named_for_the_stop_status() {
+    use crate::server::needs_blocks;
+    use proto_data as p;
+    let build = |f: &dyn Fn(&mut proto_wire::Writer)| {
+        let mut w = proto_wire::Writer::new();
+        f(&mut w);
+        w.as_bytes().to_vec()
+    };
+    assert!(needs_blocks(&build(&|w| p::write(1, b"x", w).unwrap())));
+    assert!(needs_blocks(&build(&|w| p::path_call(
+        p::Method::Mkdir,
+        b"/d",
+        w
+    )
+    .unwrap())));
+    assert!(needs_blocks(&build(
+        &|w| p::rename(b"/a", b"/b", w).unwrap()
+    )));
+    assert!(needs_blocks(&build(&|w| p::open(
+        b"/n",
+        p::WRITE | p::CREATE,
+        w
+    )
+    .unwrap())));
+    assert!(!needs_blocks(&build(
+        &|w| p::open(b"/n", p::READ, w).unwrap()
+    )));
+    assert!(!needs_blocks(&build(&|w| p::pread(1, 10, 0, w).unwrap())));
+    assert!(!needs_blocks(&build(&|w| p::statfs(w).unwrap())));
+    assert!(!needs_blocks(&build(&|w| p::path_call(
+        p::Method::Stat,
+        b"/a",
+        w
+    )
+    .unwrap())));
+    assert!(!needs_blocks(&build(&|w| p::path_call(
+        p::Method::Unlink,
+        b"/a",
+        w
+    )
+    .unwrap())));
+    assert!(!needs_blocks(&[]));
 }

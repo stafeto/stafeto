@@ -1796,6 +1796,24 @@ fn nvme_key_image(
             ));
         }
     }
+    // The first walk after READY (`datafs: first walk ...`): the data image is the machine of NVMe and
+    // datafs that the probes carry it on, besides data-probe on the virtio disk. The machine may end
+    // right after the key is restored, before a walk that the key's job stopped has been tried
+    // again, so one of the two boots must have said it, and each line says it whole.
+    let walks = [&first, &second]
+        .iter()
+        .filter(|lines| lines.iter().any(|l| l.contains("datafs: first walk ")))
+        .count();
+    if walks == 0 {
+        return Err(format!(
+            "{name}: neither boot printed the line of the first walk of the volume"
+        ));
+    }
+    for (lines, boot) in [(&first, "first"), (&second, "second")] {
+        if lines.iter().any(|l| l.contains("datafs: first walk ")) {
+            crate::data_probe::first_walk(lines, &format!("{name}, {boot} boot"))?;
+        }
+    }
     let datakey = |lines: &[String]| {
         lines
             .iter()

@@ -77,6 +77,7 @@ pub const COMPOSITOR: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 /// The compositor of the images that take keys: it asks the input service
@@ -117,6 +118,7 @@ pub const PROBE: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 /// The second probe (role `l`): waits for the first one's window to go,
