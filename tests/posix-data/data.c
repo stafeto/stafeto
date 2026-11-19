@@ -712,6 +712,18 @@ static int owner_from_the_effective_uid(void) {
     return 0;
 }
 
+/* Compares two byte strings; on a difference prints the first differing offset and the bytes around it. */
+static int same_bytes(const char *what, const unsigned char *want, const unsigned char *got, unsigned long n) {
+    for (unsigned long i = 0; i < n; i++) {
+        if (want[i] == got[i]) continue;
+        printf("posix-data: %s differs at offset %lu of %lu: wanted %02x %02x %02x, got %02x %02x %02x\n", what, i, n,
+               want[i], i + 1 < n ? want[i + 1] : 0, i + 2 < n ? want[i + 2] : 0, got[i],
+               i + 1 < n ? got[i + 1] : 0, i + 2 < n ? got[i + 2] : 0);
+        return 1;
+    }
+    return 0;
+}
+
 static int write_pwrite_and_read_back(void) {
     unsigned char buf[100];
     int fd = open("/data/w-rw", O_RDWR | O_CREAT | O_EXCL, 0644);
@@ -724,22 +736,25 @@ static int write_pwrite_and_read_back(void) {
     make_pattern(buf, 0, sizeof buf, 9);
     DATA_CHECK(pwrite(fd, buf, sizeof buf, 1000) == (ssize_t)sizeof buf);
     DATA_CHECK(lseek(fd, 0, SEEK_CUR) == 5000); /* pwrite leaves the position */
-    /* A pwrite of more than one message (a message of PWRITE holds 1,004 bytes), at an offset that
-     * is not a message boundary, and a pread of as much. */
+    /* A pwrite of more than one message (a message of PWRITE holds 1,004 bytes) at an offset that is
+     * not a message boundary: 3,000 bytes of salt 10 at 2000, which overwrite the bytes 2000 to 4999
+     * of the write above (the 100 bytes of salt 9 at 1000 stay), and a pread of as much. */
     unsigned char wide[3000], wide_back[3000];
     make_pattern(wide, 0, sizeof wide, 10);
-    DATA_CHECK(pwrite(fd, wide, sizeof wide, 500) == (ssize_t)sizeof wide);
-    DATA_CHECK(pread(fd, wide_back, sizeof wide_back, 500) == (ssize_t)sizeof wide_back);
-    DATA_CHECK(memcmp(wide, wide_back, sizeof wide) == 0);
+    DATA_CHECK(pwrite(fd, wide, sizeof wide, 2000) == (ssize_t)sizeof wide);
+    DATA_CHECK(pread(fd, wide_back, sizeof wide_back, 2000) == (ssize_t)sizeof wide_back);
+    DATA_CHECK(same_bytes("pread of the pwrite at 2000", wide, wide_back, sizeof wide) == 0);
     DATA_CHECK(lseek(fd, 0, SEEK_CUR) == 5000);
-    DATA_CHECK(pwrite(fd, big, sizeof big, 0) == (ssize_t)sizeof big); /* the first bytes again */
     DATA_CHECK(close(fd) == 0);
+    /* The whole file read back: [0,1000) salt 3, [1000,1100) salt 9, [1100,2000) salt 3 from offset
+     * 1100, [2000,5000) salt 10 from offset 0. */
     unsigned char back[5000];
     fd = open("/data/w-rw", O_RDONLY);
     DATA_CHECK(fd >= 0 && read_up_to(fd, back, sizeof back) == 5000);
     DATA_CHECK(pattern_is(back, 0, 1000, 3));
     DATA_CHECK(pattern_is(back + 1000, 0, 100, 9));
-    DATA_CHECK(pattern_is(back + 1100, 1100, 3900, 3));
+    DATA_CHECK(pattern_is(back + 1100, 1100, 900, 3));
+    DATA_CHECK(same_bytes("the pwrite at 2000 read whole", wide, back + 2000, sizeof wide) == 0);
     DATA_CHECK(close(fd) == 0);
     DATA_CHECK(unlink("/data/w-rw") == 0);
     return 0;
@@ -1191,26 +1206,46 @@ static int scm_rights_of_a_data_descriptor(void) {
 
 /* MKDIR is ENOSPC at the 1,024 directories of a volume (the root and the hidden directory among
  * them), and passes again after a removal. */
+/* The volume has at most 1,024 directories (the root and the hidden directory of the service among
+ * them) and a directory at most 1,024 entries (a flat loop of directories in one parent ends at the
+ * 1,024th entry with ENOSPC before the cap of directories), so the directories are made under 8
+ * parents. Before the loop the volume holds the root, the hidden directory, /dir, /hidden, /many,
+ * /data/w-cap and its 8 parents, 14 in all, and the loop gets 1,010 successes. */
+#define CAP_PARENTS 8
+
 static int directory_cap(void) {
     int made = 0;
-    char name[40];
+    char name[64];
     DATA_CHECK(mkdir("/data/w-cap", 0755) == 0);
+    for (int p = 0; p < CAP_PARENTS; p++) {
+        snprintf(name, sizeof name, "/data/w-cap/p%d", p);
+        DATA_CHECK(mkdir(name, 0755) == 0);
+    }
     for (;; made++) {
-        snprintf(name, sizeof name, "/data/w-cap/d%d", made);
+        snprintf(name, sizeof name, "/data/w-cap/p%d/d%d", made % CAP_PARENTS, made / CAP_PARENTS);
         if (mkdir(name, 0755) != 0) break;
     }
     int refused = errno;
     printf("posix-data: the directory cap came after %d more directories (errno %d)\n", made, refused);
     DATA_CHECK(refused == ENOSPC);
-    DATA_CHECK(made > 900 && made < 1024);
+    /* 1,024 less the 14 the volume held; the range of four leaves room for a directory of the
+     * fixture that this file does not know about, and the line above tells the number. */
+    DATA_CHECK(made >= 1007 && made <= 1010);
     /* Files and removals pass at the cap of directories; a removal makes room for one MKDIR. */
     int fd = open("/data/w-cap/file", O_WRONLY | O_CREAT | O_EXCL, 0644);
     DATA_CHECK(fd >= 0 && close(fd) == 0 && unlink("/data/w-cap/file") == 0);
-    snprintf(name, sizeof name, "/data/w-cap/d%d", made - 1);
+    int last = made - 1;
+    snprintf(name, sizeof name, "/data/w-cap/p%d/d%d", last % CAP_PARENTS, last / CAP_PARENTS);
     DATA_CHECK(rmdir(name) == 0);
     DATA_CHECK(mkdir(name, 0755) == 0);
+    errno = 0;
+    DATA_CHECK(mkdir("/data/w-cap/over", 0755) == -1 && errno == ENOSPC);
     for (int i = 0; i < made; i++) {
-        snprintf(name, sizeof name, "/data/w-cap/d%d", i);
+        snprintf(name, sizeof name, "/data/w-cap/p%d/d%d", i % CAP_PARENTS, i / CAP_PARENTS);
+        DATA_CHECK(rmdir(name) == 0);
+    }
+    for (int p = 0; p < CAP_PARENTS; p++) {
+        snprintf(name, sizeof name, "/data/w-cap/p%d", p);
         DATA_CHECK(rmdir(name) == 0);
     }
     DATA_CHECK(rmdir("/data/w-cap") == 0);
@@ -1260,7 +1295,8 @@ static int enospc_at_the_reserve_then_unlink(void) {
     make_pattern(buf, 0, sizeof buf, 1);
     unsigned long calls = 0, in_file = 0;
     for (;;) {
-        if (calls % 500 == 0) {
+        if (calls % 4 == 0) {
+            /* One block is four writes: the reserve (64 blocks) is not run through between two looks. */
             DATA_CHECK(statvfs("/data", &v) == 0);
             /* f_bavail leaves the reserve out: it is 0 when the reserve is reached. */
             if (v.f_bavail <= 4) break;
