@@ -1159,6 +1159,10 @@ impl Shadow {
                     },
                     posix_fs::Target::Tty(n) => Names::Terminal(n),
                     posix_fs::Target::Random(n) => Names::Random(n.fd()),
+                    posix_fs::Target::Data(n) => Names::Data {
+                        handle: n.handle,
+                        directory: n.directory,
+                    },
                     // An epoll descriptor never reaches the new image: its set
                     // goes with ABANDON, and its number is free there.
                     posix_fs::Target::Epoll(_) => continue,

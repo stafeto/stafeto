@@ -817,6 +817,7 @@ dependencies = [
  "process-client",
  "proto-clock",
  "proto-comp",
+ "proto-data",
  "proto-entropy",
  "proto-fs",
  "proto-gpu",
@@ -934,9 +935,11 @@ dependencies = [
 name = "posix-fs"
 version = "0.1.0"
 dependencies = [
+ "abi",
  "entries",
  "posix-fd",
  "posix-path",
+ "proto-data",
  "proto-fs",
  "proto-net",
  "proto-pipe",
