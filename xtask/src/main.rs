@@ -619,6 +619,7 @@ const POSIX_TTY_PROGRAMS: [ImageProgram; 12] = [
 ];
 const POSIX_TTY_STEPS_PROGRAMS: [ImageProgram; 12] = {
     let mut programs = POSIX_TTY_PROGRAMS;
+    programs[1].3 = &["steps"];
     programs[2].3 = &["trust-probe", "steps"];
     programs[5].3 = &["tty-probe", "steps"];
     programs
@@ -626,6 +627,7 @@ const POSIX_TTY_STEPS_PROGRAMS: [ImageProgram; 12] = {
 /// Full terminal control steps with sixteen live POSIX clients over a PTY.
 const POSIX_TTY_CONTROL_PROGRAMS: [ImageProgram; 12] = {
     let mut programs = POSIX_TTY_STEPS_PROGRAMS;
+    programs[1].3 = &[];
     programs[2].3 = &["quiet-steps"];
     programs[5].3 = &[];
     programs[8].3 = &["quiet-control"];

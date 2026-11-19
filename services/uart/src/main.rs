@@ -301,6 +301,15 @@ fn main(_: u64) -> u64 {
         issued: 0,
         heartbeat: Some(heartbeat),
     };
+    // The tag of the driver's lines of steps (`service table: 18 kind K ...`): kind 65 is the tick
+    // of the log that took nothing, kind 64 is the other notices (the interrupt of the line, the
+    // wake-up of the transmit timer, a tick that took batches), and the detail of kind 64 tells
+    // which: 1 the interrupt, 2 the transmit wake-up, 3 a tick with batches.
+    #[cfg(feature = "steps")]
+    {
+        rt::service::report_steps(18);
+        rt::service::table_steps();
+    }
     let _ = rt::service::run::<Uart, SESSIONS, HELD>(&channel, &mut uart, config);
     uart.say_peak(true);
     STOPPED
@@ -526,8 +535,8 @@ impl Uart {
     /// and a batch of text fits, whether or not the text taken before went
     /// out. The port is paced on its own timer. Only the timer's tick (and
     /// the start, once) calls it, so STEP_BATCHES is the bound of the driver's
-    /// log work in a period, for all its entry points together.
-    fn take_log(&mut self) {
+    /// log work in a period, for all its entry points together. Gives the batches taken.
+    fn take_log(&mut self) -> usize {
         let mut taken = 0;
         loop {
             let State {
@@ -568,6 +577,7 @@ impl Uart {
         if taken > 0 {
             self.kick();
         }
+        taken
     }
 
     /// Arms the timer (spec 10) at the first deadline t0 + k * period after
@@ -987,17 +997,31 @@ impl Service<HELD> for Uart {
     /// a stale expiry, before its deadline, changes nothing.
     fn notification(&mut self, n: Notice) {
         match (n.source, n.label) {
-            (Source::Interrupt, _) => self.interrupt(),
+            (Source::Interrupt, _) => {
+                #[cfg(feature = "steps")]
+                rt::service::step_detail(1);
+                self.interrupt()
+            }
             (Source::Timer, TX_TIMER_LABEL)
                 if self.irqs.resume_transmit(time::ticks_to_ns(time::now())) =>
             {
+                #[cfg(feature = "steps")]
+                rt::service::step_detail(2);
                 self.kick();
             }
             (Source::Timer, TIMER_LABEL) if time::reached(self.deadline) => {
                 if self.poll {
                     self.interrupt();
                 }
-                self.take_log();
+                let taken = self.take_log();
+                #[cfg(feature = "steps")]
+                if taken == 0 {
+                    rt::service::step_own();
+                } else {
+                    rt::service::step_detail(3);
+                }
+                #[cfg(not(feature = "steps"))]
+                let _ = taken;
                 self.say_peak(false);
                 self.arm();
                 self.exit_if_drained();
