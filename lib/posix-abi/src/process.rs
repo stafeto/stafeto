@@ -1260,6 +1260,23 @@ impl Shadow {
         Ok((ends, found))
     }
 
+    /// A clone of the session with the data file service that holds the descriptions the child's
+    /// descriptors name, none when it has none (the child takes a session at its first use of
+    /// `/data`). The current directory is the child's to open again.
+    fn clone_data(&self) -> Result<Option<Handle<Channel>>, i32> {
+        let (list, count) = self.descriptors()?;
+        crate::data::clone_for_child(
+            list[..count].iter().filter_map(|d| match d.names {
+                proto_loader::Names::Data { handle, .. } => Some(posix_fs::data::Held {
+                    handle,
+                    clofork: false,
+                }),
+                _ => None,
+            }),
+            false,
+        )
+    }
+
     /// The descriptions of sockets the child's session shares, each once.
     fn shared_nets(&self) -> Result<([u32; proto_loader::DESCRIPTORS], usize), i32> {
         let (list, count) = self.descriptors()?;
@@ -2165,6 +2182,9 @@ fn move_files(c: &Handle<Channel>) -> bool {
             (Slot::Display, moved(crate::display::session())),
             (Slot::Net, moved(crate::net::session_passive())),
             (Slot::Packages, moved(crate::packages::session())),
+            // The session with the data file service goes on with the descriptions of the
+            // descriptors that stay: its binding lapses, and the new image binds it again.
+            (Slot::Data, moved(crate::data::session_for_exec())),
         ],
     ) == 0
 }
@@ -2274,6 +2294,7 @@ fn commit(
     let entropy = crate::fork::entropy_clone();
     let display = crate::display::clone_session();
     let packages = crate::packages::clone_session();
+    let data = shadow.clone_data()?;
     let (nets, count) = shadow.shared_nets()?;
     // The child carries 64 descriptors at most: one portion.
     let net = crate::net::clone_kept(|out| {
@@ -2290,6 +2311,7 @@ fn commit(
         (Slot::Display, display),
         (Slot::Net, net),
         (Slot::Packages, packages),
+        (Slot::Data, data),
     ];
     if give_sessions(c, sessions) != 0 {
         return Err(EIO);

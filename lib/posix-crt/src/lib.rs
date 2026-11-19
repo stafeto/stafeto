@@ -369,9 +369,10 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
             }
             #[cfg(not(feature = "procfs"))]
             Names::Proc { .. } => continue,
-            // The layer has no target for the data file service yet: the description stays with the
-            // session in the slot Data, and the number is not inherited.
-            Names::Data { .. } => continue,
+            // A description of the data file service, held by the session in the slot Data.
+            Names::Data { handle, directory } => {
+                InheritedTarget::Ready(Target::Data(posix_fs::DataTarget { handle, directory }))
+            }
             Names::PendingTerminal(_) => continue,
         };
         *place = Inherited { fd: d.fd, target };
