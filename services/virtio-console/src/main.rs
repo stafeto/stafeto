@@ -89,6 +89,8 @@ const NO_LOG: u64 = 2;
 const NOT_REGISTERED: u64 = 3;
 const NOT_MAPPED: u64 = 4;
 const STOPPED: u64 = 5;
+/// The kernel refused the budget of the loop.
+const NO_BUDGET: u64 = 8;
 const NO_DEVICE: u64 = 6;
 const NO_CONSOLE: u64 = 7;
 const CONFIG_ELSEWHERE: u64 = 9;
@@ -344,6 +346,9 @@ fn main(_: u64) -> u64 {
     let Ok(log) = s.take::<Resource>("log") else {
         return NO_LOG;
     };
+    // The budget of the loop (`serve`), taken before the arguments borrow the start data and
+    // bound below, once the driver is set up and before its loop begins.
+    let budget = rt::budget::take(&mut s, rt::budget::SERVE);
     let Ok(dma) = s.take::<Memory>("dma") else {
         return NO_START_DATA;
     };
@@ -455,6 +460,11 @@ fn main(_: u64) -> u64 {
     // The line opens once the queues are up: an input that came before
     // is read at the first interrupt.
     let _ = sys::irq_ack(&driver.irq);
+    // The loop is this thread: it works under its budget from here on, and a budget the kernel
+    // refuses is a start error, since the thread would run without a limit.
+    if rt::budget::bind("virtio-console", "serve", budget, &s.thread).is_err() {
+        return NO_BUDGET;
+    }
     let heartbeat = Heartbeat {
         to: &s.parent,
         period_ns: args.map_or(0, |a| a.period_ns),

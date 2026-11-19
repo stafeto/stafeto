@@ -250,8 +250,8 @@ pub const CONSOLE: Record = Record {
     shares: Shares::CREATOR,
     cpus: GENERAL_CPUS,
     waits: &[],
-    budgets: &[],
-    free: 0,
+    budgets: super::ramfs::CONSOLE_BUDGETS,
+    free: super::ramfs::SERVICE_FREE,
 };
 
 const fn same(a: &str, b: &str) -> bool {
@@ -465,6 +465,9 @@ pub const POWER: Record = Record {
         only_if: None,
         confirm: None,
     }],
+    // The power service is no console driver: it keeps no budget.
+    budgets: &[],
+    free: 0,
     ..CONSOLE
 };
 
@@ -1021,11 +1024,11 @@ mod tests {
     }
 
     /// The budgets on CPU 0 of the EC2 table: the network service 40 % and 20 %, the file
-    /// service 5 %, the pipe service 1.5 %, the terminal service 1.5 %, the NVMe service 1 %
-    /// and the data file service 1 %, and the reserve of 3 % for the process service and the
-    /// package service: 73 % under the 75 % the table allows.
+    /// service 5 %, the pipe service 1.5 %, the terminal service 1.5 %, the console driver 1.5 %,
+    /// the NVMe service 1 % and the data file service 1 %, and the reserve of 3 % for the process
+    /// service and the package service: 74.5 % under the 75 % the table allows.
     #[test]
-    fn the_budgets_of_cpu_zero_on_ec2_are_73_percent_under_the_cap_of_75() {
+    fn the_budgets_of_cpu_zero_on_ec2_are_74_5_percent_under_the_cap_of_75() {
         for table in [TABLE, QEMU_TABLE] {
             let on_zero: u64 = table
                 .iter()
@@ -1035,8 +1038,8 @@ mod tests {
                 .sum();
             assert_eq!(
                 on_zero + crate::table::CPU0_RESERVE_PPM,
-                730_000,
-                "40 + 20 + 5 + 1.5 + 1.5 + 1 + 1 + 3 per cent"
+                745_000,
+                "40 + 20 + 5 + 1.5 + 1.5 + 1.5 + 1 + 1 + 3 per cent"
             );
             assert!(on_zero + crate::table::CPU0_RESERVE_PPM <= crate::table::BUDGET_SHARE_MAX_PPM);
         }

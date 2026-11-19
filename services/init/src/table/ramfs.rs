@@ -88,6 +88,20 @@ pub const TTY_BUDGETS: &[Budget] = &[Budget {
     low: SERVICE_LOW,
 }];
 
+/// The budget of the console driver's request thread (`serve`, which also takes the log): 75 us
+/// of each 5 ms (1.5 % of CPU 0), at `low` 32 after that. The tick of the log that finds nothing
+/// (about 30 us under -icount) fits in one chunk; the tick that takes records and a long output
+/// spend it, and the rest of the work goes on at 32, above the POSIX processes and below the
+/// network. A request of the terminal service in the background lends the time to the terminal
+/// service's budget.
+pub const CONSOLE_BUDGETS: &[Budget] = &[Budget {
+    name: "serve",
+    cpu: 0,
+    c_ns: 75_000,
+    t_ns: SERVICE_PERIOD_NS,
+    low: SERVICE_LOW,
+}];
+
 const RAM_BASE: Record = Record {
     name: "ramfs",
     program: "ramfs",
@@ -1066,6 +1080,10 @@ pub const TTY_STEPS_TABLE: &[Record] = &[
         log: false,
         args: b"S",
         restart: Restart::Never,
+        // The stub of the driver runs unbudgeted in these images: only the budget probe gives it
+        // a counting budget (below), and the real driver has `CONSOLE_BUDGETS`.
+        budgets: &[],
+        free: 0,
         ..super::normal::TABLE[0]
     },
     TTY,

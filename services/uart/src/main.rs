@@ -74,6 +74,8 @@ const NO_LOG: u64 = 2;
 const NOT_REGISTERED: u64 = 3;
 const NOT_MAPPED: u64 = 4;
 const STOPPED: u64 = 5;
+/// The kernel refused the budget of the loop.
+const NO_BUDGET: u64 = 6;
 /// The time the driver gives the kernel log and its own output to reach the
 /// port once init asked it to stop (`Uart::stop`), less than the 2 s init gives
 /// the console (shutdown::CONSOLE_STOP_NS): 3.4 KB leave in 300 ms at 115 200
@@ -213,6 +215,9 @@ fn main(_: u64) -> u64 {
     let Ok(log) = s.take::<Resource>("log") else {
         return NO_LOG;
     };
+    // The budget of the loop (`serve`), taken before the arguments borrow the start data and
+    // bound below, once the driver is set up and before its loop begins.
+    let budget = rt::budget::take(&mut s, rt::budget::SERVE);
     let Some(state) = state() else {
         return NO_START_DATA;
     };
@@ -301,6 +306,11 @@ fn main(_: u64) -> u64 {
         issued: 0,
         heartbeat: Some(heartbeat),
     };
+    // The loop is this thread: it works under its budget from here on, and a budget the kernel
+    // refuses is a start error, since the thread would run without a limit.
+    if rt::budget::bind("uart", "serve", budget, &s.thread).is_err() {
+        return NO_BUDGET;
+    }
     // The tag of the driver's lines of steps (`service table: 18 kind K ...`): kind 65 is the tick
     // of the log that found no record (the idle tick), kind 64 is the other notices, and the
     // detail of kind 64 tells which: 1 the interrupt of the line, 2 the transmit wake-up, 3 a

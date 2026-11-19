@@ -239,13 +239,25 @@ pub fn verdict(all: &[Numbers], control: &[(u64, u64, u64)]) -> Result<(), Strin
     Ok(())
 }
 
-/// The lines each service prints when it runs its request thread under its budget.
+/// The lines each service prints when it runs its request thread under its budget, and the
+/// console driver's (`uart`, or `virtio-console` on the images of Apple's framework).
 pub fn require_service_budget_lines(lines: &[String]) -> Result<(), String> {
     for service in SERVICES {
         let wanted = format!("{service}: serve runs under its budget");
         if !lines.iter().any(|l| l.contains(&wanted)) {
             return Err(format!("no line {wanted:?}: the service runs unbudgeted"));
         }
+    }
+    let driver = ["uart", "virtio-console"].iter().any(|d| {
+        lines
+            .iter()
+            .any(|l| l.contains(&format!("{d}: serve runs under its budget")))
+    });
+    if !driver {
+        return Err(
+            "no line \"uart: serve runs under its budget\": the console driver runs unbudgeted"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -882,7 +894,18 @@ mod tests {
             .iter()
             .map(|s| format!("{s}: serve runs under its budget"))
             .collect();
+        // The console driver's line is required too.
+        assert!(
+            require_service_budget_lines(&all)
+                .unwrap_err()
+                .contains("console driver")
+        );
+        all.push("uart: serve runs under its budget".to_owned());
         assert!(require_service_budget_lines(&all).is_ok());
+        let mut vz = all.clone();
+        vz.pop();
+        vz.push("virtio-console: serve runs under its budget".to_owned());
+        assert!(require_service_budget_lines(&vz).is_ok());
         all.remove(1);
         assert!(
             require_service_budget_lines(&all)
