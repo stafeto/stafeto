@@ -88,10 +88,70 @@ pub fn orphan_progress(before: (u16, u16), after: (u16, u16)) -> bool {
     after.0 < before.0 || after.1 > before.1
 }
 
-/// The slots with no session and no birth that one step of the audit passes. Passing an empty
-/// slot costs 10 to 15 ticks and the rest of a step about 7 000, so a longer run saves steps
-/// (and their fixed part) at a small price.
-pub const AUDIT_EMPTY_RUN: usize = 160;
+/// The places in use that one step of the audit visits (each a `cleanup_step`, about 615 ticks
+/// under the load of the probes). The empty places between them are passed by the map of
+/// occupied places at once.
+pub const AUDIT_LIVE_RUN: usize = 4;
+
+/// The places that may hold a session, a birth or a departure: a superset by meaning. A bit is
+/// set when a place is given out (a session is placed, a birth is stored) and cleared only when
+/// the service itself frees the place, so the audit never misses a place in use; at worst it
+/// looks at a place in vain. The words are cells, for the set that the service makes through a
+/// shared reference (`Service::place`).
+pub struct Occupancy<const WORDS: usize> {
+    words: [core::cell::Cell<u64>; WORDS],
+}
+impl<const WORDS: usize> Occupancy<WORDS> {
+    pub const fn new() -> Self {
+        Self {
+            words: [const { core::cell::Cell::new(0) }; WORDS],
+        }
+    }
+    pub fn set(&self, index: usize) {
+        let word = &self.words[index / 64];
+        word.set(word.get() | 1 << (index % 64));
+    }
+    pub fn clear(&self, index: usize) {
+        let word = &self.words[index / 64];
+        word.set(word.get() & !(1 << (index % 64)));
+    }
+    pub fn contains(&self, index: usize) -> bool {
+        self.words[index / 64].get() & (1 << (index % 64)) != 0
+    }
+    /// The first set bit in `low..=high`, by words.
+    fn first_in(&self, low: usize, high: usize) -> Option<usize> {
+        if low > high {
+            return None;
+        }
+        for w in low / 64..=high / 64 {
+            let mut bits = self.words[w].get();
+            if w == low / 64 {
+                bits &= !0 << (low % 64);
+            }
+            if w == high / 64 && high % 64 != 63 {
+                bits &= (1 << (high % 64 + 1)) - 1;
+            }
+            if bits != 0 {
+                return Some(w * 64 + bits.trailing_zeros() as usize);
+            }
+        }
+        None
+    }
+    /// The distance from `position` to the next set bit among the places `1..slots`, going on
+    /// from the last place to the first (place 0 is never audited).
+    pub fn distance(&self, position: usize, slots: usize) -> Option<usize> {
+        if let Some(found) = self.first_in(position, slots - 1) {
+            return Some(found - position);
+        }
+        self.first_in(1, position - 1)
+            .map(|found| found + (slots - 1) - position)
+    }
+}
+impl<const WORDS: usize> Default for Occupancy<WORDS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub struct Cursor {
     pub position: usize,
@@ -112,69 +172,43 @@ impl Cursor {
             self.remaining = self.remaining.saturating_sub(1);
         }
     }
-    /// Passes the slots that `empty` names, at most `limit` of them and never
-    /// the last step of the round: it stays for an ordinary step. Stops at the
-    /// first slot in use. The number of slots passed.
-    pub fn skip_empty(
+    /// Whether a step of the audit goes on after it visited `visited` places in use, the last
+    /// of them with the result `worked`: not after progress (the same place is tried again in
+    /// the next step), not at the end of the round and not past `AUDIT_LIVE_RUN` places.
+    pub fn step_continues(&self, visited: usize, worked: bool) -> bool {
+        !worked && self.remaining != 0 && visited < AUDIT_LIVE_RUN
+    }
+    /// Moves `count` places on, all of them passed.
+    fn advance(&mut self, count: usize, slots: usize) {
+        self.position = 1 + (self.position - 1 + count) % (slots - 1);
+        self.remaining -= count;
+    }
+    /// Passes the places that hold nothing, by the map of places that may hold something and
+    /// then the exact test `empty` of a place the map names, and never the last step of the
+    /// round: it stays for an ordinary step. Stops at a place in use.
+    pub fn skip_unoccupied<const WORDS: usize>(
         &mut self,
         slots: usize,
-        limit: usize,
+        map: &Occupancy<WORDS>,
         empty: impl Fn(usize) -> bool,
-    ) -> usize {
-        let mut passed = 0;
-        while passed < limit && self.remaining > 1 && empty(self.position) {
+    ) {
+        while self.remaining > 1 {
+            let room = self.remaining - 1;
+            let distance = map.distance(self.position, slots).unwrap_or(usize::MAX);
+            let moved = distance.min(room);
+            self.advance(moved, slots);
+            if moved < distance || self.remaining <= 1 || !empty(self.position) {
+                return;
+            }
+            // A set bit with nothing behind it: passed.
             self.complete(false, slots);
-            passed += 1;
         }
-        passed
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn skip_empty_stops_at_a_slot_in_use_and_at_the_limit() {
-        let mut cursor = Cursor {
-            remaining: 10,
-            ..Cursor::default()
-        };
-        // Slots 1 to 4 are empty, 5 is in use.
-        assert_eq!(cursor.skip_empty(20, 160, |i| i < 5), 4);
-        assert_eq!((cursor.position, cursor.remaining), (5, 6));
-        // The limit ends a run of empty slots early.
-        let mut cursor = Cursor {
-            remaining: 10,
-            ..Cursor::default()
-        };
-        assert_eq!(cursor.skip_empty(20, 3, |_| true), 3);
-        assert_eq!((cursor.position, cursor.remaining), (4, 7));
-    }
-
-    #[test]
-    fn skip_empty_leaves_the_last_step_of_the_round() {
-        let mut cursor = Cursor {
-            remaining: 3,
-            ..Cursor::default()
-        };
-        assert_eq!(cursor.skip_empty(20, 160, |_| true), 2);
-        assert_eq!(cursor.remaining, 1);
-        assert_eq!(cursor.skip_empty(20, 160, |_| true), 0);
-        // An idle cursor passes nothing.
-        let mut idle = Cursor::default();
-        assert_eq!(idle.skip_empty(20, 160, |_| true), 0);
-    }
-
-    #[test]
-    fn skip_empty_wraps_past_the_last_slot() {
-        let mut cursor = Cursor {
-            position: 19,
-            remaining: 10,
-        };
-        assert_eq!(cursor.skip_empty(20, 2, |_| true), 2);
-        assert_eq!(cursor.position, 2);
-    }
 
     #[test]
     fn a_share_lets_work_run_until_its_budget_and_waits_for_the_window_to_end() {
@@ -643,45 +677,185 @@ mod departure_tests {
     fn departure_admission_rejects_a_place_past_the_actual_table() {
         Departures::<11>::new(641).admit(641);
     }
+}
 
-    /// Runs a round over `slots` slots (the first is unused) as the audit does: a step passes
-    /// the empty slots, then takes the slot it stops at. The steps and the most empty slots one
-    /// step passed.
-    fn round(slots: usize, occupied: &[usize]) -> (usize, usize) {
-        let mut cursor = Cursor {
-            remaining: slots - 1,
-            ..Cursor::default()
-        };
-        let (mut steps, mut longest) = (0, 0);
-        while cursor.remaining != 0 {
-            let passed = cursor.skip_empty(slots, AUDIT_EMPTY_RUN, |i| !occupied.contains(&i));
-            longest = longest.max(passed);
-            cursor.complete(false, slots);
-            steps += 1;
+#[cfg(test)]
+mod audit_map_tests {
+    use super::*;
+
+    const SLOTS: usize = 640;
+    type Map = Occupancy<10>;
+
+    /// The seeded generator of the tests (xorshift64).
+    struct Seed(u64);
+    impl Seed {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
         }
-        (steps, longest)
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// The walk that looks at every place in turn: the reference of the map's walk. The places
+    /// it visits, in order.
+    fn linear_walk(mut cursor: Cursor, slots: usize, empty: impl Fn(usize) -> bool) -> Vec<usize> {
+        let mut visits = Vec::new();
+        while cursor.remaining != 0 {
+            while cursor.remaining > 1 && empty(cursor.position) {
+                cursor.complete(false, slots);
+            }
+            visits.push(cursor.position);
+            cursor.complete(false, slots);
+        }
+        visits
+    }
+
+    /// The walk by the map, in steps of the audit: the places in use it visits (in order) and the
+    /// steps it takes. `worked` names the places whose cleanup makes progress the first time.
+    fn map_walk(
+        mut cursor: Cursor,
+        slots: usize,
+        map: &Map,
+        empty: impl Fn(usize) -> bool,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let (mut visits, mut per_step) = (Vec::new(), Vec::new());
+        while cursor.remaining != 0 {
+            let mut visited = 0;
+            loop {
+                cursor.skip_unoccupied(slots, map, &empty);
+                visits.push(cursor.position);
+                visited += 1;
+                cursor.complete(false, slots);
+                if !cursor.step_continues(visited, false) {
+                    break;
+                }
+            }
+            per_step.push(visited);
+        }
+        (visits, per_step)
+    }
+
+    fn table(occupied: &[usize], extra_bits: &[usize]) -> Map {
+        let map = Map::new();
+        for &i in occupied.iter().chain(extra_bits) {
+            map.set(i);
+        }
+        map
     }
 
     #[test]
-    fn a_round_over_640_slots_ends_within_its_steps_and_no_step_passes_many_empty_slots() {
-        let layouts: [&[usize]; 6] = [
-            &[],
-            &[1],
-            &[639],
-            &[1, 2, 3, 4, 5],
-            &[10, 100, 200, 320, 321, 500, 639],
-            &[160, 161, 321, 322, 482, 483],
-        ];
-        for occupied in layouts {
-            let (steps, longest) = round(640, occupied);
-            let bound = 639usize.div_ceil(AUDIT_EMPTY_RUN + 1) + occupied.len();
-            assert!(steps <= bound, "{occupied:?}: {steps} steps, bound {bound}");
-            assert!(
-                longest <= AUDIT_EMPTY_RUN,
-                "{occupied:?}: {longest} slots in a step"
+    fn the_map_finds_the_next_set_bit_across_words_and_the_end() {
+        let map = table(&[1, 63, 64, 639], &[]);
+        assert_eq!(map.distance(1, SLOTS), Some(0));
+        assert_eq!(map.distance(2, SLOTS), Some(61));
+        assert_eq!(map.distance(64, SLOTS), Some(0));
+        assert_eq!(map.distance(65, SLOTS), Some(574));
+        // After the last place the walk goes on at place 1.
+        assert_eq!(map.distance(639, SLOTS), Some(0));
+        let only = table(&[100], &[]);
+        assert_eq!(only.distance(101, SLOTS), Some(638));
+        assert_eq!(Map::new().distance(5, SLOTS), None);
+        // Place 0 is never audited, so a bit there is not found.
+        let zero = table(&[0], &[]);
+        assert_eq!(zero.distance(1, SLOTS), None);
+    }
+
+    #[test]
+    fn the_walk_by_the_map_visits_the_places_of_the_linear_walk_in_the_same_order() {
+        let mut seed = Seed(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..400 {
+            let live = seed.below(40);
+            let occupied: Vec<usize> = (0..live).map(|_| 1 + seed.below(SLOTS - 1)).collect();
+            // A superset: bits with nothing behind them, which the exact test passes.
+            let extra: Vec<usize> = (0..seed.below(20))
+                .map(|_| 1 + seed.below(SLOTS - 1))
+                .collect();
+            let map = table(&occupied, &extra);
+            let empty = |i: usize| !occupied.contains(&i);
+            let cursor = Cursor {
+                position: 1 + seed.below(SLOTS - 1),
+                remaining: 1 + seed.below(SLOTS - 1),
+            };
+            let reference = linear_walk(
+                Cursor {
+                    position: cursor.position,
+                    remaining: cursor.remaining,
+                },
+                SLOTS,
+                empty,
             );
+            let (visits, _) = map_walk(cursor, SLOTS, &map, empty);
+            assert_eq!(visits, reference, "occupied {occupied:?}");
         }
-        // An idle table takes ceil(639 / 161) = 4 steps.
-        assert_eq!(round(640, &[]).0, 4);
+    }
+
+    #[test]
+    fn a_round_over_640_places_with_l_in_use_ends_within_ceil_of_l_plus_one_over_four_steps() {
+        let mut seed = Seed(12345);
+        for live in [0usize, 1, 2, 3, 4, 5, 8, 9, 17, 100, 639] {
+            for _ in 0..20 {
+                let mut occupied = Vec::new();
+                while occupied.len() < live {
+                    let i = 1 + seed.below(SLOTS - 1);
+                    if !occupied.contains(&i) {
+                        occupied.push(i);
+                    }
+                }
+                let map = table(&occupied, &[]);
+                let cursor = Cursor {
+                    position: 1 + seed.below(SLOTS - 1),
+                    remaining: SLOTS - 1,
+                };
+                let (visits, per_step) = map_walk(cursor, SLOTS, &map, |i| !occupied.contains(&i));
+                // Every place in use is visited once; the last place of the round is visited
+                // too, in use or not, so at most L + 1 places.
+                assert!(
+                    visits.len() <= live + 1,
+                    "L {live}: {} visits",
+                    visits.len()
+                );
+                for place in &occupied {
+                    assert_eq!(visits.iter().filter(|v| *v == place).count(), 1);
+                }
+                assert!(per_step.len() <= (live + 1).div_ceil(AUDIT_LIVE_RUN));
+                assert!(per_step.iter().all(|&n| n <= AUDIT_LIVE_RUN));
+                if live == 0 {
+                    // An idle table's round is one step.
+                    assert_eq!(per_step.len(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_place_with_a_session_never_lacks_its_bit() {
+        // The service sets the bit before it stores a session or a birth, and clears it only
+        // where it frees the place itself; another path may empty a place with no clear.
+        let mut seed = Seed(777);
+        let map = Map::new();
+        let mut live = [false; SLOTS];
+        for _ in 0..20_000 {
+            let i = 1 + seed.below(SLOTS - 1);
+            match seed.below(3) {
+                0 => {
+                    map.set(i);
+                    live[i] = true;
+                }
+                1 if live[i] => {
+                    map.clear(i);
+                    live[i] = false;
+                }
+                _ => live[i] = false,
+            }
+            if seed.below(50) == 0 {
+                for (j, &used) in live.iter().enumerate() {
+                    assert!(!used || map.contains(j), "place {j} lacks its bit");
+                }
+            }
+        }
     }
 }

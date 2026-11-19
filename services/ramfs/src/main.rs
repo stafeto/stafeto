@@ -25,7 +25,6 @@ use ramfs::locks::Owner;
 use ramfs::locks::simple::{Command, Response, SimpleLocks, SweepCursor};
 use ramfs::locks::simple_wait::Waits;
 use ramfs::locks::wait_receipts::Queue as WaitQueue;
-use ramfs::maintenance::AUDIT_EMPTY_RUN;
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
 use ramfs::resolve::{Intent, Progress, Resolve};
 use ramfs::storage::layers::{LAYERS_MAX, Limits};
@@ -448,6 +447,7 @@ fn main(_: u64) -> u64 {
         _audit_view: audit_view,
         audit_ready_ns: 0,
         audit_armed: false,
+        occupied: ramfs::maintenance::Occupancy::new(),
         audit_rounds: 0,
         #[cfg(feature = "audit-readout")]
         audit_span: AuditSpan::default(),
@@ -715,6 +715,10 @@ struct Fs {
     audit_ready_ns: u64,
     /// Whether the audit waits for its timer.
     audit_armed: bool,
+    /// The places that may hold a session, a birth or a departure (sessions first, then births):
+    /// the audit passes the others by this map. A bit is set when a place is given out and
+    /// cleared only where the service frees the place itself.
+    occupied: ramfs::maintenance::Occupancy<{ (SESSIONS + BIRTHS).div_ceil(64) }>,
     /// The rounds of the audit that ended.
     audit_rounds: u32,
     /// The round of the audit that is open, as the steps line tells it.
@@ -1454,6 +1458,7 @@ impl Fs {
             return Err(code);
         }
         let identity = child.authority_index;
+        self.occupied.set(SESSIONS + Self::birth_index(label));
         self.births[Self::birth_index(label)] = Some((label, child));
         fds.image_outcome = Some(ramfs::image::ImageOutcome {
             job,
@@ -2350,6 +2355,7 @@ impl Fs {
                     self.ram.release(&mut child);
                     return Answer::Status(Status::BadSize);
                 }
+                self.occupied.set(SESSIONS + Self::birth_index(label));
                 self.births[Self::birth_index(label)] = Some((label, child));
                 let adopted = self.clones.adopt(label, r.label());
                 debug_assert!(adopted.is_ok(), "the place of a new label is free");
@@ -2399,6 +2405,7 @@ impl Fs {
         };
         let (_, mut child) = self.births[i].take().expect("a birth the caller made");
         let result = self.ram.clone_more_fds(fds, &list[..count], &mut child);
+        self.occupied.set(SESSIONS + i);
         self.births[i] = Some((label, child));
         match result {
             Ok(()) => Answer::Status(Status::Ok),
@@ -2517,7 +2524,10 @@ impl Service<0> for Fs {
 
     /// Genuine ordinary and image labels each name their exact retained slot.
     fn place(&self, label: u64) -> Option<usize> {
-        Some(self.places.place(label))
+        let place = self.places.place(label);
+        // The session goes into its place after this call: the bit comes first.
+        self.occupied.set(place);
+        Some(place)
     }
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
@@ -4163,6 +4173,8 @@ impl Fs {
                 } else {
                     self.births[i - SESSIONS] = None;
                 }
+                // The service frees the place itself: the bit goes with it.
+                self.occupied.clear(i);
                 // The place of the label goes back after its last departure.
                 ramfs::maintenance::departure_finished(self.places, &mut self.departures, i, label);
                 self.clones.gone(label);
@@ -4197,35 +4209,44 @@ impl Fs {
             self.lock_turn(sessions);
             return;
         }
-        // The slots with no session and no birth pass in this step.
-        let departures = &self.departures;
-        let births = &*self.births;
-        self.maintenance
-            .skip_empty(SESSIONS + BIRTHS, AUDIT_EMPTY_RUN, |i| {
-                Self::slot_empty(departures, births, sessions, i)
-            });
         self.audit_ready_ns = now.saturating_add(AUDIT_STEP_NS);
         rt::service::step_detail(own_step::AUDIT);
-        let mut client_work = false;
-        let i = self.maintenance.position;
-        if self.departures.contains(i) {
-            // Queued cells receive separate fair bounded cleanup turns.
-        } else if i < SESSIONS {
-            if let Some(s) = sessions.get_mut(i).and_then(Option::as_mut) {
-                let label = s.label();
-                client_work = self.cleanup_step(&mut s.data, label);
+        // A step visits up to `AUDIT_LIVE_RUN` places in use; the empty places between them are
+        // passed by the map of occupied places at once.
+        let round_open = self.maintenance.remaining != 0;
+        let mut client_work;
+        let mut visited = 0;
+        loop {
+            let departures = &self.departures;
+            let births = &*self.births;
+            self.maintenance
+                .skip_unoccupied(SESSIONS + BIRTHS, &self.occupied, |i| {
+                    Self::slot_empty(departures, births, sessions, i)
+                });
+            client_work = false;
+            let i = self.maintenance.position;
+            if self.departures.contains(i) {
+                // Queued cells receive separate fair bounded cleanup turns.
+            } else if i < SESSIONS {
+                if let Some(s) = sessions.get_mut(i).and_then(Option::as_mut) {
+                    let label = s.label();
+                    client_work = self.cleanup_step(&mut s.data, label);
+                }
+            } else if let Some((label, mut fds)) = self.births[i - SESSIONS].take() {
+                client_work = self.cleanup_step(&mut fds, label);
+                self.births[i - SESSIONS] = Some((label, fds));
             }
-        } else if let Some((label, mut fds)) = self.births[i - SESSIONS].take() {
-            client_work = self.cleanup_step(&mut fds, label);
-            self.births[i - SESSIONS] = Some((label, fds));
+            visited += 1;
+            self.maintenance.complete(client_work, SESSIONS + BIRTHS);
+            if !self.maintenance.step_continues(visited, client_work) {
+                break;
+            }
         }
         work |= client_work;
-        let round_open = self.maintenance.remaining != 0;
         #[cfg(feature = "audit-readout")]
         if round_open {
             self.audit_span.steps += 1;
         }
-        self.maintenance.complete(client_work, SESSIONS + BIRTHS);
         if round_open && self.maintenance.remaining == 0 {
             self.audit_rounds = self.audit_rounds.wrapping_add(1);
             #[cfg(feature = "audit-readout")]
@@ -4727,6 +4748,7 @@ impl Fs {
                 .ok_or(proto_fs::PERMISSION)
                 .and_then(|identity| self.install_identity(&mut child, label, identity, false))
         };
+        self.occupied.set(SESSIONS + i);
         self.births[i] = Some((label, child));
         if let Err(code) = installed {
             return status(code);
@@ -4839,6 +4861,7 @@ impl Fs {
         binding.offered = offered;
         binding.pending = true;
         binding.require = require;
+        self.occupied.set(SESSIONS + Self::birth_index(label));
         self.births[Self::birth_index(label)] = Some((label, child));
         let adopted = self.clones.adopt_within(label, r.label(), CLONES);
         debug_assert!(adopted.is_ok(), "the place of a new label is free");
