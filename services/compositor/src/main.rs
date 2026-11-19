@@ -52,8 +52,7 @@
 use abi::{Access, Error, MESSAGE_MAX, Rights, Source};
 use compositor::frame::{self, Fire, Pacer, Wake};
 use compositor::{
-    BAND_TICKS, Band, Format, FrameKind, MAX_WINDOWS, Refusal, SCREEN, Scene,
-    Source as PixelSource, compose,
+    Band, Format, FrameKind, MAX_WINDOWS, Refusal, SCREEN, Scene, Source as PixelSource, compose,
 };
 use core::mem::ManuallyDrop;
 use core::slice;
@@ -408,7 +407,7 @@ fn main(_: u64) -> u64 {
             "compositor: the arguments of the record are no period and cap, the defaults stand"
         );
     }
-    let cap = frame::band_cap(period, cap_ppm, BAND_TICKS);
+    let cap = frame::band_cap(period, cap_ppm);
     let mut service = Compositor {
         channel: Handle::borrowed(channel.raw()),
         notify,
@@ -1184,15 +1183,15 @@ impl Compositor {
             &Pixels(&self.scene),
             &mut self.raster,
         );
-        // The images this band made (surfaces first used in it) go in the
-        // detail with the band's number, so that a long band is told from a
-        // band of images made.
-        rt::service::step_detail(STEP_BAND + u64::from(self.raster.made().wrapping_sub(made)));
         #[cfg(feature = "steps")]
         px::cost::band_end(
             rt::time::now() - compose_began,
             rt::time::now() - band_began,
         );
+        // The images this band made (surfaces first used in it) go in the
+        // detail with the band's number, so that a long band is told from a
+        // band of images made.
+        rt::service::step_detail(STEP_BAND + u64::from(self.raster.made().wrapping_sub(made)));
         self.scene.band_done();
         let more = job.at.row < job.damage.y + job.damage.h;
         let now = now_ns();

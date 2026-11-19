@@ -8,7 +8,7 @@
 //! service (which may grant the focus), and a session with the display
 //! service in the launcher's `connects`, which every child of the shell
 //! inherits as its place `Display`. The display service the launcher names
-//! (`gpu`) is the compositor (`comp::COMPOSITOR_KEYS_FREE`, in the free run so that the frames a second of `doom-measure` stay comparable with the series): Doom draws in a
+//! (`gpu`) is the compositor (`comp::COMPOSITOR_KEYS`, on the frame clock; the table of the measures, `FREE_TABLE`, has it in the free run so that the frames a second of `doom-measure` stay comparable with the series): Doom draws in a
 //! buffer the compositor makes and the compositor puts it on the screen of
 //! the driver (`comp::DISPLAY`), which has the compositor as its one
 //! client. Doom
@@ -57,5 +57,23 @@ pub const TABLE: &[Record] = &[
     BUSYBOX_DIALOG_TABLE[8],
     input::INPUT,
     comp::DISPLAY,
+    comp::COMPOSITOR_KEYS,
+];
+
+/// The table of the measures (`boot-doom-steps.img`, xtask doom-measure): the
+/// games table with the compositor in the free run, which has no frame clock
+/// and no cap, so that the frames a second stay comparable with the series.
+pub const FREE_TABLE: &[Record] = &[
+    TABLE[0],
+    TABLE[1],
+    TABLE[2],
+    TABLE[3],
+    TABLE[4],
+    TABLE[5],
+    TABLE[6],
+    TABLE[7],
+    TABLE[8],
+    TABLE[9],
+    TABLE[10],
     comp::COMPOSITOR_KEYS_FREE,
 ];

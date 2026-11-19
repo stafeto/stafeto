@@ -33,7 +33,7 @@
 use proto_comp::{BUCKETS, INTERVAL_MAX, Stats, WindowStats};
 
 /// The nanoseconds of one tick of the model that prices a band
-/// (`BAND_TICKS`): the counter of a run under -icount, 62.5 MHz.
+/// (`BAND_TICKS`, `BAND_GATE`): the counter of a run under -icount, 62.5 MHz.
 pub const TICK_NS: u64 = 16;
 
 /// The default period, 60 Hz, and the default cap of the work of a period in
@@ -42,10 +42,11 @@ pub const DEFAULT_PERIOD_NS: u64 = 16_666_667;
 pub const DEFAULT_CAP_PPM: u64 = 750_000;
 
 /// The bands a period holds at most: the cap, as a part of the period, over
-/// the ticks of a band (the gate's `band_ticks`), at least one.
-pub const fn band_cap(period_ns: u64, cap_ppm: u64, band_ticks: u32) -> u32 {
+/// the gate of a band (`BAND_GATE`), at least one. The service and the probes
+/// take the cap from this function alone.
+pub const fn band_cap(period_ns: u64, cap_ppm: u64) -> u32 {
     let ticks = period_ns * cap_ppm / 1_000_000 / TICK_NS;
-    let bands = ticks / band_ticks as u64;
+    let bands = ticks / crate::BAND_GATE as u64;
     if bands == 0 { 1 } else { bands as u32 }
 }
 
@@ -486,7 +487,7 @@ impl Counters {
         let us = |ns: u64| (ns / 1_000).min(u64::from(u32::MAX)) as u32;
         Stats {
             period_us: us(period),
-            cap_us: us(u64::from(cap_bands) * u64::from(crate::BAND_TICKS) * TICK_NS),
+            cap_us: us(u64::from(cap_bands) * u64::from(crate::BAND_GATE) * TICK_NS),
             since_ms: (now.saturating_sub(self.since) / 1_000_000).min(u64::from(u32::MAX)) as u32,
             releases: self.releases,
             frames: self.frames,
@@ -665,6 +666,13 @@ impl Pace {
 /// the budget, `e` ticks each, two for each period. None when the iteration
 /// does not settle within `limit` ticks, which is the case for shares that sum
 /// to 1 or more.
+///
+/// The term `2 e ceil(w/t)` carries the cost of a preemption, which belongs to
+/// the preempting source: two switches of 1 300 ticks each. The bound assumes at
+/// most two preemptions from a source in its period; a source that wakes more
+/// often (the network's under load) breaks the assumption, and the term of the
+/// preemptions is separate from the events of the budget once the budgets have
+/// their specification.
 pub fn bound(own: u64, sources: &[Source], e: u64, limit: u64) -> Option<u64> {
     let mut w = own;
     // A sum of shares of 1 or more never settles: the value passes the limit
@@ -841,11 +849,21 @@ mod tests {
     }
 
     #[test]
-    fn the_cap_in_bands_is_52_at_60_hz() {
-        assert_eq!(band_cap(T, DEFAULT_CAP_PPM, 15_000), 52);
-        assert_eq!(band_cap(T, DEFAULT_CAP_PPM, crate::BAND_TICKS), 55);
-        assert_eq!(band_cap(T, 0, 15_000), 1);
-        assert_eq!(band_cap(T, 1_000_000, 15_000), 69);
+    fn the_cap_in_bands_is_47_at_60_hz() {
+        // Derived: 0.75 of the period in ticks over the gate of a band.
+        let ticks = T * DEFAULT_CAP_PPM / 1_000_000 / TICK_NS;
+        let derived = (ticks / u64::from(crate::BAND_GATE)) as u32;
+        assert_eq!(band_cap(T, DEFAULT_CAP_PPM), derived);
+        // Pinned on purpose: the gate 16 328 and the cap of 60 Hz give 47.
+        assert_eq!(derived, 47);
+        assert_eq!(band_cap(T, 0), 1);
+        assert_eq!(band_cap(T, 1_000_000), 63);
+        // The service takes the cap's bands at their gates and the three steps
+        // of the frame around them: about 79 percent of a period.
+        let service = u64::from(derived) * u64::from(crate::BAND_GATE) + 3 * (20_410 * 9 / 10);
+        assert_eq!(service, 822_523);
+        let period_ticks = T / TICK_NS;
+        assert!((78..80).contains(&(service * 100 / period_ticks)));
     }
 
     #[test]
@@ -1205,7 +1223,14 @@ mod tests {
     /// up in ticks of 62.5 MHz.
     #[test]
     fn the_four_rows_of_the_table_of_bounds() {
-        let step = 18_369;
+        // The terms come from term B (20 410): a step of a source is 0.9 B, the
+        // gate of a band 0.8 B, the longest kernel path and a step B + 0.9 B.
+        let term_b: u64 = 20_410;
+        let step = term_b * 9 / 10;
+        let gate = term_b * 8 / 10;
+        let kernel = term_b + step;
+        assert_eq!((step, gate, kernel), (18_369, 16_328, 38_779));
+        assert_eq!(gate, u64::from(crate::BAND_GATE));
         let src = |budget, period| Source {
             budget,
             period,
@@ -1222,14 +1247,16 @@ mod tests {
         ];
         let console = [src(9_375, 625_000)];
         let (e, limit) = (1_875, 10_000_000);
+        // The term of the events covers two preemptions of 1 300 ticks.
+        assert!(2 * e >= 2 * 1_300);
         // The terms: a band is 16 328, the taking 3 000, the commit and the end
         // 2 x 18 369, the longest kernel path and a step 38 779, the display
         // driver 13 596, the disk 2 x 18 369, the signs of life 64 000, the
         // clients' requests 10 000.
         let own = |bands: u64, disk: bool, requests: bool| {
-            let mut w = 3_000 + bands * 16_328 + 2 * 18_369 + 38_779 + 13_596;
+            let mut w = 3_000 + bands * gate + 2 * step + kernel + 13_596;
             if disk {
-                w += 2 * 18_369;
+                w += 2 * step;
             }
             w += 64_000;
             if requests {
@@ -1237,11 +1264,28 @@ mod tests {
             }
             w
         };
-        // P: a window of 160 by 100, 7 bands at 16 lines, all the loads.
-        assert_eq!(own(7, true, true), 317_147);
+        // P: a window of 160 by 100, its bands from `tile` (7 at 16 lines,
+        // pinned on purpose), all the loads.
+        let p_bands = {
+            let mut scene = crate::Scene::new();
+            let r = crate::Rect {
+                x: 0,
+                y: 0,
+                w: 160,
+                h: 100,
+            };
+            let a = scene.create(1, 1, r, true, 0).unwrap();
+            scene.flush(a, r).unwrap();
+            let damage = scene.begin().unwrap();
+            let rows = scene.tile(damage).1;
+            scene.end(true);
+            u64::from(100u32.div_ceil(rows))
+        };
+        assert_eq!(p_bands, 7);
+        assert_eq!(own(p_bands, true, true), 317_147);
         assert_eq!(bound(317_147, &all, e, limit), Some(924_178));
         // D: a direct frame, no band, all the loads (no taking by bands).
-        let d = 2 * 18_369 + 38_779 + 13_596 + 2 * 18_369 + 64_000 + 10_000;
+        let d = 2 * step + kernel + 13_596 + 2 * step + 64_000 + 10_000;
         assert_eq!(d, 199_851);
         assert_eq!(bound(d, &all, e, limit), Some(742_193));
         // F: the whole screen, no load: the bands of a copy over the screen by

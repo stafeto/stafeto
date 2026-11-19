@@ -104,6 +104,9 @@ table-busybox = []
 table-busybox-dialog = []
 # The games image: the dialog with the quota of Doom (xtask doom-headless).
 table-doom = []
+# The games image of the measures (xtask doom-measure, boot-doom-steps.img): the same table with the
+# compositor in the free run.
+table-doom-free = []
 # The image of the LVGL demo's probe (xtask lvgl-probe).
 table-lvgl = []
 # The image for the measurements of the frame time (xtask frame-loads).
