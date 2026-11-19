@@ -608,20 +608,42 @@ impl Server {
         loop {
             let next = match self.pending[slot].take() {
                 Some(pending) => pending,
-                None => match volume(fs.readdir(Dir(d.object)))? {
-                    None => break,
-                    Some(entry) if root && entry.name() == &ORPHANS[1..] => continue,
-                    Some(entry) => {
-                        let ino = entry_ino(fs, dir.get(), entry.name(), entry.kind)?;
-                        let mut pending = Pending {
-                            ino,
-                            kind: entry.kind,
-                            name: [0; crate::NAME_MAX],
-                            len: entry.name().len(),
-                        };
-                        pending.name[..pending.len].copy_from_slice(entry.name());
-                        pending
+                None => match listed(fs, Dir(d.object)) {
+                    // Entries already gathered are sent; the failed one was put back, so the next
+                    // READDIR meets the error again and reports it.
+                    Err(_) if !batch.is_empty() => {
+                        more = true;
+                        break;
                     }
+                    Err(e) => return Err(e),
+                    Ok(found) => match found {
+                        None => break,
+                        Some((entry, _, _)) if root && entry.name() == &ORPHANS[1..] => continue,
+                        Some((entry, record, at)) => {
+                            // The number of `.` and `..` is looked up: a failure there moves the
+                            // iterator back too.
+                            let ino =
+                                match entry_ino(fs, dir.get(), entry.name(), entry.kind, &record) {
+                                    Ok(ino) => ino,
+                                    Err(e) => {
+                                        let _ = fs.seek_dir(Dir(d.object), at);
+                                        if batch.is_empty() {
+                                            return Err(e);
+                                        }
+                                        more = true;
+                                        break;
+                                    }
+                                };
+                            let mut pending = Pending {
+                                ino,
+                                kind: entry.kind,
+                                name: [0; crate::NAME_MAX],
+                                len: entry.name().len(),
+                            };
+                            pending.name[..pending.len].copy_from_slice(entry.name());
+                            pending
+                        }
+                    },
                 },
             };
             if !batch.push(next.ino, kind_word(next.kind), &next.name[..next.len]) {
@@ -660,40 +682,59 @@ pub(super) fn entry_of<D: Device>(fs: &mut Fs<'_, D>, path: &[u8], kind: Kind) -
     }
 }
 
-/// The number of the entry `name` of the directory `dir` (`.` and `..` name the directory and its
-/// parent): what STAT gives for that name. THE ONE PLACE READDIR READS AN ENTRY'S ATTRIBUTE: it looks
-/// the entry up by its path (the cost grows with the entry's place in a large directory); a later
-/// change of littlefs that reads the attribute of the entry the iterator stands at replaces this body.
-pub(super) fn entry_ino<D: Device>(
+/// The next entry of an open directory, the size and bytes of its record and the position of the
+/// iterator before it, from the attribute of the entry the iterator stands at (`Fs::readdir_attr`: no
+/// lookup of the entry by its path, which costs more the further the entry is in a large directory).
+/// The iterator keeps its place from one READDIR to the next. When the read fails (the attribute could
+/// not be read after the iterator moved) it goes back to the position taken before, so that a retry
+/// does not lose the entry; the caller does the same when it fails after this.
+#[allow(clippy::type_complexity)]
+fn listed<D: Device>(
+    fs: &mut Fs<'_, D>,
+    dir: Dir,
+) -> Res<Option<(crate::fs::Entry, ([u8; WALK_EACH], Option<usize>), u32)>> {
+    let at = volume(fs.tell_dir(dir))?;
+    let mut buf = [0u8; WALK_EACH];
+    match fs.readdir_attr(dir, ATTR_TYPE, &mut buf) {
+        Ok(Some((entry, size))) => Ok(Some((entry, (buf, size), at))),
+        Ok(None) => Ok(None),
+        Err(e) => {
+            let _ = fs.seek_dir(dir, at);
+            Err(status_of(e))
+        }
+    }
+}
+
+/// The number of the entry `name` of the directory `dir`, as STAT gives it: from the record the
+/// listing read with the entry. `.` and `..` carry no attribute on the volume: they take the number
+/// of the directory itself and of its parent (looked up once for each listing).
+fn entry_ino<D: Device>(
     fs: &mut Fs<'_, D>,
     dir: &[u8],
     name: &[u8],
     kind: Kind,
+    record: &([u8; WALK_EACH], Option<usize>),
 ) -> Res<u64> {
-    let mut path = [0u8; MAX_PATH + 1 + crate::NAME_MAX];
-    let len = if name == b"." {
-        path[..dir.len()].copy_from_slice(dir);
-        dir.len()
-    } else if name == b".." {
+    if name == b"." {
+        return Ok(entry_of(fs, dir, Kind::Directory)?.attr.ino);
+    }
+    if name == b".." {
         let (parent, _) = split(dir);
-        path[..parent.len()].copy_from_slice(parent);
-        parent.len()
-    } else {
-        let mut n = dir.len();
-        path[..n].copy_from_slice(dir);
-        if dir != b"/" {
-            path[n] = b'/';
-            n += 1;
-        }
-        path[n..n + name.len()].copy_from_slice(name);
-        n + name.len()
-    };
-    let kind = if name == b"." || name == b".." {
-        Kind::Directory
-    } else {
-        kind
-    };
-    Ok(entry_of(fs, &path[..len], kind)?.attr.ino)
+        return Ok(entry_of(fs, parent, Kind::Directory)?.attr.ino);
+    }
+    // The path is wanted only for the default of an entry with no record (a number from the path).
+    let mut path = [0u8; MAX_PATH + 1 + crate::NAME_MAX];
+    let mut n = dir.len();
+    path[..n].copy_from_slice(dir);
+    if dir != b"/" {
+        path[n] = b'/';
+        n += 1;
+    }
+    path[n..n + name.len()].copy_from_slice(name);
+    let (bytes, size) = record;
+    Ok(record_of(kind, &path[..n + name.len()], *size, bytes)
+        .attr
+        .ino)
 }
 
 /// The stat record of an entry.

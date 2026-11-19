@@ -1267,16 +1267,8 @@ fn costs_of_the_common_jobs() {
     let stat = |rig: &mut Rig, path: &[u8]| {
         rig.stat(OWNER, path).unwrap();
     };
-    row(
-        "stat depth 2, first (directories not remembered)",
-        &mut rig,
-        &mut |r| stat(r, b"/a/f"),
-    );
-    row(
-        "stat depth 2, again (directories remembered)",
-        &mut rig,
-        &mut |r| stat(r, b"/a/f"),
-    );
+    row("stat depth 2, first", &mut rig, &mut |r| stat(r, b"/a/f"));
+    row("stat depth 2, again", &mut rig, &mut |r| stat(r, b"/a/f"));
     row("stat depth 9, first", &mut rig, &mut |r| {
         stat(r, deep_file.as_bytes())
     });
@@ -1804,4 +1796,45 @@ fn a_cold_stat_at_depth_200_costs_about_three_reads_a_level_and_depth_253_is_acc
         rig.stat(OTHER, &over).map(drop),
         Err(p::code(p::NAME_TOO_LONG))
     );
+}
+
+#[test]
+fn a_read_that_fails_in_a_listing_loses_no_entry_and_repeats_none() {
+    let mut rig = Rig::new();
+    rig.mkdir(ROOT, b"/d", 0o755).unwrap();
+    let mut want: Vec<String> = vec![".".into(), "..".into()];
+    for i in 0..80 {
+        let name = std::format!("entry-{i:03}-{}", "n".repeat(60));
+        rig.put(ROOT, std::format!("/d/{name}").as_bytes(), 0o644, b"");
+        want.push(name);
+    }
+    rig.fs.unmount().unwrap();
+    let device = rig.fs.into_device();
+    let mut tried = 0;
+    for k in 0..40 {
+        let mut rig = Rig::on(device.clone());
+        let dir = rig.open(ROOT, b"/d", p::DIRECTORY | p::READ, 0).unwrap();
+        rig.fs.device().fail_read_after(Some(k));
+        let (mut got, mut errors) = (Vec::new(), 0);
+        loop {
+            match rig.call(ROOT, |w| p::handle_call(p::Method::Readdir, dir, w)) {
+                Ok(e) => {
+                    let mut batch = p::read_dir_reply(Reader::new(&e)).unwrap();
+                    while let Some(entry) = batch.next_entry().unwrap() {
+                        got.push(String::from_utf8(entry.name.to_vec()).unwrap());
+                    }
+                    if !batch.more {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    errors += 1;
+                    assert!(errors < 4, "point {k}");
+                }
+            }
+        }
+        tried += errors;
+        assert_eq!(got, want, "a read failed at point {k}");
+    }
+    assert!(tried > 0, "no read of the listings failed");
 }

@@ -457,6 +457,26 @@ int datafs_readdir(struct datafs *d, void *ctx, int slot, uint8_t *type, uint32_
     return res;
 }
 
+// The position of the iterator of a directory (the entries it has gone past), and a move to such a
+// position: the iterator of a read that failed has advanced, and the listing goes back to where it was.
+int64_t datafs_tell_dir(struct datafs *d, void *ctx, int slot)
+{
+    d->ctx = ctx;
+    if (!dir_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    return lfs_dir_tell(&d->lfs, &d->dir[slot]);
+}
+
+int datafs_seek_dir(struct datafs *d, void *ctx, int slot, uint32_t off)
+{
+    d->ctx = ctx;
+    if (!dir_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    return lfs_dir_seek(&d->lfs, &d->dir[slot], off);
+}
+
 int datafs_rewinddir(struct datafs *d, void *ctx, int slot)
 {
     d->ctx = ctx;

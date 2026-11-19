@@ -74,6 +74,8 @@ unsafe extern "C" {
         name: *mut u8,
     ) -> c_int;
     fn datafs_rewinddir(d: *mut c_void, ctx: *mut c_void, slot: c_int) -> c_int;
+    fn datafs_tell_dir(d: *mut c_void, ctx: *mut c_void, slot: c_int) -> i64;
+    fn datafs_seek_dir(d: *mut c_void, ctx: *mut c_void, slot: c_int, off: u32) -> c_int;
     fn datafs_getattr(
         d: *mut c_void,
         ctx: *mut c_void,
@@ -713,6 +715,21 @@ impl<'a, D: Device> Fs<'a, D> {
         let path = CPath::new(path)?;
         // SAFETY: as above.
         check(self.call(|d, ctx| unsafe { datafs_removeattr(d, ctx, path.ptr(), kind) })).map(drop)
+    }
+
+    /// The position of the iterator of `dir`: the entries it has gone past, `.` and `..` included.
+    pub fn tell_dir(&mut self, dir: Dir) -> Res<u32> {
+        // SAFETY: as above.
+        check64(self.call(|d, ctx| unsafe { datafs_tell_dir(d, ctx, c_int::from(dir.0)) }))
+            .map(|at| at as u32)
+    }
+
+    /// Moves the iterator of `dir` to a position `tell_dir` gave (from the start, so the cost
+    /// grows with the position: it is for a read that failed).
+    pub fn seek_dir(&mut self, dir: Dir, at: u32) -> Res<()> {
+        // SAFETY: as above.
+        check(self.call(|d, ctx| unsafe { datafs_seek_dir(d, ctx, c_int::from(dir.0), at) }))
+            .map(drop)
     }
 
     pub fn rewinddir(&mut self, dir: Dir) -> Res<()> {
