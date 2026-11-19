@@ -159,7 +159,7 @@ fn posix_volume_entries() -> Vec<Entry> {
     v
 }
 
-/// The data volume of the POSIX probe, made offline: a version 3 volume (every entry has its record,
+/// The data volume of the POSIX probe, made offline: a volume with the mark 4 (every entry has its record, no file inline,
 /// the root has the format mark and the counter of file numbers), so the service converts nothing
 /// and the owners, the modes and the numbers are those the C probe knows. The record is written with
 /// the format of `datafs::attr`, the one the service reads: the attribute 0x70 on every entry, the

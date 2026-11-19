@@ -3,7 +3,7 @@
 
 //! `cargo xtask data-posix`: the reading paths of `/data` in the POSIX layer (tests/posix-data) on
 //! QEMU's `virt` with a virtio disk that holds a data volume made offline
-//! (`data_image::make_posix_volume`: known files, owners, modes, times and numbers, version 3, so the
+//! (`data_image::make_posix_volume`: known files, owners, modes, times and numbers, the mark 4, so the
 //! service converts nothing). The image has the RAM files, the process, clock and pipe services, the
 //! disk service of the volume, the data file service and the probe, a POSIX process of the root that
 //! waits for the data service and takes its session from the process service at its first call
