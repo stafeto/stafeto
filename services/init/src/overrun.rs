@@ -64,9 +64,11 @@ pub fn decode(label: u64) -> Option<(usize, usize)> {
 
 /// Whether the budgets of the record `name` report their overruns. The
 /// network service's do not: a budget that runs out under the load of the
-/// wire is the normal case there, and the budget keeps the work in order.
+/// wire is the normal case there, and the budget keeps the work in order. The
+/// image of the frame-time measures reports them as well: the probe reads from
+/// the journal how loaded the service was.
 pub fn reports(name: &str) -> bool {
-    name != crate::table::NET_SERVICE
+    cfg!(feature = "table-frame") || name != crate::table::NET_SERVICE
 }
 
 /// A line of the journal that is due: the budget `index` of the record at
@@ -301,7 +303,10 @@ mod tests {
 
     #[test]
     fn the_network_service_does_not_report() {
-        assert!(!reports(crate::table::NET_SERVICE));
+        assert_eq!(
+            reports(crate::table::NET_SERVICE),
+            cfg!(feature = "table-frame")
+        );
         assert!(reports("ramfs"));
     }
 }

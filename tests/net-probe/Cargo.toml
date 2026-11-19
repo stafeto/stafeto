@@ -14,6 +14,7 @@ bench = false
 
 [dependencies]
 abi = { path = "../../lib/abi" }
+frame-load = { path = "../frame-load" }
 proto-init = { path = "../../proto/init" }
 proto-net = { path = "../../proto/net" }
 proto-pipe = { path = "../../proto/pipe" }
