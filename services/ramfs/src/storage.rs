@@ -247,10 +247,11 @@ impl LockPage {
         self.anchor.root()
     }
 }
-/// The most lock pages that wait for the maintenance to release them. A page emptied with the
-/// stack full is released at once, as every page was before the stack.
-pub const PARK_MAX: usize = 128;
-/// The pages the maintenance releases in one turn (`Storage::reclaim_step`).
+/// The most lock pages that wait for the maintenance to release them: every entry is a distinct
+/// physical page, so the stack of all the pages cannot overflow and no request ever releases a
+/// page itself.
+pub const PARK_MAX: usize = PAGES;
+/// The pages the maintenance releases in one turn (`Storage::release_parked_turn`).
 pub const PARK_TURN: usize = 16;
 
 /// A parked lock page: the physical page and the index of the account that pays for it.
@@ -1499,12 +1500,14 @@ impl<'a> Storage<'a> {
             .expect("exact paid lock page");
     }
     /// Parks an emptied lock page for the maintenance to release: a push and two counts, the
-    /// charge and the anchor stay where they are. Gives the page back when the stack is full,
-    /// for the caller to release at once with `release_lock_page`.
-    pub fn park_lock_page(&mut self, page: LockPage) -> Result<(), LockPage> {
-        if self.state.parked_len == PARK_MAX {
-            return Err(page);
-        }
+    /// charge and the anchor stay where they are.
+    ///
+    /// The payer's account stays open until the turn releases the page, and the table of
+    /// accounts has `ROOTS` places: with the table full, a new root is refused (`NO_SPACE`)
+    /// until the turn that releases the last parked page of an account that holds nothing
+    /// else. The window is bounded by the turns that empty the stack (16 pages a turn, and a
+    /// turn at least every second one while locks or the audit wait).
+    pub fn park_lock_page(&mut self, page: LockPage) {
         // The anchor goes with the entry: `release_parked_page` makes it again from the account,
         // whose count of references the parked page keeps.
         let LockPage { physical, anchor } = page;
@@ -1515,7 +1518,17 @@ impl<'a> Storage<'a> {
             .as_mut()
             .expect("parked page keeps its account")
             .parked += 1;
-        Ok(())
+    }
+    /// One turn of the maintenance for the parked lock pages: releases up to `PARK_TURN` of
+    /// them. The only caller is the turn of the service that is set aside for them, so that no
+    /// step of a client pays for a page of another and `reclaim_step` keeps its pace for the
+    /// queues of nodes. Tells whether it released a page.
+    pub fn release_parked_turn(&mut self) -> bool {
+        let count = PARK_TURN.min(self.state.parked_len);
+        for _ in 0..count {
+            self.release_parked_page();
+        }
+        count != 0
     }
     /// Test check of the page books: every physical page is in exactly one place (the free list,
     /// the retired FIFO, the parking stack, a file, or the lock page `live_locks` names), and
@@ -2573,12 +2586,6 @@ impl<'a> Storage<'a> {
         self.state.reclaim_len
     }
     pub fn reclaim_step(&mut self) -> bool {
-        if self.state.parked_len != 0 {
-            for _ in 0..PARK_TURN.min(self.state.parked_len) {
-                self.release_parked_page();
-            }
-            return true;
-        }
         if self.state.retired_len != 0 && (self.state.reclaim_len == 0 || self.state.retired_turn) {
             self.state.retired_turn = false;
             self.reclaim_retired_page();

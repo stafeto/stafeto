@@ -1103,11 +1103,9 @@ impl SimpleLocks {
         if self.pages[physical as usize].free == u64::MAX {
             self.unlink_available(physical);
             // The emptied page waits on the parking stack for the maintenance to release: the
-            // step does not give back the charge or the anchor. With the stack full it does.
+            // step does not give back the charge or the anchor.
             let page = self.pages[physical as usize].paid.take().unwrap();
-            if let Err(page) = storage.park_lock_page(page) {
-                storage.release_lock_page(page);
-            }
+            storage.park_lock_page(page);
             // take already cleared paid. Reset only the remaining live fields;
             // no full-page metadata copy is needed for its now-free slot.
             let empty = &mut self.pages[physical as usize];
@@ -1845,9 +1843,9 @@ mod tests {
     // Turns of the maintenance until the parked pages are gone; the count of turns.
     fn turns(ram: &mut crate::Ram<'_>) -> usize {
         let mut turns = 0;
-        while ram.storage.reclaim_step() {
+        while ram.storage.release_parked_turn() {
             turns += 1;
-            assert!(turns < 64);
+            assert!(turns < 512);
         }
         turns
     }
@@ -1937,7 +1935,7 @@ mod tests {
     }
 
     #[test]
-    fn the_parking_stack_holds_its_limit_and_the_rest_is_released_at_once() {
+    fn a_hundred_and_ninety_two_emptied_pages_all_wait_and_twelve_turns_release_them() {
         let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
         let mut table = fresh();
         let files: Vec<_> = (0..3)
@@ -1986,15 +1984,16 @@ mod tests {
         for (file, owner) in files.iter().zip(&owners) {
             table.close(&mut ram.storage, *file, *owner).unwrap();
         }
-        // 192 pages were emptied: 128 wait, the 64 after them went at once.
-        assert_eq!(ram.storage.parked_backlog(), storage::PARK_MAX);
+        // 192 pages were emptied: the calls released none, all wait on the stack.
+        assert_eq!(ram.storage.parked_backlog(), 3 * PER_INODE);
         assert_eq!(
             ram.storage.assert_pages_exact(&table.live_pages()),
-            storage::PARK_MAX
+            3 * PER_INODE
         );
-        assert_eq!(turns(&mut ram), storage::PARK_MAX / storage::PARK_TURN);
+        assert_eq!(turns(&mut ram), 3 * PER_INODE / storage::PARK_TURN);
         assert_eq!(ram.storage.assert_pages_exact(&table.live_pages()), 0);
     }
+
     // A parked page keeps its account open and its payer charged until a turn releases it,
     // however the clients of the account come and go: the account of a payer with nothing else
     // left is open exactly as long as a page of it is parked.
@@ -2019,9 +2018,9 @@ mod tests {
         assert_eq!(ram.storage.usage(payer(1)), storage::Usage::default());
         assert_eq!(ram.storage.open_accounts(), open + 1);
         assert_eq!(ram.storage.assert_pages_exact(&table.live_pages()), 1);
-        assert!(ram.storage.reclaim_step());
+        assert!(ram.storage.release_parked_turn());
         assert_eq!(ram.storage.open_accounts(), open);
-        assert!(!ram.storage.reclaim_step());
+        assert!(!ram.storage.release_parked_turn());
         assert_eq!(ram.storage.assert_pages_exact(&table.live_pages()), 0);
         // The same payer asks for a page again: the page comes from the pool.
         table
@@ -2034,6 +2033,52 @@ mod tests {
             .unwrap();
         assert_eq!(ram.storage.usage(payer(1)).pages, 1);
         assert_eq!(ram.storage.assert_pages_exact(&table.live_pages()), 1);
+    }
+
+    // A parked page keeps its payer's place in the table of accounts until the turn: with the
+    // table full a new root is refused for that window, and the turn gives its place back.
+    #[test]
+    fn a_full_table_of_accounts_gives_a_new_root_the_place_of_a_parked_payer_after_the_turn() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let file = inode(&mut ram, b"one");
+        let mut table = fresh();
+        let owner = Owner::Process(900);
+        table
+            .set(
+                &mut ram.storage,
+                payer(1),
+                request(file, owner, 0, 1, Some(Kind::Write)),
+                |_| true,
+            )
+            .unwrap();
+        table.close(&mut ram.storage, file, owner).unwrap();
+        assert_eq!(ram.storage.parked_backlog(), 1);
+        // Fill the table: each anchor holds the account of its key open.
+        let mut anchors = Vec::new();
+        loop {
+            match ram
+                .storage
+                .lock_anchor(payer(10_000 + anchors.len() as u64))
+            {
+                Ok(anchor) => anchors.push(anchor),
+                Err(code) => {
+                    assert_eq!(code, proto_fs::NO_SPACE);
+                    break;
+                }
+            }
+        }
+        assert_eq!(ram.storage.open_accounts(), storage::ROOTS);
+        // The window: the parked page holds the place.
+        assert_eq!(
+            ram.storage.lock_anchor(payer(99_999)).unwrap_err(),
+            proto_fs::NO_SPACE
+        );
+        assert!(ram.storage.release_parked_turn());
+        let fresh_key = ram.storage.lock_anchor(payer(99_999)).unwrap();
+        ram.storage.release_lock_anchor(fresh_key).unwrap();
+        for anchor in anchors {
+            ram.storage.release_lock_anchor(anchor).unwrap();
+        }
     }
 
     #[test]
@@ -2169,6 +2214,9 @@ mod tests {
                         .storage
                         .truncate_zero(data[n], proto_fs::Timestamp::ZERO);
                 }
+                94..=96 => {
+                    ram.storage.release_parked_turn();
+                }
                 _ => {
                     ram.storage.reclaim_step();
                 }
@@ -2180,6 +2228,7 @@ mod tests {
         assert!(parked_seen > 0, "the run never parked a page");
         // The turns drain every queue: nothing is parked and the charge is the pages held.
         while ram.storage.reclaim_step() {}
+        turns(&mut ram);
         assert_eq!(ram.storage.parked_backlog(), 0);
         let charged = ram.storage.assert_pages_exact(&table.live_pages());
         assert_eq!(charged, table.live_pages().len() + file_pages(&ram));

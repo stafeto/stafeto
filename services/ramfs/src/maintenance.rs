@@ -82,6 +82,19 @@ impl Share {
     }
 }
 
+/// Whether the next turn of the maintenance releases the parked lock pages. Any number of
+/// clients can keep pages parked, so the turn is theirs only while no other work waits, and at
+/// most every second turn when lock work (the waking of waiters, the sweep of dead records) or
+/// the audit waits: the turn after a turn of parked pages goes to that work.
+pub const fn parked_turn(
+    parked: bool,
+    lock_work: bool,
+    audit: bool,
+    last_was_parked: bool,
+) -> bool {
+    parked && !(last_was_parked && (lock_work || audit))
+}
+
 /// Trying a cancellation proves progress only when it retires a job or
 /// returns a page. A partial data cancellation returns one page per portion.
 pub fn orphan_progress(before: (u16, u16), after: (u16, u16)) -> bool {
@@ -999,5 +1012,25 @@ mod audit_map_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_parked_pages_take_every_second_turn_while_other_work_waits() {
+        // (parked, lock work, audit): the turn after a turn of parked pages goes to the work.
+        let cases = [
+            ((false, false, false), [false, false]),
+            ((true, false, false), [true, true]),
+            ((true, true, false), [true, false]),
+            ((true, false, true), [true, false]),
+            ((true, true, true), [true, false]),
+            ((false, true, true), [false, false]),
+        ];
+        for ((parked, lock_work, audit), expected) in cases {
+            let first = parked_turn(parked, lock_work, audit, false);
+            let second = parked_turn(parked, lock_work, audit, first);
+            assert_eq!([first, second], expected, "{parked} {lock_work} {audit}");
+        }
+        // After a turn of the other work the parked pages come again.
+        assert!(parked_turn(true, true, true, false));
     }
 }
