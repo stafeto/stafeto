@@ -15201,14 +15201,14 @@ mod tests {
         let steps = |tick: u64| -> Vec<String> {
             vec![
                 "service step: 18 kind 11 8490 ticks detail 0".to_owned(),
-                format!("service step: 18 kind 64 {tick} ticks detail 124"),
+                format!("service step: 18 kind 64 {tick} ticks detail 112"),
                 "service step: 18 kind 65 1851 ticks detail 0".to_owned(),
             ]
         };
         assert!(check_console_driver_steps(&steps(TERM_B * 9 / 10)).is_ok());
         // The calls on a loan stay under B_K, 9,375 ticks: 8,490 was measured.
         assert_eq!(CONSOLE_LOAN_STEP_MAX, 9_375);
-        let mut loan = steps(14_000);
+        let mut loan = steps(13_000);
         loan[0] = "service step: 18 kind 11 9375 ticks detail 0".to_owned();
         assert!(check_console_driver_steps(&loan).is_ok());
         loan[0] = "service step: 18 kind 11 9376 ticks detail 0".to_owned();
@@ -15226,11 +15226,20 @@ mod tests {
         assert!(
             check_console_driver_steps(&steps(20_410))
                 .unwrap_err()
-                .contains("detail 124")
+                .contains("detail 112")
+        );
+        // The tick of 24 records of run 44468779564 (23,092 ticks, detail 124) is over the bound;
+        // the tick of 12 records, about 13,000, is 71 % of it.
+        let mut two = steps(13_000);
+        two[1] = "service step: 18 kind 64 23092 ticks detail 124".to_owned();
+        assert!(
+            check_console_driver_steps(&two)
+                .unwrap_err()
+                .contains("23092")
         );
         // The table of the service stands for lines lost in the burst.
-        let mut table = steps(14_000);
-        table[1] = "service table: 18 kind 64 14000 ticks detail 124 preempts 0".to_owned();
+        let mut table = steps(13_000);
+        table[1] = "service table: 18 kind 64 13000 ticks detail 112 preempts 0".to_owned();
         assert!(check_console_driver_steps(&table).is_ok());
         // Without a step of the calls, or of the log tick, the table was not printed.
         assert!(check_console_driver_steps(&steps(100)[..1]).is_err());
