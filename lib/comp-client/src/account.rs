@@ -112,6 +112,16 @@ impl Buffers {
     }
 }
 
+/// Whether a drain of the window's channel (by `post`, outside the wait)
+/// sends the wake: it took `taken` notifications of any kind (the service's
+/// bits, the timer's expiry, an earlier wake) and a thread waits. The waiter
+/// may have set its timer or be about to block on exactly what was taken, so
+/// anything taken wakes it once; it looks again at the account and at its
+/// time.
+pub const fn should_wake(taken: usize, waiting: bool) -> bool {
+    taken > 0 && waiting
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +274,20 @@ mod tests {
         b.bits(1);
         assert_eq!(b.take_pending(), 1);
         assert_eq!(b.take_pending(), 0);
+    }
+
+    #[test]
+    fn a_drain_that_took_anything_wakes_a_waiter() {
+        // Scenario A: the poster took the timer's expiry (no service bit),
+        // and the waiter is about to block with no timer.
+        assert!(should_wake(1, true));
+        // Scenario B: the second poster took the first one's wake.
+        assert!(should_wake(1, true));
+        // Service bits, with several notifications.
+        assert!(should_wake(3, true));
+        // Nothing taken, or nobody waits: no wake.
+        assert!(!should_wake(0, true));
+        assert!(!should_wake(2, false));
+        assert!(!should_wake(0, false));
     }
 }

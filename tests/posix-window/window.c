@@ -114,11 +114,17 @@ static void snapshot(const char *what, uint32_t crc) {
     nanosleep(&pause, NULL);
 }
 
+/* The first buffer's points carry 0xFF in their top byte, which XRGB8888
+ * ignores: the CRC above takes R, G and B alone, as the host does over the
+ * screenshot, so the screen of the first buffer and of the second (top byte
+ * 0) must agree wherever they hold the same colours. */
 static void draw(const struct stafeto_window *w, unsigned k, int marked) {
     uint32_t *p = (uint32_t *)w->pixels[k];
     uint32_t words = w->stride / 4;
+    uint32_t top = k == 0 ? 0xFF000000u : 0;
     for (int y = 0; y < WIN_H; y++)
-        for (int x = 0; x < WIN_W; x++) p[(uint32_t)y * words + (uint32_t)x] = point_of(marked, x, y);
+        for (int x = 0; x < WIN_W; x++)
+            p[(uint32_t)y * words + (uint32_t)x] = top | point_of(marked, x, y);
 }
 
 /* Waits until every buffer of `mask` is free by the library's account,
@@ -155,12 +161,14 @@ static int child_without_window(void) {
     if (stafeto_window_events(0, e, 2, NULL) != -1 || errno != EBADF) return 43;
     errno = 0;
     if (stafeto_window_close(0) != -1 || errno != EBADF) return 44;
-    /* The parent's signal comes while it waits. */
-    {
-        struct timespec later = {0, 300000000};
+    /* The parent's signal comes while it waits: sent again every 200 ms
+     * (the parent kills this child once a wait ended with EINTR), at most 150
+     * times. */
+    for (int i = 0; i < 150; i++) {
+        struct timespec later = {0, 200000000};
         nanosleep(&later, NULL);
+        if (kill(getppid(), SIGUSR1) != 0) return 45;
     }
-    if (kill(getppid(), SIGUSR1) != 0) return 45;
     return 0;
 }
 
@@ -302,18 +310,35 @@ static int run_role(void) {
         pid_t pid;
         memset(&act, 0, sizeof act);
         act.sa_handler = on_usr1;
+        /* SA_RESTART: a wait ends with EINTR whatever it says. */
+        act.sa_flags = SA_RESTART;
         sigemptyset(&act.sa_mask);
         CHECK(sigaction(SIGUSR1, &act, NULL) == 0);
         pid = fork();
         CHECK(pid >= 0);
         if (pid == 0) _exit(child_without_window());
-        for (int i = 0; i < 20 && !ended; i++) {
+        /* At most 10 waits of 3 s: a child that failed its checks exits at once
+         * and sends nothing, and the loop ends. */
+        for (int i = 0; i < 10 && !ended; i++) {
             errno = 0;
-            if (stafeto_window_wait(0, 10 * SECOND, &bits) == -1 && errno == EINTR) ended = 1;
+            if (stafeto_window_wait(0, 3 * SECOND, &bits) == -1 && errno == EINTR) ended = 1;
+            if (waitpid(pid, &status, WNOHANG) == pid) {
+                pid = 0;
+                break;
+            }
+        }
+        if (pid != 0) {
+            /* Still looping its signals: it passed its checks. */
+            CHECK(kill(pid, SIGKILL) == 0);
+            CHECK(waitpid(pid, &status, 0) == pid);
+            CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+        } else {
+            /* It exited by itself: its code says which check failed. */
+            printf("posix-window: the child ended by itself, status %d\n",
+                   WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            return 21;
         }
         CHECK(ended && usr1 == 1);
-        CHECK(waitpid(pid, &status, 0) == pid);
-        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
         CHECK(stafeto_window_free_buffers(0) == 3);
     }
     printf("posix-window: a forked child has no window, and a signal ends a wait with EINTR\n");

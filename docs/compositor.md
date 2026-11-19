@@ -248,13 +248,22 @@ moves the library into `libc.so` and gives the window's channel to `poll`.
   A signal with a handler ends it with EINTR. One thread at a time waits and
   one takes events; another gets EBUSY. Events the service gave beyond the
   caller's room wait in the library for the next call.
-- `fork` gives the child no window (the state is reset in `after_fork`, the
-  pieces are not copied); `exec` and `stafeto_window_close` close the
-  session, which ends the window in the service, unmap the buffers and close
-  the channel and the timer. A service that ended answers ENODEV from every
-  call from then on.
+- `fork` gives the child no window (the state is reset in `after_fork`, and
+  the map of the child has no piece of a buffer); `exec` and
+  `stafeto_window_close` close the session, which ends the window in the
+  service, unmap the buffers and close the channel and the timer (a failed
+  unmap is told once on the console). A call that finds the service ended
+  (post, events, shown) answers ENODEV, and the calls after it too. A
+  `stafeto_window_wait` does not learn of the end by itself, since its check
+  runs at entry: it ends with a bit or its time, so a program uses a finite
+  timeout.
+- `stafeto_window_events` asks the service again while its replies are full
+  (32 events) and the caller has room, so a call returns fewer than `max`
+  only when the ring is empty; the ring holds 64 and the service sends its
+  bit for new events only.
 - `stafeto_window_shown` is a helper of the probes: it looks at DESCRIBE
   every 2 ms until `frames` has grown since the last look and `busy` is 0.
+  When no POST came since the last look it returns as soon as `busy` is 0.
 
 `cargo xtask posix-window` runs `tests/posix-window` in an image of its own
 (`boot-posix-window.img`, the table `table::window`): the screenshots of QEMU

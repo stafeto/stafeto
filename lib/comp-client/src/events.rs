@@ -115,6 +115,74 @@ impl WindowEvent {
     }
 }
 
+/// The events of a window as a program takes them. The service's ring holds
+/// 64 events and one EVENTS call gives at most `EVENTS_MAX` of them, and it
+/// sends its bit only for new events, so a program that stops at what one
+/// call gave would strand the rest. `take` asks the service again while the
+/// last reply was full and the caller has room, so a call returns fewer
+/// than `out.len()` only when the ring is empty. What a reply held beyond
+/// the caller's room waits in the stash.
+#[derive(Clone, Copy, Debug)]
+pub struct Taker {
+    stash: Stash,
+    /// The last reply of the service held `EVENTS_MAX` events: more may wait.
+    last_full: bool,
+}
+
+impl Taker {
+    pub const fn new() -> Taker {
+        Taker {
+            stash: Stash::new(),
+            last_full: false,
+        }
+    }
+
+    /// Up to `out.len()` events: how many and the flags. `ask` is one EVENTS
+    /// call: it fills the array and gives the count and whether the ring
+    /// lost events. An error of `ask` after some events were taken ends the
+    /// call with what it has.
+    pub fn take<E>(
+        &mut self,
+        out: &mut [WindowEvent],
+        mut ask: impl FnMut(&mut [WindowEvent; EVENTS_MAX]) -> Result<(usize, bool), E>,
+    ) -> Result<(usize, u32), E> {
+        let mut done = 0;
+        let mut flags = 0;
+        loop {
+            if self.stash.is_empty() {
+                let mut list = [WindowEvent::default(); EVENTS_MAX];
+                match ask(&mut list) {
+                    Ok((n, lost)) => {
+                        let n = n.min(EVENTS_MAX);
+                        self.stash.fill(&list[..n], lost);
+                        self.last_full = n == EVENTS_MAX;
+                    }
+                    Err(_) if done > 0 => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            let (n, f) = self.stash.take(&mut out[done..]);
+            done += n;
+            flags |= f;
+            if done == out.len() || !self.stash.is_empty() || !self.last_full {
+                break;
+            }
+        }
+        Ok((done, flags))
+    }
+
+    /// Forgets what was held (a new window).
+    pub fn reset(&mut self) {
+        *self = Taker::new();
+    }
+}
+
+impl Default for Taker {
+    fn default() -> Taker {
+        Taker::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +266,102 @@ mod tests {
         let mut out = [WindowEvent::default(); 32];
         assert_eq!(stash.take(&mut out), (32, 0));
         assert_eq!(out[31].code, 31);
+    }
+
+    /// A ring of `n` events the way the service serves it: 32 a call.
+    struct Ring {
+        left: Vec<u16>,
+        calls: usize,
+    }
+
+    impl Ring {
+        fn new(n: u16) -> Ring {
+            Ring {
+                left: (1..=n).collect(),
+                calls: 0,
+            }
+        }
+
+        fn ask(&mut self, list: &mut [WindowEvent; EVENTS_MAX]) -> Result<(usize, bool), ()> {
+            self.calls += 1;
+            let n = self.left.len().min(EVENTS_MAX);
+            for (slot, code) in list.iter_mut().zip(self.left.drain(..n)) {
+                *slot = key(code);
+            }
+            Ok((n, false))
+        }
+    }
+
+    #[test]
+    fn max_above_the_ring_reply_takes_every_event_waiting() {
+        let mut ring = Ring::new(40);
+        let mut taker = Taker::new();
+        let mut out = [WindowEvent::default(); 64];
+        let (n, _) = taker.take(&mut out, |l| ring.ask(l)).unwrap();
+        assert_eq!(n, 40);
+        assert_eq!(out[39].code, 40);
+        assert_eq!(ring.calls, 2);
+        // A full ring of 64 is two full replies and one empty one.
+        let mut ring = Ring::new(64);
+        let (n, _) = taker.take(&mut out, |l| ring.ask(l)).unwrap();
+        assert_eq!(n, 64);
+        // Exactly 32 asks again and finds none.
+        let mut ring = Ring::new(32);
+        let (n, _) = taker.take(&mut out, |l| ring.ask(l)).unwrap();
+        assert_eq!((n, ring.calls), (32, 2));
+    }
+
+    #[test]
+    fn a_small_max_never_returns_fewer_while_the_ring_holds_more() {
+        let mut ring = Ring::new(64);
+        let mut taker = Taker::new();
+        let mut out = [WindowEvent::default(); 10];
+        let mut sizes = Vec::new();
+        let mut codes = Vec::new();
+        loop {
+            let (n, _) = taker.take(&mut out, |l| ring.ask(l)).unwrap();
+            sizes.push(n);
+            codes.extend(out[..n].iter().map(|e| e.code));
+            if n < out.len() {
+                break;
+            }
+        }
+        assert_eq!(sizes, [10, 10, 10, 10, 10, 10, 4]);
+        assert_eq!(codes, (1..=64).collect::<Vec<u16>>());
+        assert!(ring.left.is_empty());
+    }
+
+    #[test]
+    fn an_error_after_some_events_keeps_them() {
+        let mut taker = Taker::new();
+        let mut out = [WindowEvent::default(); 64];
+        let mut ring = Ring::new(32);
+        let mut first = true;
+        let got = taker.take(&mut out, |l| {
+            if first {
+                first = false;
+                ring.ask(l)
+            } else {
+                Err(())
+            }
+        });
+        assert_eq!(got.map(|(n, _)| n), Ok(32));
+        let got = taker.take(&mut out, |_| Err::<(usize, bool), ()>(()));
+        assert_eq!(got, Err(()));
+    }
+
+    #[test]
+    fn lost_is_told_once_across_calls() {
+        let mut taker = Taker::new();
+        let mut out = [WindowEvent::default(); 64];
+        let got = taker
+            .take(&mut out, |l| {
+                l[0] = key(1);
+                Ok::<_, ()>((1, true))
+            })
+            .unwrap();
+        assert_eq!(got, (1, EVENTS_LOST));
+        let got = taker.take(&mut out, |_| Ok::<_, ()>((0, false))).unwrap();
+        assert_eq!(got, (0, 0));
     }
 }

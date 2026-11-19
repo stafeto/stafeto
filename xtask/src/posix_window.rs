@@ -84,22 +84,24 @@ const LINES: [&str; 8] = [
 const ENDED: &str = "init: posix-window ended: exit code 0, not restarted";
 
 /// Follows the run: the three screenshots against the guest's CRC lines,
-/// then the end of the probe.
-fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
+/// then the end of the probe. The CRC-32 of each screenshot.
+fn drive(run: &mut Run, scratch: &Scratch) -> Result<[u32; 3], String> {
     const WITHIN: Duration = Duration::from_secs(120);
     let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
-    for prefix in SHOTS {
+    let mut shots = [0; 3];
+    for (shot, prefix) in shots.iter_mut().zip(SHOTS) {
         let line = run.expect_line(prefix, |l| l.contains(prefix), WITHIN)?;
-        gpu_probe::compare(&mut monitor, &scratch.picture(), &line, prefix)?;
+        *shot = gpu_probe::compare_shot(&mut monitor, &scratch.picture(), &line, prefix)?;
     }
     run.expect_line(ENDED, |l| l == ENDED, WITHIN)?;
-    Ok(())
+    Ok(shots)
 }
 
-/// Judges the lines of a run: no check failed, each line of the probe came
-/// once, and the screen was the same after the first frame and after the
-/// merged one.
-fn verdict(lines: &[String]) -> Result<(), String> {
+/// Judges the lines of a run and the CRC-32 of the three screenshots: no
+/// check failed, each line of the probe came once, the screenshot after the
+/// merged post is the first one again (the first buffer's top byte is 0xFF
+/// and the screen ignores it), and the one after the second buffer differs.
+fn verdict(lines: &[String], shots: [u32; 3]) -> Result<(), String> {
     if let Some(failed) = lines
         .iter()
         .find(|l| l.starts_with("posix-window: check failed"))
@@ -112,17 +114,13 @@ fn verdict(lines: &[String]) -> Result<(), String> {
             return Err(format!("{found} lines {marker:?}, 1 expected"));
         }
     }
-    let crc = |prefix: &str| -> Result<u32, String> {
-        let line = lines
-            .iter()
-            .find(|l| l.starts_with(prefix))
-            .ok_or_else(|| format!("no line {prefix:?}"))?;
-        gpu_probe::crc_of(line, prefix)
-    };
-    if crc(SHOTS[0])? != crc(SHOTS[2])? {
-        return Err("the merged post did not bring the first picture back".into());
+    if shots[0] != shots[2] {
+        return Err(format!(
+            "the merged post did not bring the first picture back: screenshots {:08x} and {:08x}",
+            shots[0], shots[2]
+        ));
     }
-    if crc(SHOTS[0])? == crc(SHOTS[1])? {
+    if shots[0] == shots[1] {
         return Err("the screen did not change with the second buffer".into());
     }
     Ok(())
@@ -144,8 +142,8 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     let mut run = Run::start(cmd, Input::Null)?;
     let driven = drive(&mut run, &scratch);
     let outcome = run.stop();
-    driven.map_err(|e| format!("posix-window on {}: {e}", machine.name))?;
-    verdict(&outcome.lines).map_err(|e| format!("posix-window on {}: {e}", machine.name))?;
+    let shots = driven.map_err(|e| format!("posix-window on {}: {e}", machine.name))?;
+    verdict(&outcome.lines, shots).map_err(|e| format!("posix-window on {}: {e}", machine.name))?;
     println!(
         "posix-window on {}: a window of the C library with two buffers matched QEMU's screenshot for the first frame, a rectangle of the second buffer and the merge of five rectangles; the bits freed the buffers, the child had no window, a signal ended the wait, close and a new window: ok",
         machine.name
@@ -157,31 +155,117 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn run(crcs: [&str; 3]) -> Vec<String> {
+    fn run() -> Vec<String> {
         let mut lines: Vec<String> = LINES.iter().map(|l| (*l).to_owned()).collect();
-        for (prefix, crc) in SHOTS.iter().zip(crcs) {
-            lines.push(format!("{prefix}{crc}"));
-        }
         lines.push("posix-window: ok".to_owned());
         lines
     }
 
     #[test]
-    fn a_run_whose_merge_restores_the_first_picture_passes() {
-        assert_eq!(verdict(&run(["0a0b0c0d", "11223344", "0a0b0c0d"])), Ok(()));
+    fn a_run_whose_merge_restores_the_first_screenshot_passes() {
+        assert_eq!(
+            verdict(&run(), [0x0a0b_0c0d, 0x1122_3344, 0x0a0b_0c0d]),
+            Ok(())
+        );
     }
 
     #[test]
     fn the_verdict_names_what_is_wrong() {
-        let err = verdict(&run(["0a0b0c0d", "11223344", "55555555"])).unwrap_err();
+        let err = verdict(&run(), [1, 2, 3]).unwrap_err();
         assert!(err.contains("merged"), "{err}");
-        let err = verdict(&run(["0a0b0c0d", "0a0b0c0d", "0a0b0c0d"])).unwrap_err();
+        let err = verdict(&run(), [1, 1, 1]).unwrap_err();
         assert!(err.contains("did not change"), "{err}");
-        let mut lines = run(["1", "2", "1"]);
+        let mut lines = run();
         lines.remove(0);
-        assert!(verdict(&lines).unwrap_err().contains("expected"));
-        let mut lines = run(["1", "2", "1"]);
+        assert!(verdict(&lines, [1, 2, 1]).unwrap_err().contains("expected"));
+        let mut lines = run();
         lines.push("posix-window: check failed at line 9: x (errno 1)".to_owned());
-        assert!(verdict(&lines).unwrap_err().contains("check failed"));
+        assert!(
+            verdict(&lines, [1, 2, 1])
+                .unwrap_err()
+                .contains("check failed")
+        );
+    }
+
+    /// The header compiles under every mode a program may use, with the
+    /// layout assertions on (`_Static_assert`, `static_assert`, or the
+    /// array of size -1 before C11 and C++11), and a wrong layout does not
+    /// compile. By hand:
+    /// `clang --target=aarch64-linux-gnu -std=c99 -pedantic-errors -Wall -Wextra -Werror
+    ///  -fsyntax-only -x c -I lib/posix-crt/window -` with `#include <stafeto/window.h>`,
+    /// and `clang++ ... -std=c++98 ... -x c++`. Skipped when no clang is found (the
+    /// host job of ci has one, as `cargo xtask abi` needs it).
+    #[test]
+    fn the_header_compiles_in_every_standard() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let include = root.join("lib/posix-crt/window");
+        let tool = |name: &str| {
+            let brew = std::path::PathBuf::from("/opt/homebrew/opt/llvm/bin").join(name);
+            if brew.exists() { brew } else { name.into() }
+        };
+        let compile =
+            |program: &str, std: &str, lang: &str, source: &str, include: &std::path::Path| {
+                let mut child = Command::new(tool(program))
+                    .args([
+                        "--target=aarch64-linux-gnu",
+                        "-pedantic-errors",
+                        "-Wall",
+                        "-Wextra",
+                        "-Werror",
+                    ])
+                    .args(["-fsyntax-only", "-x", lang, &format!("-std={std}")])
+                    .arg("-I")
+                    .arg(include)
+                    .arg("-")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .ok()?;
+                child.stdin.take()?.write_all(source.as_bytes()).ok()?;
+                Some(child.wait().ok()?.success())
+            };
+        let source = "#include <stafeto/window.h>\n#include <stafeto/window.h>\nint main(void) { return 0; }\n";
+        if compile("clang", "c11", "c", source, &include).is_none() {
+            eprintln!("no clang: the header's standards are not tried");
+            return;
+        }
+        for std in ["c99", "c11", "c17"] {
+            assert_eq!(
+                compile("clang", std, "c", source, &include),
+                Some(true),
+                "{std}"
+            );
+        }
+        for std in ["c++98", "c++11", "c++17"] {
+            assert_eq!(
+                compile("clang++", std, "c++", source, &include),
+                Some(true),
+                "{std}"
+            );
+        }
+        // A wrong size is refused in the old mode and the new one.
+        let dir =
+            std::env::temp_dir().join(format!("stafeto-window-header-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("stafeto")).unwrap();
+        let text = std::fs::read_to_string(include.join("stafeto/window.h")).unwrap();
+        let wrong = text.replace("stafeto_screen) == 32", "stafeto_screen) == 33");
+        assert_ne!(text, wrong);
+        std::fs::write(dir.join("stafeto/window.h"), wrong).unwrap();
+        for (program, std, lang) in [
+            ("clang", "c99", "c"),
+            ("clang", "c11", "c"),
+            ("clang++", "c++98", "c++"),
+            ("clang++", "c++17", "c++"),
+        ] {
+            assert_eq!(
+                compile(program, std, lang, source, &dir),
+                Some(false),
+                "{std}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

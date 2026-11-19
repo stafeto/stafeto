@@ -36,8 +36,9 @@ pub const fn kernel(error: Error) -> i32 {
 /// is EBUSY (a buffer that is not free, another client's ATTACH under
 /// way), INVALID and UNSUPPORTED EINVAL, NOT_ALLOWED EBADF (the session is
 /// not a window's), REVOKED and NO_DEVICE ENODEV (the window or the display
-/// is gone); `proto_gpu`'s CLEARING (the display is being set up) is EBUSY.
-/// Any other status is EIO.
+/// is gone); `proto_gpu`'s CLEARING (the display is being set up) is EBUSY,
+/// its NO_DEVICE and REVOKED ENODEV. Any other status (its IO among them) is
+/// EIO.
 pub fn status(status: Status) -> i32 {
     use proto_comp::{BUSY, INVALID, NO_DEVICE, NOT_ALLOWED, REVOKED, UNSUPPORTED};
     match status {
@@ -49,6 +50,9 @@ pub fn status(status: Status) -> i32 {
             NOT_ALLOWED => EBADF,
             REVOKED | NO_DEVICE => ENODEV,
             proto_gpu::CLEARING => EBUSY,
+            // The compositor answers DESCRIBE and WINDOW_CREATE with the
+            // display driver's codes when it has no screen.
+            proto_gpu::NO_DEVICE | proto_gpu::REVOKED => ENODEV,
             _ => EIO,
         },
         _ => EIO,
@@ -73,6 +77,9 @@ mod tests {
             assert_eq!(status(code(refusal)), errno, "{refusal}");
         }
         assert_eq!(status(proto_gpu::code(proto_gpu::CLEARING)), EBUSY);
+        assert_eq!(status(proto_gpu::code(proto_gpu::NO_DEVICE)), ENODEV);
+        assert_eq!(status(proto_gpu::code(proto_gpu::REVOKED)), ENODEV);
+        assert_eq!(status(proto_gpu::code(proto_gpu::IO)), EIO);
         assert_eq!(status(Status::Ok), 0);
         assert_eq!(status(Status::BadSize), EIO);
         assert_eq!(status(Status::Unknown(7777)), EIO);

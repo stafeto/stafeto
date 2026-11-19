@@ -68,7 +68,12 @@ TOOLCHAIN = "nightly-2026-05-24"
 TRACE = bool(os.environ.get("STAFETO_TRACE"))
 # The names of `<stafeto/window.h>`, which libc.so never exports.
 WINDOW_NAMES = re.compile(r"stafeto_(window|screen)_")
-LAYER_FEATURES = "shared,procfs" + (",trace" if TRACE else "")
+# The features of posix-crt that libc.so is built with, named once in tools/layer-features.txt:
+# `cargo xtask abi` reads the same file for the crates its fingerprint counts, and a host test of
+# xtask holds the file to posix-crt's features. `trace` is on only for the measurement build.
+LAYER_FEATURES = ",".join(
+    f for f in (ROOT / "tools" / "layer-features.txt").read_text().strip().split(",")
+    if f != "trace" or TRACE)
 LAYER_RUSTFLAGS = ("-C relocation-model=pic -C target-feature=+fix-cortex-a53-835769"
                    " -C llvm-args=--enable-machine-outliner=never")
 

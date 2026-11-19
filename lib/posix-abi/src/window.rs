@@ -43,7 +43,7 @@ use crate::threads;
 use comp_client::account::Buffers;
 use comp_client::damage;
 use comp_client::errno;
-use comp_client::events::Stash;
+use comp_client::events::Taker;
 use comp_client::layout::{self, Screen, Window, WindowEvent};
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
@@ -96,12 +96,15 @@ static TAKING: AtomicBool = AtomicBool::new(false);
 /// POST came since.
 static FRAMES: AtomicU32 = AtomicU32::new(0);
 static DIRTY: AtomicBool = AtomicBool::new(false);
+/// The failure of an unmap was told once.
+static UNMAP_TOLD: AtomicBool = AtomicBool::new(false);
 
-/// The events a call had no room for; the thread that holds `TAKING` owns it.
-struct Held(UnsafeCell<Stash>);
+/// The events a call had no room for and what the last reply was; the thread
+/// that holds `TAKING` owns it.
+struct Held(UnsafeCell<Taker>);
 // SAFETY: touched only by the thread that holds TAKING.
 unsafe impl Sync for Held {}
-static STASH: Held = Held(UnsafeCell::new(Stash::new()));
+static STASH: Held = Held(UnsafeCell::new(Taker::new()));
 
 /// Clears a flag at the end of the scope.
 struct Flag(&'static AtomicBool);
@@ -380,7 +383,7 @@ fn open_window(
         cell.store(value, Ordering::Release);
     }
     // SAFETY: no thread but this one knows the window yet (TAKING is clear).
-    unsafe { *STASH.0.get() = Stash::new() };
+    unsafe { *STASH.0.get() = Taker::new() };
     ACCOUNT.store(Buffers::new(buffers as usize).raw(), Ordering::Release);
     Ok(Window {
         width: w,
@@ -449,19 +452,22 @@ fn absorb(got: &Received) -> bool {
     false
 }
 
-/// Takes what waits on the channel without blocking: whether service bits
-/// came. They stay in the account for the next `wait`, which a `wait`
-/// asleep in another thread is told of.
-fn drain() -> bool {
+/// Takes what waits on the channel without blocking. Service bits stay in
+/// the account for the next `wait`. A `wait` in another thread may have set
+/// its timer or be about to block on exactly what was taken (the timer's
+/// expiry, an earlier wake, a bit), so when anything at all was taken and a
+/// thread waits, one wake goes after the loop: the waiter looks again at the
+/// account and at its time (`comp_client::account::should_wake`).
+fn drain() {
     let own = channel();
-    let mut any = false;
+    let mut taken = 0;
     while let Ok(got) = sys::try_receive(&own) {
-        any |= absorb(&got);
+        absorb(&got);
+        taken += 1;
     }
-    if any && WAITING.load(Ordering::Acquire) {
+    if comp_client::account::should_wake(taken, WAITING.load(Ordering::Acquire)) {
         let _ = sys::notify(&own, WAKE);
     }
-    any
 }
 
 /// `stafeto_window_free`: the free buffers by the account; 0 for a window
@@ -590,7 +596,9 @@ pub fn wait(win: i32, timeout_ns: u64) -> Result<u32, i32> {
 }
 
 /// `stafeto_window_events`: up to `out.len()` events of the ring and the
-/// flags. Events the service gave beyond `out` wait for the next call.
+/// flags, and fewer only when the ring is empty (`comp_client::events::Taker`
+/// asks the service again while its replies are full). Events the service
+/// gave beyond `out` wait for the next call.
 pub fn events(win: i32, out: &mut [WindowEvent]) -> Result<(usize, u32), i32> {
     opened(win)?;
     if out.is_empty() {
@@ -600,10 +608,8 @@ pub fn events(win: i32, out: &mut [WindowEvent]) -> Result<(usize, u32), i32> {
         return Err(EBUSY);
     };
     // SAFETY: TAKING is held.
-    let stash = unsafe { &mut *STASH.0.get() };
-    let room = out.len().min(layout::EVENTS_MAX);
-    let out = &mut out[..room];
-    if stash.is_empty() {
+    let taker = unsafe { &mut *STASH.0.get() };
+    taker.take(out, |list| {
         alive()?;
         let reply = call(
             &session(),
@@ -612,7 +618,6 @@ pub fn events(win: i32, out: &mut [WindowEvent]) -> Result<(usize, u32), i32> {
         )
         .map_err(refused)?;
         let mut buffer = [0; MESSAGE_MAX];
-        let mut list = [WindowEvent::default(); layout::EVENTS_MAX];
         let mut n = 0;
         let flags = proto_comp::read_events(reply.bytes(&mut buffer), |event| {
             if n < list.len() {
@@ -621,9 +626,8 @@ pub fn events(win: i32, out: &mut [WindowEvent]) -> Result<(usize, u32), i32> {
             }
         })
         .map_err(refusal)?;
-        stash.fill(&list[..n], flags & proto_comp::LOST != 0);
-    }
-    Ok(stash.take(out))
+        Ok((n, flags & proto_comp::LOST != 0))
+    })
 }
 
 /// `stafeto_window_shown`: until the service has shown a frame since the
@@ -654,7 +658,12 @@ pub fn shown(win: i32, timeout_ns: u64) -> Result<(), i32> {
 /// the buffers leave the map and the process, the timer and the channel
 /// close. Safe on a state that is part made.
 fn release() {
-    let _ = crate::allocation::heap(|state| state.unmap_windows());
+    if let Err(errno) = crate::allocation::heap(|state| state.unmap_windows()) {
+        // Once: a program that closes windows in a loop would repeat it.
+        if !UNMAP_TOLD.swap(true, Ordering::AcqRel) {
+            rt::println!("posix: a buffer of the window could not be unmapped (errno {errno})");
+        }
+    }
     let raw = SESSION.swap(0, Ordering::AcqRel);
     if raw != 0 {
         drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
@@ -705,7 +714,7 @@ pub unsafe fn after_fork() {
         flag.store(false, Ordering::Release);
     }
     // SAFETY: the child's only thread.
-    unsafe { *STASH.0.get() = Stash::new() };
+    unsafe { *STASH.0.get() = Taker::new() };
     STATE.store(CLOSED, Ordering::Release);
 }
 

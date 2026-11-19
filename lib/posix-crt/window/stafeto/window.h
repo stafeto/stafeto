@@ -22,9 +22,9 @@
  * 32-bit word stored low byte first: 0xXXRRGGBB (XRGB8888: the top byte is
  * ignored) or 0xAARRGGBB with the colour already multiplied by the alpha
  * (ARGB8888, laid over what is below). The buffers are ordinary memory of
- * the process, `stride` bytes a line. They are not copied by fork: after a
- * fork the child's pixels[] point at nothing and must not be used, and the
- * child has no window. The window and its buffers go with
+ * the process, `stride` bytes a line. A fork leaves them out of the child:
+ * after a fork the child's pixels[] point at nothing and must not be used,
+ * and the child has no window. The window and its buffers go with
  * stafeto_window_close, exec and the end of the process.
  *
  * The window's size is fixed for its life (the protocol has no resize). A
@@ -112,12 +112,17 @@ struct stafeto_window_event {
 };
 
 /* The layouts the library's Rust side holds too. */
-#if defined(__cplusplus)
+#if defined(__cplusplus) && __cplusplus >= 201103L
 #define STAFETO_WINDOW_ASSERT(c) static_assert(c, #c)
-#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#elif !defined(__cplusplus) && defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 #define STAFETO_WINDOW_ASSERT(c) _Static_assert(c, #c)
 #else
-#define STAFETO_WINDOW_ASSERT(c)
+/* Before C11 and C++11: an array of size -1 does not compile. One typedef
+ * for each line, so each assertion has a name of its own. */
+#define STAFETO_WINDOW_JOIN_(a, b) a##b
+#define STAFETO_WINDOW_JOIN(a, b) STAFETO_WINDOW_JOIN_(a, b)
+#define STAFETO_WINDOW_ASSERT(c) \
+    typedef char STAFETO_WINDOW_JOIN(stafeto_window_assert_, __LINE__)[(c) ? 1 : -1]
 #endif
 STAFETO_WINDOW_ASSERT(sizeof(struct stafeto_screen) == 32);
 STAFETO_WINDOW_ASSERT(offsetof(struct stafeto_screen, height) == 4);
@@ -138,12 +143,16 @@ STAFETO_WINDOW_ASSERT(offsetof(struct stafeto_window_event, value) == 4);
 STAFETO_WINDOW_ASSERT(offsetof(struct stafeto_window_event, x) == 8);
 STAFETO_WINDOW_ASSERT(offsetof(struct stafeto_window_event, y) == 12);
 #undef STAFETO_WINDOW_ASSERT
+#undef STAFETO_WINDOW_JOIN
+#undef STAFETO_WINDOW_JOIN_
 
 /* Describes the screen. 0, or -1 with errno:
  *   ENODEV  the process has no display service (an image without one, a
  *           service that ended or started again) or the device did not
  *           answer;
  *   EINVAL  s is null;
+ *   EBUSY   the display is still being set up after the library's tries
+ *           (half a second);
  *   EINTR   a signal ended a wait for a display that is being set up;
  *   EIO     the service answered in a way the layer does not know. */
 int stafeto_screen_describe(struct stafeto_screen *s);
@@ -222,9 +231,13 @@ uint32_t stafeto_window_free_buffers(int win);
  *   ETIMEDOUT  no bit came in time;
  *   EINTR      a signal with a handler ran during the wait;
  *   EBADF      win is not the window's number;
- *   ENODEV     the service ended;
+ *   ENODEV     the service ended (known from an earlier call; see below);
  *   EBUSY      another thread of the process is waiting on the window;
  *   EIO        the kernel refused the wait.
+ * A wait does not learn of the service's end by itself: the check runs at
+ * entry, so a wait that is under way when the service ends returns only when
+ * a bit or its time comes, and a later call (post, events) is what finds the
+ * service gone. A program should use a finite timeout.
  * A later descriptor for poll will only add a way to sleep;
  * stafeto_window_wait(win, 0, &bits) stays the call that takes the bits. */
 int stafeto_window_wait(int win, uint64_t timeout_ns, uint32_t *bits);
