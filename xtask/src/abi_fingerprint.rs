@@ -462,7 +462,11 @@ fn compute(tree: &Path) -> Result<Parts, String> {
         "--offline",
         "--prefix",
         "none",
-        "--all-features",
+        // The features libc.so is built with (`LAYER_FEATURES` of tools/build-libc-so.py, with
+        // the packet path's trace). All features would add the crates of the libraries that
+        // only statically linked programs use (the feature `window`).
+        "-F",
+        "posix-crt/shared,posix-crt/procfs,posix-crt/trace",
         "-e",
         "normal,build",
         "--format",

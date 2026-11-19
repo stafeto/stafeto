@@ -66,6 +66,8 @@ TOOLCHAIN = "nightly-2026-05-24"
 # The build of the measurement of the packet path (STAFETO_TRACE=1) adds the time stamps of
 # the layer and the points of the stack's glue (`cargo xtask net-trace`).
 TRACE = bool(os.environ.get("STAFETO_TRACE"))
+# The names of `<stafeto/window.h>`, which libc.so never exports.
+WINDOW_NAMES = re.compile(r"stafeto_(window|screen)_")
 LAYER_FEATURES = "shared,procfs" + (",trace" if TRACE else "")
 LAYER_RUSTFLAGS = ("-C relocation-model=pic -C target-feature=+fix-cortex-a53-835769"
                    " -C llvm-args=--enable-machine-outliner=never")
@@ -454,6 +456,12 @@ def link_so(output: Path, libc_a: Path, layer_a: Path, extra: list) -> Path:
 def export_names(sysroot: Path, plain: Elf) -> dict:
     """The names libc.so exports, each with its reason."""
     defined = {n for n, is_def, bind, vis, _ in plain.dynsym() if is_def and n and bind in (1, 2)}
+    # The windows of the composition service are a static library of the programs that use them
+    # (the feature `window` of posix-crt): their names in libc.so would change the frozen series.
+    leaked = sorted(n for n in defined if WINDOW_NAMES.match(n))
+    if leaked:
+        fail(f"libc.so defines names of the window library, which stays out of it: "
+             f"{' '.join(leaked)}")
     words = set()
     for header in (sysroot / "include").rglob("*.h"):
         words.update(re.findall(r"[A-Za-z_]\w*", header.read_text(errors="replace")))
