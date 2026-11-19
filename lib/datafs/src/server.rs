@@ -1478,13 +1478,13 @@ impl Server {
 
     /// Before a change of the attribute of the file at `path` (CHMOD, CHOWN, UTIMENS and their
     /// variants by description): the writes still pending on its open node are folded into the
-    /// record with one commit and the mark is cleared, so that the last close does not write the time
-    /// of the writes over a time or a mode the caller just set.
-    fn fold_pending<D: Device>(&mut self, fs: &mut Fs<'_, D>, path: &[u8]) -> Res<()> {
-        match self.node_at(path) {
-            Some(ni) if self.nodes[ni].wrote => self.write_times(fs, ni),
-            _ => Ok(()),
-        }
+    /// record in memory, so that the checks see the mode and the times the file has, and the one
+    /// commit after them writes the change with the writes in it (`write_changed` clears the mark).
+    /// A change that is refused writes nothing. The node, when there is a pending write.
+    pub(super) fn fold_into(&self, path: &[u8], entry: &mut Record) -> Option<usize> {
+        let ni = self.node_at(path).filter(|&ni| self.nodes[ni].wrote)?;
+        self.overlay_pending(ni, &mut entry.attr);
+        Some(ni)
     }
 
     /// The attribute of the file of node `ni` takes the time of its writes (`mtime`, `ctime`) and

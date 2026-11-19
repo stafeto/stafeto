@@ -477,12 +477,12 @@ impl Server {
         path: &[u8],
         mode: u32,
     ) -> Res<()> {
-        self.fold_pending(fs, path)?;
-        let (info, entry) = self.load_for_change(fs, caller, by_path, path)?;
+        let (info, mut entry) = self.load_for_change(fs, caller, by_path, path)?;
+        let node = self.fold_into(path, &mut entry);
         let new = perm::chmod_result(caller.identity(false), &entry.attr.perm(info.kind), mode)
             .map_err(denied)?;
         self.reserve_allows(fs, caller)?;
-        self.write_changed(fs, path, info.kind, entry, |a, now| {
+        self.write_changed(fs, path, info.kind, (entry, node), |a, now| {
             a.mode = new;
             a.ctime = now;
         })
@@ -498,8 +498,8 @@ impl Server {
         uid: u32,
         gid: u32,
     ) -> Res<()> {
-        self.fold_pending(fs, path)?;
-        let (info, entry) = self.load_for_change(fs, caller, by_path, path)?;
+        let (info, mut entry) = self.load_for_change(fs, caller, by_path, path)?;
+        let node = self.fold_into(path, &mut entry);
         let keep = |v: u32| (v != p::UID_KEEP).then_some(v);
         let owned = perm::chown_result(
             caller.identity(false),
@@ -509,7 +509,7 @@ impl Server {
         )
         .map_err(denied)?;
         self.reserve_allows(fs, caller)?;
-        self.write_changed(fs, path, info.kind, entry, |a, now| {
+        self.write_changed(fs, path, info.kind, (entry, node), |a, now| {
             a.mode = owned.mode;
             a.uid = owned.uid;
             a.gid = owned.gid;
@@ -527,8 +527,8 @@ impl Server {
         atime: p::TimeSpec,
         mtime: p::TimeSpec,
     ) -> Res<()> {
-        self.fold_pending(fs, path)?;
-        let (info, entry) = self.load_for_change(fs, caller, by_path, path)?;
+        let (info, mut entry) = self.load_for_change(fs, caller, by_path, path)?;
+        let node = self.fold_into(path, &mut entry);
         let request = match (atime, mtime) {
             (p::TimeSpec::Omit, p::TimeSpec::Omit) => TimesRequest::Omit,
             (p::TimeSpec::Now, p::TimeSpec::Now) => TimesRequest::Now,
@@ -545,7 +545,7 @@ impl Server {
             p::TimeSpec::Omit => old,
             p::TimeSpec::At(t) => t,
         };
-        self.write_changed(fs, path, info.kind, entry, |a, now| {
+        self.write_changed(fs, path, info.kind, (entry, node), |a, now| {
             a.atime = pick(atime, a.atime, now);
             a.mtime = pick(mtime, a.mtime, now);
             a.ctime = now;
@@ -560,7 +560,7 @@ impl Server {
         fs: &mut Fs<'_, D>,
         path: &[u8],
         kind: Kind,
-        entry: Record,
+        (entry, node): (Record, Option<usize>),
         change: impl FnOnce(&mut Attr, i64),
     ) -> Res<()> {
         if entry.standing == Standing::Foreign {
@@ -569,6 +569,10 @@ impl Server {
         let mut attr = entry.attr;
         change(&mut attr, self.now);
         volume(fs.setattr(path, ATTR_TYPE, &attr.to_bytes()))?;
+        // The writes pending on the open node went into this commit (`fold_into`).
+        if let Some(ni) = node {
+            self.nodes[ni].wrote = false;
+        }
         if kind == Kind::Directory {
             self.forget(path);
         }

@@ -232,7 +232,8 @@
 //! 15. **The channels.** The root channel (label `ROOT`) takes SESSION and VERIFY_SESSION and
 //!     nothing else; any other session answers them, and the root answers every other method, with
 //!     IS_ROOT. VERIFY_SESSION answers the offered session itself when it is a live session of the
-//!     service, and BAD_HANDLE with no handle otherwise. Every session SESSION makes is bound at
+//!     service that a POSIX client holds, and BAD_HANDLE with no handle otherwise (a pass and the
+//!     session of a native client are not offered sessions). Every session SESSION makes is bound at
 //!     birth, so no process holds an unbound session from the root. The reason is that the label
 //!     of the root channel is one for all its holders: a limit of unbound sessions per root channel
 //!     would be a limit for the whole system.
@@ -392,12 +393,19 @@ pub const MODE_MASK: u32 = 0o7777;
 pub const SERVICE: u64 = 1 << 61;
 /// The mark of the labels the service makes for its own sessions.
 pub const OWN: u64 = 1 << 63;
+/// The mark of the labels of passes (EXPORT), with `OWN`: a pass is not a session.
+pub const PASS: u64 = OWN | 1 << 58;
 /// The label of the service's root channel (rule 15): bit 60 with `OWN`.
 pub const ROOT: u64 = OWN | 1 << 60;
 
 /// Whether `label` is the profile of a native client.
 pub const fn is_service(label: u64) -> bool {
     label & OWN == 0 && label & SERVICE != 0
+}
+
+/// Whether `label` is a pass made by EXPORT.
+pub const fn is_pass(label: u64) -> bool {
+    label & PASS == PASS && label != ROOT
 }
 
 /// Whether `label` is the root channel.
@@ -1167,6 +1175,16 @@ mod tests {
 
     fn body(w: &Writer) -> Reader<'_> {
         Reader::new(&w.as_bytes()[HEADER_LEN..])
+    }
+
+    #[test]
+    fn the_labels_of_passes_sessions_natives_and_the_root_are_told_apart() {
+        assert!(is_pass(PASS | 7));
+        assert!(!is_pass(OWN | 7), "a clone or SESSION session is no pass");
+        assert!(!is_pass(ROOT), "the root channel is no pass");
+        assert!(!is_pass(SERVICE | 7));
+        assert!(is_service(SERVICE | 7));
+        assert!(!is_service(PASS | 7));
     }
 
     fn sample() -> Stat {

@@ -1838,3 +1838,30 @@ fn a_read_that_fails_in_a_listing_loses_no_entry_and_repeats_none() {
     }
     assert!(tried > 0, "no read of the listings failed");
 }
+
+#[test]
+fn a_refused_change_of_a_file_with_a_pending_write_writes_nothing() {
+    let mut rig = Rig::new();
+    rig.mkdir(ROOT, b"/d", 0o777).unwrap();
+    rig.server.set_now(5_000);
+    rig.put(OWNER, b"/d/f", 0o4755, b"");
+    rig.server.set_now(9_000);
+    let h = rig.open(OWNER, b"/d/f", p::READ | p::WRITE, 0).unwrap();
+    rig.write(OWNER, h, b"x").unwrap();
+    let before = rig.fs.device().programs;
+    // Another user may change neither the mode, the owner nor the times of the file.
+    assert!(rig.chmod(OTHER, b"/d/f", 0o777).is_err());
+    assert!(rig.chown(OTHER, b"/d/f", 5, p::UID_KEEP).is_err());
+    assert_eq!(
+        rig.fs.device().programs,
+        before,
+        "a refused change commits nothing"
+    );
+    // The write is still pending and the last close writes its time; the allowed change writes the
+    // write's time and the new mode in one commit.
+    rig.server.set_now(9_900);
+    rig.chmod(OWNER, b"/d/f", 0o640).unwrap();
+    rig.close(OWNER, h);
+    let st = rig.stat(OWNER, b"/d/f").unwrap();
+    assert_eq!((st.mode, st.mtime), (0o640, 9_000));
+}

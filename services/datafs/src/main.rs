@@ -275,8 +275,12 @@ impl Datafs {
     }
 
     /// A new label of the service's own and a copy of its channel that carries it, with `rights`.
-    fn make(&mut self, rights: Rights) -> Result<(u64, Handle<Any>), abi::Error> {
-        let label = OWN | self.next_label;
+    fn make(&mut self, rights: Rights, pass: bool) -> Result<(u64, Handle<Any>), abi::Error> {
+        let label = if pass {
+            proto_data::PASS | self.next_label
+        } else {
+            OWN | self.next_label
+        };
         let copy = sys::handle_label(&self.channel, rights, label, self.level)?;
         self.next_label += 1;
         Ok((label, copy.erase()))
@@ -350,7 +354,7 @@ impl Datafs {
         };
         match Method::from_number(r.method()) {
             Some(Method::Bind) => Ok((0, (None, Some(brought)))),
-            Some(Method::Session) => match self.make(Rights::SEND | Rights::TRANSFER) {
+            Some(Method::Session) => match self.make(Rights::SEND | Rights::TRANSFER, false) {
                 Ok(made) => Ok((made.0, (Some((Held::Made, made.1)), Some(brought)))),
                 Err(e) => Err(Answer::Status(Status::Kernel(e))),
             },
@@ -373,7 +377,12 @@ impl Datafs {
             return Answer::Status(proto_data::code(proto_data::BAD_HANDLE));
         };
         match sys::copy_label(&self.channel, &offered) {
-            Ok(label) if !proto_data::is_root(label) => {
+            // A pass and the session of a native client are not sessions a POSIX client holds.
+            Ok(label)
+                if !proto_data::is_root(label)
+                    && !proto_data::is_pass(label)
+                    && !proto_data::is_service(label) =>
+            {
                 if r.reply().u32(0).is_err() {
                     return Answer::Status(Status::BadSize);
                 }
@@ -446,11 +455,11 @@ impl Service<0> for Datafs {
         };
         // The calls that bring or make a handle are the request thread's: a kernel call each, no disk.
         let (aux, handle) = match Method::from_number(r.method()) {
-            Some(Method::Clone) => match self.make(Rights::SEND | Rights::TRANSFER) {
+            Some(Method::Clone) => match self.make(Rights::SEND | Rights::TRANSFER, false) {
                 Ok(made) => (made.0, (Some((Held::Made, made.1)), None)),
                 Err(e) => return Answer::Status(Status::Kernel(e)),
             },
-            Some(Method::Export) => match self.make(Rights::TRANSFER) {
+            Some(Method::Export) => match self.make(Rights::TRANSFER, true) {
                 Ok(made) => (made.0, (Some((Held::Made, made.1)), None)),
                 Err(e) => return Answer::Status(Status::Kernel(e)),
             },

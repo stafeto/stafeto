@@ -848,9 +848,20 @@ fn identity_job(
     use proto_data::{self as p, Method};
     let (request, owner, aux, carried) = call;
     let status = |code: u32| proto_wire::reply(Status::Unknown(code));
-    let method = request
-        .get(..2)
-        .and_then(|b| Method::from_number(u16::from_le_bytes([b[0], b[1]])));
+    // The header is read whole, as the server reads it: a version other than this one is BAD_VERSION
+    // and a body on a request that has none is BAD_SIZE.
+    let mut reader = proto_wire::Reader::new(request);
+    let header = match proto_wire::Header::read(&mut reader) {
+        Ok(header) => header,
+        Err(e) => return proto_wire::reply(e),
+    };
+    if header.version != p::VERSION {
+        return proto_wire::reply(Status::BadVersion);
+    }
+    let method = Method::from_number(header.method);
+    if matches!(method, Some(Method::Session | Method::Bind)) && reader.left() != 0 {
+        return proto_wire::reply(Status::BadSize);
+    }
     let root = p::is_root(owner);
     match method {
         // The root channel takes SESSION and VERIFY_SESSION and nothing else; a session takes
@@ -877,7 +888,6 @@ fn vouch_and_bind(
     label: u64,
     carried: u64,
 ) -> [u8; proto_wire::HEADER_LEN] {
-    use datafs::vouching::vouched_from;
     use proto_data as p;
     let status = |code: u32| proto_wire::reply(Status::Unknown(code));
     if carried == 0 {
@@ -893,13 +903,8 @@ fn vouch_and_bind(
     let Some(who) = notary.vouch(&kept) else {
         return status(p::ACCESS);
     };
-    let vouched = vouched_from(&who);
-    let bound = if new {
-        server.bind_new(label, vouched)
-    } else {
-        server.bind(label, vouched)
-    };
-    match bound {
+    // An answer about a loader binds nothing (`bind_from`).
+    match datafs::vouching::bind_from(server, new, label, &who) {
         Ok(()) if identities.put(label, kept) => proto_wire::reply(Status::Ok),
         Ok(()) => {
             server.set_binding(label, datafs::binding::Binding::Unbound);

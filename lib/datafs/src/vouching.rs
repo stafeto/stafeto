@@ -13,13 +13,19 @@ use proto_process::WhoReply;
 /// The index of `RLIMIT_FSIZE` in the limits of a `WhoReply` (the process service's table).
 const FSIZE: usize = 2;
 
-/// The identity a process service's answer stands for.
-pub fn vouched_from(who: &WhoReply) -> Vouched {
+/// The identity a process service's answer stands for. None for the answer about a loader (`loader`
+/// set): Vouch also vouches for the identity copy of a loader while a set-ID image is loading, and
+/// that copy goes to the caller of the spawn, so whoever holds it could bind a session with the
+/// raised identity before the load ends. No such answer makes a binding or keeps one.
+pub fn vouched_from(who: &WhoReply) -> Option<Vouched> {
+    if who.loader.is_some() {
+        return None;
+    }
     let mut groups = [0u32; GROUPS_MAX];
     let count = (who.groups.count as usize).min(GROUPS_MAX);
     groups[..count].copy_from_slice(&who.groups.ids[..count]);
     let c = who.credentials;
-    Vouched {
+    Some(Vouched {
         pid: who.pid,
         index: who.index,
         generation: who.generation,
@@ -33,6 +39,24 @@ pub fn vouched_from(who: &WhoReply) -> Vouched {
         group_count: count,
         fsize_limit: who.limits.values[FSIZE].soft,
         root: (u64::from(who.root.pid) << 32) | u64::from(who.root.generation),
+    })
+}
+
+/// BIND or SESSION with the answer of the process service: binds `label` (`new`: a session made by
+/// SESSION, bound at birth). The answer about a loader is ACCESS and binds nothing.
+pub fn bind_from(
+    server: &mut Server,
+    new: bool,
+    label: u64,
+    who: &WhoReply,
+) -> Result<(), proto_wire::Status> {
+    let Some(vouched) = vouched_from(who) else {
+        return Err(proto_wire::Status::Unknown(proto_data::ACCESS));
+    };
+    if new {
+        server.bind_new(label, vouched)
+    } else {
+        server.bind(label, vouched)
     }
 }
 
@@ -66,7 +90,7 @@ pub fn before_job(
     if refresh(stored.generation, generation(stored.index)) == Refresh::Stands {
         return Looked::Stands;
     }
-    let renewed = revouch(&stored, ask().map(|who| vouched_from(&who)));
+    let renewed = revouch(&stored, ask().and_then(|who| vouched_from(&who)));
     server.set_binding(label, renewed);
     match renewed {
         Binding::Bound(_) => Looked::Renewed,
@@ -151,7 +175,7 @@ mod tests {
 
     #[test]
     fn an_answer_becomes_an_identity_with_the_groups_the_limit_and_the_root() {
-        let v = vouched_from(&who(10, 3, 9, 1000));
+        let v = vouched_from(&who(10, 3, 9, 1000)).unwrap();
         assert_eq!(
             (v.pid, v.index, v.generation, v.euid, v.egid),
             (10, 3, 9, 1000, 100)
@@ -166,7 +190,7 @@ mod tests {
     fn a_stored_generation_that_stands_makes_no_call_and_a_moved_one_asks_once() {
         let (mut server, _fs) = rig();
         server
-            .bind_new(40, vouched_from(&who(10, 3, 9, 1000)))
+            .bind_new(40, vouched_from(&who(10, 3, 9, 1000)).unwrap())
             .unwrap();
         let asked = Cell::new(0);
         let page = Cell::new(9u64);
@@ -196,11 +220,48 @@ mod tests {
         assert_eq!(asked.get(), 1);
     }
 
+    fn loader_answer() -> WhoReply {
+        let mut w = who(10, 3, 9, 0);
+        w.loader = Some(proto_process::LoaderOf {
+            image: 1,
+            ticket: 2,
+        });
+        w
+    }
+
+    #[test]
+    fn an_answer_about_a_loader_binds_nothing() {
+        let (mut server, _fs) = rig();
+        assert!(vouched_from(&loader_answer()).is_none());
+        let refused = Err(proto_wire::Status::Unknown(p::ACCESS));
+        assert_eq!(bind_from(&mut server, true, 60, &loader_answer()), refused);
+        assert_eq!(bind_from(&mut server, false, 61, &loader_answer()), refused);
+        assert!(!matches!(server.binding_of(60), Some(Binding::Bound(_))));
+        assert!(!matches!(server.binding_of(61), Some(Binding::Bound(_))));
+        // The same record as an ordinary process binds.
+        assert_eq!(
+            bind_from(&mut server, false, 61, &who(10, 3, 9, 1000)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_loader_answer_before_a_job_unbinds_the_session() {
+        let (mut server, _fs) = rig();
+        server
+            .bind_new(62, vouched_from(&who(10, 3, 9, 1000)).unwrap())
+            .unwrap();
+        // The generation moved and Vouch answers for the loader of the same record: no renewal.
+        let looked = before_job(&mut server, 62, |_| 10, || Some(loader_answer()));
+        assert_eq!(looked, Looked::Lapsed);
+        assert!(!matches!(server.binding_of(62), Some(Binding::Bound(_))));
+    }
+
     #[test]
     fn an_answer_for_another_process_or_none_unbinds_the_session() {
         let (mut server, _fs) = rig();
         server
-            .bind_new(41, vouched_from(&who(10, 3, 9, 1000)))
+            .bind_new(41, vouched_from(&who(10, 3, 9, 1000)).unwrap())
             .unwrap();
         let moved = |s: &mut Server, a: Option<WhoReply>| before_job(s, 41, |_| 99, || a);
         // The record at that place is another process's now (the process executed a new image, or
@@ -213,7 +274,7 @@ mod tests {
         // The unbound session is not asked about again; a session of a native client never is.
         assert_eq!(moved(&mut server, None), Looked::Nothing);
         server
-            .bind_new(42, vouched_from(&who(12, 4, 1, 1000)))
+            .bind_new(42, vouched_from(&who(12, 4, 1, 1000)).unwrap())
             .unwrap();
         assert_eq!(before_job(&mut server, 42, |_| 2, || None), Looked::Lapsed);
         assert_eq!(
@@ -235,7 +296,7 @@ mod tests {
         let _ = h;
         // A process of user 1000 binds a session; its stat is refused.
         server
-            .bind_new(50, vouched_from(&who(20, 6, 1, 1000)))
+            .bind_new(50, vouched_from(&who(20, 6, 1, 1000)).unwrap())
             .unwrap();
         let stat = |server: &mut Server, fs: &mut Fs<'static, MemDevice>| {
             call(server, fs, 50, |w| {
@@ -271,7 +332,7 @@ mod tests {
         const ROOT: u64 = p::SERVICE | 1;
         call(&mut server, &mut fs, ROOT, |w| p::mkdir(b"/d", 0o777, w)).unwrap();
         server
-            .bind_new(70, vouched_from(&who(30, 7, 1, 1000)))
+            .bind_new(70, vouched_from(&who(30, 7, 1, 1000)).unwrap())
             .unwrap();
         let h = call(&mut server, &mut fs, 70, |w| {
             p::open(b"/d/f", p::READ | p::WRITE | p::CREATE, 0o644, w)
@@ -300,7 +361,9 @@ mod tests {
             Some(p::code(p::NOT_BOUND))
         );
         // The new image binds again with its own copy.
-        server.bind(70, vouched_from(&who(30, 7, 2, 1000))).unwrap();
+        server
+            .bind(70, vouched_from(&who(30, 7, 2, 1000)).unwrap())
+            .unwrap();
         assert!(call(&mut server, &mut fs, 70, |w| p::write(h, b"x", w)).is_ok());
     }
 }
