@@ -524,6 +524,10 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     steps.push(step("host", "licences", &[RELIBC], || {
         super::run_cmd(Command::new("python3").arg(super::root().join("tools/check-licenses.py")))
     }));
+    // The tree of third-party/littlefs is the release plus the change its STAFETO-CHANGES.md states.
+    steps.push(step("host", "littlefs sources", &[], || {
+        super::run_cmd(Command::new("python3").arg(super::root().join("tools/check-littlefs.py")))
+    }));
     steps.push(step(
         "host",
         "no transport-probe feature",

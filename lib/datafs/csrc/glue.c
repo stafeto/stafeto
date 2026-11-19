@@ -483,3 +483,51 @@ int datafs_removeattr(struct datafs *d, void *ctx, const char *path, uint8_t typ
     d->ctx = ctx;
     return lfs_removeattr(&d->lfs, path, type);
 }
+
+// The entries of a directory with the attribute `attr` of each, and the status of a path with its
+// attribute, from the two functions of the change to littlefs (third-party/littlefs/STAFETO-CHANGES.md).
+
+// As datafs_readdir, and for an entry the user attribute `attr` of the entry: its size in
+// *attr_res (LFS_ERR_NOATTR when there is none, always for "." and ".."), the bytes in `buffer`
+// (at most `bufsize`).
+int datafs_readdir_attr(struct datafs *d, void *ctx, int slot, uint8_t *type, uint32_t *size,
+                        char *name, uint8_t attr, void *buffer, uint32_t bufsize,
+                        int32_t *attr_res)
+{
+    struct lfs_info info;
+    lfs_ssize_t found = LFS_ERR_NOATTR;
+    d->ctx = ctx;
+    if (!dir_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    int res = lfs_dir_read_attr(&d->lfs, &d->dir[slot], &info, attr, buffer, bufsize, &found);
+    if (res > 0) {
+        *type = info.type;
+        *size = info.size;
+        for (size_t i = 0; i <= LFS_NAME_MAX; i++) {
+            name[i] = info.name[i];
+        }
+        *attr_res = (int32_t)found;
+    }
+    return res;
+}
+
+// As datafs_stat, and the user attribute `attr` of the entry as datafs_readdir_attr gives it.
+int datafs_stat_attr(struct datafs *d, void *ctx, const char *path, uint8_t *type, uint32_t *size,
+                     char *name, uint8_t attr, void *buffer, uint32_t bufsize, int32_t *attr_res)
+{
+    struct lfs_info info;
+    lfs_ssize_t found = LFS_ERR_NOATTR;
+    d->ctx = ctx;
+    int err = lfs_stat_attr(&d->lfs, path, &info, attr, buffer, bufsize, &found);
+    if (err < 0) {
+        return err;
+    }
+    *type = info.type;
+    *size = info.size;
+    for (size_t i = 0; i <= LFS_NAME_MAX; i++) {
+        name[i] = info.name[i];
+    }
+    *attr_res = (int32_t)found;
+    return 0;
+}
