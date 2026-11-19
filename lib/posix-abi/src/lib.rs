@@ -73,6 +73,8 @@ pub mod timers;
 pub mod tls;
 pub mod tracing;
 pub mod wait;
+#[cfg(feature = "window")]
+pub mod window;
 
 use constants::*;
 use core::ffi::{c_char, c_int};

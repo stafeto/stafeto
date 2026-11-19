@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! The C functions of the windows of the composition service
+//! (`<stafeto/window.h>`, `lib/posix-crt/window/stafeto/window.h`), behind
+//! the feature `window`: a statically linked program turns it on, and
+//! libc.so is built without it. Each is the layer's call
+//! (`posix_abi::window`) with the errno set as C expects: 0, a count or
+//! the window's number, or -1 with errno. The layouts of the structures are
+//! `comp_client::layout`, which holds the same assertions as the header.
+
+use comp_client::layout::{Rect, Screen, Window, WindowEvent};
+use core::ffi::c_int;
+use posix_abi::constants::EINVAL;
+use posix_abi::window;
+
+unsafe extern "C" {
+    fn __errno_location() -> *mut c_int;
+}
+
+fn fail(errno: i32) -> c_int {
+    // SAFETY: relibc's errno of this thread.
+    unsafe { *__errno_location() = errno };
+    -1
+}
+
+/// Describes the screen.
+///
+/// # Safety
+/// `s` is null or points to a writable `struct stafeto_screen`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_screen_describe(s: *mut Screen) -> c_int {
+    if s.is_null() {
+        return fail(EINVAL);
+    }
+    match window::screen() {
+        Ok(screen) => {
+            // SAFETY: the caller's pointer, checked for null.
+            unsafe { s.write(screen) };
+            0
+        }
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Makes the window and describes it in `*out`: the window's number.
+///
+/// # Safety
+/// `out` is null or points to a writable `struct stafeto_window`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_window_open(
+    x: c_int,
+    y: c_int,
+    w: c_int,
+    h: c_int,
+    format: u32,
+    buffers: u32,
+    flags: u32,
+    out: *mut Window,
+) -> c_int {
+    if out.is_null() {
+        return fail(EINVAL);
+    }
+    match window::open(x, y, w, h, format, buffers, flags) {
+        Ok(opened) => {
+            // SAFETY: the caller's pointer, checked for null.
+            unsafe { out.write(opened) };
+            0
+        }
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Posts `buffer` with the `count` rectangles `r` (none: the whole window).
+///
+/// # Safety
+/// `r` is null or points to `count` `struct stafeto_rect`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_window_post(
+    win: c_int,
+    buffer: u32,
+    r: *const Rect,
+    count: u32,
+) -> c_int {
+    let rects: &[Rect] = if count == 0 {
+        &[]
+    } else if r.is_null() {
+        return fail(EINVAL);
+    } else {
+        // SAFETY: the caller gives `count` rectangles.
+        unsafe { core::slice::from_raw_parts(r, count as usize) }
+    };
+    match window::post(win, buffer, rects) {
+        Ok(()) => 0,
+        Err(errno) => fail(errno),
+    }
+}
+
+/// The buffers the library counts free, as a mask.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_window_free_buffers(win: c_int) -> u32 {
+    window::free(win)
+}
+
+/// Waits for a bit of the service; `*bits` (null allowed) gets the bits.
+///
+/// # Safety
+/// `bits` is null or points to a writable `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_window_wait(win: c_int, timeout_ns: u64, bits: *mut u32) -> c_int {
+    match window::wait(win, timeout_ns) {
+        Ok(got) => {
+            if !bits.is_null() {
+                // SAFETY: the caller's pointer, checked for null.
+                unsafe { bits.write(got) };
+            }
+            0
+        }
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Takes up to `max` events without waiting: the count.
+///
+/// # Safety
+/// `e` is null or points to room for `max` events, `flags` is null or
+/// points to a writable `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_window_events(
+    win: c_int,
+    e: *mut WindowEvent,
+    max: c_int,
+    flags: *mut u32,
+) -> c_int {
+    if e.is_null() || max <= 0 {
+        return fail(EINVAL);
+    }
+    // SAFETY: the caller gives room for `max` events.
+    let out = unsafe { core::slice::from_raw_parts_mut(e, max as usize) };
+    match window::events(win, out) {
+        Ok((count, lost)) => {
+            if !flags.is_null() {
+                // SAFETY: the caller's pointer, checked for null.
+                unsafe { flags.write(lost) };
+            }
+            count as c_int
+        }
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Waits until the frame of the last post is on the screen.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_window_shown(win: c_int, timeout_ns: u64) -> c_int {
+    match window::shown(win, timeout_ns) {
+        Ok(()) => 0,
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Closes the window.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_window_close(win: c_int) -> c_int {
+    match window::close(win) {
+        Ok(()) => 0,
+        Err(errno) => fail(errno),
+    }
+}

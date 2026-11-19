@@ -100,7 +100,10 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 name = "comp-client"
 version = "0.1.0"
 dependencies = [
+ "abi",
  "proto-comp",
+ "proto-gpu",
+ "proto-wire",
 ]
 
 [[package]]
@@ -768,6 +771,7 @@ dependencies = [
 name = "posix-abi"
 version = "0.1.0"
 dependencies = [
+ "comp-client",
  "entries",
  "posix-change",
  "posix-clock",
@@ -786,6 +790,7 @@ dependencies = [
  "posix-types",
  "process-client",
  "proto-clock",
+ "proto-comp",
  "proto-entropy",
  "proto-fs",
  "proto-gpu",
@@ -868,6 +873,7 @@ dependencies = [
 name = "posix-crt"
 version = "0.1.0"
 dependencies = [
+ "comp-client",
  "entries",
  "posix-abi",
  "posix-fs",

@@ -11,4 +11,7 @@ description = "The client side of the composition service's windows of the secon
 bench = false
 
 [dependencies]
+abi = { path = "../abi" }
 proto-comp = { path = "../../proto/comp" }
+proto-gpu = { path = "../../proto/gpu" }
+proto-wire = { path = "../../proto/wire" }
