@@ -5,7 +5,7 @@
 # data volume (`cargo xtask open-posix --data`: TMPDIR is /data/tmp, a directory of the data file
 # service): the file-related sections fsync, aio_*, lio_listio, mmap and munmap, 111 tests that all
 # pass on the RAM file service. The run fails when one of these does not pass. The first run on a
-# guest gives the exact list; a test that starts to pass joins it. Sorted.
+# guest gave the list (the five tests of mmap that pass there, which do not map the file shared, joined it); a test that starts to pass joins it. Sorted.
 conformance/interfaces/aio_cancel/1-1
 conformance/interfaces/aio_cancel/10-1
 conformance/interfaces/aio_cancel/2-1
@@ -75,6 +75,7 @@ conformance/interfaces/lio_listio/7-1
 conformance/interfaces/lio_listio/8-1
 conformance/interfaces/lio_listio/9-1
 conformance/interfaces/mmap/1-2
+conformance/interfaces/mmap/11-1
 conformance/interfaces/mmap/11-3
 conformance/interfaces/mmap/11-5
 conformance/interfaces/mmap/16-1
@@ -82,13 +83,17 @@ conformance/interfaces/mmap/17-1
 conformance/interfaces/mmap/18-1
 conformance/interfaces/mmap/19-1
 conformance/interfaces/mmap/20-1
+conformance/interfaces/mmap/21-1
 conformance/interfaces/mmap/23-1
 conformance/interfaces/mmap/24-1
 conformance/interfaces/mmap/24-2
+conformance/interfaces/mmap/32-1
 conformance/interfaces/mmap/6-5
 conformance/interfaces/mmap/6-6
+conformance/interfaces/mmap/7-2
 conformance/interfaces/mmap/7-3
 conformance/interfaces/mmap/7-4
+conformance/interfaces/mmap/9-1
 conformance/interfaces/munmap/10-1
 conformance/interfaces/munmap/4-1
 conformance/interfaces/munmap/7-1

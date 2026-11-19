@@ -1,33 +1,28 @@
 # Tests of the Open POSIX Test Suite that do not pass on the data volume by design in 0.6.0
 # (`cargo xtask open-posix --data`), and why: name, outcome, reason. The outcome is the suite's own
-# (FAIL, UNRESOLVED, UNSUPPORTED) or ANY for the first run to tell: anything but PASS. A test of this
+# (FAIL, UNRESOLVED, UNSUPPORTED), as the first run on the guest gave it (ANY would mean anything but PASS). A test of this
 # list that passes is reported and does not fail the run. The list is documentation of the
 # departures of docs/posix-coverage.md.
 #
 # A shared mapping (MAP_SHARED) of a file of the volume is ENODEV: the pages of the layer are filled
 # by reads and written back through the RAM file service's pin alone, so a test that maps its
 # scratch file shared fails by design until a later release gives the data service a pin.
-conformance/interfaces/mmap/1-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/11-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/11-2 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/11-4 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/11-6 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/12-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/13-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/14-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/21-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/27-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/3-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/32-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/5-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/6-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/6-2 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/6-3 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/6-4 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/7-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/7-2 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/mmap/9-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/munmap/1-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/munmap/1-2 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/munmap/3-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
-conformance/interfaces/munmap/9-1 ANY MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/1-1 FAIL MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/11-2 FAIL MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/11-4 FAIL MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/11-6 FAIL MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/12-1 FAIL MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/13-1 FAIL MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/14-1 FAIL MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/27-1 UNRESOLVED MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/3-1 FAIL MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/5-1 FAIL MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/6-1 UNRESOLVED MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/6-2 UNRESOLVED MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/6-3 UNRESOLVED MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/6-4 FAIL MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/mmap/7-1 FAIL MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/munmap/1-1 UNRESOLVED MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/munmap/1-2 UNRESOLVED MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/munmap/3-1 UNRESOLVED MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
+conformance/interfaces/munmap/9-1 UNRESOLVED MAP_SHARED of a file of the volume is ENODEV (docs/posix-coverage.md).
