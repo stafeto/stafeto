@@ -107,6 +107,10 @@ pub enum Fire {
     Take(u64),
     /// Go on with the bands a cap put off.
     Continue,
+    /// The expiry came before the time the timer is armed for (the kernel
+    /// delivers the expiry of an earlier deadline that `timer_set` has moved
+    /// since): nothing is done, the timer stays armed, and no wakeup is counted.
+    Early,
 }
 
 /// What the caller does after a band.
@@ -186,7 +190,13 @@ impl Pacer {
     /// A change came at `now` (a post, a flush, a window that went, the
     /// manager), that a window may have it taken `not_before` a period only
     /// (its interval): it waits for the first start at or after both. The
-    /// timer is armed for it when no frame is in work.
+    /// pacer keeps one `pending` for the whole service, the least of the starts
+    /// its changes are owed, so `not_before` is the earliest start for the
+    /// window that gave it and says nothing of the others: a taking that
+    /// another window's change brings on can come before it, and the frame
+    /// then leaves that window's buffer posted (`Scene::begin` takes only the
+    /// windows `Pace::due`) and the caller says `hold` with the start it is due.
+    /// The timer is armed for it when no frame is in work.
     pub fn change(&mut self, now: u64, not_before: Option<u64>) -> Wake {
         if self.free() {
             self.pending = Some(0);
@@ -223,6 +233,11 @@ impl Pacer {
 
     /// The timer fired at `now`.
     pub fn fire(&mut self, now: u64) -> Fire {
+        if let Some(at) = self.armed
+            && now < at
+        {
+            return Fire::Early;
+        }
         self.armed = None;
         self.counters.wakeups += 1;
         if self.deferred {
@@ -251,6 +266,13 @@ impl Pacer {
             committed_at: None,
         });
         Fire::Take(k)
+    }
+
+    /// A window the frame did not take (its interval says its buffer is due at
+    /// the start `due`, a later one) keeps its change: the next taking is owed
+    /// no later than that start. The timer is armed when the frame is shown.
+    pub fn hold(&mut self, due: u64) {
+        self.pending = Some(self.pending.map_or(due, |p| p.min(due)));
     }
 
     /// In the free run a frame begins at `now` (nothing waited for a start).
@@ -485,6 +507,35 @@ impl Pace {
         true
     }
 
+    /// The first period the window's next buffer may be taken in: the start it
+    /// is awaited at, for a window with an interval that was taken; None
+    /// when it may be taken at any start.
+    pub const fn earliest(&self) -> Option<u64> {
+        if self.interval == 0 {
+            None
+        } else {
+            self.expected
+        }
+    }
+
+    /// Whether a buffer of the window may be taken at the start of period `k`.
+    pub const fn due(&self, k: u64) -> bool {
+        match self.earliest() {
+            Some(e) => k >= e,
+            None => true,
+        }
+    }
+
+    /// RESET: the counts start again; the interval and the start the window is
+    /// awaited at stay.
+    pub fn reset_counts(&mut self) {
+        *self = Pace {
+            interval: self.interval,
+            expected: self.expected,
+            ..Pace::new()
+        };
+    }
+
     /// The window's counters as STATS' record of window `id`.
     pub fn record(&self, id: u32) -> WindowStats {
         WindowStats {
@@ -555,19 +606,15 @@ impl Pace {
 /// `I(w) = floor(w/t) c + min(w mod t, c) + step + 2 e ceil(w/t)`: the whole
 /// budgets of the periods that began, a part of the last, one step of the
 /// service that has it (`step`, the longest of its steps) and the events of
-/// the budget, `e` ticks each, two for each period. None when the shares sum
-/// to 1 or more (no bound), or when the iteration does not settle within
-/// `limit` ticks.
+/// the budget, `e` ticks each, two for each period. None when the iteration
+/// does not settle within `limit` ticks, which is the case for shares that sum
+/// to 1 or more.
 pub fn bound(own: u64, sources: &[Source], e: u64, limit: u64) -> Option<u64> {
-    let share: f64 = sources
-        .iter()
-        .map(|s| s.budget as f64 / s.period as f64)
-        .sum();
-    if share >= 1.0 {
-        return None;
-    }
     let mut w = own;
-    loop {
+    // A sum of shares of 1 or more never settles: the value passes the limit
+    // (or the rounds run out) and there is no bound. A sum a little under 1
+    // settles slowly, which the rounds allow for.
+    for _ in 0..1_000_000 {
         let mut next = own;
         for s in sources {
             let periods = w / s.period;
@@ -582,6 +629,7 @@ pub fn bound(own: u64, sources: &[Source], e: u64, limit: u64) -> Option<u64> {
         }
         w = next;
     }
+    None
 }
 
 /// A source of interference above the service: a budget of `budget` ticks
@@ -915,6 +963,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_stale_expiry_before_the_armed_time_does_nothing() {
+        let mut p = pacer();
+        let c = *p.clock();
+        assert_eq!(p.change(c.start(2) - 500, None), Wake::At(c.start(2)));
+        // An expiry delivered for an earlier deadline: nothing is taken, the
+        // timer stays armed, and no wakeup is counted.
+        assert_eq!(p.fire(c.start(2) - 1), Fire::Early);
+        assert!(p.armed() && !p.busy());
+        assert_eq!(p.counters.wakeups, 0);
+        assert_eq!(p.fire(c.start(2)), Fire::Take(2));
+        assert_eq!(p.counters.wakeups, 1);
+        // The same for bands put off by the cap.
+        for n in 1..=51 {
+            p.band_done(c.start(2) + n, 1, true);
+        }
+        assert_eq!(
+            p.band_done(c.start(2) + 60, 1, true),
+            Band::Defer(c.start(3))
+        );
+        assert_eq!(p.fire(c.start(3) - 1), Fire::Early);
+        assert!(p.armed());
+        assert_eq!(p.fire(c.start(3)), Fire::Continue);
+        assert_eq!(p.counters.wakeups, 2);
+    }
+
+    /// A window of interval 2 waits for its start e while another window's
+    /// change brings a taking at k < e: the frame leaves it, `hold` keeps the
+    /// pacer owing it, and the next taking is at e with no new post.
+    #[test]
+    fn a_window_held_by_its_interval_is_taken_at_its_start_without_a_new_post() {
+        let mut p = Pacer::new(0, 1_000, 52);
+        let c = *p.clock();
+        let mut a = Pace::new();
+        let mut b = Pace::new();
+        assert!(b.set_interval(2));
+        b.took(3); // awaited at 5
+        assert_eq!(b.earliest(), Some(5));
+        // B posts in period 4: its buffer waits for 5.
+        let not_before = b.posted(&c, 4_200, false);
+        assert_eq!(not_before, Some(5));
+        assert_eq!(p.change(4_200, not_before), Wake::At(5_000));
+        // A posts in period 3: the nearest start is 4.
+        a.posted(&c, 3_500, false);
+        assert_eq!(p.change(3_500, None), Wake::At(4_000));
+        assert_eq!(p.fire(4_000), Fire::Take(4));
+        // The frame takes A and not B, which is not due; the pacer owes it 5.
+        assert!(a.due(4) && !b.due(4));
+        a.took(4);
+        p.hold(b.earliest().unwrap());
+        assert_eq!(p.shown(4_300, true, false), Wake::At(5_000));
+        assert_eq!(p.fire(5_000), Fire::Take(5));
+        assert!(b.due(5));
+        b.took(5);
+        assert_eq!(b.taken, 2);
+        assert_eq!(p.counters.skipped, 0);
+        assert_eq!(p.shown(5_200, true, false), Wake::None);
+    }
+
+    #[test]
+    fn a_reset_clears_the_counts_of_a_window_and_keeps_its_interval_and_awaited_start() {
+        let c = clock();
+        let mut w = taken_at(2, 3);
+        w.posted(&c, 4_500, true);
+        w.posted(&c, 4_600, false);
+        assert!(w.posts > 0 && w.taken > 0 && w.replaced > 0);
+        w.settle(&c, 9_000);
+        assert_eq!(w.missed, 1);
+        let kept = w.earliest();
+        w.reset_counts();
+        assert_eq!(
+            (
+                w.posts,
+                w.taken,
+                w.replaced,
+                w.late,
+                w.missed,
+                w.late_max_ns
+            ),
+            (0, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(w.interval(), 2);
+        assert_eq!(w.earliest(), kept);
+        let mut v = taken_at(2, 3);
+        v.reset_counts();
+        assert_eq!((v.interval(), v.earliest()), (2, Some(5)));
+    }
+
     // ---- the bound
 
     #[test]
@@ -957,5 +1093,62 @@ mod tests {
         // The floor of the first term: a ceiling there gives more.
         let more = |w: u64| 10 * w.div_ceil(100) + (w % 100).min(10) + 5 + 2 * w.div_ceil(100);
         assert!(100 + more(w) > w);
+    }
+
+    /// The rows of the design's table of bounds (section 9 of the plan): each
+    /// source steps 18 369 ticks, the events are 1 875, the budgets are rounded
+    /// up in ticks of 62.5 MHz.
+    #[test]
+    fn the_four_rows_of_the_table_of_bounds() {
+        let step = 18_369;
+        let src = |budget, period| Source {
+            budget,
+            period,
+            step,
+        };
+        let all = [
+            src(9_375, 62_500),   // switch
+            src(4_688, 62_500),   // stack0
+            src(15_625, 312_500), // ramfs
+            src(4_688, 312_500),  // pipe
+            src(4_688, 312_500),  // tty
+            src(9_375, 625_000),  // console
+            src(6_250, 625_000),  // datafs
+        ];
+        let console = [src(9_375, 625_000)];
+        let (e, limit) = (1_875, 10_000_000);
+        // The terms: a band is 16 328, the taking 3 000, the commit and the end
+        // 2 x 18 369, the longest kernel path and a step 38 779, the display
+        // driver 13 596, the disk 2 x 18 369, the signs of life 64 000, the
+        // clients' requests 10 000.
+        let own = |bands: u64, disk: bool, requests: bool| {
+            let mut w = 3_000 + bands * 16_328 + 2 * 18_369 + 38_779 + 13_596;
+            if disk {
+                w += 2 * 18_369;
+            }
+            w += 64_000;
+            if requests {
+                w += 10_000;
+            }
+            w
+        };
+        // P: a window of 160 by 100, 7 bands at 16 lines, all the loads.
+        assert_eq!(own(7, true, true), 317_147);
+        assert_eq!(bound(317_147, &all, e, limit), Some(924_178));
+        // D: a direct frame, no band, all the loads (no taking by bands).
+        let d = 2 * 18_369 + 38_779 + 13_596 + 2 * 18_369 + 64_000 + 10_000;
+        assert_eq!(d, 199_851);
+        assert_eq!(bound(d, &all, e, limit), Some(742_193));
+        // F: the whole screen, no load: the expected 42 bands and the limit of 45.
+        assert_eq!(own(42, false, false), 841_889);
+        assert_eq!(bound(841_889, &console, e, limit), Some(886_508));
+        assert_eq!(own(45, false, false), 890_873);
+        assert_eq!(bound(890_873, &console, e, limit), Some(935_492));
+        // The network's budgets of the tables (60 percent of the CPU) leave no
+        // bound inside a period.
+        let net = [src(25_000, 62_500), src(12_500, 62_500)];
+        let mut sources = net.to_vec();
+        sources.extend_from_slice(&all[2..]);
+        assert!(bound(317_147, &sources, e, limit).is_none_or(|w| w > 1_041_667));
     }
 }
