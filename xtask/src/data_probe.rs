@@ -187,20 +187,34 @@ fn datafs_line(lines: &[String], prefix: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The line of the first walk of the volume (`datafs: first walk N blocks used, M reads, T ms`, or
-/// that a request or the mount work made it), which the worker prints once after READY, when its queue
-/// is empty (a walk that a request stopped is tried again and prints its line when it ends). The
-/// lines of the services come glued to the lines of a step under -icount, so the text is looked for
-/// inside the line. Returns the text from `first walk` on.
-pub(crate) fn first_walk(lines: &[String], what: &str) -> Result<String, String> {
+/// The line of the first walk of the volume, if the run has it (`datafs: first walk N blocks used,
+/// M reads, T ms`, or that a request or the mount work made it). The worker walks after the queue
+/// has been empty for 2 s (`datafs::idle::QUIET_NS`), and the probes end within seconds of READY, so
+/// a run may end before the walk starts: no probe requires the line, and each checks what a run
+/// does show. At most one line of the first walk, none that says it failed, and no more than
+/// `MAX_YIELDS` lines of a walk stopped for a request. The lines of the services come glued to the
+/// lines of a step under -icount, so the text is looked for inside the line. Returns the text from
+/// `first walk` on when it is there.
+pub(crate) fn first_walk(lines: &[String], what: &str) -> Result<Option<String>, String> {
     let said: Vec<&str> = lines
         .iter()
         .filter_map(|l| l.find("datafs: first walk ").map(|at| &l[at..]))
         .collect();
+    let stopped = lines
+        .iter()
+        .filter(|l| l.contains("datafs: walk stopped for a request"))
+        .count();
+    if stopped > 3 {
+        return Err(format!(
+            "data-probe ({what}): {stopped} walks stopped for a request, three tries at most"
+        ));
+    }
     match said.as_slice() {
-        [one] => Ok((*one).to_owned()),
+        [] => Ok(None),
+        [one] if one.contains("failed") => Err(format!("data-probe ({what}): {one}")),
+        [one] => Ok(Some((*one).to_owned())),
         other => Err(format!(
-            "data-probe ({what}): {} lines of the first walk, one expected: {other:?}",
+            "data-probe ({what}): {} lines of the first walk, one at most: {other:?}",
             other.len()
         )),
     }
@@ -251,7 +265,13 @@ pub fn probe() -> Result<(), String> {
         return Err("data-probe (verifying): the service did not only mount the volume".into());
     }
     let walk_verifying = first_walk(&lines, "verifying")?;
-    println!("data-probe: {walk_writing} (writing), {walk_verifying} (verifying)");
+    let said =
+        |w: Option<String>| w.unwrap_or_else(|| "no line of the first walk before the end".into());
+    println!(
+        "data-probe: {} (writing), {} (verifying)",
+        said(walk_writing),
+        said(walk_verifying)
+    );
     let rows = steps_verdict(&written, &lines)?;
     println!("data-probe: steps of the request loop (kind, ticks, whole step): {rows:?}");
     println!(
