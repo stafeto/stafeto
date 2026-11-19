@@ -310,6 +310,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("posix-display", 20),
     ("posix-window", 25),
     ("display-probe", 25),
+    ("lvgl-probe", 40),
 ];
 const DEFAULT_WEIGHT: u32 = 20;
 

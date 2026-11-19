@@ -83,6 +83,7 @@ mod kernel_size;
 mod keys;
 mod layer_probe;
 mod linux_guest;
+mod lvgl;
 mod lvgl_image;
 #[cfg(test)]
 mod lvgl_scenario;
@@ -2318,6 +2319,15 @@ commands:
             QEMU's tablet, then the window manager program with a native client and one of
             the first revision (the chord, the keys, the manager's end), and the steps of
             the services under -icount; with --hvf under HVF
+  lvgl-probe [--hvf] run the probe of the LVGL demo in QEMU: the demo's first frame and the frame after
+            the scenario of 22 injected events, each compared three ways: the CRC-32 the demo prints,
+            the CRC-32 of QEMU's screenshot and the CRC-32 the reference program on the host
+            (target/lvgl-host/lvgl-ref) draws; and the state line, the turns, the frames, the glyph
+            evidence, the CRC of each band of 16 rows, the events taken by kind with none lost and
+            the largest use of LVGL's pool; then, on QEMU's own emulation, the same under -icount with
+            the longest steps of the compositor, the display driver and the tablet's driver
+  lvgl [--machine hvf] run the LVGL demo by hand: QEMU with the window of the screen (cocoa on a Mac)
+            and the console on the terminal; at the prompt of ash type `lvgl-demo`, click its widgets
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
@@ -2794,6 +2804,15 @@ fn main() {
             }),
             Some(_) => Err("focus-probe [--hvf]".to_owned()),
         },
+        Some("lvgl-probe") => match args.get(1).map(String::as_str) {
+            None => lvgl::probe(&qemu::VIRT),
+            Some("--hvf") => hvf_host().and_then(|()| {
+                lvgl::probe(&qemu::HVF_V3)?;
+                lvgl::probe(&qemu::HVF_V2)
+            }),
+            Some(_) => Err("lvgl-probe [--hvf]".to_owned()),
+        },
+        Some("lvgl") => lvgl::window(&args[1..]),
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -10744,6 +10763,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // the steps of the compositor and of the tablet's driver under
         // -icount.
         job("focus-probe", || focus_probe::probe(&qemu::VIRT)),
+        // The LVGL demo with FreeType text in a window of the second
+        // revision: its two frames against QEMU's screenshots and the host
+        // reference program's CRCs, the evidence of the glyph path, and the
+        // steps of the services under -icount.
+        job("lvgl-probe", || lvgl::probe(&qemu::VIRT)),
         // The input service on virtio-input: keys from the monitor reach
         // the focus, then its steps under -icount.
         job("input-probe", || input_probe::probe(&qemu::VIRT)),
