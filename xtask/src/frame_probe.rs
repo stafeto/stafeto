@@ -53,9 +53,9 @@ const LIMIT: u64 = 10_000_000;
 const FULL_BANDS_MAX: u64 = 45;
 /// The bands of a window of 160 by 100 at 16 rows a band.
 const P_BANDS: u64 = 7;
-/// The frames of a phase of 240 periods: the reset of the counters and the read
-/// at the end leave a few at the edges.
-const FRAMES_MIN: u64 = 236;
+/// The frames of a phase of 240 periods: the counters start 50 ms after the
+/// phase starts and are read 5 ms before it ends, which leaves about 237.
+const FRAMES_MIN: u64 = 230;
 const FRAMES_MAX: u64 = 242;
 /// The share of a period the service may use at most (52 bands under the
 /// cap, 849 056 ticks of 1 041 667): the CPU the levels below it can count on

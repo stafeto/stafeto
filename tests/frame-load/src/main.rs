@@ -56,6 +56,10 @@ const MAP_STEP: usize = 0x100_0000;
 const RETRY_NS: u64 = 5_000_000;
 /// The lateness of a wake-up at a phase start that fails the run.
 const WAKE_LATE_NS: u64 = 100_000_000;
+/// The counters of a phase start this long after its start and are read this
+/// long before its end.
+const SETTLE_NS: u64 = 50_000_000;
+const READ_BEFORE_END_NS: u64 = 5_000_000;
 const WAIT_NS: u64 = 60_000_000_000;
 /// How long after the last phase the conductor says `done`.
 const DONE_AFTER_NS: u64 = 2_000_000_000;
@@ -221,10 +225,13 @@ impl Env<'_> {
         for phase in ORDER {
             self.sleep_until(self.schedule.start_of(phase));
             self.woke_in_time("ctl", phase)?;
-            // The counters start again with the phase.
+            // The window of the scene of the phase is made in its first moments
+            // (the one of the phase before goes at the boundary), so the counters
+            // start after them and are read before the boundary.
+            self.sleep_until(self.schedule.start_of(phase) + SETTLE_NS);
             Self::stats(&display, true)?;
             let before = Self::describe(&display).map_err(say("DESCRIBE"))?;
-            self.sleep_until(self.schedule.end_of(phase));
+            self.sleep_until(self.schedule.end_of(phase) - READ_BEFORE_END_NS);
             let after = Self::describe(&display).map_err(say("DESCRIBE"))?;
             let reply = Self::stats(&display, false)?;
             let s = &reply.stats;
@@ -387,6 +394,9 @@ impl Env<'_> {
         self.on_time("draw")?;
         let (objects, at) = self.objects()?;
         let mut open: Option<(Scene, Handle<Channel>)> = None;
+        // The buffers the service has given back: both in a new window, and
+        // kept from phase to phase while the window stays.
+        let mut free: u64 = 0b11;
         for phase in ORDER {
             let scene = phase.scene();
             self.sleep_until(self.schedule.start_of(phase));
@@ -400,14 +410,12 @@ impl Env<'_> {
                 // The window of the scene before closes first.
                 drop(open.take());
                 self.bits.set(0);
+                free = 0b11;
                 open = Some((scene, self.window(&display, rect, &objects)?));
             }
             let Some((_, session)) = &open else {
                 continue;
             };
-            // Both buffers are free in a new window.
-            let mut free: u64 = 0b11;
-            self.bits.set(0);
             let (mut posts, mut idle, mut step) = (0u32, 0u32, 0u64);
             let end = self.schedule.end_of(phase);
             let t0 = self.schedule.start_of(phase);
@@ -505,7 +513,12 @@ impl Env<'_> {
             .map_err(say("map the buffer"))?;
             let mut flushes = 0u32;
             let finish = self.schedule.end_of(phase);
+            let t0 = self.schedule.start_of(phase);
             while now() < finish {
+                // One flush a period: a client of 60 Hz, which is the pace of the
+                // service with a clock and the pace this loop keeps on a service
+                // that shows a frame as soon as it can.
+                self.sleep_until(t0 + u64::from(flushes) * PERIOD_NS);
                 // SAFETY: mapped for reading and writing above; one thread.
                 let points = unsafe {
                     core::slice::from_raw_parts_mut(
@@ -523,7 +536,6 @@ impl Env<'_> {
                 proto_gpu::Rect::SCREEN
                     .write(&mut w)
                     .map_err(say("FLUSH's bytes"))?;
-                // The reply comes once the frame is shown, which paces the loop.
                 sys::send(&owner, w.as_bytes()).map_err(say("FLUSH"))?;
                 flushes += 1;
             }
