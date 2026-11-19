@@ -632,8 +632,15 @@ impl Probe<'_> {
 
     /// A client: a window, its picture, and the list of its events.
     fn client(self, second: bool) -> Result<(), &'static str> {
+        // In the run under -icount (quick) the first window is ARGB8888 with every
+        // point opaque (the same picture), so that the seven windows of the many
+        // windows over it make eight translucent layers over one place, as the
+        // overload of the frame probe does.
+        let quick = cfg!(feature = "quick");
         let (name, rect, format) = if second {
             ("b", B, FORMAT_ARGB8888)
+        } else if quick {
+            ("a", A, FORMAT_ARGB8888)
         } else {
             ("a", A, FORMAT_XRGB8888)
         };
@@ -670,7 +677,13 @@ impl Probe<'_> {
             .map_err(say("ATTACH"))?;
         for y in 0..rect.h {
             for x in 0..rect.w {
-                let point = if second { b_point(x, y) } else { a_point(x, y) };
+                let point = if second {
+                    b_point(x, y)
+                } else if quick {
+                    0xFF00_0000 | a_point(x, y)
+                } else {
+                    a_point(x, y)
+                };
                 // SAFETY: `buffers` mapped this object for writing at this
                 // address; the probe is the only user, in one thread.
                 unsafe {
@@ -900,9 +913,10 @@ impl Probe<'_> {
 
     /// The many windows: seven windows more over the screen's lower right,
     /// four of this context and three of a clone's (a context has four), all of
-    /// ARGB8888 and all on one place, which with the first client's make the
-    /// eight the service has: a band over that place lays seven translucent
-    /// layers (the model of a band charges each layer after the first). None has the focus while the manager runs, and the bands of
+    /// ARGB8888 and all on one place over the first client's window (ARGB8888 in
+    /// the run under -icount), which with it make the eight the service has: a
+    /// band over that place lays eight translucent layers (the model of a band
+    /// charges each layer after the first). None has the focus while the manager runs, and the bands of
     /// the frames they make stay under the bound (xtask reads the steps of the
     /// run under -icount, which is the one that has them: the other has the
     /// screenshots, and these windows are not in them).
@@ -929,8 +943,8 @@ impl Probe<'_> {
         let mut keep = [const { None }; 7];
         for k in 0..7usize {
             let rect = Rect {
-                x: 320,
-                y: 230,
+                x: A.x + 10,
+                y: A.y + 10,
                 w: 200,
                 h: 150,
             };

@@ -274,7 +274,7 @@ const FRAMES: &str = "net: frames rx ";
 const SERVICE_ENDED: &str = "init: net ended: fault";
 
 /// The tag of the service's lines of steps (rt::service::report_steps).
-const NET_TAG: &str = "14";
+pub const NET_TAG: &str = "14";
 /// The kinds of steps that must come: CONFIG (21), PING (62) and the
 /// service's own steps (65: the interrupt, the continuation and the
 /// deadline).
@@ -828,7 +828,7 @@ fn longest_named(lines: &[String], which: &str) -> u64 {
 fn epoll_set_by_batch(lines: &[String]) -> Vec<(usize, u64)> {
     let mut out: Vec<(usize, u64)> = Vec::new();
     for step in lines.iter().filter_map(|l| crate::step_line::parse(l)) {
-        let (kind, ticks, detail) = (step.kind, step.judged(), step.detail as usize);
+        let (kind, ticks, detail) = (step.kind, step.least(), step.detail as usize);
         if step.tag != NET_TAG {
             continue;
         }
@@ -876,6 +876,7 @@ fn epoll_allowed(rows: &[(usize, u64)]) -> Vec<(usize, u64)> {
 /// STEP_MAX, and a CLONE (kind 19) under PORTION_MAX when the run made one.
 pub fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
     let rows = longest_over_starts(lines);
+    crate::step_line::within_b(lines, NET_TAG, crate::step_line::Kinds::All)?;
     for (kind, name) in STEP_KINDS {
         if !rows.iter().any(|(k, ..)| *k == kind) {
             return Err(format!("the network service: no step {name}: {rows:?}"));
@@ -911,6 +912,7 @@ pub fn traffic_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, Strin
         (28, "WatchTake"),
     ];
     let rows = longest_over_starts(lines);
+    crate::step_line::within_b(lines, NET_TAG, crate::step_line::Kinds::All)?;
     for (kind, name) in KINDS {
         if !rows.iter().any(|(k, ..)| *k == kind) {
             return Err(format!("the network service: no step {name}: {rows:?}"));
@@ -1333,6 +1335,10 @@ fn acceptance(
             strict,
         )?;
         let rows = longest_over_starts(&lines);
+        if strict {
+            crate::step_line::within_b(&lines, NET_TAG, crate::step_line::Kinds::All)
+                .map_err(|e| format!("run {what}: {e}"))?;
+        }
         if what == "E" {
             epoll_run = lines;
         } else if what == "x" {
@@ -1355,6 +1361,10 @@ fn acceptance(
         strict,
     )?;
     let rows = longest_over_starts(&lines);
+    if strict {
+        crate::step_line::within_b(&lines, NET_TAG, crate::step_line::Kinds::All)
+            .map_err(|e| format!("run W: {e}"))?;
+    }
     let rows = if strict {
         steps_verdict_rows(&rows).map_err(|e| format!("run W: {e}"))?
     } else {
@@ -1982,6 +1992,8 @@ pub fn command(args: &[String]) -> Result<(), String> {
                 measured_programs(Some("net-wire-echo"), &[]),
                 true,
             )?;
+            crate::step_line::within_b(&lines, NET_TAG, crate::step_line::Kinds::All)
+                .map_err(|e| format!("run W: {e}"))?;
             let rows = steps_verdict_rows(&longest_over_starts(&lines))
                 .map_err(|e| format!("run W: {e}"))?;
             print_rows(&qemu::VIRT, "role W", &rows);

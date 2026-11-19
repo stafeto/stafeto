@@ -396,8 +396,17 @@ fn run(steps: bool) -> Result<Vec<String>, String> {
 
 /// The steps of the layer methods under -icount (tag 2 is the RAM file service).
 fn steps() -> Result<(), String> {
-    let lines = run(true)?;
-    let rows = longest_steps(&lines, "2");
+    steps_verdict(&run(true)?)
+}
+
+/// The kinds this probe bounds: the steps of the layer calls, of ReadInto beside the mapping of
+/// the big layer and of the maintenance and notifications.
+const JUDGED_KINDS: [usize; 5] = [17, 51, 53, 64, 65];
+
+/// The verdict over the lines of the run.
+fn steps_verdict(lines: &[String]) -> Result<(), String> {
+    let rows = longest_steps(lines, "2");
+    crate::step_line::within_b(lines, "2", crate::step_line::Kinds::Only(&JUDGED_KINDS))?;
     let mut worst = 0;
     for &(kind, ticks, detail) in &rows {
         let name = crate::RAM_STEP_KINDS
@@ -409,7 +418,7 @@ fn steps() -> Result<(), String> {
         // of the maintenance and notifications are the ones this probe bounds; the others
         // belong to the probes of their own, and kind 63 is the whole start of the service,
         // which the first line of the counter takes in.
-        if matches!(kind, 17 | 51 | 53 | 64 | 65) {
+        if JUDGED_KINDS.contains(&kind) {
             worst = worst.max(ticks);
             if ticks > STEP_MAX {
                 return Err(format!(
@@ -433,4 +442,32 @@ fn steps() -> Result<(), String> {
         "layer-probe steps: the worst step {worst} of 0.9 B {STEP_MAX}; layer step {portion} of 0.8 B {PORTION_MAX}"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_lines(extra: &[&str]) -> Vec<String> {
+        let mut lines: Vec<String> = [51, 53, 65]
+            .iter()
+            .map(|k| format!("service step: 2 kind {k} 9000 ticks detail 0"))
+            .collect();
+        lines.extend(extra.iter().map(|l| (*l).to_owned()));
+        lines
+    }
+
+    #[test]
+    fn the_start_of_the_service_is_exempt_from_the_hard_check() {
+        // Kind 63 is the whole start of the service, half a million ticks by design.
+        let start = run_lines(&["service step: 2 kind 63 539997 ticks detail 0 preempts 1"]);
+        assert!(steps_verdict(&start).is_ok());
+        // A judged kind past B by the least charge still fails.
+        let over = run_lines(&["service step: 2 kind 51 21000 ticks detail 0 preempts 1"]);
+        let error = steps_verdict(&over).unwrap_err();
+        assert!(
+            error.contains("kind 51") && error.contains("against B 20410"),
+            "{error}"
+        );
+    }
 }

@@ -702,6 +702,7 @@ pub fn crash(rest: &[String]) -> Result<(), String> {
 /// CLAIM, CLAIM_MORE and KICK must be among them.
 pub(crate) fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
     let rows = net_probe::longest_over_starts(lines);
+    crate::step_line::within_b(lines, net_probe::NET_TAG, crate::step_line::Kinds::All)?;
     for (kind, name) in [
         (CLAIM_KIND, "CLAIM"),
         (CLAIM_MORE_KIND, "CLAIM_MORE"),
