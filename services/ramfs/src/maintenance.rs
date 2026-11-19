@@ -88,15 +88,27 @@ pub fn orphan_progress(before: (u16, u16), after: (u16, u16)) -> bool {
     after.0 < before.0 || after.1 > before.1
 }
 
-/// The most places in use that one step of the audit visits.
-pub const AUDIT_LIVE_RUN: usize = 4;
-/// The time, in counter ticks, after which a step visits no further place in use. The cleanup
-/// of a place in use costs from about 600 ticks (nothing to do) to several thousand (a session
-/// that is authenticated, or a departure in portions), and before the map a step ended at the
-/// first place in use. A step now goes on to another place only while the places it has visited
-/// cost little, so that it is longer than a step of that kind by less than this time and the
-/// search of the map.
-pub const AUDIT_STEP_TICKS: u64 = 2_500;
+/// The most places that the map names and that hold nothing, which one step of the audit passes
+/// (each costs about 45 ticks for its exact test). A bit goes out when the audit finds its place
+/// vacant, so the places that rt freed with no word to the service (an ordinary departure)
+/// cost this once. The limit is the run of empty places that a step passed before the map.
+pub const AUDIT_STALE_RUN: usize = 160;
+/// A round whose map names at most this many places takes its steps a period of the budget
+/// apart (`AUDIT_SPARSE_STEP_NS` in the service): a step costs about 50 us with the heartbeat's
+/// chain of 120 us in the same cycle, and a few steps 1 ms apart in one period would come to most
+/// of the 250 us capacity.
+pub const AUDIT_FEW_PLACES: usize = 16;
+
+/// What the audit finds at a place that the map names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Place {
+    /// A session or a birth: the step visits it.
+    InUse,
+    /// A cell that has its own turns of cleanup (a departure): passed, its bit stays.
+    Departing,
+    /// Nothing: passed, and its bit goes out.
+    Vacant,
+}
 
 /// The places that may hold a session, a birth or a departure: a superset by meaning. A bit is
 /// set when a place is given out (a session is placed, a birth is stored) and cleared only when
@@ -122,6 +134,13 @@ impl<const WORDS: usize> Occupancy<WORDS> {
     }
     pub fn contains(&self, index: usize) -> bool {
         self.words[index / 64].get() & (1 << (index % 64)) != 0
+    }
+    /// The number of set bits.
+    pub fn count(&self) -> usize {
+        self.words
+            .iter()
+            .map(|w| w.get().count_ones() as usize)
+            .sum()
     }
     /// The first set bit in `low..=high`, by words.
     fn first_in(&self, low: usize, high: usize) -> Option<usize> {
@@ -184,38 +203,42 @@ impl Cursor {
         self.remaining = slots - 1;
         now.saturating_add(first)
     }
-    /// Whether a step of the audit goes on to another place in use, after it visited `visited`
-    /// of them, the last with the result `worked`, and has spent `spent` ticks. It stops after
-    /// progress (a place that worked is tried again in the next step, and a step that worked
-    /// ends there, as it did before the map), at the end of the round, after `AUDIT_LIVE_RUN`
-    /// places and once the visits cost `AUDIT_STEP_TICKS`.
-    pub fn step_continues(&self, visited: usize, worked: bool, spent: u64) -> bool {
-        !worked && self.remaining != 0 && visited < AUDIT_LIVE_RUN && spent < AUDIT_STEP_TICKS
-    }
     /// Moves `count` places on, all of them passed.
     fn advance(&mut self, count: usize, slots: usize) {
         self.position = 1 + (self.position - 1 + count) % (slots - 1);
         self.remaining -= count;
     }
     /// Passes the places that hold nothing, by the map of places that may hold something and
-    /// then the exact test `empty` of a place the map names, and never the last step of the
-    /// round: it stays for an ordinary step. Stops at a place in use.
+    /// then the exact test `classify` of a place the map names, and never the last step of the
+    /// round: it stays for an ordinary step. Stops at a place in use, and after `stale` places
+    /// that the map named in vain or that depart (the ordinary step then looks at the next
+    /// place). A vacant place loses its bit.
     pub fn skip_unoccupied<const WORDS: usize>(
         &mut self,
         slots: usize,
         map: &Occupancy<WORDS>,
-        empty: impl Fn(usize) -> bool,
+        stale: usize,
+        classify: impl Fn(usize) -> Place,
     ) {
+        let mut passed = 0;
         while self.remaining > 1 {
             let room = self.remaining - 1;
             let distance = map.distance(self.position, slots).unwrap_or(usize::MAX);
             let moved = distance.min(room);
             self.advance(moved, slots);
-            if moved < distance || self.remaining <= 1 || !empty(self.position) {
+            if moved < distance || self.remaining <= 1 {
                 return;
             }
-            // A set bit with nothing behind it: passed.
+            match classify(self.position) {
+                Place::InUse => return,
+                Place::Departing => {}
+                Place::Vacant => map.clear(self.position),
+            }
             self.complete(false, slots);
+            passed += 1;
+            if passed == stale {
+                return;
+            }
         }
     }
 }
@@ -728,34 +751,24 @@ mod audit_map_tests {
         visits
     }
 
-    /// The walk by the map, in steps of the audit. `visit` gives the result and the cost in
-    /// ticks of the cleanup of a place. The places visited (in order), the places each step
-    /// visited and the ticks each step spent.
+    /// The walk by the map, a step visiting exactly one place. `worked` says for a place whether
+    /// its visit made progress (the place is then visited again). The places visited, in order.
     fn map_walk(
         mut cursor: Cursor,
         slots: usize,
         map: &Map,
-        empty: impl Fn(usize) -> bool,
-        mut visit: impl FnMut(usize) -> (bool, u64),
-    ) -> (Vec<usize>, Vec<usize>, Vec<u64>) {
-        let (mut visits, mut per_step, mut costs) = (Vec::new(), Vec::new(), Vec::new());
+        stale: usize,
+        classify: impl Fn(usize) -> Place,
+        mut worked: impl FnMut(usize) -> bool,
+    ) -> Vec<usize> {
+        let mut visits = Vec::new();
         while cursor.remaining != 0 {
-            let (mut visited, mut spent) = (0, 0);
-            loop {
-                cursor.skip_unoccupied(slots, map, &empty);
-                visits.push(cursor.position);
-                let (worked, cost) = visit(cursor.position);
-                visited += 1;
-                spent += cost;
-                cursor.complete(worked, slots);
-                if !cursor.step_continues(visited, worked, spent) {
-                    break;
-                }
-            }
-            per_step.push(visited);
-            costs.push(spent);
+            cursor.skip_unoccupied(slots, map, stale, &classify);
+            visits.push(cursor.position);
+            let progress = worked(cursor.position);
+            cursor.complete(progress, slots);
         }
-        (visits, per_step, costs)
+        visits
     }
 
     fn table(occupied: &[usize], extra_bits: &[usize]) -> Map {
@@ -764,6 +777,27 @@ mod audit_map_tests {
             map.set(i);
         }
         map
+    }
+
+    fn occupied_set(seed: &mut Seed, live: usize) -> Vec<usize> {
+        let mut occupied = Vec::new();
+        while occupied.len() < live {
+            let i = 1 + seed.below(SLOTS - 1);
+            if !occupied.contains(&i) {
+                occupied.push(i);
+            }
+        }
+        occupied
+    }
+
+    fn classify<'a>(occupied: &'a [usize]) -> impl Fn(usize) -> Place + 'a {
+        move |i| {
+            if occupied.contains(&i) {
+                Place::InUse
+            } else {
+                Place::Vacant
+            }
+        }
     }
 
     #[test]
@@ -792,6 +826,7 @@ mod audit_map_tests {
         // Place 0 is never audited, so a bit there is not found.
         let zero = table(&[0], &[]);
         assert_eq!(zero.distance(1, SLOTS), None);
+        assert_eq!(map.count(), 4);
     }
 
     #[test]
@@ -799,13 +834,12 @@ mod audit_map_tests {
         let mut seed = Seed(0x9e37_79b9_7f4a_7c15);
         for _ in 0..400 {
             let live = seed.below(40);
-            let occupied: Vec<usize> = (0..live).map(|_| 1 + seed.below(SLOTS - 1)).collect();
+            let occupied = occupied_set(&mut seed, live);
             // A superset: bits with nothing behind them, which the exact test passes.
             let extra: Vec<usize> = (0..seed.below(20))
                 .map(|_| 1 + seed.below(SLOTS - 1))
                 .collect();
             let map = table(&occupied, &extra);
-            let empty = |i: usize| !occupied.contains(&i);
             let cursor = Cursor {
                 position: 1 + seed.below(SLOTS - 1),
                 remaining: 1 + seed.below(SLOTS - 1),
@@ -816,107 +850,133 @@ mod audit_map_tests {
                     remaining: cursor.remaining,
                 },
                 SLOTS,
-                empty,
+                |i| !occupied.contains(&i),
             );
-            let (visits, _, _) = map_walk(cursor, SLOTS, &map, empty, |_| (false, 0));
+            let visits = map_walk(cursor, SLOTS, &map, usize::MAX, classify(&occupied), |_| {
+                false
+            });
             assert_eq!(visits, reference, "occupied {occupied:?}");
         }
     }
 
-    fn occupied_set(seed: &mut Seed, live: usize) -> Vec<usize> {
-        let mut occupied = Vec::new();
-        while occupied.len() < live {
-            let i = 1 + seed.below(SLOTS - 1);
-            if !occupied.contains(&i) {
-                occupied.push(i);
-            }
-        }
-        occupied
-    }
-
     #[test]
-    fn a_round_with_l_places_in_use_that_need_no_work_takes_few_steps() {
+    fn a_round_with_l_places_in_use_takes_l_plus_one_steps_at_most() {
         let mut seed = Seed(12345);
-        for cost in [0u64, 600, 1_000, 2_500, 5_000] {
-            // The visits one step makes: the places until their cost reaches the time of a step.
-            let per_step = if cost == 0 {
-                AUDIT_LIVE_RUN
-            } else {
-                (AUDIT_STEP_TICKS.div_ceil(cost) as usize).min(AUDIT_LIVE_RUN)
-            };
-            for live in [0usize, 1, 2, 3, 4, 5, 8, 9, 17, 100, 639] {
+        for live in [0usize, 1, 2, 3, 4, 5, 8, 9, 17, 100, 639] {
+            for _ in 0..20 {
                 let occupied = occupied_set(&mut seed, live);
                 let map = table(&occupied, &[]);
                 let cursor = Cursor {
                     position: 1 + seed.below(SLOTS - 1),
                     remaining: SLOTS - 1,
                 };
-                let (visits, steps, spent) = map_walk(
+                let visits = map_walk(
                     cursor,
                     SLOTS,
                     &map,
-                    |i| !occupied.contains(&i),
-                    |_| (false, cost),
+                    AUDIT_STALE_RUN,
+                    classify(&occupied),
+                    |_| false,
                 );
-                // Every place in use is visited once; the last place of the round is visited
-                // too, in use or not, so at most L + 1 places.
-                assert!(
-                    visits.len() <= live + 1,
-                    "L {live}: {} visits",
-                    visits.len()
-                );
+                // A step visits one place: each place in use once, and the last place of the
+                // round, in use or not.
+                assert!(visits.len() <= live + 1, "L {live}: {} steps", visits.len());
                 for place in &occupied {
                     assert_eq!(visits.iter().filter(|v| *v == place).count(), 1);
                 }
-                assert!(steps.len() <= (live + 1).div_ceil(per_step));
-                assert!(steps.iter().all(|&n| n <= per_step));
-                // No step spends the time of a step before its last visit.
-                assert!(spent.iter().all(|&t| t < AUDIT_STEP_TICKS + cost.max(1)));
                 if live == 0 {
                     // An idle table's round is one step.
-                    assert_eq!(steps.len(), 1);
+                    assert_eq!(visits.len(), 1);
                 }
             }
         }
     }
 
     #[test]
-    fn a_step_ends_after_a_place_that_needed_work_as_it_did_before_the_map() {
+    fn places_that_need_work_are_visited_once_more_and_the_round_stays_within_two_l_plus_one() {
         let mut seed = Seed(99);
         for live in [1usize, 2, 5, 20, 100] {
             let occupied = occupied_set(&mut seed, live);
             let map = table(&occupied, &[]);
-            // Each place in use needs one unit of work, then is done.
-            let mut owed: Vec<usize> = occupied.clone();
+            let mut owed = occupied.clone();
             let cursor = Cursor {
                 position: 1 + seed.below(SLOTS - 1),
                 remaining: SLOTS - 1,
             };
-            let (visits, steps, _) = map_walk(
+            let visits = map_walk(
                 cursor,
                 SLOTS,
                 &map,
-                |i| !occupied.contains(&i),
+                AUDIT_STALE_RUN,
+                classify(&occupied),
                 |place| match owed.iter().position(|&p| p == place) {
                     Some(at) => {
                         owed.swap_remove(at);
-                        (true, 6_000)
+                        true
                     }
-                    None => (false, 600),
+                    None => false,
                 },
             );
-            // A worked visit ends its step, so no step has two of them, and each place is
-            // visited twice at most: once for its work and once to find it done.
-            assert!(steps.len() <= live + 1, "L {live}: {} steps", steps.len());
-            assert!(visits.len() <= 2 * live + 1);
+            assert!(
+                visits.len() <= 2 * live + 1,
+                "L {live}: {} steps",
+                visits.len()
+            );
             assert!(owed.is_empty());
         }
     }
 
     #[test]
+    fn a_step_passes_few_stale_bits_and_each_costs_once() {
+        // 600 places that rt freed with no word to the service: their bits are stale.
+        let stale: Vec<usize> = (10..610).collect();
+        let occupied = [5usize, 620];
+        let map = table(&occupied, &stale);
+        let round = |map: &Map| {
+            let mut cursor = Cursor {
+                position: 1,
+                remaining: SLOTS - 1,
+            };
+            let mut steps = 0;
+            while cursor.remaining != 0 {
+                cursor.skip_unoccupied(SLOTS, map, AUDIT_STALE_RUN, classify(&occupied));
+                cursor.complete(false, SLOTS);
+                steps += 1;
+            }
+            steps
+        };
+        // 600 stale bits at 160 a step: 4 steps for them, and the places in use.
+        let first = round(&map);
+        assert!(
+            (4..=4 + occupied.len() + 1).contains(&first),
+            "{first} steps"
+        );
+        // The place a step stops at when its limit is reached keeps its bit until the next
+        // round: at most one for each such step.
+        assert!(map.count() <= occupied.len() + 4);
+        round(&map);
+        assert_eq!(map.count(), occupied.len(), "the stale bits went out");
+        // A round with no stale bit is the round of the places in use.
+        assert!(round(&map) <= occupied.len() + 1);
+    }
+
+    #[test]
+    fn a_departing_cell_is_passed_and_keeps_its_bit() {
+        let map = table(&[7], &[]);
+        let mut cursor = Cursor {
+            position: 1,
+            remaining: SLOTS - 1,
+        };
+        cursor.skip_unoccupied(SLOTS, &map, AUDIT_STALE_RUN, |_| Place::Departing);
+        assert!(map.contains(7));
+        assert_eq!(cursor.remaining, 1);
+    }
+
+    #[test]
     fn a_place_with_a_session_never_lacks_its_bit() {
         // The service sets the bit before it stores a session or a birth, and clears it only
-        // where it frees the place itself; another path may empty a place with no clear.
+        // where it frees the place itself or finds it vacant; another path may empty a place
+        // with no clear.
         let mut seed = Seed(777);
         let map = Map::new();
         let mut live = [false; SLOTS];

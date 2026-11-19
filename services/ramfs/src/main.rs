@@ -181,6 +181,12 @@ mod own_step {
 /// the 16 to 21 steps that a shorter run of empty places would make, each with the fixed part.
 /// A shorter step and a longer gap between steps both measured worse under load.
 const AUDIT_STEP_NS: u64 = 1_000_000;
+/// The time between two steps of a round over few places (`AUDIT_FEW_PLACES` or fewer named by
+/// the map): the period of the service's budget (`SERVICE_PERIOD_NS` in the table of init, 5 ms).
+/// The steps of such a round cost about 50 us each, and four of them 1 ms apart sum to about
+/// 200 us of the 250 us capacity in one period; a step a period keeps each in a period of its
+/// own, and a round of 16 places takes under 100 ms.
+const AUDIT_SPARSE_STEP_NS: u64 = 5_000_000;
 /// The time from the opening of a round to its first step: the period of the service's budget
 /// (`SERVICE_PERIOD_NS` in the table of init, 5 ms; this crate does not see that constant) and
 /// 1 ms more. A round opens in the turn after the answer of init to the heartbeat, and the work
@@ -454,6 +460,7 @@ fn main(_: u64) -> u64 {
         _audit_view: audit_view,
         audit_ready_ns: 0,
         audit_armed: false,
+        audit_step_ns: AUDIT_STEP_NS,
         occupied: ramfs::maintenance::Occupancy::new(),
         audit_rounds: 0,
         #[cfg(feature = "audit-readout")]
@@ -722,6 +729,8 @@ struct Fs {
     audit_ready_ns: u64,
     /// Whether the audit waits for its timer.
     audit_armed: bool,
+    /// The time between the steps of the open round.
+    audit_step_ns: u64,
     /// The places that may hold a session, a birth or a departure (sessions first, then births):
     /// the audit passes the others by this map. A bit is set when a place is given out and
     /// cleared only where the service frees the place itself.
@@ -4113,6 +4122,11 @@ impl Fs {
                 .maintenance
                 .open(now, AUDIT_FIRST_NS, SESSIONS + BIRTHS);
             self.audit_armed = false;
+            self.audit_step_ns = if self.occupied.count() <= ramfs::maintenance::AUDIT_FEW_PLACES {
+                AUDIT_SPARSE_STEP_NS
+            } else {
+                AUDIT_STEP_NS
+            };
             #[cfg(feature = "audit-readout")]
             {
                 self.audit_span.open(now);
@@ -4220,43 +4234,41 @@ impl Fs {
             self.lock_turn(sessions);
             return;
         }
-        self.audit_ready_ns = now.saturating_add(AUDIT_STEP_NS);
+        self.audit_ready_ns = now.saturating_add(self.audit_step_ns);
         rt::service::step_detail(own_step::AUDIT);
-        // The empty places are passed by the map of occupied places at once. The step ends at a
-        // place whose cleanup worked, as it did before the map; it goes on to another place in
-        // use only while the places it has visited were cheap (`AUDIT_STEP_TICKS`), so that it
-        // is no longer than a step with one place in use by more than that time.
+        // The step passes the empty places by the map of occupied places, then visits the one
+        // place it stops at, as it did before the map.
         let round_open = self.maintenance.remaining != 0;
-        let mut client_work;
-        let mut visited = 0;
-        let began = rt::time::now();
-        loop {
-            let departures = &self.departures;
-            let births = &*self.births;
-            self.maintenance
-                .skip_unoccupied(SESSIONS + BIRTHS, &self.occupied, |i| {
-                    Self::slot_empty(departures, births, sessions, i)
-                });
-            client_work = false;
-            let i = self.maintenance.position;
-            if self.departures.contains(i) {
-                // Queued cells receive separate fair bounded cleanup turns.
-            } else if i < SESSIONS {
-                if let Some(s) = sessions.get_mut(i).and_then(Option::as_mut) {
-                    let label = s.label();
-                    client_work = self.cleanup_step(&mut s.data, label);
+        let departures = &self.departures;
+        let births = &*self.births;
+        self.maintenance.skip_unoccupied(
+            SESSIONS + BIRTHS,
+            &self.occupied,
+            ramfs::maintenance::AUDIT_STALE_RUN,
+            |i| {
+                if departures.contains(i) {
+                    ramfs::maintenance::Place::Departing
+                } else if Self::slot_empty(departures, births, sessions, i) {
+                    ramfs::maintenance::Place::Vacant
+                } else {
+                    ramfs::maintenance::Place::InUse
                 }
-            } else if let Some((label, mut fds)) = self.births[i - SESSIONS].take() {
-                client_work = self.cleanup_step(&mut fds, label);
-                self.births[i - SESSIONS] = Some((label, fds));
+            },
+        );
+        let mut client_work = false;
+        let i = self.maintenance.position;
+        if self.departures.contains(i) {
+            // Queued cells receive separate fair bounded cleanup turns.
+        } else if i < SESSIONS {
+            if let Some(s) = sessions.get_mut(i).and_then(Option::as_mut) {
+                let label = s.label();
+                client_work = self.cleanup_step(&mut s.data, label);
             }
-            visited += 1;
-            self.maintenance.complete(client_work, SESSIONS + BIRTHS);
-            let spent = rt::time::now().saturating_sub(began);
-            if !self.maintenance.step_continues(visited, client_work, spent) {
-                break;
-            }
+        } else if let Some((label, mut fds)) = self.births[i - SESSIONS].take() {
+            client_work = self.cleanup_step(&mut fds, label);
+            self.births[i - SESSIONS] = Some((label, fds));
         }
+        self.maintenance.complete(client_work, SESSIONS + BIRTHS);
         work |= client_work;
         #[cfg(feature = "audit-readout")]
         if round_open {
