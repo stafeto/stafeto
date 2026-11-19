@@ -1777,6 +1777,114 @@ mod tests {
         }
     }
 
+    // The shape of the fragmented-pages probe: the owner holds 64 records on one inode, each
+    // alone on its own paid page. Each round
+    // adds a target record first (it opens a page, the previous page being full), then fills the
+    // page with 63 records of another owner on another inode; the fillers go at the end.
+    fn fragment(
+        ram: &mut crate::Ram<'_>,
+        table: &mut SimpleLocks,
+        target: Token,
+        owner: Owner,
+    ) -> usize {
+        let mut fillers = Vec::new();
+        for page in 0..PER_INODE as u32 {
+            table
+                .set(
+                    &mut ram.storage,
+                    payer(1),
+                    request(target, owner, 2 * i64::from(page), 1, Some(Kind::Write)),
+                    |_| true,
+                )
+                .unwrap();
+            let file = inode(ram, std::format!("filler{page}").as_bytes());
+            let filler = Owner::Process(1_000 + page);
+            for i in 0..(SLOTS - 1) as i64 {
+                table
+                    .set(
+                        &mut ram.storage,
+                        payer(1),
+                        request(file, filler, 2 * i, 1, Some(Kind::Write)),
+                        |_| true,
+                    )
+                    .unwrap();
+            }
+            fillers.push((file, filler));
+        }
+        for (file, filler) in fillers {
+            table.close(&mut ram.storage, file, filler).unwrap();
+        }
+        assert_eq!(table.count(target), PER_INODE);
+        // One paid page for each of the 64 records.
+        let pages = ram.storage.usage(payer(1)).pages as usize;
+        assert_eq!(pages, PER_INODE);
+        pages
+    }
+
+    #[test]
+    fn one_unlock_of_the_whole_file_releases_the_pages_of_64_live_records_in_one_call() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let target = inode(&mut ram, b"target");
+        let mut table = fresh();
+        let owner = Owner::Process(900);
+        let held = fragment(&mut ram, &mut table, target, owner);
+        let free_before = ram.storage.available().pages;
+        // The owner is alive: the request is no sweep of dead records, and its piece limit
+        // does not apply.
+        table
+            .set(
+                &mut ram.storage,
+                payer(1),
+                Request {
+                    range: Range::relative(0, 0, 0).unwrap(),
+                    ..request(target, owner, 0, 0, None)
+                },
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(table.count(target), 0);
+        assert_eq!(ram.storage.usage(payer(1)).pages, 0);
+        assert_eq!(ram.storage.available().pages - free_before, held as u16);
+    }
+
+    #[test]
+    fn an_unlock_that_leaves_the_last_record_out_leaves_its_page() {
+        // The count of the test above follows the range: the range that leaves the last
+        // record out leaves its page.
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let target = inode(&mut ram, b"target");
+        let mut table = fresh();
+        let owner = Owner::Process(900);
+        fragment(&mut ram, &mut table, target, owner);
+        table
+            .set(
+                &mut ram.storage,
+                payer(1),
+                request(target, owner, 0, 2 * (PER_INODE as i64 - 1), None),
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(table.count(target), 1);
+        assert_eq!(ram.storage.usage(payer(1)).pages as usize, 1);
+    }
+
+    #[test]
+    fn one_close_of_the_description_releases_the_pages_of_64_live_records_in_one_call() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let target = inode(&mut ram, b"target");
+        let mut table = fresh();
+        let owner = Owner::Description {
+            slot: 5,
+            generation: 3,
+        };
+        let held = fragment(&mut ram, &mut table, target, owner);
+        let free_before = ram.storage.available().pages;
+        assert!(table.close(&mut ram.storage, target, owner).unwrap());
+        assert_eq!(table.count(target), 0);
+        assert_eq!(ram.storage.usage(payer(1)).pages, 0);
+        assert_eq!(ram.storage.available().pages - free_before, held as u16);
+    }
+
     #[test]
     fn a_request_frees_at_most_one_piece_of_dead_records_and_the_sweep_takes_the_rest() {
         let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
