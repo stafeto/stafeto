@@ -26,6 +26,10 @@ procfs = ["posix-abi/procfs", "posix-platform/procfs"]
 shared = []
 # The points of the packet path for the C glue of a stack (`stafeto_trace_*`).
 trace = ["posix-abi/trace"]
+# The C functions of the windows of the composition service
+# (`<stafeto/window.h>`, window_c.rs) in a statically linked program. libc.so
+# is built without it.
+window = ["posix-abi/window", "dep:comp-client"]
 
 [dependencies]
 entries = { path = "../entries" }
@@ -36,3 +40,4 @@ posix-fs = { path = "../posix-fs" }
 posix-platform = { path = "../posix-platform" }
 posix-thread = { path = "../posix-thread" }
 rt = { path = "../rt" }
+comp-client = { path = "../comp-client", optional = true }

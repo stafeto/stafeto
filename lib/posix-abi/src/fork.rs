@@ -990,6 +990,10 @@ fn child() -> Result<(), &'static str> {
         // The child's session with the display service is the clone the
         // parent made; it has no owner session and no display piece.
         crate::display::after_fork(handle(raw(Slot::Display)));
+        // It has no window of the composition service either: the parent's
+        // handles of it are forgotten.
+        #[cfg(feature = "window")]
+        crate::window::after_fork();
         // The child's session with the network service is the clone the
         // parent made, which holds the descriptions the child keeps.
         crate::net::after_fork(handle(raw(Slot::Net)));

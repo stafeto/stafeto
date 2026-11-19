@@ -372,11 +372,20 @@ pub unsafe fn after_fork(
     {
         *slot = piece;
     }
+    // The buffers of the parent's window (up to three pieces).
+    let mut windows = [(0usize, 0usize); 3];
+    for (slot, piece) in windows
+        .iter_mut()
+        .zip(state.map.kind_pieces(posix_map::Kind::Window))
+    {
+        *slot = piece;
+    }
     state.map.forget();
     for (address, pages) in [display, network, files]
         .into_iter()
         .flatten()
         .chain(cache.into_iter().filter(|piece| piece.1 != 0))
+        .chain(windows.into_iter().filter(|piece| piece.1 != 0))
     {
         state.space.set(address, pages, Page::Unbacked);
     }
@@ -717,6 +726,30 @@ impl State {
         let (index, address) = self.make_own(None, pages, Access::ReadWrite, false, source, 0)?;
         self.map.object_mut(index).kind = posix_map::Kind::Fast;
         Ok(address)
+    }
+
+    /// A buffer of the process's window (`posix_map::Kind::Window`): `handle`
+    /// (`pages` pages, MAP_READ and MAP_WRITE) becomes a piece of its own, at
+    /// an address of the room; the address. ENOMEM past the room, the limits
+    /// or the table; the handle goes if the map refuses it.
+    #[cfg(feature = "window")]
+    pub(crate) fn map_window(
+        &mut self,
+        handle: Handle<Memory>,
+        pages: usize,
+    ) -> Result<usize, i32> {
+        self.map_special_more(handle, pages, posix_map::Kind::Window)
+    }
+
+    /// Every buffer of the window leaves the process (`mem_unmap`) and its
+    /// objects close; Ok when there are none. A refusal of the kernel stops
+    /// the walk with its errno, and the pieces not yet taken stay.
+    #[cfg(feature = "window")]
+    pub(crate) fn unmap_windows(&mut self) -> Result<(), i32> {
+        while self.map.kind_piece(posix_map::Kind::Window).is_some() {
+            self.unmap_special(posix_map::Kind::Window)?;
+        }
+        Ok(())
     }
 
     /// The display piece leaves the process (`mem_unmap`) and its object
