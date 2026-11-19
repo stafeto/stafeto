@@ -25,6 +25,15 @@ pub const F_RECT: Rect = Rect {
     h: 400,
 };
 
+/// The window of the scene O (eight of them in one place) and how many.
+pub const O_RECT: Rect = Rect {
+    x: 160,
+    y: 100,
+    w: 320,
+    h: 200,
+};
+pub const O_WINDOWS: usize = 8;
+
 /// The rows the stripe is high, and how far it moves in a period.
 pub const STRIPE_ROWS: u32 = 10;
 pub const STEP_ROWS: u32 = 7;
@@ -44,6 +53,7 @@ pub const fn window_of(scene: Scene) -> Option<Rect> {
     match scene {
         Scene::P => Some(P_RECT),
         Scene::F => Some(F_RECT),
+        Scene::O => Some(O_RECT),
         Scene::None | Scene::D => None,
     }
 }
@@ -102,7 +112,7 @@ fn stripes(window: Rect, step: u64) -> Rect {
 /// declares all of it changed).
 pub fn damage(scene: Scene, step: u64) -> Option<Rect> {
     let window = window_of(scene)?;
-    if step == 0 || scene == Scene::F {
+    if step == 0 || matches!(scene, Scene::F | Scene::O) {
         return Some(Rect {
             x: 0,
             y: 0,
@@ -179,6 +189,14 @@ pub const fn post_time(t0: u64, period: u64, interval: u32, k: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window's own points: the whole of it.
+    const O_RECT_OWN: Rect = Rect {
+        x: 0,
+        y: 0,
+        w: 320,
+        h: 200,
+    };
 
     fn frames(scene: Scene, step: u64) -> Vec<u32> {
         let window = window_of(scene).unwrap();
@@ -314,6 +332,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The scene O posts each window whole, every period, over buffers painted
+    /// once: no work of the client grows with the eight windows.
+    #[test]
+    fn the_overload_declares_each_window_whole() {
+        for step in [0u64, 1, 2, 99] {
+            assert_eq!(damage(Scene::O, step).unwrap(), O_RECT_OWN);
+        }
+        assert_eq!(O_WINDOWS, 8);
     }
 
     #[test]

@@ -144,11 +144,14 @@ const LOAD: Record = Record {
 pub const CTL: Record = LOAD;
 
 /// The paced client: two buffers of the whole screen (two objects of 250
-/// pages) and the window over them, and its stack.
+/// pages), the buffers of the overload (sixteen objects of 63 pages, two for
+/// each of eight windows: 1 008 pages), the sessions of the windows and its
+/// stack.
 pub const DRAW: Record = Record {
     name: "frame-draw",
     args: b"draw",
-    quota: 640 * PAGE,
+    quota: 1_792 * PAGE,
+    handle_limit: 64,
     ..LOAD
 };
 

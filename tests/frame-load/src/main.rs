@@ -36,8 +36,8 @@ use frame_load::report::{
     BandsLine, Counters, CpuLine, HistLine, PhaseLine, WindowCounters, WindowLine, loops_per_second,
 };
 use proto_comp::{
-    Attach, Create, Description, FORMAT_XRGB8888, INTERVAL, Method, Post, RESET, Rect, SetBody,
-    StatsReply,
+    Attach, Create, Description, FORMAT_ARGB8888, FORMAT_XRGB8888, INTERVAL, Method, Post, RESET,
+    Rect, SetBody, StatsReply,
 };
 use proto_gpu::{HEIGHT, STRIDE, WIDTH};
 use proto_init::ServiceArgs;
@@ -63,6 +63,10 @@ const READ_BEFORE_END_NS: u64 = 5_000_000;
 const WAIT_NS: u64 = 60_000_000_000;
 /// How long after the last phase the conductor says `done`.
 const DONE_AFTER_NS: u64 = 2_000_000_000;
+/// The windows of the overload have two buffers each of 320 by 200 points.
+const SMALL_OBJECTS: usize = 2 * paint::O_WINDOWS;
+const SMALL_STRIDE: u32 = 320 * 4;
+const SMALL_BYTES: usize = (SMALL_STRIDE * 200) as usize;
 /// The bytes of a buffer (the whole screen: both scenes use the same objects).
 const BUFFER_BYTES: u64 = (STRIDE * HEIGHT) as u64;
 
@@ -296,12 +300,28 @@ impl Env<'_> {
         Ok(([a, b], at))
     }
 
-    /// A window of `rect` over the two objects; its session.
+    /// A window of `rect` over the two objects, XRGB8888 with the interval of
+    /// one period; its session.
     fn window(
         &self,
         display: &Handle<Channel>,
         rect: paint::Rect,
         objects: &[Handle<Memory>; 2],
+    ) -> Result<Handle<Channel>, Fail> {
+        self.window_over(display, rect, FORMAT_XRGB8888, STRIDE, objects, true)
+    }
+
+    /// A window of `rect` and `format` over `objects` (one buffer each, of
+    /// `stride` bytes a row); its session. `paced` sets the interval of one
+    /// period.
+    fn window_over(
+        &self,
+        display: &Handle<Channel>,
+        rect: paint::Rect,
+        format: u32,
+        stride: u32,
+        objects: &[Handle<Memory>],
+        paced: bool,
     ) -> Result<Handle<Channel>, Fail> {
         let notify = sys::handle_duplicate(&self.channel, Rights::NOTIFY | Rights::TRANSFER)
             .map_err(say("duplicate the channel"))?;
@@ -311,7 +331,7 @@ impl Env<'_> {
             y: rect.y,
             w: rect.w,
             h: rect.h,
-            format: FORMAT_XRGB8888,
+            format,
             flags: 0,
         }
         .write(&mut w)
@@ -335,9 +355,9 @@ impl Env<'_> {
             .map_err(|_| "WINDOW_CREATE's handle")?;
         let mut w = Writer::new();
         Attach {
-            count: 2,
-            stride: STRIDE,
-            format: FORMAT_XRGB8888,
+            count: objects.len() as u32,
+            stride,
+            format,
         }
         .write(&mut w)
         .map_err(say("ATTACH's bytes"))?;
@@ -353,6 +373,9 @@ impl Env<'_> {
         match reply.bytes(&mut buffer).get(..4) {
             Some(b) if u32::from_le_bytes([b[0], b[1], b[2], b[3]]) == 0 => {}
             _ => return Err("ATTACH was refused"),
+        }
+        if !paced {
+            return Ok(session);
         }
         // One post a period: the service judges the window against its start.
         let mut w = Writer::new();
@@ -388,11 +411,118 @@ impl Env<'_> {
         }
     }
 
+    /// A POST of the whole of a window: whether the service took it (false when
+    /// it said BUSY, the buffer being the one it shows or holds).
+    fn try_post(window: &Handle<Channel>, buffer: u32, rect: paint::Rect) -> Result<bool, Fail> {
+        let rect = Rect {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+        };
+        let mut w = Writer::new();
+        Post::new(buffer, &[rect])
+            .and_then(|p| p.write(&mut w))
+            .map_err(say("POST's bytes"))?;
+        let reply = sys::send(window, w.as_bytes()).map_err(say("POST"))?;
+        let mut buffer = [0; MESSAGE_MAX];
+        match reply
+            .bytes(&mut buffer)
+            .get(..4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        {
+            Some(0) => Ok(true),
+            Some(code) if code == proto_comp::code(proto_comp::BUSY).code() => Ok(false),
+            _ => Err("POST was refused"),
+        }
+    }
+
+    /// The buffers of the overload: two objects for each of the windows, of 320
+    /// by 200 points, painted once with a part of alpha and mapped for writing.
+    fn small_objects(&self) -> Result<[Handle<Memory>; SMALL_OBJECTS], Fail> {
+        let len = (SMALL_BYTES as u64).div_ceil(4096) * 4096;
+        let mut made = [const { None }; SMALL_OBJECTS];
+        for (i, slot) in made.iter_mut().enumerate() {
+            let memory = sys::mem_create(len).map_err(say("mem_create"))?;
+            let at = MAP_AT + (2 + i) * MAP_STEP;
+            sys::mem_map(self.process, &memory, 0, len, at, Access::ReadWrite)
+                .map_err(say("map a buffer"))?;
+            // SAFETY: just mapped for reading and writing over `len` bytes.
+            let points =
+                unsafe { core::slice::from_raw_parts_mut(at as *mut u32, SMALL_BYTES / 4) };
+            points.fill(0x8040_80C0 | (i as u32 & 0xF) << 8);
+            *slot = Some(memory);
+        }
+        Ok(made.map(|m| m.expect("every buffer was made")))
+    }
+
+    /// The phase of the overload: eight windows in one place, each posted whole
+    /// every period, one buffer or the other (a buffer the service shows or
+    /// holds is BUSY, and the other goes), for the length of the phase; the
+    /// windows go with the end of it.
+    fn overload(
+        &self,
+        display: &Handle<Channel>,
+        small: &[Handle<Memory>; SMALL_OBJECTS],
+        phase: Phase,
+    ) -> Result<(), Fail> {
+        let mut sessions: [Option<Handle<Channel>>; paint::O_WINDOWS] = [const { None }; 8];
+        for (i, slot) in sessions.iter_mut().enumerate() {
+            *slot = Some(self.window_over(
+                display,
+                paint::O_RECT,
+                FORMAT_ARGB8888,
+                SMALL_STRIDE,
+                &small[2 * i..2 * i + 2],
+                false,
+            )?);
+        }
+        let whole = paint::Rect {
+            x: 0,
+            y: 0,
+            w: paint::O_RECT.w,
+            h: paint::O_RECT.h,
+        };
+        let mut next = [0u32; paint::O_WINDOWS];
+        let (mut posts, mut busy, mut step) = (0u32, 0u32, 0u64);
+        let (t0, end) = (self.schedule.start_of(phase), self.schedule.end_of(phase));
+        loop {
+            let due = paint::post_time(t0, PERIOD_NS, 1, step);
+            if due >= end {
+                break;
+            }
+            self.sleep_until(due);
+            for (i, slot) in sessions.iter().enumerate() {
+                let Some(session) = slot else {
+                    continue;
+                };
+                let mut taken = false;
+                for _ in 0..2 {
+                    if Self::try_post(session, next[i], whole)? {
+                        taken = true;
+                        next[i] ^= 1;
+                        break;
+                    }
+                    busy += 1;
+                    next[i] ^= 1;
+                }
+                posts += u32::from(taken);
+            }
+            step += 1;
+        }
+        rt::println!(
+            "frame-load: draw {} posts {posts} busy {busy}",
+            phase.name()
+        );
+        Ok(())
+    }
+
     fn draw(&self) -> Result<(), Fail> {
         let display = self.display()?;
         self.describe_when_ready(&display)?;
         self.on_time("draw")?;
         let (objects, at) = self.objects()?;
+        let small = self.small_objects()?;
         let mut open: Option<(Scene, Handle<Channel>)> = None;
         // The buffers the service has given back: both in a new window, and
         // kept from phase to phase while the window stays.
@@ -401,6 +531,11 @@ impl Env<'_> {
             let scene = phase.scene();
             self.sleep_until(self.schedule.start_of(phase));
             self.woke_in_time("draw", phase)?;
+            if scene == Scene::O {
+                drop(open.take());
+                self.overload(&display, &small, phase)?;
+                continue;
+            }
             let Some(rect) = paint::window_of(scene) else {
                 // No window in this scene: the one of the phase before goes.
                 open = None;

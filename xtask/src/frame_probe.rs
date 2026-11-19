@@ -4,13 +4,15 @@
 //! `cargo xtask frame-probe [counters]`: the frame time under the loads.
 //!
 //! One boot of the image of the measures (`boot-frame-steps.img`, init's table
-//! `table::frame`) runs the eight phases of `tests/frame-load` (quiet, idle,
-//! full, cpu, files, net, stress, direct) under -icount on one CPU. The
+//! `table::frame`) runs the ten phases of `tests/frame-load` (quiet, idle,
+//! full, cpu, files, net, full-loaded, direct, hog-ref, overload) under -icount
+//! on one CPU. The
 //! conductor reads the service's statistics (STATS) at the end of each phase
 //! and prints them; this module reads the lines and judges each phase against
 //! the bound of the analysis of the frame time:
 //!
-//! - `quiet`: no frame and no wake-up of the frame's timer;
+//! - `quiet` and `hog-ref`: no frame and no wake-up of the frame's timer (in
+//!   `hog-ref` the CPU load runs alone and its loops a second are the reference);
 //! - `idle`, `cpu`, `files`, `net` (the scene P): no late frame, no skip, the
 //!   window of the client neither late nor missed, the time to compose under
 //!   the bound of its row, and in `net` the budgets of the network service
@@ -18,10 +20,15 @@
 //! - `full` (the scene F): the same, with the bound computed from the bands of
 //!   the frame as measured, when the frame has no more than 45 bands; with more
 //!   the phase is a load phase and says so;
-//! - `stress` (F with all the loads): at least half of the periods make a frame,
+//! - `full-loaded` (F with all the loads): at least half of the periods make a frame,
 //!   late and skipped frames are printed, and the loop of the CPU load turned;
 //! - `direct` (a window of the first revision shown from the pool): no late
 //!   frame, no skip, every frame direct, the time to compose under the bound;
+//! - `overload` (eight windows of 320 by 200 with an alpha, each posted whole
+//!   every period, the CPU load alone): `capped` at least `releases` and at least
+//!   half the periods, `skipped` above 0, `late` equal to the frames, frames at
+//!   least a period count over (the bands of the frame over the cap, rounded up,
+//!   and one), and the loops of the CPU load at least 0.08 of the reference;
 //! - every step of the services under the gates of the steps (18 369 ticks, a
 //!   band or a portion 16 328), the kinds of SET and STATS and the timer's step
 //!   among them.
@@ -31,7 +38,7 @@
 
 use crate::frame_image;
 use compositor::frame::{Source, bound};
-use frame_load::phases::{ORDER, Phase};
+use frame_load::phases::{ORDER, PERIODS, Phase};
 use init::table::Kind;
 use init::table::frame::TABLE;
 
@@ -60,6 +67,10 @@ const FRAMES_MAX: u64 = 242;
 /// The frames the whole screen under all the loads must still make: half of the
 /// periods.
 const STRESS_FRAMES_MIN: u64 = 120;
+/// The share of its loop alone the CPU load must keep under the overload: the
+/// cap and three steps leave the service 86.8 % of a period and the console and
+/// the signs of life take about 3 %, so about a tenth is left.
+const HOG_FLOOR_PPM: u64 = 80_000;
 /// The share of a period the service may use at most (52 bands under the
 /// cap, 849 056 ticks of 1 041 667): the CPU the levels below it can count on
 /// is what the budgets above leave of the rest.
@@ -117,6 +128,46 @@ pub fn budgets_share_ppm() -> u64 {
         .filter(|b| b.cpu == 0)
         .map(|b| b.share_ppm())
         .sum()
+}
+
+/// The bands a layer-by-layer frame of `w` by `h` points takes, by the model of
+/// the service's `Scene::tile`: `opaque` windows of XRGB8888, `over` of ARGB8888
+/// and `fill` black layers all touching the damage, no pointer. A band is as
+/// many whole lines as the ticks allow (at most BAND_ROWS) or, when not even
+/// one line fits, a run of the points of the rectangle.
+pub fn bands_of(w: u32, h: u32, opaque: u32, over: u32, fill: u32) -> u64 {
+    use compositor::{BAND_ROWS, BAND_TICKS, FILL, OPAQUE, OVER};
+    let calls = OPAQUE.call * opaque + OVER.call * over + FILL.call * fill;
+    let per_row = OPAQUE.row * opaque + OVER.row * over + FILL.row * fill;
+    let per_point = OPAQUE.point * opaque + OVER.point * over + FILL.point * fill;
+    if per_row + per_point == 0 {
+        return u64::from(h.div_ceil(BAND_ROWS));
+    }
+    let budget = u64::from(BAND_TICKS.saturating_sub(calls)) * 100;
+    let one_row = u64::from(per_row) + u64::from(w) * u64::from(per_point);
+    let rows = budget / one_row;
+    if rows >= 1 {
+        return u64::from(h).div_ceil(rows.min(u64::from(BAND_ROWS)));
+    }
+    let room = budget.saturating_sub(u64::from(per_row));
+    let run = room
+        .checked_div(u64::from(per_point))
+        .unwrap_or(0)
+        .clamp(1, u64::from(w));
+    (u64::from(w) * u64::from(h)).div_ceil(run)
+}
+
+/// The bands of a frame of the overload: eight windows of 320 by 200 points
+/// with an alpha over one another, no opaque one under them (the black
+/// layer is made as well).
+pub fn overload_frame_bands() -> u64 {
+    bands_of(320, 200, 0, 8, 1)
+}
+
+/// The bands the service makes in a period at most.
+pub fn frame_cap_bands() -> u32 {
+    use compositor::frame::{DEFAULT_CAP_PPM, DEFAULT_PERIOD_NS, band_cap};
+    band_cap(DEFAULT_PERIOD_NS, DEFAULT_CAP_PPM, compositor::BAND_TICKS)
 }
 
 /// The rows of the table of bounds.
@@ -183,6 +234,8 @@ struct Phased {
     wakeups: u64,
     compose_max_us: u64,
     direct: u64,
+    capped: u64,
+    releases: u64,
     bands: u64,
 }
 
@@ -211,6 +264,8 @@ fn read_phase(lines: &[String], phase: Phase) -> Result<Phased, String> {
         wakeups: get("wakeups")?,
         compose_max_us: get("compose-max-us")?,
         direct: get("direct")?,
+        capped: get("capped")?,
+        releases: get("releases")?,
         bands,
     })
 }
@@ -260,15 +315,18 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
             return fail(format!("{} frames failed", p.failed));
         }
         match phase {
-            Phase::Quiet => {
+            Phase::Quiet | Phase::HogRef => {
                 if p.frames != 0 || (timed && p.wakeups != 0) {
                     return fail(format!(
                         "frames {} wakeups {} with nothing drawn",
                         p.frames, p.wakeups
                     ));
                 }
+                if phase == Phase::HogRef && loops(lines, phase).is_none_or(|n| n == 0) {
+                    return fail("the CPU load made no loop alone".to_owned());
+                }
                 said.push(format!(
-                    "frame-probe: quiet: no frame, wakeups {}",
+                    "frame-probe: {name}: no frame, wakeups {}",
                     p.wakeups
                 ));
             }
@@ -326,7 +384,7 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                     ms(us(bound))
                 ));
             }
-            Phase::Stress => {
+            Phase::FullLoaded => {
                 // The whole screen under every load at once: the service keeps
                 // delivering frames. Skips and lateness are the report's; the
                 // frame of this scene fits a period, so none is required.
@@ -353,13 +411,60 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                     ));
                 }
                 said.push(format!(
-                    "frame-probe: stress: 240 periods, frames {}, late {}, skipped {}, cpu share {} (floor {})",
+                    "frame-probe: full-loaded: 240 periods, frames {}, late {}, skipped {}, cpu share {} (floor {})",
                     p.frames,
                     p.late,
                     p.skipped,
                     frac(share),
                     frac(floor)
                 ));
+            }
+            Phase::Overload => {
+                if timed {
+                    let bands = overload_frame_bands();
+                    let cap = u64::from(frame_cap_bands());
+                    let floor = PERIODS / (bands.div_ceil(cap) + 1);
+                    if p.capped < p.releases || p.capped < PERIODS / 2 {
+                        return fail(format!(
+                            "capped {} for releases {} and {} periods (the cap does not hold the bands back)",
+                            p.capped, p.releases, PERIODS
+                        ));
+                    }
+                    if p.skipped == 0 || p.late != p.frames {
+                        return fail(format!(
+                            "skipped {} late {} of {} frames (a frame of {bands} bands over a cap of {cap} is late every time)",
+                            p.skipped, p.late, p.frames
+                        ));
+                    }
+                    if p.frames < floor {
+                        return fail(format!(
+                            "{} frames of {PERIODS} periods ({floor} at least for {bands} bands at {cap} a period)",
+                            p.frames
+                        ));
+                    }
+                    let alone = loops(lines, Phase::HogRef).unwrap_or(0);
+                    let share = loops(lines, phase)
+                        .map(|n| n * 1_000_000 / alone.max(1))
+                        .unwrap_or(0);
+                    if share < HOG_FLOOR_PPM {
+                        return fail(format!(
+                            "the CPU load kept {} of its loop alone (floor {}): the cap does not keep the promise",
+                            frac(share),
+                            frac(HOG_FLOOR_PPM)
+                        ));
+                    }
+                    said.push(format!(
+                        "frame-probe: overload: {} frames of {bands} bands, capped {}, skipped {}, late {}, cpu share {} (floor {})",
+                        p.frames,
+                        p.capped,
+                        p.skipped,
+                        p.late,
+                        frac(share),
+                        frac(HOG_FLOOR_PPM)
+                    ));
+                } else {
+                    said.push(format!("frame-probe: overload: {} frames", p.frames));
+                }
             }
             Phase::Direct => {
                 if !(FRAMES_MIN..=FRAMES_MAX).contains(&p.frames) && timed {
@@ -514,8 +619,12 @@ mod tests {
         assert_eq!(heartbeat_ticks(), 46_400);
         assert_eq!(bound_ticks(Row::P), Some(906_578));
         assert_eq!(bound_ticks(Row::D), Some(622_091));
-        assert_eq!(bound_ticks(Row::F(42)), Some(868_908));
-        assert_eq!(bound_ticks(Row::F(45)), Some(917_892));
+        // The whole screen by the fitted table of the bands (31 of them), and at 33 when
+        // the band is 14 000 ticks.
+        assert_eq!(own(Row::F(31)), 644_681);
+        assert_eq!(bound_ticks(Row::F(31)), Some(689_300));
+        assert_eq!(own(Row::F(33)), 677_337);
+        assert_eq!(bound_ticks(Row::F(33)), Some(721_956));
     }
 
     /// The counts the heartbeat is made of: three services above the
@@ -544,16 +653,23 @@ mod tests {
             let (frames, direct, skipped, wakeups, bands, compose) = match phase {
                 Phase::Quiet => (0, 0, 0, 0, 0, 0),
                 Phase::Full => (240, 0, 0, 240, 240 * 40, 9_000),
-                Phase::Stress => (200, 0, 0, 240, 200 * 40, 10_000),
+                Phase::FullLoaded => (200, 0, 0, 240, 200 * 40, 10_000),
+                Phase::HogRef => (0, 0, 0, 0, 0, 0),
+                Phase::Overload => (30, 0, 210, 240, 30 * 424, 12_000),
                 Phase::Direct => (240, 240, 0, 240, 0, 1_000),
                 _ => (240, 0, 0, 240, 240 * 4, 2_950),
             };
+            let (late, capped) = if phase == Phase::Overload {
+                (frames, 240)
+            } else {
+                (0, 0)
+            };
             lines.push(format!(
-                "frame-load: phase {name} frames {frames} late 0 skipped {skipped} failed 0 capped 0 wakeups {wakeups} take-max-us 410 compose-max-us {compose} device-max-us 120 frame-max-us 3070 band-max-us 260 releases {frames} direct {direct}"
+                "frame-load: phase {name} frames {frames} late {late} skipped {skipped} failed 0 capped {capped} wakeups {wakeups} take-max-us 410 compose-max-us {compose} device-max-us 120 frame-max-us 3070 band-max-us 260 releases {frames} direct {direct}"
             ));
             lines.push(format!("frame-load: hist {name} 0 212 26 2 0"));
             lines.push(format!("frame-load: bands {name} {bands}"));
-            if matches!(phase.scene(), Scene::P | Scene::F) {
+            if matches!(phase.scene(), Scene::P | Scene::F | Scene::O) {
                 lines.push(format!(
                     "frame-load: window {name} id 1 interval 1 posts {frames} taken {frames} replaced 0 late 0 missed 0 late-max-us 0"
                 ));
@@ -565,10 +681,10 @@ mod tests {
                 lines.push("frame-load: legacy direct flushes 77".to_owned());
             }
             if phase.loads().cpu || phase == Phase::Quiet {
-                let n = if phase == Phase::Stress {
-                    200_000
-                } else {
-                    812_345
+                let n = match phase {
+                    Phase::FullLoaded => 200_000,
+                    Phase::Overload => 100_000,
+                    _ => 812_345,
                 };
                 lines.push(format!("frame-load: cpu {name} loops-per-s {n}"));
             }
@@ -602,7 +718,7 @@ mod tests {
                 .any(|l| l.starts_with("frame-probe: net: 240 frames, late 0, skipped 0"))
         );
         assert!(said.iter().any(|l| {
-            l.starts_with("frame-probe: stress: 240 periods, frames 200, late 0, skipped 0")
+            l.starts_with("frame-probe: full-loaded: 240 periods, frames 200, late 0, skipped 0")
         }));
         assert!(
             said.iter()
@@ -673,25 +789,113 @@ mod tests {
     }
 
     #[test]
-    fn too_few_frames_in_stress_fail_and_so_does_a_loop_that_did_not_turn() {
+    fn too_few_frames_in_full_loaded_fail_and_so_does_a_loop_that_did_not_turn() {
         let mut lines = good();
         let l = lines
             .iter_mut()
-            .find(|l| l.starts_with("frame-load: phase stress "))
+            .find(|l| l.starts_with("frame-load: phase full-loaded "))
             .unwrap();
         *l = l.replace("frames 200", "frames 59");
         assert!(
             verdict(&lines, true)
                 .unwrap_err()
-                .starts_with("stress: 59 frames")
+                .starts_with("full-loaded: 59 frames")
         );
         let mut lines = good();
         replace_line(
             &mut lines,
-            "frame-load: cpu stress ",
-            "frame-load: cpu stress loops-per-s 0",
+            "frame-load: cpu full-loaded ",
+            "frame-load: cpu full-loaded loops-per-s 0",
         );
         assert!(verdict(&lines, true).is_err());
+    }
+
+    /// The model of the bands here is the service's: a frame of one opaque window
+    /// over the whole screen has the bands `full_screen_bands` counts.
+    #[test]
+    fn the_band_model_agrees_with_the_service_for_the_whole_screen() {
+        assert_eq!(
+            bands_of(640, 400, 1, 0, 0),
+            u64::from(compositor::full_screen_bands())
+        );
+    }
+
+    /// Eight windows with an alpha over one place take far more bands than the
+    /// cap lets the service make in a period.
+    #[test]
+    fn a_frame_of_the_overload_is_many_periods_of_the_cap() {
+        let bands = overload_frame_bands();
+        let cap = u64::from(frame_cap_bands());
+        assert_eq!(cap, 52);
+        assert!(bands > 8 * cap, "{bands} bands");
+    }
+
+    fn overload_line(lines: &mut [String], from: &str, to: &str) {
+        let l = lines
+            .iter_mut()
+            .find(|l| l.starts_with("frame-load: phase overload "))
+            .unwrap();
+        *l = l.replace(from, to);
+    }
+
+    #[test]
+    fn a_good_overload_passes_and_is_reported() {
+        let said = verdict(&good(), true).unwrap();
+        assert!(said.iter().any(|l| {
+            l.starts_with("frame-probe: overload: 30 frames of ")
+                && l.contains("capped 240, skipped 210, late 30, cpu share 0.12 (floor 0.08)")
+        }));
+    }
+
+    /// The faults the verdict of the overload exists for.
+    #[test]
+    fn a_hog_under_the_floor_no_cap_or_a_frame_on_time_fails() {
+        // The CPU load kept under 0.08 of its loop alone.
+        let mut lines = good();
+        replace_line(
+            &mut lines,
+            "frame-load: cpu overload ",
+            "frame-load: cpu overload loops-per-s 50000",
+        );
+        let e = verdict(&lines, true).unwrap_err();
+        assert!(e.starts_with("overload: the CPU load kept 0.06"), "{e}");
+        // The cap never put a band off.
+        let mut lines = good();
+        overload_line(&mut lines, "capped 240", "capped 0");
+        let e = verdict(&lines, true).unwrap_err();
+        assert!(e.starts_with("overload: capped 0 for releases 30"), "{e}");
+        // A frame shown in its period though the scene cannot make one.
+        let mut lines = good();
+        overload_line(&mut lines, "late 30", "late 29");
+        let e = verdict(&lines, true).unwrap_err();
+        assert!(e.starts_with("overload: skipped 210 late 29 of 30"), "{e}");
+        // No skip.
+        let mut lines = good();
+        overload_line(&mut lines, "skipped 210", "skipped 0");
+        assert!(
+            verdict(&lines, true)
+                .unwrap_err()
+                .starts_with("overload: skipped 0")
+        );
+        // Fewer frames than a frame a period count would give.
+        let mut lines = good();
+        overload_line(&mut lines, "frames 30", "frames 0");
+        overload_line(&mut lines, "late 30", "late 0");
+        overload_line(&mut lines, "releases 30", "releases 0");
+        let e = verdict(&lines, true).unwrap_err();
+        assert!(e.contains("0 frames of 240 periods"), "{e}");
+        // A reference with no loops makes no share to judge.
+        let mut lines = good();
+        replace_line(
+            &mut lines,
+            "frame-load: cpu hog-ref ",
+            "frame-load: cpu hog-ref loops-per-s 0",
+        );
+        assert!(verdict(&lines, true).is_err());
+        // The counts alone judge no time.
+        let mut lines = good();
+        overload_line(&mut lines, "capped 240", "capped 0");
+        assert!(verdict(&lines, false).is_ok());
     }
 
     #[test]

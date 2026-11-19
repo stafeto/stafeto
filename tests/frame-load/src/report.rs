@@ -280,7 +280,10 @@ mod tests {
 
     #[test]
     fn a_line_renders_into_a_buffer() {
-        let (bytes, n) = render::<64>(&CpuLine(Phase::Stress, 812_345));
-        assert_eq!(&bytes[..n], b"frame-load: cpu stress loops-per-s 812345");
+        let (bytes, n) = render::<64>(&CpuLine(Phase::FullLoaded, 812_345));
+        assert_eq!(
+            &bytes[..n],
+            b"frame-load: cpu full-loaded loops-per-s 812345"
+        );
     }
 }

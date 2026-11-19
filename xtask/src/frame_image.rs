@@ -140,7 +140,7 @@ pub fn loads_verdict(lines: &[String]) -> Result<String, String> {
             }
         }
         match phase.scene() {
-            Scene::P | Scene::F => {
+            Scene::P | Scene::F | Scene::O => {
                 let prefix = format!("frame-load: draw {name} ");
                 match number_after(lines, &prefix, "posts") {
                     Some(n) if n > 0 => said.push(format!("{name} posts {n}")),
@@ -245,7 +245,7 @@ mod tests {
                 lines.push(format!("frame-load: cpu {name} loops-per-s 812345"));
             }
             match phase.scene() {
-                Scene::P | Scene::F => lines.push(format!(
+                Scene::P | Scene::F | Scene::O => lines.push(format!(
                     "frame-load: draw {name} posts 239 no-free-buffer 0"
                 )),
                 Scene::D => lines.push(format!("frame-load: legacy {name} flushes 77")),
@@ -275,7 +275,7 @@ mod tests {
             good().into_iter().filter(|l| !l.contains(text)).collect()
         };
         for (cut, want) in [
-            ("cpu stress", "CPU load in the phase stress"),
+            ("cpu full-loaded", "CPU load in the phase full-loaded"),
             (
                 "draw net posts",
                 "paced client posted nothing in the phase net",

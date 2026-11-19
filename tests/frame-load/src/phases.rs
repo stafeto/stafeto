@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The phases of the probe, by the clock of the guest. Each phase is 4 s (240
-//! periods of 60 Hz) and has a scene on the screen and a set of loads running.
+//! periods of 60 Hz), the reference of the CPU load 1 s, and has a scene on the
+//! screen and a set of loads running.
 //! Every load program derives its own start and stop from this table and the
 //! epoch, so the conductor does not have to tell them: they are started by
 //! init at boot, sleep until their first phase, work while the phase lasts
@@ -14,6 +15,8 @@ pub const PERIOD_NS: u64 = 16_666_667;
 /// The length of a phase, in periods and in ns.
 pub const PERIODS: u64 = 240;
 pub const PHASE_NS: u64 = PERIODS * PERIOD_NS;
+/// The reference phase of the CPU load: one second, 60 periods.
+pub const HOG_REF_PERIODS: u64 = 60;
 /// Where the first phase starts on the guest's clock (time since boot), in
 /// ns. The programs start at boot and the image is up in a few seconds of
 /// guest time, so 30 s leave the room, and a program that starts later than
@@ -31,6 +34,10 @@ pub enum Scene {
     F,
     /// A window of the first revision over the whole screen: shown directly.
     D,
+    /// Eight windows of 320 by 200 points with an alpha, over one another in one
+    /// place, each posted whole every period: more bands than the cap lets the
+    /// service make in a period.
+    O,
 }
 
 /// Which loads run in a phase.
@@ -50,21 +57,25 @@ pub enum Phase {
     Cpu,
     Files,
     Net,
-    Stress,
+    FullLoaded,
     Direct,
+    HogRef,
+    Overload,
 }
 
 /// The order of the phases: the loads are added one after another, and the
 /// last two have them all.
-pub const ORDER: [Phase; 8] = [
+pub const ORDER: [Phase; 10] = [
     Phase::Quiet,
     Phase::Idle,
     Phase::Full,
     Phase::Cpu,
     Phase::Files,
     Phase::Net,
-    Phase::Stress,
+    Phase::FullLoaded,
     Phase::Direct,
+    Phase::HogRef,
+    Phase::Overload,
 ];
 
 impl Phase {
@@ -76,16 +87,19 @@ impl Phase {
             Phase::Cpu => "cpu",
             Phase::Files => "files",
             Phase::Net => "net",
-            Phase::Stress => "stress",
+            Phase::FullLoaded => "full-loaded",
             Phase::Direct => "direct",
+            Phase::HogRef => "hog-ref",
+            Phase::Overload => "overload",
         }
     }
 
     pub const fn scene(self) -> Scene {
         match self {
-            Phase::Quiet => Scene::None,
+            Phase::Quiet | Phase::HogRef => Scene::None,
+            Phase::Overload => Scene::O,
             Phase::Idle | Phase::Cpu | Phase::Files | Phase::Net => Scene::P,
-            Phase::Full | Phase::Stress => Scene::F,
+            Phase::Full | Phase::FullLoaded => Scene::F,
             Phase::Direct => Scene::D,
         }
     }
@@ -93,11 +107,24 @@ impl Phase {
     pub const fn loads(self) -> Loads {
         let (cpu, files, net) = match self {
             Phase::Quiet | Phase::Idle | Phase::Full => (false, false, false),
-            Phase::Cpu => (true, false, false),
+            Phase::Cpu | Phase::HogRef | Phase::Overload => (true, false, false),
             Phase::Files => (true, true, false),
-            Phase::Net | Phase::Stress | Phase::Direct => (true, true, true),
+            Phase::Net | Phase::FullLoaded | Phase::Direct => (true, true, true),
         };
         Loads { cpu, files, net }
+    }
+
+    /// The periods of the phase.
+    pub const fn periods(self) -> u64 {
+        match self {
+            Phase::HogRef => HOG_REF_PERIODS,
+            _ => PERIODS,
+        }
+    }
+
+    /// The length of the phase in ns.
+    pub const fn duration_ns(self) -> u64 {
+        self.periods() * PERIOD_NS
     }
 
     const fn index(self) -> usize {
@@ -122,22 +149,31 @@ impl Schedule {
     pub const DEFAULT: Schedule = Schedule { epoch_ns: EPOCH_NS };
 
     pub const fn start_of(&self, phase: Phase) -> u64 {
-        self.epoch_ns + phase.index() as u64 * PHASE_NS
+        let mut at = self.epoch_ns;
+        let mut i = 0;
+        while i < phase.index() {
+            at += ORDER[i].duration_ns();
+            i += 1;
+        }
+        at
     }
 
     pub const fn end_of(&self, phase: Phase) -> u64 {
-        self.start_of(phase) + PHASE_NS
+        self.start_of(phase) + phase.duration_ns()
     }
 
     /// The end of the last phase.
     pub const fn finish(&self) -> u64 {
-        self.epoch_ns + ORDER.len() as u64 * PHASE_NS
+        self.end_of(ORDER[ORDER.len() - 1])
     }
 
     /// The phase `now_ns` is in, or `None` before the epoch and after the end.
     pub fn at(&self, now_ns: u64) -> Option<Phase> {
-        let since = now_ns.checked_sub(self.epoch_ns)?;
-        ORDER.get((since / PHASE_NS) as usize).copied()
+        now_ns.checked_sub(self.epoch_ns)?;
+        ORDER
+            .iter()
+            .copied()
+            .find(|&p| now_ns >= self.start_of(p) && now_ns < self.end_of(p))
     }
 
     /// The first phase after `now_ns` in which `wants` is true, or the one
@@ -177,11 +213,21 @@ mod tests {
         assert_eq!(
             names,
             [
-                "quiet", "idle", "full", "cpu", "files", "net", "stress", "direct"
+                "quiet",
+                "idle",
+                "full",
+                "cpu",
+                "files",
+                "net",
+                "full-loaded",
+                "direct",
+                "hog-ref",
+                "overload"
             ]
         );
         let at = |p: Phase| ORDER.iter().position(|&o| o == p).unwrap();
-        assert!(at(Phase::Net) < at(Phase::Stress), "stress comes after net");
+        assert!(at(Phase::Net) < at(Phase::FullLoaded));
+        assert!(at(Phase::HogRef) + 1 == at(Phase::Overload));
         assert!(at(Phase::Files) < at(Phase::Net));
         assert!(at(Phase::Cpu) < at(Phase::Files));
     }
@@ -191,7 +237,9 @@ mod tests {
         assert_eq!(Phase::Quiet.scene(), Scene::None);
         assert_eq!(Phase::Idle.scene(), Scene::P);
         assert_eq!(Phase::Full.scene(), Scene::F);
-        assert_eq!(Phase::Stress.scene(), Scene::F);
+        assert_eq!(Phase::FullLoaded.scene(), Scene::F);
+        assert_eq!(Phase::Overload.scene(), Scene::O);
+        assert_eq!(Phase::HogRef.scene(), Scene::None);
         assert_eq!(Phase::Direct.scene(), Scene::D);
         let none = Loads {
             cpu: false,
@@ -213,9 +261,18 @@ mod tests {
             files: true,
             net: true,
         };
-        for p in [Phase::Net, Phase::Stress, Phase::Direct] {
+        for p in [Phase::Net, Phase::FullLoaded, Phase::Direct] {
             assert_eq!(p.loads(), all, "{}", p.name());
         }
+        // The overload has the CPU load alone, so that the share it keeps
+        // means the cap and not the budgets of the files and the network.
+        let cpu = Loads {
+            cpu: true,
+            files: false,
+            net: false,
+        };
+        assert_eq!(Phase::HogRef.loads(), cpu);
+        assert_eq!(Phase::Overload.loads(), cpu);
     }
 
     #[test]
@@ -225,7 +282,12 @@ mod tests {
             assert_eq!(s.end_of(pair[0]), s.start_of(pair[1]));
         }
         assert_eq!(s.start_of(Phase::Quiet), EPOCH_NS);
-        assert_eq!(s.finish(), s.end_of(Phase::Direct));
+        assert_eq!(s.finish(), s.end_of(Phase::Overload));
+        // The reference of the CPU load is a second.
+        assert_eq!(
+            s.end_of(Phase::HogRef) - s.start_of(Phase::HogRef),
+            1_000_000_020
+        );
     }
 
     #[test]
@@ -235,7 +297,7 @@ mod tests {
         assert_eq!(s.at(1000), Some(Phase::Quiet));
         assert_eq!(s.at(1000 + PHASE_NS - 1), Some(Phase::Quiet));
         assert_eq!(s.at(1000 + PHASE_NS), Some(Phase::Idle));
-        assert_eq!(s.at(s.finish() - 1), Some(Phase::Direct));
+        assert_eq!(s.at(s.finish() - 1), Some(Phase::Overload));
         assert_eq!(s.at(s.finish()), None);
     }
 
