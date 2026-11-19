@@ -140,6 +140,8 @@ pub unsafe fn init(session: Option<Handle<Channel>>) {
 /// The child's only thread, before anything else of the layer runs.
 pub unsafe fn after_fork(session: Option<Handle<Channel>>) {
     SESSION.store(session.map_or(0, |s| s.into_raw().0), Ordering::Release);
+    // The child's session is the clone: the parent's failed close is not its own.
+    CLOSE_FAILED.store(false, Ordering::Release);
     if SESSION.load(Ordering::Acquire) == 0 {
         CWD_HANDLE.store(NONE, Ordering::Release);
         CWD_CHECKED.store(false, Ordering::Release);
@@ -299,6 +301,8 @@ fn forget(raw: rt::abi::Handle) {
         // (the next path call opens it again from the string) and the listings.
         CWD_HANDLE.store(NONE, Ordering::Release);
         CWD_CHECKED.store(false, Ordering::Release);
+        // A close that failed was a call on the session that is gone.
+        CLOSE_FAILED.store(false, Ordering::Release);
         LISTINGS.forget_all();
     }
 }
@@ -537,13 +541,13 @@ pub fn stat(vol: &Vol) -> Result<proto_fs::NodeInfo, i32> {
 }
 
 /// access of a path of the volume: `bits` as `R_OK`, `W_OK` and `X_OK` (0 for `F_OK`), with the
-/// real identifiers unless `effective`. Write permission on a volume the layer cannot write to is
-/// EROFS for a path that exists (XSH access()).
+/// real identifiers unless `effective`. The service's answer is the answer, except that a regular
+/// file is never executable here (a program is not run from the volume): X_OK on one is EACCES.
 pub fn access(vol: &Vol, bits: c_int, effective: bool) -> Result<(), i32> {
     let flags = if effective { 0 } else { p::ACCESS_REAL };
     ask(|w| p::access(vol.bytes(), bits as u32 & 7, flags, w))?;
-    if bits & 2 != 0 {
-        return Err(EROFS);
+    if bits & 1 != 0 && stat(vol)?.kind != 1 {
+        return Err(EACCES);
     }
     Ok(())
 }
