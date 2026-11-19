@@ -112,6 +112,8 @@ pub struct Disk {
     notify: Handle<Channel>,
     sectors: u64,
     pub flush: bool,
+    /// The reads of the volume since the start, for the line of a walk.
+    pub reads: u64,
 }
 
 enum Got {
@@ -214,6 +216,19 @@ impl Device for Disk {
     }
 
     fn read(&mut self, sector: u64, out: &mut [u8]) -> Result<(), DeviceError> {
+        // A stop notice ends a walk at its next read, and so does a queued job when the walk may
+        // give way to one: the walk only reads, nothing is lost, and the glue leaves the caches of
+        // littlefs without the block of the failed read.
+        if WALKING.load(Acquire) {
+            if STOPPING.load(Acquire) {
+                return Err(DeviceError);
+            }
+            if YIELD_OK.load(Acquire) && queued_job() {
+                YIELDED.store(true, Release);
+                return Err(DeviceError);
+            }
+        }
+        self.reads += 1;
         for (i, chunk) in out.chunks_mut(CELL_BYTES as usize).enumerate() {
             let at = sector + (i * CELL_BYTES as usize / SECTOR) as u64;
             let key = self
@@ -341,6 +356,7 @@ fn connect_disk(process: &Handle<Process>) -> Result<Disk, &'static str> {
         dead: AtomicBool::new(false),
         sectors: info.sectors,
         flush: info.flush(),
+        reads: 0,
     })
 }
 
@@ -374,8 +390,9 @@ fn open_volume(disk: Disk) -> Option<Volume> {
     // SAFETY: the storage is the worker's alone, and lives for the life of the process.
     let storage = unsafe { &mut *STORAGE.get() };
     match volume::open(disk, storage, seed) {
-        Ok((mut fs, did, part)) => {
-            let used = fs.used_blocks().unwrap_or(0);
+        Ok((fs, did, part)) => {
+            // No count of the blocks in use here: that is a walk of the whole volume, which the
+            // worker makes after READY, when its queue is empty (`first_walk`).
             let how = match did {
                 Did::Partitioned => "partition table written, data volume formatted",
                 Did::Formatted => "data volume formatted",
@@ -385,7 +402,7 @@ fn open_volume(disk: Disk) -> Option<Volume> {
                 }
             };
             rt::println!(
-                "datafs: {how}, {} blocks, {used} in use, partition at sector {}",
+                "datafs: {how}, {} blocks, partition at sector {}",
                 fs.blocks(),
                 part.first
             );
@@ -445,6 +462,19 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
     }
     let mut server = Server::with_epoch(epoch);
     let kicks = Handle::<Channel>::borrowed(abi::Handle(JOBS_CHANNEL.load(Acquire)));
+    // The idle work: the first walk after READY, and the walk that finds the blocks removals gave
+    // back. A timer on the kick channel wakes the thread when the queue has been empty for
+    // `IDLE_NS`; without one (the kernel refused it) the refresh does not happen.
+    let timer = sys::timer_create(&kicks, LEVEL).ok();
+    let mut idle = Idle {
+        first_pending: volume.is_some(),
+        last_job: rt::time::ticks_to_ns(rt::time::now()),
+        refresh_failed: false,
+        tries: 0,
+        filled_at_mount: volume
+            .as_ref()
+            .is_some_and(|fs| u64::from(fs.window_state().2) == fs.blocks()),
+    };
     loop {
         while let Some(i) = oldest() {
             if STOPPING.load(Acquire) && stop_decision() == Drain::GiveUp {
@@ -455,6 +485,18 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
             let job = unsafe { &mut *job(i) };
             let request = &job.request[..job.request_len];
             match (&mut volume, job.kind) {
+                // At the stop a job that would take blocks from an empty window would walk the
+                // whole volume inside the 3 s of the stop (an aborted walk empties the window):
+                // it gets the status the service gives every request after the notice.
+                (Some(fs), REQUEST)
+                    if STOPPING.load(Acquire)
+                        && fs.window_state().2 == 0
+                        && datafs::server::needs_blocks(request) =>
+                {
+                    let bytes = proto_wire::reply(Status::Kernel(abi::Error::BadState));
+                    job.reply[..bytes.len()].copy_from_slice(&bytes);
+                    job.reply_len = bytes.len();
+                }
                 (Some(fs), REQUEST) => {
                     let reply = server.handle(fs, job.owner, job.aux, request);
                     let bytes = reply.as_bytes();
@@ -474,6 +516,7 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
                 }
             }
             state(i).store(DONE, Release);
+            idle.last_job = rt::time::ticks_to_ns(rt::time::now());
             if STOPPING.load(Acquire) {
                 STOP_JOBS.fetch_add(1, Release);
             }
@@ -488,7 +531,165 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
                 let _ = sys::receive(&kicks);
             }
         }
+        // The queue is empty: the walks of the idle. Requests that came before this point were
+        // served first. A job that comes during a walk stops it at the next read, is served, and
+        // the walk is tried again when the queue is empty (`datafs::idle::MAX_YIELDS` tries; after that it runs
+        // to its end, and a request waits for it).
+        if let Some(fs) = volume.as_mut() {
+            if idle.first_pending {
+                idle_walk(fs, &mut idle, true);
+                continue;
+            }
+            if refresh_wanted(fs, &idle) {
+                let now = rt::time::ticks_to_ns(rt::time::now());
+                let wait = (idle.last_job + IDLE_NS).saturating_sub(now);
+                if wait == 0 {
+                    idle_walk(fs, &mut idle, false);
+                    continue;
+                }
+                if let Some(timer) = &timer {
+                    let _ = sys::timer_set(timer, now + wait);
+                }
+            }
+        }
         let _ = sys::receive(&kicks);
+    }
+}
+
+/// How long the queue stays empty before the worker walks the volume to count the blocks that
+/// removals gave back.
+const IDLE_NS: u64 = 2_000_000_000;
+
+/// What the worker keeps for its idle walks.
+struct Idle {
+    /// The first walk after the mount has not been made yet.
+    first_pending: bool,
+    /// The instant the last job ended, in nanoseconds.
+    last_job: u64,
+    /// A refresh walk failed: no more of them in this instance (the disk is not answering well).
+    refresh_failed: bool,
+    /// The walks a queued job has stopped since the last walk that ended.
+    tries: u32,
+    /// The window was full when the mount work ended (a directory made at mount filled it).
+    filled_at_mount: bool,
+}
+
+/// Whether a walk in the idle would help: the blocks that removals, truncations and replacing
+/// renames gave back since the last walk are over a sixteenth of the volume and the window's free
+/// bits are under a sixteenth too (a walk inside a request is then about to happen, and the free
+/// count of STATFS is low by what was given back); or the window holds less than the volume (the
+/// allocator wrapped in the middle of a request) and the free count is low.
+fn refresh_wanted(fs: &Volume, idle: &Idle) -> bool {
+    if idle.refresh_failed || STOPPING.load(Acquire) {
+        return false;
+    }
+    let sixteenth = fs.blocks() / 16;
+    fs.window_short() || (fs.freed_estimate() > sixteenth && fs.window_free() < sixteenth)
+}
+
+/// How a walk ended.
+enum Walked {
+    Done {
+        reads: u64,
+        ms: u64,
+    },
+    /// A queued job (or the stop) ended it at a read: the window is empty and the walk is tried
+    /// again later.
+    Yielded {
+        reads: u64,
+    },
+    Failed {
+        reads: u64,
+        ms: u64,
+    },
+}
+
+/// The walk of a volume while no request waits: fills the allocator's window from the tree, so that
+/// every request after it finds the free count and the free blocks with no walk of its own. It only
+/// reads. The worker marks it (`WALKING`), the disk calls it makes stamp the progress the request
+/// thread looks at, and a stop notice ends it at its next read, as a queued job does when `may_yield`.
+fn walk(fs: &mut Volume, may_yield: bool) -> Walked {
+    let reads_before = fs.device().device.reads;
+    let started = rt::time::ticks_to_ns(rt::time::now());
+    YIELDED.store(false, Release);
+    YIELD_OK.store(may_yield, Release);
+    WALKING.store(true, Release);
+    let ok = fs.walk().is_ok();
+    WALKING.store(false, Release);
+    YIELD_OK.store(false, Release);
+    let ms = rt::time::ticks_to_ns(rt::time::now()).saturating_sub(started) / 1_000_000;
+    let reads = fs.device().device.reads - reads_before;
+    if ok {
+        Walked::Done { reads, ms }
+    } else if YIELDED.swap(false, Release) || STOPPING.load(Acquire) {
+        Walked::Yielded { reads }
+    } else {
+        Walked::Failed { reads, ms }
+    }
+}
+
+/// One idle walk, the first after the mount (`first`) or a refresh, with its line.
+fn idle_walk(fs: &mut Volume, idle: &mut Idle, first: bool) {
+    let blocks = fs.blocks();
+    let used = |fs: &Volume| blocks.saturating_sub(fs.window_free());
+    if first && u64::from(fs.window_state().2) == blocks {
+        // The mount work or a request filled the window whole before this point.
+        idle.first_pending = false;
+        let who = if idle.filled_at_mount {
+            "made at mount"
+        } else {
+            "made by a request"
+        };
+        rt::println!("datafs: first walk {who}, {} blocks used", used(fs));
+        return;
+    }
+    let freed = fs.freed_estimate();
+    match walk(fs, datafs::idle::may_yield(idle.tries)) {
+        Walked::Done { reads, ms } => {
+            let tries = idle.tries;
+            idle.tries = 0;
+            let by = AbortedTries(tries);
+            if first {
+                idle.first_pending = false;
+                rt::println!(
+                    "datafs: first walk {} blocks used, {reads} reads, {ms} ms{by}",
+                    used(fs)
+                );
+            } else {
+                rt::println!(
+                    "datafs: refresh walk {} blocks used, about {freed} given back, {reads} reads, {ms} ms{by}",
+                    used(fs)
+                );
+            }
+        }
+        Walked::Yielded { reads } => {
+            idle.tries += 1;
+            rt::println!(
+                "datafs: walk stopped for a request after {reads} reads, try {}",
+                idle.tries
+            );
+        }
+        Walked::Failed { reads, ms } => {
+            if first {
+                idle.first_pending = false;
+                rt::println!("datafs: first walk failed after {reads} reads, {ms} ms");
+            } else {
+                idle.refresh_failed = true;
+                rt::println!("datafs: refresh walk failed after {reads} reads, {ms} ms");
+            }
+        }
+    }
+}
+
+/// The tail of a walk line that says how many tries a request stopped (nothing for none).
+struct AbortedTries(u32);
+
+impl core::fmt::Display for AbortedTries {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            0 => Ok(()),
+            n => write!(f, ", after {n} tries a request stopped"),
+        }
     }
 }
 

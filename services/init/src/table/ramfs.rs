@@ -148,6 +148,7 @@ const RAM_BASE: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 /// Standalone RAM probes use an explicit deterministic source.
@@ -202,6 +203,7 @@ pub const TABLE: &[Record] = &[
         waits: &[],
         budgets: &[],
         free: 0,
+        broken_after: None,
     },
 ];
 

@@ -124,6 +124,7 @@ pub const CONSOLE: Record = Record {
     waits: &[],
     budgets: super::ramfs::CONSOLE_BUDGETS,
     free: super::ramfs::SERVICE_FREE,
+    broken_after: None,
 };
 
 /// The walk of bus 0 (tests/pci-walk): one window over the whole ECAM of

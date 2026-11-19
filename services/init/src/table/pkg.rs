@@ -156,6 +156,7 @@ pub const BLK: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 /// The bytes of the store of an image with no disk: 256 MiB, the object of the memory disk.
@@ -425,6 +426,7 @@ pub const BLK_PROBE: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 /// The image of the disk probe: the PL011's driver, the disk service and
@@ -445,8 +447,13 @@ pub const DATAFS_BUDGETS: &[Budget] = &[Budget {
 /// The data file service (services/datafs): the files of `/data` on the data partition of the disk
 /// service. Its request thread works at 36 under a budget, above the clients of POSIX (ceiling 31) and
 /// below the disk service (39) whose client its worker is, at 30. Its quota is the worker's stack, the
-/// disk buffer and the pages of the volume's memory with room over. It connects to the disk service and
-/// restarts: a new instance mounts the volume again, and a client opens its files again.
+/// disk buffer and the pages of the volume's memory with room over. The allocator's window (one bit for
+/// each block, 128 KiB for a volume of 4 GiB, 32 pages) is in the volume's memory, which is a static of
+/// the program: init pays for it as a segment at the load (`quota::need_pages` counts the segments of
+/// the program besides the quota), so the quota stays at 512 pages. It connects to the disk service and restarts: a new
+/// instance mounts the volume again, and a client opens its files again. A service that ends twice in a
+/// row with the stuck exit (6, no disk call completed for 20 s with a job waiting) is marked broken: a
+/// restart would mount the same volume again and wait on it again, for ever (stafeto#443).
 pub const DATAFS: Record = Record {
     name: "datafs",
     program: "datafsd",
@@ -477,6 +484,7 @@ pub const DATAFS: Record = Record {
     waits: &[],
     budgets: DATAFS_BUDGETS,
     free: super::ramfs::SERVICE_FREE,
+    broken_after: Some((6, 2)),
 };
 
 /// The probe of the data file service (tests/data-probe): a client at 30 with a session of the
@@ -511,6 +519,7 @@ pub const DATA_PROBE: Record = Record {
     }],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 /// The image of the data probe: the PL011's driver, the disk service, the data file service and the
@@ -557,6 +566,7 @@ pub const DATAKEY: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 /// The probe of the host key service (tests/datakey-probe): the boot script of Dropbear without the
@@ -630,6 +640,7 @@ pub const PKGD: Record = Record {
     waits: &[],
     budgets: &[],
     free: 0,
+    broken_after: None,
 };
 
 /// The probe of the package service (tests/store-probe): the first POSIX process, root,
@@ -1031,6 +1042,20 @@ mod tests {
         assert_eq!(NVME_QEMU_DATA.program, "nvme-blk");
         assert_eq!(BLK_DATADISK.name, "datadisk");
         assert_eq!(DATAFS.connects, &["datadisk"]);
+        // The stuck exit (services/datafs `STUCK`, 6) twice in a row marks the service broken, and
+        // no other record has such a rule: a restart of the stuck volume would only repeat it.
+        assert_eq!(DATAFS.broken_after, Some((6, 2)));
+        for table in [
+            crate::table::aws::TABLE,
+            crate::table::aws::QEMU_TABLE,
+            DATA_PROBE_TABLE,
+        ] {
+            for record in table.iter().filter(|r| r.name != "datafs") {
+                assert_eq!(record.broken_after, None, "{}", record.name);
+            }
+        }
+        // The allocator's window of 32 pages is a segment of the program, paid at load; the quota does not hold it.
+        assert_eq!(DATAFS.quota, 512 * PAGE);
         assert_eq!(DATAKEY_PROBE_TABLE[2].name, "datadisk");
         assert!(DATA_PROBE_TABLE.iter().any(|r| r.name == "datadisk"));
         assert!(DATA_PROBE_TABLE.iter().all(|r| r.name != "blk"));

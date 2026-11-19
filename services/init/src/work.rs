@@ -217,6 +217,7 @@ mod tests {
             waits: &[],
             budgets: &[],
             free: 0,
+            broken_after: None,
         }
     }
 
