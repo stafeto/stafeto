@@ -116,16 +116,22 @@ them for the licence notes of the image.
   arithmetic on one thread (no assembler, no LCD filter, no variable fonts, no
   properties read from the environment), so the same sources and the same font
   file give the same pixels on every run. After the build the script stops when
-  an object leaves undefined a name outside the list of the C library's
-  functions the library calls (`mem*`, `str*`, `fopen`, `fread`, `fseek`,
-  `ftell`, `fclose`, `malloc`, `calloc`, `realloc`, `free`, `qsort`, `setjmp`,
-  `longjmp`, `strtol`, `snprintf`, and the two names of the stack protector),
-  when relibc's `libc.a` does not define one of them, when the library reaches
-  `getenv`, threads, the dynamic loader, `mmap` or a floating-point function of
-  libm, when `getenv` is in an object, when an object calls `FT_Property_Set`
+  an object leaves undefined a name outside the exact list of the C library's
+  functions the library calls (`fopen`, `fread`, `fseek`, `ftell`, `fclose`,
+  `malloc`, `realloc`, `free`, `qsort`, `setjmp`, `longjmp`, `memcpy`,
+  `memmove`, `memset`, `strcmp`, `strlen`, `strstr`, and the two names of the
+  stack protector; `strtol`, `strtod`, `calloc`, `snprintf` and the like trip
+  the check, as the property strings and the debug memory would), when relibc's
+  `libc.a` does not define one of them, when the library reaches `getenv`,
+  threads, the dynamic loader, `mmap` or a floating-point function of libm,
+  when `getenv` is in an object, when an object calls `FT_Property_Set`
   from outside its own file, or when the text `FREETYPE_PROPERTIES` is in one.
-  `python3 -I tools/test_build_freetype.py` checks the configuration file and
-  these rules on samples. FTL asks a distribution to say in its documentation
+  The flags include `-fwrapv` and, for `--host`, `-funsigned-char` (the `char` of
+  AArch64 Linux). `python3 -I tools/test_build_freetype.py` checks the
+  configuration file and these rules on samples; the header of that file records
+  one real run of the planted fault (`STAFETO_FREETYPE_PORT_DIR` pointed at a
+  copy of `ftoption.h` with the environment properties on), which the build
+  refuses with `getenv`, `strtol` and the `FREETYPE_PROPERTIES` text. FTL asks a distribution to say in its documentation
   that the software is based in part on the work of the FreeType Team: the
   line is `ports/freetype/CREDIT.txt`, which the notices of a package that
   links FreeType carry in `/usr/share/licenses/<name>/freetype/`; the notes of a

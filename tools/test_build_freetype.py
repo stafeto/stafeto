@@ -7,7 +7,14 @@ configuration file of ports/freetype (the macros that keep the glyph path
 integer and free of run-time properties are as the plan of stage G4 says),
 the list of undefined names the build accepts, and the names no object may
 carry, each on samples of `llvm-nm` output and on a configuration with a
-planted fault."""
+planted fault.
+
+One real run of the planted fault (the file ftoption.h copied with
+FT_CONFIG_OPTION_ENVIRONMENT_PROPERTIES defined, the build pointed at the copy
+with STAFETO_FREETYPE_PORT_DIR) ended with exit status 1 and the findings
+FREETYPE_PROPERTIES (the text is in ftinit.o), getenv (the objects must not
+name it), getenv (a name the library never calls) and strtol (not in the list
+of the C library's functions it may call)."""
 
 import importlib.util
 from pathlib import Path
@@ -110,8 +117,12 @@ class NamesTests(unittest.TestCase):
         bad = builder.undefined_violations(["printf"])
         self.assertIn("printf", bad[0])
 
-    def test_the_families_of_names_pass(self):
-        self.assertEqual(builder.undefined_violations(["memchr", "strncmp", "strtol"]), [])
+    def test_the_names_of_the_property_and_debug_paths_are_refused(self):
+        for name in ("strtol", "strtod", "strtof", "calloc", "snprintf", "memchr", "strncmp"):
+            self.assertEqual(len(builder.undefined_violations([name])), 1, name)
+
+    def test_the_underscore_of_an_elf_name_stays(self):
+        self.assertEqual(builder.symbol_names("__stack_chk_fail\n"), ["__stack_chk_fail"])
 
     def test_getenv_in_an_object_is_found_defined_or_not(self):
         self.assertEqual(len(builder.absent_violations(["FT_Init_FreeType", "getenv"])), 1)

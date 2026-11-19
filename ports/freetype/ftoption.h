@@ -40,9 +40,8 @@
 #define TT_CONFIG_OPTION_MAX_RUNNABLE_OPCODES 1000000L
 #endif
 
-// Sizes of the structures psaux.h declares (the header comes in with
-// ftobjs.h; no Type 1 or CFF driver is built).
-#define T1_MAX_DICT_DEPTH 5
+// Sizes of the structures psaux.h declares (the header comes in through
+// ftobjs.c and ftpsprop.c; no Type 1 or CFF driver is built).
 #define T1_MAX_SUBRS_CALLS 16
 #define T1_MAX_CHARSTRINGS_OPERANDS 256
 
