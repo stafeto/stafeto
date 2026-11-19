@@ -514,6 +514,9 @@ impl PipeService {
         if self.step_due && !self.step_told {
             self.step_due = false;
             rt::service::step_own();
+            if self.watch_turn() {
+                return;
+            }
             let mut wakes = Wakes::default();
             let more = self.cleanup_step(&mut wakes);
             self.tell(&wakes);
@@ -521,6 +524,49 @@ impl PipeService {
                 self.kick();
             }
         }
+    }
+
+    /// The turn of the service's own for a watch whose subscriptions a
+    /// request left unfinished: one portion of at most `WATCH_STEP_QUEUES`
+    /// queues and nothing else in this turn. A refused portion marks the
+    /// record (`Take` answers AGAIN) and tells the waiter. After the last
+    /// portion the readiness of the set is checked once more, for a change
+    /// of a queue that was not subscribed yet when it happened. Returns
+    /// whether the turn was this (the next turn is kicked).
+    fn watch_turn(&mut self) -> bool {
+        let Some((label, key)) = self.watches.pending() else {
+            return false;
+        };
+        if !self.ops.waits(label, key) {
+            // The operation is gone: nothing is left to subscribe for.
+            rt::service::step_own();
+            self.watches.mark_registered(label, key, watch::MAX);
+            self.kick();
+            return true;
+        }
+        let ops = &self.ops;
+        let named = &self.named;
+        let tell = match self
+            .pipes
+            .watch_portion(self.watches, label, key, |(l, k)| {
+                ops.waits(l, k) || named.alive(l, k)
+            }) {
+            Ok(portion) => {
+                rt::service::step_own();
+                rt::service::step_detail(portion.subscribed as u64);
+                portion.ready
+            }
+            Err(_) => {
+                rt::service::step_own();
+                self.watches.refuse(label, key);
+                true
+            }
+        };
+        if tell {
+            self.ops.tell(label, key);
+        }
+        self.kick();
+        true
     }
 
     /// One reverse subscription and one deferred description per step.
@@ -881,16 +927,19 @@ impl PipeService {
         } else {
             Some(proto_pipe::AGAIN)
         };
+        let mut more = false;
         if registered {
-            for description in pipe::watches::unique_queues(&queues[..set.len]) {
-                let ops = &self.ops;
-                let named = &self.named;
-                if let Err(code) = self.pipes.wait_new(description, (label, key), |(l, k)| {
+            // The first portion only: the turn of the service's own
+            // subscribes the rest (`watch_turn`).
+            let ops = &self.ops;
+            let named = &self.named;
+            match self
+                .pipes
+                .watch_portion(self.watches, label, key, |(l, k)| {
                     ops.waits(l, k) || named.alive(l, k)
                 }) {
-                    refusal = Some(code);
-                    break;
-                }
+                Ok(portion) => more = !portion.last,
+                Err(code) => refusal = Some(code),
             }
         }
         if let Some(code) = refusal {
@@ -901,6 +950,9 @@ impl PipeService {
             let finished = self.ops.finish(&mut s.data.long, label, key);
             self.over(s, finished);
             return status(code);
+        }
+        if more {
+            self.kick();
         }
         long_answer(r, long::Reply::Wait(key))
     }
@@ -924,6 +976,10 @@ impl PipeService {
         else {
             return Answer::Status(Status::Kernel(Error::BadState));
         };
+        if !cancel && self.watches.refused(label, key) {
+            // A later portion of the subscriptions was refused.
+            return status(proto_pipe::AGAIN);
+        }
         if cancel {
             if !r.handles.is_empty() {
                 return Answer::Status(Status::BadSize);
@@ -1970,6 +2026,9 @@ impl Service<0> for PipeService {
             return;
         }
         self.step_told = false;
+        if self.watch_turn() {
+            return;
+        }
         let mut wakes = Wakes::default();
         let more = self.cleanup_step(&mut wakes);
         self.tell(&wakes);

@@ -12,7 +12,22 @@ struct Registration {
     queues: [u8; MAX],
     retired: bool,
     cleaned: u8,
+    /// How many of the record's unique queues are subscribed so far.
+    registered: u8,
+    /// How many unique queues the record has in all.
+    wanted: u8,
+    /// A later portion of subscriptions was refused: `Take` answers AGAIN.
+    refused: bool,
 }
+
+/// The most queues one step of the service subscribes a watch to. A request
+/// subscribes the first portion and answers `Wait`, and a turn of the
+/// service's own subscribes each next portion, so no step grows with the
+/// size of the set (at most `MAX` = 32 elements). In `posix-poll` the
+/// request step of a set of 32 was 19563 ticks against the bound of
+/// 20410 (96 %); the portion of 16 brings it to about 15200, under 0.9 of
+/// the bound (18369). Should a run show more than 16500, lower this to 8.
+pub const WATCH_STEP_QUEUES: usize = 16;
 /// Each readiness operation subscribes once to an underlying queue: a ring
 /// end (0 to 127) or a socket (128 to 255).
 pub fn unique_queues(queues: &[u8]) -> impl Iterator<Item = u32> + '_ {
@@ -67,8 +82,52 @@ impl<const N: usize> Pool<N> {
             queues,
             retired: false,
             cleaned: 0,
+            registered: 0,
+            wanted: unique_queues(&queues[..set.len]).count() as u8,
+            refused: false,
         });
         true
+    }
+    fn live_mut(&mut self, label: u64, key: u64) -> Option<&mut Registration> {
+        self.list
+            .iter_mut()
+            .flatten()
+            .find(|r| !r.retired && r.label == label && r.key == key)
+    }
+    /// How many unique queues of the live record are subscribed.
+    pub fn registered(&self, label: u64, key: u64) -> Option<usize> {
+        self.list
+            .iter()
+            .flatten()
+            .find(|r| !r.retired && r.label == label && r.key == key)
+            .map(|r| usize::from(r.registered))
+    }
+    /// The record has `n` unique queues subscribed.
+    pub fn mark_registered(&mut self, label: u64, key: u64, n: usize) {
+        if let Some(r) = self.live_mut(label, key) {
+            r.registered = n as u8;
+        }
+    }
+    /// The first live record with queues still to subscribe.
+    pub fn pending(&self) -> Option<(u64, u64)> {
+        self.list
+            .iter()
+            .flatten()
+            .find(|r| !r.retired && !r.refused && r.registered < r.wanted)
+            .map(|r| (r.label, r.key))
+    }
+    /// A later portion was refused: the record stays (a `Cancel` takes it
+    /// off) and `Take` answers AGAIN.
+    pub fn refuse(&mut self, label: u64, key: u64) {
+        if let Some(r) = self.live_mut(label, key) {
+            r.refused = true;
+        }
+    }
+    pub fn refused(&self, label: u64, key: u64) -> bool {
+        self.list
+            .iter()
+            .flatten()
+            .any(|r| !r.retired && r.label == label && r.key == key && r.refused)
     }
     pub fn get(&self, label: u64, key: u64) -> Option<&WatchSet> {
         self.list

@@ -56,6 +56,14 @@
 //! WatchStart/Take/Cancel use proto_wire::watch: at most 32 descriptions,
 //! one registration per actual description, READY through Cancel, which
 //! recomputes every original element and frees the registration.
+//! WatchStart checks every element and subscribes to at most 16 queues in
+//! its own step; the service subscribes to the rest in turns of its own. The
+//! answer Wait may therefore come before the subscription to every
+//! description is done. Take always recomputes every element, so no change
+//! is lost, and the service tells the waiter once it has subscribed to the
+//! last queue and one of the elements is ready. Take answers AGAIN when the
+//! service could not subscribe to a later queue (the waiter's queue is full);
+//! Cancel frees the registration at any point.
 //!
 //! BAD_FD for an end the session does not hold or of the wrong kind.
 //! An end goes when its last session lets go of it: by CLOSE, or when the

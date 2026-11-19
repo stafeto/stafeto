@@ -21,6 +21,17 @@ pub mod named;
 pub mod sockets;
 pub mod verify;
 pub mod watches;
+
+/// What one portion of a watch's subscriptions did (`Pipes::watch_portion`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Portion {
+    /// The queues the portion subscribed.
+    pub subscribed: usize,
+    /// No queue of the watch is left to subscribe.
+    pub last: bool,
+    /// The portion was the last and an element of the set is ready.
+    pub ready: bool,
+}
 pub use named::NamedInode;
 use proto_pipe::sock::{SOCK_END, SOCKETS};
 use proto_pipe::{Endpoint, NAMED_END, NAMED_MAX};
@@ -567,6 +578,72 @@ impl Pipes {
             return watch::NVAL;
         };
         self.readiness_at(index, end)
+    }
+
+    /// The readiness of the canonical queue a watch element was resolved to
+    /// (a ring end or a socket), with no session at hand.
+    pub fn queue_readiness(&self, queue: u32) -> u32 {
+        use proto_wire::watch;
+        let queue = queue as usize;
+        if queue < DESCRIPTIONS {
+            let (index, is_write) = proto_pipe::end_of(queue as u32);
+            self.readiness_at(index, usize::from(is_write))
+        } else if queue < DESCRIPTIONS + SOCKETS {
+            self.sock_readiness(queue - DESCRIPTIONS)
+        } else {
+            watch::NVAL
+        }
+    }
+
+    /// Subscribes the next portion (at most `WATCH_STEP_QUEUES` queues) of
+    /// the live watch `(label, key)`. A refusal leaves the queues of the
+    /// portion so far subscribed (a cancel takes them off). The portion
+    /// that completes the record is checked against the readiness of the
+    /// queues, which the first portion's request did not cover: `Ok` then
+    /// carries the number of the portion and whether it is the last, and
+    /// `ready` says whether an element of the set is ready already.
+    pub fn watch_portion<const N: usize>(
+        &mut self,
+        watches: &mut watches::Pool<N>,
+        label: u64,
+        key: u64,
+        alive: impl Fn(Waiter) -> bool,
+    ) -> Result<Portion, u32> {
+        let (Some(queues), Some(done)) = (
+            watches.queues(label, key).copied(),
+            watches.registered(label, key),
+        ) else {
+            return Ok(Portion {
+                subscribed: 0,
+                last: true,
+                ready: false,
+            });
+        };
+        let len = watches.get(label, key).map_or(0, |set| set.len);
+        let mut subscribed = 0;
+        for description in watches::unique_queues(&queues[..len])
+            .skip(done)
+            .take(watches::WATCH_STEP_QUEUES)
+        {
+            self.wait_new(description, (label, key), &alive)?;
+            subscribed += 1;
+        }
+        let all = watches::unique_queues(&queues[..len]).count();
+        watches.mark_registered(label, key, done + subscribed);
+        let last = done + subscribed >= all;
+        let ready = last
+            && watches.get(label, key).is_some_and(|set| {
+                (0..set.len).any(|i| {
+                    self.queue_readiness(u32::from(queues[i]))
+                        & (set.items[i].events | proto_wire::watch::ALWAYS)
+                        != 0
+                })
+            });
+        Ok(Portion {
+            subscribed,
+            last,
+            ready,
+        })
     }
 
     fn readiness_at(&self, index: usize, end: usize) -> u32 {
@@ -1295,5 +1372,197 @@ mod tests {
             "a writer is left"
         );
         assert_eq!(p.stat(&a, wr), Ok((0, 0)));
+    }
+
+    /// The watch tests: 32 ring ends of 16 pipes, the write ends first
+    /// (queues 0 to 15 of a portion) and the read ends after them.
+    struct Rig {
+        p: Box<Pipes>,
+        held: Held,
+        wr: Vec<u32>,
+        rd: Vec<u32>,
+        pool: watches::Pool<4>,
+    }
+
+    const LABEL: u64 = 1;
+    const KEY: u64 = 0x1_0000_0001;
+
+    fn rig() -> Rig {
+        let mut p = pipes();
+        let mut held = Held::default();
+        let (mut rd, mut wr) = (Vec::new(), Vec::new());
+        for _ in 0..CREATED_MAX {
+            let (r, w) = p.create(&mut held, LABEL, 1, 0).unwrap();
+            rd.push(r);
+            wr.push(w);
+        }
+        Rig {
+            p,
+            held,
+            wr,
+            rd,
+            pool: watches::Pool::new(),
+        }
+    }
+
+    fn watch_of(elements: &[u32]) -> (proto_pipe::WatchSet, [u8; proto_wire::watch::MAX]) {
+        let mut set = proto_pipe::WatchSet::new();
+        let mut queues = [0u8; proto_wire::watch::MAX];
+        set.len = elements.len();
+        for (i, &queue) in elements.iter().enumerate() {
+            set.items[i].description = queue;
+            set.items[i].events = proto_wire::watch::READ;
+            queues[i] = queue as u8;
+        }
+        (set, queues)
+    }
+
+    fn waiting_at(p: &Pipes, queue: u32) -> usize {
+        let (index, is_write) = proto_pipe::end_of(queue);
+        usize::from(p.pipes[index].ends[usize::from(is_write)].count)
+    }
+
+    fn portion(r: &mut Rig) -> Portion {
+        r.p.watch_portion(&mut r.pool, LABEL, KEY, |_| true)
+            .unwrap()
+    }
+
+    fn all_queues(r: &Rig) -> Vec<u32> {
+        r.wr.iter().chain(&r.rd).copied().collect()
+    }
+
+    #[test]
+    fn a_set_of_32_queues_is_subscribed_in_two_portions_of_16() {
+        let mut r = rig();
+        let queues = all_queues(&r);
+        let (set, q) = watch_of(&queues);
+        assert!(r.pool.insert(LABEL, KEY, set, q));
+        assert_eq!(r.pool.pending(), Some((LABEL, KEY)));
+        let first = portion(&mut r);
+        assert_eq!(
+            (first.subscribed, first.last, first.ready),
+            (16, false, false)
+        );
+        assert_eq!(
+            queues.iter().filter(|&&q| waiting_at(&r.p, q) == 1).count(),
+            16
+        );
+        assert_eq!(r.pool.pending(), Some((LABEL, KEY)));
+        let second = portion(&mut r);
+        assert_eq!(
+            (second.subscribed, second.last, second.ready),
+            (16, true, false)
+        );
+        assert!(queues.iter().all(|&q| waiting_at(&r.p, q) == 1));
+        assert_eq!(r.pool.pending(), None);
+    }
+
+    #[test]
+    fn a_description_repeated_across_the_boundary_is_subscribed_once() {
+        let mut r = rig();
+        let q = all_queues(&r);
+        // 16 distinct, then repeats of the last and the first of them, then
+        // 14 more distinct: 32 elements, 30 queues.
+        let mut elements: Vec<u32> = q[..16].to_vec();
+        elements.extend([q[15], q[0]]);
+        elements.extend(&q[16..30]);
+        assert_eq!(elements.len(), 32);
+        let (set, queues) = watch_of(&elements);
+        assert!(r.pool.insert(LABEL, KEY, set, queues));
+        assert_eq!(portion(&mut r).subscribed, 16);
+        assert_eq!(portion(&mut r).subscribed, 14);
+        assert_eq!(r.pool.pending(), None);
+        for &queue in &q[..30] {
+            assert_eq!(waiting_at(&r.p, queue), 1, "queue {queue}");
+        }
+        assert_eq!(waiting_at(&r.p, q[30]), 0);
+    }
+
+    #[test]
+    fn cancel_and_retirement_before_the_continuation_leave_nothing() {
+        for retire in [false, true] {
+            let mut r = rig();
+            let queues = all_queues(&r);
+            let (set, q) = watch_of(&queues);
+            assert!(r.pool.insert(LABEL, KEY, set, q));
+            portion(&mut r);
+            if retire {
+                r.pool.retire(LABEL);
+                assert_eq!(r.pool.pending(), None);
+                while let Some((label, key, end)) = r.pool.cleanup() {
+                    r.p.unwait(end, (label, key));
+                }
+            } else {
+                for &queue in &queues {
+                    r.p.unwait(queue, (LABEL, KEY));
+                }
+                r.pool.remove(LABEL, KEY);
+                assert_eq!(r.pool.pending(), None);
+            }
+            assert!(queues.iter().all(|&q| waiting_at(&r.p, q) == 0));
+            // A turn with nothing pending subscribes nothing.
+            assert_eq!(portion(&mut r).subscribed, 0);
+            assert!(queues.iter().all(|&q| waiting_at(&r.p, q) == 0));
+        }
+    }
+
+    #[test]
+    fn a_write_between_the_two_turns_is_not_lost() {
+        let mut r = rig();
+        let queues = all_queues(&r);
+        let (set, q) = watch_of(&queues);
+        assert!(r.pool.insert(LABEL, KEY, set, q));
+        portion(&mut r);
+        // The read ends are in the second portion: nobody is subscribed.
+        let mut wakes = Wakes::default();
+        let wr = r.wr[3];
+        assert_eq!(r.p.write(&r.held, wr, &[7], &mut wakes), Ok(Some(1)));
+        assert!(woke(&wakes).is_empty());
+        let last = portion(&mut r);
+        assert!(last.last);
+        assert!(last.ready, "the waiter is told after the last portion");
+    }
+
+    #[test]
+    fn a_refusal_in_the_second_portion_marks_the_record() {
+        let mut r = rig();
+        let queues = all_queues(&r);
+        let (set, q) = watch_of(&queues);
+        assert!(r.pool.insert(LABEL, KEY, set, q));
+        // Fill a read end, which the second portion subscribes to.
+        for i in 0..WAITERS as u64 {
+            r.p.wait_new(r.rd[5], (9, i), |_| true).unwrap();
+        }
+        assert_eq!(portion(&mut r).subscribed, 16);
+        assert_eq!(
+            r.p.watch_portion(&mut r.pool, LABEL, KEY, |_| true),
+            Err(AGAIN)
+        );
+        assert!(!r.pool.refused(LABEL, KEY));
+        r.pool.refuse(LABEL, KEY);
+        assert!(r.pool.refused(LABEL, KEY));
+        assert_eq!(r.pool.pending(), None);
+        for &queue in &queues {
+            r.p.unwait(queue, (LABEL, KEY));
+        }
+        r.pool.remove(LABEL, KEY);
+        assert!(!r.pool.refused(LABEL, KEY));
+        for &queue in &queues {
+            let own = waiting_at(&r.p, queue);
+            assert_eq!(own, if queue == r.rd[5] { WAITERS } else { 0 });
+        }
+    }
+
+    #[test]
+    fn a_set_of_16_or_fewer_has_no_continuation() {
+        for n in [1usize, 5, 16] {
+            let mut r = rig();
+            let elements: Vec<u32> = all_queues(&r)[..n].to_vec();
+            let (set, q) = watch_of(&elements);
+            assert!(r.pool.insert(LABEL, KEY, set, q));
+            let only = portion(&mut r);
+            assert_eq!((only.subscribed, only.last), (n, true));
+            assert_eq!(r.pool.pending(), None);
+        }
     }
 }
