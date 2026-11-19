@@ -12,7 +12,7 @@
 
 use crate::PAGE;
 use crate::restart::{PAUSE_FIRST_NS, PAUSE_MAX_NS};
-use crate::table::Shares;
+use crate::table::{Dma, Shares};
 use bootimg::Program;
 
 /// The pages of init's pools an instance takes: its shell, the memory
@@ -34,6 +34,51 @@ pub fn need_pages(quota: u64, program: &Program<'_>) -> u64 {
         .sum();
     let stack = u64::from(program.stack_size).div_ceil(PAGE);
     quota.div_ceil(PAGE) + segments + stack + POOL_PAGES + TABLES_AHEAD
+}
+
+/// The pages of the DMA objects of a record, which init makes in its worker
+/// (`mem_create_contiguous`) and pays for from its own quota: apart from
+/// `need_pages`, since the objects are made after the program loaded. The
+/// kernel takes a block of 2^order frames for a contiguous object, so each
+/// object counts as its pages rounded up to a power of two.
+pub fn dma_pages(dma: &[Dma]) -> u64 {
+    dma.iter()
+        .map(|d| d.size.div_ceil(PAGE).next_power_of_two())
+        .sum()
+}
+
+/// The pages of init's quota one instance takes in all: `need_pages` and the
+/// pages of its DMA objects. A start that checks `need_pages` alone can pass
+/// and then fail in the contiguous allocation (`did not load`), which counts
+/// toward the record's failures.
+pub fn need_with_dma(quota: u64, program: &Program<'_>, dma: &[Dma]) -> u64 {
+    need_pages(quota, program) + dma_pages(dma)
+}
+
+/// The pool of the process service as init sizes it at boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pool {
+    /// The pages the pool has: the remainder, and at least `min`.
+    pub pages: u64,
+    /// How far the remainder falls under `min` (0 when it does not).
+    pub short: u64,
+}
+
+/// The pool of the process service: what is left of the `free` pages of
+/// init's quota once the instances init loads besides the process service
+/// (`others`, with the POSIX records the service loads for) and the process
+/// service's own program (`own`) are paid for, and `reserve` and `slack`
+/// stay free. A remainder under `min` gives `min` and the shortfall.
+pub fn pool_pages(free: u64, others: u64, own: u64, reserve: u64, slack: u64, min: u64) -> Pool {
+    let rest = free
+        .saturating_sub(others)
+        .saturating_sub(own)
+        .saturating_sub(reserve)
+        .saturating_sub(slack);
+    Pool {
+        pages: rest.max(min),
+        short: min.saturating_sub(rest),
+    }
 }
 
 /// Whether `free` pages of init's quota cover `need`.
@@ -154,6 +199,68 @@ mod tests {
             start(u64::MAX, need, false, 0),
             Start::Wait { pause_ns: 100 * MS }
         );
+    }
+
+    #[test]
+    fn dma_objects_count_in_the_need() {
+        let dma = |size: u64| Dma {
+            name: "d",
+            size,
+            uncached: false,
+            duplicate: false,
+        };
+        let p = program();
+        let objects = [dma(16 * PAGE), dma(256 * PAGE)];
+        assert_eq!(dma_pages(&objects), 272);
+        assert_eq!(dma_pages(&[dma(PAGE + 1)]), 2);
+        // The kernel charges 2^order frames: 24 pages take 32.
+        assert_eq!(dma_pages(&[dma(24 * PAGE)]), 32);
+        assert_eq!(
+            need_with_dma(20 * PAGE, &p, &objects),
+            need_pages(20 * PAGE, &p) + 272
+        );
+        assert_eq!(need_with_dma(20 * PAGE, &p, &[]), need_pages(20 * PAGE, &p));
+        // A restart that has `need_pages` free and lacks the pages of its DMA objects waits.
+        let need = need_with_dma(20 * PAGE, &p, &objects);
+        let free = need_pages(20 * PAGE, &p);
+        assert!(!fits(free, need));
+    }
+
+    #[test]
+    fn the_pool_is_the_remainder_above_the_reserve() {
+        let pool = pool_pages(130_000, 30_000, 100, 16_384, 64, 52_120);
+        assert_eq!(
+            pool,
+            Pool {
+                pages: 130_000 - 30_000 - 100 - 16_384 - 64,
+                short: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_remainder_of_exactly_the_minimum_is_no_shortfall() {
+        let pool = pool_pages(52_120 + 100 + 16_384 + 64 + 7, 7, 100, 16_384, 64, 52_120);
+        assert_eq!((pool.pages, pool.short), (52_120, 0));
+    }
+
+    #[test]
+    fn a_remainder_under_the_minimum_gives_the_minimum_and_names_the_shortfall() {
+        let pool = pool_pages(52_120 + 100 + 16_384 + 64 - 25, 0, 100, 16_384, 64, 52_120);
+        assert_eq!(
+            (pool.pages, pool.short),
+            (52_120, 25),
+            "pool {} pages, under POOL_MIN 52120 by {}",
+            pool.pages,
+            pool.short
+        );
+    }
+
+    #[test]
+    fn the_pool_subtraction_does_not_wrap() {
+        let pool = pool_pages(10, 1_000, 1_000, 1_000, 1_000, 500);
+        assert_eq!((pool.pages, pool.short), (500, 500));
+        assert_eq!(pool_pages(0, 0, 0, 0, 0, 0), Pool { pages: 0, short: 0 });
     }
 
     #[test]

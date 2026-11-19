@@ -21,10 +21,11 @@
 //! are put together by), the arena of pixman's allocations (8 pages), the
 //! rings of events (3 pages), the tables of its mappings and its 64 KiB stack.
 //! The 250 pages of a buffer of its own that the quota held until the direct
-//! frame are gone: the quota is 250 pages smaller, and the process service's
-//! pool, which init counts at the start, is 250 pages larger. The base image
-//! keeps 16 384 free pages after its services started (`cargo xtask
-//! pkg-identity`), and init takes each record's quota from them.
+//! frame are gone. The base image keeps `INIT_RESERVE_PAGES` free after its
+//! services started (`cargo xtask pkg-identity`) and init gives the pool of
+//! the process service the rest of its quota (`INIT_SLACK_PAGES`,
+//! `POOL_MIN_PAGES` in `base.rs`): a change of this record's quota goes into
+//! or comes out of that pool by itself.
 //!
 //! Level 32 (design of graphics, 'Processes'): above the processes of POSIX
 //! (31 and below), whose clients call it, and below the driver (33) and the

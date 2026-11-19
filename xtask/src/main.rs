@@ -75,6 +75,7 @@ mod guards;
 mod htop_dialog;
 mod image;
 mod image_listing;
+mod init_reserve;
 mod init_wait;
 mod input_probe;
 mod jobs;
@@ -2211,6 +2212,8 @@ commands:
   abi       the fingerprint of the ABI of the packages against packages/abi.txt (`--check`, `--update`,
             `--freeze`, `--explain`; `--release` wants a frozen series; docs/packages.md)
   pkg-ci    pkg-build, repo, abi, pkg-identity and dist-licenses in a row (the job `pkg` of CI)
+  init-reserve  build the programs of the base table that restart and check that the largest
+            need of a restart, DMA objects included, fits INIT_RESERVE_PAGES
   netd-quota  build the network service and check that the quota of its records
             covers the tables of its mappings and its kernel objects
   htop-dialog  check htop in an ash dialog in QEMU: processes, CPU and memory meters, quit
@@ -2726,6 +2729,7 @@ fn main() {
         Some("abi") => abi_fingerprint::command(&args[1..]),
         Some("pkg-sign") => pkg_sign::sign_command(&args[1..]),
         Some("image-repack") => pkg_sign::repack_command(&args[1..]),
+        Some("init-reserve") => init_reserve::check(),
         Some("netd-quota") => netd_quota::check(),
         Some("nano-dialog") => nano_dialog::nano_dialog(),
         Some("htop-dialog") => htop_dialog::htop_dialog(),
