@@ -749,10 +749,7 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
             &output.lines,
             comp_probe::COMP_TAG
         )),
-        comp_probe::band_split_text(&comp_probe::band_splits(
-            &output.lines,
-            comp_probe::COMP_TAG
-        ))
+        comp_probe::band_report(&output.lines, comp_probe::COMP_TAG)
     );
     Ok(())
 }
