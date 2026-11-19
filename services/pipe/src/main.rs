@@ -548,9 +548,12 @@ impl PipeService {
         }
         let ops = &self.ops;
         let named = &self.named;
-        let tell = match self.watches.portion(at, self.pipes, |(l, k)| {
-            ops.waits(l, k) || named.alive(l, k)
-        }) {
+        let tell = match self.watches.portion(
+            at,
+            self.pipes,
+            |(l, k)| ops.waits(l, k) || named.alive(l, k),
+            true,
+        ) {
             Ok(portion) => {
                 rt::service::step_detail(portion.subscribed as u64);
                 portion.ready
@@ -943,16 +946,42 @@ impl PipeService {
         let placed = self.watches.insert(label, key, &set, &queues);
         #[cfg(feature = "steps")]
         let t_insert = rt::time::now();
-        if placed.is_none() {
+        let Some(at) = placed else {
             // Nothing is subscribed yet: the operation only goes.
             let finished = self.ops.finish(&mut s.data.long, label, key);
             self.over(s, finished);
             return status(proto_pipe::AGAIN);
+        };
+        let ops = &self.ops;
+        let named = &self.named;
+        let alive = |(l, k): (u64, u64)| ops.waits(l, k) || named.alive(l, k);
+        let refusal = if self.watches.wanted(at) <= pipe::watches::WATCH_STEP_QUEUES {
+            // A set of few queues is subscribed at once, and a full queue
+            // refuses the start, as it always did.
+            self.watches.portion(at, self.pipes, alive, false).err()
+        } else if !pipe::watches::unique_queues(&queues[..set.len])
+            .all(|queue| self.pipes.has_room(queue, alive))
+        {
+            // A larger set only has its room checked here (nothing is
+            // subscribed), so that a start at queues which are all taken
+            // is refused here too. Its queues are subscribed by the turns of
+            // the service's own, a portion of `WATCH_STEP_QUEUES` each
+            // (`watch_turn`); `Take` computes the readiness of the whole set
+            // meanwhile, and answers AGAIN if a later portion was refused.
+            Some(proto_pipe::AGAIN)
+        } else {
+            self.kick();
+            None
+        };
+        if let Some(code) = refusal {
+            for &queue in &queues[..set.len] {
+                self.pipes.unwait(u32::from(queue), (label, key));
+            }
+            self.watches.remove(label, key);
+            let finished = self.ops.finish(&mut s.data.long, label, key);
+            self.over(s, finished);
+            return status(code);
         }
-        // The request subscribes to no queue: the turns of the service's own
-        // do, a portion of `WATCH_STEP_QUEUES` each (`watch_turn`), and
-        // `Take` computes the readiness of the whole set meanwhile.
-        self.kick();
         #[cfg(feature = "steps")]
         if set.len > 16 {
             steps_parts::record(

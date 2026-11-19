@@ -29,10 +29,11 @@ impl Registration {
 }
 
 /// The most queues one step of the service subscribes a watch to. A request
-/// parses the set, checks its readiness, inserts the record and answers
-/// `Wait`; the turns of the service's own subscribe the queues, a portion
-/// each, so no step grows with the size of the set (at most `MAX` = 32
-/// elements). In `posix-poll` the request step of a set of 32 took 19563
+/// for a set of at most this many distinct queues subscribes them at once, as
+/// it always did. A request for a larger set checks the room at its queues,
+/// inserts the record and answers `Wait`; the turns of the service's own
+/// subscribe the queues, a portion each, so no step grows with the size of
+/// the set (at most `MAX` = 32 elements). In `posix-poll` the request step of a set of 32 took 19563
 /// ticks against the bound of 20410 (96 %), and each subscription costs 270
 /// ticks and more with each operation already waiting at the queue (up to
 /// 8): a portion of 8 keeps a turn near 2000 ticks.
@@ -145,14 +146,15 @@ impl<const N: usize> Pool<N> {
     /// Subscribes the next portion (at most `WATCH_STEP_QUEUES` queues) of
     /// the record at `at` (from `insert` or `pending`, in the same step).
     /// A refusal leaves the queues subscribed so far (a cancel takes them
-    /// off). The portion that completes the record also looks at the
-    /// readiness of every element: a change of a queue that was not
-    /// subscribed yet woke nobody.
+    /// off). With `check`, the portion that completes the record also
+    /// looks at the readiness of every element: a change of a queue that
+    /// was not subscribed yet woke nobody.
     pub fn portion(
         &mut self,
         at: usize,
         pipes: &mut Pipes,
         alive: impl Fn(Waiter) -> bool,
+        check: bool,
     ) -> Result<Portion, u32> {
         let Some(r) = self.list[at].as_mut() else {
             return Ok(Portion::NONE);
@@ -171,7 +173,8 @@ impl<const N: usize> Pool<N> {
         if last {
             self.open -= 1;
         }
-        let ready = last
+        let ready = check
+            && last
             && (0..r.set.len).any(|i| {
                 pipes.queue_readiness(u32::from(r.queues[i]))
                     & (r.set.items[i].events | proto_wire::watch::ALWAYS)
@@ -182,6 +185,10 @@ impl<const N: usize> Pool<N> {
             last,
             ready,
         })
+    }
+    /// How many unique queues the record at `at` has in all.
+    pub fn wanted(&self, at: usize) -> usize {
+        self.list[at].as_ref().map_or(0, |r| usize::from(r.wanted))
     }
     /// The record at `at` needs no more subscriptions.
     pub fn complete(&mut self, at: usize) {
