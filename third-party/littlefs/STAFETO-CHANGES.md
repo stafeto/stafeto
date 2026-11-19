@@ -10,9 +10,11 @@ the copy is modified, so that the notice is not read as saying it is the release
 
 ## What was added
 
-Two functions that only read. They add no field to any structure, change no function of the
-release and change nothing on the disk: a volume written by the release reads with the change
-and the other way round.
+Three functions that only read. They add no field to any structure of the release, and change
+nothing on the disk: a volume written by the release reads with the change and the other way
+round. One function of the release, `lfs_dir_find`, is split to carry the third (below): its body
+becomes `lfs_dir_find_` with one more argument, and `lfs_dir_find` calls it with that argument
+NULL, so every caller of the release behaves as before.
 
 - `lfs_dir_read_attr(lfs, dir, info, type, buffer, size, &res)` in `lfs.h` and `lfs.c`. It does what
   `lfs_dir_read` does (it calls `lfs_dir_read_`), and then reads the user attribute `type` of the
@@ -25,10 +27,22 @@ and the other way round.
   `lfs_stat` does and then reads the attribute with `lfs_dir_get` from the pair the lookup found,
   with the root as `lfs_getattr` handles it: one `lfs_dir_find` and the gets of the name, of the
   structure and of the attribute. `*res` as above; the return value is 0 or a negative error.
-- A private helper, `lfs_dir_getattr_`, which both use: the tail of `lfs_getattr_` over a pair
+- `lfs_path_attrs(lfs, path, info, type, out, buffer, size, capacity, &count)` in `lfs.h` and
+  `lfs.c`, with `struct lfs_path_attr {res, type}`. It does `lfs_stat_attr` for the root and for
+  every entry of the path in one walk: `lfs_dir_find_` calls `lfs_path_walk_visit` for the root and
+  right after it matches each entry, when the pair that holds the entry is still the one it
+  fetched, and the visit reads the attribute from that pair into the caller's `out` (the kind and
+  the size of the attribute) and `buffer` (`size` bytes for each entry). Entries that `.` and
+  `..` make the path skip are never matched and have no place. `*count` is the number of places
+  filled also when the call fails, so that a caller still has the attributes of the directories
+  above a missing name (`LFS_ERR_NOENT`) or a file in the middle of the path (`LFS_ERR_NOTDIR`);
+  a path of more entries than `capacity` gives `LFS_ERR_NAMETOOLONG`. The status of the last entry
+  is returned as `lfs_stat` does. A walk of a path of depth d costs about 3 reads for each
+  component with the read size of 4096 (the lookups of the release repeat from the root).
+- A private helper, `lfs_dir_getattr_`, which they use: the tail of `lfs_getattr_` over a pair
   and an id.
 
-Each has the public wrapper with `LFS_LOCK` and `LFS_TRACE` and the private function with a
+Each of the three has the public wrapper with `LFS_LOCK` and `LFS_TRACE` and the private function with a
 trailing underscore, as the functions around them do. The attribute buffer is read as
 `lfs_getattr` reads it (padded with zeros, truncated to `size` and to `LFS_ATTR_MAX`).
 
@@ -49,6 +63,11 @@ listing of the same directory cost 1,791 reads (5,505 after three rewrites), and
 added about 0.9 read for each entry. The plan of the service caps a directory at 1,024 entries,
 which these figures cover.
 
+The path walk was added because a check of search permission on each directory of a path needs
+the attribute of every ancestor, and a lookup of each prefix from the root costs the square of the
+depth: 60,301 reads for the 201 prefixes of a path of depth 200, against 602 for the walk (8 and 26
+reads at depth 2 and 8, against 10 and 109).
+
 ## Against which release
 
 littlefs v2.11.3 (`LFS_VERSION` 0x0002000b, disk format 2.1). Checksums of the files of the
@@ -62,8 +81,8 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 0cb4ff1daf5fdc1359c6a6ee3116092f08fc100c9d58b1b77ab17bfd801f856d  LICENSE.md
 6dd74dfc58ac93589f8e002bb73c0830a59206912cfe8c951c07eb2bd5fccad0  SPEC.md
 2a8b3459d74b9fa8bdd947738522c46331739405b1fc3d70f057f636a1dea768  DESIGN.md
-dcbdc815892164b427b0835e6a1f06d7a240b0cf4d66814c9bfb1448442b3726  lfs.c (with the change)
-361a9b1292e01e5ef48c918caceee14c585e77be3665b711575f0f1bed277953  lfs.h (with the change)
+7fa02871d2147b6230183694e8b9efc1cfd797808cba687aa4e91e19debab557  lfs.c (with the change)
+d629440b6046fd0474e1f5c2ba8b080d932b66432f5315bb78e9eb7cde7f7f1b  lfs.h (with the change)
 ```
 
 `tools/check-littlefs.py` (run by `cargo xtask ci` as "littlefs sources") fails when a file of the

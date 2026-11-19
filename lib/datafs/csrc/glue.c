@@ -537,3 +537,27 @@ int datafs_stat_attr(struct datafs *d, void *ctx, const char *path, uint8_t *typ
     *attr_res = (int32_t)found;
     return 0;
 }
+
+// The status of `path` and the user attribute `attr` of the root and of every entry of the path in
+// one walk of it (lfs_path_attrs): `out` and `buffer` (`each` bytes for an entry) have room for
+// `capacity` entries, and *count says how many are filled, also when the call fails.
+int datafs_path_attrs(struct datafs *d, void *ctx, const char *path, uint8_t *type, uint32_t *size,
+                      char *name, uint8_t attr, struct lfs_path_attr *out, uint8_t *buffer,
+                      uint32_t each, uint32_t capacity, uint32_t *count)
+{
+    struct lfs_info info;
+    lfs_size_t filled = 0;
+    memset(&info, 0, sizeof(info));
+    d->ctx = ctx;
+    int err = lfs_path_attrs(&d->lfs, path, &info, attr, out, buffer, each, capacity, &filled);
+    *count = filled;
+    if (err < 0) {
+        return err;
+    }
+    *type = info.type;
+    *size = info.size;
+    for (size_t i = 0; i <= LFS_NAME_MAX; i++) {
+        name[i] = info.name[i];
+    }
+    return 0;
+}

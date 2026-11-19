@@ -496,3 +496,215 @@ fn scale_the_read_size() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// `Fs::path_attrs`: the attributes of every entry of a path in one walk (lfs_path_attrs).
+
+use crate::fs::PathEntry;
+
+const EACH: usize = 48;
+
+/// A long name at the limit of littlefs.
+fn long_name(c: char) -> String {
+    core::iter::repeat_n(c, 255).collect()
+}
+
+/// A tree to walk: `/a` (attribute of 8 bytes), `/a/b` (none), `/a/b/c` (48 bytes), a file
+/// `/a/b/c/f` (48 bytes), a file `/a/g` with no attribute, a directory with a name of
+/// 255 bytes and a file in it, and the root with an attribute.
+fn tree() -> Vol {
+    let mut fs = fresh();
+    fs.setattr(b"/", ATTR, &[0x11u8; 48]).unwrap();
+    for (path, attr) in [
+        ("/a", Some(8)),
+        ("/a/b", None),
+        ("/a/b/c", Some(48)),
+        (&format!("/a/{}", long_name('d')), Some(48)),
+    ] {
+        fs.mkdir(path.as_bytes()).unwrap();
+        if let Some(n) = attr {
+            let bytes: Vec<u8> = (0..n).map(|k| (k + path.len()) as u8).collect();
+            fs.setattr(path.as_bytes(), ATTR, &bytes).unwrap();
+        }
+    }
+    for (path, attr) in [
+        ("/a/b/c/f", Some(48)),
+        ("/a/g", None),
+        (&format!("/a/{}/f", long_name('d')), Some(48)),
+    ] {
+        let f = fs
+            .open(path.as_bytes(), Open::WRITE.with(Open::CREATE))
+            .unwrap();
+        fs.close(f).unwrap();
+        if let Some(n) = attr {
+            let bytes: Vec<u8> = (0..n).map(|k| (k * 3 + path.len()) as u8).collect();
+            fs.setattr(path.as_bytes(), ATTR, &bytes).unwrap();
+        }
+    }
+    fs
+}
+
+type Walk = (usize, Result<crate::Info, Error>, Vec<PathEntry>, Vec<u8>);
+
+fn walk(fs: &mut Vol, path: &str, capacity: usize) -> Walk {
+    let mut entries = std::vec![PathEntry::EMPTY; capacity];
+    let mut bytes = std::vec![0u8; capacity * EACH];
+    let (count, info) = fs.path_attrs(path.as_bytes(), ATTR, &mut entries, &mut bytes, EACH);
+    (count, info, entries, bytes)
+}
+
+/// The prefixes of `/a/b/c/f` that are entries, root first.
+fn prefixes(path: &str) -> Vec<String> {
+    let mut out = std::vec![String::from("/")];
+    let mut at = String::new();
+    for part in path.split('/').filter(|p| !p.is_empty()) {
+        at.push('/');
+        at.push_str(part);
+        out.push(at.clone());
+    }
+    out
+}
+
+/// Every entry of the walk equals `stat_attr` of its prefix: the kind, the size of the attribute
+/// and its bytes.
+fn assert_equal_to_stat_attr(fs: &mut Vol, path: &str, walked: &Walk) {
+    let (count, info, entries, bytes) = walked;
+    let prefixes = prefixes(path);
+    assert_eq!(*count, prefixes.len(), "{path}");
+    let last = fs
+        .stat_attr(path.as_bytes(), ATTR, &mut [0u8; 48])
+        .unwrap()
+        .0;
+    assert_eq!(info.as_ref().unwrap().kind, last.kind);
+    assert_eq!(info.as_ref().unwrap().size, last.size);
+    for (i, prefix) in prefixes.iter().enumerate() {
+        let mut b = [0u8; 48];
+        let (stat, size) = fs.stat_attr(prefix.as_bytes(), ATTR, &mut b).unwrap();
+        assert_eq!(entries[i].kind().unwrap(), stat.kind, "{prefix}: kind");
+        assert_eq!(entries[i].attr_size().unwrap(), size, "{prefix}: size");
+        let n = size.unwrap_or(0).min(EACH);
+        assert_eq!(&bytes[i * EACH..i * EACH + n], &b[..n], "{prefix}: bytes");
+    }
+}
+
+#[test]
+fn a_walk_of_a_path_gives_what_stat_attr_gives_for_every_prefix() {
+    let mut fs = tree();
+    for path in ["/", "/a", "/a/b", "/a/b/c", "/a/b/c/f", "/a/g"] {
+        let walked = walk(&mut fs, path, 16);
+        assert_equal_to_stat_attr(&mut fs, path, &walked);
+    }
+    // After a restart as well, and at the limit of the length of a name.
+    let mut fs = restarted(fs);
+    let long = format!("/a/{}/f", long_name('d'));
+    for path in ["/a/b/c/f", long.as_str()] {
+        let walked = walk(&mut fs, path, 16);
+        assert_equal_to_stat_attr(&mut fs, path, &walked);
+    }
+    // The root comes first, with its own attribute.
+    let (_, _, entries, bytes) = walk(&mut fs, "/a", 4);
+    assert_eq!(entries[0].kind().unwrap(), crate::Kind::Directory);
+    assert_eq!(&bytes[..EACH], &[0x11u8; 48]);
+    assert_eq!(entries[1].attr_size().unwrap(), Some(8));
+    // An entry with no attribute and one of another size.
+    let (_, _, entries, _) = walk(&mut fs, "/a/b", 4);
+    assert_eq!(entries[2].attr_size().unwrap(), None);
+}
+
+#[test]
+fn dot_and_dot_dot_skip_entries_as_littlefs_resolves_them() {
+    let mut fs = tree();
+    // "." is skipped, and "b/.." matches "b" away without a lookup of it.
+    let plain = walk(&mut fs, "/a/b/c", 16);
+    for path in ["/a/./b/c", "/a/b/../b/c", "//a///b//c", "/a/b/c/."] {
+        let walked = walk(&mut fs, path, 16);
+        assert_eq!(walked.0, plain.0, "{path}");
+        assert_eq!(walked.3, plain.3, "{path}");
+    }
+    // "/a/b/.." is "/a": the root and a, and b is never looked up.
+    let up = walk(&mut fs, "/a/b/..", 16);
+    assert_eq!(up.0, 2);
+    assert_eq!(up.1.unwrap().kind, crate::Kind::Directory);
+    // A name that "b/.." skips need not exist.
+    let ghost = walk(&mut fs, "/a/ghost/../b", 16);
+    assert_eq!(ghost.0, 3);
+    assert!(ghost.1.is_ok());
+    // ".." above the root is an error with nothing but the root found.
+    let above = walk(&mut fs, "/..", 16);
+    assert_eq!((above.0, above.1), (1, Err(Error::Invalid)));
+}
+
+#[test]
+fn a_trailing_slash_a_file_in_the_middle_and_a_missing_name_count_the_entries_found() {
+    let mut fs = tree();
+    let slash = walk(&mut fs, "/a/b/", 16);
+    assert_eq!(slash.0, 3);
+    assert_eq!(slash.1.unwrap().kind, crate::Kind::Directory);
+    // A file with a trailing slash: the entries are there, the status is NOTDIR.
+    let file_slash = walk(&mut fs, "/a/g/", 16);
+    assert_eq!((file_slash.0, file_slash.1), (3, Err(Error::NotDirectory)));
+    // A file in the middle of the path.
+    let middle = walk(&mut fs, "/a/g/x", 16);
+    assert_eq!((middle.0, middle.1), (3, Err(Error::NotDirectory)));
+    // A missing name: the ancestors that exist are there for a search check.
+    let missing = walk(&mut fs, "/a/b/nope", 16);
+    assert_eq!((missing.0, missing.1), (3, Err(Error::NoEntry)));
+    let deeper = walk(&mut fs, "/a/nope/x/y", 16);
+    assert_eq!((deeper.0, deeper.1), (2, Err(Error::NoEntry)));
+    assert_eq!(deeper.2[1].attr_size().unwrap(), Some(8));
+    // More entries than the caller's room.
+    let small = walk(&mut fs, "/a/b/c/f", 3);
+    assert_eq!((small.0, small.1), (3, Err(Error::NameTooLong)));
+    assert_eq!(small.2[2].kind().unwrap(), crate::Kind::Directory);
+}
+
+/// A chain of `depth` directories named "a" with an attribute on each.
+fn chain(depth: usize) -> (Vol, String) {
+    let mut fs = fresh();
+    let mut path = String::new();
+    for d in 0..depth {
+        path.push_str("/a");
+        fs.mkdir(path.as_bytes()).unwrap();
+        fs.setattr(path.as_bytes(), ATTR, &[d as u8; 48]).unwrap();
+    }
+    (fs, path)
+}
+
+#[test]
+fn the_walk_of_a_deep_path_is_linear_where_a_lookup_for_each_prefix_is_not() {
+    let mut rows = Vec::new();
+    for depth in [2usize, 8, 200] {
+        let (fs, path) = chain(depth);
+        let mut cold = restarted(fs);
+        let at = reads(&mut cold);
+        let walked = walk(&mut cold, &path, depth + 1);
+        let one = reads(&mut cold) - at;
+        assert_eq!(walked.0, depth + 1);
+        assert!(walked.1.is_ok());
+        // The same by a stat with the attribute of each prefix, on a volume just mounted.
+        let mut cold = restarted(cold);
+        let prefixes = prefixes(&path);
+        let at = reads(&mut cold);
+        for prefix in &prefixes {
+            cold.stat_attr(prefix.as_bytes(), ATTR, &mut [0u8; 48])
+                .unwrap();
+        }
+        let each = reads(&mut cold) - at;
+        // The entries and attributes are those of the prefixes.
+        for (i, prefix) in prefixes.iter().enumerate().step_by(depth / 4 + 1) {
+            let mut b = [0u8; 48];
+            let (_, size) = cold.stat_attr(prefix.as_bytes(), ATTR, &mut b).unwrap();
+            assert_eq!(walked.2[i].attr_size().unwrap(), size, "{prefix}");
+            if i > 0 {
+                assert_eq!(&walked.3[i * EACH..(i + 1) * EACH], &b[..], "{prefix}");
+            }
+        }
+        rows.push((depth, one, each));
+        assert!(one <= 3 * depth as u64 + 20, "depth {depth}: {one} reads");
+    }
+    for (depth, one, each) in &rows {
+        println!("depth {depth}: one walk {one} reads; a stat_attr of every prefix {each}");
+    }
+    let (depth, one, each) = rows[2];
+    assert!(each > 10 * one, "depth {depth}: {each} reads against {one}");
+}

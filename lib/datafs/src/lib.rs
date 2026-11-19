@@ -37,7 +37,7 @@ mod tests_scale;
 pub mod volume;
 pub mod watch;
 
-pub use fs::{Dir, Entry, Error, File, Fs, Info, Kind, Open, Storage, Whence};
+pub use fs::{Dir, Entry, Error, File, Fs, Info, Kind, Open, PathEntry, Storage, Whence};
 
 use core::fmt;
 
