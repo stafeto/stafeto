@@ -302,9 +302,13 @@ fn main(_: u64) -> u64 {
         heartbeat: Some(heartbeat),
     };
     // The tag of the driver's lines of steps (`service table: 18 kind K ...`): kind 65 is the tick
-    // of the log that took nothing, kind 64 is the other notices (the interrupt of the line, the
-    // wake-up of the transmit timer, a tick that took batches), and the detail of kind 64 tells
-    // which: 1 the interrupt, 2 the transmit wake-up, 3 a tick with batches.
+    // of the log that found no record (the idle tick), kind 64 is the other notices, and the
+    // detail of kind 64 tells which: 1 the interrupt of the line, 2 the transmit wake-up, 3 a
+    // tick that took no batch (a client's DRAIN is pending or the buffer is full), 100 + N a tick
+    // that took N records of the log. The methods of proto_uart keep their numbers (1 WRITE, 2
+    // READ, 7 READ_START, 8 READ_TAKE, 9 READ_CANCEL, 10 CLONE, 11 WRITE_SOME, 12 ROOM, 13
+    // DRAIN_START, 14 DRAIN_TAKE, 15 DRAIN_RELEASE, 19 DRAIN_STATE, 20 INPUT_FLUSH, 21
+    // OUTPUT_FLUSH).
     #[cfg(feature = "steps")]
     {
         rt::service::report_steps(18);
@@ -535,9 +539,10 @@ impl Uart {
     /// and a batch of text fits, whether or not the text taken before went
     /// out. The port is paced on its own timer. Only the timer's tick (and
     /// the start, once) calls it, so STEP_BATCHES is the bound of the driver's
-    /// log work in a period, for all its entry points together. Gives the batches taken.
-    fn take_log(&mut self) -> usize {
+    /// log work in a period, for all its entry points together. Gives the batches and the records taken.
+    fn take_log(&mut self) -> (usize, usize) {
         let mut taken = 0;
+        let mut records_taken = 0;
         loop {
             let State {
                 output,
@@ -565,6 +570,7 @@ impl Uart {
             let batch = sources.next(&mut take, &mut peek, records);
             self.left = batch.left;
             self.peak.batch(batch);
+            records_taken += (batch.count as usize).min(LOG_BATCH);
             uart::log::text(records, batch, lines, |bytes| {
                 // A batch fits: take_more asked for the room of its worst.
                 let _ = output.put_log(bytes);
@@ -577,7 +583,7 @@ impl Uart {
         if taken > 0 {
             self.kick();
         }
-        taken
+        (taken, records_taken)
     }
 
     /// Arms the timer (spec 10) at the first deadline t0 + k * period after
@@ -1013,15 +1019,17 @@ impl Service<HELD> for Uart {
                 if self.poll {
                     self.interrupt();
                 }
-                let taken = self.take_log();
+                let (batches, records) = self.take_log();
                 #[cfg(feature = "steps")]
-                if taken == 0 {
-                    rt::service::step_own();
-                } else {
+                if records > 0 {
+                    rt::service::step_detail(100 + records as u64);
+                } else if batches == 0 {
                     rt::service::step_detail(3);
+                } else {
+                    rt::service::step_own();
                 }
                 #[cfg(not(feature = "steps"))]
-                let _ = taken;
+                let _ = (batches, records);
                 self.say_peak(false);
                 self.arm();
                 self.exit_if_drained();
