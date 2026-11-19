@@ -862,12 +862,40 @@ pub fn band_floors(lines: &[String], tag: &str) -> Vec<BandFloor> {
     out
 }
 
+/// The last line of each of the kinds `service band place: T NAME ...`, `service band
+/// histogram: T ...` and `service band trace: T ...` of the service `tag`, told as they
+/// stand (the places of the bands of two layers or more in the work of the service, their
+/// ticks in bins, and what the bands past the gate spent in the kernel and in the table of
+/// images).
+pub fn band_places(lines: &[String], tag: &str) -> Vec<String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for l in lines {
+        let w: Vec<&str> = l.split_whitespace().collect();
+        let key = match w.as_slice() {
+            ["service", "band", "place:", t, name, ..] if *t == tag => format!("place {name}"),
+            ["service", "band", "histogram:", t, ..] if *t == tag => "histogram".to_owned(),
+            ["service", "band", "trace:", t, ..] if *t == tag => "trace".to_owned(),
+            _ => continue,
+        };
+        let text = l.trim_start_matches("service band ").trim_end().to_owned();
+        match out.iter_mut().find(|(k, _)| *k == key) {
+            Some(old) => old.1 = text,
+            None => out.push((key, text)),
+        }
+    }
+    out.into_iter().map(|(_, t)| t).collect()
+}
+
 /// The bands by layers and their floors, told together: the split of each count
 /// and the least band of it, which tells whether a band over the gate is the
 /// band of its scene or an excess that came to it.
 pub fn band_report(lines: &[String], tag: &str) -> String {
     let floors = band_floors(lines, tag);
-    let text = band_split_text(&band_splits(lines, tag));
+    let mut text = band_split_text(&band_splits(lines, tag));
+    let places = band_places(lines, tag);
+    if !places.is_empty() {
+        text = format!("{text}; places of the bands: {}", places.join("; "));
+    }
     if floors.is_empty() {
         return text;
     }
@@ -1567,6 +1595,19 @@ mod tests {
         assert!(text.contains(
             "8 layers (4 bands): the least band 15400 ticks of which compose 14300 and the operations 11800, 3 past the gate 16328"
         ));
+        let more: Vec<String> = [
+            "service band place: 17 rest n 5 greatest 14000 past-gate 0",
+            "service band place: 17 rest n 9 greatest 15000 past-gate 1",
+            "service band place: 17 before-cap n 2 greatest 15500 past-gate 2",
+            "service band histogram: 17 layers 2+ from 11000 step 500: [0, 1]",
+            "service band trace: 12 system least 1",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let places = band_places(&more, COMP_TAG);
+        assert_eq!(places.len(), 3);
+        assert!(places[0].starts_with("place: 17 rest n 9"));
+        assert!(band_report(&more, COMP_TAG).contains("places of the bands: place: 17 rest n 9"));
         // The line of the split keeps its own fields.
         assert!(band_splits(&lines, COMP_TAG).is_empty());
     }

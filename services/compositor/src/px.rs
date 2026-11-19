@@ -171,6 +171,12 @@ pub mod cost {
     pub fn band_end(compose: u64, total: u64) {
         let ops = BAND_OPS.load(Ordering::Relaxed);
         let layers = (BAND_LAYERS.load(Ordering::Relaxed) as usize).min(MAX_LAYERS - 1);
+        // What the band was, for `tell` to fold in after the step (the folding costs
+        // the step nothing): its count of layers, its ticks and its place.
+        LAST_LAYERS.store(layers as u32, Ordering::Relaxed);
+        LAST_TOTAL.store(total, Ordering::Relaxed);
+        LAST_PLACE.store(NEXT_PLACE.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+        LAST_DUE.store(1, Ordering::Relaxed);
         let s = &SPLIT[layers];
         let outside = compose.saturating_sub(ops);
         let n = s.n.fetch_add(1, Ordering::Relaxed) + 1;
@@ -192,6 +198,191 @@ pub mod cost {
             s.total_greatest.store(total, Ordering::Relaxed);
             s.compose_at_greatest.store(compose, Ordering::Relaxed);
             s.ops_at_greatest.store(ops, Ordering::Relaxed);
+        }
+    }
+
+    /// The ticks of the step around a band (the entry, the notice of the next band,
+    /// the reply to the loop) that the probes measure, about 1 080: a band whose
+    /// ticks and these pass the gate is a step past it.
+    const STEP_AROUND: u64 = 1_080;
+
+    /// The place of a band in the work of the service: after an expiry of the timer
+    /// that went on with the bands put off by the cap, the first of its frame (the
+    /// step before it took the frame), the last before the cap, or any other.
+    const PLACES: [&str; 4] = ["rest", "after-expiry", "first-of-frame", "before-cap"];
+    const AFTER_EXPIRY: u32 = 1;
+    const FIRST_OF_FRAME: u32 = 2;
+    const BEFORE_CAP: u32 = 3;
+    static NEXT_PLACE: AtomicU32 = AtomicU32::new(0);
+    static LAST_PLACE: AtomicU32 = AtomicU32::new(0);
+    static LAST_LAYERS: AtomicU32 = AtomicU32::new(0);
+    static LAST_TOTAL: AtomicU64 = AtomicU64::new(0);
+    static LAST_DUE: AtomicU32 = AtomicU32::new(0);
+
+    /// The expiry of the timer went on with the bands the cap put off: the next band
+    /// is the first after it.
+    pub fn mark_expiry() {
+        NEXT_PLACE.fetch_max(AFTER_EXPIRY, Ordering::Relaxed);
+    }
+
+    /// A frame was taken: the next band is the first of it.
+    pub fn mark_first_of_frame() {
+        NEXT_PLACE.fetch_max(FIRST_OF_FRAME, Ordering::Relaxed);
+    }
+
+    /// The band that just ended reached the cap.
+    pub fn mark_before_cap() {
+        LAST_PLACE.store(BEFORE_CAP, Ordering::Relaxed);
+    }
+
+    /// The bands of two layers or more by their ticks: 500 ticks a bin from
+    /// 11 000, and the places they came at (their number, the greatest ticks, and how
+    /// many passed the gate of a band).
+    const BINS: usize = 18;
+    const BIN_FROM: u64 = 11_000;
+    const BIN_STEP: u64 = 500;
+    static HIST: [AtomicU32; BINS] = [const { AtomicU32::new(0) }; BINS];
+    struct Place {
+        n: AtomicU64,
+        greatest: AtomicU64,
+        past: AtomicU64,
+    }
+    static AT: [Place; 4] = [const {
+        Place {
+            n: AtomicU64::new(0),
+            greatest: AtomicU64::new(0),
+            past: AtomicU64::new(0),
+        }
+    }; 4];
+
+    /// The band that ended in the step just taken is folded into the histogram and
+    /// the places (from the loop's hook after the step, so no step pays for it).
+    fn fold() {
+        if LAST_DUE.swap(0, Ordering::Relaxed) == 0 {
+            return;
+        }
+        if LAST_LAYERS.load(Ordering::Relaxed) < 2 {
+            return;
+        }
+        // The ticks of the band: the thread's own (a preemption of a higher level does
+        // not lengthen them) when the run reads them, else the wall's.
+        #[cfg(feature = "irq-trace")]
+        let total = trace::ran();
+        #[cfg(not(feature = "irq-trace"))]
+        let total = LAST_TOTAL.load(Ordering::Relaxed);
+        let bin = if total < BIN_FROM {
+            0
+        } else {
+            (1 + (total - BIN_FROM) / BIN_STEP).min(BINS as u64 - 1) as usize
+        };
+        HIST[bin].fetch_add(1, Ordering::Relaxed);
+        let place = &AT[LAST_PLACE.load(Ordering::Relaxed) as usize % 4];
+        place.n.fetch_add(1, Ordering::Relaxed);
+        place.greatest.fetch_max(total, Ordering::Relaxed);
+        if total + STEP_AROUND > u64::from(compositor::BAND_GATE) {
+            place.past.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(feature = "irq-trace")]
+        trace::fold(total);
+    }
+
+    /// What a band of the run with the feature `irq-trace` spent in the kernel (the
+    /// system time of the thread between its two reads) and how many entries of the
+    /// table of images its lookups looked at, and what that tells of the bands past
+    /// the gate: the least of each over the bands of two layers or more, and for the
+    /// bands under the gate and past it the greatest (and, past it, the least).
+    #[cfg(feature = "irq-trace")]
+    pub mod trace {
+        use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+        static OWN: AtomicU64 = AtomicU64::new(0);
+        static LAST_RAN: AtomicU64 = AtomicU64::new(0);
+        static LAST_SYS: AtomicU64 = AtomicU64::new(0);
+        static LAST_SCAN: AtomicU32 = AtomicU32::new(0);
+        static SYS_LEAST: AtomicU64 = AtomicU64::new(u64::MAX);
+        static SCAN_LEAST: AtomicU32 = AtomicU32::new(u32::MAX);
+        static UNDER: AtomicU32 = AtomicU32::new(0);
+        static UNDER_SYS_GREATEST: AtomicU64 = AtomicU64::new(0);
+        static UNDER_SCAN_GREATEST: AtomicU32 = AtomicU32::new(0);
+        static PAST: AtomicU32 = AtomicU32::new(0);
+        static PAST_SYS_LEAST: AtomicU64 = AtomicU64::new(u64::MAX);
+        static PAST_SYS_GREATEST: AtomicU64 = AtomicU64::new(0);
+        static PAST_SCAN_LEAST: AtomicU32 = AtomicU32::new(u32::MAX);
+        static PAST_SCAN_GREATEST: AtomicU32 = AtomicU32::new(0);
+        /// Past the gate with a system time more than 200 ticks over the least.
+        static PAST_WITH_SYS: AtomicU32 = AtomicU32::new(0);
+
+        /// The ticks the thread has run, and of them those it has spent in the
+        /// kernel (0 and 0 when the kernel does not say): the time of its own
+        /// stints, which a higher level that runs in the middle does not lengthen.
+        pub fn times() -> (u64, u64) {
+            let mut raw = OWN.load(Ordering::Relaxed);
+            if raw == 0 {
+                match rt::sys::self_thread() {
+                    Ok(handle) => {
+                        raw = handle.into_raw().0;
+                        OWN.store(raw, Ordering::Relaxed);
+                    }
+                    Err(_) => return (0, 0),
+                }
+            }
+            let handle = core::mem::ManuallyDrop::new(
+                rt::handle::Handle::<rt::handle::Thread>::borrowed(abi::Handle(raw)),
+            );
+            rt::sys::thread_times(&handle).unwrap_or((0, 0))
+        }
+
+        /// The band's own figures: the ticks the thread ran in it, those of them in the
+        /// kernel, and the entries looked at.
+        pub fn band(ran: u64, sys: u64, scan: u32) {
+            LAST_RAN.store(ran, Ordering::Relaxed);
+            LAST_SYS.store(sys, Ordering::Relaxed);
+            LAST_SCAN.store(scan, Ordering::Relaxed);
+        }
+
+        /// The ticks of the band that ended, as the thread ran them.
+        pub(super) fn ran() -> u64 {
+            LAST_RAN.load(Ordering::Relaxed)
+        }
+
+        pub(super) fn fold(ran: u64) {
+            let sys = LAST_SYS.load(Ordering::Relaxed);
+            let scan = LAST_SCAN.load(Ordering::Relaxed);
+            let least = SYS_LEAST.fetch_min(sys, Ordering::Relaxed).min(sys);
+            SCAN_LEAST.fetch_min(scan, Ordering::Relaxed);
+            if ran + super::STEP_AROUND > u64::from(compositor::BAND_GATE) {
+                PAST.fetch_add(1, Ordering::Relaxed);
+                PAST_SYS_LEAST.fetch_min(sys, Ordering::Relaxed);
+                PAST_SYS_GREATEST.fetch_max(sys, Ordering::Relaxed);
+                PAST_SCAN_LEAST.fetch_min(scan, Ordering::Relaxed);
+                PAST_SCAN_GREATEST.fetch_max(scan, Ordering::Relaxed);
+                if sys > least + 200 {
+                    PAST_WITH_SYS.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                UNDER.fetch_add(1, Ordering::Relaxed);
+                UNDER_SYS_GREATEST.fetch_max(sys, Ordering::Relaxed);
+                UNDER_SCAN_GREATEST.fetch_max(scan, Ordering::Relaxed);
+            }
+        }
+
+        pub(super) fn tell() {
+            let zero = |v: u64| if v == u64::MAX { 0 } else { v };
+            let zero32 = |v: u32| if v == u32::MAX { 0 } else { v };
+            rt::println!(
+                "service band trace: 17 system least {} scan least {} under-gate {} system greatest {} scan greatest {} past-gate {} of which system over the least by 200 or more {} system {}..{} scan {}..{}",
+                zero(SYS_LEAST.load(Ordering::Relaxed)),
+                zero32(SCAN_LEAST.load(Ordering::Relaxed)),
+                UNDER.load(Ordering::Relaxed),
+                UNDER_SYS_GREATEST.load(Ordering::Relaxed),
+                UNDER_SCAN_GREATEST.load(Ordering::Relaxed),
+                PAST.load(Ordering::Relaxed),
+                PAST_WITH_SYS.load(Ordering::Relaxed),
+                zero(PAST_SYS_LEAST.load(Ordering::Relaxed)),
+                PAST_SYS_GREATEST.load(Ordering::Relaxed),
+                zero32(PAST_SCAN_LEAST.load(Ordering::Relaxed)),
+                PAST_SCAN_GREATEST.load(Ordering::Relaxed),
+            );
         }
     }
 
@@ -275,6 +466,7 @@ pub mod cost {
     /// each class: C the call in ticks, R the row and P the point in hundredths of
     /// a tick.
     pub fn tell() {
+        fold();
         let frames =
             DUE.swap(0, Ordering::Relaxed) != 0 && FRAMES.load(Ordering::Relaxed).is_power_of_two();
         let bands = BANDS_DUE.swap(0, Ordering::Relaxed) != 0;
@@ -306,6 +498,28 @@ pub mod cost {
                 k.row_n.load(Ordering::Relaxed),
                 k.point_n.load(Ordering::Relaxed),
             );
+        }
+        if bands {
+            // The bands of two layers or more by the place they came at and by their
+            // ticks (bin 0 is under 11 000, bin i from 11 000 + 500 (i - 1), the last
+            // 19 000 or more).
+            for (name, p) in PLACES.iter().zip(&AT) {
+                rt::println!(
+                    "service band place: 17 {name} n {} greatest {} past-gate {}",
+                    p.n.load(Ordering::Relaxed),
+                    p.greatest.load(Ordering::Relaxed),
+                    p.past.load(Ordering::Relaxed),
+                );
+            }
+            let mut bins = [0u32; BINS];
+            for (b, h) in bins.iter_mut().zip(&HIST) {
+                *b = h.load(Ordering::Relaxed);
+            }
+            rt::println!(
+                "service band histogram: 17 layers 2+ from {BIN_FROM} step {BIN_STEP}: {bins:?}"
+            );
+            #[cfg(feature = "irq-trace")]
+            trace::tell();
         }
         for (layers, s) in SPLIT.iter().enumerate() {
             let n = s.n.load(Ordering::Relaxed);
@@ -392,6 +606,12 @@ impl Pixman {
     /// The images made so far.
     pub fn made(&self) -> u32 {
         self.images.made()
+    }
+
+    /// The entries of the table of images looked at so far (feature `irq-trace`).
+    #[cfg(feature = "irq-trace")]
+    pub fn scanned(&self) -> u32 {
+        self.images.scanned()
     }
 
     /// One operation was refused: counted, and said the first time and at

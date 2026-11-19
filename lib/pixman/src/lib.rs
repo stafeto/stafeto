@@ -116,6 +116,8 @@ mod imp {
         kept: [Option<(Key, Image)>; KEPT],
         next: usize,
         made: u32,
+        /// The entries of the table looked at in all (feature `scan-count`).
+        scanned: u32,
     }
 
     impl Images {
@@ -124,6 +126,7 @@ mod imp {
                 kept: [const { None }; KEPT],
                 next: 0,
                 made: 0,
+                scanned: 0,
             }
         }
 
@@ -133,9 +136,32 @@ mod imp {
             self.made
         }
 
+        /// The entries of the table looked at in all (0 without the feature
+        /// `scan-count`).
+        pub fn scanned(&self) -> u32 {
+            self.scanned
+        }
+
         /// The image of `key`, made when it is not kept. None when pixman
         /// refuses (no memory in its arena).
         fn image(&mut self, key: Key) -> Option<*mut c_void> {
+            #[cfg(feature = "scan-count")]
+            {
+                let mut seen = 0u32;
+                let mut hit = None;
+                for (k, image) in self.kept.iter().flatten() {
+                    seen += 1;
+                    if *k == key {
+                        hit = Some(image.0);
+                        break;
+                    }
+                }
+                self.scanned = self.scanned.wrapping_add(seen);
+                if hit.is_some() {
+                    return hit;
+                }
+            }
+            #[cfg(not(feature = "scan-count"))]
             if let Some((_, image)) = self.kept.iter().flatten().find(|(k, _)| *k == key) {
                 return Some(image.0);
             }
