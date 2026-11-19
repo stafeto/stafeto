@@ -61,6 +61,10 @@ pub const LEVEL: u8 = 30;
 #[cfg(feature = "steps")]
 static WAITED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The reads, writes and flushes of the disk when the conversion job took its first step.
+static CONVERSION_BASE: [core::sync::atomic::AtomicU64; 3] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// The instant the conversion job took its first step, in nanoseconds (0 before it).
 static CONVERSION_BEGAN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -172,6 +176,10 @@ pub struct Disk {
     pub flush: bool,
     /// The reads of the volume since the start, for the line of a walk.
     pub reads: u64,
+    /// The writes (a call each, up to a cell) and the flushes since the start, for the line of the
+    /// conversion job: each commit of littlefs is some writes and a flush.
+    pub writes: u64,
+    pub flushes: u64,
 }
 
 enum Got {
@@ -307,6 +315,7 @@ impl Device for Disk {
     }
 
     fn write(&mut self, sector: u64, data: &[u8]) -> Result<(), DeviceError> {
+        self.writes += 1;
         for (i, chunk) in data.chunks(CELL_BYTES as usize).enumerate() {
             let at = sector + (i * CELL_BYTES as usize / SECTOR) as u64;
             #[cfg_attr(not(feature = "crash"), allow(unused_mut))]
@@ -328,6 +337,7 @@ impl Device for Disk {
     }
 
     fn flush(&mut self) -> Result<(), DeviceError> {
+        self.flushes += 1;
         match self.call(&Blk::Flush.header().bytes(), None) {
             Ok(Got::Wait(key)) => self.finish(key).map_err(|_| DeviceError),
             _ => Err(DeviceError),
@@ -419,6 +429,8 @@ fn connect_disk(process: &Handle<Process>) -> Result<Disk, &'static str> {
         sectors: info.sectors,
         flush: info.flush(),
         reads: 0,
+        writes: 0,
+        flushes: 0,
     })
 }
 
@@ -707,14 +719,24 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             if begun == 0 {
                 begun = rt::time::ticks_to_ns(rt::time::now()).max(1);
                 CONVERSION_BEGAN.store(begun, Release);
+                let d = &fs.device().device;
+                CONVERSION_BASE[0].store(d.reads, Release);
+                CONVERSION_BASE[1].store(d.writes, Release);
+                CONVERSION_BASE[2].store(d.flushes, Release);
             }
             match server.convert_step(fs) {
                 Ok(datafs::server::Step::More) => {}
                 Ok(datafs::server::Step::Done { converted, moved }) => {
                     let ms =
                         rt::time::ticks_to_ns(rt::time::now()).saturating_sub(begun) / 1_000_000;
+                    let d = &fs.device().device;
+                    let (reads, writes, flushes) = (
+                        d.reads - CONVERSION_BASE[0].load(Acquire),
+                        d.writes - CONVERSION_BASE[1].load(Acquire),
+                        d.flushes - CONVERSION_BASE[2].load(Acquire),
+                    );
                     rt::println!(
-                        "datafs: conversion ended after {ms} ms, {converted} entries got attributes, {moved} inline files moved out"
+                        "datafs: conversion ended after {ms} ms, {converted} entries got attributes, {moved} inline files moved out; the job read {reads} blocks, made {writes} writes and {flushes} flushes"
                     );
                 }
                 Err(_) => {

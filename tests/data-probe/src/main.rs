@@ -681,7 +681,7 @@ fn measure_fill(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
     let begun = now_us();
     for n in 1..200u32 {
         let mut name = [0u8; 16];
-        name[..6].copy_from_slice(b"/rm/e");
+        name[..5].copy_from_slice(b"/rm/e");
         let mut digits = [0u8; 4];
         let d = decimal(n, &mut digits);
         name[5..5 + d].copy_from_slice(&digits[..d]);

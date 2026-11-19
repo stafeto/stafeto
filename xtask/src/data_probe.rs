@@ -642,6 +642,29 @@ fn fill_on(built: &Built, cpus: usize) -> Result<Filled, String> {
     println!(
         "data-probe fill ({cpus} CPUs): READY after {ready_ms} ms, the conversion job ended after {job_ms} ms (after READY, one entry a step)"
     );
+    // What the job cost for each entry: a commit is some writes and a flush (a sync of the disk file
+    // on the host), which is what a read of 27 blocks an entry does not show.
+    let job_line: Vec<String> = converted
+        .iter()
+        .filter(|l| l.contains("datafs: conversion ended"))
+        .cloned()
+        .collect();
+    let one = |prefix: &str| qemu::number_after(&job_line, prefix);
+    if let (Some(entries), Some(reads), Some(writes), Some(flushes)) = (
+        one("ms, "),
+        one("the job read "),
+        one("blocks, made "),
+        one("writes and "),
+    ) && entries > 0
+    {
+        println!(
+            "data-probe fill ({cpus} CPUs): the job took {} us, read {:.1} blocks, made {:.1} writes and {:.1} flushes for each of {entries} entries",
+            job_ms * 1000 / entries,
+            reads as f64 / entries as f64,
+            writes as f64 / entries as f64,
+            flushes as f64 / entries as f64
+        );
+    }
     report(
         &converted,
         &format!("{cpus} CPUs, the boot that converts the volume"),
