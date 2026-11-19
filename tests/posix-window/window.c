@@ -128,11 +128,21 @@ static void draw(const struct stafeto_window *w, unsigned k, int marked) {
 }
 
 /* Waits until every buffer of `mask` is free by the library's account,
- * collecting the bits that came. */
+ * collecting the bits that came. The wait is made first, with no time to
+ * wait: a post that returned already took the bits that waited on the
+ * channel (the frame can end before the post returns), and it keeps them
+ * for the next wait, which is where the program sees them. The mask alone
+ * would say "free" and leave those bits uncollected. */
 static int wait_free(uint32_t mask, uint32_t *all) {
+    uint32_t bits = 0;
+    if (stafeto_window_wait(0, 0, &bits) == 0) {
+        if (all) *all |= bits;
+    } else if (errno != ETIMEDOUT) {
+        return -1;
+    }
     for (int i = 0; i < 600; i++) {
-        uint32_t bits = 0;
         if ((stafeto_window_free_buffers(0) & mask) == mask) return 0;
+        bits = 0;
         if (stafeto_window_wait(0, SECOND / 10, &bits) == 0) {
             if (all) *all |= bits;
         } else if (errno != ETIMEDOUT) {
@@ -264,6 +274,9 @@ static int run_role(void) {
     CHECK(stafeto_window_post(0, 1, &CHANGED, 1) == 0);
     CHECK(stafeto_window_shown(0, WITHIN) == 0);
     CHECK(wait_free(STAFETO_WINDOW_BUFFER(0), &all) == 0);
+    if (!(all & STAFETO_WINDOW_BUFFER(0)))
+        printf("posix-window: the bits that came: %x, the free buffers: %x\n", (unsigned)all,
+               (unsigned)stafeto_window_free_buffers(0));
     CHECK(all & STAFETO_WINDOW_BUFFER(0));
     CHECK(stafeto_window_free_buffers(0) == STAFETO_WINDOW_BUFFER(0));
     printf("posix-window: the frame is shown and its bit frees the replaced buffer\n");

@@ -90,7 +90,16 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<[u32; 3], String> {
     let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
     let mut shots = [0; 3];
     for (shot, prefix) in shots.iter_mut().zip(SHOTS) {
-        let line = run.expect_line(prefix, |l| l.contains(prefix), WITHIN)?;
+        // A check that failed ends the probe: no CRC line will come, and the
+        // wait for it would run to the end of the time.
+        let line = run.expect_line(
+            prefix,
+            |l| l.contains(prefix) || l.starts_with("posix-window: check failed"),
+            WITHIN,
+        )?;
+        if line.starts_with("posix-window: check failed") {
+            return Err(line);
+        }
         *shot = gpu_probe::compare_shot(&mut monitor, &scratch.picture(), &line, prefix)?;
     }
     run.expect_line(ENDED, |l| l == ENDED, WITHIN)?;
