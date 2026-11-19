@@ -26,20 +26,7 @@ impl<T> Shared<T> {
     }
 }
 
-/// The requests in flight at once, and the notice of a session that went.
-pub const JOBS: usize = 24;
-
-/// The jobs one session may have in flight at once: no session fills the table alone.
-pub const SESSION_JOBS: usize = 4;
-
-/// The jobs one root (a process tree, or a client of init) may have in flight at once, whatever
-/// the number of its sessions (up to `ROOT_CLONES` and one for each process of the tree): three
-/// roots fill the table, and no tree starves another.
-pub const ROOT_JOBS: usize = 8;
-
-/// The jobs only the sessions of native clients may take: the last of the table, so that the
-/// sessions of the process trees (many, each with its share) never leave `datakey` with no job.
-pub const NATIVE_JOBS: usize = 4;
+pub use datafs::admit::JOBS;
 
 pub const FREE: u8 = 0;
 pub const QUEUED: u8 = 1;

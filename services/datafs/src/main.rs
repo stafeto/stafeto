@@ -19,7 +19,7 @@ mod worker;
 
 use abi::{Rights, Source};
 use core::sync::atomic::Ordering::{Acquire, Release};
-use datafs::admit::{self, Adopt, Forgotten, Held};
+use datafs::admit::{self, Adopt, Fifo, Forgotten, Held, Wait};
 use proto_data::{METHODS as DATA_METHODS, Method, VERSION};
 use proto_init::ServiceArgs;
 use proto_wire::Status;
@@ -125,6 +125,8 @@ fn main(_: u64) -> u64 {
         outgoing: [const { None }; JOBS],
         carried: [const { None }; JOBS],
         forgotten: Forgotten::new(),
+        waiting: Fifo::new(),
+        made: 0,
         ready: false,
         since: 0,
     };
@@ -238,11 +240,28 @@ struct Datafs {
     carried: [Option<Handle<Channel>>; JOBS],
     /// The labels that went while every job was in use: what they held closes when a job is free.
     forgotten: Forgotten<FORGOTTEN>,
+    /// The SESSION requests of the root channel that wait for a job, first in, first out.
+    waiting: Fifo<Waiting, { admit::WAITING_MAX }>,
+    /// The sessions and clones of process trees made and not yet closed: the last places of the
+    /// table stay for the native clients (`admit::may_make`).
+    made: usize,
     /// READY went to init (once the worker's start is over, the volume mounted or not).
     ready: bool,
     /// The instant the worker's start was over (0 while it is not), for the look at the oldest job.
     since: u64,
 }
+
+/// A SESSION request of the root channel that waits for a job: the answer to give, the identity
+/// session it brought, and the request as it came (a header, `WAITING_BYTES` at most).
+struct Waiting {
+    pending: Pending,
+    brought: Handle<Channel>,
+    owner: u64,
+    request: [u8; WAITING_BYTES],
+    len: usize,
+}
+
+const WAITING_BYTES: usize = 16;
 
 /// The clock in nanoseconds.
 fn now_ns() -> u64 {
@@ -323,6 +342,9 @@ impl Datafs {
 
     /// A new label of the service's own and a copy of its channel that carries it, with `rights`.
     fn make(&mut self, rights: Rights, pass: bool) -> Result<(u64, Handle<Any>), abi::Error> {
+        if !pass && !admit::may_make(self.made, SESSIONS) {
+            return Err(abi::Error::LimitReached);
+        }
         let label = if pass {
             proto_data::PASS | self.next_label
         } else {
@@ -330,6 +352,7 @@ impl Datafs {
         };
         let copy = sys::handle_label(&self.channel, rights, label, self.level)?;
         self.next_label += 1;
+        self.made += usize::from(!pass);
         Ok((label, copy.erase()))
     }
 
@@ -349,12 +372,13 @@ impl Datafs {
         let free = (0..JOBS)
             .filter(|&j| state(j).load(Acquire) == FREE && self.pending[j].is_none())
             .count();
-        if !admit::leaves_for_native(free, proto_data::is_service(owner), NATIVE_JOBS)
-            || !admit::root_has_room(tree, ROOT_JOBS)
-        {
-            return None;
-        }
-        admit::job_for(self.free_job(), mine, SESSION_JOBS)
+        admit::admit(admit::Load {
+            free_job: self.free_job(),
+            free,
+            mine,
+            tree,
+            native: proto_data::is_service(owner),
+        })
     }
 
     /// ADOPT: the handle of the request is a pass of the service; its label goes to the worker, which
@@ -435,9 +459,12 @@ impl Datafs {
             Ok(label) if admit::verifiable(label) => {
                 // The session came from a loader, for a set-ID program: the identity it was
                 // bound to is the parent's, so the worker ends the binding before the program's
-                // first request (the queue keeps the order). With no job free the session is not
+                // first request (the queue keeps the order). With no job admitted the session is not
                 // vouched for: the loader leaves the slot empty.
-                let Some(i) = self.free_job() else {
+                // The job is admitted under the rules of every request, for the label of the
+                // session verified: a loop of VERIFY_SESSION on one session takes its share and no
+                // more, and leaves the native places and the other roots' alone.
+                let Some(i) = self.job_for(label) else {
                     return Answer::Status(proto_data::code(proto_data::BAD_HANDLE));
                 };
                 if r.reply().u32(0).is_err() {
@@ -485,7 +512,80 @@ impl Datafs {
         if more {
             let _ = sys::notify(&self.again, 1);
         }
+        self.release_waiting();
         self.close_forgotten();
+    }
+
+    /// Keeps a SESSION request of the root channel until a job is admitted: the answer is deferred
+    /// and the identity session it brought is held with it. A request that does not fit the queue
+    /// gets busy.
+    fn wait(&mut self, r: &mut Request<'_>, owner: u64) -> Answer {
+        if r.handles.len() != 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        let bytes = r.bytes();
+        if bytes.len() > WAITING_BYTES {
+            return Answer::Status(busy());
+        }
+        let Ok(brought) = r.handles.take::<Channel>(0) else {
+            return Answer::Status(Status::Kernel(abi::Error::WrongType));
+        };
+        let Some(pending) = r.defer() else {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        };
+        let mut request = [0; WAITING_BYTES];
+        request[..bytes.len()].copy_from_slice(bytes);
+        let waiting = Waiting {
+            pending,
+            brought,
+            owner,
+            request,
+            len: bytes.len(),
+        };
+        if let Err(back) = self.waiting.push(waiting) {
+            let _ = back
+                .pending
+                .answer(&busy().code().to_le_bytes(), Outgoing::new());
+        }
+        Answer::Deferred
+    }
+
+    /// The waiting requests go to the worker in the order they came, while jobs are admitted.
+    fn release_waiting(&mut self) {
+        while let Some(front) = self.waiting.front() {
+            let Some(i) = self.job_for(front.owner) else {
+                break;
+            };
+            let Some(waiting) = self.waiting.pop() else {
+                break;
+            };
+            match self.make(Rights::SEND | Rights::TRANSFER, false) {
+                Ok((label, copy)) => {
+                    self.pending[i] = Some(waiting.pending);
+                    self.outgoing[i] = Some((Held::Made, copy));
+                    self.carried[i] = Some(waiting.brought);
+                    self.queue(
+                        i,
+                        REQUEST,
+                        waiting.owner,
+                        label,
+                        &waiting.request[..waiting.len],
+                    );
+                }
+                Err(e) => {
+                    let code = Status::Kernel(e).code().to_le_bytes();
+                    let _ = waiting.pending.answer(&code, Outgoing::new());
+                }
+            }
+        }
+    }
+
+    /// The service stops: nothing waits for a job any more.
+    fn refuse_waiting(&mut self) {
+        let code = Status::Kernel(abi::Error::BadState).code().to_le_bytes();
+        while let Some(waiting) = self.waiting.pop() {
+            let _ = waiting.pending.answer(&code, Outgoing::new());
+        }
     }
 }
 
@@ -508,7 +608,17 @@ impl Service<0> for Datafs {
             return self.verify_session(r);
         }
         let owner = r.label();
-        let Some(i) = self.job_for(owner) else {
+        let job = self.job_for(owner);
+        // Every SESSION arrives with the one root label and shares its jobs: over the share the
+        // request waits its turn, and busy answers only a full queue.
+        if Method::from_number(r.method()) == Some(Method::Session) && proto_data::is_root(owner) {
+            match admit::wait_plan(job.is_some(), self.waiting.len()) {
+                Wait::Run => {}
+                Wait::Defer => return self.wait(r, owner),
+                Wait::Busy => return Answer::Status(busy()),
+            }
+        }
+        let Some(i) = job else {
             return Answer::Status(busy());
         };
         // The calls that bring or make a handle are the request thread's: a kernel call each, no disk.
@@ -556,6 +666,10 @@ impl Service<0> for Datafs {
     /// The last copy of the handle of `label` went, whether it had a session or not (a session, a
     /// clone's or a client's, or a pass): what it held closes in a job of the worker.
     fn closed(&mut self, label: u64) {
+        // A session or clone made for a process tree: its place of the count is free again.
+        if label & OWN != 0 && !proto_data::is_pass(label) && !proto_data::is_root(label) {
+            self.made = self.made.saturating_sub(1);
+        }
         match self.free_job() {
             Some(i) => self.queue(i, GONE, label, 0, &[]),
             None => {
@@ -606,6 +720,7 @@ impl Service<0> for Datafs {
             }
             STOP_AT.store(rt::time::now().max(1), Release);
             STOPPING.store(true, Release);
+            self.refuse_waiting();
             let _ = sys::notify(&self.kick, 1);
         }
     }
