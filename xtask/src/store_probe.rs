@@ -785,10 +785,21 @@ fn steps() -> Result<(), String> {
     expect(&lines, &measured(true, disk_lines(&layout)[..4].to_vec()))?;
     // The full scenario under the same measurement: every method of the service comes.
     let full = full_run(true)?;
-    let both = |tag: &str| merge(longest_steps(&lines, tag), longest_steps(&full, tag));
-    let pkgd = both(PKGD_TAG);
-    let blk = both(blk_probe::BLK_TAG);
-    let ram = both(RAM_TAG);
+    let both = |tag: &str| -> Result<_, String> {
+        Ok(merge(longest_steps(&lines, tag), longest_steps(&full, tag)))
+    };
+    // The hard check against B, for the kinds each service is judged on below.
+    {
+        use crate::step_line::{Kinds, within_b};
+        for run_lines in [&lines, &full] {
+            within_b(run_lines, PKGD_TAG, Kinds::All)?;
+            within_b(run_lines, blk_probe::BLK_TAG, Kinds::All)?;
+            within_b(run_lines, RAM_TAG, Kinds::Only(&[51, 53, 64, 65]))?;
+        }
+    }
+    let pkgd = both(PKGD_TAG)?;
+    let blk = both(blk_probe::BLK_TAG)?;
+    let ram = both(RAM_TAG)?;
     judge("pkgd", &pkgd, &PKGD_STEP_KINDS)?;
     judge("the disk service", &blk, &BLK_STEP_KINDS)?;
     // The file service: the layer calls the worker makes while the main thread answers.
@@ -1351,6 +1362,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
     if steps {
         // Every method of the service came, and no step of it, the heartbeat's and the
         // interrupt's included, is past 0.9 of term B.
+        crate::step_line::within_b(&first, blk_probe::BLK_TAG, crate::step_line::Kinds::All)?;
         let mut blk = step_rows(&first);
         // A line of a step is told only when it is a new longest of its kind, and with the lines
         // of the services glued together under -icount one may be lost: a kind that did not come
@@ -1374,6 +1386,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
                 BOOT_TIMEOUT * 40,
             )?;
             expect_within(&again, &steady_lines(&world))?;
+            crate::step_line::within_b(&again, blk_probe::BLK_TAG, crate::step_line::Kinds::All)?;
             blk = merge(blk, step_rows(&again));
             lost.push(lost_records(&again));
             runs += 1;

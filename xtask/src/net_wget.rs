@@ -457,6 +457,11 @@ pub(crate) fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, 
         (19, "Clone"),
     ];
     let rows = crate::net_probe::longest_over_starts(lines);
+    crate::step_line::within_b(
+        lines,
+        crate::net_probe::NET_TAG,
+        crate::step_line::Kinds::All,
+    )?;
     for (kind, name) in KINDS {
         if !rows.iter().any(|(k, ..)| *k == kind) {
             return Err(format!("the network service: no step {name}: {rows:?}"));

@@ -1028,6 +1028,8 @@ impl Compositor {
     /// the step of a band).
     fn band(&mut self) {
         rt::service::step_own();
+        #[cfg(feature = "steps")]
+        let band_began = rt::time::now();
         let Some(job) = self.job.as_mut() else {
             return;
         };
@@ -1043,6 +1045,10 @@ impl Compositor {
         // object, read and write, SCREEN_BYTES of its 256 pages; nothing
         // else in this thread holds it.
         let fb = unsafe { slice::from_raw_parts_mut(FB_AT as *mut u8, SCREEN_BYTES as usize) };
+        #[cfg(feature = "steps")]
+        px::cost::band_begin();
+        #[cfg(feature = "steps")]
+        let compose_began = rt::time::now();
         job.at = compose(
             &self.scene,
             job.damage,
@@ -1050,6 +1056,11 @@ impl Compositor {
             fb,
             &Pixels(&self.scene),
             &mut self.raster,
+        );
+        #[cfg(feature = "steps")]
+        px::cost::band_end(
+            rt::time::now() - compose_began,
+            rt::time::now() - band_began,
         );
         self.scene.band_done();
         let _ = sys::notify(&self.notify, BAND);

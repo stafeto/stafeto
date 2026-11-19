@@ -228,6 +228,7 @@ fn rows_of(
     kinds: &[(usize, &str)],
 ) -> Result<Vec<(usize, u64, u64)>, String> {
     let rows = longest_steps(lines, tag);
+    crate::step_line::within_b(lines, tag, crate::step_line::Kinds::All)?;
     for (kind, what) in kinds {
         if !rows.iter().any(|(k, ..)| k == kind) {
             return Err(format!("the {name}: no step {what}: {rows:?}"));
@@ -239,11 +240,14 @@ fn rows_of(
             gpu_probe::STEP_MAX
         ));
     }
+    // A portion is a target of the kind of 0.9 B and is judged the same way: the greatest by
+    // kind of N - P * PREEMPT_CHARGE. The work no preemption touched is told beside it.
     if let Some(row) = rows.iter().find(|r| r.0 == 65 && r.1 > PORTION_MAX) {
         return Err(format!(
             "the {name}: a portion or an interrupt past {PORTION_MAX}: {row:?}"
         ));
     }
+    crate::step_line::say_clean(lines, tag, name, 65);
     Ok(rows)
 }
 
@@ -675,10 +679,6 @@ pub struct LayerTerm {
     pub by_count: Vec<(u64, i64)>,
     /// The greatest of those.
     pub term: i64,
-    /// The greatest shortfall of a band of one layer under the table's prices
-    /// (the black and the layer by `compositor::PRICES`), in ticks (0 when none):
-    /// the measure of `compositor::BAND_FIXED_MEASURED`.
-    pub fixed: i64,
 }
 
 pub fn layer_term(costs: &[ShapeCost]) -> Option<LayerTerm> {
@@ -697,24 +697,14 @@ pub fn layer_term(costs: &[ShapeCost]) -> Option<LayerTerm> {
         c.greatest as i64 - ticks(black, c.w, c.h) - count as i64 * ticks(over, c.w, c.h)
     };
     let mut one = i64::MIN;
-    let mut fixed = 0i64;
     let mut by_count = Vec::new();
-    let table = |p: compositor::Price, w: u32, h: u32| -> i64 {
-        i64::from(p.call)
-            + (i64::from(p.row) * i64::from(h)
-                + i64::from(p.point) * i64::from(w) * i64::from(h)
-                + 99)
-                .div_euclid(100)
-    };
     for c in costs.iter().filter(|c| c.kind == "layers1") {
         one = one.max(excess(1, c));
-        let model = table(compositor::FILL, c.w, c.h) + table(compositor::OVER, c.w, c.h);
-        fixed = fixed.max(c.greatest as i64 - model);
     }
     if one == i64::MIN {
         return None;
     }
-    for count in [2u64, 4, 8] {
+    for count in [2u64, 4, 8, 9] {
         let mut greatest = i64::MIN;
         for c in costs.iter().filter(|c| c.kind == format!("layers{count}")) {
             if let Some(single) = band(1, c.w, c.h) {
@@ -731,8 +721,109 @@ pub fn layer_term(costs: &[ShapeCost]) -> Option<LayerTerm> {
         one: one.max(0),
         by_count,
         term: term.max(0),
-        fixed,
     })
+}
+
+/// The line `service band: T layers L n N outside least A greatest B total
+/// greatest G compose C ops O`: for the bands of L layers the service made, the
+/// least and the greatest ticks of `compose` less its operations (what the band
+/// spends around the calls), and, of the band whose own code took longest (G), the
+/// ticks of its `compose` and of its operations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BandSplit {
+    pub layers: u64,
+    pub n: u64,
+    pub outside_least: u64,
+    pub outside_greatest: u64,
+    pub total: u64,
+    pub compose: u64,
+    pub ops: u64,
+}
+
+impl BandSplit {
+    fn parse(line: &str, tag: &str) -> Option<BandSplit> {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let [
+            "service",
+            "band:",
+            t,
+            "layers",
+            layers,
+            "n",
+            n,
+            "outside",
+            "least",
+            a,
+            "greatest",
+            b,
+            "total",
+            "greatest",
+            g,
+            "compose",
+            c,
+            "ops",
+            o,
+        ] = w.as_slice()
+        else {
+            return None;
+        };
+        if *t != tag {
+            return None;
+        }
+        Some(BandSplit {
+            layers: layers.parse().ok()?,
+            n: n.parse().ok()?,
+            outside_least: a.parse().ok()?,
+            outside_greatest: b.parse().ok()?,
+            total: g.parse().ok()?,
+            compose: c.parse().ok()?,
+            ops: o.parse().ok()?,
+        })
+    }
+}
+
+/// The last line of each count of layers of the service `tag`.
+pub fn band_splits(lines: &[String], tag: &str) -> Vec<BandSplit> {
+    let mut out: Vec<BandSplit> = Vec::new();
+    for c in lines.iter().filter_map(|l| BandSplit::parse(l, tag)) {
+        match out.iter_mut().find(|o| o.layers == c.layers) {
+            Some(old) => *old = c,
+            None => out.push(c),
+        }
+    }
+    out.sort_by_key(|b| b.layers);
+    out
+}
+
+/// The bands the service made, by layers: what a band spends around its
+/// operations (`compose` less the calls, least and greatest, the greatest includes a
+/// preemption in the middle), and the band whose own code took longest: its ticks,
+/// of which the operations and what is around them, each by the layers it laid.
+pub fn band_split_text(splits: &[BandSplit]) -> String {
+    if splits.is_empty() {
+        return "bands by layers: no lines (a run without the steps feature)".to_owned();
+    }
+    let parts: Vec<String> = splits
+        .iter()
+        .map(|b| {
+            let layers = b.layers.max(1);
+            format!(
+                "{} layers ({} bands): around the operations {}..{} ticks, the model's {} ({}..{} a layer), longest band {} ticks of which the operations {} and around them {} ({} a layer)",
+                b.layers,
+                b.n,
+                b.outside_least,
+                b.outside_greatest,
+                compositor::BAND_FIXED + compositor::LAYER * b.layers as u32,
+                b.outside_least / layers,
+                b.outside_greatest / layers,
+                b.total,
+                b.ops,
+                b.total.saturating_sub(b.ops),
+                b.total.saturating_sub(b.ops) / layers
+            )
+        })
+        .collect();
+    format!("bands by layers: {}", parts.join("; "))
 }
 
 /// The term of a layer told against the table.
@@ -746,15 +837,14 @@ pub fn layer_text(costs: &[ShapeCost]) -> String {
         .map(|(n, g)| format!("{n} layers {g}"))
         .collect();
     format!(
-        "layers: the greatest excess of a band of one layer over its operations is {} ticks, and of each layer added {} ticks (by count: {}; a term that is the same at 2, 4 and 8 is a constant a layer, one that grows with the count is not); the table has {} measured ({} with the margin); the greatest shortfall of a band of one layer under the table's prices is {} ticks (the fixed term of a band, the table has {} measured, {} with the margin)",
+        "layers: the greatest excess of a band of one layer over its operations is {} ticks, and of each layer added {} ticks (by count: {}; a term that is the same at 2, 4 and 8 is a constant a layer, one that grows with the count is not); the table follows the real bands (`service band`), whose terms are the fixed term of a band {} measured ({} with the margin) and the term of every layer {} measured ({} with the margin), and the calibration's term is the check on shapes of its own",
         t.one,
         t.term,
         counts.join(", "),
-        compositor::LAYER_MEASURED,
-        compositor::LAYER,
-        t.fixed,
         compositor::BAND_FIXED_MEASURED,
-        compositor::BAND_FIXED
+        compositor::BAND_FIXED,
+        compositor::LAYER_MEASURED,
+        compositor::LAYER
     )
 }
 
@@ -812,7 +902,7 @@ pub fn fit_text(costs: &[ShapeCost]) -> String {
         let (cw, ch) = band_size(cc, cr, cp, 12);
         let (tw, th) = band_size(cc, cr, cp, 200);
         // Eight windows with an alpha over the whole screen, and the black.
-        let term = compositor::LAYER * 7;
+        let term = compositor::LAYER * 8;
         let (ew, er) = band_size(8 * oc + bc + term, 8 * or + br, 8 * op + bp, 640);
         let worst = |calls: u32, row: u32, point: u32, w: u32, h: u32| {
             u64::from(calls)
@@ -1014,13 +1104,14 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         text(&driver)
     );
     println!(
-        "comp-probe on {}: {}; the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}; the calibration of the prices on shapes of their own: {}; the upper fit over the shapes: {}",
+        "comp-probe on {}: {}; the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}; the calibration of the prices on shapes of their own: {}; the upper fit over the shapes: {}; {}",
         machine.name,
         full_frame_text(),
         compositor::BAND_TICKS,
         raster_text(&raster_costs(&output.lines, COMP_TAG)),
         calibration_text(&calibrations(&output.lines, COMP_TAG)),
-        fit_text(&shape_costs(&output.lines, COMP_TAG))
+        fit_text(&shape_costs(&output.lines, COMP_TAG)),
+        band_split_text(&band_splits(&output.lines, COMP_TAG))
     );
     Ok(())
 }
@@ -1340,34 +1431,26 @@ mod tests {
         assert!(fit_text(&shapes[..2]).contains("no fit"));
     }
 
-    /// The probes' bands of one layer (the greatest ticks) give the fixed term
-    /// of the table: the greatest shortfall under the prices is 88 ticks, at 16 by 1.
     #[test]
-    fn the_fixed_term_is_the_greatest_shortfall_of_a_band_of_one_layer() {
-        let mut lines = Vec::new();
-        let mut shape = |kind: &str, w: u32, h: u32, ticks: u64| {
-            lines.push(format!(
-                "service shape: 17 {kind} {w} {h} least {} greatest {ticks} n 12",
-                ticks - 1
-            ));
-        };
-        for (w, h) in [(8u32, 1u32), (64, 1), (150, 1), (64, 16), (150, 8), (16, 8)] {
-            let p = u64::from(w) * u64::from(h);
-            shape("black", w, h, 200 + p);
-            shape("over", w, h, 800 + 4 * p);
-        }
-        for (w, h, ticks) in [
-            (16u32, 1u32, 1_565u64),
-            (64, 1, 1_787),
-            (150, 1, 2_187),
-            (150, 4, 4_913),
-            (76, 8, 5_689),
-            (8, 8, 1_647),
-        ] {
-            shape("layers1", w, h, ticks);
-        }
-        let t = layer_term(&shape_costs(&lines, COMP_TAG)).unwrap();
-        assert_eq!(t.fixed, i64::from(compositor::BAND_FIXED_MEASURED));
+    fn the_bands_by_layers_are_read_from_their_lines() {
+        let lines = vec![
+            "service band: 17 layers 8 n 100 outside least 3000 greatest 3400 total greatest 17000 compose 14500 ops 10000".to_owned(),
+            "service band: 17 layers 8 n 200 outside least 3000 greatest 3500 total greatest 17100 compose 14600 ops 10100".to_owned(),
+            "service band: 17 layers 1 n 5 outside least 400 greatest 500 total greatest 4000 compose 1500 ops 1000".to_owned(),
+            "service band: 12 layers 8 n 1 outside least 1 greatest 1 total greatest 1 compose 1 ops 1".to_owned(),
+        ];
+        let splits = band_splits(&lines, COMP_TAG);
+        assert_eq!(splits.len(), 2);
+        assert_eq!((splits[0].layers, splits[0].n), (1, 5));
+        assert_eq!(
+            (splits[1].layers, splits[1].n, splits[1].total),
+            (8, 200, 17_100)
+        );
+        let text = band_split_text(&splits);
+        assert!(text.contains(
+            "8 layers (200 bands): around the operations 3000..3500 ticks, the model's 2948 (375..437 a layer)"
+        ));
+        assert!(band_split_text(&[]).contains("no lines"));
     }
 
     #[test]
@@ -1408,8 +1491,6 @@ mod tests {
         let t = layer_term(&shape_costs(&lines, COMP_TAG)).unwrap();
         assert_eq!(t.one, 0);
         assert_eq!(t.term, 300);
-        // The black and a layer by the table's prices are far over these planes.
-        assert_eq!(t.fixed, 0);
         assert_eq!(t.by_count, vec![(2, 300), (4, 300), (8, 300)]);
         assert!(layer_text(&shape_costs(&lines, COMP_TAG)).contains("each layer added 300"));
         assert!(layer_text(&[]).contains("no lines"));
@@ -1428,6 +1509,26 @@ mod tests {
         // A band past the portion bound fails for the own kind alone.
         assert!(steps_verdict(&rows(Some((COMP_TAG, 65, PORTION_MAX + 1)), None)).is_err());
         assert!(steps_verdict(&rows(Some((COMP_TAG, 20, PORTION_MAX + 1)), None)).is_ok());
+        // A portion is judged like 0.9 B, by N - P * 1 300: 18 807 with three preemptions passes
+        // (14 907), 17 000 with none and 18 000 with one (16 700) fail, and a kind with lines that
+        // all have preemptions is judged.
+        let with = |text: &str| {
+            let mut lines = rows(Some((COMP_TAG, 65, 100)), None);
+            lines.push(format!("service step: {COMP_TAG} kind 65 {text}"));
+            lines
+        };
+        assert!(steps_verdict(&with("18807 ticks detail 0 preempts 3")).is_ok());
+        assert!(steps_verdict(&with("17000 ticks detail 0")).is_err());
+        let error = steps_verdict(&with("18000 ticks detail 0 preempts 1")).unwrap_err();
+        assert!(error.contains("16700"), "{error}");
+        let only_preempted: Vec<String> = rows(None, None)
+            .into_iter()
+            .filter(|l| !l.contains(&format!("{COMP_TAG} kind 65 ")))
+            .chain([format!(
+                "service step: {COMP_TAG} kind 65 18000 ticks detail 0 preempts 1"
+            )])
+            .collect();
+        assert!(steps_verdict(&only_preempted).is_err());
         assert!(
             steps_verdict(&rows(None, Some((COMP_TAG, 19))))
                 .unwrap_err()
