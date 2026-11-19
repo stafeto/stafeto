@@ -815,7 +815,7 @@ mod served {
             fs.format().unwrap();
             fs.mount().unwrap();
             let opened = call(&mut server, &mut fs, 1, |w| {
-                p::open(b"/f", p::WRITE | p::CREATE | p::TRUNCATE, w)
+                p::open_v2(b"/f", p::WRITE | p::CREATE | p::TRUNCATE, w)
             })
             .unwrap();
             let handle = word(&opened, 0);
@@ -880,7 +880,7 @@ mod served {
         })
         .unwrap();
         let opened = call(s, &mut fs, 1, |w| {
-            p::open(b"//ssh/./key", p::WRITE | p::READ | p::CREATE, w)
+            p::open_v2(b"//ssh/./key", p::WRITE | p::READ | p::CREATE, w)
         })
         .unwrap();
         let handle = word(&opened, 0);
@@ -917,7 +917,7 @@ mod served {
         call(s, &mut fs, 2, |w| p::rename(b"/ssh/key", b"/ssh/key2", w)).unwrap();
         // A directory, listed.
         let dir = word(
-            &call(s, &mut fs, 2, |w| p::open(b"/ssh", p::DIRECTORY, w)).unwrap(),
+            &call(s, &mut fs, 2, |w| p::open_v2(b"/ssh", p::DIRECTORY, w)).unwrap(),
             0,
         );
         let mut names = Vec::new();

@@ -25,13 +25,29 @@
 use crate::fs::{Dir, Entry, Error, File, Fs, Kind, Open, Whence};
 use crate::{DIRS, Device, FILES};
 use proto_data as p;
-use proto_data::{HELD_MAX, MAX_PATH, Method};
+use proto_data::Method;
 use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 
 /// The sessions of the table: the loop of the service holds as many.
 pub const SESSIONS: usize = 32;
 /// The descriptions open at once (a bit of a session's mask each).
 pub const DESCRIPTIONS: usize = 16;
+// The limits of the protocol's version 2, which this service's tables still hold. Version 3 of
+// `proto_data` names larger ones (MAX_PATH 506, HELD_MAX 32, ROOT_DESCRIPTIONS 48, ROOT_CLONES 32,
+// PASSES_MAX 8);
+// the service takes them when its tables grow to match.
+/// The longest path the service takes.
+pub const MAX_PATH: usize = 480;
+/// The descriptions one session holds at most.
+pub const HELD_MAX: usize = 6;
+/// The descriptions CLONE and CLONE_MORE carry at most.
+pub const CLONE_MAX: usize = HELD_MAX;
+/// The passes one process tree has made and not spent at once.
+pub const PASSES_MAX: usize = 4;
+/// The live clones of one process tree.
+pub const ROOT_CLONES: usize = 8;
+/// The distinct descriptions the sessions of one process tree hold together.
+pub const ROOT_DESCRIPTIONS: usize = 10;
 /// The passes alive at once.
 pub const PASSES: usize = 8;
 /// The hidden directory of the files that are unlinked and still open.
@@ -551,7 +567,7 @@ impl Server {
         }
         let tree = self.root_held(s.root);
         if s.held.count_ones() as usize >= HELD_MAX
-            || (tree & (1 << di) == 0 && tree.count_ones() as usize >= p::ROOT_DESCRIPTIONS)
+            || (tree & (1 << di) == 0 && tree.count_ones() as usize >= ROOT_DESCRIPTIONS)
         {
             return Err(p::code(p::TOO_MANY_OPEN));
         }
@@ -1106,7 +1122,7 @@ impl Server {
             }
             Method::Clone => {
                 let count = r.u32()?;
-                let mut handles = [0; p::CLONE_MAX];
+                let mut handles = [0; CLONE_MAX];
                 let count = p::read_handles(r, count, &mut handles)?;
                 if count == 0 {
                     return Err(p::code(p::INVALID));
@@ -1123,7 +1139,7 @@ impl Server {
                     .iter()
                     .filter(|s| s.used && s.root == root && s.parent != 0)
                     .count();
-                if clones >= p::ROOT_CLONES {
+                if clones >= ROOT_CLONES {
                     return Err(p::code(p::TOO_MANY_OPEN));
                 }
                 let ci = self.free_session()?;
@@ -1142,7 +1158,7 @@ impl Server {
             Method::CloneMore => {
                 let birth = r.u32()?;
                 let count = r.u32()?;
-                let mut handles = [0; p::CLONE_MAX];
+                let mut handles = [0; CLONE_MAX];
                 let count = p::read_handles(r, count, &mut handles)?;
                 if count == 0 {
                     return Err(p::code(p::INVALID));
@@ -1180,7 +1196,7 @@ impl Server {
                     .iter()
                     .filter(|p| p.used && p.owner == root)
                     .count();
-                if mine >= p::PASSES_MAX {
+                if mine >= PASSES_MAX {
                     return Err(p::code(p::TOO_MANY_OPEN));
                 }
                 let free = self
@@ -1197,6 +1213,18 @@ impl Server {
                 self.descriptions[di].refs += 1;
                 Ok(())
             }
+            // The requests of version 3 that this service does not read yet.
+            Method::Bind
+            | Method::Chmod
+            | Method::Chown
+            | Method::Fchmod
+            | Method::Fchown
+            | Method::Utimens
+            | Method::Futimens
+            | Method::Access
+            | Method::Where
+            | Method::Session
+            | Method::VerifySession => Err(Status::UnknownMethod),
             Method::Adopt => {
                 r.finish()?;
                 let pi = self
@@ -1319,7 +1347,7 @@ impl Server {
         }
         let tree = self.root_held(self.sessions[si].root);
         if self.sessions[si].held.count_ones() as usize >= HELD_MAX
-            || tree.count_ones() as usize >= p::ROOT_DESCRIPTIONS
+            || tree.count_ones() as usize >= ROOT_DESCRIPTIONS
         {
             return Err(p::code(p::TOO_MANY_OPEN));
         }

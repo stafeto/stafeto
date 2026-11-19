@@ -188,7 +188,7 @@ mod served {
         }
 
         fn try_open(&mut self, owner: u64, path: &[u8], flags: u32) -> Res {
-            self.call(owner, 0, |w| p::open(path, flags, w))
+            self.call(owner, 0, |w| p::open_v2(path, flags, w))
         }
 
         fn write(&mut self, owner: u64, h: u32, data: &[u8]) -> u32 {
@@ -547,16 +547,16 @@ mod served {
         let mut state = Storage::new();
         let mut t = Rig::new(&mut state);
         let mut held = Vec::new();
-        for i in 0..p::HELD_MAX {
+        for i in 0..crate::server::HELD_MAX {
             held.push(t.open(1, std::format!("/f{i}").as_bytes(), RW));
         }
         assert_eq!(t.try_open(1, b"/more", RW), Err(p::code(p::TOO_MANY_OPEN)));
         // The refusal took nothing: the same descriptions are all there is.
-        assert_eq!(t.server.open_count(), p::HELD_MAX);
+        assert_eq!(t.server.open_count(), crate::server::HELD_MAX);
         // Another client still opens; a child that holds as many cannot take one more by CLONE_MORE.
         let other = t.open(2, b"/other", RW);
         let birth = word(
-            &t.call(1, 500, |w| p::clone(&held[..p::CLONE_MAX], w))
+            &t.call(1, 500, |w| p::clone(&held[..crate::server::CLONE_MAX], w))
                 .unwrap(),
             0,
         );
@@ -583,7 +583,7 @@ mod served {
             t.call(1, 100, |w| p::clone(&[], w)),
             Err(p::code(p::INVALID))
         );
-        for i in 0..p::ROOT_CLONES as u64 {
+        for i in 0..crate::server::ROOT_CLONES as u64 {
             t.call(1, 100 + i, |w| p::clone(&[f], w)).unwrap();
         }
         assert_eq!(
@@ -604,7 +604,7 @@ mod served {
         // The tree's distinct descriptions are limited too, over all its sessions.
         let mut opened = 1;
         let mut by = 1u64;
-        while opened < p::ROOT_DESCRIPTIONS {
+        while opened < crate::server::ROOT_DESCRIPTIONS {
             if t.try_open(by, b"/f", p::READ).is_err() {
                 by = 100 + (by + 1) % 8;
                 continue;
@@ -620,7 +620,7 @@ mod served {
             Err(p::code(p::TOO_MANY_OPEN))
         );
         // Passes of a tree are limited as a whole.
-        for i in 0..p::PASSES_MAX as u64 {
+        for i in 0..crate::server::PASSES_MAX as u64 {
             t.call(1, 300 + i, |w| p::handle_call(p::Method::Export, f, w))
                 .unwrap();
         }
@@ -636,7 +636,7 @@ mod served {
         let mut t = Rig::new(&mut state);
         // Two clients take every open file of the volume (FILES), by distinct names.
         for i in 0..crate::FILES {
-            let owner = 1 + (i / p::HELD_MAX) as u64;
+            let owner = 1 + (i / crate::server::HELD_MAX) as u64;
             t.open(owner, std::format!("/f{i}").as_bytes(), RW);
         }
         assert_eq!(t.try_open(3, b"/one-more", RW), Err(p::code(p::TABLE_FULL)));
@@ -721,7 +721,7 @@ mod served {
         assert_eq!(t.server.open_count(), 0);
         // Passes of one session are bounded.
         let h = t.open(1, b"/h", RW);
-        for label in 0..p::PASSES_MAX as u64 {
+        for label in 0..crate::server::PASSES_MAX as u64 {
             t.call(1, 1000 + label, |w| p::handle_call(p::Method::Export, h, w))
                 .unwrap();
         }
@@ -747,7 +747,7 @@ mod served {
         assert_eq!(ask(&mut next, &mut t.fs, f), Err(p::code(p::STALE)));
         // The new instance's own handle works, and the old one still does on the old instance.
         let mut w = Writer::new();
-        p::open(b"/f", p::READ, &mut w).unwrap();
+        p::open_v2(b"/f", p::READ, &mut w).unwrap();
         let r = next.handle(&mut t.fs, 1, 0, w.as_bytes());
         let g = word(p::reply(r.as_bytes()).unwrap().bytes(8).unwrap(), 0);
         assert_eq!(g >> 13, 8);
@@ -890,7 +890,7 @@ mod served {
         let mut a = Server::with_epoch(one);
         let mut b = Server::with_epoch(3);
         let mut w = Writer::new();
-        p::open(b"/x", p::READ | p::WRITE | p::CREATE, &mut w).unwrap();
+        p::open_v2(b"/x", p::READ | p::WRITE | p::CREATE, &mut w).unwrap();
         let h = word(
             p::reply(a.handle(&mut fs, 1, 0, w.as_bytes()).as_bytes())
                 .unwrap()
@@ -915,13 +915,13 @@ mod served {
         t.call(1, 900, |w| p::handle_call(p::Method::Export, f, w))
             .unwrap();
         let mut mine = Vec::new();
-        for i in 0..p::HELD_MAX {
+        for i in 0..crate::server::HELD_MAX {
             mine.push(t.open(2, std::format!("/g{i}").as_bytes(), RW));
         }
         // The session is full: the pass is not spent, and a retry after a close works.
         assert_eq!(t.call(2, 900, p::adopt), Err(p::code(p::TOO_MANY_OPEN)));
         assert_eq!(t.server.pass_count(), 1);
-        assert_eq!(t.server.open_count(), p::HELD_MAX + 1);
+        assert_eq!(t.server.open_count(), crate::server::HELD_MAX + 1);
         t.server.gone(&mut t.fs, 900 + 1_000_000);
         assert_eq!(
             t.server.pass_count(),
@@ -934,7 +934,7 @@ mod served {
         assert_eq!(t.server.pass_count(), 0);
         t.close(1, f).unwrap();
         t.close(2, f).unwrap();
-        assert_eq!(t.server.open_count(), p::HELD_MAX - 1);
+        assert_eq!(t.server.open_count(), crate::server::HELD_MAX - 1);
     }
 
     #[test]

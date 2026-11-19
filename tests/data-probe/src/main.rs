@@ -109,7 +109,7 @@ impl Client {
     }
 
     fn open(&self, path: &[u8], flags: u32) -> Result<u32, Status> {
-        Ok(self.call(|w| p::open(path, flags, w))?.word(0))
+        Ok(self.call(|w| p::open_v2(path, flags, w))?.word(0))
     }
 
     fn close(&self, handle: u32) -> Result<(), Status> {
