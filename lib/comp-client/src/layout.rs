@@ -22,9 +22,9 @@ pub const EVENTS_MAX: usize = 32;
 pub const EVENTS: u32 = 1 << 3;
 /// The mask of the bits the service sends: buffers 0 to 2 and the events.
 pub const BITS: u32 = 0xf;
-/// `STAFETO_EVENTS_LOST`.
+/// `STAFETO_WINDOW_EVENTS_LOST`.
 pub const EVENTS_LOST: u32 = 1;
-/// `STAFETO_EVENT_KEY` and the others: the kinds of `proto_comp`.
+/// `STAFETO_WINDOW_EVENT_KEY` and the others: the kinds of `proto_comp`.
 pub const EVENT_KEY: u16 = 1;
 pub const EVENT_MOVE: u16 = 2;
 pub const EVENT_BUTTON: u16 = 3;
@@ -39,6 +39,7 @@ pub struct Screen {
     pub height: u32,
     pub format: u32,
     pub flags: u32,
+    pub reserved: [u32; 4],
 }
 
 /// `struct stafeto_window`.
@@ -76,9 +77,13 @@ pub struct WindowEvent {
 }
 
 const _: () = {
-    assert!(size_of::<Screen>() == 16 && align_of::<Screen>() == 4);
+    assert!(size_of::<Screen>() == 32 && align_of::<Screen>() == 4);
+    assert!(offset_of!(Screen, height) == 4 && offset_of!(Screen, format) == 8);
+    assert!(offset_of!(Screen, flags) == 12 && offset_of!(Screen, reserved) == 16);
     assert!(size_of::<Window>() == 48 && align_of::<Window>() == 8);
+    assert!(offset_of!(Window, height) == 4);
     assert!(offset_of!(Window, stride) == 8);
+    assert!(offset_of!(Window, format) == 12);
     assert!(offset_of!(Window, buffers) == 16);
     assert!(offset_of!(Window, reserved) == 20);
     assert!(offset_of!(Window, pixels) == 24);
