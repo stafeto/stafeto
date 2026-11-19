@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
 /* The input driver of the demo: the events of the window's ring, taken
@@ -42,6 +42,10 @@ unsigned stafeto_input_events(void *user, demo_event *out, unsigned max)
         if (flags & STAFETO_WINDOW_EVENTS_LOST) {
             io->events_lost++;
             io->log("LOST: the ring of events dropped some");
+        }
+        for (int i = 0; i < n; i++) {
+            unsigned kind = out[total + (unsigned)i].kind;
+            io->seen[kind < 6 ? kind : 0]++;
         }
         total += (unsigned)n;
         if (n < want) {

@@ -10,19 +10,23 @@ reference program that runs the demo on the host (tools/lvgl-ref):
   - schedule.c: a MOVE moves the point and is not a change; the next change
     waits until the frame has settled; all the events at once and the same
     events one by one give the same changes in the same order;
-  - the reference program: the same CRCs and state line in every run and with
-    either way of feeding the events, and the evidence lines of the glyph path.
+  - the reference program: the pinned CRCs, turns, frames and state line in
+    every run and with every way of feeding the events (all at once, one at a
+    time, a slow injector), and the pinned evidence lines of the glyph path.
 
-Two planted faults are shown to fail, each by a changed copy of the source:
+Three planted faults are shown to fail, each by a changed copy of the source:
 a change handed out before the frame settled (the test of all events at once
-fails) and x and y swapped in the hand-out of the point (the state line of the
-reference is not "presses 2 option 1 switch 1 ...").
+fails), x and y swapped in the hand-out of the point (the state line of the
+reference is not "presses 2 option 1 switch 1 ..."), and the events not
+collected before the clock runs (a slow injector gives key repeats).
 
 One real run of each fault: with the first, the changes of the scenario were
 handed out 1 turn apart (0 once) where the model needs 11 to settle,
 and the test of all events at once failed; with the second, the reference
 printed "presses 0 option 0 switch 0 slider 20 text hi" (and a different
-second CRC), and the test of the state line failed."""
+second CRC), and the test of the state line failed; with the third, feeding one
+event every 20, 30 and 40 looks gave "text hi", "text hhii" and "text hhhiii"
+and other CRCs, turns and frames (the first frame is the same)."""
 
 import importlib.util
 from pathlib import Path
@@ -46,6 +50,24 @@ spec.loader.exec_module(builder)
 CC = shutil.which("clang") or shutil.which("cc") or "cc"
 STATE = "presses 2 option 1 switch 1 slider 75 text hi"
 BUSY = 10
+# The values of the reference, pinned: a difference between the machine of the
+# CI (arm64 Linux) and a developer's Mac shows in the host job.
+FIRST_CRC = "450D7460"
+AFTER_CRC = "DDBD81B9"
+TURNS, FRAMES = "111", "64"
+EVIDENCE = [
+    "evidence glyph a outline points 49 contours 2 crc EFEA584D",
+    "evidence glyph a bitmap width 9 rows 9 pitch 9 left 0 top 9 advance 576 crc DEA4419D",
+    "evidence glyph g outline points 47 contours 2 crc 085C25DD",
+    "evidence glyph g bitmap width 8 rows 12 pitch 8 left 0 top 9 advance 576 crc 399C66AA",
+    "evidence glyph W outline points 26 contours 1 crc 5D6492C1",
+    "evidence glyph W bitmap width 16 rows 12 pitch 16 left 0 top 12 advance 960 crc CE9F7BE4",
+    "evidence glyph 0 outline points 24 contours 2 crc 1AB06B25",
+    "evidence glyph 0 bitmap width 9 rows 12 pitch 9 left 0 top 12 advance 576 crc B9D6844A",
+    "evidence multiple-masters 0",
+    "evidence kerning AV x -64 y 0",
+    "evidence truetype interpreter-version 40",
+]
 
 
 def compile_test(name: str, port: Path, out: Path) -> Path:
@@ -73,13 +95,17 @@ def handouts(output: str) -> list[tuple]:
     return rows
 
 
-def mutated(port: Path, name: str, old: str, new: str, into: Path) -> Path:
-    """A copy of the port directory with `old` replaced by `new` in `name`."""
+def mutated(port: Path, name: str, old: str, new: str, into: Path, *more: str) -> Path:
+    """A copy of the port directory with `old` replaced by `new` in `name`
+    (and further pairs of `more` after them)."""
     copy = into / "port"
     shutil.copytree(port, copy)
     text = (copy / name).read_text()
-    assert old in text, f"{old!r} is not in {name}"
-    (copy / name).write_text(text.replace(old, new))
+    pairs = [(old, new), *zip(more[::2], more[1::2])]
+    for was, now in pairs:
+        assert was in text, f"{was!r} is not in {name}"
+        text = text.replace(was, now)
+    (copy / name).write_text(text)
     return copy
 
 
@@ -220,36 +246,64 @@ class ReferenceTests(unittest.TestCase):
     def lines(self, *args: str, ref: Path | None = None) -> dict[str, str]:
         out = subprocess.run([str(ref or self.ref), *args, str(self.font)], capture_output=True,
                              check=True, text=True).stdout
-        return {m.group(1): m.group(2) for m in re.finditer(r"^lvgl-ref: (first crc|after crc|state) (.*)$", out, re.M)}
+        return {m.group(1): m.group(2) for m in re.finditer(
+            r"^lvgl-ref: (first crc|after crc|state|turns) (.*)$", out, re.M)}
 
     def test_the_state_after_the_scenario(self):
         self.assertEqual(self.lines()["state"], STATE)
 
+    def test_the_crcs_the_turns_and_the_frames_are_the_pinned_ones(self):
+        got = self.lines()
+        self.assertEqual(got["first crc"], FIRST_CRC)
+        self.assertEqual(got["after crc"], AFTER_CRC)
+        self.assertEqual(got["turns"], f"{TURNS} frames {FRAMES}")
+
     def test_the_two_crcs_repeat(self):
         first = self.lines()
-        self.assertEqual(len(first["first crc"]), 8)
-        self.assertEqual(len(first["after crc"]), 8)
-        self.assertNotEqual(first["first crc"], first["after crc"])
         for _ in range(2):
             self.assertEqual(self.lines(), first)
 
     def test_feeding_the_events_one_by_one_gives_the_same_frames(self):
         self.assertEqual(self.lines("--feed", "single"), self.lines("--feed", "batch"))
 
-    def test_the_evidence_of_the_glyph_path_repeats(self):
+    def test_a_slow_injector_gives_the_same_frames_turns_and_state(self):
+        batch = self.lines("--feed", "batch")
+        for gap in ("20", "30", "40"):
+            self.assertEqual(self.lines("--feed", "gap", gap), batch, gap)
+
+    def test_the_evidence_of_the_glyph_path_is_the_pinned_one(self):
         def evidence():
             out = subprocess.run([str(self.ref), "--evidence", str(self.font)], capture_output=True,
                                  check=True, text=True).stdout
-            return [l for l in out.splitlines() if "evidence" in l]
+            return [l.removeprefix("lvgl-ref: ") for l in out.splitlines()
+                    if "evidence" in l and "bands" not in l]
         first = evidence()
+        self.assertEqual(first, EVIDENCE)
         self.assertEqual(first, evidence())
-        text = "\n".join(first)
-        for glyph in "agW0":
-            self.assertIn(f"evidence glyph {glyph} outline points", text)
-            self.assertIn(f"evidence glyph {glyph} bitmap width", text)
-        self.assertIn("evidence multiple-masters 0", text)
-        self.assertIn("evidence kerning AV x ", text)
-        self.assertIn("evidence truetype interpreter-version 40", text)
+
+    def test_the_bands_of_the_two_frames_are_printed_with_the_evidence(self):
+        out = subprocess.run([str(self.ref), "--evidence", str(self.font)], capture_output=True,
+                             check=True, text=True).stdout
+        bands = [l.split() for l in out.splitlines() if "evidence bands" in l]
+        self.assertEqual([b[3] for b in bands], ["first", "after"])
+        for row in bands:
+            self.assertEqual(len(row[4:]), 25)
+        # The first frame is the whole screen; the scenario changes the lower
+        # bands and the bands of the controls; the title's bands stay as they were.
+        self.assertEqual(bands[0][4], bands[1][4])
+        self.assertNotEqual(bands[0][4:], bands[1][4:])
+
+    def test_planted_fault_the_events_are_not_collected_before_the_clock_runs(self):
+        # The old way: pull events in each turn of the clock. A late key-up
+        # then becomes a long press with repeats.
+        with tempfile.TemporaryDirectory() as tmp:
+            port = mutated(PORT, "demo.c", "if (collect_inputs(d) != 0) {", "if (0) {", Path(tmp),
+                           "settle(d, 0, scenario_done)", "settle(d, 1, scenario_done)")
+            ref = builder.build_reference(port, Path(tmp) / "ref")
+            got = self.lines("--feed", "gap", "40", ref=ref)
+            self.assertNotEqual(got["state"], STATE)
+            self.assertIn("text hhhiii", got["state"])
+            self.assertNotEqual(got["after crc"], AFTER_CRC)
 
     def test_planted_fault_x_and_y_swapped_in_the_hand_out_of_the_point(self):
         with tempfile.TemporaryDirectory() as tmp:

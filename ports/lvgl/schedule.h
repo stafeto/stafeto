@@ -1,10 +1,11 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
 /* The order in which input reaches LVGL (section 5.3 of the plan). Events
  * wait in a queue of the program. LVGL reads the pointer and the keyboard
- * through two functions that each hand out one change: a MOVE only moves the
- * point and is not a change, a button or key going down or up is. In strict
+ * through two functions that each hand out one change: a MOVE moves the
+ * point and counts for nothing else, while a button or key going down or up is
+ * a change. In strict
  * mode (the probe) the next change waits until the frame has settled: a turn
  * of the loop with no frame drawn and no animation running, after at least one
  * more read of the same device since the change was handed out. The pixels of

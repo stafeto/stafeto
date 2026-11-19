@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Builds the C side of the demo: runs tools/build-lvgl.py (which runs
@@ -29,10 +29,28 @@ fn run(cmd: &mut Command) {
     assert!(status.success(), "command failed: {cmd:?}");
 }
 
+/// Fails when the file holds the build directory's path (a `__FILE__` that
+/// -fmacro-prefix-map should have mapped).
+fn no_build_path(file: &Path, root: &Path) {
+    let bytes = std::fs::read(file).expect("the object is readable");
+    let needle = root.to_string_lossy();
+    let needle = needle.as_bytes();
+    assert!(
+        !bytes.windows(needle.len()).any(|w| w == needle),
+        "{} holds the build directory's path {}",
+        file.display(),
+        root.display()
+    );
+}
+
 fn main() {
     let manifest =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"));
-    let root = manifest.join("../..");
+    // The canonical path: -fmacro-prefix-map must match the text of __FILE__.
+    let root = manifest
+        .join("../..")
+        .canonicalize()
+        .expect("the workspace root exists");
     let port = root.join("ports/lvgl");
     for file in SOURCES {
         println!("cargo:rerun-if-changed={}", port.join(file).display());
@@ -85,6 +103,7 @@ fn main() {
     let freetype = root.join("target/freetype");
     for built in [lvgl.join("liblvgl.a"), freetype.join("libfreetype.a")] {
         println!("cargo:rerun-if-changed={}", built.display());
+        no_build_path(&built, &root);
     }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
     let mut objects: Vec<PathBuf> = Vec::new();
@@ -114,6 +133,8 @@ fn main() {
                 "-isystem",
             ])
             .arg(sysroot.join("include"))
+            // No object holds the build directory's path.
+            .arg(format!("-fmacro-prefix-map={}/=", root.display()))
             .arg("-I")
             .arg(&port)
             .arg("-I")
@@ -127,6 +148,7 @@ fn main() {
             .arg(port.join(file))
             .arg("-o")
             .arg(&object));
+        no_build_path(&object, &root);
         objects.push(object);
     }
     let archive = out.join("liblvgldemo.a");

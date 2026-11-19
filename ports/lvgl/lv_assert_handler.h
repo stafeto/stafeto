@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
 /* The handler of a failed LVGL assertion (ports/lvgl/lv_conf.h): the

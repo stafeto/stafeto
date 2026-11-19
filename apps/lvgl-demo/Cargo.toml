@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
-license = "GPL-3.0-or-later"
+license = "MIT"
 description = "The LVGL demo of stafeto: widgets with FreeType text in a window of the composition service, a statically linked C program on relibc"
 build = "build.rs"
 

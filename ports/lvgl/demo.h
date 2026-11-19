@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
 /* The demo of stage G4: a screen of LVGL widgets with FreeType text, and the
@@ -56,20 +56,27 @@ typedef struct demo_host {
     uint8_t *buffer[2];
     /* A finished frame is in `buffer`; `rects` (at most DEMO_MAX_RECTS) are the
      * areas that changed. The demo does not draw into the buffer again until
-     * wait_free for it has returned. */
-    void (*post)(void *user, unsigned buffer, const demo_rect *rects, unsigned count);
+     * wait_free for it has returned. 0, or -1 when the display has ended (the
+     * demo stops). */
+    int (*post)(void *user, unsigned buffer, const demo_rect *rects, unsigned count);
     /* Return when the buffer may be drawn into: 0, or -1 when the display is
      * gone (the demo stops). */
     int (*wait_free)(void *user, unsigned buffer);
-    /* Hand in up to `max` events that arrived; the number handed in. */
+    /* Hand in up to `max` events that arrived; the number handed in. The demo
+     * calls again while a call returns as many as it asked for. */
     unsigned (*events)(void *user, demo_event *out, unsigned max);
-    /* The time in milliseconds on a monotonic clock (normal mode only). */
+    /* The time in milliseconds on a monotonic clock: the clock of LVGL in
+     * normal mode, and in probe mode the real-time deadline of the wait for
+     * the events of the scenario (the clock of LVGL is the virtual one). */
     uint32_t (*now_ms)(void *user);
-    /* Sleep until an event may have arrived or `ms` have passed (normal mode). */
+    /* Sleep until an event may have arrived or `ms` have passed. Normal mode
+     * calls it between turns; probe mode calls it while it waits for the
+     * events of the scenario, with no turn of the clock in between. */
     void (*idle)(void *user, uint32_t ms);
     /* Probe stages: 0 the last posted frame is on the screen, 1 the snapshot
-     * of the first frame may be taken (the host waits for it). */
-    void (*pause)(void *user, int stage);
+     * of the first frame may be taken (the host waits for it). 0, or -1 when
+     * the display has ended (the probe fails). */
+    int (*pause)(void *user, int stage);
     /* One line of text for the log (no newline). */
     void (*log)(void *user, const char *line);
 } demo_host;
@@ -84,19 +91,33 @@ typedef struct demo demo;
  * LVGL or FreeType does not start or the font is missing. */
 demo *demo_open(const demo_host *host, const char *font_path, int probe);
 
+/* Rows in a band of the frame CRCs the evidence prints, and the bands. */
+#define DEMO_BAND_ROWS 16
+#define DEMO_BANDS (DEMO_HEIGHT / DEMO_BAND_ROWS)
+
 typedef struct demo_result {
     uint32_t first_crc;   /* CRC-32 of the R, G, B bytes of the first settled frame */
     uint32_t after_crc;   /* the same after the scenario */
+    uint32_t first_bands[DEMO_BANDS];   /* the same for each band of 16 rows */
+    uint32_t after_bands[DEMO_BANDS];
+    unsigned long mem_max_used;         /* the most LVGL's pool held, in bytes */
     char status[160];     /* "presses 2 option 1 switch 1 slider 75 text hi" */
     unsigned turns;       /* turns of the loop */
     unsigned frames;      /* frames posted */
 } demo_result;
 
-/* Probe mode: settle the first frame, take its CRC, read the events of the
- * scenario of scene.h, hand them in one change at a time, settle, take the CRC
- * and the state. 0, or -1 when the frame does not settle or the events do not
- * come (the log tells). */
+/* Probe mode: settle the first frame, take its CRC, then collect all the input
+ * events of the scenario of scene.h with no turn of the clock (waiting
+ * through the host's idle, against a real-time deadline: a late key-up would
+ * otherwise become a long press), hand them in one change at a time, settle,
+ * take the CRC and the state. 0, or -1 when the frame does not settle or the
+ * events do not come (the log says how many came). */
 int demo_probe(demo *d, demo_result *result);
+
+/* The CRC of each band of 16 rows of the two frames of `result`, as lines of
+ * the log (behind the evidence flag of the program: a probe that finds the
+ * CRCs differ names the bands). */
+void demo_bands(const demo_host *host, const demo_result *result);
 
 /* Normal mode: run until the host's wait_free fails. */
 void demo_run(demo *d);

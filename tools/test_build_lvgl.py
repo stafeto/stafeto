@@ -77,6 +77,51 @@ class ConfigurationTests(unittest.TestCase):
                 self.assertEqual(value, "0", name)
 
 
+# Every LV_USE_* name the port's lv_conf.h sets: the parts it turns on or off
+# on purpose. A name that is not here (a driver or a board of the template, say)
+# was pasted in from the template and is not the port's own.
+OWN_SWITCHES = set("""
+LV_USE_3DTEXTURE LV_USE_ANIMIMG LV_USE_ARC LV_USE_ARCLABEL LV_USE_ASSERT_MALLOC LV_USE_ASSERT_NULL
+LV_USE_BAR LV_USE_BARCODE LV_USE_BIDI LV_USE_BMP LV_USE_BUTTON LV_USE_BUTTONMATRIX LV_USE_CALENDAR
+LV_USE_CANVAS LV_USE_CHART LV_USE_CHECKBOX LV_USE_DRAW_SW LV_USE_DRAW_SW_ASM LV_USE_DROPDOWN
+LV_USE_EVDEV LV_USE_FFMPEG LV_USE_FILE_EXPLORER LV_USE_FLEX LV_USE_FLOAT LV_USE_FONT_MANAGER
+LV_USE_FONT_PLACEHOLDER LV_USE_FRAGMENT LV_USE_FREETYPE LV_USE_FS_ARDUINO_ESP_LITTLEFS
+LV_USE_FS_ARDUINO_SD LV_USE_FS_FATFS LV_USE_FS_FROGFS LV_USE_FS_LITTLEFS LV_USE_FS_MEMFS
+LV_USE_FS_POSIX LV_USE_FS_STDIO LV_USE_FS_UEFI LV_USE_FS_WIN32 LV_USE_GIF LV_USE_GLFW LV_USE_GRID
+LV_USE_GRIDNAV LV_USE_IMAGE LV_USE_IMAGEBUTTON LV_USE_IME_PINYIN LV_USE_IMGFONT LV_USE_KEYBOARD
+LV_USE_LABEL LV_USE_LAYER_DEBUG LV_USE_LED LV_USE_LIBINPUT LV_USE_LIBJPEG_TURBO LV_USE_LIBPNG
+LV_USE_LIBWEBP LV_USE_LINE LV_USE_LINUX_DRM LV_USE_LINUX_FBDEV LV_USE_LIST LV_USE_LODEPNG
+LV_USE_LOG LV_USE_LOTTIE LV_USE_LZ4 LV_USE_MATRIX LV_USE_MEM_MONITOR LV_USE_MENU LV_USE_MONKEY
+LV_USE_MSGBOX LV_USE_NUTTX LV_USE_OBSERVER LV_USE_OPENGLES LV_USE_OS LV_USE_PARALLEL_DRAW_DEBUG
+LV_USE_PERF_MONITOR LV_USE_PROFILER LV_USE_QRCODE LV_USE_REFR_DEBUG LV_USE_RLE LV_USE_ROLLER
+LV_USE_SCALE LV_USE_SDL LV_USE_SLIDER LV_USE_SNAPSHOT LV_USE_SPAN LV_USE_SPINBOX LV_USE_SPINNER
+LV_USE_STDLIB_MALLOC LV_USE_STDLIB_SPRINTF LV_USE_STDLIB_STRING LV_USE_SVG LV_USE_SWITCH
+LV_USE_SYSMON LV_USE_TABLE LV_USE_TABVIEW LV_USE_TEST LV_USE_TEXTAREA LV_USE_THEME_DEFAULT
+LV_USE_THEME_MONO LV_USE_THEME_SIMPLE LV_USE_THORVG LV_USE_TILEVIEW LV_USE_TINY_TTF LV_USE_TJPGD
+LV_USE_UEFI LV_USE_VECTOR_GRAPHIC LV_USE_WAYLAND LV_USE_WIN LV_USE_WINDOWS LV_USE_X11
+""".split())
+
+
+def foreign_switches(text: str) -> list[str]:
+    """The LV_USE_* switches `text` sets that the port does not list as its own."""
+    return sorted(name for name in settings(text) if name.startswith("LV_USE_")
+                  and name not in OWN_SWITCHES)
+
+
+class OwnSwitchesTests(unittest.TestCase):
+    def test_the_file_sets_only_switches_the_port_lists(self):
+        self.assertEqual(foreign_switches(CONF), [])
+
+    def test_a_switch_pasted_from_the_template_is_found(self):
+        pasted = CONF + "\n#define LV_USE_SOME_BOARD_DRIVER 0\n"
+        self.assertEqual(foreign_switches(pasted), ["LV_USE_SOME_BOARD_DRIVER"])
+
+    def test_every_listed_switch_is_in_the_file_or_is_a_driver_left_off(self):
+        # The list does not grow past the file: a name the file dropped is
+        # taken off the list too.
+        self.assertEqual(sorted(OWN_SWITCHES - set(settings(CONF))), [])
+
+
 def effective(overrides: dict[str, str]) -> dict[str, str]:
     """The macros a compiler would see: the expected ones, with changes."""
     macros = dict(builder.EXPECTED)

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
 #include "demo.h"
@@ -93,8 +93,8 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
     }
     if (lv_display_flush_is_last(disp)) {
         unsigned b = buffer_of(d, px_map);
-        if (d->host.post) {
-            d->host.post(d->host.user, b, d->rects, d->rect_count);
+        if (d->host.post && d->host.post(d->host.user, b, d->rects, d->rect_count) != 0) {
+            d->stopped = 1;
         }
         d->posted++;
         d->last_posted = b;
@@ -313,23 +313,67 @@ void demo_close(demo *d)
     current = NULL;
 }
 
-/* Hand the events that arrived to the queue. */
-static void pull_events(demo *d)
+/* Hand the events that arrived to the queue, as long as a call returns as many
+ * as it was asked for. The input events (not the focus) among them are added
+ * to `*inputs`. */
+static void pull_events(demo *d, unsigned *inputs)
 {
     if (!d->host.events) {
         return;
     }
     demo_event batch[32];
-    unsigned room = SCHED_QUEUE - d->sched.count;
-    if (room > 32) {
-        room = 32;
+    for (;;) {
+        unsigned room = SCHED_QUEUE - d->sched.count;
+        if (room > 32) {
+            room = 32;
+        }
+        if (room == 0) {
+            return;
+        }
+        unsigned n = d->host.events(d->host.user, batch, room);
+        for (unsigned i = 0; i < n; i++) {
+            if (batch[i].kind == DEMO_EVENT_KEY || batch[i].kind == DEMO_EVENT_MOVE
+                || batch[i].kind == DEMO_EVENT_BUTTON) {
+                if (inputs) {
+                    (*inputs)++;
+                }
+            }
+            sched_push(&d->sched, &batch[i]);
+        }
+        if (n < room) {
+            return;
+        }
     }
-    if (room == 0) {
-        return;
-    }
-    unsigned n = d->host.events(d->host.user, batch, room);
-    for (unsigned i = 0; i < n; i++) {
-        sched_push(&d->sched, &batch[i]);
+}
+
+/* The real-time wait of the probe for the events of the scenario: the longest
+ * it waits, and how often it looks. */
+#define COLLECT_MS 30000
+#define COLLECT_LOOKS 2000
+
+/* Collect all the input events of the scenario before the clock of LVGL
+ * runs again: the clock does not move while the program waits, so the time an
+ * event takes to arrive cannot show in the pixels. */
+static int collect_inputs(demo *d)
+{
+    unsigned inputs = 0;
+    uint32_t start = d->host.now_ms ? d->host.now_ms(d->host.user) : 0;
+    for (unsigned looks = 0;; looks++) {
+        pull_events(d, &inputs);
+        if (inputs >= SCENE_EVENTS) {
+            return 0;
+        }
+        int late = d->host.now_ms ? d->host.now_ms(d->host.user) - start > COLLECT_MS
+                                  : looks > COLLECT_LOOKS;
+        if (late || d->stopped) {
+            char line[120];
+            snprintf(line, sizeof line, "only %u of %d input events came", inputs, SCENE_EVENTS);
+            say(d, "demo: %s", line);
+            return -1;
+        }
+        if (d->host.idle) {
+            d->host.idle(d->host.user, TURN_MS);
+        }
     }
 }
 
@@ -340,11 +384,14 @@ static int probe_turn(demo *d, int pull)
     d->vnow += TURN_MS;
     d->turns++;
     if (pull) {
-        pull_events(d);
+        pull_events(d, NULL);
     }
     d->flushes = 0;
     lv_timer_handler();
-    return sched_end_turn(&d->sched, d->flushes != 0, lv_anim_count_running());
+    /* A frame is not settled while a redraw is pending: the last step of an
+     * animation can invalidate after a turn that drew nothing. */
+    int drew = d->flushes != 0 || !lv_timer_get_paused(lv_display_get_refr_timer(d->display));
+    return sched_end_turn(&d->sched, drew, lv_anim_count_running());
 }
 
 static int settle(demo *d, int pull, int (*done)(const demo *))
@@ -371,9 +418,24 @@ static int scenario_done(const demo *d)
     return d->sched.changes >= SCENE_CHANGES && sched_idle(&d->sched);
 }
 
-static uint32_t posted_crc(demo *d)
+static uint32_t posted_crc(demo *d, uint32_t *bands)
 {
-    return crc32_xrgb(d->host.buffer[d->last_posted], DEMO_WIDTH, DEMO_HEIGHT, DEMO_STRIDE);
+    const uint8_t *frame = d->host.buffer[d->last_posted];
+    for (unsigned band = 0; band < DEMO_BANDS; band++) {
+        bands[band] = crc32_xrgb(frame + (size_t)band * DEMO_BAND_ROWS * DEMO_STRIDE, DEMO_WIDTH,
+                                 DEMO_BAND_ROWS, DEMO_STRIDE);
+    }
+    return crc32_xrgb(frame, DEMO_WIDTH, DEMO_HEIGHT, DEMO_STRIDE);
+}
+
+/* The frame is on the screen: false when the host says the display ended. */
+static int shown(demo *d)
+{
+    if (d->host.pause && d->host.pause(d->host.user, 0) != 0) {
+        say(d, "demo: %s", "the display ended before the frame was shown");
+        return 0;
+    }
+    return 1;
 }
 
 int demo_probe(demo *d, demo_result *r)
@@ -384,27 +446,33 @@ int demo_probe(demo *d, demo_result *r)
         say(d, "demo: %s", "the first frame did not settle");
         return -1;
     }
-    if (d->host.pause) {
-        d->host.pause(d->host.user, 0);
+    if (!shown(d)) {
+        return -1;
     }
-    r->first_crc = posted_crc(d);
+    r->first_crc = posted_crc(d, r->first_bands);
     snprintf(line, sizeof line, "first crc %08X", (unsigned)r->first_crc);
     if (d->host.log) {
         d->host.log(d->host.user, line);
     }
-    if (d->host.pause) {
-        d->host.pause(d->host.user, 1);
+    if (d->host.pause && d->host.pause(d->host.user, 1) != 0) {
+        say(d, "demo: %s", "the display ended before the snapshot");
+        return -1;
     }
-    if (settle(d, 1, scenario_done) != 0) {
+    /* All the events first, with no turn of the clock; then the scenario with
+     * no further pulls. */
+    if (collect_inputs(d) != 0) {
+        return -1;
+    }
+    if (settle(d, 0, scenario_done) != 0) {
         snprintf(line, sizeof line, "the scenario did not finish: %u changes of %d, %u lost",
                  d->sched.changes, SCENE_CHANGES, d->sched.lost);
         say(d, "demo: %s", line);
         return -1;
     }
-    if (d->host.pause) {
-        d->host.pause(d->host.user, 0);
+    if (!shown(d)) {
+        return -1;
     }
-    r->after_crc = posted_crc(d);
+    r->after_crc = posted_crc(d, r->after_bands);
     snprintf(line, sizeof line, "after crc %08X", (unsigned)r->after_crc);
     if (d->host.log) {
         d->host.log(d->host.user, line);
@@ -413,16 +481,32 @@ int demo_probe(demo *d, demo_result *r)
              lv_obj_has_state(d->check, LV_STATE_CHECKED) ? 1 : 0,
              lv_obj_has_state(d->toggle, LV_STATE_CHECKED) ? 1 : 0,
              (int)lv_slider_get_value(d->slider), lv_textarea_get_text(d->area));
+    lv_mem_monitor_t monitor;
+    lv_mem_monitor(&monitor);
+    r->mem_max_used = (unsigned long)monitor.max_used;
     r->turns = d->turns;
     r->frames = d->posted;
     return 0;
+}
+
+void demo_bands(const demo_host *host, const demo_result *r)
+{
+    char line[DEMO_BANDS * 9 + 32];
+    for (int which = 0; which < 2; which++) {
+        const uint32_t *bands = which ? r->after_bands : r->first_bands;
+        size_t at = (size_t)snprintf(line, sizeof line, "evidence bands %s", which ? "after" : "first");
+        for (unsigned i = 0; i < DEMO_BANDS; i++) {
+            at += (size_t)snprintf(line + at, sizeof line - at, " %08X", (unsigned)bands[i]);
+        }
+        host->log(host->user, line);
+    }
 }
 
 void demo_run(demo *d)
 {
     while (!d->stopped) {
         uint32_t wait = lv_timer_handler();
-        pull_events(d);
+        pull_events(d, NULL);
         if (d->stopped) {
             break;
         }
@@ -458,7 +542,12 @@ int demo_evidence(const demo_host *host, const char *font_path)
     if (FT_Init_FreeType(&library) != 0) {
         return -1;
     }
-    if (FT_New_Face(library, font_path, 0, &face) != 0 || FT_Set_Pixel_Sizes(face, 0, SCENE_TEXT_PX) != 0) {
+    if (FT_New_Face(library, font_path, 0, &face) != 0) {
+        FT_Done_FreeType(library);
+        return -1;
+    }
+    if (FT_Set_Pixel_Sizes(face, 0, SCENE_TEXT_PX) != 0) {
+        FT_Done_Face(face);
         FT_Done_FreeType(library);
         return -1;
     }
@@ -467,6 +556,8 @@ int demo_evidence(const demo_host *host, const char *font_path)
     for (const char *p = "agW0"; *p; p++) {
         FT_UInt index = FT_Get_Char_Index(face, (FT_ULong)(unsigned char)*p);
         if (FT_Load_Glyph(face, index, hinted) != 0) {
+            FT_Done_Face(face);
+            FT_Done_FreeType(library);
             return -1;
         }
         snprintf(line, sizeof line, "evidence glyph %c outline points %d contours %d crc %08X", *p,
@@ -474,6 +565,8 @@ int demo_evidence(const demo_host *host, const char *font_path)
                  (unsigned)crc_points(&face->glyph->outline));
         host->log(host->user, line);
         if (FT_Load_Glyph(face, index, hinted | FT_LOAD_RENDER) != 0) {
+            FT_Done_Face(face);
+            FT_Done_FreeType(library);
             return -1;
         }
         const FT_GlyphSlot slot = face->glyph;

@@ -43,6 +43,7 @@ const LIBC_SO: &str = "libc.so";
 const BASE: &str = "BusyBox and base packages";
 const ADDONS: &str = "add-on packages";
 const GAMES: &str = "game packages";
+const LVGL_HOST: &str = "lvgl host reference";
 const NET_PACKAGES: &str = "network packages";
 const KERNELS: &str = "kernel images";
 const IMAGES: &str = "boot images";
@@ -467,6 +468,20 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         &[RELIBC, BASE, ADDONS],
         super::doom::build_games,
     ));
+    // The reference program of the LVGL demo on the host (the host tests run
+    // it): built here, after the guest build of the same package, so the run
+    // cache carries target/lvgl-host to the groups and the next run restores
+    // it. On a cold cache the step downloads the LVGL archive (111 MB) and
+    // checks its SHA-256: when the upstream host is down it fails with the
+    // script's message naming the archive and its SHA-256, and the host
+    // tests that need the reference fail with it.
+    steps.push(step("build", LVGL_HOST, &[RELIBC, GAMES], || {
+        super::run_cmd(
+            Command::new("python3")
+                .arg(super::root().join("tools/build-lvgl.py"))
+                .arg("--host"),
+        )
+    }));
     steps.push(step(
         "build",
         NET_PACKAGES,
@@ -536,7 +551,12 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         super::run_cmd(super::cargo().args(["fmt", "--all", "--check"]))
     }));
     steps.push(step("host", "clippy", &[], super::ci_lints));
-    steps.push(step("host", "host tests", &[LIBC_SO], super::host_tests));
+    steps.push(step(
+        "host",
+        "host tests",
+        &[LIBC_SO, LVGL_HOST],
+        super::host_tests,
+    ));
     // The headers of os-test (include, namespace) compile and link against
     // the sysroot, and the interfaces of POSIX.1-2024 are in the archives:
     // what passed once passes (tests/os-test/headers-pass.txt,

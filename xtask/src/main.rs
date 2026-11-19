@@ -3749,6 +3749,29 @@ fn write_boot_image_files(
 
 /// Strips the symbols and the non-loadable sections off `elf`, the image's
 /// copy of the linker's file.
+/// The programs whose shipped file must hold no path of the directory they
+/// were built in (their C sources are built with `-fmacro-prefix-map`).
+const NO_BUILD_PATH: [&str; 1] = ["lvgl-demo"];
+
+/// Fails when the file at `elf` holds the text of `root`, the build directory.
+fn no_build_path(elf: &Path, root: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?;
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", root.display()))?;
+    let text = root.to_string_lossy();
+    if bytes
+        .windows(text.len())
+        .any(|window| window == text.as_bytes())
+    {
+        return Err(format!(
+            "{} holds the build directory's path {text}",
+            elf.display()
+        ));
+    }
+    Ok(())
+}
+
 fn strip_elf(elf: &Path, objcopy: &Path) -> Result<(), String> {
     run_cmd(Command::new(objcopy).arg("--strip-all").arg(elf))
 }
@@ -3820,6 +3843,9 @@ fn write_elf_image(
             .windows(READY_MARK.len())
             .any(|w| w == READY_MARK);
         strip_elf(elf, &objcopy)?;
+        if NO_BUILD_PATH.contains(file) {
+            no_build_path(elf, &root())?;
+        }
     }
     for (file, elf, stack) in sources {
         let why = |e: String| format!("{}: {e}", elf.display());
@@ -14407,6 +14433,26 @@ fn ci_lints() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// A file that holds the build directory's path is refused, one that does
+    /// not is passed.
+    #[test]
+    fn a_program_that_holds_the_build_directory_is_refused() {
+        let dir = std::env::temp_dir().join(format!("xtask-build-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.canonicalize().unwrap();
+        let clean = dir.join("clean");
+        let dirty = dir.join("dirty");
+        std::fs::write(&clean, b"\x7fELF no path here").unwrap();
+        std::fs::write(&dirty, format!("a {}/src/x.c b", root.display())).unwrap();
+        assert!(no_build_path(&clean, &root).is_ok());
+        let error = no_build_path(&dirty, &root).unwrap_err();
+        assert!(
+            error.contains("holds the build directory's path"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The command `logburst` is for the probes: no release image list has
     /// a program built with the feature `log-burst`.
     #[test]

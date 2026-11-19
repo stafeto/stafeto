@@ -112,7 +112,7 @@ them for the licence notes of the image.
   rasterizer) with the settings of `ports/freetype/{ftoption.h,ftmodule.h}`;
   the headers a program includes are in `target/freetype/include` with those two
   files in place, and `--host` builds the same files with the compiler of the
-  host into `target/freetype/host/`. The settings keep the glyph path integer
+  host into `target/freetype-host/` (a guest rebuild leaves it alone). The settings keep the glyph path integer
   arithmetic on one thread (no assembler, no LCD filter, no variable fonts, no
   properties read from the environment), so the same sources and the same font
   file give the same pixels on every run. After the build the script stops when
@@ -151,7 +151,7 @@ them for the licence notes of the image.
   It runs `tools/build-freetype.py` first and compiles against its headers.
   The flags include `-funsigned-char` (the `char` of AArch64 Linux, on the host
   build too), `-fwrapv` and `-ffp-contract=off`; `--host` builds the same files
-  with the compiler of the host into `target/lvgl/host/`. The font
+  with the compiler of the host into `target/lvgl-host/` (a guest rebuild leaves it alone). The font
   `LiberationSans-Regular.ttf` and its licence text come out of the archive into
   `target/lvgl/`. After the build the script stops when the compiler's macros
   differ from the settings that fix what is drawn (the defaults of LVGL
@@ -173,7 +173,18 @@ them for the licence notes of the image.
   `ports/lvgl/{main.c,stafeto_display.c,stafeto_input.c}` with the demo's
   files, then links them with `liblvgl.a`, `libfreetype.a` and relibc's
   `libc.a`; the program has no `DT_NEEDED` and a `PT_GNU_STACK` of 256 KiB), and
-  the font is `/usr/share/fonts/LiberationSans-Regular.ttf`. The archive of the
+  the font is `/usr/share/fonts/LiberationSans-Regular.ttf`. The licences that
+  meet in the linked program: the demo's own files (`ports/lvgl`, `tools/lvgl-ref`
+  and the crate `apps/lvgl-demo`) and LVGL are MIT, FreeType is under the
+  FreeType Licence (its credit line travels in the notices), relibc is MIT, and
+  the POSIX layer (`posix-abi`, `posix-crt`) is GPL-3.0-or-later with the GCC
+  Runtime Library Exception 3.1, which lets a program of any licence link it
+  (`comp-client` is MIT). The font is a data file under the SIL Open Font
+  License 1.1 that no program links, and its licence text is in the notices of
+  the package.
+  The sources are built with `-fmacro-prefix-map`, the scripts refuse an object
+  that holds the build directory's path, and so does the build of the program
+  (its C objects and the final ELF). The archive of the
   tag is pinned by its SHA-256; if GitHub ever changes its bytes, the fallback
   is to pin the commit of the tag (`80ca777e37a2b176770726a02e07a6fb79ef0b39`)
   and fetch only `src` and `include` of it with a sparse shallow checkout, as
@@ -188,7 +199,7 @@ them for the licence notes of the image.
   after the frame has settled (no frame drawn, no animation running, one more
   read of the same device), so the CRC of a frame does not depend on when the
   events arrived. `tools/build-lvgl.py --host` also builds the reference program
-  `target/lvgl/host/lvgl-ref` (`tools/lvgl-ref/main.c`): the same demo, LVGL and
+  `target/lvgl-host/lvgl-ref` (`tools/lvgl-ref/main.c`): the same demo, LVGL and
   FreeType code on the host, which prints the CRC-32 of the first settled frame
   and of the frame after the scenario, the state line (`presses 2 option 1
   switch 1 slider 75 text hi`), and with `--evidence` the determinism evidence of

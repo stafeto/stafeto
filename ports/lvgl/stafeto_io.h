@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
 /* The glue between the demo (demo.h) and the window library
@@ -28,6 +28,7 @@ struct stafeto_io {
     int id;                    /* the window's number */
     int events_pending;        /* the bit for events came and they are not all taken */
     unsigned events_lost;      /* events the ring dropped */
+    unsigned seen[6];          /* events taken, by kind (1 key, 2 move, 3 button, 4 focus in, 5 focus out) */
     int gone;                  /* the service ended or took the window away */
     unsigned posts;            /* frames posted */
     void (*log)(const char *line);
@@ -39,7 +40,7 @@ int stafeto_display_open(struct stafeto_io *io);
 
 /* The display's side of the contract of demo.h. `user` is a struct
  * stafeto_io. */
-void stafeto_display_post(void *user, unsigned buffer, const demo_rect *rects, unsigned count);
+int stafeto_display_post(void *user, unsigned buffer, const demo_rect *rects, unsigned count);
 int stafeto_display_wait_free(void *user, unsigned buffer);
 
 /* Take the bits of the window's channel: wait at most `timeout_ns` (0 looks

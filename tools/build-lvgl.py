@@ -21,7 +21,7 @@ target/freetype/include); the font and the licences are copied to
 target/lvgl/ (LiberationSans-Regular.ttf, LiberationSans-LICENSE.txt,
 LICENCE.txt). `--host` builds the same files with the compiler of the host
 (`-funsigned-char`, as the char of AArch64 Linux, which the guest build has too)
-into target/lvgl/host/ and then the reference program target/lvgl/host/lvgl-ref
+into target/lvgl-host/ and then the reference program target/lvgl-host/lvgl-ref
 (tools/lvgl-ref/main.c with the demo of ports/lvgl), whose CRCs the probe of the
 guest compares with.
 
@@ -30,6 +30,8 @@ module links; its library and headers are those of target/freetype.
 
 Checks after the build, each stopping it with what it found:
   - the archive's SHA-256 is the one of packages/lvgl.toml;
+  - no object holds the build directory's path (the sources are built with
+    -fmacro-prefix-map);
   - the settings that fix what is drawn (one thread, no floating point in the
     drawing, no assembler, no file system, no monitors, only the widgets of
     the demo) are what the compiler sees, defaults of LVGL included;
@@ -63,13 +65,13 @@ URL = PACKAGE["url"]
 ROOT = HERE.parent
 HOST = freetype.HOST
 WORK = ROOT / "target" / "lvgl"
-BUILD = WORK / "host" if HOST else WORK
+BUILD = ROOT / "target" / "lvgl-host" if HOST else WORK
 # The directory of lv_conf.h; the test of the planted faults points it at a
 # changed copy.
 PORT_DIR = Path(os.environ.get("STAFETO_LVGL_PORT_DIR", ROOT / "ports" / "lvgl"))
 CACHE = ROOT / "target" / "lvgl-src"
 RELIBC = ROOT / "target" / "relibc" / "sysroot"
-FREETYPE_DIR = ROOT / "target" / "freetype" / ("host" if HOST else "")
+FREETYPE_DIR = ROOT / "target" / ("freetype-host" if HOST else "freetype")
 OUTPUT = BUILD / "liblvgl.a"
 SOURCE_DIR = f"lvgl-{VERSION}"
 # What of the archive is unpacked: the first path component of the archive
@@ -157,7 +159,7 @@ OFF_NAMES = (
 LIBRARY_PORT = ("lv_conf.h", "lv_assert_handler.h")
 # The reference program of the host (tools/lvgl-ref): the demo, its schedule,
 # key table and CRC, with the host's LVGL and FreeType.
-HOST_DIR = WORK / "host"
+HOST_DIR = ROOT / "target" / "lvgl-host"
 REFERENCE = HOST_DIR / "lvgl-ref"
 REFERENCE_SOURCES = ("demo.c", "schedule.c", "keys.c", "crc.c")
 
@@ -165,9 +167,10 @@ REFERENCE_SOURCES = ("demo.c", "schedule.c", "keys.c", "crc.c")
 def reference_flags(port_dir: Path) -> list[str]:
     """The flags of the host build of the library and the reference: the char
     of AArch64 Linux, wrapping overflow, no fused multiply-add."""
-    return ["-std=gnu11", "-O2", "-funsigned-char", "-fwrapv", "-ffp-contract=off",
+    return ["-std=gnu11", "-O2", "-funsigned-char", "-fwrapv", f"-fmacro-prefix-map={ROOT}/=",
+            "-ffp-contract=off",
             f"-I{port_dir}", f"-I{HOST_DIR / SOURCE_DIR}",
-            f"-I{ROOT / 'target' / 'freetype' / 'host' / 'include'}"]
+            f"-I{ROOT / 'target' / 'freetype-host' / 'include'}"]
 
 
 def build_reference(port_dir: Path = PORT_DIR, output: Path = REFERENCE,
@@ -177,7 +180,7 @@ def build_reference(port_dir: Path = PORT_DIR, output: Path = REFERENCE,
     program. Rebuilt only when a source, the compiler flags or a library
     changed."""
     library = HOST_DIR / "liblvgl.a"
-    ft = ROOT / "target" / "freetype" / "host" / "libfreetype.a"
+    ft = ROOT / "target" / "freetype-host" / "libfreetype.a"
     if not library.exists() or not ft.exists():
         raise SystemExit("build the libraries first: tools/build-lvgl.py --host")
     sources = [port_dir / name for name in REFERENCE_SOURCES] + [main]
@@ -248,11 +251,14 @@ def fetch() -> Path:
     CACHE.mkdir(parents=True, exist_ok=True)
     archive = CACHE / f"lvgl-{VERSION}.tar.gz"
     if not archive.exists() or sha256(archive.read_bytes()).hexdigest() != SHA256:
-        with urlopen(URL) as response:
-            archive.write_bytes(response.read())
+        try:
+            with urlopen(URL) as response:
+                archive.write_bytes(response.read())
+        except OSError as error:
+            raise SystemExit(f"cannot fetch the LVGL source archive {URL} (SHA-256 {SHA256}): {error}")
     if sha256(archive.read_bytes()).hexdigest() != SHA256:
         archive.unlink()
-        raise SystemExit("the LVGL source archive has an unexpected SHA-256")
+        raise SystemExit(f"the LVGL source archive {URL} has an unexpected SHA-256 (expected {SHA256})")
     return archive
 
 
@@ -313,7 +319,8 @@ def main() -> None:
     nm_tool, lld = freetype.tool("llvm-nm", "llvm"), freetype.tool("ld.lld", "lld")
     # -funsigned-char: the char of AArch64 Linux, on the host sample too;
     # -fwrapv: signed overflow wraps.
-    flags = ["-std=gnu11", "-O2", "-funsigned-char", "-fwrapv", "-ffunction-sections", "-fdata-sections",
+    # -fmacro-prefix-map: the build machine's directory is in no object.
+    flags = ["-std=gnu11", "-O2", "-funsigned-char", "-fwrapv", f"-fmacro-prefix-map={ROOT}/=", "-ffunction-sections", "-fdata-sections",
              "-ffp-contract=off", f"-I{PORT_DIR}", f"-I{root}",
              f"-I{FREETYPE_DIR / 'include'}"]
     if HOST:
@@ -338,6 +345,7 @@ def main() -> None:
         obj = BUILD / "obj" / (str(path.relative_to(root / "src")).replace("/", "__")[:-2] + ".o")
         run(log, *cc, "-c", path, "-o", obj)
         objects.append(obj)
+        found += freetype.build_path_violations(obj, ROOT)
     if not HOST:
         joined = BUILD / "joined.o"
         run(log, lld, "-r", "-o", joined, *objects)

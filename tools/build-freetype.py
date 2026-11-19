@@ -19,7 +19,7 @@ target/freetype/include (the source's own with the two configuration files
 replaced, so a program that includes them sees the settings of the library)
 and target/freetype/FTL.TXT, the licence text the notices of the package
 carry. `--host` builds the same files with the compiler of the host into
-target/freetype/host/ (the sample that compares the host's pixels with the
+target/freetype-host/ (the sample that compares the host's pixels with the
 guest's links it).
 
 FreeType is under the FreeType Licence (FTL): the archive is fetched at build
@@ -32,6 +32,8 @@ Checks after the build, each stopping it with the names it found:
     them, and none is one of the names the
     library must never call (the environment, threads, the dynamic loader,
     the memory mapper, floating point from libm);
+  - no object holds the build directory's path (the sources are built with
+    -fmacro-prefix-map);
   - `getenv` appears in no object, no object calls `FT_Property_Set` from
     outside the file that defines it (ftobjs.c defines it in every build, as
     part of the public interface, so the name itself cannot be absent), and
@@ -57,7 +59,7 @@ URL = PACKAGE["url"]
 ROOT = Path(__file__).resolve().parents[1]
 HOST = "--host" in sys.argv[1:]
 WORK = ROOT / "target" / "freetype"
-BUILD = WORK / "host" if HOST else WORK
+BUILD = ROOT / "target" / "freetype-host" if HOST else WORK
 # The directory of the configuration files; the test of the planted faults
 # points it at a changed copy.
 PORT_DIR = Path(os.environ.get("STAFETO_FREETYPE_PORT_DIR", ROOT / "ports" / "freetype"))
@@ -169,6 +171,14 @@ def absent_violations(names: list[str]) -> list[str]:
             for name in ABSENT if name in set(names)]
 
 
+def build_path_violations(path: Path, root: Path = ROOT) -> list[str]:
+    """The finding when the file at `path` holds the directory of the build
+    (a __FILE__ or a debug path that -fmacro-prefix-map should have mapped)."""
+    if str(root).encode() in path.read_bytes():
+        return [f"{root} (the build directory is in {path.name})"]
+    return []
+
+
 def called_violations(undefined: list[str]) -> list[str]:
     """The names an object leaves undefined that no object may call."""
     return [f"{name} (called from outside its file)"
@@ -195,6 +205,7 @@ def check(log: Path, objects: list[Path], nm_tool: Path, lld: Path | None,
     for obj in objects:
         every += symbol_names(nm(nm_tool, obj))
         found += called_violations(symbol_names(nm(nm_tool, "-u", obj)))
+        found += build_path_violations(obj)
         if ENVIRONMENT_TEXT in obj.read_bytes():
             found.append(f"{ENVIRONMENT_TEXT.decode()} (the text is in {obj.name})")
     found += absent_violations(every)
@@ -222,11 +233,14 @@ def fetch() -> Path:
     CACHE.mkdir(parents=True, exist_ok=True)
     archive = CACHE / Path(URL).name
     if not archive.exists() or sha256(archive.read_bytes()).hexdigest() != SHA256:
-        with urlopen(URL) as response:
-            archive.write_bytes(response.read())
+        try:
+            with urlopen(URL) as response:
+                archive.write_bytes(response.read())
+        except OSError as error:
+            raise SystemExit(f"cannot fetch the FreeType source archive {URL} (SHA-256 {SHA256}): {error}")
     if sha256(archive.read_bytes()).hexdigest() != SHA256:
         archive.unlink()
-        raise SystemExit("the FreeType source archive has an unexpected SHA-256")
+        raise SystemExit(f"the FreeType source archive {URL} has an unexpected SHA-256 (expected {SHA256})")
     return archive
 
 
@@ -255,7 +269,9 @@ def main() -> None:
     nm_tool, lld = tool("llvm-nm", "llvm"), tool("ld.lld", "lld")
     # -funsigned-char: the char of AArch64 Linux, on the host sample too;
     # -fwrapv: signed overflow wraps, as the 64-bit fixed-point code expects.
-    flags = ["-O2", "-fwrapv", "-ffunction-sections", "-fdata-sections", "-DFT2_BUILD_LIBRARY",
+    # -fmacro-prefix-map: the build machine's directory is in no object (the
+    # __FILE__ of an assertion would carry it).
+    flags = ["-O2", "-fwrapv", f"-fmacro-prefix-map={ROOT}/=", "-ffunction-sections", "-fdata-sections", "-DFT2_BUILD_LIBRARY",
              "-DFT_CONFIG_MODULES_H=<ftmodule.h>", "-DFT_CONFIG_OPTIONS_H=<ftoption.h>",
              f"-I{PORT_DIR}", f"-I{source / 'include'}"]
     if HOST:

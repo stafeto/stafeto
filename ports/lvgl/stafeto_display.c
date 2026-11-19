@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
 /* The display driver of the demo: its two buffers are those of a window of
@@ -57,18 +57,19 @@ int stafeto_display_take_bits(struct stafeto_io *io, uint64_t timeout_ns)
     return -1;
 }
 
-void stafeto_display_post(void *user, unsigned buffer, const demo_rect *rects, unsigned count)
+int stafeto_display_post(void *user, unsigned buffer, const demo_rect *rects, unsigned count)
 {
     struct stafeto_io *io = user;
     if (io->gone) {
-        return;
+        return -1;
     }
     if (stafeto_window_post(io->id, buffer, (const struct stafeto_rect *)rects, count) != 0) {
         say(io, "cannot post the frame", errno);
         io->gone = 1;
-        return;
+        return -1;
     }
     io->posts++;
+    return 0;
 }
 
 int stafeto_display_wait_free(void *user, unsigned buffer)

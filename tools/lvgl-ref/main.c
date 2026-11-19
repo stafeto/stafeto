@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
 /* The reference program of the LVGL demo on the host: the same demo, LVGL and
@@ -8,10 +8,12 @@
  * after the scenario, and the state line. The guest's probe prints the same
  * lines and the expected values are these.
  *
- *   lvgl-ref [--feed batch|single] [--evidence] [--out DIR] FONT
+ *   lvgl-ref [--feed batch|single|gap N] [--evidence] [--out DIR] FONT
  *
  * --feed batch hands in all the events of the scenario at once; single hands
- * in one event at each turn of the loop. The result is the same.
+ * in one event at each look of the demo; gap N hands in one event at every Nth
+ * look (a slow injector). The result is the same: the demo collects all the
+ * events before its clock runs.
  * --evidence also prints the determinism evidence of the glyph path.
  * --out DIR writes ref.txt (the two CRCs and the state line) and the two
  * frames as PPM files for the eye. */
@@ -19,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -29,6 +32,8 @@
 struct ref {
     uint8_t *buffer[2];
     int single;                 /* one event per call */
+    unsigned gap;               /* with single: one event every `gap` calls (0 or 1: every call) */
+    unsigned calls;             /* calls of events() */
     unsigned fed;               /* events of the scenario handed in */
     int released;               /* the scenario may start (after the first frame) */
     uint8_t *copy;              /* the frame at the last pause 0 */
@@ -39,12 +44,13 @@ struct ref {
 
 static const demo_event scenario[SCENE_EVENTS] = {SCENE_EVENT_ROWS};
 
-static void post(void *user, unsigned buffer, const demo_rect *rects, unsigned count)
+static int post(void *user, unsigned buffer, const demo_rect *rects, unsigned count)
 {
     struct ref *r = user;
     (void)rects;
     (void)count;
     r->last = buffer;
+    return 0;
 }
 
 static int wait_free(void *user, unsigned buffer)
@@ -59,21 +65,41 @@ static unsigned events(void *user, demo_event *out, unsigned max)
     struct ref *r = user;
     unsigned n = 0;
     unsigned limit = r->single ? 1 : max;
+    r->calls++;
+    if (r->single && r->gap > 1 && r->calls % r->gap != 0) {
+        return 0;
+    }
     while (n < limit && n < max && r->fed < SCENE_EVENTS) {
         out[n++] = scenario[r->fed++];
     }
     return n;
 }
 
-static void pause_cb(void *user, int stage)
+static int pause_cb(void *user, int stage)
 {
     struct ref *r = user;
     if (stage != 0) {
-        return;
+        return 0;
     }
     uint8_t *into = r->stage == 0 ? r->first : r->after;
     memcpy(into, r->buffer[r->last], DEMO_BUFFER_BYTES);
     r->stage++;
+    return 0;
+}
+
+static uint32_t now_ms(void *user)
+{
+    (void)user;
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint32_t)((uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u);
+}
+
+static void idle(void *user, uint32_t ms)
+{
+    /* The reference has no display to wait for: the events come at once. */
+    (void)user;
+    (void)ms;
 }
 
 static void say(void *user, const char *line)
@@ -106,7 +132,11 @@ int main(int argc, char **argv)
     int evidence = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--feed") && i + 1 < argc) {
-            r.single = !strcmp(argv[++i], "single");
+            const char *mode = argv[++i];
+            r.single = strcmp(mode, "batch") != 0;
+            if (!strcmp(mode, "gap") && i + 1 < argc) {
+                r.gap = (unsigned)atoi(argv[++i]);
+            }
         } else if (!strcmp(argv[i], "--evidence")) {
             evidence = 1;
         } else if (!strcmp(argv[i], "--out") && i + 1 < argc) {
@@ -130,6 +160,8 @@ int main(int argc, char **argv)
         .post = post,
         .wait_free = wait_free,
         .events = events,
+        .now_ms = now_ms,
+        .idle = idle,
         .pause = pause_cb,
         .log = say,
     };
@@ -157,6 +189,10 @@ int main(int argc, char **argv)
     }
     printf("lvgl-ref: state %s\n", result.status);
     printf("lvgl-ref: turns %u frames %u\n", result.turns, result.frames);
+    printf("lvgl-ref: mem max-used %lu\n", result.mem_max_used);
+    if (evidence) {
+        demo_bands(&host, &result);
+    }
     if (out) {
         char path[512];
         snprintf(path, sizeof path, "%s/ref.txt", out);

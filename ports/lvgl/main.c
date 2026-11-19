@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
 /* The program lvgl-demo: the demo of demo.h on a window of the composition
@@ -33,9 +33,9 @@ extern unsigned long lvgl_demo_own_pages(void);
 
 static struct stafeto_io io;
 static int quick;
-/* Per-frame time: the turns of the loop in which a frame was posted. */
-static uint64_t last_turn_us;
-static unsigned last_posts;
+/* Per-frame time: the probe runs its turns back to back, so the time between
+ * two posts is a frame's turn (and the cheap turns between). */
+static uint64_t last_post_us;
 static uint64_t frame_total_us, frame_longest_us;
 static unsigned frame_count;
 
@@ -66,34 +66,39 @@ static void sleep_ns(uint64_t ns)
     }
 }
 
-/* The input driver, with the clock of the frames: the calls come once in a
- * turn of the loop, so the time between two of them is a turn. */
-static unsigned timed_events(void *user, demo_event *out, unsigned max)
+/* The post of a frame, with its time. */
+static int timed_post(void *user, unsigned buffer, const demo_rect *rects, unsigned count)
 {
+    int result = stafeto_display_post(user, buffer, rects, count);
     uint64_t now = now_us();
-    if (last_turn_us && io.posts > last_posts) {
-        uint64_t took = now - last_turn_us;
+    if (last_post_us) {
+        uint64_t took = now - last_post_us;
         frame_total_us += took;
         frame_count++;
         if (took > frame_longest_us) {
             frame_longest_us = took;
         }
     }
-    last_turn_us = now;
-    last_posts = io.posts;
-    return stafeto_input_events(user, out, max);
+    last_post_us = now;
+    return result;
 }
 
-static void pause_cb(void *user, int stage)
+static int pause_cb(void *user, int stage)
 {
     (void)user;
     if (stage == 0) {
         if (stafeto_window_shown(io.id, SHOWN_NS) != 0) {
             say("the frame did not reach the screen");
+            return -1;
         }
-    } else if (!quick) {
-        sleep_ns(SNAPSHOT_NS);
+    } else {
+        if (!quick) {
+            sleep_ns(SNAPSHOT_NS);
+        }
+        /* The frames of the scenario are timed from here. */
+        last_post_us = now_us();
     }
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -121,9 +126,9 @@ int main(int argc, char **argv)
     demo_host host = {
         .user = &io,
         .buffer = {io.window.pixels[0], io.window.pixels[1]},
-        .post = stafeto_display_post,
+        .post = timed_post,
         .wait_free = stafeto_display_wait_free,
-        .events = timed_events,
+        .events = stafeto_input_events,
         .now_ms = stafeto_now_ms,
         .idle = stafeto_idle,
         .pause = pause_cb,
@@ -146,9 +151,20 @@ int main(int argc, char **argv)
             char line[240];
             snprintf(line, sizeof line, "state %s", result.status);
             say(line);
+            snprintf(line, sizeof line, "turns %u frames %u", result.turns, result.frames);
+            say(line);
+            snprintf(line, sizeof line, "mem max-used %lu", result.mem_max_used);
+            say(line);
             snprintf(line, sizeof line, "memory heap-bytes %lu own-pages %lu", lvgl_demo_heap_bytes(),
                      lvgl_demo_own_pages());
             say(line);
+            snprintf(line, sizeof line,
+                     "events key %u move %u button %u focus-in %u focus-out %u lost %u", io.seen[1],
+                     io.seen[2], io.seen[3], io.seen[4], io.seen[5], io.events_lost);
+            say(line);
+            if (evidence) {
+                demo_bands(&host, &result);
+            }
             snprintf(line, sizeof line, "frames %u longest-us %llu mean-us %llu", frame_count,
                      (unsigned long long)frame_longest_us,
                      (unsigned long long)(frame_count ? frame_total_us / frame_count : 0));
