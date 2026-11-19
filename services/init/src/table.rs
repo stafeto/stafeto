@@ -104,7 +104,7 @@ pub const COMP_INPUT_MARK: u64 = 1 << 59;
 /// in for it.
 pub const COMP_MANAGERS: &[&str] = &["wm", "focus-wm"];
 /// The programs that inject events as a device would: the probes only.
-pub const COMP_INJECTORS: &[&str] = &["focus-inject"];
+pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject"];
 
 /// The mark of the compositor's session that `client` gets by asking for
 /// `service`: the manager's, the input's, or none.
@@ -1548,6 +1548,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-gpu") as usize
     + cfg!(feature = "table-comp") as usize
     + cfg!(feature = "table-focus") as usize
+    + cfg!(feature = "table-focus-wm") as usize
     + cfg!(feature = "table-net") as usize
     + cfg!(feature = "table-net-probe") as usize
     + cfg!(feature = "table-pci-walk-vz") as usize
@@ -1647,6 +1648,7 @@ const _: () = assert!(
     feature = "table-gpu",
     feature = "table-comp",
     feature = "table-focus",
+    feature = "table-focus-wm",
     feature = "table-net",
     feature = "table-net-probe",
     feature = "table-pci-walk-vz",
@@ -1810,6 +1812,8 @@ pub const TABLE: &[Record] = gpu::TABLE;
 pub const TABLE: &[Record] = comp::TABLE;
 #[cfg(feature = "table-focus")]
 pub const TABLE: &[Record] = focus::TABLE;
+#[cfg(feature = "table-focus-wm")]
+pub const TABLE: &[Record] = focus::WM_TABLE;
 #[cfg(feature = "table-net")]
 pub const TABLE: &[Record] = net::NET_TABLE;
 #[cfg(feature = "table-net-probe")]
@@ -1906,6 +1910,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     gpu::TABLE,
     comp::TABLE,
     focus::TABLE,
+    focus::WM_TABLE,
     input::TABLE,
     entropy::TABLE,
     entropy::VZ_TABLE,
@@ -3856,6 +3861,18 @@ mod tests {
             ]
         );
         assert_eq!(
+            order_of(focus::WM_TABLE),
+            [
+                "input",
+                "display",
+                "gpu",
+                "wm",
+                "wm-new",
+                "wm-old",
+                "wm-inject"
+            ]
+        );
+        assert_eq!(
             order_of(net::NET_PROBE_TABLE),
             ["ramfs", "rng", "entropy", "net", "net-probe"]
         );
@@ -3891,6 +3908,13 @@ mod tests {
             Some(COMP_INPUT_MARK)
         );
         assert_eq!(comp_mark(named("focus-a"), b"gpu"), None);
+        // The window manager's image: the program `wm` is the manager there,
+        // and its injector the only input session.
+        let wm = |name: &str| focus::WM_TABLE.iter().find(|r| r.name == name).unwrap();
+        assert_eq!(comp_mark(wm("wm"), b"gpu"), Some(COMP_MANAGER_MARK));
+        assert_eq!(comp_mark(wm("wm-inject"), b"gpu"), Some(COMP_INPUT_MARK));
+        assert_eq!(comp_mark(wm("wm-new"), b"gpu"), None);
+        assert_eq!(comp_mark(wm("wm-old"), b"gpu"), None);
         assert_eq!(comp_mark(named("focus-wm"), b"clock"), None);
         // The marks are bits no label of init's count reaches, and apart from
         // the compositor's own.

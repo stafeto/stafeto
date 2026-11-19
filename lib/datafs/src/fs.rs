@@ -70,6 +70,23 @@ unsafe extern "C" {
         name: *mut u8,
     ) -> c_int;
     fn datafs_rewinddir(d: *mut c_void, ctx: *mut c_void, slot: c_int) -> c_int;
+    fn datafs_getattr(
+        d: *mut c_void,
+        ctx: *mut c_void,
+        path: *const c_char,
+        kind: u8,
+        buffer: *mut u8,
+        size: u32,
+    ) -> c_int;
+    fn datafs_setattr(
+        d: *mut c_void,
+        ctx: *mut c_void,
+        path: *const c_char,
+        kind: u8,
+        buffer: *const u8,
+        size: u32,
+    ) -> c_int;
+    fn datafs_removeattr(d: *mut c_void, ctx: *mut c_void, path: *const c_char, kind: u8) -> c_int;
 }
 
 /// The device of the volume as the C side calls back: `ctx` is a pointer to a `&mut dyn Device`
@@ -176,6 +193,8 @@ pub enum Error {
     /// The volume is damaged, or holds no littlefs (EILSEQ in the files service; 84 here).
     Corrupt,
     NoEntry,
+    /// No attribute of that kind (ENODATA).
+    NoAttr,
     Exists,
     NotDirectory,
     IsDirectory,
@@ -196,6 +215,7 @@ impl Error {
             Self::Io => -5,
             Self::Corrupt => -84,
             Self::NoEntry => -2,
+            Self::NoAttr => -61,
             Self::Exists => -17,
             Self::NotDirectory => -20,
             Self::IsDirectory => -21,
@@ -215,6 +235,7 @@ impl Error {
             -5 => Self::Io,
             -84 => Self::Corrupt,
             -2 => Self::NoEntry,
+            -61 => Self::NoAttr,
             -17 => Self::Exists,
             -20 => Self::NotDirectory,
             -21 => Self::IsDirectory,
@@ -562,6 +583,34 @@ impl<'a, D: Device> Fs<'a, D> {
             name,
             len,
         }))
+    }
+
+    /// The user attribute `kind` of `path` into `out`: its size, or NoAttr when there is none.
+    pub fn getattr(&mut self, path: &[u8], kind: u8, out: &mut [u8]) -> Res<usize> {
+        let path = CPath::new(path)?;
+        let size = u32::try_from(out.len()).unwrap_or(u32::MAX);
+        // SAFETY: as above; `out` holds `size` bytes.
+        let n = self.call(|d, ctx| unsafe {
+            datafs_getattr(d, ctx, path.ptr(), kind, out.as_mut_ptr(), size)
+        });
+        check(n).map(|n| n as usize)
+    }
+
+    /// Sets the attribute `kind` of `path` in one commit.
+    pub fn setattr(&mut self, path: &[u8], kind: u8, data: &[u8]) -> Res<()> {
+        let path = CPath::new(path)?;
+        let size = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        // SAFETY: as above.
+        check(self.call(|d, ctx| unsafe {
+            datafs_setattr(d, ctx, path.ptr(), kind, data.as_ptr(), size)
+        }))
+        .map(drop)
+    }
+
+    pub fn removeattr(&mut self, path: &[u8], kind: u8) -> Res<()> {
+        let path = CPath::new(path)?;
+        // SAFETY: as above.
+        check(self.call(|d, ctx| unsafe { datafs_removeattr(d, ctx, path.ptr(), kind) })).map(drop)
     }
 
     pub fn rewinddir(&mut self, dir: Dir) -> Res<()> {

@@ -15,6 +15,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../packages/pixman.toml");
     println!("cargo:rerun-if-changed=../../ports/pixman");
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
+    println!("cargo:rerun-if-env-changed=STAFETO_PIXMAN_PORTABLE");
     if env::var("TARGET").as_deref() != Ok("aarch64-unknown-none") {
         return;
     }

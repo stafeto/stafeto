@@ -22,6 +22,8 @@ rawframe = { path = "../lib/rawframe" }
 bootimg = { path = "../lib/bootimg", features = ["write"] }
 # The records of the network service, whose quota `netd-quota` checks.
 init = { path = "../services/init" }
+# The constants of its bands, which comp-probe and focus-probe report the measured costs against.
+compositor = { path = "../services/compositor" }
 # The ESP of the disk of the EFI loader (efi_disk.rs): FAT32 without the clock of
 # the host, so that the disk is the same file every time.
 fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }

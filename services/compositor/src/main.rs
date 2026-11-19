@@ -28,8 +28,11 @@
 //! (GRANT with a channel of its own, so that a bit tells it when events
 //! wait) and routes to the windows (stage G2: the window with the focus
 //! gets the keys, the one under the pointer the pointer, a click moves the
-//! focus). The keyboard's focus passes to the program that holds the window
-//! of the first revision while that window lives. A manager (a program the
+//! focus). The keyboard's focus stays the compositor's: the program that
+//! holds the window of the first revision reads its keys from a session of
+//! focus the compositor itself serves (READ of proto_input), which holds the
+//! keys of the window's ring, so they reach it while the window has the focus
+//! and no other time. A manager (a program the
 //! table gives a session marked MANAGER_MARK) moves, raises and hides the
 //! windows and gives one the focus; a session marked INPUT_MARK injects
 //! events as a device would. It ends with a code of its own when the driver
@@ -56,7 +59,7 @@ use proto_init::ServiceArgs;
 use proto_input::{ABS_MAX, ABS_X, ABS_Y, EV_ABS, EV_KEY, Method as InputMethod};
 use proto_wire::clones::Clones;
 use proto_wire::{Status, Writer};
-use rt::handle::{Any, Channel, Memory, Outgoing, Process};
+use rt::handle::{Channel, Memory, Outgoing, Process};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
 use rt::wait::Waiter;
 use rt::{Handle, sys};
@@ -103,6 +106,12 @@ const DRIVER: u64 = 1 << 61;
 /// and 57). Init's labels are counts, far under these bits.
 const KEYS: u64 = 1 << 58;
 const POINTER: u64 = 1 << 57;
+/// The mark of the session of keyboard focus of a window of the first
+/// revision: the label of the window and this bit. The service serves its
+/// READ (proto_input) from the window's ring, so the keys follow the focus.
+const WINDOW_KEYS: u64 = 1 << 56;
+/// The low bits of a device's label: the generation of the grant.
+const GENERATION: u64 = 0xFFFF;
 /// The service's own bits: the next band of the frame is due, a chunk of
 /// mapping, unmapping or clearing is, and more events wait at an input
 /// service.
@@ -123,7 +132,12 @@ const fn buf_at(i: usize, b: usize) -> usize {
 }
 
 fn is_window(label: u64) -> bool {
-    label & WINDOW != 0 && label & OWN == 0
+    label & WINDOW != 0 && label & (OWN | WINDOW_KEYS) == 0
+}
+
+/// A window's session of keyboard focus (a window of the first revision).
+fn is_window_keys(label: u64) -> bool {
+    label & WINDOW != 0 && label & WINDOW_KEYS != 0 && label & OWN == 0
 }
 
 /// A session of the manager or of the input: a label init marked. The
@@ -211,8 +225,11 @@ enum Link {
 /// An input service and the focus the compositor holds at it.
 struct Device {
     name: &'static str,
-    /// The bit's label of the handle the service notifies through.
+    /// The bit's label of the handle the service notifies through, with the
+    /// generation of the grant in its low 16 bits (a label a driver that
+    /// ended left is told from the one of the grant that followed).
     mark: u64,
+    generation: u64,
     link: Link,
     /// The session of focus the service made for the compositor.
     own: Option<Handle<Channel>>,
@@ -223,6 +240,7 @@ impl Device {
         Device {
             name,
             mark,
+            generation: 0,
             link: Link::Absent,
             own: None,
         }
@@ -271,8 +289,6 @@ struct Compositor {
     manager: Option<Handle<Channel>>,
     /// The label of the session that subscribed: only its end clears it.
     manager_label: u64,
-    /// The first revision's window holds the keyboard's focus.
-    focus_on: bool,
     /// The buffer of the window of the first revision: the service's own
     /// object, mapped at LEGACY_AT for good, cleared a step at a time when
     /// its window goes (`cleared`: the bytes done, None when it is clean).
@@ -330,7 +346,6 @@ fn main(_: u64) -> u64 {
         axes: Axes::default(),
         manager: None,
         manager_label: 0,
-        focus_on: false,
         legacy,
         cleared: None,
         attaching: None,
@@ -349,6 +364,7 @@ fn main(_: u64) -> u64 {
     {
         rt::service::report_steps(17);
         rt::service::table_steps_from(16);
+        rt::service::step_after(px::cost::tell);
     }
     let config = Config {
         issued: 0,
@@ -510,6 +526,34 @@ impl Compositor {
         }
     }
 
+    /// The device a label of a grant names, if it is one: neither the
+    /// service's own marks nor init's are set, and one of the two device
+    /// bits is.
+    fn device_label(label: u64) -> Option<Which> {
+        if label & (OWN | WINDOW | DRIVER | MANAGER_MARK | INPUT_MARK | WINDOW_KEYS) != 0 {
+            return None;
+        }
+        match label & !GENERATION {
+            KEYS => Some(Which::Keys),
+            POINTER => Some(Which::Pointer),
+            _ => None,
+        }
+    }
+
+    /// The focus of each input device the compositor does not hold, though
+    /// the image has the device, is taken again (the driver ended and was
+    /// started again by init). A connection to a service that is starting
+    /// again waits for it.
+    fn regrant(&mut self) {
+        for which in [Which::Keys, Which::Pointer] {
+            let device = self.device(which);
+            let present = !matches!(device.link, Link::Absent);
+            if compositor::wants_focus(present, device.own.is_some()) {
+                self.take_own(which);
+            }
+        }
+    }
+
     /// GRANT with a channel of the compositor's own: the focus of the
     /// device is its, and the device says by a bit when events wait.
     fn take_own(&mut self, which: Which) {
@@ -527,7 +571,9 @@ impl Compositor {
                 return;
             };
             let rights = Rights::NOTIFY | Rights::TRANSFER;
-            let Ok(wake) = sys::handle_label(channel, rights, device.mark, level) else {
+            device.generation = (device.generation + 1) & GENERATION;
+            let label = device.mark | device.generation;
+            let Ok(wake) = sys::handle_label(channel, rights, label, level) else {
                 return;
             };
             match sys::send_handles(
@@ -551,54 +597,6 @@ impl Compositor {
         }
     }
 
-    /// GRANT: the session of focus for the window of the first revision,
-    /// or None (OPEN's status is NO_INPUT). The keyboard's focus is the
-    /// client's while its window lives: the service revokes ours.
-    fn grant_focus(&mut self) -> Option<Handle<Any>> {
-        for _ in 0..2 {
-            if matches!(self.keys.link, Link::Lost) {
-                self.keys.link = connect_device(&self.parent, self.keys.name);
-            }
-            let Link::Linked(session) = &self.keys.link else {
-                return None;
-            };
-            match sys::send(session, &InputMethod::Grant.header().bytes()) {
-                Ok(mut reply) => {
-                    let mut buffer = [0; MESSAGE_MAX];
-                    let status = status_of(reply.bytes(&mut buffer));
-                    if status != Some(Status::Ok) || reply.handles.len() != 1 {
-                        rt::println!("compositor: GRANT refused: {status:?}");
-                        return None;
-                    }
-                    let focus = reply.handles.take::<Any>(0).ok()?;
-                    self.keys.own = None;
-                    self.focus_on = true;
-                    return Some(focus);
-                }
-                Err(Error::PeerClosed) => self.keys.link = Link::Lost,
-                Err(_) => return None,
-            }
-        }
-        None
-    }
-
-    /// The window of the first revision went: its focus ends and the
-    /// keyboard's is the compositor's again.
-    fn revoke_focus(&mut self) {
-        if !core::mem::take(&mut self.focus_on) {
-            return;
-        }
-        let Link::Linked(session) = &self.keys.link else {
-            return;
-        };
-        match sys::send(session, &InputMethod::Revoke.header().bytes()) {
-            Ok(_) => {}
-            Err(Error::PeerClosed) => self.keys.link = Link::Lost,
-            Err(error) => rt::println!("compositor: REVOKE failed: {error:?}"),
-        }
-        self.take_own(Which::Keys);
-    }
-
     /// READ of a device's events (up to READ_MAX, without waiting) into the
     /// scene; when it filled the request the next ones wait for the
     /// service's own bit.
@@ -617,6 +615,7 @@ impl Compositor {
             Err(Error::PeerClosed) => {
                 device.own = None;
                 device.link = Link::Lost;
+                let _ = sys::notify(&self.notify, WORK);
                 return;
             }
             Err(_) => return,
@@ -734,6 +733,8 @@ impl Compositor {
         if job.at.row >= job.damage.y + job.damage.h {
             let damage = job.damage;
             self.job = None;
+            #[cfg(feature = "steps")]
+            px::cost::frame_done();
             self.commit(damage);
             return;
         }
@@ -810,9 +811,9 @@ impl Compositor {
 
     /// The window at place `i` goes: what it waited for is refused
     /// (PEER_CLOSED), its buffers are unmapped a chunk a step (the place is
-    /// `dying` until then), the focus of a window of the first revision
-    /// ends and its buffer is cleared a step at a time, and the place on
-    /// the screen is shown again.
+    /// `dying` until then), its buffer, if it is of the first revision, is
+    /// cleared a step at a time (its session of keyboard focus answers
+    /// REVOKED from now on), and the place on the screen is shown again.
     fn destroy(&mut self, i: usize) {
         let Some(w) = self.scene.destroy(i) else {
             return;
@@ -830,7 +831,6 @@ impl Compositor {
             *extra = Extra::new();
         }
         if w.legacy {
-            self.revoke_focus();
             self.released += 1;
             self.cleared = Some(0);
         }
@@ -861,6 +861,7 @@ impl Compositor {
     /// own bit.
     fn work(&mut self) {
         rt::service::step_own();
+        self.regrant();
         if let Some(done) = self.cleared {
             let len = CLEARED.min(LEGACY_LEN - done);
             // SAFETY: the service's own read and write mapping of the
@@ -992,6 +993,13 @@ impl Compositor {
         Ok((label, session))
     }
 
+    /// The session of keyboard focus of the window of the first revision
+    /// with label `window`.
+    fn keys_session(&mut self, window: u64) -> Result<Handle<Channel>, Error> {
+        let rights = Rights::SEND | Rights::TRANSFER;
+        sys::handle_label(&self.channel, rights, window | WINDOW_KEYS, self.level)
+    }
+
     // ------------------------------------------------------------ the methods
 
     /// OPEN of a `Display` session (proto_gpu): a window of the whole
@@ -1032,14 +1040,25 @@ impl Compositor {
             return Answer::Status(Status::Kernel(Error::NoMemory));
         };
         let mut handles: Outgoing = [client.erase(), session.erase()].into();
-        let focus = self.grant_focus();
+        // The keyboard's focus is the compositor's always; the program reads
+        // the keys of its window from a session of the compositor's own, so
+        // they go to it while the window has the focus. An image without a
+        // keyboard has none to give.
+        if self.keys.own.is_none() {
+            self.take_own(Which::Keys);
+        }
+        let focus = if self.keys.own.is_some() {
+            self.keys_session(label).ok()
+        } else {
+            None
+        };
         let status = if focus.is_some() {
             Status::Ok
         } else {
             code(NO_INPUT)
         };
         if let Some(focus) = focus {
-            let _ = handles.push(focus);
+            let _ = handles.push(focus.erase());
         }
         if Screen::FIXED.write(status, r.reply()).is_err() {
             self.destroy(i);
@@ -1284,6 +1303,34 @@ impl Compositor {
         }
     }
 
+    /// READ of a window's session of keyboard focus (proto_input): the keys
+    /// in the window's ring, none when it has not the focus, REVOKED once
+    /// the window is gone.
+    fn read_keys(&mut self, label: u64, method: u16, r: &mut Request<'_>) -> Answer {
+        if method != InputMethod::Read.number() {
+            return Answer::Status(proto_input::code(proto_input::NOT_ALLOWED));
+        }
+        let max = match proto_input::read_max(r.body()) {
+            Ok(max) if r.handles.is_empty() => max as usize,
+            Ok(_) => return Answer::Status(Status::BadSize),
+            Err(status) => return Answer::Status(status),
+        };
+        let Some(i) = self.scene.find(label & !WINDOW_KEYS) else {
+            return Answer::Status(proto_input::code(proto_input::REVOKED));
+        };
+        let mut keys = [Event::default(); proto_comp::RING];
+        let n = max.min(keys.len());
+        let (n, lost) = self.scene.take_keys(i, &mut keys[..n]);
+        let mut out = [proto_input::Event::default(); proto_comp::RING];
+        for (to, from) in out.iter_mut().zip(&keys[..n]) {
+            *to = proto_input::Event::key(from.code, from.value != 0);
+        }
+        match proto_input::write_events(&out[..n], lost, r.reply()) {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(status) => Answer::Status(status),
+        }
+    }
+
     /// The requests of the manager's session: EVENTS of its ring and MANAGE.
     fn manager_request(&mut self, method: u16, r: &mut Request<'_>) -> Answer {
         match Comp::from_number(method) {
@@ -1419,6 +1466,9 @@ impl Service<1> for Compositor {
                 _ => Compositor::not_allowed(comp.is_some()),
             };
         }
+        if is_window_keys(label) {
+            return self.read_keys(label, method, r);
+        }
         if is_window(label) {
             // A window's session: ATTACH and POST of a window with buffers
             // of its own, FLUSH and CLOSE of the window of the first
@@ -1449,7 +1499,18 @@ impl Service<1> for Compositor {
     /// context's (the process ended, or `exec` closed it) takes all its
     /// windows, and a clone's frees its place.
     fn closed(&mut self, label: u64) {
-        if label == DRIVER || label == KEYS || label == POINTER {
+        if label == DRIVER {
+            return;
+        }
+        if let Some(which) = Compositor::device_label(label) {
+            // The driver of an input device ended with the grant it held:
+            // the focus is to be taken again, from its next instance.
+            let device = self.device(which);
+            if label & GENERATION == device.generation {
+                device.own = None;
+                device.link = Link::Lost;
+                let _ = sys::notify(&self.notify, WORK);
+            }
             return;
         }
         if is_manager(label) {
@@ -1461,6 +1522,9 @@ impl Service<1> for Compositor {
             return;
         }
         if is_input(label) {
+            return;
+        }
+        if is_window_keys(label) {
             return;
         }
         if is_window(label) {
@@ -1483,8 +1547,8 @@ impl Service<1> for Compositor {
             self.read_device(Which::Pointer);
         }
         match n.source {
-            Source::Session if n.label == KEYS => self.read_device(Which::Keys),
-            Source::Session if n.label == POINTER => self.read_device(Which::Pointer),
+            Source::Session if n.label & !GENERATION == KEYS => self.read_device(Which::Keys),
+            Source::Session if n.label & !GENERATION == POINTER => self.read_device(Which::Pointer),
             // One piece of work to a step: when both bits came, the work's
             // goes again by the service's own bit.
             Source::Unlabeled if n.bits & BAND != 0 => {
