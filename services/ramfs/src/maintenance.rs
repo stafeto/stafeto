@@ -88,10 +88,15 @@ pub fn orphan_progress(before: (u16, u16), after: (u16, u16)) -> bool {
     after.0 < before.0 || after.1 > before.1
 }
 
-/// The places in use that one step of the audit visits (each a `cleanup_step`, about 615 ticks
-/// under the load of the probes). The empty places between them are passed by the map of
-/// occupied places at once.
+/// The most places in use that one step of the audit visits.
 pub const AUDIT_LIVE_RUN: usize = 4;
+/// The time, in counter ticks, after which a step visits no further place in use. The cleanup
+/// of a place in use costs from about 600 ticks (nothing to do) to several thousand (a session
+/// that is authenticated, or a departure in portions), and before the map a step ended at the
+/// first place in use. A step now goes on to another place only while the places it has visited
+/// cost little, so that it is longer than a step of that kind by less than this time and the
+/// search of the map.
+pub const AUDIT_STEP_TICKS: u64 = 2_500;
 
 /// The places that may hold a session, a birth or a departure: a superset by meaning. A bit is
 /// set when a place is given out (a session is placed, a birth is stored) and cleared only when
@@ -179,11 +184,13 @@ impl Cursor {
         self.remaining = slots - 1;
         now.saturating_add(first)
     }
-    /// Whether a step of the audit goes on after it visited `visited` places in use, the last
-    /// of them with the result `worked`: not after progress (the same place is tried again in
-    /// the next step), not at the end of the round and not past `AUDIT_LIVE_RUN` places.
-    pub fn step_continues(&self, visited: usize, worked: bool) -> bool {
-        !worked && self.remaining != 0 && visited < AUDIT_LIVE_RUN
+    /// Whether a step of the audit goes on to another place in use, after it visited `visited`
+    /// of them, the last with the result `worked`, and has spent `spent` ticks. It stops after
+    /// progress (a place that worked is tried again in the next step, and a step that worked
+    /// ends there, as it did before the map), at the end of the round, after `AUDIT_LIVE_RUN`
+    /// places and once the visits cost `AUDIT_STEP_TICKS`.
+    pub fn step_continues(&self, visited: usize, worked: bool, spent: u64) -> bool {
+        !worked && self.remaining != 0 && visited < AUDIT_LIVE_RUN && spent < AUDIT_STEP_TICKS
     }
     /// Moves `count` places on, all of them passed.
     fn advance(&mut self, count: usize, slots: usize) {
@@ -721,29 +728,34 @@ mod audit_map_tests {
         visits
     }
 
-    /// The walk by the map, in steps of the audit: the places in use it visits (in order) and the
-    /// steps it takes. `worked` names the places whose cleanup makes progress the first time.
+    /// The walk by the map, in steps of the audit. `visit` gives the result and the cost in
+    /// ticks of the cleanup of a place. The places visited (in order), the places each step
+    /// visited and the ticks each step spent.
     fn map_walk(
         mut cursor: Cursor,
         slots: usize,
         map: &Map,
         empty: impl Fn(usize) -> bool,
-    ) -> (Vec<usize>, Vec<usize>) {
-        let (mut visits, mut per_step) = (Vec::new(), Vec::new());
+        mut visit: impl FnMut(usize) -> (bool, u64),
+    ) -> (Vec<usize>, Vec<usize>, Vec<u64>) {
+        let (mut visits, mut per_step, mut costs) = (Vec::new(), Vec::new(), Vec::new());
         while cursor.remaining != 0 {
-            let mut visited = 0;
+            let (mut visited, mut spent) = (0, 0);
             loop {
                 cursor.skip_unoccupied(slots, map, &empty);
                 visits.push(cursor.position);
+                let (worked, cost) = visit(cursor.position);
                 visited += 1;
-                cursor.complete(false, slots);
-                if !cursor.step_continues(visited, false) {
+                spent += cost;
+                cursor.complete(worked, slots);
+                if !cursor.step_continues(visited, worked, spent) {
                     break;
                 }
             }
             per_step.push(visited);
+            costs.push(spent);
         }
-        (visits, per_step)
+        (visits, per_step, costs)
     }
 
     fn table(occupied: &[usize], extra_bits: &[usize]) -> Map {
@@ -806,29 +818,46 @@ mod audit_map_tests {
                 SLOTS,
                 empty,
             );
-            let (visits, _) = map_walk(cursor, SLOTS, &map, empty);
+            let (visits, _, _) = map_walk(cursor, SLOTS, &map, empty, |_| (false, 0));
             assert_eq!(visits, reference, "occupied {occupied:?}");
         }
     }
 
+    fn occupied_set(seed: &mut Seed, live: usize) -> Vec<usize> {
+        let mut occupied = Vec::new();
+        while occupied.len() < live {
+            let i = 1 + seed.below(SLOTS - 1);
+            if !occupied.contains(&i) {
+                occupied.push(i);
+            }
+        }
+        occupied
+    }
+
     #[test]
-    fn a_round_over_640_places_with_l_in_use_ends_within_ceil_of_l_plus_one_over_four_steps() {
+    fn a_round_with_l_places_in_use_that_need_no_work_takes_few_steps() {
         let mut seed = Seed(12345);
-        for live in [0usize, 1, 2, 3, 4, 5, 8, 9, 17, 100, 639] {
-            for _ in 0..20 {
-                let mut occupied = Vec::new();
-                while occupied.len() < live {
-                    let i = 1 + seed.below(SLOTS - 1);
-                    if !occupied.contains(&i) {
-                        occupied.push(i);
-                    }
-                }
+        for cost in [0u64, 600, 1_000, 2_500, 5_000] {
+            // The visits one step makes: the places until their cost reaches the time of a step.
+            let per_step = if cost == 0 {
+                AUDIT_LIVE_RUN
+            } else {
+                (AUDIT_STEP_TICKS.div_ceil(cost) as usize).min(AUDIT_LIVE_RUN)
+            };
+            for live in [0usize, 1, 2, 3, 4, 5, 8, 9, 17, 100, 639] {
+                let occupied = occupied_set(&mut seed, live);
                 let map = table(&occupied, &[]);
                 let cursor = Cursor {
                     position: 1 + seed.below(SLOTS - 1),
                     remaining: SLOTS - 1,
                 };
-                let (visits, per_step) = map_walk(cursor, SLOTS, &map, |i| !occupied.contains(&i));
+                let (visits, steps, spent) = map_walk(
+                    cursor,
+                    SLOTS,
+                    &map,
+                    |i| !occupied.contains(&i),
+                    |_| (false, cost),
+                );
                 // Every place in use is visited once; the last place of the round is visited
                 // too, in use or not, so at most L + 1 places.
                 assert!(
@@ -839,13 +868,48 @@ mod audit_map_tests {
                 for place in &occupied {
                     assert_eq!(visits.iter().filter(|v| *v == place).count(), 1);
                 }
-                assert!(per_step.len() <= (live + 1).div_ceil(AUDIT_LIVE_RUN));
-                assert!(per_step.iter().all(|&n| n <= AUDIT_LIVE_RUN));
+                assert!(steps.len() <= (live + 1).div_ceil(per_step));
+                assert!(steps.iter().all(|&n| n <= per_step));
+                // No step spends the time of a step before its last visit.
+                assert!(spent.iter().all(|&t| t < AUDIT_STEP_TICKS + cost.max(1)));
                 if live == 0 {
                     // An idle table's round is one step.
-                    assert_eq!(per_step.len(), 1);
+                    assert_eq!(steps.len(), 1);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_step_ends_after_a_place_that_needed_work_as_it_did_before_the_map() {
+        let mut seed = Seed(99);
+        for live in [1usize, 2, 5, 20, 100] {
+            let occupied = occupied_set(&mut seed, live);
+            let map = table(&occupied, &[]);
+            // Each place in use needs one unit of work, then is done.
+            let mut owed: Vec<usize> = occupied.clone();
+            let cursor = Cursor {
+                position: 1 + seed.below(SLOTS - 1),
+                remaining: SLOTS - 1,
+            };
+            let (visits, steps, _) = map_walk(
+                cursor,
+                SLOTS,
+                &map,
+                |i| !occupied.contains(&i),
+                |place| match owed.iter().position(|&p| p == place) {
+                    Some(at) => {
+                        owed.swap_remove(at);
+                        (true, 6_000)
+                    }
+                    None => (false, 600),
+                },
+            );
+            // A worked visit ends its step, so no step has two of them, and each place is
+            // visited twice at most: once for its work and once to find it done.
+            assert!(steps.len() <= live + 1, "L {live}: {} steps", steps.len());
+            assert!(visits.len() <= 2 * live + 1);
+            assert!(owed.is_empty());
         }
     }
 

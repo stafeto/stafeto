@@ -4222,11 +4222,14 @@ impl Fs {
         }
         self.audit_ready_ns = now.saturating_add(AUDIT_STEP_NS);
         rt::service::step_detail(own_step::AUDIT);
-        // A step visits up to `AUDIT_LIVE_RUN` places in use; the empty places between them are
-        // passed by the map of occupied places at once.
+        // The empty places are passed by the map of occupied places at once. The step ends at a
+        // place whose cleanup worked, as it did before the map; it goes on to another place in
+        // use only while the places it has visited were cheap (`AUDIT_STEP_TICKS`), so that it
+        // is no longer than a step with one place in use by more than that time.
         let round_open = self.maintenance.remaining != 0;
         let mut client_work;
         let mut visited = 0;
+        let began = rt::time::now();
         loop {
             let departures = &self.departures;
             let births = &*self.births;
@@ -4249,7 +4252,8 @@ impl Fs {
             }
             visited += 1;
             self.maintenance.complete(client_work, SESSIONS + BIRTHS);
-            if !self.maintenance.step_continues(visited, client_work) {
+            let spent = rt::time::now().saturating_sub(began);
+            if !self.maintenance.step_continues(visited, client_work, spent) {
                 break;
             }
         }
