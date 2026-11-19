@@ -15,6 +15,9 @@ bench = false
 # /proc made from the process service (procfs.rs), for the shell image of the
 # utilities.
 procfs = []
+# The data file service at /data (data.rs, proto_data): the paths under /data, the descriptions of the
+# service and the session with it. libc.so has it; the other images do not carry the code.
+data = ["dep:proto-data"]
 # Read-only resident named-open witness, absent from shipped builds.
 fifo-probe = []
 # threads::set_level, the levels of rtbench 2's threads (tests/rtbench-posix).
@@ -91,3 +94,4 @@ proto-gpu = { path = "../../proto/gpu" }
 proto-input = { path = "../../proto/input" }
 comp-client = { path = "../comp-client", optional = true }
 proto-comp = { path = "../../proto/comp", optional = true }
+proto-data = { path = "../../proto/data", optional = true }

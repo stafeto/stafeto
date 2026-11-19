@@ -924,7 +924,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let list = layer_features(&root).unwrap();
         assert_eq!(
-            list, "posix-crt/shared,posix-crt/procfs,posix-crt/trace",
+            list, "posix-crt/shared,posix-crt/procfs,posix-crt/data,posix-crt/trace",
             "a feature that libc.so gains goes into the file, and its crates into the fingerprint"
         );
         // Each is a feature of posix-crt; the window library is not among them.

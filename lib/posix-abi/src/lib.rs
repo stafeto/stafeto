@@ -37,6 +37,10 @@ pub use lock_wait::{Probe as WaitProbe, probe_hook as probe_wait_hook};
 pub fn record_locks_none() -> bool {
     shared::with_files(|files| Ok(files.knows_no_record_lock())).unwrap_or(false)
 }
+#[cfg(feature = "data")]
+pub mod data;
+#[cfg(not(feature = "data"))]
+#[path = "data_off.rs"]
 pub mod data;
 pub mod display;
 pub mod epoll;
@@ -276,6 +280,10 @@ fn open_policy_inner(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result
     if let Some(path) = procfs::absolute(name).filter(procfs::Absolute::is_under) {
         return procfs::open(path.bytes(), flags);
     }
+    // The files under /data are the data file service's (data).
+    if let Some(vol) = data::route(names::AT_FDCWD, name)? {
+        return data::open(&vol, flags);
+    }
     open_image(name, flags, mode, umask)
 }
 
@@ -328,6 +336,10 @@ pub fn openat_policy(
     #[cfg(feature = "procfs")]
     if let Some(path) = procfs::relative(dirfd, name) {
         return procfs::open(path.bytes(), flags);
+    }
+    // A name against a directory of /data (data).
+    if let Some(vol) = data::route(dirfd, name)? {
+        return data::open(&vol, flags);
     }
     let point = threads::cancel::Point::begin();
     let result = (|| {
