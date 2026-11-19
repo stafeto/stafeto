@@ -49,6 +49,23 @@ pub const fn band_cap(period_ns: u64, cap_ppm: u64, band_ticks: u32) -> u32 {
     if bands == 0 { 1 } else { bands as u32 }
 }
 
+/// The own arguments of the service's record: the period and the cap of the
+/// work of a period in parts a million of it, two u64. No arguments are the
+/// defaults (60 Hz, 750 000); a period of 0 is the free run; bytes past the
+/// sixteen are not read, and fewer than sixteen (a word of one) are the
+/// defaults.
+pub fn parse_args(own: &[u8]) -> (u64, u64) {
+    let word = |i: usize| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&own[8 * i..8 * i + 8]);
+        u64::from_le_bytes(b)
+    };
+    if own.len() < 16 {
+        return (DEFAULT_PERIOD_NS, DEFAULT_CAP_PPM);
+    }
+    (word(0), word(1))
+}
+
 /// The starts of the periods.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Clock {
@@ -171,6 +188,22 @@ impl Pacer {
 
     fn free(&self) -> bool {
         self.counters.period == 0
+    }
+
+    /// Whether this is the free run (no period).
+    pub fn is_free(&self) -> bool {
+        self.free()
+    }
+
+    /// A taking found nothing to take (only windows held by their intervals):
+    /// the frame is not made, the taking is not counted, and the timer is
+    /// wanted again for what is owed.
+    pub fn nothing_taken(&mut self, now: u64) -> Wake {
+        if self.work.take().is_some() {
+            self.counters.releases = self.counters.releases.saturating_sub(1);
+        }
+        self.armed = None;
+        self.arm(self.clock.next(now))
     }
 
     pub fn clock(&self) -> &Clock {
@@ -534,6 +567,19 @@ impl Pace {
             expected: self.expected,
             ..Pace::new()
         };
+    }
+
+    /// A buffer was taken with no clock to count periods by (the free run).
+    pub fn count_taken(&mut self) {
+        self.taken += 1;
+    }
+
+    /// A post with no interval to judge: counted.
+    pub fn count_post(&mut self, replaced: bool) {
+        self.posts += 1;
+        if replaced {
+            self.replaced += 1;
+        }
     }
 
     /// The window's counters as STATS' record of window `id`.
@@ -961,6 +1007,34 @@ mod tests {
             (r.id, r.interval, r.posts, r.taken, r.missed),
             (9, 4, 1, 1, 1)
         );
+    }
+
+    #[test]
+    fn the_arguments_are_the_period_and_the_cap_or_the_defaults() {
+        assert_eq!(parse_args(&[]), (16_666_667, 750_000));
+        assert_eq!(parse_args(&[1; 15]), (16_666_667, 750_000));
+        let mut sixteen = Vec::new();
+        sixteen.extend_from_slice(&8_333_333u64.to_le_bytes());
+        sixteen.extend_from_slice(&500_000u64.to_le_bytes());
+        assert_eq!(parse_args(&sixteen), (8_333_333, 500_000));
+        // The free run, and bytes past the sixteen.
+        let mut free = vec![0u8; 16];
+        assert_eq!(parse_args(&free), (0, 0));
+        free.extend_from_slice(&[9; 5]);
+        assert_eq!(parse_args(&free), (0, 0));
+    }
+
+    #[test]
+    fn a_taking_that_found_nothing_is_not_counted_and_asks_for_the_owed_start() {
+        let mut p = pacer();
+        let c = *p.clock();
+        p.change(c.start(4) - 1, None);
+        assert_eq!(p.fire(c.start(4)), Fire::Take(4));
+        // The frame took none of the windows: they are due at 6.
+        p.hold(6);
+        assert_eq!(p.nothing_taken(c.start(4) + 10), Wake::At(c.start(6)));
+        assert_eq!(p.counters.releases, 0);
+        assert!(!p.busy());
     }
 
     #[test]

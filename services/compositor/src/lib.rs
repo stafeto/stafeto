@@ -281,6 +281,10 @@ pub struct Window {
     /// The window's promise of an interval and its counts (stage G5): the
     /// service sets and reads them; the scene keeps them with the window.
     pub pace: frame::Pace,
+    /// The damage of a post that waits for the window's interval: the window's
+    /// buffer is taken at the start it is due, and the rectangle joins the
+    /// frame's damage then.
+    pub held: Option<Rect>,
 }
 
 /// What the primary pipeline of the display shows.
@@ -431,6 +435,9 @@ pub struct Scene {
     /// to the same (OWNER_NONE: no press seen).
     owner: [u8; KEYS_TRACKED],
     damage: Option<Rect>,
+    /// The earliest start a window left by the last taking is due at (the
+    /// caller says `hold` with it to the pacer).
+    held_until: Option<u64>,
     frame: bool,
     seq: u32,
     created: u32,
@@ -506,6 +513,7 @@ impl Scene {
             modifier: 0,
             owner: [OWNER_NONE; KEYS_TRACKED],
             damage: None,
+            held_until: None,
             frame: false,
             seq: 0,
             created: 0,
@@ -752,6 +760,7 @@ impl Scene {
             current: None,
             retired: None,
             pace: frame::Pace::new(),
+            held: None,
             in_frame: false,
             visible: true,
             shown_once: false,
@@ -819,6 +828,32 @@ impl Scene {
     /// buffer a posted one it replaced ("the latest wins"), which is free
     /// at once.
     pub fn post(&mut self, i: usize, buffer: u8, rects: &[Rect]) -> Result<Option<u8>, Refusal> {
+        self.post_inner(i, buffer, rects, None)
+            .map(|(replaced, _)| replaced)
+    }
+
+    /// POST at `now` on the clock of the frame: the window's promise of an
+    /// interval is judged (`frame::Pace::posted`), and a buffer that is due
+    /// at a start later than the nearest waits with its damage in the window.
+    /// The replaced buffer, and the start the buffer is due at (None: any).
+    pub fn post_paced(
+        &mut self,
+        i: usize,
+        buffer: u8,
+        rects: &[Rect],
+        clock: &frame::Clock,
+        now: u64,
+    ) -> Result<(Option<u8>, Option<u64>), Refusal> {
+        self.post_inner(i, buffer, rects, Some((clock, now)))
+    }
+
+    fn post_inner(
+        &mut self,
+        i: usize,
+        buffer: u8,
+        rects: &[Rect],
+        paced: Option<(&frame::Clock, u64)>,
+    ) -> Result<(Option<u8>, Option<u64>), Refusal> {
         if rects.len() > MAX_RECTS {
             return Err(Refusal::Invalid);
         }
@@ -836,14 +871,48 @@ impl Scene {
         if w.bufs[buffer as usize] != Buf::Free {
             return Err(Refusal::Busy);
         }
-        let damage = Scene::changed(w.rect, rects)?;
+        let mut damage = Scene::changed(w.rect, rects)?;
         w.bufs[buffer as usize] = Buf::Posted;
         let replaced = w.posted.replace(buffer);
         if let Some(j) = replaced {
             w.bufs[j as usize] = Buf::Free;
         }
+        let mut due = None;
+        match paced {
+            Some((clock, now)) => {
+                due = w.pace.posted(clock, now, replaced.is_some());
+                if due.is_some_and(|e| e > clock.next(now)) {
+                    // Not at the nearest start: the damage waits in the window.
+                    w.held = Some(union(w.held, damage));
+                    return Ok((replaced, due));
+                }
+            }
+            None => w.pace.count_post(replaced.is_some()),
+        }
+        if let Some(h) = w.held.take() {
+            damage = union(Some(damage), h);
+        }
         self.add_damage(damage);
-        Ok(replaced)
+        Ok((replaced, due))
+    }
+
+    /// Whether a change waits for a frame: damage the next frame will take.
+    pub fn damaged(&self) -> bool {
+        self.damage.is_some()
+    }
+
+    /// The start the windows a taking left are due at, the earliest.
+    pub fn held_until(&self) -> Option<u64> {
+        self.held_until
+    }
+
+    /// The pace of window `i`.
+    pub fn pace(&self, i: usize) -> Option<&frame::Pace> {
+        self.windows.get(i)?.as_ref().map(|w| &w.pace)
+    }
+
+    pub fn pace_mut(&mut self, i: usize) -> Option<&mut frame::Pace> {
+        self.windows.get_mut(i)?.as_mut().map(|w| &mut w.pace)
     }
 
     /// FLUSH of the legacy window `i`: its one buffer, whose changed
@@ -1261,8 +1330,24 @@ impl Scene {
     /// and, when no manager has subscribed, a window that has its first
     /// buffer taken gets the focus and the top place.
     pub fn begin(&mut self) -> Option<Rect> {
+        self.begin_at(u64::MAX)
+    }
+
+    /// `begin` for the frame of period `k`: a window with an interval whose
+    /// buffer is due at a later start is left posted (its damage waits in the
+    /// window, and `held_until` says the start it is due), and the others are
+    /// taken, each counted taken at `k`.
+    pub fn begin_at(&mut self, k: u64) -> Option<Rect> {
         if self.frame {
             return None;
+        }
+        self.held_until = None;
+        for w in self.windows.iter_mut().flatten() {
+            if w.pace.due(k)
+                && let Some(h) = w.held.take()
+            {
+                self.damage = Some(union(self.damage, h));
+            }
         }
         let d = self.damage.take()?;
         let x1 = (d.x + d.w).min(WIDTH);
@@ -1275,6 +1360,14 @@ impl Scene {
             let Some(w) = w else {
                 continue;
             };
+            if w.posted.is_some() && !w.pace.due(k) {
+                // Not its start: the buffer stays posted, and the frame is
+                // owed it at its start.
+                if let Some(e) = w.pace.earliest() {
+                    self.held_until = Some(self.held_until.map_or(e, |h| h.min(e)));
+                }
+                continue;
+            }
             let Some(b) = w.posted.take() else {
                 continue;
             };
@@ -1283,6 +1376,11 @@ impl Scene {
             } else {
                 w.retired = w.current.replace(b);
                 w.bufs[b as usize] = Buf::Taken;
+                if k == u64::MAX {
+                    w.pace.count_taken();
+                } else {
+                    w.pace.took(k);
+                }
             }
             w.in_frame = true;
             if !core::mem::replace(&mut w.shown_once, true) {
@@ -2757,6 +2855,45 @@ mod tests {
         // The bands of the whole screen, by the prices: loud when it passes 45.
         assert!(bands <= 45, "{bands} bands: the full phase is no promise");
         assert_eq!(bands, full_screen_bands());
+    }
+
+    /// A window with an interval of 2, taken at period 3, is awaited at 5.
+    /// Another window's post brings a frame at 4: the frame leaves the first
+    /// window's buffer posted, with its damage, and says the start it is due.
+    #[test]
+    fn a_frame_before_the_start_of_a_window_with_an_interval_leaves_it_posted() {
+        let clock = frame::Clock::new(0, 1_000);
+        let mut s = Scene::new();
+        let a = s.create(1, 1, rect(0, 0, 40, 40), false, 0).unwrap();
+        let b = s.create(2, 2, rect(100, 100, 40, 40), false, 0).unwrap();
+        for i in [a, b] {
+            s.attach(i, 2, 160).unwrap();
+        }
+        assert!(s.pace_mut(b).unwrap().set_interval(2));
+        s.pace_mut(b).unwrap().took(3);
+        // B posts in period 3, early: due at 5, so its damage waits in the window.
+        let (_, due) = s.post_paced(b, 0, &[], &clock, 3_200).unwrap();
+        assert_eq!(due, Some(5));
+        // A posts in period 3 (no interval): a frame at 4 takes A alone.
+        let (_, due) = s.post_paced(a, 0, &[], &clock, 3_500).unwrap();
+        assert_eq!(due, None);
+        assert!(s.damaged());
+        assert_eq!(s.begin_at(4), Some(rect(0, 0, 40, 40)));
+        s.end(true);
+        assert_eq!(s.held_until(), Some(5));
+        // (B's one taking is the setup's, at period 3.)
+        assert_eq!((s.pace(a).unwrap().taken, s.pace(b).unwrap().taken), (1, 1));
+        // At 5 the held damage joins and B is taken, with no new post.
+        let d = s.begin_at(5).unwrap();
+        assert!(d.x <= 100 && d.y <= 100 && d.x + d.w >= 140 && d.y + d.h >= 140);
+        s.end(true);
+        assert_eq!(s.held_until(), None);
+        assert_eq!(s.pace(b).unwrap().taken, 2);
+        // A post counts in the window's record whatever the clock.
+        let r = s.pace(a).unwrap().record(a as u32);
+        assert_eq!((r.posts, r.taken), (1, 1));
+        s.post(b, 1, &[]).unwrap();
+        assert_eq!(s.pace(b).unwrap().posts, 2);
     }
 
     use proto_gpu::{PIPELINE_CURSOR, SOURCE_CURSOR};
