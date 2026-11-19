@@ -1046,7 +1046,7 @@ const SHELL_SERVICES_LAST: [ImageProgram; 4] = [
 /// programs of stack 0 go into the image as their ELF files alone, which the
 /// process service starts from the RAM files; init starts the launcher
 /// (`ash-launcher`), which spawns BusyBox from its file.
-const PACKAGE_PROGRAMS: [ImageProgram; 11] = [
+const PACKAGE_PROGRAMS: [ImageProgram; 12] = [
     (
         "busybox-probe",
         "busybox-probe",
@@ -1063,6 +1063,10 @@ const PACKAGE_PROGRAMS: [ImageProgram; 11] = [
     ("dropbear", "dropbear", 0, &["dynamic"]),
     ("nginx", "nginx", 0, &["dynamic"]),
     ("nginx-fast", "nginx-fast", 0, &["dynamic"]),
+    // A static program on relibc (apps/lvgl-demo): its 256 KiB stack is the
+    // PT_GNU_STACK its build script asks for, and its build script runs the
+    // scripts of LVGL and FreeType.
+    ("lvgl-demo", "lvgl-demo", 0, &[]),
 ];
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts

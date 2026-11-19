@@ -533,6 +533,18 @@ fn freedoom_wad() -> &'static [u8] {
     })
 }
 
+/// The font file of the LVGL demo (Liberation Sans Regular), which the build
+/// of the package `lvgl` copies out of its archive to `target/lvgl/`. Like the
+/// WAD, it is empty when the build has not run (the check of the descriptions
+/// needs the paths of an image only).
+fn lvgl_font() -> &'static [u8] {
+    static FONT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    FONT.get_or_init(|| {
+        let path = crate::target_dir().join("lvgl/LiberationSans-Regular.ttf");
+        std::fs::read(path).unwrap_or_default()
+    })
+}
+
 /// The bytes of the files that packages name as `bytes:<name>`.
 fn named_bytes(name: &str) -> Result<&'static [u8], String> {
     match name {
@@ -541,6 +553,7 @@ fn named_bytes(name: &str) -> Result<&'static [u8], String> {
         // The shells a login may use (Dropbear refuses an account whose shell is not listed).
         "shells" => Ok(b"/bin/ash\n/bin/sh\n"),
         "freedoom1.wad" => Ok(freedoom_wad()),
+        "LiberationSans-Regular.ttf" => Ok(lvgl_font()),
         "fstack.ini" => Ok(include_bytes!("../../ports/f-stack/fstack.ini")),
         "ca-certificates.crt" => Ok(crate::net_tls::ca_bundle()),
         "mime.types" => Ok(crate::nginx_probe::mime_types()),

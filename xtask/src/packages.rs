@@ -65,9 +65,8 @@ pub enum Group {
 /// The packages that install nothing and are linked into a service of the
 /// base system, which is no package itself (pixman, linked into the
 /// composition service by `lib/pixman`): their description, their notice and
-/// their pinned source are all they have. `lvgl` is listed until the program
-/// of the demo (stage G4) gives it files; the entry then goes.
-pub const SERVICE_LIBRARIES: &[&str] = &["pixman", "lvgl"];
+/// their pinned source are all they have.
+pub const SERVICE_LIBRARIES: &[&str] = &["pixman"];
 
 /// A package: the content of its description.
 #[derive(Clone, Debug)]

@@ -167,14 +167,17 @@ them for the licence notes of the image.
   `python3 -I tools/test_build_lvgl.py` checks the configuration file and these
   rules on samples; its header records one real run of the planted fault
   (`LV_USE_OS` set to `LV_OS_PTHREAD`, through `STAFETO_LVGL_PORT_DIR`), which
-  the build refuses with the `pthread_*` names. The package installs no file
-  yet: the program `lvgl-demo` and the installed font come with the later steps
-  of the stage, and until then `xtask/src/packages.rs` lists it in
-  `SERVICE_LIBRARIES`. The archive of the tag is pinned by its SHA-256; if
-  GitHub ever changes its bytes, the fallback is to pin the commit of the tag
-  (`80ca777e37a2b176770726a02e07a6fb79ef0b39`) and fetch only `src` and
-  `include` of it with a sparse shallow checkout, as `tools/build-relibc.py`
-  fetches relibc.
+  the build refuses with the `pthread_*` names. The package's program is
+  `/bin/lvgl-demo` (`apps/lvgl-demo`: a Rust crate on `posix-crt` with its
+  feature `window`, whose build script runs `tools/build-lvgl.py` and compiles
+  `ports/lvgl/{main.c,stafeto_display.c,stafeto_input.c}` with the demo's
+  files, then links them with `liblvgl.a`, `libfreetype.a` and relibc's
+  `libc.a`; the program has no `DT_NEEDED` and a `PT_GNU_STACK` of 256 KiB), and
+  the font is `/usr/share/fonts/LiberationSans-Regular.ttf`. The archive of the
+  tag is pinned by its SHA-256; if GitHub ever changes its bytes, the fallback
+  is to pin the commit of the tag (`80ca777e37a2b176770726a02e07a6fb79ef0b39`)
+  and fetch only `src` and `include` of it with a sparse shallow checkout, as
+  `tools/build-relibc.py` fetches relibc.
 - The demo screen of LVGL (`ports/lvgl/{demo.c,demo.h,scene.h,schedule.c,schedule.h,keys.c,keys.h,crc.c,crc.h}`)
   is plain C over a small contract that `demo.h` states: two XRGB8888 buffers of
   640 x 400 that the host program supplies, a post of a finished frame with the

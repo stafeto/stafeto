@@ -8,9 +8,9 @@
 # for its text. The font of the demo, Liberation Sans Regular (SIL Open Font
 # License 1.1), is a file of the archive: the build copies it and its licence
 # text to target/lvgl/, and the notices of the package carry the licence text.
-# The program of the package (lvgl-demo) and the installed font come with the
-# later steps of the stage; until then the package installs no file and
-# SERVICE_LIBRARIES in xtask/src/packages.rs lists it.
+# The program of the package is lvgl-demo (apps/lvgl-demo, ports/lvgl), a
+# statically linked program on relibc whose build script runs the scripts of
+# this package and of freetype; the font is installed beside it.
 # Format: docs/packages.md.
 
 name = "lvgl"
@@ -27,4 +27,9 @@ build_depends = ["freetype"]
 needs = ["display", "input"]
 notices = ["LiberationSans-LICENSE.txt = target:lvgl/LiberationSans-LICENSE.txt"]
 build = "tools/build-lvgl.py"
-files = []
+program = "lvgl-demo"
+dirs = ["/usr/share/fonts"]
+files = [
+  "/bin/lvgl-demo = elf:lvgl-demo",
+  "/usr/share/fonts/LiberationSans-Regular.ttf = bytes:LiberationSans-Regular.ttf",
+]

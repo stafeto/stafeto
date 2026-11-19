@@ -6,18 +6,18 @@
 #define KEY_LEFTSHIFT 42
 #define KEY_RIGHTSHIFT 54
 
-/* Linux key codes 0 to 57 on a US keyboard: the plain and the shifted
+/* Linux key codes 0 to 57 on a US keyboard (a string of 58 characters): the plain and the shifted
  * character, 0 for a key with none. */
-static const char plain[58] =
+static const char plain[] =
     "\0\033" "1234567890-=" "\b" "\t" "qwertyuiop[]" "\n" "\0" "asdfghjkl;'`" "\0" "\\"
     "zxcvbnm,./" "\0" "*" "\0" " ";
-static const char shifted[58] =
+static const char shifted[] =
     "\0\033" "!@#$%^&*()_+" "\b" "\t" "QWERTYUIOP{}" "\n" "\0" "ASDFGHJKL:\"~" "\0" "|"
     "ZXCVBNM<>?" "\0" "*" "\0" " ";
 
 static uint32_t translate(const keys *k, uint16_t code)
 {
-    if (code < sizeof plain) {
+    if (code < sizeof plain - 1) {
         char c = k->shift ? shifted[code] : plain[code];
         if (c == '\t') {
             return KEYS_NEXT;
