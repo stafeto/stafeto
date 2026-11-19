@@ -2180,3 +2180,27 @@ fn a_request_that_takes_blocks_is_named_for_the_stop_status() {
     .unwrap())));
     assert!(!needs_blocks(&[]));
 }
+
+#[test]
+fn the_mount_work_of_a_volume_that_exists_leaves_the_window_empty() {
+    // The verifying boot of data-probe sleeps before its first request so that the service's first
+    // walk starts after the quiet time: that holds only if the mount work (the directory of the
+    // orphans, the recovery, the epoch) takes no block from the allocator on a volume a series of
+    // writes left behind. On a new volume the directory of the orphans is made at mount and fills
+    // the window ("made at mount").
+    use crate::server::{bump_epoch, ensure_orphans, recover_orphans};
+    let device = kept_device();
+    let mut fs = mounted(&device, Win::Whole);
+    ensure_orphans(&mut fs).unwrap();
+    // The first start made the directory; a later start finds it.
+    let mut fs = mounted(&settle(fs), Win::Whole);
+    assert_eq!(fs.window_state().2, 0);
+    ensure_orphans(&mut fs).unwrap();
+    recover_orphans(&mut fs).unwrap();
+    bump_epoch(&mut fs).unwrap();
+    assert_eq!(fs.window_state().2, 0, "the mount work walked the volume");
+    // The first walk after the quiet time is then a real one.
+    let at = now(&mut fs);
+    fs.walk().unwrap();
+    assert!(now(&mut fs).since(at).reads > 0);
+}
