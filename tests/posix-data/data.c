@@ -89,6 +89,7 @@ static int wait_ok(pid_t pid) {
         if (WIFSIGNALED(status)) printf("posix-data: a process ended with the signal %d\n", WTERMSIG(status));
         return -2;
     }
+    if (WEXITSTATUS(status) != 0) printf("posix-data: a process ended with the status %d\n", WEXITSTATUS(status));
     return WEXITSTATUS(status);
 }
 
@@ -1298,8 +1299,9 @@ static int enospc_at_the_reserve_then_unlink(void) {
         if (calls % 4 == 0) {
             /* One block is four writes: the reserve (64 blocks) is not run through between two looks. */
             DATA_CHECK(statvfs("/data", &v) == 0);
-            /* f_bavail leaves the reserve out: it is 0 when the reserve is reached. */
-            if (v.f_bavail <= 4) break;
+            /* f_bavail leaves the reserve out: it is 0 with 64 free blocks, and a user is refused with
+             * fewer than 64. */
+            if (v.f_bavail == 0) break;
         }
         if (in_file == FILL_FILE_WRITES) {
             DATA_CHECK(close(fd) == 0);
@@ -1314,7 +1316,16 @@ static int enospc_at_the_reserve_then_unlink(void) {
         calls++;
         in_file++;
     }
-    printf("posix-data: the volume reached its reserve after %lu writes in %d files\n", calls, files + 1);
+    /* Root goes on into the reserve: 16 writes are 4 blocks, so that fewer than 64 blocks are free. */
+    for (int i = 0; i < 16; i++) {
+        DATA_CHECK(write(fd, buf, sizeof buf) == (ssize_t)sizeof buf);
+        calls++;
+        in_file++;
+    }
+    DATA_CHECK(statvfs("/data", &v) == 0);
+    printf("posix-data: the volume reached its reserve after %lu writes in %d files, %lu blocks free\n", calls,
+           files + 1, (unsigned long)v.f_bfree);
+    DATA_CHECK(v.f_bfree < 64 && v.f_bavail == 0);
     DATA_CHECK(as_ids(1000, 100, fill_user_body) == 0); /* ENOSPC for a creation by a user */
     errno = 0;
     DATA_CHECK(write(fd, buf, sizeof buf) > 0); /* root goes into the reserve */
@@ -1325,10 +1336,13 @@ static int enospc_at_the_reserve_then_unlink(void) {
     }
     /* The room comes back when the service has walked the volume (2 s of quiet, then the walk). */
     int back = 0;
-    for (int i = 0; i < 40 && !back; i++) {
+    int tries = 0;
+    for (; tries < 40 && !back; tries++) {
         pause_ms(3000);
         back = as_ids(1000, 100, fill_user_creates_body) == 0;
     }
+    DATA_CHECK(statvfs("/data", &v) == 0);
+    printf("posix-data: the room came back after %d tries of 3 s: %lu blocks free\n", tries, (unsigned long)v.f_bfree);
     DATA_CHECK(back);
     DATA_CHECK(chmod("/data", 0755) == 0);
     return 0;
