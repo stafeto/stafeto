@@ -38,9 +38,11 @@ permissions:
   contents: read
 
 # One run at a time for the releases of the system and the updates of packages:
-# two runs that sign at once would take the same serial of the index.
+# two runs that sign at once would take the same serial of the index. Only tag
+# runs join the group: a manual run has a group of its own, so that it cannot
+# cancel a tag run that is waiting.
 concurrency:
-  group: release-pipeline
+  group: ${{ github.event_name == 'push' && 'release-pipeline' || format('dispatch-{0}', github.run_id) }}
   cancel-in-progress: false
 
 env:
@@ -73,7 +75,13 @@ jobs:
         id: version
         env:
           SERIES_INPUT: ${{ inputs.series }}
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
         run: |
+          if [ "$EVENT" = push ] && [ "$(git cat-file -t "refs/tags/$TAG")" != tag ]; then
+            echo "::error::$TAG is a lightweight tag; set an annotated one (git tag -a)"
+            exit 1
+          fi
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           series=$(echo "$version" | cut -d. -f1,2)
           if [ -n "$SERIES_INPUT" ] && [ "$SERIES_INPUT" != "$series" ]; then

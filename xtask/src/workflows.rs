@@ -374,7 +374,9 @@ fn the_release_and_the_update_leave_each_others_tags_alone_and_share_one_queue()
     assert!(code(&release).contains("--match 'v*' --exclude 'v*-pkgs.*'"));
     for text in [&release, &update] {
         let text = code(text);
-        assert!(text.contains("group: release-pipeline"));
+        assert!(text.contains(
+            "group: ${{ github.event_name == 'push' && 'release-pipeline' || format('dispatch-{0}', github.run_id) }}"
+        ));
         assert!(text.contains("cancel-in-progress: false"));
     }
 }
@@ -532,4 +534,47 @@ fn the_owner_is_told_to_guard_the_tags_and_main_before_a_secret_goes_into_the_en
     assert!(text.contains("collaborators?permission=admin"));
     // The setting that keeps a published release as it is comes before the first secret too.
     assert!(at("Immutable releases") < at("gh secret set RELEASE_SIGNING_KEY"));
+}
+
+#[test]
+fn a_manual_run_does_not_join_the_queue_of_the_tag_runs() {
+    // A dispatch by anyone who may write would otherwise cancel the pending run of a tag.
+    for name in ["release.yml", "packages-update.yml"] {
+        let text = code(&workflow(name));
+        let at = text
+            .find("concurrency:")
+            .unwrap_or_else(|| panic!("{name}"));
+        let group = text[at..].lines().nth(1).unwrap().trim();
+        assert!(
+            group.contains("github.event_name == 'push' && 'release-pipeline'"),
+            "{name}"
+        );
+        assert!(
+            group.contains("format('dispatch-{0}', github.run_id)"),
+            "{name}"
+        );
+        // The only literal name of the shared group is the one chosen for a push.
+        assert_eq!(text.matches("release-pipeline").count(), 1, "{name}");
+    }
+}
+
+#[test]
+fn the_check_with_both_roots_is_in_the_dry_run_alone() {
+    for name in names() {
+        for (job, body) in jobs(&workflow(&name)) {
+            let uses = code(&body).contains("--with-official");
+            assert_eq!(
+                uses,
+                name == "packages-update.yml" && job == "trial",
+                "{name}: {job}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_build_job_of_an_update_wants_an_annotated_tag() {
+    let build = code(&jobs(&workflow("packages-update.yml"))["build"]);
+    assert!(build.contains("git cat-file -t \"refs/tags/$TAG\""));
+    assert!(build.contains("annotated"));
 }

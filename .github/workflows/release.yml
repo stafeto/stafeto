@@ -28,7 +28,7 @@ permissions:
 # The same group as packages-update.yml: two runs that sign at once would take
 # the same serial of the index.
 concurrency:
-  group: release-pipeline
+  group: ${{ github.event_name == 'push' && 'release-pipeline' || format('dispatch-{0}', github.run_id) }}
   cancel-in-progress: false
 
 env:

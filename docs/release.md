@@ -359,6 +359,10 @@ repository. A frozen schedule shows as an index that expires and a `pkg` that
 says so in one line; start the workflow by hand (`workflow_dispatch`) to sign
 again. The group `packages-pages` runs one job at a time and keeps one waiting
 run: when a run for a release was cancelled by a later one, press "Re-run" on it.
+Only tag runs of `release.yml` and `packages-update.yml` share the queue
+`release-pipeline`, which keeps one waiting run: when a tag run was cancelled by
+a later tag run, press "Re-run" on it. A manual run has a group of its own and
+cannot cancel a tag run.
 
 ## Before the owner has set anything up
 
