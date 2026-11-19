@@ -457,12 +457,15 @@ fn budgets(
     resource: &Handle<Resource>,
 ) -> Result<(), Error> {
     let place = table::table().iter().position(|r| r.name == record.name);
-    for (index, b) in record
-        .budgets
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| cpus >> b.cpu & 1 != 0)
-    {
+    for (index, b) in record.budgets.iter().enumerate() {
+        // The console driver's budget stands on the CPU its thread does (`table::budget_cpu`).
+        let b = &table::Budget {
+            cpu: table::budget_cpu(record.log, cpus, b.cpu),
+            ..*b
+        };
+        if cpus >> b.cpu & 1 == 0 {
+            continue;
+        }
         let budget = match place.filter(|_| overrun::reports(record.name)) {
             Some(place) => noticed(resource, overrun::label(place, index), b)?,
             None => sys::budget_create(resource, u32::from(b.cpu), b.c_ns, b.t_ns, b.low)?,

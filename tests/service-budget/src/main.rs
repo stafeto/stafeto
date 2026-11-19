@@ -724,6 +724,9 @@ fn main(_: u64) -> u64 {
 /// (`budget-hog`); the cost of one timer event is measured (`control_budget`).
 const C_US: [u64; 3] = [250, 75, 75];
 const B_K_US: u64 = 150;
+/// The budget of the console driver (`CONSOLE_BUDGETS` of init's table): 150 us of each 10 ms.
+const DRIVER_C_US: u64 = 150;
+const DRIVER_T_US: u64 = 10_000;
 /// The period T of the three budgets, microseconds.
 const T_US: u64 = 5_000;
 /// One round trip of a call (C_ipc, about 2 000 ticks; the comment above `CALL_WAIT_MAX` in
@@ -962,21 +965,31 @@ fn duty_windows() -> (u64, u64, u64) {
     (shares[0], shares[count / 2], n as u64)
 }
 
-/// The terms of one window of ten cycles of the victim, in microseconds (`worst_window`).
+/// The terms of one window of ten cycles of the victim, in microseconds (`worst_window`). The
+/// counters of the budgets are taken over the awake time of the victim (`serve_ran`,
+/// `serve_overruns`, `driver_ran`, `driver_overruns`: the sum over the cycles of what each
+/// cycle's two samples differ by), the same time the loss `W - R` is counted over; the `_l`
+/// fields are the differences over the whole length of the window, sleeps included (the bound of
+/// the gate is taken over `l`).
 struct Window {
     r: u64,
     w: u64,
     l: u64,
     serve_ran: u64,
     serve_overruns: u64,
+    serve_ran_l: u64,
+    serve_overruns_l: u64,
     pending_max: u64,
     driver_ran: u64,
     driver_overruns: u64,
+    driver_overruns_l: u64,
+    driver_ran_l: u64,
 }
 
 /// The window of ten consecutive cycles in which the victim kept the least share of its awake
 /// time (the first two cycles are the start of the threads), with what the two budgets did in it:
-/// from the start of its first cycle to the end of its tenth.
+/// over the awake spans of the ten cycles (`terms::awake_sum`) and over the whole window, from
+/// the start of its first cycle to the end of its tenth.
 fn worst_window() -> Option<Window> {
     let n = (CYCLES.load(Relaxed) as usize).min(CYC_RUN.len());
     let sums = |first: usize| {
@@ -1005,10 +1018,21 @@ fn worst_window() -> Option<Window> {
     let us = |t: u64| time::ticks_to_ns(t) / 1000;
     let start = &SAMPLE_START[first];
     let end = &SAMPLE_END[last];
+    // The difference over the whole window, sleeps included.
     let diff = |word: usize| {
         end[word]
             .load(Relaxed)
             .saturating_sub(start[word].load(Relaxed))
+    };
+    // The sum over the cycles of what the budget counted between the samples around the cycle:
+    // the victim's awake time only.
+    let awake = |word: usize| {
+        terms::awake_sum((first..=last).map(|c| {
+            (
+                SAMPLE_START[c][word].load(Relaxed),
+                SAMPLE_END[c][word].load(Relaxed),
+            )
+        }))
     };
     let pending_max = (first..=last)
         .flat_map(|c| [&SAMPLE_START[c][2], &SAMPLE_END[c][2]])
@@ -1019,11 +1043,15 @@ fn worst_window() -> Option<Window> {
         r: us(r),
         w: us(w),
         l: us(CYC_T1[last].load(Relaxed) - CYC_T0[first].load(Relaxed)),
-        serve_ran: us(diff(0)),
-        serve_overruns: diff(1),
+        serve_ran: us(awake(0)),
+        serve_overruns: awake(1),
+        serve_ran_l: us(diff(0)),
+        serve_overruns_l: diff(1),
         pending_max,
-        driver_ran: us(diff(3)),
-        driver_overruns: diff(4),
+        driver_ran: us(awake(3)),
+        driver_overruns: awake(4),
+        driver_overruns_l: diff(4),
+        driver_ran_l: us(diff(3)),
     })
 }
 
@@ -1133,20 +1161,45 @@ fn starve(
     let c = C_US[which];
     let loss = terms::loss_us(w.r, w.w);
     let service = terms::service_us(c, T_US, B_K_US, w.l);
-    let events = terms::events_us(e, w.serve_overruns);
-    let driver_term = if which == 2 { w.driver_ran } else { 0 };
-    let bound = terms::bound_us(service, events, INIT_PER_SERVICE_US, driver_term);
+    // The bound counts the events of the whole window, the account of the loss those of the
+    // awake spans.
+    let events = terms::events_us(e, w.serve_overruns_l);
+    // The console driver's part of the terminal's loss is bounded by its own budget, the bound
+    // of the kernel for the driver's C and T over the whole window.
+    let driver_term = if which == 2 {
+        terms::service_us(DRIVER_C_US, DRIVER_T_US, B_K_US, w.l)
+    } else {
+        0
+    };
+    // The timer events of the driver's own budget, by its overruns over the whole window: the
+    // stub spends about 5 % of the CPU against 1.5 %, so its budget runs out in every period.
+    let driver_events = if which == 2 {
+        terms::events_us(e, w.driver_overruns_l)
+    } else {
+        0
+    };
+    let bound = terms::bound_us(
+        service,
+        events,
+        INIT_PER_SERVICE_US,
+        driver_term,
+        driver_events,
+    );
     println!(
-        "svcbudget1 {name} worst R_us={} W_us={} l_us={} n={} loss_us={loss} serve_ran_us={} serve_overruns={} pending_max={} drv_ran_us={} drv_overruns={} beats=na c_us={c} e_us={e} s_us={service} events_us={events} entries_us={} init_us={INIT_PER_SERVICE_US} d_us={driver_term} bound_loss_us={bound} bound_share={} share={} x_us={}",
+        "svcbudget1 {name} worst R_us={} W_us={} l_us={} n={} loss_us={loss} serve_ran_us={} serve_overruns={} serve_ran_l_us={} serve_overruns_l={} pending_max={} drv_ran_us={} drv_overruns={} drv_overruns_l={} drv_ran_l_us={} beats=na c_us={c} e_us={e} s_us={service} events_us={events} entries_us={} init_us={INIT_PER_SERVICE_US} d_us={driver_term} events_d_us={driver_events} bound_loss_us={bound} bound_share={} share={} x_us={}",
         w.r,
         w.w,
         w.l,
         w.l / T_US,
         w.serve_ran,
         w.serve_overruns,
+        w.serve_ran_l,
+        w.serve_overruns_l,
         w.pending_max,
         w.driver_ran,
         w.driver_overruns,
+        w.driver_overruns_l,
+        w.driver_ran_l,
         terms::ENTRIES_US,
         terms::share_bound_permille(w.r, bound),
         w.r * 1000 / w.w.max(1),

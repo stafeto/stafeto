@@ -170,13 +170,30 @@ mod own_step {
     }
 }
 
-/// The time between two steps of the audit. The audit runs on a timer
-/// between them, so that the clients below the service keep their time while
-/// it goes round: a turn after turn of the whole round held them back for as
-/// long as it took.
+/// The time between two steps of the audit. The audit runs on a timer between its steps, so
+/// that the clients below the service keep their time while it goes round: a turn after turn of
+/// the whole round held them back for as long as it took.
+///
+/// A step costs a fixed part of about 7 000 ticks under -icount (the notification, the pump of
+/// the layers, the turn of the jobs, the cleanup of the one place the skip stopped at, and the
+/// count of the step tables) and 10 to 15 ticks for each empty place it passes. The fixed part
+/// dominates, so a round of about 7 steps in two periods of the service's budget is cheaper than
+/// the 16 to 21 steps that a shorter run of empty places would make, each with the fixed part.
+/// A shorter step and a longer gap between steps both measured worse under load.
 const AUDIT_STEP_NS: u64 = 1_000_000;
-/// The slots with no session and no birth that one step of the audit passes.
-const AUDIT_EMPTY_RUN: usize = 160;
+/// The time between two steps of a round over few places (`AUDIT_FEW_PLACES` or fewer named by
+/// the map): the period of the service's budget (`SERVICE_PERIOD_NS` in the table of init, 5 ms).
+/// The steps of such a round cost about 50 us each, and four of them 1 ms apart sum to about
+/// 200 us of the 250 us capacity in one period; a step a period keeps each in a period of its
+/// own, and a round of 16 places takes under 100 ms.
+const AUDIT_SPARSE_STEP_NS: u64 = 5_000_000;
+/// The time from the opening of a round to its first step: the period of the service's budget
+/// (`SERVICE_PERIOD_NS` in the table of init, 5 ms; this crate does not see that constant) and
+/// 1 ms more. A round opens in the turn after the answer of init to the heartbeat, and the work
+/// of the heartbeat's chain (about 120 us) and the first step (about 125 us) together came to
+/// nearly the whole 250 us capacity of one period and overran it. A period later the pieces
+/// the chain spent are replenished, and the step finds a full budget.
+const AUDIT_FIRST_NS: u64 = 6_000_000;
 /// The share of its time that the service gives to the maintenance of locks
 /// (the sweep of the table and the evaluation of waits): at most a quarter of
 /// every window. Beyond it the service sleeps to the end of the window and
@@ -410,13 +427,14 @@ fn main(_: u64) -> u64 {
     // The loop is this thread: it works under its budget from here on, and a budget the kernel
     // refuses is a start error, since the thread would run without a limit.
     match rt::budget::bind("ramfs", "serve", serve, &start.thread) {
-        // The handle stays, for the counters the profile prints (`calls`).
+        // The handle stays, for the counters the profile prints (`calls`) and the span of an
+        // audit round that the steps line tells.
         Ok(budget) => {
-            #[cfg(feature = "profile")]
+            #[cfg(any(feature = "profile", feature = "audit-readout"))]
             if let Some(budget) = budget {
-                calls::keep_budget(budget);
+                kept_budget::keep(budget);
             }
-            #[cfg(not(feature = "profile"))]
+            #[cfg(not(any(feature = "profile", feature = "audit-readout")))]
             drop(budget);
         }
         Err(_) => return 10,
@@ -442,7 +460,11 @@ fn main(_: u64) -> u64 {
         _audit_view: audit_view,
         audit_ready_ns: 0,
         audit_armed: false,
+        audit_step_ns: AUDIT_STEP_NS,
+        occupied: ramfs::maintenance::Occupancy::new(),
         audit_rounds: 0,
+        #[cfg(feature = "audit-readout")]
+        audit_span: AuditSpan::default(),
         lock_share: ramfs::maintenance::Share::new(LOCK_WINDOW_NS, LOCK_BUDGET_NS),
         lock_paused: false,
         lock_sweep: SweepCursor::default(),
@@ -519,6 +541,95 @@ fn main(_: u64) -> u64 {
 /// The calls the service answered (feature `profile`): every request, the reads among them
 /// (READ, READ_AT, READ_FD_INTO, READ_AT_FD_INTO) and SNAPSHOT_FD. A record goes to the console at
 /// most every 100 ms and only when a counter changed, so an idle service prints nothing.
+/// The handle of the request thread's budget, kept for the records of the profile and of the
+/// audit readout.
+#[cfg(any(feature = "profile", feature = "audit-readout"))]
+mod kept_budget {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// The value of the handle, 0 for none.
+    static BUDGET: AtomicU64 = AtomicU64::new(0);
+
+    pub fn keep(budget: rt::Handle<rt::handle::Budget>) {
+        BUDGET.store(budget.into_raw().0, Ordering::Relaxed);
+    }
+
+    /// The counters of the budget: the time its thread ran under it and the times it ran out,
+    /// both since the start.
+    /// The time in ticks and the overruns, zero when the budget is not kept.
+    #[cfg(feature = "audit-readout")]
+    pub fn counters() -> (u64, u64) {
+        info().map_or((0, 0), |i| (i.ran, i.overruns))
+    }
+
+    pub fn info() -> Option<rt::abi::BudgetInfo> {
+        match BUDGET.load(Ordering::Relaxed) {
+            0 => None,
+            raw => {
+                let budget = rt::Handle::<rt::handle::Budget>::borrowed(rt::abi::Handle(raw));
+                rt::sys::budget_info(&budget).ok()
+            }
+        }
+    }
+}
+
+/// What the line that closes a round of the audit tells: the state at its opening, the state at
+/// the close of the round before it (for the gap between the two), and the longest parts of the
+/// steps of the round.
+#[cfg(feature = "audit-readout")]
+#[derive(Default)]
+struct AuditSpan {
+    began_ns: u64,
+    ran_ticks: u64,
+    overruns: u64,
+    steps: u32,
+    /// The close of the round before: the time, the budget's `ran` and `overruns`.
+    closed_ns: u64,
+    closed_ran_ticks: u64,
+    closed_overruns: u64,
+    /// The gap from that close to this opening: the span, and the budget's `ran` (ticks) and
+    /// `overruns` over it.
+    gap_ns: u64,
+    gap_ran_ticks: u64,
+    gap_overruns: u64,
+}
+
+#[cfg(feature = "audit-readout")]
+impl AuditSpan {
+    fn open(&mut self, now: u64) {
+        let (ran_ticks, overruns) = kept_budget::counters();
+        *self = Self {
+            began_ns: now,
+            ran_ticks,
+            overruns,
+            gap_ns: now.saturating_sub(self.closed_ns),
+            gap_ran_ticks: ran_ticks.saturating_sub(self.closed_ran_ticks),
+            gap_overruns: overruns.saturating_sub(self.closed_overruns),
+            closed_ns: self.closed_ns,
+            closed_ran_ticks: self.closed_ran_ticks,
+            closed_overruns: self.closed_overruns,
+            ..Self::default()
+        };
+    }
+
+    fn close(&mut self, round: u32, now: u64) {
+        let (ran_ticks, overruns) = kept_budget::counters();
+        rt::println!(
+            "ramfs: audit round {round} steps {} span_us {} ran_us {} overruns {} gap_us {} gap_ran_us {} gap_overruns {}",
+            self.steps,
+            now.saturating_sub(self.began_ns) / 1000,
+            rt::time::ticks_to_ns(ran_ticks.saturating_sub(self.ran_ticks)) / 1000,
+            overruns.saturating_sub(self.overruns),
+            self.gap_ns / 1000,
+            rt::time::ticks_to_ns(self.gap_ran_ticks) / 1000,
+            self.gap_overruns,
+        );
+        self.closed_ns = now;
+        self.closed_ran_ticks = ran_ticks;
+        self.closed_overruns = overruns;
+    }
+}
+
 #[cfg(feature = "profile")]
 mod calls {
     use core::sync::atomic::{AtomicU64, Ordering};
@@ -530,15 +641,6 @@ mod calls {
     static PRINTED: AtomicU64 = AtomicU64::new(0);
     static NEXT: AtomicU64 = AtomicU64::new(0);
     static ID: AtomicU64 = AtomicU64::new(0);
-    /// The budget of the request thread (the value of its handle, 0 for none), whose time and
-    /// exhaustions the record tells.
-    static BUDGET: AtomicU64 = AtomicU64::new(0);
-
-    /// Keeps the handle of the request thread's budget for the records.
-    pub fn keep_budget(budget: rt::Handle<rt::handle::Budget>) {
-        BUDGET.store(budget.into_raw().0, Ordering::Relaxed);
-    }
-
     pub fn count(method: u16) {
         CALLS.fetch_add(1, Ordering::Relaxed);
         match Method::from_number(method) {
@@ -576,15 +678,9 @@ mod calls {
         let id = ID.fetch_add(1, Ordering::Relaxed) + 1;
         // The time the request thread ran under its budget and the times the budget ran out, since
         // the start.
-        let (ran_us, overruns) = match BUDGET.load(Ordering::Relaxed) {
-            0 => (0, 0),
-            raw => {
-                let budget = rt::Handle::<rt::handle::Budget>::borrowed(rt::abi::Handle(raw));
-                rt::sys::budget_info(&budget).map_or((0, 0), |i| {
-                    (rt::time::ticks_to_ns(i.ran) / 1000, i.overruns)
-                })
-            }
-        };
+        let (ran_us, overruns) = crate::kept_budget::info().map_or((0, 0), |i| {
+            (rt::time::ticks_to_ns(i.ran) / 1000, i.overruns)
+        });
         rt::println!(
             "ramfs: prof {id} calls {calls} reads {} snaps {} budget_ran_us {ran_us} budget_overruns {overruns}",
             READS.load(Ordering::Relaxed),
@@ -633,8 +729,17 @@ struct Fs {
     audit_ready_ns: u64,
     /// Whether the audit waits for its timer.
     audit_armed: bool,
+    /// The time between the steps of the open round.
+    audit_step_ns: u64,
+    /// The places that may hold a session, a birth or a departure (sessions first, then births):
+    /// the audit passes the others by this map. A bit is set when a place is given out and
+    /// cleared only where the service frees the place itself.
+    occupied: ramfs::maintenance::Occupancy<{ (SESSIONS + BIRTHS).div_ceil(64) }>,
     /// The rounds of the audit that ended.
     audit_rounds: u32,
+    /// The round of the audit that is open, as the steps line tells it.
+    #[cfg(feature = "audit-readout")]
+    audit_span: AuditSpan,
     lock_share: ramfs::maintenance::Share,
     lock_paused: bool,
     lock_sweep: SweepCursor,
@@ -1369,6 +1474,7 @@ impl Fs {
             return Err(code);
         }
         let identity = child.authority_index;
+        self.occupied.set(SESSIONS + Self::birth_index(label));
         self.births[Self::birth_index(label)] = Some((label, child));
         fds.image_outcome = Some(ramfs::image::ImageOutcome {
             job,
@@ -2265,6 +2371,7 @@ impl Fs {
                     self.ram.release(&mut child);
                     return Answer::Status(Status::BadSize);
                 }
+                self.occupied.set(SESSIONS + Self::birth_index(label));
                 self.births[Self::birth_index(label)] = Some((label, child));
                 let adopted = self.clones.adopt(label, r.label());
                 debug_assert!(adopted.is_ok(), "the place of a new label is free");
@@ -2314,6 +2421,7 @@ impl Fs {
         };
         let (_, mut child) = self.births[i].take().expect("a birth the caller made");
         let result = self.ram.clone_more_fds(fds, &list[..count], &mut child);
+        self.occupied.set(SESSIONS + i);
         self.births[i] = Some((label, child));
         match result {
             Ok(()) => Answer::Status(Status::Ok),
@@ -2432,7 +2540,10 @@ impl Service<0> for Fs {
 
     /// Genuine ordinary and image labels each name their exact retained slot.
     fn place(&self, label: u64) -> Option<usize> {
-        Some(self.places.place(label))
+        let place = self.places.place(label);
+        // The session goes into its place after this call: the bit comes first.
+        self.occupied.set(place);
+        Some(place)
     }
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
@@ -4006,7 +4117,20 @@ impl Fs {
         }
         if now >= self.next_audit_ns && self.maintenance.remaining == 0 {
             self.next_audit_ns = now.saturating_add(250_000_000);
-            self.maintenance.remaining = SESSIONS + BIRTHS - 1;
+            // The first step waits for its timer, a period after the heartbeat's work.
+            self.audit_ready_ns = self
+                .maintenance
+                .open(now, AUDIT_FIRST_NS, SESSIONS + BIRTHS);
+            self.audit_armed = false;
+            self.audit_step_ns = if self.occupied.count() <= ramfs::maintenance::AUDIT_FEW_PLACES {
+                AUDIT_SPARSE_STEP_NS
+            } else {
+                AUDIT_STEP_NS
+            };
+            #[cfg(feature = "audit-readout")]
+            {
+                self.audit_span.open(now);
+            }
         }
         let mut work = false;
         self.maintenance_jobs = !self.maintenance_jobs;
@@ -4074,6 +4198,8 @@ impl Fs {
                 } else {
                     self.births[i - SESSIONS] = None;
                 }
+                // The service frees the place itself: the bit goes with it.
+                self.occupied.clear(i);
                 // The place of the label goes back after its last departure.
                 ramfs::maintenance::departure_finished(self.places, &mut self.departures, i, label);
                 self.clones.gone(label);
@@ -4108,15 +4234,27 @@ impl Fs {
             self.lock_turn(sessions);
             return;
         }
-        // The slots with no session and no birth pass in this step.
+        self.audit_ready_ns = now.saturating_add(self.audit_step_ns);
+        rt::service::step_detail(own_step::AUDIT);
+        // The step passes the empty places by the map of occupied places, then visits the one
+        // place it stops at, as it did before the map.
+        let round_open = self.maintenance.remaining != 0;
         let departures = &self.departures;
         let births = &*self.births;
-        self.maintenance
-            .skip_empty(SESSIONS + BIRTHS, AUDIT_EMPTY_RUN, |i| {
-                Self::slot_empty(departures, births, sessions, i)
-            });
-        self.audit_ready_ns = now.saturating_add(AUDIT_STEP_NS);
-        rt::service::step_detail(own_step::AUDIT);
+        self.maintenance.skip_unoccupied(
+            SESSIONS + BIRTHS,
+            &self.occupied,
+            ramfs::maintenance::AUDIT_STALE_RUN,
+            |i| {
+                if departures.contains(i) {
+                    ramfs::maintenance::Place::Departing
+                } else if Self::slot_empty(departures, births, sessions, i) {
+                    ramfs::maintenance::Place::Vacant
+                } else {
+                    ramfs::maintenance::Place::InUse
+                }
+            },
+        );
         let mut client_work = false;
         let i = self.maintenance.position;
         if self.departures.contains(i) {
@@ -4130,12 +4268,18 @@ impl Fs {
             client_work = self.cleanup_step(&mut fds, label);
             self.births[i - SESSIONS] = Some((label, fds));
         }
-        work |= client_work;
-        let round_open = self.maintenance.remaining != 0;
         self.maintenance.complete(client_work, SESSIONS + BIRTHS);
+        work |= client_work;
+        #[cfg(feature = "audit-readout")]
+        if round_open {
+            self.audit_span.steps += 1;
+        }
         if round_open && self.maintenance.remaining == 0 {
             self.audit_rounds = self.audit_rounds.wrapping_add(1);
-            #[cfg(feature = "steps")]
+            #[cfg(feature = "audit-readout")]
+            self.audit_span
+                .close(self.audit_rounds, rt::time::ticks_to_ns(rt::time::now()));
+            #[cfg(all(feature = "steps", not(feature = "audit-readout")))]
             rt::println!("ramfs: audit round {}", self.audit_rounds);
         }
         // A maintenance notification makes reclamation progress with no client request.
@@ -4631,6 +4775,7 @@ impl Fs {
                 .ok_or(proto_fs::PERMISSION)
                 .and_then(|identity| self.install_identity(&mut child, label, identity, false))
         };
+        self.occupied.set(SESSIONS + i);
         self.births[i] = Some((label, child));
         if let Err(code) = installed {
             return status(code);
@@ -4743,6 +4888,7 @@ impl Fs {
         binding.offered = offered;
         binding.pending = true;
         binding.require = require;
+        self.occupied.set(SESSIONS + Self::birth_index(label));
         self.births[Self::birth_index(label)] = Some((label, child));
         let adopted = self.clones.adopt_within(label, r.label(), CLONES);
         debug_assert!(adopted.is_ok(), "the place of a new label is free");
