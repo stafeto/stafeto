@@ -154,13 +154,13 @@ fn file(session: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
         Ok(_) | Err(Status::Unknown(d::EXISTS)) => {}
         Err(_) => return Err("mkdir"),
     }
-    match call(session, |w| d::open(b"/stop/f", d::READ, w)) {
+    match call(session, |w| d::open_v2(b"/stop/f", d::READ, w)) {
         Ok((reply, _)) => return verify(session, word(&reply, 0)),
         Err(Status::Unknown(d::NO_ENTRY)) => {}
         Err(_) => return Err("open for reading"),
     }
     let (reply, _) = call(session, |w| {
-        d::open(b"/stop/f", d::WRITE | d::CREATE | d::TRUNCATE, w)
+        d::open_v2(b"/stop/f", d::WRITE | d::CREATE | d::TRUNCATE, w)
     })
     .map_err(|_| "open for writing")?;
     let handle = word(&reply, 0);

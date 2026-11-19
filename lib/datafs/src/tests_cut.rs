@@ -44,7 +44,10 @@ impl Rig<'_> {
     }
 
     fn open(&mut self, owner: u64, path: &[u8], flags: u32) -> u32 {
-        word(&self.call(owner, |w| p::open(path, flags, w)).unwrap(), 0)
+        word(
+            &self.call(owner, |w| p::open_v2(path, flags, w)).unwrap(),
+            0,
+        )
     }
 
     /// A file made, written whole and synced, through the protocol; the description stays open.
