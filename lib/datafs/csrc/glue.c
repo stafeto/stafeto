@@ -131,8 +131,11 @@ void datafs_setup(struct datafs *d, uint32_t blocks)
     d->cfg.cache_size = BLOCK;
     // No data inside a pair of metadata: a file of any size has a block of its own. A file of up to
     // 500 bytes or so lived in the pair of its directory, which made a directory of 1,024 small
-    // files 513 pairs and a removal in it walk the list of pairs. A volume of an older release that
-    // has such a file reads it as before; the first write moves it out to a block.
+    // files 513 pairs and a removal in it walk the list of pairs. A volume of an older release (or
+    // of a build with inline data on) that has such a file reads it as before, but a write at its
+    // start or in its middle is lost with LFS_ERR_CORRUPT: only an append, O_TRUNC or a truncation
+    // moves it out safely. The mount work therefore moves every inline file out (`datafs_outline`)
+    // before the first request and marks the volume (the format mark 4).
     d->cfg.inline_max = (lfs_size_t)-1;
     // One bit for each block, a multiple of 8 bytes, at least 8 and at most LOOKAHEAD_MAX.
     uint32_t window = ((blocks + 63u) / 64u) * 8u;
@@ -265,6 +268,46 @@ int datafs_pairs(struct datafs *d, void *ctx, uint32_t *out)
         out[1] = dirs;
     }
     return err;
+}
+
+// Whether the file at `path` is inline (its bytes are in the pair of its directory) and not empty,
+// and with `dry` zero it is moved out to blocks of its own: 1 for such a file, 0 for any other, or a
+// negative error. A write at the start or in the middle of an inline file fails at close with
+// LFS_ERR_CORRUPT when inline data is off (littlefs 2.11.3 copies only the bytes before the write
+// when it moves the file out), so a volume made with inline data on is made safe first: open the
+// file for writing, seek to its end and write no byte, which moves the whole file out in one commit
+// (the old file or the moved one is there after a cut). A file already in a block is not touched.
+int datafs_outline(struct datafs *d, void *ctx, const char *path, int dry)
+{
+    d->ctx = ctx;
+    int slot = -1;
+    for (int i = 0; i < DATAFS_FILES; i++) {
+        if (!d->file_used[i]) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        return LFS_ERR_NOMEM;
+    }
+    int err = lfs_file_opencfg(&d->lfs, &d->file[slot], path, dry ? LFS_O_RDONLY : LFS_O_RDWR,
+                               &d->file_cfg[slot]);
+    if (err < 0) {
+        return err;
+    }
+    int result = 0;
+    if ((d->file[slot].flags & LFS_F_INLINE) && lfs_file_size(&d->lfs, &d->file[slot]) > 0) {
+        result = 1;
+        if (!dry) {
+            lfs_soff_t at = lfs_file_seek(&d->lfs, &d->file[slot], 0, LFS_SEEK_END);
+            lfs_ssize_t wrote = at < 0 ? at : lfs_file_write(&d->lfs, &d->file[slot], "", 0);
+            if (wrote < 0) {
+                result = (int)wrote;
+            }
+        }
+    }
+    int closed = lfs_file_close(&d->lfs, &d->file[slot]);
+    return result >= 0 && closed < 0 ? closed : result;
 }
 
 // A file: the slot, or a negative error (LFS_ERR_NOMEM when every slot is open).

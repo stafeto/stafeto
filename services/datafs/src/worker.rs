@@ -545,9 +545,10 @@ fn mount_work(volume: &mut Option<Volume>, clock: &mut Clock) {
                     "datafs: the volume's format is newer than this service's: left alone and refused"
                 )
             }
-            Ok(done) if done.converted > 0 || !done.complete => rt::println!(
-                "datafs: {} entries got attributes{}",
+            Ok(done) if done.converted > 0 || done.moved > 0 || !done.complete => rt::println!(
+                "datafs: {} entries got attributes, {} inline files moved out{}",
                 done.converted,
+                done.moved,
                 if done.complete {
                     ""
                 } else {
@@ -742,6 +743,11 @@ fn longest_job(request: &[u8], began: u64) {
 fn tell_pairs() {
     // SAFETY: the server is the worker's alone.
     let server: &mut Server = unsafe { &mut *SERVER.get() };
+    if let Some((tracked, counted)) = server.take_dirs_mismatch() {
+        rt::println!(
+            "datafs: the recount found {counted} directories where the service had followed {tracked}"
+        );
+    }
     if let Some((pairs, dirs)) = server.take_pairs_report() {
         rt::println!(
             "datafs: pairs {pairs} of {}, directories {dirs} of {}",

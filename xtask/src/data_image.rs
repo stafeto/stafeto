@@ -273,6 +273,13 @@ pub fn make_v051(path: &Path, size: u64, key: &[u8]) -> Result<(), String> {
     let mut state = Box::new(Storage::new());
     let (mut fs, _, _) = volume::open(FileDevice::open(path)?, &mut state, SEED)
         .map_err(|r| format!("{}: datafs refused the file: {}", path.display(), r.text()))?;
+    // The 0.5.1 service had littlefs's default: a small file lives inside the pair of its directory,
+    // as the host key does on a volume that release made.
+    fs.unmount()
+        .map_err(|e| format!("{}: unmount: {e:?}", path.display()))?;
+    fs.set_inline_max(0);
+    fs.mount()
+        .map_err(|e| format!("{}: mount: {e:?}", path.display()))?;
     fs.mkdir(b"/ssh")
         .map_err(|e| format!("/ssh: mkdir {e:?}"))?;
     let flags = datafs::Open::WRITE.with(datafs::Open::CREATE);
@@ -431,6 +438,9 @@ mod tests {
         assert_eq!(fs.read(file, &mut back).unwrap(), 120);
         assert_eq!(back[..120], key);
         fs.close(file).unwrap();
+        // The key is inline (inside the pair of /ssh), as the 0.5.1 service left it: the move-out of
+        // the mount work has to find it.
+        assert_eq!(fs.outline(KEY_PATH.as_bytes(), true), Ok(true));
         for entry in [&b"/"[..], b"/ssh", KEY_PATH.as_bytes()] {
             for kind in [0x70u8, 0x66, 0x69] {
                 let mut out = [0u8; 64];

@@ -217,7 +217,8 @@
 //! 12. **Defaults.** A new volume has the root `0755`, user 0, group 0, and the hidden directory
 //!     `0700`. An entry with no attribute (a volume of version 2) reads as `0700` for a directory
 //!     and `0600` for a file, owned by user 0, group 0, and the root as `0755`; the first mount of
-//!     version 3 writes the attribute of every such entry and then the format mark at the root.
+//!     version 3 writes the attribute of every such entry, moves out every inline file (see the
+//!     downgrade section) and then the format mark 4 at the root.
 //! 13. **Limits of a write.** A WRITE or PWRITE stops short at a limit: it writes up to the file
 //!     size limit of the bound identity (and `FILE_MAX`) or up to the last free block the caller
 //!     may use, and answers that count. FILE_SIZE_LIMIT, TOO_BIG or NO_SPACE comes only when no
@@ -256,6 +257,21 @@
 //! does not know is never rewritten: the entry reads as the default of rule 12, and a request that
 //! would write its attribute (CHMOD, CHOWN, UTIMENS, the time of a write) answers CORRUPT.
 //!
+//! The format mark is 4 (`VOLUME_FORMAT`) when every entry has its record and no file is inline
+//! (its bytes inside the pair of its directory). A volume of the part A build has the mark 3 and
+//! small files written since are inline; a volume of the 0.5 release has neither. littlefs 2.11.3
+//! loses a write at the start or in the middle of an inline file (the close answers CORRUPT, the old
+//! bytes stay) once inline data is off, which the service keeps it, so the mount work of a volume
+//! with a mark under 4 moves out every non-empty inline file (open for writing, seek to the end,
+//! write no byte: one commit, the old file or the moved one after a cut) in the walk that gives the
+//! records, then writes the mark 4. The walk costs about 27 reads for each file and about 62 more for
+//! each file it moves, and holds READY for as long as it takes: a volume of many small files made by
+//! the part A build or the 0.5 release is converted at its first mount before the first request (at
+//! most `CONVERT_MAX` writes in one run; the next mount goes on). A service that writes the mark 3
+//! refuses a volume with the mark 4 (NOT_READY), which keeps a build that makes inline files from
+//! writing on a volume that has none. Every file takes a block of its own, and moving a file out takes
+//! one: on a nearly full volume that is NO_SPACE for the caller who is not user 0.
+//!
 //! # The size of a directory
 //!
 //! A directory has at most `DIR_ENTRIES_MAX` entries (1024), a minimum the service guarantees; the
@@ -267,7 +283,8 @@
 //! few directories, and follows it with each name it adds or removes; a rename, a removal of the
 //! directory or a change of its attributes drops what it kept. A restart starts with no counts.
 //!
-//! A volume holds at most `PAIRS_MAX` (2,048) metadata pairs and `DIRS_MAX` (1,024) directories. A
+//! A volume holds at most `PAIRS_MAX` (2,048) metadata pairs and `DIRS_MAX` (1,024) directories (the
+//! root and the hidden directory of the service among them). A
 //! directory is one pair and a large directory splits into more; a file has a block of its own
 //! (the data never goes inside a pair), so many files make pairs only through their names (about 16
 //! names of 8 bytes, 11 of 32 and 3 of 255 bytes to a pair, with the record of each). Removing a
@@ -279,7 +296,11 @@
 //! counts pairs and directories exactly at the mount, at each refresh walk and before it first
 //! refuses (one fetch of each pair, about two reads for each: 6,000 reads at the cap), and keeps an
 //! estimate of the pairs between counts: the count plus 2 for each MKDIR, 1 for each creation, 1 for
-//! each RENAME into another directory and 1 for each RENAME that lengthens the name. A refusal is
+//! each RENAME into another directory and 1 for each RENAME that lengthens the name. The estimate can
+//! fall short by 0 or 1 (a first write into an empty file grows the pair by 8 bytes; a same-size
+//! CHMOD can compact and split a pair that was over half a block), so the count can pass 2,048 by that
+//! much until the next refresh walk. Near the cap a creation whose estimate has reached it counts the
+//! pairs inside its own job (4,000 to 6,000 reads: 1.5 to 2 s on gp3). A refusal is
 //! made only on an exact count; after a confirmed refusal the service does not count again until
 //! the first removal. The directories are counted exactly and followed: 1 for each MKDIR and RMDIR.
 //! The line `datafs: pairs N of 2048, directories M of 1024` tells each count. A volume that holds

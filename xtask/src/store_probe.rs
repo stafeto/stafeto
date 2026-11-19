@@ -1929,6 +1929,17 @@ fn nvme_upgrade(run: &dyn Fn() -> Result<Vec<String>, String>) -> Result<(), Str
                     .collect::<Vec<_>>()
             ));
         }
+        // The key is an inline file the 0.5.1 service made: the mount work moved it out, so that a
+        // write at its start and in its middle is kept (littlefs 2.11.3 loses it otherwise).
+        if !said(lines, "datakey: key rewritten in place and read back") {
+            return Err(format!(
+                "{name}, {boot} boot: the key was not rewritten in place and read back: {:?}",
+                lines
+                    .iter()
+                    .filter(|l| l.contains("datakey: "))
+                    .collect::<Vec<_>>()
+            ));
+        }
         let fingerprint = key_fingerprint(lines)?;
         if fingerprint != wanted {
             return Err(format!(

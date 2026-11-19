@@ -410,6 +410,86 @@ mod attributes {
         fs.into_device()
     }
 
+    /// A volume a build with inline data on left: small files inside the pairs of their directories.
+    fn inline_volume() -> MemDevice {
+        let mut state = Storage::new();
+        let mut fs = Fs::new(MemDevice::new(SECTORS), &mut state).unwrap();
+        fs.set_inline_max(0);
+        fs.format().unwrap();
+        fs.mount().unwrap();
+        fs.mkdir(b"/ssh").unwrap();
+        for (path, data) in INLINE_FILES {
+            let f = fs.open(path, Open::WRITE.with(Open::CREATE)).unwrap();
+            fs.write(f, data).unwrap();
+            fs.close(f).unwrap();
+        }
+        fs.unmount().unwrap();
+        fs.into_device()
+    }
+
+    const INLINE_FILES: [(&[u8], &[u8]); 3] = [
+        (b"/ssh/host_key", b"0123456789abcdef0123456789abcdef"),
+        (b"/note", b"a short note"),
+        (b"/empty", b""),
+    ];
+
+    /// The bytes of the file at `path`, read from the volume directly.
+    fn bytes_of(fs: &mut Fs<'_, MemDevice>, path: &[u8]) -> Vec<u8> {
+        let f = fs.open(path, Open::READ).unwrap();
+        let mut out = vec![0u8; 64];
+        let n = fs.read(f, &mut out).unwrap();
+        fs.close(f).unwrap();
+        out.truncate(n);
+        out
+    }
+
+    #[test]
+    fn a_cut_at_every_sector_of_the_move_out_of_inline_files_leaves_the_old_file_or_the_moved_one()
+    {
+        // The sectors of the whole mount work, uncut.
+        let mut state = Storage::new();
+        let mut fs = Fs::new(inline_volume(), &mut state).unwrap();
+        fs.mount().unwrap();
+        let mut server = server::Server::new();
+        let before = fs.device().written;
+        let report = server.mount_work(&mut fs).unwrap();
+        assert!(report.complete && report.moved == 2, "{report:?}");
+        let sectors = fs.device().written - before;
+        assert!(sectors >= 4, "{sectors} sectors");
+        for cut in 0..=sectors {
+            for survive in SURVIVE {
+                let mut state = Storage::new();
+                let mut fs = Fs::new(inline_volume(), &mut state).unwrap();
+                fs.mount().unwrap();
+                let mut server = server::Server::new();
+                fs.device().cut_after(Some(cut));
+                let _ = server.mount_work(&mut fs);
+                let mut device = fs.into_device();
+                device.power_cycle(survive);
+                // The volume mounts, and every file is whole: the old bytes, moved or not.
+                let mut state = Storage::new();
+                let mut fs = Fs::new(device, &mut state).unwrap();
+                fs.mount().unwrap();
+                for (path, data) in INLINE_FILES {
+                    assert_eq!(bytes_of(&mut fs, path), data, "cut {cut} {path:?}");
+                }
+                // The next start finishes the work, and a write in the middle of the old key works.
+                let mut server = server::Server::new();
+                let done = server.mount_work(&mut fs).unwrap();
+                assert!(done.complete, "cut {cut}: {done:?}");
+                let f = fs.open(b"/ssh/host_key", Open::READ_WRITE).unwrap();
+                fs.seek(f, 8, crate::fs::Whence::Set).unwrap();
+                fs.write(f, b"NEW!").unwrap();
+                fs.close(f).unwrap();
+                assert_eq!(
+                    bytes_of(&mut fs, b"/ssh/host_key"),
+                    b"01234567NEW!cdef0123456789abcdef".to_vec(),
+                    "cut {cut}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_cut_in_the_conversion_of_a_volume_of_version_2_starts_again_and_ends() {
         let paths: [&[u8]; 8] = [
@@ -470,7 +550,7 @@ mod attributes {
                 rig.fs
                     .getattr(b"/", crate::attr::ATTR_FORMAT_TYPE, &mut mark)
                     .unwrap();
-                assert_eq!(u32::from_le_bytes(mark), 3);
+                assert_eq!(u32::from_le_bytes(mark), crate::attr::VOLUME_FORMAT);
                 assert_eq!(
                     rig.open(OWNER, b"/ssh/host_key", p::READ, 0),
                     Err(p::code(p::ACCESS))

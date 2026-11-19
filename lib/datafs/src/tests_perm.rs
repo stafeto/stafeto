@@ -1119,8 +1119,12 @@ fn a_volume_whose_format_is_above_this_one_is_refused_and_left_alone() {
     fs.format().unwrap();
     fs.mount().unwrap();
     fs.mkdir(b"/x").unwrap();
-    fs.setattr(b"/", ATTR_FORMAT_TYPE, &4u32.to_le_bytes())
-        .unwrap();
+    fs.setattr(
+        b"/",
+        ATTR_FORMAT_TYPE,
+        &(crate::attr::VOLUME_FORMAT + 1).to_le_bytes(),
+    )
+    .unwrap();
     let before = fs.device().medium().to_vec();
     let mut server = Server::new();
     let mounted = server.mount_work(&mut fs).unwrap();
@@ -2389,14 +2393,14 @@ fn a_volume_with_an_inline_file_reads_and_a_write_moves_the_file_out() {
     // A file made the way an older release made it (small, inside the pair of its directory).
     let mut rig = Rig::new();
     rig.fs.unmount().unwrap();
-    rig.fs.set_inline_for_test(0);
+    rig.fs.set_inline_max(0);
     rig.fs.mount().unwrap();
     rig.mkdir(ROOT, b"/d", 0o755).unwrap();
     rig.put(ROOT, b"/d/small", 0o644, b"inline bytes");
     let inline_blocks = rig.fs.used_blocks().unwrap();
     // The service of this release mounts the same volume with the inline limit off.
     rig.fs.unmount().unwrap();
-    rig.fs.set_inline_for_test(u32::MAX);
+    rig.fs.set_inline_max(u32::MAX);
     rig.fs.mount().unwrap();
     let h = rig.open(ROOT, b"/d/small", p::READ, 0).unwrap();
     let data = rig.ok(ROOT, |w| p::read(h, 64, w));
@@ -2408,7 +2412,7 @@ fn a_volume_with_an_inline_file_reads_and_a_write_moves_the_file_out() {
         .unwrap();
     rig.write(ROOT, h, b" and more").unwrap();
     rig.close(ROOT, h);
-    assert!(rig.fs.used_blocks().unwrap() >= inline_blocks + 1);
+    assert!(rig.fs.used_blocks().unwrap() > inline_blocks);
     let h = rig.open(ROOT, b"/d/small", p::READ, 0).unwrap();
     let data = rig.ok(ROOT, |w| p::read(h, 64, w));
     assert_eq!(&data[4..4 + 21], b"inline bytes and more");
@@ -2452,5 +2456,182 @@ fn rm_rf_of_1024_directories_behind_a_thousand_pairs_of_files() {
         "rm -rf of 1,010 directories (the volume has {dirs} directories in {pairs} pairs): {sum} reads, {:.2} a pair for each directory, {} s at 3,000 reads a second",
         sum as f64 / (1010.0 * pairs as f64),
         sum / 3000
+    );
+}
+
+/// A volume as the part A build left it: records everywhere, the mark of the records, small files
+/// inline (that build had inline data on).
+fn part_a_volume() -> MemDevice {
+    use crate::attr::{ATTR_FORMAT_TYPE, RECORDS_FORMAT};
+    let mut rig = Rig::new();
+    rig.fs.unmount().unwrap();
+    rig.fs.set_inline_max(0);
+    rig.fs.mount().unwrap();
+    rig.mkdir(ROOT, b"/ssh", 0o700).unwrap();
+    rig.put(
+        ROOT,
+        b"/ssh/host_key",
+        0o600,
+        b"0123456789abcdef0123456789abcdef",
+    );
+    rig.put(ROOT, b"/note", 0o644, b"a short note");
+    rig.fs
+        .setattr(b"/", ATTR_FORMAT_TYPE, &RECORDS_FORMAT.to_le_bytes())
+        .unwrap();
+    rig.fs.unmount().unwrap();
+    rig.fs.into_device()
+}
+
+#[test]
+fn a_write_at_the_start_or_in_the_middle_of_an_old_inline_file_after_the_mount_work_is_kept() {
+    let mut rig = Rig::on(part_a_volume());
+    // The mount work moved the two files out (the volume had the records already).
+    for (offset, text) in [(0u64, &b"NEW-"[..]), (10, b"middle")] {
+        let h = rig
+            .open(ROOT, b"/ssh/host_key", p::READ | p::WRITE, 0)
+            .unwrap();
+        rig.call(ROOT, |w| p::pwrite(h, offset, text, w)).unwrap();
+        rig.call(ROOT, |w| p::handle_call(p::Method::Fsync, h, w))
+            .unwrap();
+        rig.close(ROOT, h);
+    }
+    let h = rig.open(ROOT, b"/ssh/host_key", p::READ, 0).unwrap();
+    let data = rig.ok(ROOT, |w| p::read(h, 64, w));
+    assert_eq!(&data[4..4 + 32], b"NEW-456789middle0123456789abcdef");
+}
+
+#[test]
+fn the_mount_work_moves_the_inline_files_once_and_marks_the_volume() {
+    use crate::attr::{ATTR_FORMAT_TYPE, VOLUME_FORMAT};
+    let mut state = Storage::new();
+    let mut fs = Fs::new(part_a_volume(), &mut state).unwrap();
+    fs.mount().unwrap();
+    let mut server = Server::new();
+    let first = server.mount_work(&mut fs).unwrap();
+    assert_eq!((first.converted, first.moved, first.complete), (0, 2, true));
+    let mut mark = [0u8; 4];
+    fs.getattr(b"/", ATTR_FORMAT_TYPE, &mut mark).unwrap();
+    assert_eq!(u32::from_le_bytes(mark), VOLUME_FORMAT);
+    // The second mount reads the mark and walks nothing.
+    let reads = fs.device().reads;
+    let again = Server::new().mount_work(&mut fs).unwrap();
+    assert_eq!((again.converted, again.moved, again.complete), (0, 0, true));
+    assert!(
+        fs.device().reads - reads < 40,
+        "{} reads",
+        fs.device().reads - reads
+    );
+}
+
+#[test]
+fn without_the_move_out_a_write_in_the_middle_of_an_old_inline_file_is_lost() {
+    // What the mount work protects against (littlefs 2.11.3 with inline data off): the write fails at
+    // close with CORRUPT and the old data stays. If this test fails, littlefs no longer loses the
+    // write and the move-out is not needed for it.
+    let mut state = Storage::new();
+    let mut fs = Fs::new(part_a_volume(), &mut state).unwrap();
+    fs.mount().unwrap();
+    let f = fs.open(b"/ssh/host_key", crate::Open::READ_WRITE).unwrap();
+    fs.seek(f, 8, crate::fs::Whence::Set).unwrap();
+    fs.write(f, b"NEW!").unwrap();
+    assert!(
+        fs.close(f).is_err(),
+        "the write was kept: the move-out is not needed"
+    );
+}
+
+#[test]
+fn a_move_out_that_is_skipped_leaves_the_write_lost_which_the_test_of_the_mount_work_sees() {
+    // The planted fault: mount work with no move-out (the mark set, nothing moved) loses the write.
+    use crate::attr::{ATTR_FORMAT_TYPE, VOLUME_FORMAT};
+    let mut state = Storage::new();
+    let mut fs = Fs::new(part_a_volume(), &mut state).unwrap();
+    fs.mount().unwrap();
+    fs.setattr(b"/", ATTR_FORMAT_TYPE, &VOLUME_FORMAT.to_le_bytes())
+        .unwrap();
+    let mounted = Server::new().mount_work(&mut fs).unwrap();
+    assert_eq!(mounted.moved, 0);
+    let f = fs.open(b"/ssh/host_key", crate::Open::READ_WRITE).unwrap();
+    fs.seek(f, 8, crate::fs::Whence::Set).unwrap();
+    fs.write(f, b"NEW!").unwrap();
+    assert!(fs.close(f).is_err());
+}
+
+/// What the mount work costs on a volume of small inline files (part A's, with the mark of the
+/// records): reads for each file moved out, and for each file already in a block (the walk alone).
+#[test]
+#[ignore = "prints figures; run by name"]
+fn what_the_move_out_costs_at_the_mount() {
+    use crate::attr::{ATTR_FORMAT_TYPE, RECORDS_FORMAT};
+    for (inline, label) in [(true, "inline files"), (false, "files in blocks")] {
+        let mut rig = Rig::on(MemDevice::new(65_536));
+        rig.server.set_pairs_max(1_000_000);
+        rig.fs.unmount().unwrap();
+        rig.fs.set_inline_max(if inline { 0 } else { u32::MAX });
+        rig.fs.mount().unwrap();
+        for d in 0..6 {
+            rig.mkdir(ROOT, std::format!("/d{d}").as_bytes(), 0o755)
+                .unwrap();
+            for n in 0..100 {
+                rig.put(
+                    ROOT,
+                    std::format!("/d{d}/f{n:03}").as_bytes(),
+                    0o644,
+                    b"small file bytes",
+                );
+            }
+        }
+        rig.fs
+            .setattr(b"/", ATTR_FORMAT_TYPE, &RECORDS_FORMAT.to_le_bytes())
+            .unwrap();
+        rig.fs.unmount().unwrap();
+        rig.fs.set_inline_max(u32::MAX);
+        rig.fs.mount().unwrap();
+        let reads = rig.fs.device().reads;
+        let mounted = Server::new().mount_work(&mut rig.fs).unwrap();
+        let spent = rig.fs.device().reads - reads;
+        std::println!(
+            "{label}: 600 files in 6 directories, {} moved, {spent} reads for the mount work: {:.1} reads for each file",
+            mounted.moved,
+            spent as f64 / 600.0
+        );
+    }
+}
+
+#[test]
+fn a_mkdir_whose_record_could_not_be_written_leaves_the_directory_count_as_it_was() {
+    let mut rig = capped(1_000_000, 1_000_000);
+    rig.mkdir(ROOT, b"/a", 0o755).unwrap();
+    let before = rig.server.dirs_known().unwrap();
+    rig.server.fail_record = true;
+    assert!(rig.mkdir(ROOT, b"/b", 0o755).is_err());
+    rig.server.fail_record = false;
+    assert!(rig.stat(ROOT, b"/b").is_err(), "the name went again");
+    assert_eq!(
+        rig.server.dirs_known(),
+        Some(before),
+        "the rollback left a directory in the count"
+    );
+    assert_eq!(rig.fs.metadata_pairs().unwrap().1, before);
+}
+
+#[test]
+fn mkdir_near_the_cap_is_refused_only_after_a_recount_and_a_difference_is_told() {
+    let mut rig = capped(1_000_000, 12);
+    rig.mkdir(ROOT, b"/a", 0o755).unwrap();
+    let real = rig.server.dirs_known().unwrap();
+    // The service believes the volume is at the cap, which it is not (a change it did not see).
+    rig.server.set_dirs_tracked(12);
+    rig.server.take_pairs_report();
+    // The tracked count says full: the recount finds free places, MKDIR passes and the difference is told.
+    rig.mkdir(ROOT, b"/fits", 0o755).unwrap();
+    assert_eq!(rig.server.take_dirs_mismatch(), Some((12, real)));
+    // Fill the volume: the recount confirms the cap and refuses; a loop of refusals counts once.
+    mkdirs_until_refused(&mut rig, "/d");
+    assert!(rig.server.take_pairs_report().is_some());
+    assert_eq!(rig.mkdir(ROOT, b"/no2", 0o755), Err(no_space()));
+    assert!(
+        rig.server.take_pairs_report().is_none(),
+        "a confirmed refusal counted again"
     );
 }

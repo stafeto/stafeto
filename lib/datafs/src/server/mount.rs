@@ -6,6 +6,7 @@
 //! the format mark). Part of `server`, split out of it.
 
 use super::*;
+use crate::attr::RECORDS_FORMAT;
 
 /// What `recover_orphans` did.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -55,6 +56,8 @@ pub struct Mounted {
     pub refused: bool,
     /// Entries that got a record (a volume of version 2 has none).
     pub converted: usize,
+    /// Inline files moved out to blocks of their own (a volume made with inline data on).
+    pub moved: usize,
     /// The walk of the tree ended: the format mark was written. False when it was cut short by its
     /// bound (`CONVERT_MAX` records written); the next mount goes on. Entries deeper than
     /// `CONVERT_DEPTH` directories are left with no record (they read as the closed default, which is
@@ -62,17 +65,21 @@ pub struct Mounted {
     pub complete: bool,
 }
 
-/// The entries one run of the conversion looks at at most, and the depth it goes to.
+/// The entries one run of the conversion writes at most (a record or a move-out each), and the depth
+/// it goes to.
 pub const CONVERT_MAX: usize = 8192;
 const CONVERT_DEPTH: usize = 32;
 
 impl Server {
-    /// The work after the mount that gives the volume the attributes of version 3 (rule 12), after
-    /// `ensure_orphans` and `recover_orphans` and before the first request. A volume whose format
-    /// mark is above `VOLUME_FORMAT` is refused and left as it is. A volume with no mark, or an
-    /// older one, gets the record of every entry that has none (the closed default, a number from the
-    /// counter at the root), then the mark: a cut in between starts the walk again at the next mount,
-    /// and the entries done keep their records.
+    /// The work after the mount that gives the volume the records of version 3 (rule 12) and moves
+    /// the inline files out, after `ensure_orphans` and `recover_orphans` and before the first
+    /// request. A volume whose format mark is above `VOLUME_FORMAT` is refused and left as it is. A
+    /// volume with no mark or an older one gets the record of every entry that has none (the closed
+    /// default, a number from the counter at the root) and every inline file moved out; a volume with
+    /// the mark of the records (`RECORDS_FORMAT`) only the move-out; one with `VOLUME_FORMAT` nothing.
+    /// Then the mark: a cut in between starts the walk again at the next mount, and the entries done
+    /// are skipped at no write. The move-out is for the writes at the start or in the middle of an
+    /// old inline file, which are lost with CORRUPT in littlefs 2.11.3 once inline data is off.
     pub fn mount_work<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> Result<Mounted, Error> {
         let mut mark = [0u8; 4];
         let format = match fs.getattr(b"/", ATTR_FORMAT_TYPE, &mut mark) {
@@ -88,26 +95,23 @@ impl Server {
         for c in &mut self.counts {
             c.used = false;
         }
-        match format {
-            Some(f) if f > VOLUME_FORMAT => {
-                self.refused = true;
-                return Ok(Mounted {
-                    refused: true,
-                    converted: 0,
-                    complete: false,
-                });
-            }
-            Some(f) if f == VOLUME_FORMAT => {
-                self.count_at_mount(fs)?;
-                return Ok(Mounted {
-                    refused: false,
-                    converted: 0,
-                    complete: true,
-                });
-            }
-            _ => {}
+        if format.is_some_and(|f| f > VOLUME_FORMAT) {
+            self.refused = true;
+            return Ok(Mounted {
+                refused: true,
+                ..Mounted::default()
+            });
         }
-        let (converted, complete) = self.convert(fs)?;
+        let records = !format.is_some_and(|f| f >= RECORDS_FORMAT);
+        let inline = !format.is_some_and(|f| f >= VOLUME_FORMAT);
+        if !records && !inline {
+            self.count_at_mount(fs)?;
+            return Ok(Mounted {
+                complete: true,
+                ..Mounted::default()
+            });
+        }
+        let (converted, moved, complete) = self.convert(fs, records)?;
         if complete {
             fs.setattr(b"/", ATTR_FORMAT_TYPE, &VOLUME_FORMAT.to_le_bytes())?;
         }
@@ -115,6 +119,7 @@ impl Server {
         Ok(Mounted {
             refused: false,
             converted,
+            moved,
             complete,
         })
     }
@@ -129,16 +134,26 @@ impl Server {
             since: 0,
             dirs: Some(dirs),
             refused: false,
+            dirs_refused: false,
             report: Some((pairs, dirs)),
+            mismatch: None,
         };
         Ok(())
     }
 
-    /// Walks the tree and writes the record of every entry that has none. The root first.
-    fn convert<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> Result<(usize, bool), Error> {
+    /// Walks the tree, writes the record of every entry that has none (`records`) and moves out every
+    /// inline file. The root first. The records written and the files moved, and whether the walk
+    /// ended.
+    fn convert<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        records: bool,
+    ) -> Result<(usize, usize, bool), Error> {
         let mut converted = 0;
+        let mut moved = 0;
         // The root has number 1 and the default `0755`.
         if let Ok(root) = entry_of(fs, b"/", Kind::Directory)
+            && records
             && root.standing == Standing::Missing
         {
             let mut a = default_attr(Kind::Directory, b"/");
@@ -162,7 +177,7 @@ impl Server {
                     Ok(None) => {
                         fs.closedir(dir)?;
                         if depth == 0 {
-                            return Ok((converted, true));
+                            return Ok((converted, moved, true));
                         }
                         // Up: drop the last name of the path.
                         depth -= 1;
@@ -207,13 +222,13 @@ impl Server {
                     }
                 };
                 let mut wrote = false;
-                if rec.standing == Standing::Missing {
-                    // The bound counts the records written, so that a volume of more entries than
-                    // the bound still ends: each mount writes some, and the entries done are skipped
-                    // at no write.
-                    if converted >= CONVERT_MAX {
+                if records && rec.standing == Standing::Missing {
+                    // The bound counts the records written and the files moved, so that a volume of
+                    // more entries than the bound still ends: each mount writes some, and the
+                    // entries done are skipped at no write.
+                    if converted + moved >= CONVERT_MAX {
                         fs.closedir(dir)?;
-                        return Ok((converted, false));
+                        return Ok((converted, moved, false));
                     }
                     let mut a = default_attr(entry.kind, child_path);
                     // A number from the counter; a failed reserve leaves the entry for the next mount.
@@ -228,6 +243,22 @@ impl Server {
                     fs.setattr(child_path, ATTR_TYPE, &a.to_bytes())?;
                     converted += 1;
                     wrote = true;
+                }
+                // An inline file (found with a read, the directory still open) is moved out with the
+                // directory closed, as a record is written.
+                if entry.kind == Kind::File && fs.outline(child_path, true).unwrap_or(false) {
+                    if converted + moved >= CONVERT_MAX {
+                        if !wrote {
+                            fs.closedir(dir)?;
+                        }
+                        return Ok((converted, moved, false));
+                    }
+                    if !wrote {
+                        fs.closedir(dir)?;
+                        wrote = true;
+                    }
+                    fs.outline(child_path, false)?;
+                    moved += 1;
                 }
                 if entry.kind == Kind::Directory && depth + 1 < CONVERT_DEPTH {
                     if !wrote {

@@ -226,7 +226,9 @@ struct Pairs {
     since: u64,
     dirs: Option<u64>,
     refused: bool,
+    dirs_refused: bool,
     report: Option<(u64, u64)>,
+    mismatch: Option<(u64, u64)>,
 }
 
 impl Pairs {
@@ -235,7 +237,9 @@ impl Pairs {
         since: 0,
         dirs: None,
         refused: false,
+        dirs_refused: false,
         report: None,
+        mismatch: None,
     };
 }
 
@@ -293,6 +297,9 @@ pub struct Server {
     pub(crate) fail_reopen: bool,
     #[cfg(test)]
     pub(crate) fail_second: bool,
+    /// Tests: the write of the record of a new directory fails.
+    #[cfg(test)]
+    pub(crate) fail_record: bool,
     /// Tests: every session starts as a native client's (user 0), as before permissions; the
     /// permission tests turn it off.
     #[cfg(test)]
@@ -499,6 +506,8 @@ impl Server {
             fail_reopen: false,
             #[cfg(test)]
             fail_second: false,
+            #[cfg(test)]
+            fail_record: false,
             #[cfg(test)]
             default_service: true,
         }
@@ -1818,6 +1827,12 @@ impl Server {
     /// Tests: count the pairs and the directories now, as the mount does.
     pub(crate) fn recount_for_test(&mut self, fs: &mut Fs<'_, crate::mem::MemDevice>) {
         self.recount(fs).unwrap();
+    }
+
+    /// Tests: the tracked count of the directories set to `n`, as a change the service did not see
+    /// would leave it.
+    pub(crate) fn set_dirs_tracked(&mut self, n: u64) {
+        self.pairs.dirs = Some(n);
     }
 
     /// Tests: the server's count of the directories, None before the first count.

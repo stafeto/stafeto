@@ -193,14 +193,28 @@ impl Server {
     /// first refusal.
     pub fn recount<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> Res<(u64, u64)> {
         let (pairs, dirs) = volume(fs.metadata_pairs())?;
+        // A count that disagrees with the directories the service followed catches a change it did
+        // not see (a rollback that failed, an orphan of a cut commit): the worker says so in a line.
+        let mismatch = self
+            .pairs
+            .dirs
+            .filter(|tracked| *tracked != dirs)
+            .map(|tracked| (tracked, dirs));
         self.pairs = Pairs {
             known: Some(pairs),
             since: 0,
             dirs: Some(dirs),
             refused: false,
+            dirs_refused: false,
             report: Some((pairs, dirs)),
+            mismatch,
         };
         Ok((pairs, dirs))
+    }
+
+    /// The tracked and the counted directories when the last recount found them different, once.
+    pub fn take_dirs_mismatch(&mut self) -> Option<(u64, u64)> {
+        self.pairs.mismatch.take()
     }
 
     /// The count the last `recount` made, once: the worker tells it in a line.
@@ -216,7 +230,18 @@ impl Server {
             Some(dirs) => dirs,
             None => self.recount(fs)?.1,
         };
+        if dirs < self.dirs_max {
+            return Ok(());
+        }
+        // The tracked count can be over the volume's (a rollback that could not remove the name, an
+        // orphan the next write repairs): a refusal is made on an exact count, as the pairs' is, and
+        // after a confirmed refusal the service does not count again until a removal.
+        if self.pairs.dirs_refused {
+            return Err(p::code(p::NO_SPACE));
+        }
+        let (_, dirs) = self.recount(fs)?;
         if dirs >= self.dirs_max {
+            self.pairs.dirs_refused = true;
             Err(p::code(p::NO_SPACE))
         } else {
             Ok(())
@@ -260,12 +285,14 @@ impl Server {
         }
         if delta < 0 {
             self.pairs.refused = false;
+            self.pairs.dirs_refused = false;
         }
     }
 
     /// A name was removed: a refusal that waited for a removal may be tried again.
     pub(super) fn removed(&mut self) {
         self.pairs.refused = false;
+        self.pairs.dirs_refused = false;
     }
 
     /// The reserve (rule 14): a caller other than user 0 gets NO_SPACE with fewer than
@@ -373,9 +400,21 @@ impl Server {
         self.pairs_added(2);
         self.dirs_changed(1);
         // The record is written in the same job as the name; a cut between the two commits leaves
-        // an entry with no record, which reads as the closed default.
-        if let Err(e) = fs.setattr(path, ATTR_TYPE, &record.to_bytes()) {
-            let _ = fs.remove(path);
+        // an entry with no record, which reads as the closed default. When the record cannot be
+        // written the name goes again, and so does the directory from the count (a removal that
+        // failed leaves it in the count until the next recount, which tells the difference).
+        #[cfg(test)]
+        let written = if self.fail_record {
+            Err(Error::Io)
+        } else {
+            fs.setattr(path, ATTR_TYPE, &record.to_bytes())
+        };
+        #[cfg(not(test))]
+        let written = fs.setattr(path, ATTR_TYPE, &record.to_bytes());
+        if let Err(e) = written {
+            if fs.remove(path).is_ok() {
+                self.dirs_changed(-1);
+            }
             return Err(status_of(e));
         }
         self.count_add(parent, 1);
