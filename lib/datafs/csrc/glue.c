@@ -119,7 +119,10 @@ void datafs_setup(struct datafs *d, uint32_t blocks)
     d->cfg.prog = dev_prog;
     d->cfg.erase = dev_erase;
     d->cfg.sync = dev_sync;
-    d->cfg.read_size = SECTOR;
+    // A read of a block is one request of the device (8 sectors in one cell of the disk service).
+    // With a read size of one sector, a metadata get that walks back through the log of a pair
+    // reads once for each sector it crosses: up to 24 reads for each entry of a directory listing.
+    d->cfg.read_size = BLOCK;
     d->cfg.prog_size = SECTOR;
     d->cfg.block_size = BLOCK;
     d->cfg.block_count = blocks;
