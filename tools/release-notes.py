@@ -11,6 +11,7 @@ and a link to the pull requests merged since the previous tag follow.
 """
 
 import sys
+import tomllib
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -40,6 +41,34 @@ def files_table(version: str) -> list[str]:
             for names, content in dist.release_files(version)]
 
 
+def credits(root: Path = ROOT) -> list[str]:
+    """The credit sentences the licences of the release's packages ask the
+    notes to carry: for each package under the FreeType Licence (FTL) the line
+    its record names as `CREDIT = tree:<path>` in `notices`, the wording the
+    licence recommends."""
+    found: list[str] = []
+    for record in sorted((root / "packages").glob("*.toml")):
+        description = tomllib.loads(record.read_text())
+        if "FTL" not in description.get("license", "").replace("(", " ").replace(")", " ").split():
+            continue
+        for entry in description.get("notices", []):
+            name, _, source = entry.partition(" = ")
+            if name == "CREDIT" and source.startswith("tree:"):
+                sentence = (root / source[len("tree:"):]).read_text().strip()
+                if sentence not in found:
+                    found.append(sentence)
+    return found
+
+
+def credit_lines() -> list[str]:
+    """The section of the notes that carries the credits, or nothing when no
+    package asks for one."""
+    sentences = credits()
+    if not sentences:
+        return []
+    return ["## Credits", "", *[f"{sentence}\n" for sentence in sentences]]
+
+
 def notes(version: str, tag: str, previous: str | None) -> str:
     repository = "https://github.com/stafeto/stafeto"
     changes = (f"{repository}/compare/{previous}...{tag}" if previous
@@ -53,6 +82,7 @@ def notes(version: str, tag: str, previous: str | None) -> str:
         "| --- | --- |",
         *files_table(version),
         "",
+        *credit_lines(),
         f"The plans are in the [README]({repository}#where-it-is-going); "
         f"every change of this release is in the [merged pull requests]({changes}).",
         "",

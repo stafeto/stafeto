@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Compiles littlefs (third-party/littlefs, unchanged) and the flat interface of `csrc/glue.c` into
+//! Compiles littlefs (third-party/littlefs, with the change of STAFETO-CHANGES.md) and the flat interface of `csrc/glue.c` into
 //! one archive. For the target (`aarch64-unknown-none`, no C library) the build is freestanding
 //! with the string functions of `csrc/shim.c` and its own `string.h`; for the host it is the host's
 //! compiler and library. littlefs never allocates (LFS_NO_MALLOC) and prints nothing.
@@ -97,6 +97,11 @@ fn main() {
     }
     build.compile("datafs_c");
     println!("cargo:rerun-if-changed=csrc");
+    // An edit of the sources of littlefs rebuilds the C side as well (rerun-if-changed above
+    // would otherwise leave the old library after a change of lfs.c).
+    for source in ["lfs.c", "lfs.h", "lfs_util.c", "lfs_util.h"] {
+        println!("cargo:rerun-if-changed={}", lfs.join(source).display());
+    }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CC_aarch64_unknown_none");
 }

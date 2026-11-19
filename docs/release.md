@@ -116,8 +116,11 @@ without F-Stack (`cargo xtask image full --without f-stack`).
 The notes come from `tools/release-notes.py`: the summary written for the
 version in `docs/releases/<version>.md` (a short introduction when there is
 none), the table of files and a link to the changes since the previous `v*`
-tag. Write the summary before tagging: what the release brings, how to try
-it, its limits.
+tag. When a package under the FreeType Licence (FTL) is in the tree, the notes
+also carry the credit line its record names (`ports/freetype/CREDIT.txt`: the
+FTL asks a distribution to say that the software is based in part on the work
+of the FreeType Team). Write the summary before tagging: what the release
+brings, how to try it, its limits.
 
 ## Series and ABI
 
