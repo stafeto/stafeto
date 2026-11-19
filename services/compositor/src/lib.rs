@@ -2977,8 +2977,8 @@ mod tests {
 
     /// One opaque window of XRGB8888 over the whole screen covers the damage of
     /// a frame of the whole screen, so no black is charged and a band holds
-    /// nine lines (45 bands); a window one column short does not cover it, the
-    /// black is charged too, and a band holds seven lines (58 bands).
+    /// thirteen lines (31 bands); a window one column short does not cover it,
+    /// the black is charged too, and a band holds ten lines (40 bands).
     #[test]
     fn a_window_that_covers_the_damage_pays_no_black() {
         let bands = |w: u32| {
@@ -2997,11 +2997,11 @@ mod tests {
             (rows, 400u32.div_ceil(rows))
         };
         let (rows, n) = bands(640);
-        assert_eq!((rows, n), (9, 45));
+        assert_eq!((rows, n), (13, 31));
         assert_eq!(n, full_screen_bands());
         // One column short: the black is charged.
         let (rows, n) = bands(639);
-        assert_eq!((rows, n), (7, 58));
+        assert_eq!((rows, n), (10, 40));
     }
 
     use proto_gpu::{PIPELINE_CURSOR, SOURCE_CURSOR};
