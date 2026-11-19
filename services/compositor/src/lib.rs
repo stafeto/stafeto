@@ -84,10 +84,23 @@ pub const BAND_TICKS: u32 = 15_000;
 /// `the_constants_cover_the_measures_with_the_margin` holds every constant to
 /// its measure.
 ///
-/// What the runs of `comp-probe` and `focus-probe` proved before the classes:
-/// the call of the black is 212, of a copy 765 to 851, of a layer laid over
-/// others 765 to 1 303; the black costs 0.45 to 0.53 ticks a point on large
-/// operations.
+/// What the runs of `comp-probe` and `focus-probe` showed. Before the table of
+/// the bands changed: the call of the black is 212, of a copy 765 to 851, of a
+/// layer laid over others 765 to 1 303. After it the bands are wide, no
+/// operation of 8 points or fewer, and none that is narrow and tall, comes out
+/// of the scenes (so the classes of the call and the row were empty), and the
+/// large operations tell: black least 0.44 to 0.46 a point, copy least 1.56 to
+/// 1.62 (the call in it, 0.15), layer laid over others least 5.78 at 480 points
+/// (its call in it, about 2.7). The greatest of each (black 0.48 to 0.99, copy
+/// 2.06 to 4.69, over 8 to 25) is wall time of the service's step and can hold a
+/// higher level that ran in the middle; `px::calibration` measures each class on
+/// shapes of its own, leaves out the operations a preemption landed in, and
+/// tells the spread, and the table takes its greatest. Until then the price
+/// of a point of a copy and of a layer laid over others, and the price of a
+/// row, stay estimates. At a price of a point of a copy of 1.62 the frame of
+/// the whole screen is 37 bands, at 2.06 it is 45 and at 2.42 it is 58 (more
+/// than the period of 60 Hz holds under -icount: the full phase of the frame
+/// probe is then no promise).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Price {
     pub kind: &'static str,
