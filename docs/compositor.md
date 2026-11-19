@@ -295,7 +295,7 @@ megabyte at most.
 
 A frame takes the posted buffer of every window at its start, is made in
 bands, a step each (the compositor's own bit starts the next band, so requests
-of clients pass between bands). A band that only copies is twelve lines of the
+of clients pass between bands). A band that only copies is eleven lines of the
 damage's width under a window that covers the damage (at most 16 lines), and
 fewer where it starts black. A band that lays something
 over others (a window with an alpha, the pointer's picture) holds fewer points:
@@ -305,9 +305,7 @@ in ticks, the line and the point in hundredths of a tick, for a copy, a layer
 laid over others and the black; the upper fit of the model over the greatest
 ticks measured on 23 shapes of operations under -icount, with a margin of 15 %:
 the model errs only high), and a band holds the lines of the damage's width that
-14 000 ticks (`BAND_TICKS`, the work of a band by the model: the step around it costs up to about 2 400 ticks more, under the gate of 16 328) leave after its calls, a fixed term for every band (`BAND_FIXED`,
-102 ticks: the work of `compose` around a band, which a narrow band does not hide)
-and a term for each layer after the first (`LAYER`, 260 ticks), down the damage and across it, so that eight windows in one band stay
+14 000 ticks (`BAND_TICKS`, the work of a band by the model: the step around it costs about 1 080 ticks more, so a band of eight windows stays under 15 800 of the gate of 16 328) leave after its calls, a fixed term for every band (`BAND_FIXED`, 644 ticks: what `compose` spends around its operations in a band of no layer, 560 measured, with the margin) and a term for every layer (`LAYER`, 288 ticks: 250 measured on the real bands, with the margin), down the damage and across it, so that eight windows in one band stay
 under the bound (the shapes measured go up to the width of the screen), and then goes to the driver
 as COMMIT of the changed rectangle. COMMIT is proto_gpu's second revision:
 SUBSCRIBE gives the driver the compositor's channel once, COMMIT answers as

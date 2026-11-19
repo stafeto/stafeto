@@ -62,6 +62,8 @@ fn steps_verdict(
     verifying: &[String],
 ) -> Result<Vec<(usize, u64, u64)>, String> {
     let mut rows = longest_steps(writing, DATAFS_TAG);
+    crate::step_line::within_b(writing, DATAFS_TAG, crate::step_line::Kinds::All)?;
+    crate::step_line::within_b(verifying, DATAFS_TAG, crate::step_line::Kinds::All)?;
     for row in longest_steps(verifying, DATAFS_TAG) {
         match rows.iter_mut().find(|r| r.0 == row.0) {
             Some(known) if known.1 < row.1 => *known = row,

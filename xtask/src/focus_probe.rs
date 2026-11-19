@@ -361,6 +361,7 @@ pub(crate) fn rows_of(
     kinds: &[(usize, &str)],
 ) -> Result<Vec<(usize, u64, u64)>, String> {
     let rows = longest_steps(lines, tag);
+    crate::step_line::within_b(lines, tag, crate::step_line::Kinds::All)?;
     for (kind, what) in kinds {
         if !rows.iter().any(|(k, ..)| k == kind) {
             return Err(format!("the {name}: no step {what}: {rows:?}"));
@@ -372,11 +373,14 @@ pub(crate) fn rows_of(
             gpu_probe::STEP_MAX
         ));
     }
+    // A portion is a target of the kind of 0.9 B and is judged the same way: the greatest by
+    // kind of N - P * PREEMPT_CHARGE. The work no preemption touched is told beside it.
     if let Some(row) = rows.iter().find(|r| r.0 == 65 && r.1 > PORTION_MAX) {
         return Err(format!(
             "the {name}: a portion or an interrupt past {PORTION_MAX}: {row:?}"
         ));
     }
+    crate::step_line::say_clean(lines, tag, name, 65);
     Ok(rows)
 }
 
@@ -729,7 +733,7 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         text(&driver)
     );
     println!(
-        "focus-probe on {}: {}; the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}; the calibration of the prices on shapes of their own: {}; the upper fit over the shapes: {}",
+        "focus-probe on {}: {}; the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}; the calibration of the prices on shapes of their own: {}; the upper fit over the shapes: {}; {}",
         machine.name,
         comp_probe::full_frame_text(),
         compositor::BAND_TICKS,
@@ -742,6 +746,10 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
             comp_probe::COMP_TAG
         )),
         comp_probe::fit_text(&comp_probe::shape_costs(
+            &output.lines,
+            comp_probe::COMP_TAG
+        )),
+        comp_probe::band_split_text(&comp_probe::band_splits(
             &output.lines,
             comp_probe::COMP_TAG
         ))

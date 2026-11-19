@@ -4834,6 +4834,11 @@ fn posix_tty_control_steps() -> Result<(), String> {
     }
     check_waits(&outcome.lines, &["5"], "terminal control steps")?;
     let maxima = longest_steps(&outcome.lines, "5");
+    step_line::within_b(
+        &outcome.lines,
+        "5",
+        step_line::Kinds::Only(&[16, 17, 18, 19, 20]),
+    )?;
     for kind in 16..=20 {
         let ticks = maxima
             .iter()
@@ -5002,6 +5007,7 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
             ));
         }
         let process = longest_steps(&output.lines, "1");
+        step_line::within_b(&output.lines, "1", step_line::Kinds::Only(&[65]))?;
         let walk = process
             .iter()
             .find(|row| row.0 == 65)
@@ -5554,6 +5560,7 @@ fn posix_sock_probe() -> Result<(), String> {
 fn posix_sock_steps() -> Result<(), String> {
     let lines = posix_sock_run(true)?;
     let rows = longest_steps(&lines, "4");
+    step_line::within_b(&lines, "4", step_line::Kinds::Except(&[64]))?;
     let mut text = String::new();
     for (kind, ticks, detail) in &rows {
         let name = match kind {
@@ -5642,6 +5649,7 @@ fn posix_ipc_probe() -> Result<(), String> {
 fn posix_ipc_steps() -> Result<(), String> {
     let lines = posix_ipc_run(true)?;
     let rows = longest_steps(&lines, "4");
+    step_line::within_b(&lines, "4", step_line::Kinds::Except(&[64]))?;
     let mut text = String::new();
     for (kind, ticks, detail) in &rows {
         let name = match kind {
@@ -5670,6 +5678,7 @@ fn posix_ipc_steps() -> Result<(), String> {
     // step of the pipe service on a miss of its memory of answers; its
     // steps stay under 0.9 of B too.
     let process = longest_steps(&lines, "1");
+    step_line::within_b(&lines, "1", step_line::Kinds::Except(&[64]))?;
     if let Some(row) = process.iter().find(|r| r.0 == 19) {
         println!("process service ShareHeld: {} ticks, B {TERM_B}", row.1);
     } else {
@@ -5690,6 +5699,7 @@ fn posix_ipc_steps() -> Result<(), String> {
     // in the rows above) and runs one job or one portion of a removal.
     check_waits(&lines, &["2", "4"], "IPC job steps")?;
     let files = longest_steps(&lines, "2");
+    step_line::within_b(&lines, "2", step_line::Kinds::Except(&[64]))?;
     let Some(jobs) = files.iter().find(|row| row.0 == 63 && row.1 != 0) else {
         return Err(format!("the file service ran no IPC_JOBS step: {files:?}"));
     };
@@ -5817,6 +5827,7 @@ fn posix_pty_probe_in(steps: bool) -> Result<(), String> {
     if steps {
         check_waits(&output.lines, &["5"], "terminal Clone steps")?;
         let measured = longest_steps(&output.lines, "5");
+        step_line::within_b(&output.lines, "5", step_line::Kinds::Only(&[7, 65]))?;
         for kind in [7, 65] {
             let ticks = measured
                 .iter()
@@ -5867,6 +5878,7 @@ fn check_watch_steps(lines: &[String]) -> Result<(), String> {
     for (tag, methods) in [("4", [14, 15, 16]), ("5", [25, 26, 27])] {
         check_waits(lines, &[tag], "watch steps")?;
         let steps = longest_steps(lines, tag);
+        step_line::within_b(lines, tag, step_line::Kinds::All)?;
         for &(kind, ticks, _) in &steps {
             let bound = watch_bound(tag, kind);
             if ticks == 0 || ticks > bound {
@@ -5881,6 +5893,7 @@ fn check_watch_steps(lines: &[String]) -> Result<(), String> {
             .map(|line| line.replacen("service case:", "service step:", 1))
             .collect();
         let full = longest_steps(&cases, tag);
+        step_line::within_b(&cases, tag, step_line::Kinds::All)?;
         for &(kind, ticks, _) in &full {
             let bound = watch_bound(tag, kind);
             if ticks == 0 || ticks > bound {
@@ -6018,6 +6031,7 @@ fn ramfs_gc_probe() -> Result<(), String> {
     )?;
     check_waits(&output.lines, &["2"], "RAM file service steps")?;
     let steps = longest_steps(&output.lines, "2");
+    step_line::within_b(&output.lines, "2", step_line::Kinds::All)?;
     for kind in [22, 63, 65] {
         if !steps
             .iter()
@@ -6081,6 +6095,7 @@ fn image_gates_probe(measured: bool, normal: bool) -> Result<(), String> {
     if measured {
         check_waits(&output.lines, &["2"], "RAM file service steps")?;
         let steps = longest_steps(&output.lines, "2");
+        step_line::within_b(&output.lines, "2", step_line::Kinds::All)?;
         let required: &[usize] = if normal {
             &[14, 20, 21, 22, 65]
         } else {
@@ -6127,6 +6142,7 @@ fn loader_info_probe() -> Result<(), String> {
     )?;
     check_waits(&output.lines, &["2"], "RAM file service steps")?;
     let steps = longest_steps(&output.lines, "2");
+    step_line::within_b(&output.lines, "2", step_line::Kinds::All)?;
     if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
         return Err(format!(
             "RAM image metadata kind {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {steps:?}"
@@ -6173,6 +6189,7 @@ fn loader_abort_probe(measured: bool) -> Result<(), String> {
         }
         check_waits(&output.lines, &["2"], "RAM file service steps")?;
         let steps = longest_steps(&output.lines, "2");
+        step_line::within_b(&output.lines, "2", step_line::Kinds::All)?;
         for kind in [19, 21, 22, 23, 63, 65] {
             if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
                 return Err(format!(
@@ -6273,6 +6290,7 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     if measured {
         check_waits(&output.lines, &["2"], "RAM file service steps")?;
         let steps = longest_steps(&output.lines, "2");
+        step_line::within_b(&output.lines, "2", step_line::Kinds::All)?;
         let required: &[usize] = if data {
             &[
                 15, 19, 21, 25, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 65,
@@ -6340,6 +6358,7 @@ fn posix_lock_ring_probe(machine: &qemu::Machine) -> Result<(), String> {
     }
     qemu::expect_marker(&outcome, "posix-procs: ring16 result deadlock=1 success=15")?;
     let steps = longest_steps(&outcome.lines, "2");
+    step_line::within_b(&outcome.lines, "2", step_line::Kinds::All)?;
     println!("RAM ring16 dispatches (B {RAM_STEP_MAX}): {steps:?}");
     if steps.iter().any(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
         return Err(format!("ring16 dispatch exceeds {RAM_STEP_MAX}: {steps:?}"));
@@ -6445,6 +6464,7 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
             "posix-procs: full lock FIFO: 64 compatible queued OFDs, 64 held PID records, GET canonical and SET ENOLCK atomic",
         )?;
         let steps = longest_steps(&outcome.lines, "2");
+        step_line::within_b(&outcome.lines, "2", step_line::Kinds::All)?;
         println!("RAM full FIFO and inode dispatches (B {RAM_STEP_MAX}): {steps:?}");
         return check_lock_steps("full FIFO and inode", &steps, &[50, 54, 65]);
     }
@@ -6458,12 +6478,14 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
             "posix-procs: lock sweep share: clients below the service keep their time through the sweep of locked inodes",
         )?;
         let steps = longest_steps(&outcome.lines, "2");
+        step_line::within_b(&outcome.lines, "2", step_line::Kinds::All)?;
         println!("RAM fragmented lock page dispatches (B {RAM_STEP_MAX}): {steps:?}");
         return check_lock_steps("fragmented lock page", &steps, &[50, 65]);
     }
     if probe == LifetimeProbe::Core {
         qemu::expect_marker(&outcome, "posix-procs: full inode lock core ok")?;
         let steps = longest_steps(&outcome.lines, "2");
+        step_line::within_b(&outcome.lines, "2", step_line::Kinds::All)?;
         println!("RAM full inode lock dispatches (B {RAM_STEP_MAX}): {steps:?}");
         return check_lock_steps("full inode lock", &steps, &[50, 49]);
     }
@@ -6501,6 +6523,7 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
     }
     check_waits(&outcome.lines, &["2"], "RAM close event steps")?;
     let steps = longest_steps(&outcome.lines, "2");
+    step_line::within_b(&outcome.lines, "2", step_line::Kinds::All)?;
     qemu::expect_marker(
         &outcome,
         "RAM native locks: genuine PID, OFD conflict, unlocked query, repeat and closed description ok",
@@ -6656,6 +6679,7 @@ fn posix_fifo_run(steps: bool) -> Result<(), String> {
             ("4", &[18, 19, 20, 21, 22, 23, 24, 25][..]),
         ] {
             let measured = longest_steps(&outcome.lines, tag);
+            step_line::within_b(&outcome.lines, tag, step_line::Kinds::All)?;
             for kind in required {
                 if !measured.iter().any(|row| row.0 == *kind && row.1 != 0) {
                     return Err(format!(
@@ -7575,6 +7599,7 @@ const INIT_STEPS_SEEN: [usize; 4] = [1, 2, 3, 4];
 /// beside the exchange and the HEARTBEATs of the others in the queue).
 fn check_init_steps(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
     let init = longest_steps(lines, "6");
+    step_line::within_b(lines, "6", step_line::Kinds::All)?;
     for kind in INIT_STEPS_SEEN {
         if !init.iter().any(|(k, ..)| *k == kind) {
             return Err(format!("init printed no step of kind {kind}: {init:?}"));
@@ -7615,6 +7640,7 @@ const CONSOLE_LOAN_STEP_MAX: u64 = 150_000 / TICK_NS;
 /// (WRITE_SOME, 11).
 fn check_console_driver_steps(lines: &[String]) -> Result<(), String> {
     let rows = longest_steps(lines, CONSOLE_DRIVER_TAG);
+    step_line::within_b(lines, CONSOLE_DRIVER_TAG, step_line::Kinds::All)?;
     for kind in [11usize] {
         if !rows.iter().any(|(k, ..)| *k == kind) {
             return Err(format!(
@@ -7892,7 +7918,8 @@ fn check_loader_stack(lines: &[String]) -> Result<(), String> {
 const LOADER_REGIONS_MIN: u64 = 100;
 
 /// The longest step of each kind in `lines`: (kind, ticks, detail), by the time less the charge
-/// of the preemptions in the step (`step_line`).
+/// of the preemptions in the step (`step_line`). The hard check against B is `step_line::within_b`,
+/// which a probe calls for the kinds it judges.
 fn longest_steps(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
     step_line::longest_warned(lines, tag, TERM_B)
 }
@@ -8520,7 +8547,17 @@ fn process_steps(machine: &qemu::Machine, branches: u32, grid: bool) -> Result<(
     }
     check_audit_rounds(&outcome.lines)?;
     let rows = longest_steps(&outcome.lines, "1");
+    step_line::within_b(
+        &outcome.lines,
+        "1",
+        step_line::Kinds::Only(&[46, 55, 56, 57, 58, 59, 60, 61, 62, 65]),
+    )?;
     let ram = longest_steps(&outcome.lines, "2");
+    step_line::within_b(
+        &outcome.lines,
+        "2",
+        step_line::Kinds::Only(&[3, 52, 59, 62]),
+    )?;
     let pipe = longest_steps(&outcome.lines, "4");
     // The loader serves one fork and reports once: the longest of each kind
     // over all the forks, with its detail.
@@ -8686,6 +8723,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32, grid: bool) -> Result<(
     }
     // The entropy device's driver (tag 10): its own steps, under term B.
     let driver = longest_steps(&outcome.lines, "10");
+    step_line::within_b(&outcome.lines, "10", step_line::Kinds::All)?;
     if let Some(row) = driver.iter().find(|r| r.1 > RAM_STEP_MAX) {
         return Err(format!(
             "the entropy device's driver: a step past term B: {row:?}"
@@ -8695,6 +8733,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32, grid: bool) -> Result<(
     // whose cost stays the same with the live clones (entropy::CLONE_FULL_MAX
     // bounds it with the table full), and its own steps; every one under term B.
     let entropy = longest_steps(&outcome.lines, "11");
+    step_line::within_b(&outcome.lines, "11", step_line::Kinds::All)?;
     let clone = entropy.iter().find(|(k, ..)| *k == 8).map_or(0, |r| r.1);
     if clone == 0 {
         return Err(format!("the entropy service gave no CLONE: {entropy:?}"));
@@ -10403,6 +10442,7 @@ fn tty_steps() -> Result<(), String> {
     // Clone, GetAttr and a session's end below run with the tables full.
     qemu::expect_marker(&output, "tty-probe: holdsets 255 clones live")?;
     let steps = longest_steps(&output.lines, "5");
+    step_line::within_b(&output.lines, "5", step_line::Kinds::All)?;
     let waits = longest_waits(&output.lines, "5");
     let mut table = String::from("kind method ticks(own) detail wait\n");
     for (kind, ticks, detail) in &steps {
@@ -11306,6 +11346,16 @@ fn host_tests() -> Result<(), String> {
         "virtio-net",
         "--features",
         "virtio-net/ffi",
+    ]))?;
+    // The tests of the runtime library: its manifest sets `test = false` for the library, so
+    // only an explicit `--lib` runs them, and the feature keeps its panic handler off the host.
+    run_cmd(cargo().args([
+        "test",
+        "--package",
+        "rt",
+        "--features",
+        "host-tests",
+        "--lib",
     ]))
 }
 

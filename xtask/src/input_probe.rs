@@ -154,6 +154,7 @@ pub fn verdict(lines: &[String]) -> Result<(), String> {
 /// STEP_MAX.
 pub fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
     let rows = longest_steps(lines, INPUT_TAG);
+    crate::step_line::within_b(lines, INPUT_TAG, crate::step_line::Kinds::All)?;
     for (kind, name) in STEP_KINDS {
         if !rows.iter().any(|(k, ..)| *k == kind) {
             return Err(format!("the input service: no step {name}: {rows:?}"));

@@ -837,6 +837,7 @@ fn steps(machine: &'static qemu::Machine) -> Result<(), String> {
         ("compositor", comp_probe::COMP_TAG),
     ] {
         let rows = longest_steps(&output.lines, tag);
+        crate::step_line::within_b(&output.lines, tag, crate::step_line::Kinds::All)?;
         if rows.is_empty() {
             return Err(format!("doom steps: no step of the {name} service"));
         }
@@ -846,11 +847,14 @@ fn steps(machine: &'static qemu::Machine) -> Result<(), String> {
                 gpu_probe::STEP_MAX
             ));
         }
+        // A portion is a target of the kind of 0.9 B and is judged the same way. The work no
+        // preemption touched is told beside it.
         if let Some(row) = rows.iter().find(|r| r.0 == 65 && r.1 > PORTION_MAX) {
             return Err(format!(
                 "doom steps: a portion or an interrupt of the {name} service past {PORTION_MAX}: {row:?}"
             ));
         }
+        crate::step_line::say_clean(&output.lines, tag, name, 65);
         let rows: Vec<_> = rows
             .iter()
             .map(|(kind, ticks, detail)| format!("kind {kind} {ticks} (detail {detail})"))
