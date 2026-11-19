@@ -1277,20 +1277,27 @@ pub fn os_test_with_fixtures(
 /// of its own file with its time limit in milliseconds (`limits`, one for
 /// each test).
 pub fn open_posix(tests: &[(String, Vec<u8>)], limits: &[u64]) -> Vec<RootFile> {
-    open_posix_with(tests, limits, None)
+    open_posix_with(tests, limits, None, "")
 }
 
 /// The files of a boot of the Open POSIX tests with their scratch files on the data volume: the
 /// list starts with the directory `tmp` names, made on the volume, and the variable `TMPDIR` the
 /// suite's tests read.
 pub fn open_posix_data(tests: &[(String, Vec<u8>)], limits: &[u64], tmp: &str) -> Vec<RootFile> {
-    open_posix_with(tests, limits, Some(tmp))
+    open_posix_with(tests, limits, Some(tmp), "")
+}
+
+/// The files of a boot of the save scenario (`cargo xtask data-save`): the runner with no test and
+/// the lines of `script`, which make or read back a file of the volume.
+pub fn data_save(script: &str) -> Vec<RootFile> {
+    open_posix_with(&[], &[], Some("/data/tmp"), script)
 }
 
 fn open_posix_with(
     tests: &[(String, Vec<u8>)],
     limits: &[u64],
     tmp: Option<&str>,
+    script: &str,
 ) -> Vec<RootFile> {
     /// Tests that print a usage line without an argument: the number of
     /// threads the suite's README gives them.
@@ -1312,6 +1319,7 @@ fn open_posix_with(
     if let Some(tmp) = tmp {
         list.push_str(&format!("mkdir {tmp}\nenv TMPDIR {tmp}\n"));
     }
+    list.push_str(script);
     let mut limit = None;
     for ((name, _), ms) in tests.iter().zip(limits) {
         if limit != Some(*ms) {

@@ -2271,6 +2271,9 @@ commands:
             --one NAME, one test in a boot of its own, with its log;
             a FAIL verdict from --one returns a nonzero exit status
             --full-basic runs the complete pinned basic corpus in bounded batches
+  data-save a file saved the way sed -i saves it (temporary file, mode, fsync, rename) under /data and
+            read back after a second boot on the same disk (the Open POSIX runner's image with the data
+            file service); replaces the plan's vi scenario
   open-posix [--data] [--full | --only PREFIX] [--jobs N] run the Open POSIX Test Suite (LTP 20260930)
             on relibc in bounded batches, N boots at a time; without --full only
             the tests of tests/open-posix/pass.txt, which must all pass; --only
@@ -2634,6 +2637,7 @@ fn main() {
             rest => jobs::parse_jobs("os-test", rest).and_then(ostest::run_in_budget),
         },
         Some("os-test-headers") => os_test_headers(&args[1..]),
+        Some("data-save") => openposix::data_save(),
         Some("open-posix") => {
             // `--data` first: the file-related tests with their scratch files on the data volume.
             let (data, args) = match &args[1..] {

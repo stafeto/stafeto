@@ -938,3 +938,88 @@ mod tests {
         assert!(names.iter().chain(listed.iter()).all(|n| ram.contains(n)));
     }
 }
+
+/// The scenario that replaces the plan's `vi` one: a file saved the way `sed -i` saves it (a
+/// temporary file in the directory, the mode of the original, fsync, rename over it) under
+/// /data, and the same file read back after a second boot on the same disk. The runner of the
+/// Open POSIX tests does both (`save-write` and `save-verify` of its list), so the boot, the
+/// volume and the layer are those of `open-posix --data`.
+pub fn data_save() -> Result<(), String> {
+    crate::relibc()?;
+    crate::busybox_build()?;
+    crate::run_cmd(Command::new("python3").arg(crate::root().join("tools/build-open-posix.py")))?;
+    let work = target_dir().join("open-posix");
+    ostest::use_licence(LICENCE, work.join("source/COPYING"));
+    let kernel = build(Variant::Normal)?;
+    let disk = std::env::temp_dir().join(format!("stafeto-data-save-{}.img", std::process::id()));
+    let boot = |script: &str, name: &str, fresh: bool| -> Result<String, String> {
+        crate::qemu::store_file(&disk, DATA_DISK_BYTES, fresh)?;
+        let (log, _) = ostest::boot_with(
+            &kernel,
+            name,
+            &ostest::PROGRAMS_DATA,
+            rootfs::data_save(script),
+            Duration::from_secs(300),
+            Some(&disk),
+        )?;
+        Ok(log)
+    };
+    let result = (|| {
+        let first = boot("save-write /data/tmp/saved\n", "data-save-1.img", true)?;
+        data_save_verdict(&first, "os-test-run: data-save written")?;
+        // The same file of the disk: the volume is mounted and never formatted again.
+        let second = boot("save-verify /data/tmp/saved\n", "data-save-2.img", false)?;
+        data_save_verdict(&second, "os-test-run: data-save verified")?;
+        if second.contains("data volume formatted") {
+            return Err("data-save: the second boot formatted the volume again".to_owned());
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&disk);
+    result?;
+    println!("data-save: saved with a temporary file and rename, read back after a reboot ok");
+    Ok(())
+}
+
+/// The log of a boot says `done` and no line of a failed step of the scenario or a fault.
+fn data_save_verdict(log: &str, done: &str) -> Result<(), String> {
+    if let Some(line) = log
+        .lines()
+        .find(|l| l.starts_with("os-test-run: save-") || l.starts_with("os-test-run: mkdir"))
+    {
+        return Err(format!("data-save: {line}"));
+    }
+    if !log.lines().any(|l| l == done) {
+        return Err(format!("data-save: no line `{done}` in the log"));
+    }
+    if log.contains("process fault:") || log.contains("KERNEL PANIC") {
+        return Err("data-save: the guest faulted".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::*;
+
+    #[test]
+    fn the_save_scenario_is_judged_by_its_lines() {
+        let done = "os-test-run: data-save written";
+        assert!(data_save_verdict(&format!("a\n{done}\nb\n"), done).is_ok());
+        assert!(data_save_verdict("a\n", done).is_err());
+        let failed = format!("os-test-run: save-write: the temporary file failed: x\n{done}\n");
+        assert!(
+            data_save_verdict(&failed, done)
+                .unwrap_err()
+                .contains("temporary file")
+        );
+        assert!(data_save_verdict(&format!("{done}\nprocess fault: x\n"), done).is_err());
+        assert!(
+            data_save_verdict(
+                &format!("os-test-run: mkdir /data/tmp failed: x\n{done}\n"),
+                done
+            )
+            .is_err()
+        );
+    }
+}
