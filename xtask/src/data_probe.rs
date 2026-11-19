@@ -182,8 +182,32 @@ fn machine(built: &Built, image: &Path, disk: &Path, icount: bool) -> Command {
 
 /// A run until the probe ends well.
 fn run_to_end(built: &Built, cmd: Command, what: &str) -> Result<Vec<String>, String> {
-    let output = run_until(cmd, BOOT_TIMEOUT * 6, Some(ENDS), &built.kernel.elf)
-        .map_err(|e| format!("data-probe ({what}): {e}"))?;
+    run_to_end_within(built, cmd, what, BOOT_TIMEOUT * 6)
+}
+
+/// The same with a limit of its own, and the time the boot took told: the boots of `fill` last
+/// minutes (the conversion of a full volume holds READY for as long as it takes), and the whole
+/// command has the 60 minutes of the probe workflow.
+fn run_to_end_within(
+    built: &Built,
+    cmd: Command,
+    what: &str,
+    limit: std::time::Duration,
+) -> Result<Vec<String>, String> {
+    let started = std::time::Instant::now();
+    let output = run_until(cmd, limit, Some(ENDS), &built.kernel.elf).map_err(|e| {
+        format!(
+            "data-probe ({what}): {e} (after {} s)",
+            started.elapsed().as_secs()
+        )
+    })?;
+    if limit > BOOT_TIMEOUT * 6 {
+        println!(
+            "data-probe fill: the {what} took {} s of {} s allowed",
+            started.elapsed().as_secs(),
+            limit.as_secs()
+        );
+    }
     if let Some(failed) = output
         .lines
         .iter()
@@ -543,11 +567,14 @@ fn fill_on(built: &Built, cpus: usize) -> Result<Filled, String> {
     // walk it needs fills the window then: the line says the first walk was `made at mount`, a walk
     // with no rate). The second boot finds nothing to convert and walks in the quiet, after READY:
     // its line has the reads and the time, which give the device rate.
-    let convert = image("boot-data-probe-convert.img", None, "settle", 0, 5)?;
-    let converted = run_to_end(
+    // The probe's mode `convert` sends one request, which is answered when the mount work is over
+    // (READY comes after the conversion: 142 s for 3,258 entries in the first run), and ends.
+    let convert = image("boot-data-probe-convert.img", None, "convert", 0, 0)?;
+    let converted = run_to_end_within(
         built,
         machine(built, &convert, &disk.0, false),
         "converting boot",
+        CONVERT_LIMIT,
     )?;
     need_ready(&converted, "converting boot")?;
     report(
@@ -561,17 +588,23 @@ fn fill_on(built: &Built, cpus: usize) -> Result<Filled, String> {
         0,
         SETTLE_WAIT_S,
     )?;
-    let settled = run_to_end(built, machine(built, &settle, &disk.0, false), "quiet boot")?;
+    let settled = run_to_end_within(
+        built,
+        machine(built, &settle, &disk.0, false),
+        "quiet boot",
+        QUIET_LIMIT,
+    )?;
     need_ready(&settled, "quiet boot")?;
     report(
         &settled,
         &format!("{cpus} CPUs, the boot that walks in the quiet"),
     );
     let measure = image("boot-data-probe-fill.img", None, "fill", 0, 0)?;
-    let measured = run_to_end(
+    let measured = run_to_end_within(
         built,
         machine(built, &measure, &disk.0, false),
         "measuring boot",
+        MEASURE_LIMIT,
     )?;
     need_ready(&measured, "measuring boot")?;
     need(
@@ -590,6 +623,15 @@ fn fill_on(built: &Built, cpus: usize) -> Result<Filled, String> {
 /// The seconds the converting boot sleeps: the conversion of 3,260 entries, the quiet of 2 s and the
 /// first walk of 1 GiB at 78 % (at most 60 s by the limit 4.3) fit with room over.
 const SETTLE_WAIT_S: u32 = 120;
+
+/// The limits of the three boots of `fill` (the whole command has 60 minutes, and the boots of one
+/// machine took about 12 minutes together in the first run): the conversion holds READY for the
+/// conversion of every entry and the move-out of every inline file (about 110 reads an entry), the
+/// quiet boot sleeps `SETTLE_WAIT_S` s after a walk of up to 60 s, and the measuring boot walks the
+/// volume itself, waits 65 s and removes files.
+const CONVERT_LIMIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+const QUIET_LIMIT: std::time::Duration = std::time::Duration::from_secs(8 * 60);
+const MEASURE_LIMIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// The figures of a pair of boots and the bounds they were checked against.
 struct Checked {

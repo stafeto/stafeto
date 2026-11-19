@@ -9,6 +9,8 @@
 //!   of an earlier step), and the number of the step written into `/progress` the same way, after which
 //!   the line `data-probe: synced N` goes out. Then `data-probe: written` and a STATFS, for the host
 //!   that cuts the power in the middle of this series (`cargo xtask data-crash`).
+//! - `convert`: one STATFS, answered when the mount work is over (the conversion of a volume made by
+//!   an older release holds READY), then the probe ends.
 //! - `settle`: no request; with `STAFETO_DATA_PROBE_WAIT_S` the probe sleeps that long, so the
 //!   service converts the volume at mount and walks it in the quiet, and the probe ends.
 //! - `fill`: the volume that `cargo xtask data-image --fill` made (1 GiB, small and large files, a
@@ -101,6 +103,10 @@ fn main(_: u64) -> u64 {
         // The boot that converts a volume made by an older release and ends (the host then boots
         // `fill` on the converted volume): nothing to ask, the sleep is the work.
         "settle" => Ok(()),
+        // One request: it is answered when the data service is ready, which is after the mount work
+        // (the conversion of a full volume takes minutes). Nothing is walked for it (the conversion
+        // left the window full), and the probe ends.
+        "convert" => convert_wait(&client),
         "fill" => measure_fill(&client, &start),
         _ => Err("unknown mode"),
     };
@@ -596,6 +602,17 @@ fn verify(c: &Client) -> Result<(), Fail> {
         v3_verify(c)?;
     }
     rt::println!("data-probe: verify ok progress={done} files={files}");
+    Ok(())
+}
+
+/// The probe of mode `convert`: a STATFS, which waits for the mount work, and its line.
+fn convert_wait(c: &Client) -> Result<(), Fail> {
+    let at = now_us();
+    let (blocks, free) = statfs(c)?;
+    rt::println!(
+        "data-probe: convert answered after {} us, {blocks} blocks, {free} free",
+        now_us() - at
+    );
     Ok(())
 }
 
