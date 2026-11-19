@@ -161,6 +161,8 @@ mod own_step {
     /// A close event: the records held in the table before (bits 16 to 31) and after.
     #[cfg(feature = "steps")]
     pub const CLOSE: u64 = 10;
+    /// A turn that releases the lock pages parked by the requests that emptied them.
+    pub const PARKED: u64 = 11;
 
     pub fn sweep(turn: &ramfs::locks::simple::Sweep) -> u64 {
         LOCK_SWEEP << 48
@@ -4013,7 +4015,8 @@ impl Fs {
     }
 
     fn notify_maintenance(&self) {
-        if self.legacy_pending || self.lock_work_pending() {
+        if self.legacy_pending || self.lock_work_pending() || self.ram.storage.parked_backlog() != 0
+        {
             let _ = sys::notify(&self.channel, 1);
         }
     }
@@ -4106,6 +4109,15 @@ impl Fs {
             let now = self.time_source.now();
             self.ram.storage.layer_maintain(now, &Limits::PORTIONS);
             self.layer_pump();
+            self.legacy_pending = true;
+            self.notify_maintenance();
+            return;
+        }
+        // The lock pages that requests emptied wait on the parking stack: a turn releases up to
+        // `PARK_TURN` of them, outside any client's step.
+        if self.ram.storage.parked_backlog() != 0 {
+            rt::service::step_detail(own_step::PARKED);
+            self.ram.storage.reclaim_step();
             self.legacy_pending = true;
             self.notify_maintenance();
             return;

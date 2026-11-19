@@ -368,6 +368,15 @@ impl SimpleLocks {
             }
         }
     }
+    /// The lock pages the table holds as live: (physical page, payer index).
+    #[cfg(test)]
+    pub(crate) fn live_pages(&self) -> std::vec::Vec<(u16, u16)> {
+        self.pages
+            .iter()
+            .filter_map(|page| page.paid.as_ref())
+            .map(|paid| (paid.physical(), paid.payer()))
+            .collect()
+    }
     /// The records held in the whole table.
     pub fn total(&self) -> usize {
         self.total
@@ -1093,8 +1102,12 @@ impl SimpleLocks {
         }
         if self.pages[physical as usize].free == u64::MAX {
             self.unlink_available(physical);
+            // The emptied page waits on the parking stack for the maintenance to release: the
+            // step does not give back the charge or the anchor. With the stack full it does.
             let page = self.pages[physical as usize].paid.take().unwrap();
-            storage.release_lock_page(page);
+            if let Err(page) = storage.park_lock_page(page) {
+                storage.release_lock_page(page);
+            }
             // take already cleared paid. Reset only the remaining live fields;
             // no full-page metadata copy is needed for its now-free slot.
             let empty = &mut self.pages[physical as usize];
@@ -1193,6 +1206,14 @@ mod tests {
                 name,
                 (crate::REG, 0o600, 0, 0),
             )
+            .unwrap();
+        ram.storage.commit(reservation).unwrap()
+    }
+    // A file created and paid by `root`.
+    fn inode_of(ram: &mut crate::Ram<'_>, root: Root, name: &[u8]) -> Token {
+        let reservation = ram
+            .storage
+            .reserve(root, storage::ROOT, name, (crate::REG, 0o600, 0, 0))
             .unwrap();
         ram.storage.commit(reservation).unwrap()
     }
@@ -1821,12 +1842,24 @@ mod tests {
         pages
     }
 
+    // Turns of the maintenance until the parked pages are gone; the count of turns.
+    fn turns(ram: &mut crate::Ram<'_>) -> usize {
+        let mut turns = 0;
+        while ram.storage.reclaim_step() {
+            turns += 1;
+            assert!(turns < 64);
+        }
+        turns
+    }
+
     #[test]
-    fn one_unlock_of_the_whole_file_releases_the_pages_of_64_live_records_in_one_call() {
+    fn one_unlock_of_the_whole_file_parks_the_pages_of_64_live_records_and_the_turns_release_them()
+    {
         let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
         let target = inode(&mut ram, b"target");
         let mut table = fresh();
         let owner = Owner::Process(900);
+        let open = ram.storage.open_accounts();
         let held = fragment(&mut ram, &mut table, target, owner);
         let free_before = ram.storage.available().pages;
         // The owner is alive: the request is no sweep of dead records, and its piece limit
@@ -1843,7 +1876,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table.count(target), 0);
+        // The call released no page: 64 wait on the stack, still paid by their account. The
+        // client sees them free at once and owes nothing for them.
+        assert_eq!(ram.storage.parked_backlog(), held);
         assert_eq!(ram.storage.usage(payer(1)).pages, 0);
+        assert_eq!(ram.storage.available().pages - free_before, held as u16);
+        assert_eq!(ram.storage.assert_pages_exact(&table.live_pages()), held);
+        // Four turns of 16 release them; then nothing is charged and no account is open.
+        assert_eq!(turns(&mut ram), held / storage::PARK_TURN);
+        assert_eq!(ram.storage.parked_backlog(), 0);
+        assert_eq!(ram.storage.assert_pages_exact(&table.live_pages()), 0);
+        assert_eq!(ram.storage.open_accounts(), open);
         assert_eq!(ram.storage.available().pages - free_before, held as u16);
     }
 
@@ -1865,11 +1908,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table.count(target), 1);
+        assert_eq!(ram.storage.parked_backlog(), PER_INODE - 1);
         assert_eq!(ram.storage.usage(payer(1)).pages as usize, 1);
     }
 
     #[test]
-    fn one_close_of_the_description_releases_the_pages_of_64_live_records_in_one_call() {
+    fn one_close_of_the_description_parks_the_pages_of_64_live_records_and_the_turns_release_them()
+    {
         let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
         let target = inode(&mut ram, b"target");
         let mut table = fresh();
@@ -1877,12 +1922,273 @@ mod tests {
             slot: 5,
             generation: 3,
         };
+        let open = ram.storage.open_accounts();
         let held = fragment(&mut ram, &mut table, target, owner);
         let free_before = ram.storage.available().pages;
         assert!(table.close(&mut ram.storage, target, owner).unwrap());
         assert_eq!(table.count(target), 0);
+        assert_eq!(ram.storage.parked_backlog(), held);
         assert_eq!(ram.storage.usage(payer(1)).pages, 0);
         assert_eq!(ram.storage.available().pages - free_before, held as u16);
+        assert_eq!(ram.storage.assert_pages_exact(&table.live_pages()), held);
+        assert_eq!(turns(&mut ram), held / storage::PARK_TURN);
+        assert_eq!(ram.storage.assert_pages_exact(&table.live_pages()), 0);
+        assert_eq!(ram.storage.open_accounts(), open);
+    }
+
+    #[test]
+    fn the_parking_stack_holds_its_limit_and_the_rest_is_released_at_once() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let mut table = fresh();
+        let files: Vec<_> = (0..3)
+            .map(|i| inode(&mut ram, std::format!("t{i}").as_bytes()))
+            .collect();
+        let owners: Vec<_> = (0..3).map(|i| Owner::Process(900 + i)).collect();
+        // One inode for the filler of each of the 192 pages (two roots pay for the inodes).
+        let fillers: Vec<_> = (0..3 * PER_INODE)
+            .map(|page| {
+                inode_of(
+                    &mut ram,
+                    payer(5 + page as u64 % 2),
+                    std::format!("f{page}").as_bytes(),
+                )
+            })
+            .collect();
+        for (t, (file, owner)) in files.iter().zip(&owners).enumerate() {
+            for page in 0..PER_INODE {
+                let at = t * PER_INODE + page;
+                table
+                    .set(
+                        &mut ram.storage,
+                        payer(1),
+                        request(*file, *owner, 2 * page as i64, 1, Some(Kind::Write)),
+                        |_| true,
+                    )
+                    .unwrap();
+                let holder = Owner::Process(2_000 + at as u32);
+                for i in 0..(SLOTS - 1) as i64 {
+                    table
+                        .set(
+                            &mut ram.storage,
+                            payer(1),
+                            request(fillers[at], holder, 2 * i, 1, Some(Kind::Write)),
+                            |_| true,
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        for (at, filler) in fillers.iter().enumerate() {
+            let holder = Owner::Process(2_000 + at as u32);
+            table.close(&mut ram.storage, *filler, holder).unwrap();
+        }
+        assert_eq!(ram.storage.usage(payer(1)).pages as usize, 3 * PER_INODE);
+        for (file, owner) in files.iter().zip(&owners) {
+            table.close(&mut ram.storage, *file, *owner).unwrap();
+        }
+        // 192 pages were emptied: 128 wait, the 64 after them went at once.
+        assert_eq!(ram.storage.parked_backlog(), storage::PARK_MAX);
+        assert_eq!(
+            ram.storage.assert_pages_exact(&table.live_pages()),
+            storage::PARK_MAX
+        );
+        assert_eq!(turns(&mut ram), storage::PARK_MAX / storage::PARK_TURN);
+        assert_eq!(ram.storage.assert_pages_exact(&table.live_pages()), 0);
+    }
+    // A parked page keeps its account open and its payer charged until a turn releases it,
+    // however the clients of the account come and go: the account of a payer with nothing else
+    // left is open exactly as long as a page of it is parked.
+    #[test]
+    fn a_parked_page_keeps_its_payer_open_until_the_turn_and_no_charge_stays() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let file = inode(&mut ram, b"one");
+        let mut table = fresh();
+        let owner = Owner::Process(900);
+        let open = ram.storage.open_accounts();
+        table
+            .set(
+                &mut ram.storage,
+                payer(1),
+                request(file, owner, 0, 1, Some(Kind::Write)),
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(ram.storage.open_accounts(), open + 1);
+        table.close(&mut ram.storage, file, owner).unwrap();
+        assert_eq!(ram.storage.parked_backlog(), 1);
+        assert_eq!(ram.storage.usage(payer(1)), storage::Usage::default());
+        assert_eq!(ram.storage.open_accounts(), open + 1);
+        assert_eq!(ram.storage.assert_pages_exact(&table.live_pages()), 1);
+        assert!(ram.storage.reclaim_step());
+        assert_eq!(ram.storage.open_accounts(), open);
+        assert!(!ram.storage.reclaim_step());
+        assert_eq!(ram.storage.assert_pages_exact(&table.live_pages()), 0);
+        // The same payer asks for a page again: the page comes from the pool.
+        table
+            .set(
+                &mut ram.storage,
+                payer(1),
+                request(file, owner, 0, 1, Some(Kind::Write)),
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(ram.storage.usage(payer(1)).pages, 1);
+        assert_eq!(ram.storage.assert_pages_exact(&table.live_pages()), 1);
+    }
+
+    #[test]
+    fn with_the_free_list_empty_a_write_takes_the_parked_page() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let file = inode(&mut ram, b"one");
+        let mut table = fresh();
+        let owner = Owner::Process(900);
+        table
+            .set(
+                &mut ram.storage,
+                payer(1),
+                request(file, owner, 0, 1, Some(Kind::Write)),
+                |_| true,
+            )
+            .unwrap();
+        table.close(&mut ram.storage, file, owner).unwrap();
+        assert_eq!(ram.storage.parked_backlog(), 1);
+        // Two files of the roots 2 and 3 take every page of the pool but the parked one.
+        let page = std::vec![7u8; storage::PAGE];
+        let big = [
+            inode_of(&mut ram, payer(2), b"big-a"),
+            inode_of(&mut ram, payer(3), b"big-b"),
+            inode_of(&mut ram, payer(4), b"big-c"),
+        ];
+        let mut written = 0;
+        'fill: for (n, file) in big.iter().enumerate() {
+            for p in 0..storage::FILE_PAGES {
+                if ram.storage.available().pages == 1 {
+                    break 'fill;
+                }
+                ram.storage
+                    .write(*file, payer(2 + n as u64), p * storage::PAGE, &page)
+                    .unwrap();
+                written += 1;
+            }
+        }
+        assert_eq!(written, storage::PAGES - 1);
+        // The free list is empty and one page is parked: the write succeeds.
+        let last = big[2];
+        assert_eq!(
+            ram.storage
+                .write(last, payer(4), 2047 * storage::PAGE, &page)
+                .unwrap(),
+            storage::PAGE
+        );
+        assert_eq!(ram.storage.parked_backlog(), 0);
+        assert_eq!(ram.storage.available().pages, 0);
+        assert_eq!(
+            ram.storage.assert_pages_exact(&table.live_pages()),
+            storage::PAGES
+        );
+        // The pool is full: one more page is refused, as it is without a stack.
+        assert!(
+            ram.storage
+                .write(last, payer(4), 2046 * storage::PAGE, &page)
+                .is_err()
+        );
+    }
+
+    // The books stay exact through any run of lock requests, closes, file writes, truncations
+    // and turns of the maintenance: after every operation each page is in one place and each
+    // account is charged for what it holds.
+    #[test]
+    fn the_page_books_stay_exact_through_a_random_run() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let mut table = fresh();
+        let inodes: Vec<_> = (0..3)
+            .map(|i| inode(&mut ram, std::format!("lock{i}").as_bytes()))
+            .collect();
+        let data = [
+            inode_of(&mut ram, payer(3), b"data-a"),
+            inode_of(&mut ram, payer(4), b"data-b"),
+        ];
+        let page = std::vec![1u8; storage::PAGE];
+        let mut state = 0x5eed_u64;
+        let mut parked_seen = 0;
+        for step in 0..3_000 {
+            let roll = lcg(&mut state) % 100;
+            let file = inodes[(lcg(&mut state) % 3) as usize];
+            let owner = owner_of((lcg(&mut state) % 6) as u32);
+            let root = payer(1 + lcg(&mut state) % 2);
+            let first = 2 * (lcg(&mut state) % 40) as i64;
+            let dead = lcg(&mut state).is_multiple_of(5);
+            let live = |o: Owner| !(dead && o == owner_of(1));
+            match roll {
+                0..=44 => {
+                    let _ = table.set(
+                        &mut ram.storage,
+                        root,
+                        request(file, owner, first, 1, Some(Kind::Write)),
+                        live,
+                    );
+                }
+                45..=64 => {
+                    let _ = table.set(
+                        &mut ram.storage,
+                        root,
+                        request(file, owner, first, 1 + (lcg(&mut state) % 30) as i64, None),
+                        live,
+                    );
+                }
+                65..=74 => {
+                    let _ = table.close(&mut ram.storage, file, owner);
+                }
+                75..=79 => {
+                    let _ = table.set(
+                        &mut ram.storage,
+                        root,
+                        Request {
+                            range: Range::relative(0, 0, 0).unwrap(),
+                            ..request(file, owner, 0, 0, None)
+                        },
+                        live,
+                    );
+                }
+                80..=89 => {
+                    let n = (lcg(&mut state) % 2) as usize;
+                    let at = (lcg(&mut state) % 40) as usize * storage::PAGE;
+                    let _ = ram.storage.write(data[n], payer(3 + n as u64), at, &page);
+                }
+                90..=91 => {
+                    // Everything the clients hold goes: whole pages empty.
+                    for &file in &inodes {
+                        for n in 0..6 {
+                            let _ = table.close(&mut ram.storage, file, owner_of(n));
+                        }
+                    }
+                }
+                92..=93 => {
+                    let n = (lcg(&mut state) % 2) as usize;
+                    let _ = ram
+                        .storage
+                        .truncate_zero(data[n], proto_fs::Timestamp::ZERO);
+                }
+                _ => {
+                    ram.storage.reclaim_step();
+                }
+            }
+            parked_seen = parked_seen.max(ram.storage.parked_backlog());
+            let charged = ram.storage.assert_pages_exact(&table.live_pages());
+            assert!(charged <= storage::PAGES, "step {step}");
+        }
+        assert!(parked_seen > 0, "the run never parked a page");
+        // The turns drain every queue: nothing is parked and the charge is the pages held.
+        while ram.storage.reclaim_step() {}
+        assert_eq!(ram.storage.parked_backlog(), 0);
+        let charged = ram.storage.assert_pages_exact(&table.live_pages());
+        assert_eq!(charged, table.live_pages().len() + file_pages(&ram));
+    }
+    fn file_pages(ram: &crate::Ram<'_>) -> usize {
+        [(3, 0), (4, 1)]
+            .iter()
+            .map(|&(id, _)| ram.storage.usage(payer(id)).pages as usize)
+            .sum()
     }
 
     #[test]
