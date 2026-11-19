@@ -295,6 +295,112 @@ mod tests {
         assert_eq!(events_us(e, 0), 80);
     }
 
+    /// The bound of each phase for the worst windows of two probe runs, pinned: run bd07a002
+    /// (the probe of the awake spans, before the driver's budget) and run abf7dedc (the same
+    /// formula, after it). Each row: R, l, the overruns of the service's budget over l, the
+    /// overruns of the driver's over l, the driver's term, the printed bound and its share, the
+    /// loss. The formula is the same in both runs; what differs is the overruns each window
+    /// happened to count, which E takes from the window itself.
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn the_bound_of_each_phase_is_pinned_for_two_runs() {
+        const E: u64 = 30;
+        // `k_d` is None before the driver's events were counted (run bd07a002).
+        let bound = |c: u64, l: u64, k: u64, driver: u64, k_d: Option<u64>| {
+            let events_d = k_d.map_or(0, |k_d| events_us(E, k_d));
+            bound_us(
+                service_us(c, T, B, l),
+                events_us(E, k),
+                INIT,
+                driver,
+                events_d,
+            )
+        };
+        // (name, c, R, l, k_l, driver term, k_d, bound, share, loss)
+        let rows: [(&str, u64, u64, u64, u64, u64, Option<u64>, u64, u64, u64); 6] = [
+            (
+                "bd07a002 ramfs",
+                250,
+                8017,
+                11_501,
+                6,
+                0,
+                None,
+                1_410,
+                850,
+                1_192,
+            ),
+            (
+                "bd07a002 pipe",
+                75,
+                8005,
+                10_818,
+                8,
+                0,
+                None,
+                1_005,
+                888,
+                538,
+            ),
+            (
+                "bd07a002 tty",
+                75,
+                8006,
+                11_180,
+                7,
+                531,
+                None,
+                1_476,
+                844,
+                528,
+            ),
+            (
+                "abf7dedc ramfs",
+                250,
+                8004,
+                11_470,
+                8,
+                0,
+                None,
+                1_530,
+                839,
+                1_153,
+            ),
+            ("abf7dedc pipe", 75, 8005, 11_054, 1, 0, None, 585, 931, 650),
+            (
+                "abf7dedc tty",
+                75,
+                8005,
+                11_098,
+                5,
+                375,
+                Some(1),
+                1_320,
+                858,
+                799,
+            ),
+        ];
+        for (name, c, r, l, k, driver, k_d, want, share, loss) in rows {
+            let got = bound(c, l, k, driver, k_d);
+            assert_eq!(got, want, "{name}");
+            assert_eq!(share_bound_permille(r, got), share, "{name}");
+            let _ = loss;
+        }
+        // Every window of the first run is inside its bound, and so is every one of the second
+        // but the pipe's: its window counted one overrun (E 120 us), kept 924 per mille where the
+        // bound promises 931, and lost 650 us, 65 over 585, with 538 us that no counter of the
+        // probe accounts for (serve ran 0 us over its awake spans, the driver 32).
+        for (name, _, _, _, _, _, _, want, _, loss) in rows {
+            let over = over_bound(loss, want);
+            assert_eq!(over > 0, name == "abf7dedc pipe", "{name}: {over}");
+        }
+        assert_eq!(over_bound(650, 585), 65);
+        // Counting at least the chunks of the n + 1 periods the window touches (n = 2: 6
+        // events) takes 60 us more and leaves the pipe's window 5 us over.
+        let floor = bound_us(service_us(75, T, B, 11_054), events_us(E, 2), INIT, 0, 0);
+        assert_eq!((floor, over_bound(650, floor)), (645, 5));
+    }
+
     #[test]
     fn the_control_window_is_judged_by_its_own_terms() {
         // Worst window of the control phase of the run: 10 ms, C 250, loss 620 from the median
