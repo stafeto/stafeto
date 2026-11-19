@@ -1616,16 +1616,13 @@ impl Server {
                     }
                     // A new file needs write and search on its parent, room in it, and the reserve.
                     let (parent, _) = split(path);
-                    let parent_attr = found
-                        .parent
-                        .ok_or_else(|| p::code(p::NO_ENTRY))?
-                        .attr
-                        .perm(Kind::Directory);
+                    let parent_record = found.parent.ok_or_else(|| p::code(p::NO_ENTRY))?;
+                    let parent_attr = parent_record.attr.perm(Kind::Directory);
                     perm::place_allowed(id, &parent_attr, None).map_err(denied)?;
                     self.room_in_dir(fs, parent)?;
                     self.reserve_allows(fs, caller)?;
                     created = Some((
-                        parent_attr,
+                        parent_record,
                         self.new_record(fs, caller, &parent_attr, Kind::File, mode)?,
                     ));
                 }
@@ -1653,10 +1650,10 @@ impl Server {
                         }
                         // The name exists: the count and the directory's time follow now, whatever
                         // comes after.
-                        if created.is_some() {
+                        if let Some((parent_record, _)) = &created {
                             let (parent, _) = split(path);
                             self.count_add(parent, 1);
-                            self.touch(fs, parent);
+                            self.touch(fs, parent, *parent_record);
                         }
                         let mut node = Node {
                             used: true,

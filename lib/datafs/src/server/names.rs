@@ -204,10 +204,10 @@ impl Server {
 
     /// The directory at `path` has its `mtime` and `ctime` set to now (rule 10): a name was added,
     /// removed or renamed in it. A record this service cannot rewrite is left as it is.
-    pub(super) fn touch<D: Device>(&mut self, fs: &mut Fs<'_, D>, path: &[u8]) {
-        if let Ok(entry) = entry_of(fs, path, Kind::Directory)
-            && entry.standing != Standing::Foreign
-        {
+    /// `entry` is the record of the directory as the walk of the call read it: the call changed no
+    /// attribute of it since, so it is not read again.
+    pub(super) fn touch<D: Device>(&mut self, fs: &mut Fs<'_, D>, path: &[u8], entry: Record) {
+        if entry.standing != Standing::Foreign {
             let mut attr = entry.attr;
             attr.mtime = self.now;
             attr.ctime = self.now;
@@ -276,11 +276,8 @@ impl Server {
         }
         let found = self.lookup(fs, caller, false, path)?;
         let (parent, _) = split(path);
-        let parent_attr = found
-            .parent
-            .ok_or_else(|| p::code(p::NO_ENTRY))?
-            .attr
-            .perm(Kind::Directory);
+        let parent_record = found.parent.ok_or_else(|| p::code(p::NO_ENTRY))?;
+        let parent_attr = parent_record.attr.perm(Kind::Directory);
         perm::place_allowed(caller.identity(false), &parent_attr, None).map_err(denied)?;
         if found.last.is_some() {
             return Err(p::code(p::EXISTS));
@@ -296,7 +293,7 @@ impl Server {
             return Err(status_of(e));
         }
         self.count_add(parent, 1);
-        self.touch(fs, parent);
+        self.touch(fs, parent, parent_record);
         Ok(())
     }
 
@@ -312,11 +309,8 @@ impl Server {
         }
         let found = self.lookup(fs, caller, false, path)?;
         let (parent, _) = split(path);
-        let parent_attr = found
-            .parent
-            .ok_or_else(|| p::code(p::NO_ENTRY))?
-            .attr
-            .perm(Kind::Directory);
+        let parent_record = found.parent.ok_or_else(|| p::code(p::NO_ENTRY))?;
+        let parent_attr = parent_record.attr.perm(Kind::Directory);
         let (info, entry) = found.last.ok_or_else(|| p::code(p::NO_ENTRY))?;
         perm::remove_allowed(
             caller.identity(false),
@@ -349,7 +343,7 @@ impl Server {
             }
         }
         self.count_add(parent, -1);
-        self.touch(fs, parent);
+        self.touch(fs, parent, parent_record);
         Ok(())
     }
 
@@ -369,16 +363,10 @@ impl Server {
         let to_found = self.lookup(fs, caller, false, to)?;
         let (from_parent, _) = split(from);
         let (to_parent, _) = split(to);
-        let from_attr = from_found
-            .parent
-            .ok_or_else(|| p::code(p::NO_ENTRY))?
-            .attr
-            .perm(Kind::Directory);
-        let to_attr = to_found
-            .parent
-            .ok_or_else(|| p::code(p::NO_ENTRY))?
-            .attr
-            .perm(Kind::Directory);
+        let from_record = from_found.parent.ok_or_else(|| p::code(p::NO_ENTRY))?;
+        let to_record = to_found.parent.ok_or_else(|| p::code(p::NO_ENTRY))?;
+        let from_attr = from_record.attr.perm(Kind::Directory);
+        let to_attr = to_record.attr.perm(Kind::Directory);
         let (source, source_entry) = from_found.last.ok_or_else(|| p::code(p::NO_ENTRY))?;
         // A directory into its own subtree is INVALID; a file has no subtree (a path through it
         // already failed the search with NOT_DIRECTORY).
@@ -473,9 +461,9 @@ impl Server {
         if target_entry.is_some() && from_parent != to_parent {
             // The replaced name is gone from the destination and the source's name came: no change.
         }
-        self.touch(fs, from_parent);
+        self.touch(fs, from_parent, from_record);
         if to_parent != from_parent {
-            self.touch(fs, to_parent);
+            self.touch(fs, to_parent, to_record);
         }
         Ok(())
     }
