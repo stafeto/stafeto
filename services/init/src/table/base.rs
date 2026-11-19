@@ -8,8 +8,9 @@
 //! service and the network service, so the shell and its commands reach the
 //! screen and the network, and has the larger quota of the two tables
 //! (`NET_COMMAND_QUOTA`) and waits for the package service to say READY before
-//! it starts the shell; the process service has the pool of the network
-//! image. The disk service and the package service close the table.
+//! it starts the shell; the process service has the pool that init sizes at
+//! boot (`INIT_RESERVE_PAGES`, `POOL_MIN_PAGES`). The disk service and the
+//! package service close the table.
 
 use super::doom;
 use super::net::{NET_COMMAND_QUOTA, NET_PROCESS_SERVICE, NETD};
@@ -56,67 +57,58 @@ pub const LAUNCHER: Record = Record {
     ..doom::TABLE[5]
 };
 
-/// The command quotas of the pool of the process service of the base and the
-/// full image: the network image's sixteen less two, which the package service
-/// takes (its 16 896 pages of quota, the disk service's 64 and the table
-/// itself are out of init's 127 789 pages on 512 MiB). Nothing of the shell,
-/// `httpd` or a reload of nginx (nine processes, 30 440 pages) needs more than
-/// the 14 x 4 096 pages less `PIXMAN_PAGES` and `DISPLAY_POOL_PAGES` that the
-/// pool has.
-pub const COMMAND_QUOTAS: u64 = 14;
+/// The pages init keeps free after the services started (the line `init:
+/// free pages`): the restarts of all the records that restart, each while its
+/// clients still hold the old instance, and the DMA objects one device that
+/// did not stop leaves behind (`Instance::keep_dma`). `cargo xtask
+/// init-reserve` checks that the sum of the restart needs of those records,
+/// plus the largest DMA leak of one of them, fits it, and `cargo xtask
+/// pkg-identity` that init's free pages stay at or above it. The EC2 table's
+/// memory budget (`aws.rs`) counts the same reserve.
+pub const INIT_RESERVE_PAGES: u64 = 16_384;
 
-/// The pages the pool of the process service gave up for the compositor's
-/// pixman (stage G2 of the graphics design): the code of pixman is in the
-/// boot image and again in the process that runs it, together with its arena
-/// and the larger stack of the compositor, and the base image kept only 56
-/// pages over the 16 384 that `cargo xtask pkg-identity` asks for. The pool
-/// is tens of thousands of pages and the heaviest command (a reload of nginx,
-/// nine processes) needs 30 440, so it gives them up.
-///
-/// The NEON paths of pixman (`tools/build-pixman.py`) made the compositor's loaded segments 51
-/// pages larger (118 pages against 67 of the portable paths) and its file in the boot image 56
-/// pages larger: `boot-base.img` fell from 16 392 to 16 285 free pages, under the 16 384, and the
-/// 110 pages added here (150 to 260) bring it to 16 395.
-pub const PIXMAN_PAGES: u64 = 260 * crate::PAGE;
+/// The pages of init's quota that init's own start-up spends and its sum of
+/// the records does not see (kernel objects of the loads). Init keeps
+/// them free on top of `INIT_RESERVE_PAGES`; when `pkg-identity` reports
+/// fewer free pages than the reserve, raise this by the difference.
+pub const INIT_SLACK_PAGES: u64 = 64;
 
-/// The pages the pool of the process service gave up for the display
-/// driver's growth (stage G3 of the graphics design), counted by what init
-/// pays and measured on the base image: `pool`, 256 pages, and `cursor`, 4
-/// pages, which init makes and pays from its own quota like `fb` (260); the
-/// driver's code, which grew by 2 pages in the image and 2 pages loaded
-/// (4, from the loaded segments of `virtio-gpu` before and after, and the
-/// `init: free pages` lines of main, 16 387 of 127 332, and of this change,
-/// 16 383 of 127 330 without this give-up); and a margin of 4. The base
-/// image had 3 pages over the 16 384 that `cargo xtask pkg-identity` asks
-/// for; the figure is the change's own and is independent of `PIXMAN_PAGES`.
-/// The compositor still has the 250 pages of its own buffer for the first
-/// revision of the protocol until it shows the driver's pool directly (a
-/// later step), which takes the 250 back. The pool is far larger than the
-/// heaviest command needs.
-pub const DISPLAY_POOL_PAGES: u64 = 268 * crate::PAGE;
+/// The least pool of the process service: its 640 pages, the dialog pool of
+/// 10 520 and ten quotas of 4 096 pages, which hold `httpd` with eight
+/// children, its server and the shell (a reload of nginx takes 30 440 pages
+/// of them, and the shell 4 096). Init sizes the pool at boot as the
+/// remainder of its quota above `INIT_RESERVE_PAGES` (`init::quota::pool_pages`)
+/// and never under this; a remainder under it prints a line that says by how
+/// much, and `pkg-identity` fails on it.
+pub const POOL_MIN_PAGES: u64 = 640 + 10_520 + 10 * 4_096;
 
-/// The process service of the base and the full image: the pool of the
-/// network image with `COMMAND_QUOTAS` quotas of a command.
+// The pages above are what the table's own numbers give.
+const _: () = assert!(
+    POOL_MIN_PAGES * crate::PAGE
+        == super::ramfs::POSIX_ABI_TABLE[1].quota
+            + super::ramfs::BUSYBOX_DIALOG_POOL
+            + 10 * NET_COMMAND_QUOTA
+);
+
+/// The process service of the base and the full image. Its quota here is the
+/// minimum pool: init replaces it at boot with the pool it sizes
+/// (`Init::size_pool`).
 pub const BASE_PROCESS_SERVICE: Record = Record {
-    quota: super::ramfs::POSIX_ABI_TABLE[1].quota
-        + super::ramfs::BUSYBOX_DIALOG_POOL
-        + COMMAND_QUOTAS * NET_COMMAND_QUOTA
-        - PIXMAN_PAGES
-        - DISPLAY_POOL_PAGES,
+    quota: POOL_MIN_PAGES * crate::PAGE,
     ..NET_PROCESS_SERVICE
 };
 
 /// The table of the base and the full image.
 ///
-/// What init has free after the services started (the line `init: free pages`,
-/// kept from 16 384 by `cargo xtask pkg-identity`): `boot-base.img` 16 416 pages of
-/// 127 341 on 512 MiB (16 813 before the compositor took its quota of 336 pages, 16 440 before
-/// pixman took 64 pages of the compositor's quota and its code in the boot image and in the
-/// process, which `PIXMAN_PAGES` of the process pool paid; 16 387 of 127 332 on main at 227de814, the figure the display driver's growth `DISPLAY_POOL_PAGES` is counted from); `boot-full.img` 15 837 of 116 988 on 512 MiB, because its container
-/// of 54 MB leaves the memory of init about 11 000 pages smaller than the base image's, and the
-/// pool of the process service (16 quotas of 4 096 pages) stays; so the full image runs on 1 GiB
-/// (xtask `base_image::machine`), where the number is the one in docs/packages.md. The disk
-/// and package services come out of the same number.
+/// What init has free after the services started (the line `init: free pages`)
+/// is `INIT_RESERVE_PAGES` and the little over it that `INIT_SLACK_PAGES`
+/// keeps: init gives the pool of the process service everything above them
+/// (`Init::size_pool`), so a service that grows takes its pages from the
+/// pool and nothing is balanced by hand. `cargo xtask pkg-identity` holds the
+/// image to the reserve. The full image's container of 54 MB leaves the memory of init
+/// about 11 000 pages smaller than the base image's, so it runs on 1 GiB
+/// (xtask `base_image::machine`). The disk and package services come out of
+/// the same number.
 pub const BASE_TABLE: &[Record] = &[
     doom::TABLE[0],
     doom::TABLE[1],
