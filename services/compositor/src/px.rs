@@ -71,6 +71,20 @@ pub mod cost {
         large_best: AtomicU64,
         large_best_points: AtomicU64,
         large_worst: AtomicU64,
+        /// The three prices of the model `call + rows * row + points * point`,
+        /// each the greatest over its class of operations, and how many there
+        /// were: the call (one row, 8 points or fewer), the row (at most 16
+        /// points wide, at least 8 rows) hundredths of a tick a row with the call
+        /// taken off, the point (1 024 points or more) hundredths of a tick with
+        /// the call and the rows taken off. The row and the point take off the
+        /// greatest call and row known when the operation came, which can only
+        /// be less than the final ones: the figure never falls short.
+        call_g: AtomicU64,
+        row_g: AtomicU64,
+        point_g: AtomicU64,
+        call_n: AtomicU64,
+        row_n: AtomicU64,
+        point_n: AtomicU64,
     }
 
     static KINDS: [Kind; 3] = [const {
@@ -86,15 +100,45 @@ pub mod cost {
             large_best: AtomicU64::new(u64::MAX),
             large_best_points: AtomicU64::new(0),
             large_worst: AtomicU64::new(0),
+            call_g: AtomicU64::new(0),
+            row_g: AtomicU64::new(0),
+            point_g: AtomicU64::new(0),
+            call_n: AtomicU64::new(0),
+            row_n: AtomicU64::new(0),
+            point_n: AtomicU64::new(0),
         }
     }; 3];
     /// Frames done, and whether the one that just ended is yet to be told.
     static FRAMES: AtomicU32 = AtomicU32::new(0);
     static DUE: AtomicU32 = AtomicU32::new(0);
 
-    /// One operation of `points` points that took `ticks`.
-    pub fn record(kind: usize, points: u64, ticks: u64) {
+    /// The classes of the model: the call is an operation of one row and 8
+    /// points or fewer, the row one at most 16 points wide and at least 8 rows,
+    /// the point one of 1 024 points or more.
+    const CALL_POINTS: u64 = 8;
+    const ROW_WIDTH: u64 = 16;
+    const ROW_ROWS: u64 = 8;
+    const POINT_POINTS: u64 = 1_024;
+
+    /// One operation of `width` by `height` points that took `ticks`.
+    pub fn record(kind: usize, width: u64, height: u64, ticks: u64) {
+        let points = width * height;
         let k = &KINDS[kind];
+        if height == 1 && points <= CALL_POINTS {
+            k.call_n.fetch_add(1, Ordering::Relaxed);
+            k.call_g.fetch_max(ticks, Ordering::Relaxed);
+        }
+        if width <= ROW_WIDTH && height >= ROW_ROWS {
+            k.row_n.fetch_add(1, Ordering::Relaxed);
+            let net = ticks.saturating_sub(k.call_g.load(Ordering::Relaxed));
+            k.row_g.fetch_max(net * 100 / height, Ordering::Relaxed);
+        }
+        if points >= POINT_POINTS {
+            k.point_n.fetch_add(1, Ordering::Relaxed);
+            let rows = k.row_g.load(Ordering::Relaxed) * height / 100;
+            let net = ticks.saturating_sub(k.call_g.load(Ordering::Relaxed) + rows);
+            k.point_g.fetch_max(net * 100 / points, Ordering::Relaxed);
+        }
         k.calls.fetch_add(1, Ordering::Relaxed);
         k.points.fetch_add(points, Ordering::Relaxed);
         k.ticks.fetch_add(ticks, Ordering::Relaxed);
@@ -127,7 +171,7 @@ pub mod cost {
     /// Runs after each step of the loop (rt::service::step_after): at the
     /// 1st, 2nd, 4th, 8th... frame it tells the totals so far, a line for
     /// each kind that has been drawn: `service raster: 17 KIND calls C
-    /// points P ticks T big B W small S L large N B P W`, B and W the least and the
+    /// points P ticks T big B W small S L large N B P W price C R P NC NR NP`, B and W the least and the
     /// greatest ticks a hundred points of an operation of BIG points or more, S
     /// and L the least and the greatest ticks of an operation of SMALL points or
     /// fewer (0 when there was none), then, over the operations of LARGE points
@@ -135,7 +179,10 @@ pub mod cost {
     /// points P of the operation that made it, and the greatest W. The
     /// greatest values include the preemption of a higher level in the middle
     /// of an operation; the least do not. The price of a point is B less the
-    /// call S, a hundred over P; the call is S.
+    /// call S, a hundred over P; the call is S. Then the three prices of the
+    /// model (`record`), each the greatest over its class and the operations of
+    /// each class: C the call in ticks, R the row and P the point in hundredths of
+    /// a tick.
     pub fn tell() {
         if DUE.swap(0, Ordering::Relaxed) == 0 {
             return;
@@ -150,7 +197,7 @@ pub mod cost {
                 continue;
             }
             rt::println!(
-                "service raster: 17 {name} calls {calls} points {} ticks {} big {} {} small {} {} large {} {} {} {}",
+                "service raster: 17 {name} calls {calls} points {} ticks {} big {} {} small {} {} large {} {} {} {} price {} {} {} {} {} {}",
                 k.points.load(Ordering::Relaxed),
                 k.ticks.load(Ordering::Relaxed),
                 zero(k.big_best.load(Ordering::Relaxed)),
@@ -161,6 +208,12 @@ pub mod cost {
                 zero(k.large_best.load(Ordering::Relaxed)),
                 k.large_best_points.load(Ordering::Relaxed),
                 k.large_worst.load(Ordering::Relaxed),
+                k.call_g.load(Ordering::Relaxed),
+                k.row_g.load(Ordering::Relaxed),
+                k.point_g.load(Ordering::Relaxed),
+                k.call_n.load(Ordering::Relaxed),
+                k.row_n.load(Ordering::Relaxed),
+                k.point_n.load(Ordering::Relaxed),
             );
         }
     }
@@ -236,7 +289,8 @@ impl Raster for Pixman {
         #[cfg(feature = "steps")]
         cost::record(
             cost::BLACK,
-            u64::from(r.w) * u64::from(r.h),
+            u64::from(r.w),
+            u64::from(r.h),
             rt::time::now() - began,
         );
     }
@@ -275,7 +329,8 @@ impl Raster for Pixman {
         #[cfg(feature = "steps")]
         cost::record(
             if over { cost::OVER } else { cost::COPY },
-            u64::from(area.0) * u64::from(area.1),
+            u64::from(area.0),
+            u64::from(area.1),
             rt::time::now() - began,
         );
     }

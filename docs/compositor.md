@@ -295,11 +295,13 @@ of clients pass between bands). A band that only copies is nine lines of the
 damage's width under a window that covers the damage (at most 16 lines), and
 fewer where it starts black. A band that lays something
 over others (a window with an alpha, the pointer's picture) holds fewer points:
-each shown window that touches the damage is a call of pixman (1 495 ticks)
-and a price a point (`compositor::PRICES`: 2.19 ticks for a copy, 20.13 for a
-layer laid over others, 3.22 for the black; each is a measure of the layer on
-pixman's NEON paths with a margin of 15 %, and the table holds the measure
-beside its constant), and a band holds the points that 15 000 ticks leave after its
+each shown window that touches the damage is a call of pixman, a price for each
+of its lines and a price for each of its points (`compositor::PRICES`: the call
+in ticks, the line and the point in hundredths of a tick, for a copy, a layer
+laid over others and the black; each is the greatest of its class of operations
+measured under -icount with a margin of 15 %, or an estimate kept high until a
+probe measures it, and the table says which), and a band holds the lines of the
+damage's width that 15 000 ticks leave after its
 calls, down the damage and across it, so that eight windows in one band stay
 under the bound, and then goes to the driver
 as COMMIT of the changed rectangle. COMMIT is proto_gpu's second revision:
