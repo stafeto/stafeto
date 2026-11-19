@@ -35,7 +35,11 @@
 //! and no other time. A manager (a program the
 //! table gives a session marked MANAGER_MARK) moves, raises and hides the
 //! windows and gives one the focus; a session marked INPUT_MARK injects
-//! events as a device would. It ends with a code of its own when the driver
+//! events as a device would. The pointer's picture is the display's cursor
+//! when the driver has a cursor pipeline (proto_gpu revision 3): the service
+//! draws the arrow into the cursor source once at the opening of the screen
+//! and sends one LAYERS per step of input that moved the pointer, never
+//! inside a frame. It ends with a code of its own when the driver
 //! goes (every session it gave is dead then); init starts it again.
 
 #![no_std]
@@ -52,8 +56,9 @@ use proto_comp::{
     MAX_EVENTS, Method as Comp, Post, Rect, SHOWN, WindowRecord, manage,
 };
 use proto_gpu::{
-    BUFFER_BYTES, BUSY, CLEARING, FRAME_FAILED, FRAME_SHOWN, HEIGHT, IO, Method as Gpu, NO_DEVICE,
-    NO_INPUT, NOT_ALLOWED, SCREEN_BYTES, Screen, VERSION, WIDTH, code,
+    BUFFER_BYTES, BUSY, CLEARING, FORMATS_ARGB8888, FRAME_FAILED, FRAME_SHOWN, HEIGHT, IO,
+    KIND_CURSOR, Layers, Method as Gpu, NO_DEVICE, NO_INPUT, NOT_ALLOWED, Pipelines, SCREEN_BYTES,
+    SOURCE_KIND_CURSOR, Screen, SourceInfo, VERSION, WIDTH, code,
 };
 use proto_init::ServiceArgs;
 use proto_input::{ABS_MAX, ABS_X, ABS_Y, EV_ABS, EV_KEY, Method as InputMethod};
@@ -75,6 +80,10 @@ const BUF_AT: usize = 0x11_0000_0000;
 /// Where the service maps the buffer it made for the window of the first
 /// revision, for reading and writing, for its whole life.
 const LEGACY_AT: usize = 0x12_0000_0000;
+/// Where the service maps the cursor's picture (source 3 of the driver),
+/// past the legacy buffer inside the same 2 MiB span, so that its page
+/// table is the one the legacy buffer already pays for.
+const CURSOR_AT: usize = 0x12_0010_0000;
 const PAGE: usize = 4096;
 /// The pages one step of the service maps or unmaps at most: a page costs
 /// the kernel about 200 ticks of a mapping and 80 of an unmapping, and a
@@ -480,6 +489,7 @@ impl Compositor {
         }
         // The mapping keeps the object; the handle is not needed.
         drop(fb);
+        self.take_cursor_plane(&owner);
         self.screen = Some(owner);
         rt::println!(
             "compositor: screen ready, {}x{}, stride {}",
@@ -488,6 +498,102 @@ impl Compositor {
             screen.stride
         );
         Ok(())
+    }
+
+    /// Puts the pointer on the display's cursor pipeline when the driver has
+    /// one: PIPELINES, the record of kind CURSOR, SOURCE of the cursor
+    /// picture, the object mapped, the arrow drawn into it once. Any
+    /// refusal leaves the pointer drawn into the frame, as before. Two
+    /// calls to the driver and a mapping of four pages, so it belongs to the
+    /// opening of the screen, which no frame is waiting for.
+    fn take_cursor_plane(&mut self, owner: &Handle<Channel>) {
+        match self.cursor_picture(owner) {
+            Ok(plane) => {
+                self.scene.set_cursor_plane(Some(plane));
+                rt::println!("compositor: the pointer is on the cursor pipeline");
+            }
+            Err(why) => rt::println!("compositor: the pointer is drawn in the frame: {why}"),
+        }
+    }
+
+    /// The pipeline and the source of the cursor, with the picture in place.
+    fn cursor_picture(&mut self, owner: &Handle<Channel>) -> Result<(u32, u32), &'static str> {
+        let mut buffer = [0; MESSAGE_MAX];
+        let mut request = Writer::new();
+        Pipelines::write_request(&mut request).map_err(|_| "PIPELINES")?;
+        let reply = sys::send(owner, request.as_bytes()).map_err(|_| "PIPELINES failed")?;
+        let list = Pipelines::read(reply.bytes(&mut buffer)).map_err(|_| "no PIPELINES")?;
+        let pipeline = *list
+            .as_slice()
+            .iter()
+            .find(|p| p.kind == KIND_CURSOR && p.formats & FORMATS_ARGB8888 != 0)
+            .ok_or("no cursor pipeline")?;
+        let mut request = Writer::new();
+        SourceInfo::write_request(SOURCE_KIND_CURSOR, &mut request).map_err(|_| "SOURCE")?;
+        let mut reply = sys::send(owner, request.as_bytes()).map_err(|_| "SOURCE failed")?;
+        let source = SourceInfo::read(reply.bytes(&mut buffer)).map_err(|_| "SOURCE refused")?;
+        let object = reply.handles.take::<Memory>(0).map_err(|_| "no object")?;
+        let bytes = u64::from(source.stride) * u64::from(source.height);
+        if !source.suits(&pipeline)
+            || source.width < compositor::CURSOR_W
+            || source.height < compositor::CURSOR_H
+            || bytes > (4 * PAGE) as u64
+        {
+            return Err("the cursor source does not suit");
+        }
+        sys::mem_map(
+            &self.process,
+            &object,
+            0,
+            bytes,
+            CURSOR_AT,
+            Access::ReadWrite,
+        )
+        .map_err(|_| "the picture cannot be mapped")?;
+        // SAFETY: the object was mapped for reading and writing at CURSOR_AT
+        // for `bytes` bytes just above, and nothing else in this thread
+        // holds the range.
+        let picture = unsafe { slice::from_raw_parts_mut(CURSOR_AT as *mut u8, bytes as usize) };
+        let line = (compositor::CURSOR_W * 4) as usize;
+        for (y, row) in compositor::CURSOR.chunks(line).enumerate() {
+            let at = y * source.stride as usize;
+            picture[at..at + line].copy_from_slice(row);
+        }
+        // The mapping keeps the object.
+        drop(object);
+        Ok((pipeline.id, source.id))
+    }
+
+    /// The cursor to the pointer: one LAYERS of the cursor pipeline alone
+    /// when the pointer's place or visibility changed since the last one
+    /// the driver took, however many moves the step's events made. The
+    /// driver takes it at once (it queues the move for the device) and
+    /// merges moves itself, so the step never waits for the device. A
+    /// refusal is asked again at the next step of input.
+    fn move_cursor(&mut self) {
+        let Some(row) = self.scene.cursor_row() else {
+            return;
+        };
+        let Some(owner) = &self.screen else {
+            return;
+        };
+        let mut request = Writer::new();
+        let wrote = Layers::new(&[row])
+            .and_then(|layers| layers.write(&mut request))
+            .map_err(|_| Error::InvalidArgs);
+        let sent = wrote.and_then(|()| sys::send(owner, request.as_bytes()));
+        match sent {
+            Ok(reply) => {
+                let mut buffer = [0; MESSAGE_MAX];
+                if status_of(reply.bytes(&mut buffer)) == Some(Status::Ok) {
+                    self.scene.cursor_shown(&row);
+                } else {
+                    rt::println!("compositor: the cursor LAYERS was refused");
+                }
+            }
+            Err(Error::PeerClosed) => self.driver_gone(),
+            Err(_) => {}
+        }
     }
 
     /// `open_screen`, again every few milliseconds while the driver says it
@@ -636,6 +742,7 @@ impl Compositor {
             self.route(which, *e);
         }
         self.pointer_to_axes();
+        self.move_cursor();
         if n == READ_MAX as usize {
             let _ = sys::notify(&self.notify, INPUT);
         }
@@ -1136,7 +1243,8 @@ impl Compositor {
             width: WIDTH,
             height: HEIGHT,
             format: proto_comp::FORMAT_XRGB8888,
-            flags: u32::from(self.scene.has_manager()),
+            flags: (u32::from(self.scene.has_manager()) * proto_comp::HAS_MANAGER)
+                | (u32::from(self.scene.cursor_plane()) * proto_comp::CURSOR_PLANE),
             open: self.scene.open(),
             created: self.scene.created(),
             frames: self.scene.frames(),
@@ -1425,6 +1533,7 @@ impl Compositor {
             return Answer::Status(Status::BadSize);
         }
         self.scene.inject(event);
+        self.move_cursor();
         self.kick();
         Answer::Status(Status::Ok)
     }

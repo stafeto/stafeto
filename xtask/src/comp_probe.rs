@@ -132,7 +132,7 @@ const CHECKS: [(&str, usize); 20] = [
 
 /// The tags of the lines of steps (rt::service::report_steps): the driver's
 /// and the compositor's.
-const DRIVER_TAG: &str = "12";
+pub const DRIVER_TAG: &str = "12";
 pub const COMP_TAG: &str = "17";
 /// The kinds of the compositor's steps that must come: OPEN and FLUSH of
 /// proto_gpu, DESCRIBE, WINDOW_CREATE, ATTACH and POST of proto_comp, and
@@ -146,8 +146,17 @@ const COMP_KINDS: [(usize, &str); 7] = [
     (20, "Post"),
     (65, "a band of a frame and the end of a frame"),
 ];
-/// The driver's: SUBSCRIBE, COMMIT, and its own (the interrupt).
-const DRIVER_KINDS: [(usize, &str); 3] = [(5, "Subscribe"), (6, "Commit"), (65, "the interrupt")];
+/// The driver's: SUBSCRIBE, COMMIT, PIPELINES and SOURCE (the compositor
+/// asks both when it opens the screen, to put the pointer on the cursor
+/// pipeline), and its own (the interrupt). LAYERS needs the pointer, which
+/// this image has none of (focus-probe's does).
+const DRIVER_KINDS: [(usize, &str); 5] = [
+    (5, "Subscribe"),
+    (6, "Commit"),
+    (9, "Pipelines"),
+    (10, "Source"),
+    (65, "the interrupt"),
+];
 
 /// Judges the lines of a run: the compositor and the driver started and
 /// were ready once, every check of the clients passed once, none failed,
