@@ -6506,7 +6506,12 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
     let ended = run.expect_line(
         "the PID lifetime probe to exit",
         |line| line.starts_with("init: posix-procs ended:"),
-        Duration::from_secs(30),
+        // The page probe builds its 64-page shape three times.
+        Duration::from_secs(if probe == LifetimeProbe::Pages {
+            60
+        } else {
+            30
+        }),
     );
     let mut outcome = run.stop();
     // A line of the audit of ramfs or of the services' timing may land inside a long line.
