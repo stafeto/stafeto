@@ -62,7 +62,7 @@ use proto_comp::{
 use proto_gpu::{
     BUFFER_BYTES, BUSY, CLEARING, FORMATS_ARGB8888, FORMATS_XRGB8888, FRAME_FAILED, FRAME_SHOWN,
     HEIGHT, IO, KIND_CURSOR, KIND_PRIMARY, LayerRow, Layers, Method as Gpu, NO_DEVICE, NO_INPUT,
-    NOT_ALLOWED, PIPELINE_FULL_SCREEN, Pipelines, SCREEN_BYTES, SOURCE_KIND_CURSOR,
+    NOT_ALLOWED, PIPELINE_FULL_SCREEN, Pipeline, Pipelines, SCREEN_BYTES, SOURCE_KIND_CURSOR,
     SOURCE_KIND_POOL, SOURCE_POOL, SOURCE_TARGET, Screen, SourceInfo, VERSION, WIDTH, code,
 };
 use proto_init::ServiceArgs;
@@ -84,8 +84,8 @@ const FB_AT: usize = 0x10_0100_0000;
 const BUF_AT: usize = 0x11_0000_0000;
 /// Where the service maps the pool (source 2 of the driver), the buffer of
 /// the window of the first revision, for reading and writing, for its whole
-/// life. The mapping is the 250 pages the source describes (POOL_LEN), not
-/// the whole 256 pages of the object, so it ends at 0x12_000F_A000 and the
+/// life. The mapping covers the 250 pages the source describes (POOL_LEN) of
+/// the object's 256, so it ends at 0x12_000F_A000 and the
 /// six pages up to CURSOR_AT stay unmapped: a guard gap between the two
 /// objects. Both lie in the 2 MiB span 0x12_0000_0000 to 0x12_0020_0000, one
 /// page table, the one the service's own buffer of the first revision used
@@ -285,10 +285,31 @@ struct Job {
 /// DUPLICATE (the driver gives it to the owner so), and each window gets a
 /// copy without it; `refs` is the number of references the object had right
 /// after the mapping (init's, the driver's two and the service's two): more
-/// of them mean a program kept a copy of an earlier window's buffer.
+/// of them mean a program kept a copy of an earlier window's buffer. `dirty`
+/// says a program may have written into the pool since the last clearing
+/// that ended with no copy out (`compositor::pool_open`).
 struct Pool {
     handle: Handle<Memory>,
     refs: u64,
+    dirty: bool,
+}
+
+/// Where the pool is.
+enum PoolState {
+    /// The service has none and asks no more: the driver has no primary
+    /// pipeline that suits, or its source does not.
+    None,
+    /// SOURCE was BUSY (a program kept a copy of the pool of an earlier
+    /// screen, as after the service ended while Doom ran): it is asked again
+    /// at OPEN.
+    Retry,
+    /// The object is being mapped, a chunk of pages a step of the work
+    /// (`done` pages so far): OPEN says CLEARING meanwhile.
+    Mapping {
+        handle: Handle<Memory>,
+        done: usize,
+    },
+    Ready(Pool),
 }
 
 struct Compositor {
@@ -323,10 +344,9 @@ struct Compositor {
     /// gave none (OPEN is BUSY then). It is cleared a step at a time once its
     /// window has gone and the display does not show it (`cleared`: the
     /// bytes done, None when it is clean).
-    pool: Option<Pool>,
-    /// The id of the driver's primary pipeline, when the display can show
-    /// the pool.
-    primary: u32,
+    pool: PoolState,
+    /// The driver's primary pipeline, when it can show the pool.
+    primary: Option<Pipeline>,
     cleared: Option<usize>,
     attaching: Option<Attaching>,
 }
@@ -369,8 +389,8 @@ fn main(_: u64) -> u64 {
         axes: Axes::default(),
         manager: None,
         manager_label: 0,
-        pool: None,
-        primary: 0,
+        pool: PoolState::None,
+        primary: None,
         cleared: None,
         attaching: None,
     };
@@ -550,16 +570,17 @@ impl Compositor {
             Err(why) => rt::println!("compositor: the pointer is drawn in the frame: {why}"),
         }
         match self.pool_source(owner, &list) {
-            Ok(()) => rt::println!("compositor: the pool is the buffer of the first revision"),
+            Ok(()) => {}
             Err(why) => {
                 rt::println!("compositor: no pool for the window of the first revision: {why}");
             }
         }
     }
 
-    /// The pool: SOURCE of kind pool, the object mapped at POOL_AT, and the
-    /// scene told the display can show it. The primary pipeline must take
-    /// the screen's whole size.
+    /// The pool: SOURCE of kind pool. The object is mapped by the steps of
+    /// the work (`map_pool_chunk`), a chunk of pages each, since 250 pages
+    /// in one step would pass the bound; OPEN says CLEARING until that is
+    /// done. The primary pipeline must take the screen's whole size.
     fn pool_source(
         &mut self,
         owner: &Handle<Channel>,
@@ -574,37 +595,84 @@ impl Compositor {
                     && p.formats & FORMATS_XRGB8888 != 0
             })
             .ok_or("no primary pipeline that takes the whole screen")?;
+        self.primary = Some(primary);
+        self.ask_pool(owner)
+    }
+
+    /// SOURCE of kind pool: the object goes to the mapping steps. A BUSY
+    /// from the driver is remembered (`PoolState::Retry`): the driver marks a
+    /// source as given only when it gives it, so OPEN may ask again once the
+    /// program that holds the old copy is gone.
+    fn ask_pool(&mut self, owner: &Handle<Channel>) -> Result<(), &'static str> {
+        let primary = self.primary.ok_or("no primary pipeline")?;
         let mut buffer = [0; MESSAGE_MAX];
         let mut request = Writer::new();
         SourceInfo::write_request(SOURCE_KIND_POOL, &mut request).map_err(|_| "SOURCE")?;
         let mut reply = sys::send(owner, request.as_bytes()).map_err(|_| "SOURCE failed")?;
-        let source = SourceInfo::read(reply.bytes(&mut buffer)).map_err(|_| "SOURCE refused")?;
+        let bytes = reply.bytes(&mut buffer);
+        if status_of(bytes) == Some(code(BUSY)) {
+            self.pool = PoolState::Retry;
+            return Err("the pool is held by a program of an earlier screen");
+        }
+        let source = SourceInfo::read(bytes).map_err(|_| "SOURCE refused")?;
         let object = reply.handles.take::<Memory>(0).map_err(|_| "no object")?;
         if source.id != SOURCE_POOL
             || !source.suits(&primary)
             || u64::from(source.stride) * u64::from(source.height) != POOL_LEN as u64
         {
+            self.pool = PoolState::None;
             return Err("the pool source does not suit");
         }
-        sys::mem_map(
-            &self.process,
-            &object,
-            0,
-            POOL_LEN as u64,
-            POOL_AT,
-            Access::ReadWrite,
-        )
-        .map_err(|_| "the pool cannot be mapped")?;
-        let refs = sys::memory_info(&object)
-            .map_err(|_| "the pool's references")?
-            .refs;
-        self.pool = Some(Pool {
+        self.pool = PoolState::Mapping {
             handle: object,
-            refs,
-        });
-        self.primary = primary.id;
-        self.scene.set_direct(true);
+            done: 0,
+        };
+        let _ = sys::notify(&self.notify, WORK);
         Ok(())
+    }
+
+    /// A chunk of the pool mapped at POOL_AT; the last one records the
+    /// references and the pool is ready (dirty: its first OPEN clears it).
+    fn map_pool_chunk(&mut self) {
+        let PoolState::Mapping { handle, done } = &mut self.pool else {
+            return;
+        };
+        let pages = CHUNK.min(POOL_LEN / PAGE - *done);
+        let mapped = sys::mem_map(
+            &self.process,
+            handle,
+            (*done * PAGE) as u64,
+            (pages * PAGE) as u64,
+            POOL_AT + *done * PAGE,
+            Access::ReadWrite,
+        );
+        if mapped.is_err() {
+            rt::println!("compositor: the pool cannot be mapped");
+            let first = *done;
+            if first != 0 {
+                // SAFETY: the pages from POOL_AT to `first` were mapped by
+                // this function in earlier steps and nothing reads them yet.
+                let _ = unsafe { sys::mem_unmap(&self.process, POOL_AT, (first * PAGE) as u64) };
+            }
+            self.pool = PoolState::None;
+            return;
+        }
+        *done += pages;
+        if *done * PAGE < POOL_LEN {
+            return;
+        }
+        let refs = sys::memory_info(handle).map_or(0, |info| info.refs);
+        let PoolState::Mapping { handle, .. } = core::mem::replace(&mut self.pool, PoolState::None)
+        else {
+            return;
+        };
+        self.pool = PoolState::Ready(Pool {
+            handle,
+            refs,
+            dirty: true,
+        });
+        self.scene.set_direct(true);
+        rt::println!("compositor: the pool is the buffer of the first revision");
     }
 
     /// The pipeline and the source of the cursor, with the picture in place.
@@ -992,14 +1060,18 @@ impl Compositor {
         let mut request = Writer::new();
         let wrote = match kind {
             FrameKind::Compose => damage.write_as(Gpu::Commit, &mut request),
-            FrameKind::Rebind => {
-                Layers::new(&[LayerRow::primary(self.primary, SOURCE_TARGET, Some(SCREEN))])
-                    .and_then(|layers| layers.write(&mut request))
-            }
-            FrameKind::Bypass => {
-                Layers::new(&[LayerRow::primary(self.primary, SOURCE_POOL, Some(damage))])
-                    .and_then(|layers| layers.write(&mut request))
-            }
+            FrameKind::Rebind => Layers::new(&[LayerRow::primary(
+                self.primary.map_or(0, |p| p.id),
+                SOURCE_TARGET,
+                Some(SCREEN),
+            )])
+            .and_then(|layers| layers.write(&mut request)),
+            FrameKind::Bypass => Layers::new(&[LayerRow::primary(
+                self.primary.map_or(0, |p| p.id),
+                SOURCE_POOL,
+                Some(damage),
+            )])
+            .and_then(|layers| layers.write(&mut request)),
         };
         let sent = wrote
             .map_err(|_| Error::InvalidArgs)
@@ -1110,7 +1182,10 @@ impl Compositor {
 
     /// Whether a step of the work is due: clearing, unmapping, mapping.
     fn has_work(&self) -> bool {
-        self.cleared.is_some() || self.attaching.is_some() || self.extra.iter().any(|e| e.dying)
+        self.cleared.is_some()
+            || matches!(self.pool, PoolState::Mapping { .. })
+            || self.attaching.is_some()
+            || self.extra.iter().any(|e| e.dying)
     }
 
     /// One step of the work: a piece of the legacy buffer cleared, else a
@@ -1129,6 +1204,15 @@ impl Compositor {
             unsafe { core::ptr::write_bytes((POOL_AT + done) as *mut u8, 0, len) };
             let done = done + len;
             self.cleared = (done < POOL_LEN).then_some(done);
+            if self.cleared.is_none()
+                && let PoolState::Ready(pool) = &mut self.pool
+            {
+                // A copy that is out can write after the clearing passed.
+                let refs = sys::memory_info(&pool.handle).map_or(u64::MAX, |info| info.refs);
+                pool.dirty = compositor::dirty_after_clearing(refs, pool.refs);
+            }
+        } else if matches!(self.pool, PoolState::Mapping { .. }) {
+            self.map_pool_chunk();
         } else if let Some(i) = self.extra.iter().position(|e| e.dying) {
             self.unmap_chunk(i);
         } else if self.attaching.is_some() {
@@ -1276,17 +1360,48 @@ impl Compositor {
         // The pool is the window's buffer. A client that closed its window and
         // kept its handle, mapped or not, or sent a copy on, still reaches
         // it: the service holds the only references it may have, its handle
-        // and its mapping. A service without the pool has no buffer to give.
-        let Some(pool) = &self.pool else {
-            return Answer::Status(code(BUSY));
-        };
-        if sys::memory_info(&pool.handle).is_ok_and(|info| info.refs > pool.refs) {
-            return Answer::Status(code(BUSY));
+        // and its mapping, and a program that kept its mapping can write
+        // after the clearing passed, so the pool is cleared again once the
+        // copy is gone (`compositor::pool_open`).
+        if matches!(self.pool, PoolState::Retry) {
+            // The driver said BUSY at the opening of the screen: ask again.
+            let asked = match self.screen.take() {
+                Some(owner) => {
+                    let asked = self.ask_pool(&owner);
+                    self.screen = Some(owner);
+                    asked
+                }
+                None => Err("no screen"),
+            };
+            return Answer::Status(if asked.is_ok() {
+                code(CLEARING)
+            } else {
+                code(BUSY)
+            });
         }
-        // The last window's buffer is being cleared, or waits for the frame
-        // that takes the screen back from it: ask again.
-        if self.cleared.is_some() || self.scene.pool_release_pending() {
-            return Answer::Status(code(CLEARING));
+        let decision = match &self.pool {
+            PoolState::Ready(pool) => {
+                let refs = sys::memory_info(&pool.handle).map_or(pool.refs, |info| info.refs);
+                compositor::pool_open(
+                    refs,
+                    pool.refs,
+                    pool.dirty,
+                    self.cleared.is_some(),
+                    self.scene.pool_release_pending(),
+                )
+            }
+            PoolState::Mapping { .. } => compositor::PoolOpen::Clearing,
+            PoolState::None | PoolState::Retry => compositor::PoolOpen::Busy,
+        };
+        match decision {
+            compositor::PoolOpen::Busy => return Answer::Status(code(BUSY)),
+            compositor::PoolOpen::Clearing => return Answer::Status(code(CLEARING)),
+            compositor::PoolOpen::StartClearing => {
+                self.cleared = Some(0);
+                let _ = sys::notify(&self.notify, WORK);
+                return Answer::Status(code(CLEARING));
+            }
+            compositor::PoolOpen::Go => {}
         }
         let Ok((label, session)) = self.window_session() else {
             return Answer::Status(Status::Kernel(Error::NoMemory));
@@ -1318,10 +1433,15 @@ impl Compositor {
             return Answer::Status(Status::BadSize);
         }
         let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
-        let client = self
-            .pool
-            .as_ref()
-            .and_then(|pool| sys::handle_duplicate(&pool.handle, rights).ok());
+        let client = match &mut self.pool {
+            PoolState::Ready(pool) => {
+                let copy = sys::handle_duplicate(&pool.handle, rights).ok();
+                // A copy is out: the program may write into the pool.
+                pool.dirty |= copy.is_some();
+                copy
+            }
+            _ => None,
+        };
         let Some(client) = client else {
             self.destroy(i);
             return Answer::Status(Status::Kernel(Error::NoMemory));

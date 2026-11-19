@@ -85,6 +85,53 @@ pub const fn wants_focus(present: bool, holds: bool) -> bool {
     present && !holds
 }
 
+/// What OPEN of the first revision does with the pool, as a decision of the
+/// pool's state alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolOpen {
+    /// A copy besides the service's own is out: BUSY.
+    Busy,
+    /// The clearing runs or waits for the frame that takes the screen back
+    /// from the pool: ask again.
+    Clearing,
+    /// The pool may hold pixels a program wrote after the last clearing
+    /// ended (a copy was given, or the pool is new): start the clearing, and
+    /// ask again.
+    StartClearing,
+    /// The pool is clean and the service's own: a window may have it.
+    Go,
+}
+
+/// The decision of OPEN. `refs` is the object's references now and `base`
+/// the count the service recorded after it mapped the pool: more means a
+/// program holds a copy. `dirty` is set when a copy is given and cleared only
+/// by a clearing that ended with no copy out (`dirty_after_clearing`), so a
+/// program that closed its window, kept its mapping and wrote after the
+/// clearing passed leaves the pool dirty until it is gone and cleared again.
+pub fn pool_open(
+    refs: u64,
+    base: u64,
+    dirty: bool,
+    clearing: bool,
+    release_pending: bool,
+) -> PoolOpen {
+    if refs > base {
+        PoolOpen::Busy
+    } else if clearing || release_pending {
+        PoolOpen::Clearing
+    } else if dirty {
+        PoolOpen::StartClearing
+    } else {
+        PoolOpen::Go
+    }
+}
+
+/// Whether the pool is still dirty when a clearing ends: it is when a copy
+/// was out then (the program could write after the clearing passed a place).
+pub const fn dirty_after_clearing(refs: u64, base: u64) -> bool {
+    refs != base
+}
+
 /// The owner byte of window place `i`.
 const fn window_owner(i: usize) -> u8 {
     i as u8 + 1
@@ -2717,6 +2764,40 @@ mod tests {
         s.post(i, 0, &[]).unwrap();
         settle(s);
         i
+    }
+
+    #[test]
+    fn open_of_the_pool_is_decided_by_references_dirt_and_clearing() {
+        // base 5 references.
+        assert_eq!(pool_open(5, 5, false, false, false), PoolOpen::Go);
+        assert_eq!(pool_open(6, 5, false, false, false), PoolOpen::Busy);
+        // Busy comes before everything else.
+        assert_eq!(pool_open(7, 5, true, true, true), PoolOpen::Busy);
+        assert_eq!(pool_open(5, 5, true, true, false), PoolOpen::Clearing);
+        assert_eq!(pool_open(5, 5, false, false, true), PoolOpen::Clearing);
+        assert_eq!(pool_open(5, 5, true, false, false), PoolOpen::StartClearing);
+    }
+
+    #[test]
+    fn a_program_that_writes_after_the_clearing_leaves_the_pool_dirty() {
+        // The window went and a program kept its mapping: BUSY, and the
+        // clearing that runs meanwhile ends with the copy out.
+        let (base, mut dirty) = (5, true);
+        assert_eq!(pool_open(6, base, dirty, false, false), PoolOpen::Busy);
+        dirty = dirty_after_clearing(6, base);
+        assert!(dirty);
+        // It writes, and exits: the pool is the service's again but dirty,
+        // so OPEN clears it and does not give it.
+        assert_eq!(
+            pool_open(5, base, dirty, false, false),
+            PoolOpen::StartClearing
+        );
+        // The clearing that ends with no copy out makes it clean.
+        dirty = dirty_after_clearing(5, base);
+        assert!(!dirty);
+        assert_eq!(pool_open(5, base, dirty, false, false), PoolOpen::Go);
+        // A copy given dirties it again (the caller sets the flag).
+        assert_eq!(pool_open(6, base, true, false, false), PoolOpen::Busy);
     }
 
     #[test]

@@ -60,16 +60,22 @@ and the header version 1 of both.
   OPEN makes a window of the whole screen over the driver's pool, the one
   buffer of the window of the first revision (a source of the driver,
   `SOURCE_KIND_POOL`: 250 pages of the 256 of its object, 640 by 400, XRGB8888,
-  asked for and mapped when the screen is opened, outside any step); FLUSH
+  asked for when the screen is opened and mapped by the steps of the work, a
+  chunk of 32 pages each, so OPEN says CLEARING until that is done); FLUSH
   posts a rectangle of it and its reply comes once the frame that shows it is on
   the screen. Doom runs as it did on the driver, without a rebuild. One such
   window lives at a time; a second OPEN is BUSY, as it was. When the window goes
   the pool is cleared in portions of 16 KiB once the display no longer shows it
   (see "The direct frame": the frame that returns the screen to the service's
-  target must be shown first), OPEN says CLEARING meanwhile, and the next window
-  finds it zero. The driver gives the owner of the screen a handle of the pool
-  with DUPLICATE (the cursor's picture has none), so the compositor hands a
-  copy without it to each window.
+  target must be shown first), and OPEN says CLEARING meanwhile. The driver gives
+  the owner of the screen a handle of the pool with DUPLICATE (the cursor's
+  picture has none), so the compositor hands a copy without it to each window.
+  A copy that is out can write into the pool after a clearing passed (a program
+  that closed its window and kept its mapping), so the service keeps a `dirty`
+  flag: it is set when a copy is given and cleared only by a clearing that ended
+  with no copy out; an OPEN that finds the pool dirty and the copies gone starts
+  the clearing and answers CLEARING (`compositor::pool_open`). The next window
+  therefore finds the pool zero.
   The buffer is shared with its client: CLOSE, or dropping the window's
   session, leaves a client that kept the handle, mapped or not, or sent a copy
   of it to another process, able to read and write the next window of the
@@ -84,8 +90,13 @@ and the header version 1 of both.
   handle, and the second revision (ATTACH) is unaffected. The driver
   (`virtio-gpu`) makes the same check for its `fb` in OPEN, and for the pool
   and the cursor's picture in SOURCE, with three references of its own: its
-  handle, its mapping and init's handle. A driver that gives no pool (an older
-  one, or a pool a program kept from an earlier screen) leaves OPEN BUSY.
+  handle, its mapping and init's handle. When SOURCE answers BUSY at the
+  opening of the screen (the service ended while Doom ran and started again,
+  and Doom still holds its copy) the service remembers it, answers BUSY to
+  OPEN, and asks SOURCE again at the next OPEN: the driver marks the source as
+  given only when it gives it, so the ask succeeds once the program is gone.
+  The mapping then starts, and OPEN says CLEARING until it is done and the pool
+  is cleared. A driver with no primary pipeline that suits leaves OPEN BUSY.
   The pool's mapping sits at 0x12_0000_0000 and ends at 0x12_000F_A000; the
   cursor's four pages are at 0x12_0010_0000, so six unmapped pages lie between
   them, in the same 2 MiB span and the same page table.
@@ -258,7 +269,12 @@ are taken, and it holds when all of these do:
    (`Scene::cursor_refused`) the pointer is back in the frame and this reads
    false from then on.
 
-A frame the rule does not allow is composed as before. The transitions:
+A frame the rule does not allow is composed as before. The plan once had a
+fifth condition, an image flag that forbids the direct frame, so that a probe
+could compare the composed and the direct screen; it was dropped. The composed
+path from the pool is covered by `comp-probe`'s `above crc` check, where a
+window over the pool's window makes the service put its pixels together. The
+transitions:
 
 - composed to direct: no band, one LAYERS row with the pool and the changed
   area (the driver transfers the whole pool when the source changes, whatever

@@ -752,14 +752,14 @@ impl Probe<'_> {
         let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
         loop {
             let d = self.describe_when_ready(&display)?;
-            if d.open == 1 && d.bypassed >= 3 && d.busy == 0 {
+            if d.open == 1 && d.bypassed >= 4 && d.busy == 0 {
                 break;
             }
             if time::ticks_to_ns(time::now()) > end {
                 return Err("the window of the first revision was never shown directly");
             }
             self.sleep(RETRY_NS);
-        };
+        }
         rt::println!("comp-probe: the window below is shown from its pool");
         let (window, _) = self
             .create(&display, SECOND, FORMAT_XRGB8888)
@@ -923,36 +923,35 @@ impl Probe<'_> {
         rt::println!(
             "comp-probe: three FLUSHes were shown from the pool, no band was put together"
         );
-        // The third client puts a window over the window: the frame is put
-        // together now.
-        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
-        let over = loop {
-            let d = self.settled(&display)?;
-            if d.open == 2 && d.bands > after.bands {
-                break d;
-            }
-            if time::ticks_to_ns(time::now()) > end {
-                return Err("the window over the pool never made the service put a frame together");
-            }
-            self.sleep(RETRY_NS);
-        };
-        if over.bypassed != after.bypassed {
-            return Err("a frame with a window above was shown directly");
+        // A fourth FLUSH: the third client starts once it has seen four frames
+        // shown directly, so the check above has been made by then.
+        flush(inside).map_err(say("the fourth FLUSH"))?;
+        let fourth = self.settled(&display)?;
+        if fourth.bands != after.bands || fourth.bypassed != after.bypassed + 1 {
+            return Err("the fourth FLUSH was not shown directly");
         }
-        rt::println!("comp-probe: a window above the pool made the service put the frame together");
-        // And goes: the screen is the pool again, with no band.
+        // The third client puts a window over the window and ends: the frame
+        // that has it is put together (`bands` grow), and the one after it
+        // went is direct again. The service may be seen only after both (the
+        // third client can end at once when it does not wait for a
+        // screenshot), so the wait is for its window to have been made and
+        // gone.
         let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
         let back = loop {
             let d = self.settled(&display)?;
-            if d.open == 1 {
+            if d.created == fourth.created + 1 && d.open == 1 {
                 break d;
             }
             if time::ticks_to_ns(time::now()) > end {
-                return Err("the window over the pool never went");
+                return Err("the window over the pool never came and went");
             }
             self.sleep(RETRY_NS);
         };
-        if back.bands != over.bands || back.bypassed != over.bypassed + 1 {
+        if back.bands <= fourth.bands {
+            return Err("a frame with a window above was not put together");
+        }
+        rt::println!("comp-probe: a window above the pool made the service put the frame together");
+        if back.bypassed != fourth.bypassed + 1 {
             return Err("the frame after the window above went was not direct");
         }
         rt::println!("comp-probe: the window above went and the pool was shown again with no band");
@@ -977,6 +976,20 @@ impl Probe<'_> {
             self.sleep(RETRY_NS);
         }
         rt::println!("comp-probe: OPEN is BUSY while a closed window's mapping is kept");
+        // The pool is cleared once the frame that took the screen back is
+        // shown, which the mapping kept here sees as zeros. The program then
+        // writes into it, as a program that kept its mapping can: the pool
+        // must be cleared again before a next window has it.
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        while points.iter().any(|&p| p != 0) {
+            if time::ticks_to_ns(time::now()) > end {
+                return Err("the closed window's buffer was never cleared");
+            }
+            self.sleep(RETRY_NS);
+        }
+        points[0] = 0x00DE_AD00;
+        points[(WIDTH * HEIGHT) as usize - 1] = 0x00BE_EF00;
+        rt::println!("comp-probe: the pool is cleared and written again through the kept mapping");
         // SAFETY: the probe uses `points` no more.
         unsafe { sys::mem_unmap(self.process, at, u64::from(proto_gpu::SCREEN_BYTES)) }
             .map_err(say("unmap"))?;

@@ -372,7 +372,10 @@ fn title_crc_fault(line: &str) -> Option<String> {
 /// The device's trace of a run of Doom: the scanout was the target (OPEN),
 /// then the pool (Doom's window covers the screen with nothing above it, so
 /// the display shows its buffer as it is, from the title on, the level
-/// included), then the target again (Doom left).
+/// included), then the target again (Doom left). The probe opens three Doom
+/// windows (the first to the end of its menu, the second in the background,
+/// the third ended by Ctrl-C), each reaching its title, so the sequence is
+/// 1, then 2 and 1 three times.
 fn doom_trace_verdict(events: &[qemu::GpuTrace]) -> Result<(), String> {
     let scanouts: Vec<u32> = events
         .iter()
@@ -388,11 +391,11 @@ fn doom_trace_verdict(events: &[qemu::GpuTrace]) -> Result<(), String> {
             _ => None,
         })
         .collect();
-    if gpu_probe::contains_in_order(&scanouts, &[1, 2, 1]) {
+    if gpu_probe::contains_in_order(&scanouts, &[1, 2, 1, 2, 1, 2, 1]) {
         Ok(())
     } else {
         Err(format!(
-            "the trace of SET_SCANOUT shows resources {scanouts:?}, 1, 2, 1 in order expected: Doom's buffer (resource 2) was never the screen"
+            "the trace of SET_SCANOUT shows resources {scanouts:?}, 1, 2, 1, 2, 1, 2, 1 in order expected: Doom's buffer (resource 2) was not the screen of each of the three Doom windows"
         ))
     }
 }
@@ -1047,8 +1050,11 @@ mod tests {
             x: 0,
             y: 0,
         };
-        let good: Vec<_> = [1, 2, 1].map(scanout).to_vec();
+        let good: Vec<_> = [1, 2, 1, 2, 1, 2, 1].map(scanout).to_vec();
         assert_eq!(doom_trace_verdict(&good), Ok(()));
+        // The first Doom alone is not enough.
+        let first_only: Vec<_> = [1, 2, 1].map(scanout).to_vec();
+        assert!(doom_trace_verdict(&first_only).is_err());
         let composed: Vec<_> = [1, 1].map(scanout).to_vec();
         assert!(
             doom_trace_verdict(&composed)
