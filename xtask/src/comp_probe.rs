@@ -274,6 +274,34 @@ pub struct RasterCost {
     pub big_worst: u64,
     pub small_best: u64,
     pub small_worst: u64,
+    /// The operations of 256 points or more, when the line has them: their
+    /// number, the least ticks a hundred points, the points of that operation
+    /// and the greatest.
+    pub large: Option<Large>,
+}
+
+/// The large operations of a kind (`px::cost`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Large {
+    pub calls: u64,
+    pub best: u64,
+    pub best_points: u64,
+    pub worst: u64,
+}
+
+impl RasterCost {
+    /// The price of a point net of the call, in hundredths of a tick: the least
+    /// of the large operations, less the least call of the small ones, over the
+    /// points of the operation that made the least. None without large
+    /// operations; the whole least (call included) when no small operation came.
+    pub fn net_price(&self) -> Option<u64> {
+        let large = self.large?;
+        if large.calls == 0 || large.best_points == 0 {
+            return None;
+        }
+        let ticks = large.best * large.best_points / 100;
+        Some(ticks.saturating_sub(self.small_best) * 100 / large.best_points)
+    }
 }
 
 impl RasterCost {
@@ -296,6 +324,7 @@ impl RasterCost {
             "small",
             sb,
             sw,
+            rest @ ..,
         ] = w.as_slice()
         else {
             return None;
@@ -303,6 +332,16 @@ impl RasterCost {
         if *t != tag {
             return None;
         }
+        let large = match rest {
+            [] => None,
+            ["large", n, lb, lp, lw] => Some(Large {
+                calls: n.parse().ok()?,
+                best: lb.parse().ok()?,
+                best_points: lp.parse().ok()?,
+                worst: lw.parse().ok()?,
+            }),
+            _ => return None,
+        };
         Some(RasterCost {
             kind: (*kind).to_owned(),
             calls: calls.parse().ok()?,
@@ -312,6 +351,7 @@ impl RasterCost {
             big_worst: bw.parse().ok()?,
             small_best: sb.parse().ok()?,
             small_worst: sw.parse().ok()?,
+            large,
         })
     }
 
@@ -343,12 +383,16 @@ fn price(kind: &str) -> compositor::Price {
         .unwrap_or(compositor::PRICES[2])
 }
 
-/// The costs for the report of a probe: the ticks a point (mean, least and
-/// greatest over the big operations) and a small operation (least and
-/// greatest), against the table of prices of `Scene::tile` (`compositor::PRICES`:
-/// the measure and the constant of each kind, hundredths of a tick a point). The
-/// greatest of a point goes into the table as the measure, and its constant
-/// follows with the margin; BAND_TICKS stays.
+/// The costs for the report of a probe, per kind of layer: the table's
+/// price of a point and of a call (the measure and the constant, hundredths of
+/// a tick a point and ticks a call), then what the run measured: the call from
+/// the operations of 8 points or fewer (least and greatest), the price of a
+/// point from the operations of 256 points or more (the least, the points of
+/// the operation that made it, the price net of the call, and the greatest,
+/// which holds the preemption of a higher level), and, as before, the ticks a
+/// point over the operations of 64 points or more. The least of the large
+/// operations less the call is what goes into the table as the measure of a
+/// point; the greatest of the small ones is the call.
 pub fn raster_text(costs: &[RasterCost]) -> String {
     if costs.is_empty() {
         return "no cost lines (the log lost them, or the frames came too few)".to_owned();
@@ -357,18 +401,34 @@ pub fn raster_text(costs: &[RasterCost]) -> String {
         .iter()
         .map(|c| {
             let hundredths = |v: u64| format!("{}.{:02}", v / 100, v % 100);
+            let p = price(&c.kind);
+            let large = match c.large {
+                Some(l) if l.calls > 0 => format!(
+                    "{} large operations: least {} at {} points, net of the call {}, greatest {}",
+                    l.calls,
+                    hundredths(l.best),
+                    l.best_points,
+                    c.net_price().map_or("none".to_owned(), hundredths),
+                    hundredths(l.worst)
+                ),
+                _ => "no large operation".to_owned(),
+            };
             format!(
-                "{} (table: measure {} constant {}): {} calls, {} points, a point mean {} least {} greatest {}, an operation of 8 points or fewer least {} greatest {}",
+                "{} (table: point measure {} constant {}{}, call measure {} constant {}): {} calls, {} points, {}; call of an operation of 8 points or fewer least {} greatest {}; over 64 points or more a point mean {} least {} greatest {}",
                 c.kind,
-                hundredths(u64::from(price(&c.kind).measured)),
-                hundredths(u64::from(price(&c.kind).constant)),
+                hundredths(u64::from(p.measured)),
+                hundredths(u64::from(p.constant)),
+                if p.estimate { " (estimate)" } else { "" },
+                p.call_measured,
+                p.call,
                 c.calls,
                 c.points,
+                large,
+                c.small_best,
+                c.small_worst,
                 hundredths(c.mean_per_hundred()),
                 hundredths(c.big_best),
                 hundredths(c.big_worst),
-                c.small_best,
-                c.small_worst,
             )
         })
         .collect::<Vec<_>>()
@@ -503,9 +563,8 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         text(&driver)
     );
     println!(
-        "comp-probe on {}: the cost of the layers inside the bands, ticks (CALL_TICKS {}, BAND_TICKS {}): {}",
+        "comp-probe on {}: the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}",
         machine.name,
-        compositor::CALL_TICKS,
         compositor::BAND_TICKS,
         raster_text(&raster_costs(&output.lines, COMP_TAG))
     );
@@ -662,9 +721,41 @@ mod tests {
         assert_eq!(costs[1].big_worst, 2500);
         let text = raster_text(&costs);
         assert!(text.contains(
-            "copy (table: measure 1.90 constant 2.19): 6 calls, 1800 points, a point mean 2.77 least 2.70 greatest 3.30"
+            "copy (table: point measure 1.90 constant 2.19 (estimate), call measure 851 constant 979): 6 calls, 1800 points, no large operation; call of an operation of 8 points or fewer least 40 greatest 60; over 64 points or more a point mean 2.77 least 2.70 greatest 3.30"
         ));
         assert!(raster_text(&[]).contains("no cost lines"));
+    }
+
+    /// The line with the large operations: the price of a point net of the
+    /// call is the least of them less the least call, over its points; a line
+    /// without them (an older build) is read as before.
+    #[test]
+    fn the_large_operations_give_the_price_of_a_point_net_of_the_call() {
+        let lines: Vec<String> = [
+            "service raster: 17 copy calls 31 points 90000 ticks 159000 big 156 352 small 765 851 large 20 160 6144 352",
+            "service raster: 17 black calls 16 points 64000 ticks 28800 big 45 53 small 212 212 large 12 46 6400 53",
+            "service raster: 17 over calls 5 points 900 ticks 9000 big 700 1300 small 0 0 large 0 0 0 0",
+            "service raster: 17 copy calls 2 points 3 ticks 4 big 1 1 small 1 1 large 1 2",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        let costs = raster_costs(&lines, COMP_TAG);
+        assert_eq!(costs.len(), 3, "the line with a short tail is not read");
+        let copy = &costs[0];
+        assert_eq!(copy.large.unwrap().calls, 20);
+        // 160 a hundred over 6144 points is 9830 ticks; less the call 765, over
+        // the points: 147 a hundred.
+        assert_eq!(copy.net_price(), Some(147));
+        assert_eq!(costs[1].net_price(), Some(42));
+        assert_eq!(costs[2].net_price(), None);
+        let text = raster_text(&costs);
+        assert!(text.contains(
+            "20 large operations: least 1.60 at 6144 points, net of the call 1.47, greatest 3.52"
+        ));
+        assert!(text.contains(
+            "black (table: point measure 0.53 constant 0.61, call measure 212 constant 244)"
+        ));
     }
 
     #[test]

@@ -32,8 +32,8 @@ const fn format(f: Format) -> Px {
 /// What each kind of layer costs, for the run of the probes under -icount
 /// (feature `steps`): `Pixman` times each of its operations with the
 /// counter, and the service tells the totals after a frame, for the
-/// constants of `compositor::Scene::tile` (OPAQUE_TICKS, OVER_TICKS,
-/// FILL_TICKS, CALL_TICKS) to be set from a run.
+/// constants of `compositor::Scene::tile` (`PRICES`: the prices of a point and the
+/// calls of the three kinds) to be set from a run.
 #[cfg(feature = "steps")]
 pub mod cost {
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -49,6 +49,10 @@ pub mod cost {
     /// cost of a call.
     const BIG: u64 = 64;
     const SMALL: u64 = 8;
+    /// An operation of at least LARGE points tells the price of a point with
+    /// its call under a few percent of it: 256 points make a call of 800
+    /// ticks at most 3 ticks a point.
+    const LARGE: u64 = 256;
 
     struct Kind {
         calls: AtomicU64,
@@ -60,6 +64,13 @@ pub mod cost {
         /// Ticks of an operation, over the small ones.
         small_best: AtomicU64,
         small_worst: AtomicU64,
+        /// The operations of LARGE points or more: how many, the least ticks a
+        /// hundred points and the points of the operation that made it, and
+        /// the greatest.
+        large_calls: AtomicU64,
+        large_best: AtomicU64,
+        large_best_points: AtomicU64,
+        large_worst: AtomicU64,
     }
 
     static KINDS: [Kind; 3] = [const {
@@ -71,6 +82,10 @@ pub mod cost {
             big_worst: AtomicU64::new(0),
             small_best: AtomicU64::new(u64::MAX),
             small_worst: AtomicU64::new(0),
+            large_calls: AtomicU64::new(0),
+            large_best: AtomicU64::new(u64::MAX),
+            large_best_points: AtomicU64::new(0),
+            large_worst: AtomicU64::new(0),
         }
     }; 3];
     /// Frames done, and whether the one that just ended is yet to be told.
@@ -91,6 +106,16 @@ pub mod cost {
             k.small_best.fetch_min(ticks, Ordering::Relaxed);
             k.small_worst.fetch_max(ticks, Ordering::Relaxed);
         }
+        if points >= LARGE {
+            let per_hundred = ticks * 100 / points;
+            k.large_calls.fetch_add(1, Ordering::Relaxed);
+            // The service is one thread: the least and its points go together.
+            if per_hundred < k.large_best.load(Ordering::Relaxed) {
+                k.large_best.store(per_hundred, Ordering::Relaxed);
+                k.large_best_points.store(points, Ordering::Relaxed);
+            }
+            k.large_worst.fetch_max(per_hundred, Ordering::Relaxed);
+        }
     }
 
     /// A frame ended.
@@ -102,12 +127,15 @@ pub mod cost {
     /// Runs after each step of the loop (rt::service::step_after): at the
     /// 1st, 2nd, 4th, 8th... frame it tells the totals so far, a line for
     /// each kind that has been drawn: `service raster: 17 KIND calls C
-    /// points P ticks T big B W small S L`, B and W the least and the
+    /// points P ticks T big B W small S L large N B P W`, B and W the least and the
     /// greatest ticks a hundred points of an operation of BIG points or more, S
     /// and L the least and the greatest ticks of an operation of SMALL points or
-    /// fewer (0 when there was none). The greatest values include the
-    /// preemption of a higher level in the middle of an operation; the
-    /// least do not.
+    /// fewer (0 when there was none), then, over the operations of LARGE points
+    /// or more, their number N, the least ticks a hundred points B with the
+    /// points P of the operation that made it, and the greatest W. The
+    /// greatest values include the preemption of a higher level in the middle
+    /// of an operation; the least do not. The price of a point is B less the
+    /// call S, a hundred over P; the call is S.
     pub fn tell() {
         if DUE.swap(0, Ordering::Relaxed) == 0 {
             return;
@@ -122,13 +150,17 @@ pub mod cost {
                 continue;
             }
             rt::println!(
-                "service raster: 17 {name} calls {calls} points {} ticks {} big {} {} small {} {}",
+                "service raster: 17 {name} calls {calls} points {} ticks {} big {} {} small {} {} large {} {} {} {}",
                 k.points.load(Ordering::Relaxed),
                 k.ticks.load(Ordering::Relaxed),
                 zero(k.big_best.load(Ordering::Relaxed)),
                 k.big_worst.load(Ordering::Relaxed),
                 zero(k.small_best.load(Ordering::Relaxed)),
                 k.small_worst.load(Ordering::Relaxed),
+                k.large_calls.load(Ordering::Relaxed),
+                zero(k.large_best.load(Ordering::Relaxed)),
+                k.large_best_points.load(Ordering::Relaxed),
+                k.large_worst.load(Ordering::Relaxed),
             );
         }
     }

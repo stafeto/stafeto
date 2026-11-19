@@ -58,22 +58,38 @@ pub const PER_CONTEXT: usize = 4;
 pub const BAND_ROWS: u32 = 16;
 
 /// What a band costs the service in ticks (`Scene::tile`): at most
-/// BAND_TICKS in all, CALL_TICKS for each layer's call of pixman, and a
-/// price for each point of each layer. The step stays under 16 500.
+/// BAND_TICKS in all, a call of pixman for each layer, and a price for each
+/// point of each layer. The step stays under 16 500.
 pub const BAND_TICKS: u32 = 15_000;
 
-/// The price of one kind of operation. `measured` is the greatest ticks a
-/// hundred points of a big operation cost under -icount, in the line
-/// `service raster` of the probes (`px::cost`: the `big` worst field, with
-/// the preemption of a higher level in it), and `constant` is what the
-/// scene charges: the measure with the margin of MARGIN_PERCENT, rounded up.
-/// The test `the_constants_cover_the_measures_with_the_margin` holds the
-/// table to that, so a new measure goes into this table beside its constant.
+/// The price of one kind of operation: a point, in hundredths of a tick, and
+/// the call that makes the operation, in ticks. A `measured` is a figure of
+/// the probes under -icount (the line `service raster` of `px::cost`) and the
+/// constant the scene charges is the measure with the margin of
+/// MARGIN_PERCENT, rounded up. `estimate` marks a price of a point that no
+/// probe has measured yet: it is a figure scaled from the cost before pixman's
+/// NEON paths (a copy 2.7 ticks, a layer laid over others 25), kept high on
+/// purpose, until the line of large operations (256 points or more) gives the
+/// least cost of a point, and the table takes it. The test
+/// `the_constants_cover_the_measures_with_the_margin` holds every constant to
+/// its measure.
+///
+/// What the runs of `comp-probe` and `focus-probe` proved: the call of the
+/// black is 212 ticks, of a copy 765 to 851, of a layer laid over others 765 to
+/// 1 303; the black costs 0.45 to 0.53 ticks a point on large operations. The
+/// greatest ticks a point over operations of every size (110 and 130 on a
+/// copy and a layer laid over others) is the call of small ones and the
+/// preemption of the levels above, and tells nothing of the price of a point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Price {
     pub kind: &'static str,
+    /// Hundredths of a tick a point.
     pub measured: u32,
     pub constant: u32,
+    pub estimate: bool,
+    /// Ticks a call.
+    pub call_measured: u32,
+    pub call: u32,
 }
 
 /// The margin over a measure, in percent.
@@ -84,41 +100,40 @@ pub const fn with_margin(measured: u32) -> u32 {
     (measured * (100 + MARGIN_PERCENT)).div_ceil(100)
 }
 
-/// The prices of the operations of a band, in hundredths of a tick for a
-/// point (the unit of the `big` fields of `service raster`): the black a
-/// band starts with, a layer copied, a layer laid over others (the
-/// pointer's picture too). The measures are those of the layers on pixman's
-/// NEON paths: the least cost of a copy before them was 2.7 ticks a point,
-/// the layer laid over 25 and the black 4, and the greatest band measured
-/// with them is 9 571 ticks where it was 13 681, a ratio of 0.70 that these
-/// figures take (190, 1 750 and 280) until the lines `service raster` of
-/// `comp-probe` and `focus-probe` under -icount give the measure of each,
-/// and the table takes those.
+/// The prices of the operations of a band: the black a band starts with, a
+/// layer copied, a layer laid over others (the pointer's picture too).
 pub const PRICES: [Price; 3] = [
     Price {
         kind: "black",
-        measured: 280,
-        constant: with_margin(280),
+        measured: 53,
+        constant: with_margin(53),
+        estimate: false,
+        call_measured: 212,
+        call: with_margin(212),
     },
     Price {
         kind: "copy",
         measured: 190,
         constant: with_margin(190),
+        estimate: true,
+        call_measured: 851,
+        call: with_margin(851),
     },
     Price {
         kind: "over",
         measured: 1_750,
         constant: with_margin(1_750),
+        estimate: true,
+        call_measured: 1_303,
+        call: with_margin(1_303),
     },
 ];
 pub const FILL_CENTI: u32 = PRICES[0].constant;
 pub const OPAQUE_CENTI: u32 = PRICES[1].constant;
 pub const OVER_CENTI: u32 = PRICES[2].constant;
-
-/// The price of a call of pixman for one layer of a band, in ticks, and its
-/// measure (the greatest ticks of an operation of eight points or fewer).
-pub const CALL_TICKS: u32 = with_margin(CALL_MEASURED_TICKS);
-pub const CALL_MEASURED_TICKS: u32 = 1_300;
+pub const FILL_CALL: u32 = PRICES[0].call;
+pub const OPAQUE_CALL: u32 = PRICES[1].call;
+pub const OVER_CALL: u32 = PRICES[2].call;
 
 /// Linux's key codes the scene knows: the Super keys (the manager's
 /// modifier: Doom binds Alt, Ctrl and Shift, so a program of the first
@@ -1422,11 +1437,9 @@ impl Scene {
                 && w.rect.y + w.rect.h >= damage.y + damage.h
         });
         let fill = u32::from(!covered);
-        let calls = opaque + over + fill;
+        let calls = OPAQUE_CALL * opaque + OVER_CALL * over + FILL_CALL * fill;
         let per_hundred = OPAQUE_CENTI * opaque + OVER_CENTI * over + FILL_CENTI * fill;
-        let Some(points) =
-            (BAND_TICKS.saturating_sub(CALL_TICKS * calls) * 100).checked_div(per_hundred)
-        else {
+        let Some(points) = (BAND_TICKS.saturating_sub(calls) * 100).checked_div(per_hundred) else {
             // Nothing to draw: the damage is black or untouched.
             return (damage.w, BAND_ROWS);
         };
@@ -1934,11 +1947,11 @@ mod tests {
         while at.row < d.y + d.h {
             let next = compose(&s, d, at, &mut fb, &src, &mut Plain);
             assert_eq!(next.col, 0);
-            assert_eq!(next.row, (at.row + 9).min(HEIGHT));
+            assert_eq!(next.row, (at.row + 10).min(HEIGHT));
             at = next;
             bands += 1;
         }
-        assert_eq!(bands, HEIGHT.div_ceil(9));
+        assert_eq!(bands, HEIGHT.div_ceil(10));
         assert_eq!(at.row, HEIGHT);
         // A band past the damage is a no-op that says the frame is done.
         let done = Band {
@@ -2523,7 +2536,7 @@ mod tests {
         s.post(b, 0, &[]).unwrap();
         // A frame with an alpha window in it is made in bands of
         // the points the prices allow the layers: 30 wide, a copy and a
-        // layer over it, so 13 lines.
+        // layer over it, so the most lines of a band.
         let d = s.begin().unwrap();
         assert_eq!(d, rect(0, 0, 30, 30));
         let first = compose(&s, d, Band::default(), &mut fb, &src, &mut Plain);
@@ -2534,7 +2547,7 @@ mod tests {
                 col: 0
             }
         );
-        assert_eq!(first.row, 13);
+        assert_eq!(first.row, BAND_ROWS);
         draw(&s, d, &mut fb, &src);
         s.end(true);
         // Only a: 0x80. Over a: 0x40 + 0x80 * 0x7F / 255 = 0x80.
@@ -2556,6 +2569,7 @@ mod tests {
     /// calls and the ticks the model of `Scene::tile` gives them.
     #[derive(Default)]
     struct Cost {
+        /// Ticks of the calls.
         calls: u32,
         /// Hundredths of a tick.
         centi: u32,
@@ -2569,7 +2583,7 @@ mod tests {
 
     impl Raster for Cost {
         fn black(&mut self, _: &mut [u8], r: Rect) {
-            self.calls += 1;
+            self.calls += FILL_CALL;
             self.centi += FILL_CENTI * r.w * r.h;
         }
 
@@ -2585,7 +2599,7 @@ mod tests {
             area: (u32, u32),
             over: bool,
         ) {
-            self.calls += 1;
+            self.calls += if over { OVER_CALL } else { OPAQUE_CALL };
             self.centi += if over { OVER_CENTI } else { OPAQUE_CENTI } * area.0 * area.1;
         }
     }
@@ -2598,7 +2612,7 @@ mod tests {
         while at.row < d.y + d.h {
             let mut cost = Cost::default();
             at = compose(s, d, at, &mut fb, src, &mut cost);
-            worst = worst.max(cost.calls * CALL_TICKS + cost.ticks());
+            worst = worst.max(cost.calls + cost.ticks());
             bands += 1;
         }
         (worst, bands)
@@ -2612,13 +2626,16 @@ mod tests {
         let d = s.begin().unwrap();
         s.end(true);
         // One window that covers the damage: lines of the width.
-        // (the copy of a point is 2.19 in the model: 9 lines of 640).
-        assert_eq!(s.tile(d), (640, 9));
+        // (the copy of a point is 2.19 in the model, its call 979: 10 lines of 640).
+        assert_eq!(s.tile(d), (640, 10));
         // The pointer over it: a layer laid over others costs 25 a point.
         s.pointer_to(5, 5);
         let (w, rows) = s.tile(d);
         assert_eq!(rows, 1);
-        assert!(w < 640 && (w * OVER_CENTI).div_ceil(100) + 2 * CALL_TICKS <= BAND_TICKS + 3 * w);
+        assert!(
+            w < 640
+                && (w * OVER_CENTI).div_ceil(100) + OPAQUE_CALL + OVER_CALL <= BAND_TICKS + 3 * w
+        );
         // A damage nothing covers starts black: fewer lines.
         let mut t = Scene::new();
         let b = t.create(1, 1, rect(10, 10, 50, 50), true, 0).unwrap();
@@ -2644,10 +2661,25 @@ mod tests {
             );
             assert_eq!(p.constant, with_margin(p.measured), "{}", p.kind);
         }
-        assert!(
-            u64::from(CALL_TICKS) * 100
-                >= u64::from(CALL_MEASURED_TICKS) * u64::from(100 + MARGIN_PERCENT)
-        );
+        for p in PRICES {
+            assert!(
+                u64::from(p.call) * 100
+                    >= u64::from(p.call_measured) * u64::from(100 + MARGIN_PERCENT),
+                "{}: call {} for a measure of {}",
+                p.kind,
+                p.call,
+                p.call_measured
+            );
+            assert_eq!(p.call, with_margin(p.call_measured), "{}", p.kind);
+        }
+        // What the runs proved: the black's price and the calls are measures;
+        // the prices of a copy and of a layer laid over others are estimates
+        // that no run has under-run (a copy of large operations: mean 1.77, a
+        // layer laid over others: the least 7.02 with its call in it).
+        assert!(!PRICES[0].estimate && PRICES[1].estimate && PRICES[2].estimate);
+        assert!(PRICES[1].measured >= 177 && PRICES[2].measured >= 702);
+        assert!(PRICES[0].measured >= 53 && PRICES[0].call_measured >= 212);
+        assert!(PRICES[1].call_measured >= 851 && PRICES[2].call_measured >= 1_303);
         assert_eq!(
             (FILL_CENTI, OPAQUE_CENTI, OVER_CENTI),
             (PRICES[0].constant, PRICES[1].constant, PRICES[2].constant)
@@ -2691,8 +2723,8 @@ mod tests {
         let src = flat(&[(a, 0, 0x10, (STRIDE * HEIGHT) as usize)]);
         let (worst, bands) = worst_band(&s, d, &src);
         assert!(worst <= BAND_TICKS, "{worst}");
-        // 400 lines at 9 lines of 640 points a band.
-        assert_eq!(bands, 45);
+        // 400 lines at 10 lines of 640 points a band.
+        assert_eq!(bands, 40);
     }
 
     use proto_gpu::{PIPELINE_CURSOR, SOURCE_CURSOR};
@@ -2737,7 +2769,7 @@ mod tests {
         let mut s = settled(true);
         s.pointer_to(5, 5);
         // The tile of a frame over the pointer is that of a copy alone.
-        assert_eq!(s.tile(SCREEN), (640, 9));
+        assert_eq!(s.tile(SCREEN), (640, 10));
         s.add_damage(SCREEN);
         let d = s.begin().unwrap();
         let src = flat(&[(0, 0, 0x80, 640 * 4 * 400)]);
