@@ -46,3 +46,4 @@ proto-wire = { path = "../proto/wire" }
 posix-fd = { path = "../lib/posix-fd" }
 posix-types = { path = "../lib/posix-types" }
 proto-fs = { path = "../proto/fs" }
+proto-comp = { path = "../proto/comp" }

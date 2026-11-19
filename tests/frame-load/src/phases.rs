@@ -28,7 +28,7 @@ pub const EPOCH_NS: u64 = 30_000_000_000;
 pub enum Scene {
     /// Nothing is drawn: the service has no window and must not wake.
     None,
-    /// A small window of 160 by 100 points, composed from a copy (four bands).
+    /// A small window of 160 by 100 points, composed from a copy (a few bands, counted by the model of the service).
     P,
     /// A window of the whole screen, composed from a copy.
     F,

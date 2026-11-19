@@ -58,17 +58,17 @@ const DRIVER: u64 = 13_596;
 const REQUESTS: u64 = 10_000;
 const EVENTS: u64 = 1_875;
 const LIMIT: u64 = 10_000_000;
-/// A frame with more bands than this does not fit a period without a load.
+/// The acceptance limit of the whole screen with no load: a frame with more bands than this
+/// does not fit a period (a decision of the design, which a test holds against the bound of the
+/// row and the service's own count of the bands of the screen).
 const FULL_BANDS_MAX: u64 = 45;
-/// The bands of a window of 160 by 100 at 16 rows a band.
-const P_BANDS: u64 = 7;
 /// The frames of a phase of 240 periods: the counters start 50 ms after the
 /// phase starts and are read 5 ms before it ends, which leaves about 237.
 const FRAMES_MIN: u64 = 230;
 const FRAMES_MAX: u64 = 242;
 /// The frames the whole screen under all the loads must still make: half of the
 /// periods.
-const STRESS_FRAMES_MIN: u64 = 120;
+const STRESS_FRAMES_MIN: u64 = PERIODS / 2;
 /// The share of its loop alone the CPU load must keep under the overload: the
 /// cap and three steps leave the service most of a period and the console and
 /// the signs of life take a few percent, so about a tenth is left.
@@ -143,12 +143,10 @@ pub fn budgets_share_ppm() -> u64 {
 /// one line fits, a run of one line, the lines cut in as many runs as it takes.
 pub fn bands_of(w: u32, h: u32, opaque: u32, over: u32, fill: u32) -> u64 {
     use compositor::{FILL, LAYER, OPAQUE, OVER, band_size};
-    // The calls of the layers, a layer after the first costing `LAYER` more, as
+    // The calls of the layers, every layer costing `LAYER` more, the first too, as
     // `Scene::tile` charges them; the size of the band is the service's own.
-    let calls = OPAQUE.call * opaque
-        + OVER.call * over
-        + FILL.call * fill
-        + LAYER * (opaque + over).saturating_sub(1);
+    let calls =
+        OPAQUE.call * opaque + OVER.call * over + FILL.call * fill + LAYER * (opaque + over);
     let per_row = OPAQUE.row * opaque + OVER.row * over + FILL.row * fill;
     let per_point = OPAQUE.point * opaque + OVER.point * over + FILL.point * fill;
     let (run, rows) = band_size(calls, per_row, per_point, w);
@@ -159,6 +157,11 @@ pub fn bands_of(w: u32, h: u32, opaque: u32, over: u32, fill: u32) -> u64 {
     // of the same line or the next line: every line is cut in `ceil(w / run)`
     // bands.
     u64::from(h) * u64::from(w).div_ceil(u64::from(run))
+}
+
+/// The bands of a window of 160 by 100 by the model (the scene of the rows P).
+pub fn p_bands() -> u64 {
+    bands_of(160, 100, 1, 0, 0)
 }
 
 /// The bands of a frame of the overload: eight windows of 320 by 200 points
@@ -199,7 +202,7 @@ pub enum Row {
 /// The own work of a frame of a row, in ticks.
 pub fn own(row: Row) -> u64 {
     let (bands, disk, requests) = match row {
-        Row::P => (P_BANDS, true, true),
+        Row::P => (p_bands(), true, true),
         Row::D => (0, true, true),
         Row::F(bands) => (bands, false, false),
         Row::FullLoaded(bands) => (bands, true, true),
@@ -460,6 +463,12 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                             p.capped, PERIODS
                         ));
                     }
+                    if p.capped < p.releases {
+                        return fail(format!(
+                            "capped {} periods, fewer than the {} frames released",
+                            p.capped, p.releases
+                        ));
+                    }
                     // Skips are printed only: with the client unable to post while
                     // its frame is in work almost no change waits at a period start.
                     if p.late != p.frames {
@@ -705,6 +714,11 @@ pub fn steps_verdict(lines: &[String]) -> Result<String, String> {
                 kind(row)
             ));
         }
+        // After the gates the hard check against B covers every kind of both services: the probe judges all of
+        // them against the gates below, and no kind is exempt (neither service has a start-up
+        // step in this image).
+        crate::step_line::within_b(lines, tag, crate::step_line::Kinds::All)
+            .map_err(|e| format!("the {name}: {e}"))?;
         said.push(format!(
             "{name} {}",
             rows.iter()
@@ -769,6 +783,7 @@ mod tests {
             (31, 644_681, 689_300),
             (33, 677_337, 721_956),
             (34, 693_665, 738_284),
+            (37, 742_649, 787_268),
         ] {
             assert_eq!(own(Row::F(bands)), own_ticks);
             assert_eq!(bound_ticks(Row::F(bands)), Some(bound));
@@ -776,6 +791,59 @@ mod tests {
         // Under all the loads the whole screen has a bound past a period (1 041 667
         // ticks): the analysis does not promise this frame on time.
         assert_eq!(bound_ticks(Row::FullLoaded(31)), Some(1_710_647));
+    }
+
+    /// The limit of the whole screen holds the service's count of the bands and a bound inside
+    /// a period, so a change of the terms of a band moves this test and not a literal.
+    #[test]
+    fn the_whole_screen_limit_follows_the_terms_of_a_band() {
+        let period = compositor::frame::DEFAULT_PERIOD_NS / TICK_NS;
+        assert!(u64::from(compositor::full_screen_bands()) <= FULL_BANDS_MAX);
+        assert!(bound_ticks(Row::F(FULL_BANDS_MAX)).is_some_and(|b| b <= period));
+        // The rows of the image are made of the model of the bands of the service.
+        assert_eq!(p_bands(), 7);
+    }
+
+    /// The overload scene as the service lays it (eight windows with an alpha over one place):
+    /// the model of the probe counts the bands the way `Scene::tile` does.
+    #[test]
+    fn the_band_model_agrees_with_the_service_for_the_overload() {
+        use frame_load::paint::{O_RECT, O_WINDOWS};
+        let mut s = compositor::Scene::new();
+        let rect = proto_comp::Rect {
+            x: O_RECT.x,
+            y: O_RECT.y,
+            w: O_RECT.w,
+            h: O_RECT.h,
+        };
+        let own = proto_comp::Rect {
+            x: 0,
+            y: 0,
+            w: O_RECT.w,
+            h: O_RECT.h,
+        };
+        for i in 0..O_WINDOWS {
+            let w = s
+                .create(i as u64, 1 + (i / 4) as u64, rect, true, 0)
+                .unwrap();
+            s.set_format(w, compositor::Format::Argb);
+            s.flush(w, own).unwrap();
+        }
+        let d = s.begin().unwrap();
+        s.end(true);
+        let (run, rows) = s.tile(d);
+        let bands =
+            u64::from(d.h).div_ceil(u64::from(rows)) * u64::from(d.w).div_ceil(u64::from(run));
+        assert_eq!(bands, overload_frame_bands());
+    }
+
+    /// The floor of the overload is a function of the bands and the cap, and the gate of the
+    /// share of the hog stays under what the cap leaves of a period.
+    #[test]
+    fn the_gates_of_the_overload_follow_the_service() {
+        let periods = overload_frame_bands().div_ceil(u64::from(frame_cap_bands()));
+        assert_eq!(overload_floor_frames(), PERIODS / (periods + 1));
+        assert!(HOG_FLOOR_PPM < 1_000_000 - service_share_ppm());
     }
 
     /// The counts the heartbeat is made of: three services above the
@@ -806,7 +874,14 @@ mod tests {
                 Phase::Full => (240, 0, 0, 240, 240 * 40, 9_000),
                 Phase::FullLoaded => (200, 0, 0, 240, 200 * 40, 10_000),
                 Phase::HogRef => (0, 0, 0, 0, 0, 0),
-                Phase::Overload => (30, 0, 210, 240, 30 * 424, 12_000),
+                Phase::Overload => (
+                    overload_floor_frames(),
+                    0,
+                    PERIODS - overload_floor_frames(),
+                    PERIODS,
+                    overload_floor_frames() * overload_frame_bands(),
+                    12_000,
+                ),
                 Phase::Direct => (240, 240, 0, 240, 0, 1_000),
                 _ => (240, 0, 0, 240, 240 * 4, 2_950),
             };
@@ -1082,8 +1157,14 @@ mod tests {
     fn a_good_overload_passes_and_is_reported() {
         let said = verdict(&good(), true).unwrap();
         assert!(said.iter().any(|l| {
-            l.starts_with("frame-probe: overload: 30 frames of ")
-                && l.contains("capped 240, skipped 210, late 30, cpu share 0.12 (floor 0.08)")
+            let f = overload_floor_frames();
+            l.starts_with(&format!(
+                "frame-probe: overload: {f} frames of {} bands",
+                overload_frame_bands()
+            )) && l.contains(&format!(
+                "capped 240, skipped {}, late {f}, cpu share 0.12 (floor 0.08)",
+                PERIODS - f
+            ))
         }));
     }
 
@@ -1104,20 +1185,36 @@ mod tests {
         overload_line(&mut lines, "capped 240", "capped 0");
         let e = verdict(&lines, true).unwrap_err();
         assert!(e.starts_with("overload: capped 0 of 240 periods"), "{e}");
+        // Fewer capped periods than frames released.
+        let mut lines = good();
+        let f = overload_floor_frames();
+        overload_line(&mut lines, "capped 240", "capped 120");
+        overload_line(&mut lines, &format!("releases {f}"), "releases 200");
+        let e = verdict(&lines, true).unwrap_err();
+        assert!(e.contains("fewer than the"), "{e}");
         // A frame shown in its period though the scene cannot make one.
         let mut lines = good();
-        overload_line(&mut lines, "late 30", "late 29");
+        let f = overload_floor_frames();
+        overload_line(&mut lines, &format!("late {f}"), &format!("late {}", f - 1));
         let e = verdict(&lines, true).unwrap_err();
-        assert!(e.starts_with("overload: late 29 of 30 frames"), "{e}");
+        assert!(
+            e.starts_with(&format!("overload: late {} of {f} frames", f - 1)),
+            "{e}"
+        );
         // Skips are printed and judge nothing.
         let mut lines = good();
-        overload_line(&mut lines, "skipped 210", "skipped 0");
+        overload_line(
+            &mut lines,
+            &format!("skipped {}", PERIODS - overload_floor_frames()),
+            "skipped 0",
+        );
         assert!(verdict(&lines, true).is_ok());
         // Fewer frames than a frame a period count would give.
         let mut lines = good();
-        overload_line(&mut lines, "frames 30", "frames 0");
-        overload_line(&mut lines, "late 30", "late 0");
-        overload_line(&mut lines, "releases 30", "releases 0");
+        let f = overload_floor_frames();
+        overload_line(&mut lines, &format!("frames {f}"), "frames 0");
+        overload_line(&mut lines, &format!("late {f}"), "late 0");
+        overload_line(&mut lines, &format!("releases {f}"), "releases 0");
         let e = verdict(&lines, true).unwrap_err();
         assert!(e.contains("0 frames of 240 periods"), "{e}");
         // A reference with no loops makes no share to judge.
@@ -1266,6 +1363,41 @@ mod tests {
             ));
         }
         lines
+    }
+
+    /// The hard check against B: the compositor and the display driver are judged in every
+    /// kind (none is exempt), by the time less the least charge of the preemptions; the steps of
+    /// a service the probe does not judge are the business of its own probe.
+    #[test]
+    fn a_step_past_b_by_the_least_charge_fails_in_any_kind_of_both_services() {
+        // Eight preemptions at the measured charge leave 15 600 ticks (under 0.9 B), and at the
+        // least charge 22 104, past B.
+        for (tag, kind) in [
+            (crate::comp_probe::COMP_TAG, 20usize),
+            (crate::comp_probe::DRIVER_TAG, 6),
+        ] {
+            let mut lines = steps(&[]);
+            lines.push(format!(
+                "service step: {tag} kind {kind} 26000 ticks detail 0 preempts 8"
+            ));
+            let e = steps_verdict(&lines).unwrap_err();
+            assert!(
+                e.contains(&format!("kind {kind}"))
+                    && e.contains(&format!("against B {}", crate::TERM_B)),
+                "{e}"
+            );
+        }
+        // The same step of a service this probe does not judge passes.
+        let mut lines = steps(&[]);
+        lines.push("service step: 99 kind 20 26000 ticks detail 0 preempts 8".to_owned());
+        assert!(steps_verdict(&lines).is_ok());
+        // A step of 20 500 ticks with two preemptions is within B by the least charge.
+        let mut lines = steps(&[]);
+        lines.push(format!(
+            "service step: {} kind 20 20500 ticks detail 0 preempts 2",
+            crate::comp_probe::COMP_TAG
+        ));
+        assert!(steps_verdict(&lines).is_ok());
     }
 
     #[test]
