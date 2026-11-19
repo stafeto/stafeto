@@ -14,13 +14,22 @@ name: release
 #
 # `workflow_dispatch` from `main` is the dry run: the same jobs with the real
 # key, no draft, the files only in the artifacts of the run for three days.
+#
+# A tag `v<series>-pkgs.<k>` is an update of packages and belongs to
+# packages-update.yml; this workflow leaves it alone.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "!v*-pkgs.*"]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# The same group as packages-update.yml: two runs that sign at once would take
+# the same serial of the index.
+concurrency:
+  group: release-pipeline
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: never
@@ -234,7 +243,7 @@ jobs:
 
       - name: Notes of the release
         run: |
-          previous=$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_REF_NAME^" 2>/dev/null || true)
+          previous=$(git describe --tags --abbrev=0 --match 'v*' --exclude 'v*-pkgs.*' "$GITHUB_REF_NAME^" 2>/dev/null || true)
           python3 tools/release-notes.py "$VERSION" "$GITHUB_REF_NAME" "$previous" > release-notes.md
 
       - name: Draft release
