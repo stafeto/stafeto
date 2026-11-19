@@ -267,6 +267,16 @@
 //! few directories, and follows it with each name it adds or removes; a rename, a removal of the
 //! directory or a change of its attributes drops what it kept. A restart starts with no counts.
 //!
+//! A volume holds at most `PAIRS_MAX` (1,024) metadata pairs for a MKDIR to be accepted: a directory
+//! is one pair and a large directory splits into more, and removing an old directory costs about
+//! three reads for each pair of the volume. The service counts the pairs (one fetch of each,
+//! about two reads for each) the first time it is asked for a MKDIR after the mount and again when
+//! its own bound reaches the cap: the count of the last walk plus 2 for each MKDIR and 1 for each
+//! create or rename since (every such commit may split one pair), so the bound is never below the
+//! number of pairs that those commits made. A volume that holds more pairs than the cap (a volume of
+//! an older release) mounts and works: only MKDIR answers NO_SPACE, and the cost of a RMDIR is that
+//! of its pairs. Splits that a rewrite of an attribute causes are seen at the next walk.
+//!
 //! # The attribute of an entry
 //!
 //! The constants `ATTR_*`, `VOLUME_FORMAT`, `INO_BLOCK`, `RESERVE_BLOCKS` and the `Attr` record are
@@ -347,6 +357,14 @@ pub const ROOT_DESCRIPTIONS: usize = 48;
 /// The entries of one directory: a minimum the service guarantees and the service step may fix
 /// after measurement (never smaller). A create past it is NO_SPACE.
 pub const DIR_ENTRIES_MAX: usize = 1024;
+/// The metadata pairs of one volume at which MKDIR stops: a minimum the service guarantees. A
+/// removal of a directory looks the pair before its own up in the list of all the pairs (about
+/// three reads for each pair), so the cost of RMDIR and of a RENAME over a directory grows with the
+/// pairs; at the cap it is about 3,300 reads (1.1 s at 3,000 reads a second), and `rm -rf` of a tree
+/// of that many directories takes about 970,000 reads (5.4 minutes at 3,000 a second; the same tree
+/// of 2,000 directories takes 3.8 million, 21 minutes, which is why the cap is not 2,048). A MKDIR
+/// past it is NO_SPACE.
+pub const PAIRS_MAX: u64 = 1024;
 /// The flags of OPEN.
 pub const READ: u32 = 1;
 pub const WRITE: u32 = 2;

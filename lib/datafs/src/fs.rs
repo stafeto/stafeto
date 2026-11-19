@@ -27,6 +27,7 @@ unsafe extern "C" {
     fn datafs_mount(d: *mut c_void, ctx: *mut c_void) -> c_int;
     fn datafs_unmount(d: *mut c_void, ctx: *mut c_void) -> c_int;
     fn datafs_used(d: *mut c_void, ctx: *mut c_void) -> i64;
+    fn datafs_pairs(d: *mut c_void, ctx: *mut c_void) -> i64;
     fn datafs_open(d: *mut c_void, ctx: *mut c_void, path: *const c_char, flags: c_int) -> c_int;
     fn datafs_close(d: *mut c_void, ctx: *mut c_void, slot: c_int) -> c_int;
     fn datafs_read(d: *mut c_void, ctx: *mut c_void, slot: c_int, buf: *mut u8, size: u32) -> i64;
@@ -484,6 +485,13 @@ impl<'a, D: Device> Fs<'a, D> {
     pub fn used_blocks(&mut self) -> Res<u64> {
         // SAFETY: as above.
         check64(self.call(|d, ctx| unsafe { datafs_used(d, ctx) }))
+    }
+
+    /// The metadata pairs of the volume (the list `lfs_fs_pred` walks to find the pair before the one a
+    /// removal takes out): about two reads for each pair.
+    pub fn metadata_pairs(&mut self) -> Res<u64> {
+        // SAFETY: as above.
+        check64(self.call(|d, ctx| unsafe { datafs_pairs(d, ctx) }))
     }
 
     /// Walks the file system once and fills the allocator's window from it: every block the tree

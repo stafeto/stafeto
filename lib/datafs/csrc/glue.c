@@ -247,6 +247,14 @@ int64_t datafs_used(struct datafs *d, void *ctx)
     return lfs_fs_size(&d->lfs);
 }
 
+// The metadata pairs of the volume (the pairs of the directories, the pairs that large directories
+// split into, and the superblock's), or a negative error: one fetch of each pair.
+int64_t datafs_pairs(struct datafs *d, void *ctx)
+{
+    d->ctx = ctx;
+    return lfs_fs_pairs(&d->lfs);
+}
+
 // A file: the slot, or a negative error (LFS_ERR_NOMEM when every slot is open).
 int datafs_open(struct datafs *d, void *ctx, const char *path, int flags)
 {

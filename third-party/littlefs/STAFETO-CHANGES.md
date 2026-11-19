@@ -10,7 +10,7 @@ the copy is modified, so that the notice is not read as saying it is the release
 
 ## What was added
 
-Three functions that only read. They add no field to any structure of the release, and change
+Four functions that only read. They add no field to any structure of the release, and change
 nothing on the disk: a volume written by the release reads with the change and the other way
 round. One function of the release, `lfs_dir_find`, is split to carry the third (below): its body
 becomes `lfs_dir_find_` with one more argument, and `lfs_dir_find` calls it with that argument
@@ -42,8 +42,13 @@ NULL, so every caller of the release behaves as before.
   repeats from the root.
 - A private helper, `lfs_dir_getattr_`, which they use: the tail of `lfs_getattr_` over a pair
   and an id.
+- `lfs_fs_pairs(lfs)` in `lfs.h` and `lfs.c`: the number of metadata pairs, the length of the
+  threaded list of pairs that `lfs_fs_traverse_` walks (the superblock's pair first), by one
+  `lfs_dir_fetch` for each pair with the cycle check of the traversal. About two reads for each
+  pair, where `lfs_fs_pred` (which a removal of a directory uses to find the pair before the one it
+  removes) walks the same list from its head. The data service caps the pairs of a volume with it.
 
-Each of the three has the public wrapper with `LFS_LOCK` and `LFS_TRACE` and the private function with a
+Each of the four has the public wrapper with `LFS_LOCK` and `LFS_TRACE` and the private function with a
 trailing underscore, as the functions around them do. The attribute buffer is read as
 `lfs_getattr` reads it (padded with zeros, truncated to `size` and to `LFS_ATTR_MAX`).
 
@@ -82,8 +87,8 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 0cb4ff1daf5fdc1359c6a6ee3116092f08fc100c9d58b1b77ab17bfd801f856d  LICENSE.md
 6dd74dfc58ac93589f8e002bb73c0830a59206912cfe8c951c07eb2bd5fccad0  SPEC.md
 2a8b3459d74b9fa8bdd947738522c46331739405b1fc3d70f057f636a1dea768  DESIGN.md
-7fa02871d2147b6230183694e8b9efc1cfd797808cba687aa4e91e19debab557  lfs.c (with the change)
-9c13b195643ccfd5025961fa3fb6029bbb9be0f6ffce9488ec9be958d33163b6  lfs.h (with the change)
+26bcb854f51dd836b1cbb64830e325f4d6a7bb28f2a2daf5a574ed9c0615b8e6  lfs.c (with the change)
+61e5ef35e4b940a7204279c59530b9cc81b19f1dac9b54de2c7df47519bb891e  lfs.h (with the change)
 ```
 
 `tools/check-littlefs.py` (run by `cargo xtask ci` as "littlefs sources") fails when a file of the
@@ -111,4 +116,4 @@ change, or when `stafeto-changes.patch` applied backwards to them does not give 
 4. Run `cargo test -p datafs`: `tests_entry_attr.rs` compares the attribute of every entry of
    a directory with `lfs_getattr` by path, across several metadata pairs.
 5. When a release has the same functions, delete the change: remove the patch, this file, the use
-   of the three functions in `lib/datafs/csrc/glue.c` and `lib/datafs/src/fs.rs`, and the check.
+   of the four functions in `lib/datafs/csrc/glue.c` and `lib/datafs/src/fs.rs`, and the check.

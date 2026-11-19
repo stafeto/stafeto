@@ -58,6 +58,8 @@ pub const ROOT_CLONES: usize = p::ROOT_CLONES;
 pub const ROOT_DESCRIPTIONS: usize = p::ROOT_DESCRIPTIONS;
 /// The entries of one directory at most (the service keeps the minimum of the protocol).
 pub const DIR_ENTRIES_MAX: usize = p::DIR_ENTRIES_MAX;
+/// The metadata pairs at which MKDIR stops (see `proto_data::PAIRS_MAX`).
+pub const PAIRS_MAX: u64 = p::PAIRS_MAX;
 /// The passes alive at once.
 pub const PASSES: usize = 16;
 /// The directories whose count of entries the server remembers.
@@ -210,6 +212,22 @@ struct Pending {
     len: usize,
 }
 
+/// What the server knows of the number of metadata pairs: the count of the last walk of the list and
+/// the most that the commits since have added (each MKDIR 2: its own pair and a split of its
+/// parent's; each create or rename 1: a split of the pair the name goes in).
+#[derive(Clone, Copy)]
+struct Pairs {
+    known: Option<u64>,
+    since: u64,
+}
+
+impl Pairs {
+    const NONE: Pairs = Pairs {
+        known: None,
+        since: 0,
+    };
+}
+
 /// The table a walk of a path fills (`Fs::path_attrs`): the root and each entry of the longest path
 /// the protocol accepts (`MAX_PATH` bytes is at most `ceil(MAX_PATH / 2)` components of one letter
 /// and a slash), with the bytes of the attribute of each. About 16 KiB, in the server's static, never
@@ -239,6 +257,11 @@ pub struct Server {
     walk: PathWalk,
     counts: [Counted; COUNT_CACHE],
     counts_hand: usize,
+    /// The count of the metadata pairs of the volume: what the last walk of the list found
+    /// (None before the first MKDIR after the mount) and the pairs the commits since may have added.
+    pairs: Pairs,
+    /// The cap (`PAIRS_MAX`; a test lowers it).
+    pairs_max: u64,
     /// The present moment in nanoseconds, which the service sets before each job (the clock page).
     now: i64,
     /// The next file number to hand out and the end of the block reserved in the counter.
@@ -436,6 +459,8 @@ impl Server {
                 entries: 0,
             }; COUNT_CACHE],
             counts_hand: 0,
+            pairs: Pairs::NONE,
+            pairs_max: PAIRS_MAX,
             now: 0,
             ino_next: 0,
             ino_end: 0,
@@ -1653,6 +1678,7 @@ impl Server {
                         if let Some((parent_record, _)) = &created {
                             let (parent, _) = split(path);
                             self.count_add(parent, 1);
+                            self.pairs_added(1);
                             self.touch(fs, parent, *parent_record);
                         }
                         let mut node = Node {
@@ -1762,3 +1788,16 @@ impl Server {
 pub const REQUEST_MAX: usize = abi::MESSAGE_MAX;
 
 const _: () = assert!(HEADER_LEN == 8);
+
+#[cfg(test)]
+impl Server {
+    /// Tests: the cap of the pairs of the volume, lowered so that a small volume reaches it.
+    pub(crate) fn set_pairs_max(&mut self, n: u64) {
+        self.pairs_max = n;
+    }
+
+    /// Tests: the server's upper bound of the pairs, None before the first count.
+    pub(crate) fn pairs_bound(&self) -> Option<u64> {
+        self.pairs.known.map(|k| k + self.pairs.since)
+    }
+}

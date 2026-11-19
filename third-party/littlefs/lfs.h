@@ -778,6 +778,13 @@ int lfs_fs_stat(lfs_t *lfs, struct lfs_fsinfo *fsinfo);
 // Returns the number of allocated blocks, or a negative error code on failure.
 lfs_ssize_t lfs_fs_size(lfs_t *lfs);
 
+// Counts the metadata pairs of the filesystem: the length of the threaded
+// list of pairs, the superblock's first. Each pair is fetched once, no entry
+// is read, so the cost grows with the number of pairs only.
+//
+// Returns the number of pairs, or a negative error code on failure.
+lfs_ssize_t lfs_fs_pairs(lfs_t *lfs);
+
 // Traverse through all blocks in use by the filesystem
 //
 // The provided callback will be called with each block address that is

@@ -186,6 +186,34 @@ impl Server {
         }
     }
 
+    /// MKDIR is about to make a pair: NO_SPACE when the volume has `PAIRS_MAX` pairs or more. The
+    /// bound (the last count plus what the commits since may have added) is kept below the cap with
+    /// no read; when it reaches the cap, or there is no count yet, the pairs are counted (about two
+    /// reads for each) and the count decides. At the cap this repeats at every MKDIR, which costs
+    /// what a removal of an old directory costs.
+    pub(super) fn room_for_pair<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> Res<()> {
+        if let Some(known) = self.pairs.known
+            && known + self.pairs.since < self.pairs_max
+        {
+            return Ok(());
+        }
+        let counted = volume(fs.metadata_pairs())?;
+        self.pairs = Pairs {
+            known: Some(counted),
+            since: 0,
+        };
+        if counted >= self.pairs_max {
+            Err(p::code(p::NO_SPACE))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Commits that may add pairs: `n` more to the bound.
+    pub(super) fn pairs_added(&mut self, n: u64) {
+        self.pairs.since += n;
+    }
+
     /// The reserve (rule 14): a caller other than user 0 gets NO_SPACE with fewer than
     /// `RESERVE_BLOCKS` free blocks, for a create, a rename and a change of attributes: each may
     /// split or compact a pair of metadata blocks, which takes blocks the superuser needs to remove
@@ -283,9 +311,11 @@ impl Server {
             return Err(p::code(p::EXISTS));
         }
         self.room_in_dir(fs, parent)?;
+        self.room_for_pair(fs)?;
         self.reserve_allows(fs, caller)?;
         let record = self.new_record(fs, caller, &parent_attr, Kind::Directory, mode)?;
         volume(fs.mkdir(path))?;
+        self.pairs_added(2);
         // The record is written in the same job as the name; a cut between the two commits leaves
         // an entry with no record, which reads as the closed default.
         if let Err(e) = fs.setattr(path, ATTR_TYPE, &record.to_bytes()) {
@@ -450,6 +480,8 @@ impl Server {
             }
             moved?;
         }
+        // A name made in the pair of the destination may split it.
+        self.pairs_added(1);
         if from_parent != to_parent {
             self.count_add(from_parent, -1);
             if target_entry.is_none() {

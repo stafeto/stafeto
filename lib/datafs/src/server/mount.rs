@@ -83,7 +83,8 @@ impl Server {
         };
         self.ino_next = 0;
         self.ino_end = 0;
-        // What the server remembers of directories starts empty at every mount.
+        // What the server remembers of directories and of the pairs starts empty at every mount.
+        self.pairs = super::Pairs::NONE;
         for c in &mut self.counts {
             c.used = false;
         }

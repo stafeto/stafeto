@@ -5379,6 +5379,34 @@ static lfs_ssize_t lfs_fs_size_(lfs_t *lfs) {
     return size;
 }
 
+// the number of metadata pairs of the filesystem: the length of the threaded
+// list of pairs that lfs_fs_traverse_ walks, the superblock's pair first. Each
+// pair is fetched once, no entry is looked at, so the cost is about the
+// fetch of two blocks for each pair.
+static lfs_ssize_t lfs_fs_pairs_(lfs_t *lfs) {
+    lfs_mdir_t dir = {.tail = {0, 1}};
+    struct lfs_tortoise_t tortoise = {
+        .pair = {LFS_BLOCK_NULL, LFS_BLOCK_NULL},
+        .i = 1,
+        .period = 1,
+    };
+    lfs_size_t pairs = 0;
+    while (!lfs_pair_isnull(dir.tail)) {
+        int err = lfs_tortoise_detectcycles(&dir, &tortoise);
+        if (err < 0) {
+            return LFS_ERR_CORRUPT;
+        }
+
+        err = lfs_dir_fetch(lfs, &dir, dir.tail);
+        if (err) {
+            return err;
+        }
+        pairs += 1;
+    }
+
+    return pairs;
+}
+
 // explicit garbage collection
 #ifndef LFS_READONLY
 static int lfs_fs_gc_(lfs_t *lfs) {
@@ -6695,6 +6723,20 @@ lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
     lfs_ssize_t res = lfs_fs_size_(lfs);
 
     LFS_TRACE("lfs_fs_size -> %"PRId32, res);
+    LFS_UNLOCK(lfs->cfg);
+    return res;
+}
+
+lfs_ssize_t lfs_fs_pairs(lfs_t *lfs) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_fs_pairs(%p)", (void*)lfs);
+
+    lfs_ssize_t res = lfs_fs_pairs_(lfs);
+
+    LFS_TRACE("lfs_fs_pairs -> %"PRId32, res);
     LFS_UNLOCK(lfs->cfg);
     return res;
 }
