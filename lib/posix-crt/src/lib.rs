@@ -32,6 +32,10 @@ use rt::handle::{Channel, Handle, Process, Resource, Thread};
 #[cfg(feature = "shared")]
 mod display_c;
 mod fast_c;
+// The C functions of the windows of the composition service, for a statically
+// linked program (`<stafeto/window.h>`); libc.so leaves them out.
+#[cfg(feature = "window")]
+mod window_c;
 
 // relibc's platform calls the layer through posix-platform's functions.
 extern crate posix_platform;

@@ -1,0 +1,25 @@
+[package]
+name = "lvgl-inject"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Injects the scenario of the LVGL demo through the compositor's input session"
+
+[[bin]]
+name = "lvgl-inject"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-comp = { path = "../../proto/comp" }
+proto-gpu = { path = "../../proto/gpu" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }
+
+# `quick`: the image of the measures under -icount, where the run does not wait for a
+# photograph; the poll for the window is tighter.
+[features]
+quick = []

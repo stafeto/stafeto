@@ -533,6 +533,18 @@ fn freedoom_wad() -> &'static [u8] {
     })
 }
 
+/// The font file of the LVGL demo (Liberation Sans Regular), which the build
+/// of the package `lvgl` copies out of its archive to `target/lvgl/`. Like the
+/// WAD, it is empty when the build has not run (the check of the descriptions
+/// needs the paths of an image only).
+fn lvgl_font() -> &'static [u8] {
+    static FONT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    FONT.get_or_init(|| {
+        let path = crate::target_dir().join("lvgl/LiberationSans-Regular.ttf");
+        std::fs::read(path).unwrap_or_default()
+    })
+}
+
 /// The bytes of the files that packages name as `bytes:<name>`.
 fn named_bytes(name: &str) -> Result<&'static [u8], String> {
     match name {
@@ -541,6 +553,7 @@ fn named_bytes(name: &str) -> Result<&'static [u8], String> {
         // The shells a login may use (Dropbear refuses an account whose shell is not listed).
         "shells" => Ok(b"/bin/ash\n/bin/sh\n"),
         "freedoom1.wad" => Ok(freedoom_wad()),
+        "LiberationSans-Regular.ttf" => Ok(lvgl_font()),
         "fstack.ini" => Ok(include_bytes!("../../ports/f-stack/fstack.ini")),
         "ca-certificates.crt" => Ok(crate::net_tls::ca_bundle()),
         "mime.types" => Ok(crate::nginx_probe::mime_types()),
@@ -1903,6 +1916,8 @@ pub const IMAGES: &[&str] = &[
     "boot-ash-dialog.img",
     "boot-doom.img",
     "boot-doom-steps.img",
+    "boot-lvgl.img",
+    "boot-lvgl-steps.img",
     "boot-base.img",
     "boot-full.img",
     "boot-pkg-probe.img",
@@ -2029,7 +2044,11 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
-        "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
+        "boot-ash-dialog.img"
+        | "boot-doom.img"
+        | "boot-doom-steps.img"
+        | "boot-lvgl.img"
+        | "boot-lvgl-steps.img" => dialog(name),
         // The probe of the boot script: the shell with the network, the script, and the
         // static address of `net-ec2-key` (the service of the metadata is not on the link).
         "boot-net-rc.img" => {
@@ -2417,6 +2436,15 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                         extra: 4096,
                     },
                 ),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
+        "boot-posix-window.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/posix-window", 0o755, ROOT, "posix-window"),
                 dir("/dev"),
             ];
             files.extend(devices());
@@ -3098,6 +3126,8 @@ mod tests {
                 "boot-ash-dialog.img" => shell,
                 "boot-doom.img" => crate::doom::programs(),
                 "boot-doom-steps.img" => crate::doom::steps_programs(),
+                "boot-lvgl.img" => crate::lvgl_image::programs(),
+                "boot-lvgl-steps.img" => crate::lvgl_image::steps_programs(),
                 "boot-base.img" | "boot-full.img" | "boot-pkg-probe.img" => {
                     crate::base_image::programs(image)
                 }
@@ -3295,6 +3325,8 @@ mod tests {
             "boot-ash-dialog.img",
             "boot-doom.img",
             "boot-doom-steps.img",
+            "boot-lvgl.img",
+            "boot-lvgl-steps.img",
             "boot-posix-procs.img",
             "boot-posix-lifetimes.img",
             "boot-posix-lock-rules.img",
@@ -3315,6 +3347,7 @@ mod tests {
             "boot-posix-random-limit.img",
             "boot-posix-random-rejoin-steps.img",
             "boot-posix-display.img",
+            "boot-posix-window.img",
             "boot-pkg-slot.img",
             "boot-display.img",
             "boot-posix-pty.img",

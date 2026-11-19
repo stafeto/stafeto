@@ -49,6 +49,12 @@ break-no-rejoin = []
 # Deliberate breakage: the threads of a process ask for a new session at once
 # (the second gets PERMISSION).
 break-rejoin-race = []
+# The windows of the composition service for a C program (window.rs): the
+# state of the process's window, its buffers as pieces of the map and the
+# calls that `<stafeto/window.h>` has. Statically linked programs turn it on
+# (posix-crt's feature `window`); libc.so is built without it, so that its
+# exports and the series 0.5 of the ABI stay as they were.
+window = ["dep:comp-client", "dep:proto-comp"]
 
 [dependencies]
 trace = { path = "../trace" }
@@ -83,3 +89,5 @@ posix-random = { path = "../posix-random" }
 proto-entropy = { path = "../../proto/entropy" }
 proto-gpu = { path = "../../proto/gpu" }
 proto-input = { path = "../../proto/input" }
+comp-client = { path = "../comp-client", optional = true }
+proto-comp = { path = "../../proto/comp", optional = true }

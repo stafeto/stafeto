@@ -2096,6 +2096,9 @@ fn move_files(c: &Handle<Channel>) -> bool {
     }
     // The screen goes back with the old image (spec 3, 3.5).
     crate::display::release_for_exec();
+    // And so is the window of the composition service.
+    #[cfg(feature = "window")]
+    crate::window::release_for_exec();
     // The operations of the stopped threads that wait in the session with the
     // network service go: the new image gets the session itself, with the
     // descriptions of the descriptors that stay.
