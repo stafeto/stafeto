@@ -554,11 +554,12 @@ directories of `/usr/share/licenses`, the services of the screen and the keys, a
 attached` line of the service (every run of QEMU fails on that line, `qemu::Run`). The notices of
 every package are checked whole in its package file (the licences of the packages linked into it
 too, `pcre2` and `musl-fts` among them), and the container of an image holds no file of F-Stack's
-notices. The full image runs on 1 GiB: on 512 MiB its container of 54 MB leaves init 15 837 free
-pages, under the 16 384 that `pkg-identity` keeps (the line `init: free pages` after `init:
-services started`); on 1 GiB and for the base image on 512 MiB the numbers are in the report of the
-stage. Whoever starts the full image, `run.sh` of its archive among them (stage 5 of subproject 5),
-passes `-m 1024`.
+notices. The full image runs on 1 GiB: its container of 54 MB leaves init's quota about 11 000 pages
+smaller than the base image's. Init keeps `INIT_RESERVE_PAGES` of its quota free after the services
+started (the line `init: free pages` after `init: services started`, which `pkg-identity` holds the
+image to) and sizes the pool of the process service as the rest, never under `POOL_MIN_PAGES` (the
+line `init: pool of posix`); the numbers of each image are in the report of the stage. Whoever starts the full image,
+`run.sh` of its archive among them (stage 5 of subproject 5), passes `-m 1024`.
 
 ## The disk service
 
