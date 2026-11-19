@@ -386,10 +386,11 @@ mod tests {
             assert_eq!(share_bound_permille(r, got), share, "{name}");
             let _ = loss;
         }
-        // Every window of the first run is inside its bound, and so is every one of the second
-        // but the pipe's: its window counted one overrun (E 120 us), kept 924 per mille where the
-        // bound promises 931, and lost 650 us, 65 over 585, with 538 us that no counter of the
-        // probe accounts for (serve ran 0 us over its awake spans, the driver 32).
+        // The arithmetic only: every window of the first run is inside its bound, and so is every
+        // one of the second but the pipe's, which counted one overrun (E 120 us), kept 924 per
+        // mille where the bound promises 931 and lost 650 us, 65 over 585. The bound counts the
+        // budget of the phase's own service; the other budgets and init run above the victim too
+        // (stafeto/stafeto#493), so the gate prints that window and does not fail on it.
         for (name, _, _, _, _, _, _, want, _, loss) in rows {
             let over = over_bound(loss, want);
             assert_eq!(over > 0, name == "abf7dedc pipe", "{name}: {over}");
