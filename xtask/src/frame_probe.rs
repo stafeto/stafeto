@@ -862,7 +862,9 @@ mod tests {
         let bands = overload_frame_bands();
         let cap = u64::from(frame_cap_bands());
         assert_eq!(cap, 52);
-        assert!(bands > 8 * cap, "{bands} bands");
+        // 424 on the fitted table; a refit may move it a little.
+        assert!((380..=470).contains(&bands), "{bands} bands");
+        assert_eq!(PERIODS / (bands.div_ceil(cap) + 1), 24);
     }
 
     fn overload_line(lines: &mut [String], from: &str, to: &str) {
