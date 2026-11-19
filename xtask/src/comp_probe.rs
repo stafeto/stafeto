@@ -1076,7 +1076,7 @@ mod tests {
         assert_eq!(costs[1].big_worst, 2500);
         let text = raster_text(&costs);
         assert!(text.contains(
-            "copy (table: call 759 constant 873, row 56.04 constant 64.45, point 1.37 constant 1.58; measured: no classes in this line): 6 calls, 1800 points, no large operation; call of an operation of 8 points or fewer least 40 greatest 60; over 64 points or more a point mean 2.77 least 2.70 greatest 3.30"
+            "copy (table: call 780 constant 897, row 54.80 constant 63.02, point 1.38 constant 1.59; measured: no classes in this line): 6 calls, 1800 points, no large operation; call of an operation of 8 points or fewer least 40 greatest 60; over 64 points or more a point mean 2.77 least 2.70 greatest 3.30"
         ));
         assert!(raster_text(&[]).contains("no cost lines"));
     }
@@ -1177,9 +1177,9 @@ mod tests {
         assert_eq!(costs[0].preempted, 3);
         let text = calibration_text(&costs);
         assert!(
-            text.contains("copy: call least 700 greatest 780 (48 operations, at 8x1; table 759)")
+            text.contains("copy: call least 700 greatest 780 (48 operations, at 8x1; table 780)")
         );
-        assert!(text.contains("point least 1.50 greatest 1.70 (120, at 64x32; table 1.37)"));
+        assert!(text.contains("point least 1.50 greatest 1.70 (120, at 64x32; table 1.38)"));
         assert!(text.contains("3 preempted and left out"));
         assert!(calibration_text(&[]).contains("no calibration lines"));
     }

@@ -88,12 +88,15 @@ pub const BAND_TICKS: u32 = 15_000;
 ///
 /// What the fit showed (the same in both probes). The cost of a row at a width
 /// is the price of a row plus the width's points where the width is 64 points or
-/// more (copy: 144 ticks at 64 wide, 265 at 152, a slope of 1.37 a point and a
-/// row of 56), and cheaper at the narrow widths (4 to 12 wide: 16 to 30 ticks
+/// more (copy: 144 ticks at 64 wide, 265 at 152, a slope of 1.38 a point and a
+/// row of 55), and cheaper at the narrow widths (4 to 12 wide: 16 to 30 ticks
 /// for a copy): the narrow rows do not cost more a point than the model says,
 /// so three terms suffice, and the model overstates a narrow tall shape (4 by
-/// 32: by 273 ticks for the black, 1 104 for a copy, 3 203 for a layer laid over
+/// 32: by 273 ticks for the black, 1 090 for a copy, 3 189 for a layer laid over
 /// others), which only makes a band of a narrow damage smaller than it could be.
+/// The shapes of the width of the screen are in the fit (a copy of 640 by 13:
+/// 12 438 to 12 945 ticks, a layer laid over others 36 345 to 38 620, the black
+/// 3 459 to 3 641), and the model with the constants is above their greatest.
 /// The widths of the shapes go up to 152 points and include 640 (the width of
 /// the screen: 640 by 1, 8 and 13 lines), the width of the main band of the
 /// table. Under -icount the time is instructions: there is no cold cache, no
@@ -156,13 +159,14 @@ const fn price(
 }
 
 /// The prices: black, copy, over, each the upper fit of the model over the
-/// greatest ticks of 23 shapes of operations (`compositor::fit`, `px::calibration`),
+/// greatest ticks of 26 shapes of operations, the widths 1 to 152 and 640
+/// (`compositor::fit`, `px::calibration`),
 /// measured under -icount, the same in `comp-probe` and in `focus-probe`
 /// (the run is deterministic). Every entry is a measure.
 pub const PRICES: [Price; 3] = [
     price("black", 209, 2_400, false, 38, false),
-    price("copy", 759, 5_604, false, 137, false),
-    price("over", 754, 19_075, false, 427, false),
+    price("copy", 780, 5_480, false, 138, false),
+    price("over", 785, 18_981, false, 427, false),
 ];
 pub const FILL: Price = PRICES[0];
 pub const OPAQUE: Price = PRICES[1];
@@ -2754,6 +2758,22 @@ mod tests {
             assert!(
                 model(p, w, h) >= live,
                 "{} {w}x{h}: {} < {live}",
+                p.kind,
+                model(p, w, h)
+            );
+        }
+        // The shapes of the width of the screen, the greatest of each over the
+        // four offsets (the refit of the probes): the model is above them.
+        for (p, w, h, greatest) in [
+            (OPAQUE, 640u32, 1u32, 1_715u64),
+            (OPAQUE, 640, 8, 8_265),
+            (OPAQUE, 640, 13, 12_945),
+            (OVER, 640, 13, 38_620),
+            (FILL, 640, 13, 3_641),
+        ] {
+            assert!(
+                model(p, w, h) >= greatest + greatest * 15 / 100,
+                "{} {w}x{h}: {} below {greatest} with the margin",
                 p.kind,
                 model(p, w, h)
             );
