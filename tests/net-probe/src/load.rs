@@ -156,7 +156,10 @@ impl Probe<'_> {
                             sockets::read_received(data).map_err(|_| "RECV's data")?;
                         taken += got.len();
                     }
-                    Err(fail) if is(&fail, AGAIN) => self.sleep(super::PAUSE_NS),
+                    // Nothing yet: ask again at once. The load polls, so that the
+                    // network service's own work and the requests it serves are what
+                    // spend its budgets.
+                    Err(fail) if is(&fail, AGAIN) => {}
                     Err(_) => return Err("RECV failed"),
                 }
             }

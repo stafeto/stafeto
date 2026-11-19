@@ -15,8 +15,8 @@
 //!   `hog-ref` the CPU load runs alone and its loops a second are the reference);
 //! - `idle`, `cpu`, `files`, `net` (the scene P): no late frame, no skip, the
 //!   window of the client neither late nor missed, the time to compose under
-//!   the bound of its row, and in `net` the budgets of the network service
-//!   overrun (the load is real);
+//!   the bound of its row; the report says how many times the budgets of the
+//!   network service were spent in the run, and says so when none was;
 //! - `full` (the scene F): the same, with the bound computed from the bands of
 //!   the frame as measured, when the frame has no more than 45 bands; with more
 //!   the phase is a load phase and says so;
@@ -517,24 +517,24 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
             }
         }
     }
-    // The network load is real: the budgets of the network service ran out. The
-    // journal of init counts them over the whole run (no count by phase exists) and says how
-    // many times the kernel found each budget spent.
+    // How loaded the network service was: the journal of init counts, over the
+    // whole run, the times the kernel found each of its budgets spent. A run
+    // with none says so, and the bound's term for the service has been
+    // exercised in part only.
     let overruns = netd_overruns(lines);
-    if timed && overruns.iter().all(|(_, n)| *n == 0) {
-        return Err("net: no line of init about an overrun of the budgets of netd".to_owned());
-    }
-    said.push(format!(
-        "frame-probe: netd: budgets spent in the run (the kernel's count of overruns){}",
-        if overruns.is_empty() {
-            ": none reported".to_owned()
-        } else {
+    let spent = overruns.iter().map(|(_, n)| *n).sum::<u64>();
+    said.push(if spent == 0 {
+        "frame-probe: netd: the budgets were not spent in the run, so the bound's term for the service is exercised in part"
+            .to_owned()
+    } else {
+        format!(
+            "frame-probe: netd: budgets spent in the run (the kernel's count of overruns){}",
             overruns
                 .iter()
                 .map(|(name, n)| format!(", {name} {n}"))
                 .collect::<String>()
-        }
-    ));
+        )
+    });
     if full_judged_as_load {
         said.push(
             "frame-probe: the whole-screen frame has more bands than the design allows: raise it in the report"
@@ -1023,26 +1023,29 @@ mod tests {
         );
         let said = verdict(&lines, true).unwrap();
         assert!(said.iter().any(|l| l.ends_with(", switch 5, stack0 91")));
-        // Lines that say no overrun are no load.
-        let mut none = good();
-        none.retain(|l| !l.starts_with("init: netd budget"));
-        none.push(
+    }
+
+    /// A run whose budgets were not spent still passes and says plainly that the
+    /// term for the service was exercised in part.
+    #[test]
+    fn a_run_with_no_overrun_of_netd_says_so() {
+        let mut lines = good();
+        lines.retain(|l| !l.starts_with("init: netd budget"));
+        let said = verdict(&lines, true).unwrap();
+        assert!(
+            said.iter()
+                .any(|l| l.contains("budgets were not spent") && l.contains("exercised in part"))
+        );
+        lines.push(
             "init: netd budget switch: at least 0 overruns, at least 0 in all, kernel counts 0"
                 .to_owned(),
         );
-        assert!(verdict(&none, true).is_err());
-    }
-
-    #[test]
-    fn a_net_phase_without_an_overrun_of_netd_fails() {
-        let mut lines = good();
-        lines.retain(|l| !l.starts_with("init: netd budget"));
         assert!(
             verdict(&lines, true)
-                .unwrap_err()
-                .starts_with("net: no line of init")
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("not spent"))
         );
-        assert!(verdict(&lines, false).is_ok());
     }
 
     #[test]

@@ -496,6 +496,11 @@ impl Env<'_> {
             h: paint::O_RECT.h,
         };
         let mut next = [0u32; paint::O_WINDOWS];
+        // A window whose both buffers the service holds is left alone until it
+        // gives one back (a bit on the channel says that some window's buffer
+        // came back): asking again in the meantime is a request the service
+        // serves between its bands for nothing.
+        let mut held = [false; paint::O_WINDOWS];
         let (mut posts, mut busy, mut step) = (0u32, 0u32, 0u64);
         let (t0, end) = (self.schedule.start_of(phase), self.schedule.end_of(phase));
         loop {
@@ -504,10 +509,16 @@ impl Env<'_> {
                 break;
             }
             self.sleep_until(due);
+            if self.bits.replace(0) & 0b11 != 0 {
+                held = [false; paint::O_WINDOWS];
+            }
             for (i, slot) in sessions.iter().enumerate() {
                 let Some(session) = slot else {
                     continue;
                 };
+                if held[i] {
+                    continue;
+                }
                 let mut taken = false;
                 for _ in 0..2 {
                     if Self::try_post(session, next[i], whole)? {
@@ -518,6 +529,7 @@ impl Env<'_> {
                     busy += 1;
                     next[i] ^= 1;
                 }
+                held[i] = !taken;
                 posts += u32::from(taken);
             }
             step += 1;
