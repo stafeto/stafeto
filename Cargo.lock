@@ -1190,6 +1190,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-window-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "power"
 version = "0.5.1"
 dependencies = [

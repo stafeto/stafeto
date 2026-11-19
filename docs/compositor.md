@@ -212,6 +212,56 @@ copy of a band and the lay of a band over
 the screen are pixman's SRC and OVER; the glue is `lib/pixman` and
 `services/compositor/src/px.rs`.
 
+## The C library of windows
+
+A C program makes windows of the second revision with the functions of
+`<stafeto/window.h>` (`lib/posix-crt/window/stafeto/window.h`). They are a
+static library: the Rust crate `posix-crt` with its feature `window` carries
+the C functions (`window_c.rs`), `posix-abi` with the same feature the calls
+(`window.rs`), and the crate `comp-client` the logic that needs no kernel.
+`libc.so` is built without the feature and the header lies outside the libc
+sysroot, so the series 0.5 of the ABI is as it was, and `tools/build-libc-so.py`
+refuses a build of `libc.so` that defines a name of the library
+(`stafeto_window_*`, `stafeto_screen_*`). A program that uses windows is a
+statically linked one (`tests/posix-window` is the model); a later series
+moves the library into `libc.so` and gives the window's channel to `poll`.
+
+- The process has one window, number 0. `stafeto_window_open` asks DESCRIBE
+  for the screen (it waits for a display that is being set up), makes the
+  buffers (memory objects of the process, mapped as pieces of the memory map
+  of the kind `Window`, a page-rounded `4 w h` bytes each), a channel of its
+  own with a timer, WINDOW_CREATE with a copy of the channel (NOTIFY and
+  TRANSFER) and ATTACH with a copy of each buffer (MAP_READ and TRANSFER). A
+  failure at any step closes what was made, so a failed open leaves nothing.
+- The account of the buffers is `comp_client::account`: a buffer is free at
+  the start, a POST takes it out before the request goes (a failed POST gives
+  it back), and only the service's bit for it brings it back. The service
+  sends the bit of a buffer a later POST replaced before it replies to that
+  POST, so `stafeto_window_post` takes the bits that wait before and after
+  its request and keeps them for the next `stafeto_window_wait`, which a
+  thread asleep in it is woken for. Each bit is returned by one wait.
+- POST with 5 or more rectangles goes as their bounding box; up to 4 go as
+  they are, none means the whole window. Each rectangle is checked against
+  the window before anything is sent.
+- `stafeto_window_wait` is the wait of `fast::wait`: a try without waiting,
+  the signals, the entries deferred, a receive with a timer for the bound.
+  A signal with a handler ends it with EINTR. One thread at a time waits and
+  one takes events; another gets EBUSY. Events the service gave beyond the
+  caller's room wait in the library for the next call.
+- `fork` gives the child no window (the state is reset in `after_fork`, the
+  pieces are not copied); `exec` and `stafeto_window_close` close the
+  session, which ends the window in the service, unmap the buffers and close
+  the channel and the timer. A service that ended answers ENODEV from every
+  call from then on.
+- `stafeto_window_shown` is a helper of the probes: it looks at DESCRIBE
+  every 2 ms until `frames` has grown since the last look and `busy` is 0.
+
+`cargo xtask posix-window` runs `tests/posix-window` in an image of its own
+(`boot-posix-window.img`, the table `table::window`): the screenshots of QEMU
+after the first frame, a rectangle of the second buffer and the merge of
+five rectangles have the CRC-32 the program computed, and the bits, events,
+fork, a signal and close are checked by the program.
+
 ## Limits accepted in stage G1
 
 One process can take all 8 window places through clones of its session. A
@@ -405,5 +455,5 @@ the bands set from the NEON costs (the probes report them), the window manager
 and the keyboard in the base image (the manager's image is the probe's), the
 pointer in the base image, the layers of the display
 controller, a window of the second revision shown directly (the flag `SCANOUT`
-of WINDOW_CREATE is reserved), and the C
-functions for windows in `libc.so` (a change of the ABI series).
+of WINDOW_CREATE is reserved), and the C functions for windows in `libc.so` (a
+change of the ABI series; the static library above has them now).
