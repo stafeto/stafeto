@@ -330,6 +330,9 @@ impl Env<'_> {
         self.on_time("draw")?;
         let (objects, at) = self.objects()?;
         let mut open: Option<(Scene, Handle<Channel>)> = None;
+        // The buffers the service has given back: both in a new window, and
+        // kept from phase to phase while the window stays.
+        let mut free: u64 = 0b11;
         for phase in ORDER {
             let scene = phase.scene();
             self.sleep_until(self.schedule.start_of(phase));
@@ -343,14 +346,12 @@ impl Env<'_> {
                 // The window of the scene before closes first.
                 drop(open.take());
                 self.bits.set(0);
+                free = 0b11;
                 open = Some((scene, self.window(&display, rect, &objects)?));
             }
             let Some((_, session)) = &open else {
                 continue;
             };
-            // Both buffers are free in a new window.
-            let mut free: u64 = 0b11;
-            self.bits.set(0);
             let (mut posts, mut idle, mut step) = (0u32, 0u32, 0u64);
             let end = self.schedule.end_of(phase);
             let t0 = self.schedule.start_of(phase);
@@ -448,7 +449,12 @@ impl Env<'_> {
             .map_err(say("map the buffer"))?;
             let mut flushes = 0u32;
             let finish = self.schedule.end_of(phase);
+            let t0 = self.schedule.start_of(phase);
             while now() < finish {
+                // One flush a period: a client of 60 Hz, which is the pace of the
+                // service with a clock and the pace this loop keeps on a service
+                // that shows a frame as soon as it can.
+                self.sleep_until(t0 + u64::from(flushes) * PERIOD_NS);
                 // SAFETY: mapped for reading and writing above; one thread.
                 let points = unsafe {
                     core::slice::from_raw_parts_mut(
@@ -466,7 +472,6 @@ impl Env<'_> {
                 proto_gpu::Rect::SCREEN
                     .write(&mut w)
                     .map_err(say("FLUSH's bytes"))?;
-                // The reply comes once the frame is shown, which paces the loop.
                 sys::send(&owner, w.as_bytes()).map_err(say("FLUSH"))?;
                 flushes += 1;
             }
