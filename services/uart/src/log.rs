@@ -294,7 +294,12 @@ impl Sources {
 /// batches took up to 20,410 ticks under -icount (about 570 ticks a record if the cost is linear), as
 /// long as the longest step the system allows a service; two batches are expected to keep the
 /// longest tick near 14,000 ticks, under nine tenths of that bound (xtask posix-tty-steps checks
-/// it).
+/// it). The driver also has a budget of 75 us of each 5 ms (4,687 ticks): a tick of 24 records
+/// is longer, and its rest runs at level 32, which the CPU gives it only when no level from 33 to
+/// 59 runs. With those levels saturated the driver takes about 5.7 records in 5 ms (a tick that
+/// finds nothing costs about 1,850 ticks and a record about 500), 1.1 a millisecond, and a burst
+/// of 2.5 records a millisecond loses 18 to 40 of 150 to the ring of 64 (the lost count of the
+/// next batch tells it).
 pub const STEP_BATCHES: usize = 2;
 
 /// The period of the reads while the driver holds log text it has not put
@@ -720,6 +725,92 @@ mod tests {
             let r = run(150, 60, 1000, true, phase);
             assert_eq!(r.lost, 0, "phase {phase}");
             assert_eq!(r.delivered, (0..150).collect::<Vec<u32>>(), "phase {phase}");
+        }
+    }
+
+    /// What the log tick costs under -icount, in ticks of the counter (xtask posix-tty-steps,
+    /// the table of tag 18): the tick that finds nothing about 1,850, a record about 500 (the
+    /// busy ticks of 7,810, 12,454 and 18,432 to 20,410 ticks hold 12, 24 and 36 records), and
+    /// the budget of the driver, 75 us of each 5 ms, 4,687 ticks.
+    const TICK_FIXED: u64 = 1_850;
+    const PER_RECORD: u64 = 500;
+    const BUDGET_TICKS: u64 = 4_687;
+    /// What the model gives for the burst of 150 records over the phases of the first tick: the
+    /// ring of 64 and about 60 records taken in the 60 ms leave 18 to 40 overwritten.
+    const SATURATED_LOST_MIN: u64 = 18;
+    const SATURATED_LOST_MAX: u64 = 40;
+
+    /// The driver when levels 33 to 59 never leave the CPU: it works at its own level only for
+    /// its budget, and the rest of a tick waits until the budget is back (a step the budget cuts
+    /// goes on in the next period, so the unused part of a period's budget is carried). A tick
+    /// comes each DRAIN_NS while records are left, each IDLE_NS otherwise; `pushes` records
+    /// arrive evenly in `span_ms`. Gives the records lost and delivered.
+    fn run_saturated(pushes: u32, span_ms: u32, total_ms: u32, phase: u32) -> (u64, usize) {
+        let mut kernel = Kernel {
+            ring: Default::default(),
+            lost: 0,
+        };
+        let mut delivered = 0usize;
+        let mut lost = 0u64;
+        let mut sent = 0;
+        let mut credit = 0u64;
+        let mut next_at = phase;
+        for ms in 0..total_ms {
+            while sent < pushes
+                && u64::from(sent) * u64::from(span_ms) <= u64::from(ms) * u64::from(pushes)
+            {
+                kernel.push(sent);
+                sent += 1;
+            }
+            if ms >= next_at {
+                // The period's budget, less the tick's fixed part; what the tick cannot spend on
+                // records (nothing to take) is not kept past the period.
+                credit = (credit + BUDGET_TICKS)
+                    .min(2 * BUDGET_TICKS)
+                    .saturating_sub(TICK_FIXED);
+                let can = (credit / PER_RECORD) as usize;
+                let take = can.min(STEP_BATCHES * LOG_BATCH).min(kernel.ring.len());
+                let got: Vec<u32> = kernel.ring.drain(..take).collect();
+                lost += core::mem::take(&mut kernel.lost);
+                delivered += got.len();
+                credit = if take < can {
+                    0
+                } else {
+                    credit - take as u64 * PER_RECORD
+                };
+                next_at = ms
+                    + if kernel.ring.is_empty() {
+                        (IDLE_NS / 1_000_000) as u32
+                    } else {
+                        (DRAIN_NS / 1_000_000) as u32
+                    };
+            }
+        }
+        (lost + kernel.lost, delivered)
+    }
+
+    #[test]
+    fn the_burst_with_levels_33_to_59_saturated_loses_records_and_counts_them() {
+        // The records a period takes under the budget: (4,687 - 1,850) / 500, 5.7 in 5 ms, 1.1 a
+        // millisecond, against the 2.5 of the burst. Whatever the phase of the first tick, the
+        // ring (64) overflows and the kernel counts what it overwrote; every record is
+        // delivered or counted.
+        let mut worst = (u64::MAX, 0);
+        for phase in 0..(IDLE_NS / 1_000_000) as u32 {
+            let (lost, delivered) = run_saturated(150, 60, 2000, phase);
+            assert_eq!(delivered as u64 + lost, 150, "phase {phase}");
+            worst = (worst.0.min(lost), worst.1.max(lost));
+        }
+        assert_eq!(worst, (SATURATED_LOST_MIN, SATURATED_LOST_MAX));
+    }
+
+    #[test]
+    fn the_burst_with_idle_middle_levels_loses_none_under_the_budget() {
+        // The driver at 32 runs whenever nothing at 33 to 59 does: the budget does not cut its
+        // rate, and the model of the drain (no loss at any phase) stands.
+        for phase in 0..(IDLE_NS / 1_000_000) as u32 {
+            let r = run(150, 60, 1000, true, phase);
+            assert_eq!(r.lost, 0, "phase {phase}");
         }
     }
 
