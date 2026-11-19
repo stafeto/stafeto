@@ -485,7 +485,8 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                         frac(share),
                         frac(HOG_FLOOR_PPM),
                         match band_step_in(lines, Phase::HogRef, Phase::Overload) {
-                            (Some(t), _) => format!("{t} ticks in the phase"),
+                            (Some((t, d)), _) =>
+                                format!("{t} ticks in the phase, {}", own_step_kind(d)),
                             (None, before) =>
                                 format!("none above the earlier greatest {before} ticks"),
                         },
@@ -555,12 +556,26 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
     Ok(said)
 }
 
+/// What the detail of the compositor's longest own step (kind 65) says it was:
+/// 1000 and the images made for a band, 2000 a take, 3000 the commit after the
+/// last band, 4000 the end of a frame, 5000 housekeeping.
+pub fn own_step_kind(detail: u64) -> String {
+    match detail {
+        1000..=1999 => format!("a band that made {} images", detail - 1000),
+        2000..=2999 => "a take".to_owned(),
+        3000..=3999 => "the commit after the last band".to_owned(),
+        4000..=4999 => "the end of a frame".to_owned(),
+        5000..=5999 => "housekeeping".to_owned(),
+        _ => format!("a step of detail {detail}"),
+    }
+}
+
 /// The longest step of the compositor's own kind (65: a band and the end of a
 /// frame) that the lines of the steps show between the end of the phase
 /// `from` and the end of the phase `to`, and the longest before them. The
 /// lines of a step come when a kind's greatest grows, so a phase with no line
 /// had no step above the earlier greatest.
-pub fn band_step_in(lines: &[String], from: Phase, to: Phase) -> (Option<u64>, u64) {
+pub fn band_step_in(lines: &[String], from: Phase, to: Phase) -> (Option<(u64, u64)>, u64) {
     let at = |phase: Phase| {
         lines
             .iter()
@@ -574,9 +589,12 @@ pub fn band_step_in(lines: &[String], from: Phase, to: Phase) -> (Option<u64>, u
         crate::longest_steps(part, tag)
             .into_iter()
             .find(|r| r.0 == 65)
-            .map(|r| r.1)
+            .map(|r| (r.1, r.2))
     };
-    (kind65(&lines[a..b]), kind65(&lines[..a]).unwrap_or(0))
+    (
+        kind65(&lines[a..b]),
+        kind65(&lines[..a]).map_or(0, |(t, _)| t),
+    )
 }
 
 /// The overruns of the budgets of the network service by the lines of init's
@@ -640,16 +658,25 @@ pub fn steps_verdict(lines: &[String]) -> Result<String, String> {
                 return Err(format!("the {name}: no step {what}: {rows:?}"));
             }
         }
+        let kind = |row: &(usize, u64, u64)| {
+            if row.0 == 65 && tag == crate::comp_probe::COMP_TAG {
+                format!(", {}", own_step_kind(row.2))
+            } else {
+                String::new()
+            }
+        };
         if let Some(row) = rows.iter().find(|r| r.1 > crate::gpu_probe::STEP_MAX) {
             return Err(format!(
-                "the {name}: a step past the gate ({}): {row:?}",
-                crate::gpu_probe::STEP_MAX
+                "the {name}: a step past the gate ({}): {row:?}{}",
+                crate::gpu_probe::STEP_MAX,
+                kind(row)
             ));
         }
         if let Some(row) = rows.iter().find(|r| r.0 == 65 && r.1 > crate::PORTION_MAX) {
             return Err(format!(
-                "the {name}: a portion past {}: {row:?}",
-                crate::PORTION_MAX
+                "the {name}: a portion past {}: {row:?}{}",
+                crate::PORTION_MAX,
+                kind(row)
             ));
         }
         said.push(format!(
@@ -959,12 +986,13 @@ mod tests {
         );
         assert_eq!(
             band_step_in(&lines, Phase::HogRef, Phase::Overload),
-            (Some(15_100), 14_000)
+            (Some((15_100, 0)), 14_000)
         );
         let said = verdict(&lines, true).unwrap();
         assert!(
             said.iter()
-                .any(|l| l.contains("longest band step 15100 ticks in the phase"))
+                .any(|l| l
+                    .contains("longest band step 15100 ticks in the phase, a step of detail 0"))
         );
         // No line in the phase: nothing above the earlier greatest.
         lines.remove(over);
@@ -973,6 +1001,37 @@ mod tests {
             said.iter()
                 .any(|l| l.contains("none above the earlier greatest 14000 ticks"))
         );
+    }
+
+    #[test]
+    fn the_kind_of_a_long_step_is_named() {
+        let tag = crate::comp_probe::COMP_TAG;
+        assert_eq!(own_step_kind(1008), "a band that made 8 images");
+        assert_eq!(own_step_kind(1000), "a band that made 0 images");
+        assert_eq!(own_step_kind(2000), "a take");
+        assert_eq!(own_step_kind(3000), "the commit after the last band");
+        assert_eq!(own_step_kind(4000), "the end of a frame");
+        assert_eq!(own_step_kind(5000), "housekeeping");
+        // The phase's line carries it, and a gate message names it.
+        let mut lines = good();
+        let over = lines
+            .iter()
+            .position(|l| l.starts_with("frame-load: phase overload "))
+            .unwrap();
+        lines.insert(
+            over,
+            format!("service step: {tag} kind 65 21333 ticks detail 1008"),
+        );
+        let said = verdict(&lines, true).unwrap();
+        assert!(said.iter().any(|l| {
+            l.contains("longest band step 21333 ticks in the phase, a band that made 8 images")
+        }));
+        let mut steps = steps(&[]);
+        steps.push(format!(
+            "service step: {tag} kind 65 21333 ticks detail 1008"
+        ));
+        let e = steps_verdict(&steps).unwrap_err();
+        assert!(e.contains("a band that made 8 images"), "{e}");
     }
 
     #[test]
