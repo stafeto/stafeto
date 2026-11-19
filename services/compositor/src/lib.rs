@@ -608,9 +608,12 @@ impl Scene {
         false
     }
 
-    /// Whether a frame is in progress or damage waits for one.
+    /// Whether a frame is in progress or a change waits for one: damage of the
+    /// scene, or a buffer a window holds for the start of its interval.
     pub fn busy(&self) -> bool {
-        self.frame || self.damage.is_some()
+        self.frame
+            || self.damage.is_some()
+            || self.windows.iter().flatten().any(|w| w.held.is_some())
     }
 
     pub fn framing(&self) -> bool {
@@ -1341,7 +1344,15 @@ impl Scene {
         if self.frame {
             return None;
         }
-        self.held_until = None;
+        // The start the windows this taking leaves are due at, whether or not
+        // anything else is taken: with nothing to take the caller says `hold`.
+        self.held_until = self
+            .windows
+            .iter()
+            .flatten()
+            .filter(|w| w.posted.is_some() && !w.pace.due(k))
+            .filter_map(|w| w.pace.earliest())
+            .min();
         for w in self.windows.iter_mut().flatten() {
             if w.pace.due(k)
                 && let Some(h) = w.held.take()
@@ -1362,10 +1373,7 @@ impl Scene {
             };
             if w.posted.is_some() && !w.pace.due(k) {
                 // Not its start: the buffer stays posted, and the frame is
-                // owed it at its start.
-                if let Some(e) = w.pace.earliest() {
-                    self.held_until = Some(self.held_until.map_or(e, |h| h.min(e)));
-                }
+                // owed it at its start (`held_until`).
                 continue;
             }
             let Some(b) = w.posted.take() else {
@@ -2894,6 +2902,72 @@ mod tests {
         assert_eq!((r.posts, r.taken), (1, 1));
         s.post(b, 1, &[]).unwrap();
         assert_eq!(s.pace(b).unwrap().posts, 2);
+    }
+
+    /// A taking with nothing to take that leaves a window held: the scene says
+    /// the start it is due at, the pacer is told to hold it, and the next
+    /// arming stands at that start, where the buffer is taken with no new post.
+    /// The scene is busy meanwhile, so a probe that waits for the screen to
+    /// settle does not decide it has.
+    #[test]
+    fn a_taking_with_nothing_to_take_leaves_the_held_window_a_timer() {
+        let mut p = frame::Pacer::new(0, 1_000, 52);
+        let clock = *p.clock();
+        let mut s = Scene::new();
+        let b = s.create(2, 2, rect(100, 100, 40, 40), false, 0).unwrap();
+        s.attach(b, 2, 160).unwrap();
+        assert!(s.pace_mut(b).unwrap().set_interval(2));
+        s.pace_mut(b).unwrap().took(3); // awaited at 5
+        assert!(!s.busy());
+        // B posts early, in period 3: its damage waits in the window.
+        let (_, due) = s.post_paced(b, 0, &[], &clock, 3_200).unwrap();
+        assert_eq!(due, Some(5));
+        assert!(!s.damaged() && s.busy());
+        // Another change (a window gone, the manager) brings a taking at 4.
+        assert_eq!(p.change(3_500, None), frame::Wake::At(4_000));
+        assert_eq!(p.fire(4_000), frame::Fire::Take(4));
+        // Nothing is taken, and the scene says B is due at 5.
+        assert_eq!(s.begin_at(4), None);
+        assert_eq!(s.held_until(), Some(5));
+        assert!(s.busy());
+        p.hold(s.held_until().unwrap());
+        assert_eq!(p.nothing_taken(4_100), frame::Wake::At(5_000));
+        // At 5 the buffer is taken without a new post, and the scene settles.
+        assert_eq!(p.fire(5_000), frame::Fire::Take(5));
+        assert!(s.begin_at(5).is_some());
+        assert_eq!(s.held_until(), None);
+        s.end(true);
+        assert!(!s.busy());
+        assert_eq!(s.pace(b).unwrap().taken, 2);
+    }
+
+    /// One opaque window of XRGB8888 over the whole screen covers the damage of
+    /// a frame of the whole screen, so no black is charged and a band holds
+    /// nine lines (45 bands); a window one column short does not cover it, the
+    /// black is charged too, and a band holds seven lines (58 bands).
+    #[test]
+    fn a_window_that_covers_the_damage_pays_no_black() {
+        let bands = |w: u32| {
+            let mut s = Scene::new();
+            let a = s.create(1, 1, rect(0, 0, w, 400), false, 0).unwrap();
+            s.attach(a, 1, w * 4).unwrap();
+            s.post(a, 0, &[]).unwrap();
+            s.begin().unwrap();
+            s.end(true);
+            // The whole screen changes: the frame's damage is the screen.
+            s.add_damage(SCREEN);
+            let d = s.begin().unwrap();
+            assert_eq!(d, SCREEN);
+            let rows = s.tile(d).1;
+            s.end(true);
+            (rows, 400u32.div_ceil(rows))
+        };
+        let (rows, n) = bands(640);
+        assert_eq!((rows, n), (9, 45));
+        assert_eq!(n, full_screen_bands());
+        // One column short: the black is charged.
+        let (rows, n) = bands(639);
+        assert_eq!((rows, n), (7, 58));
     }
 
     use proto_gpu::{PIPELINE_CURSOR, SOURCE_CURSOR};

@@ -392,7 +392,12 @@ fn main(_: u64) -> u64 {
     let Ok(timer) = sys::timer_create(&timer_view, level) else {
         return NOT_REGISTERED;
     };
-    let (period, cap_ppm) = frame::parse_args(args.map_or(&[], |a| a.own));
+    let (period, cap_ppm, bad) = frame::parse_args(args.map_or(&[], |a| a.own));
+    if bad {
+        rt::println!(
+            "compositor: the arguments of the record are no period and cap, the defaults stand"
+        );
+    }
     let cap = frame::band_cap(period, cap_ppm, BAND_TICKS);
     let mut service = Compositor {
         channel: Handle::borrowed(channel.raw()),
@@ -1055,6 +1060,9 @@ impl Compositor {
     /// The timer fired at the start of a period (or the bands put off by the cap
     /// are due): take the frame, or go on with its bands.
     fn timer_fired(&mut self) {
+        // The step that takes a frame is judged as a band is (under the band's
+        // limit), with the steps of the service's own work.
+        rt::service::step_own();
         let now = now_ns();
         match self.pacer.fire(now) {
             Fire::Take(k) => {
@@ -1065,6 +1073,11 @@ impl Compositor {
                     }
                     self.deliver();
                 } else {
+                    // Nothing was taken (damage that has gone, or only windows
+                    // held for their intervals): they are owed their start.
+                    if let Some(e) = self.scene.held_until() {
+                        self.pacer.hold(e);
+                    }
                     let wake = self.pacer.nothing_taken(now);
                     self.arm(wake);
                 }

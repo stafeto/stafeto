@@ -737,7 +737,10 @@ pub const INTERVAL_MAX: u32 = 4;
 
 /// STATS' flags: bit 0 RESET clears the counters and their greatest values
 /// after the reply is made. The counters are shared, so only a session with
-/// MANAGER_MARK or INPUT_MARK may ask it (others: NOT_ALLOWED).
+/// MANAGER_MARK or INPUT_MARK may ask it (others: NOT_ALLOWED). A frame taken
+/// before a RESET and shown after it is counted in `frames` of the period
+/// that follows (and not in its `releases`), so in the first period after a
+/// reset `frames` can be one more than `releases`.
 pub const RESET: u32 = 1;
 
 /// The most windows STATS' reply holds records of: MAX_WINDOWS of the service.
