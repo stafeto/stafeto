@@ -84,7 +84,11 @@ static long read_up_to(int fd, unsigned char *buf, unsigned long n) {
 static int wait_ok(pid_t pid) {
     int status = 0;
     if (waitpid(pid, &status, 0) != pid) return -1;
-    if (!WIFEXITED(status)) return -2;
+    if (!WIFEXITED(status)) {
+        /* Killed by a signal (SIGXFSZ from the limit on the size of a file, a fault): say which. */
+        if (WIFSIGNALED(status)) printf("posix-data: a process ended with the signal %d\n", WTERMSIG(status));
+        return -2;
+    }
     return WEXITSTATUS(status);
 }
 
@@ -720,6 +724,15 @@ static int write_pwrite_and_read_back(void) {
     make_pattern(buf, 0, sizeof buf, 9);
     DATA_CHECK(pwrite(fd, buf, sizeof buf, 1000) == (ssize_t)sizeof buf);
     DATA_CHECK(lseek(fd, 0, SEEK_CUR) == 5000); /* pwrite leaves the position */
+    /* A pwrite of more than one message (a message of PWRITE holds 1,004 bytes), at an offset that
+     * is not a message boundary, and a pread of as much. */
+    unsigned char wide[3000], wide_back[3000];
+    make_pattern(wide, 0, sizeof wide, 10);
+    DATA_CHECK(pwrite(fd, wide, sizeof wide, 500) == (ssize_t)sizeof wide);
+    DATA_CHECK(pread(fd, wide_back, sizeof wide_back, 500) == (ssize_t)sizeof wide_back);
+    DATA_CHECK(memcmp(wide, wide_back, sizeof wide) == 0);
+    DATA_CHECK(lseek(fd, 0, SEEK_CUR) == 5000);
+    DATA_CHECK(pwrite(fd, big, sizeof big, 0) == (ssize_t)sizeof big); /* the first bytes again */
     DATA_CHECK(close(fd) == 0);
     unsigned char back[5000];
     fd = open("/data/w-rw", O_RDONLY);
@@ -1227,30 +1240,53 @@ static int fill_user_creates_body(void) {
 /* The reserve: with fewer than 64 free blocks a user other than root gets ENOSPC for a creation
  * and root goes on; a removal gives room back (the count of free blocks catches up with the
  * refresh walk of the service, which comes after a quiet of 2 s). */
+/* The default limit on the size of a file is 8 MiB (a write past it is FILE_SIZE_LIMIT and SIGXFSZ
+ * ends the process), so the volume is filled with files of 4 MiB. */
+#define FILL_FILE_WRITES 4096
+
+static void fill_name(int index, char *name, size_t size) {
+    snprintf(name, size, "/data/w-big%d", index);
+}
+
 static int enospc_at_the_reserve_then_unlink(void) {
     struct statvfs v;
     unsigned char buf[1012];
+    char name[40];
     DATA_CHECK(chmod("/data", 0777) == 0);
-    int fd = open("/data/w-big", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    int files = 0;
+    fill_name(files, name, sizeof name);
+    int fd = open(name, O_WRONLY | O_CREAT | O_EXCL, 0644);
     DATA_CHECK(fd >= 0);
     make_pattern(buf, 0, sizeof buf, 1);
-    unsigned long calls = 0;
+    unsigned long calls = 0, in_file = 0;
     for (;;) {
         if (calls % 500 == 0) {
             DATA_CHECK(statvfs("/data", &v) == 0);
             /* f_bavail leaves the reserve out: it is 0 when the reserve is reached. */
             if (v.f_bavail <= 4) break;
         }
+        if (in_file == FILL_FILE_WRITES) {
+            DATA_CHECK(close(fd) == 0);
+            files++;
+            fill_name(files, name, sizeof name);
+            fd = open(name, O_WRONLY | O_CREAT | O_EXCL, 0644);
+            DATA_CHECK(fd >= 0);
+            in_file = 0;
+        }
         ssize_t w = write(fd, buf, sizeof buf);
         DATA_CHECK(w > 0);
         calls++;
+        in_file++;
     }
-    printf("posix-data: the volume reached its reserve after %lu writes\n", calls);
+    printf("posix-data: the volume reached its reserve after %lu writes in %d files\n", calls, files + 1);
     DATA_CHECK(as_ids(1000, 100, fill_user_body) == 0); /* ENOSPC for a creation by a user */
     errno = 0;
     DATA_CHECK(write(fd, buf, sizeof buf) > 0); /* root goes into the reserve */
     DATA_CHECK(fsync(fd) == 0 && close(fd) == 0);
-    DATA_CHECK(unlink("/data/w-big") == 0);
+    for (int i = 0; i <= files; i++) {
+        fill_name(i, name, sizeof name);
+        DATA_CHECK(unlink(name) == 0);
+    }
     /* The room comes back when the service has walked the volume (2 s of quiet, then the walk). */
     int back = 0;
     for (int i = 0; i < 40 && !back; i++) {
@@ -1529,36 +1565,55 @@ static unsigned long long now_ms(void) {
     return (unsigned long long)t.tv_sec * 1000ULL + (unsigned long long)t.tv_nsec / 1000000ULL;
 }
 
+/* 64 MiB as sixteen files of 4 MiB (the limit on the size of a file is 8 MiB by default), written
+ * in blocks of 1 MiB. */
+#define DD_FILES 16
+#define DD_FILE_BYTES (DD_BYTES / DD_FILES)
+
+static void dd_name(int index, char *name, size_t size) {
+    snprintf(name, size, "/data/dd-%d", index);
+}
+
 static int dd_there_and_back(void) {
     static unsigned char block[DD_BLOCK];
-    int fd = open("/data/dd-64m", O_WRONLY | O_CREAT | O_EXCL, 0644);
-    DATA_CHECK(fd >= 0);
+    char name[40];
     unsigned long long began = now_ms();
-    for (unsigned long at = 0; at < DD_BYTES; at += DD_BLOCK) {
-        make_pattern(block, at, DD_BLOCK, 14);
-        unsigned long done = 0;
-        while (done < DD_BLOCK) {
-            ssize_t w = write(fd, block + done, DD_BLOCK - done);
-            DATA_CHECK(w > 0);
-            done += (unsigned long)w;
+    for (int i = 0; i < DD_FILES; i++) {
+        dd_name(i, name, sizeof name);
+        int fd = open(name, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        DATA_CHECK(fd >= 0);
+        for (unsigned long at = 0; at < DD_FILE_BYTES; at += DD_BLOCK) {
+            make_pattern(block, (unsigned long)i * DD_FILE_BYTES + at, DD_BLOCK, 14);
+            unsigned long done = 0;
+            while (done < DD_BLOCK) {
+                ssize_t w = write(fd, block + done, DD_BLOCK - done);
+                DATA_CHECK(w > 0);
+                done += (unsigned long)w;
+            }
         }
+        DATA_CHECK(fsync(fd) == 0 && close(fd) == 0);
     }
-    DATA_CHECK(fsync(fd) == 0 && close(fd) == 0);
     unsigned long long wrote_ms = now_ms() - began;
     printf("posix-data: dd wrote 64 MiB in %llu ms: %llu KiB/s\n", wrote_ms,
            wrote_ms ? 65536ULL * 1000ULL / wrote_ms : 0ULL);
-    fd = open("/data/dd-64m", O_RDONLY);
-    DATA_CHECK(fd >= 0);
     began = now_ms();
-    for (unsigned long at = 0; at < DD_BYTES; at += DD_BLOCK) {
-        DATA_CHECK(read_up_to(fd, block, DD_BLOCK) == (long)DD_BLOCK);
-        DATA_CHECK(pattern_is(block, at, DD_BLOCK, 14));
+    for (int i = 0; i < DD_FILES; i++) {
+        dd_name(i, name, sizeof name);
+        int fd = open(name, O_RDONLY);
+        DATA_CHECK(fd >= 0);
+        for (unsigned long at = 0; at < DD_FILE_BYTES; at += DD_BLOCK) {
+            DATA_CHECK(read_up_to(fd, block, DD_BLOCK) == (long)DD_BLOCK);
+            DATA_CHECK(pattern_is(block, (unsigned long)i * DD_FILE_BYTES + at, DD_BLOCK, 14));
+        }
+        DATA_CHECK(close(fd) == 0);
     }
-    DATA_CHECK(close(fd) == 0);
     unsigned long long read_ms = now_ms() - began;
     printf("posix-data: dd read 64 MiB in %llu ms: %llu KiB/s\n", read_ms,
            read_ms ? 65536ULL * 1000ULL / read_ms : 0ULL);
-    DATA_CHECK(unlink("/data/dd-64m") == 0);
+    for (int i = 0; i < DD_FILES; i++) {
+        dd_name(i, name, sizeof name);
+        DATA_CHECK(unlink(name) == 0);
+    }
     return 0;
 }
 
