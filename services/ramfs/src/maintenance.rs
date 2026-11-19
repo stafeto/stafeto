@@ -88,6 +88,11 @@ pub fn orphan_progress(before: (u16, u16), after: (u16, u16)) -> bool {
     after.0 < before.0 || after.1 > before.1
 }
 
+/// The slots with no session and no birth that one step of the audit passes: a step is at most
+/// a quarter of the capacity of the service's budget (250 us, of which a step takes about
+/// 3 900 ticks under -icount at 40 slots).
+pub const AUDIT_EMPTY_RUN: usize = 40;
+
 pub struct Cursor {
     pub position: usize,
     pub remaining: usize,
@@ -637,5 +642,46 @@ mod departure_tests {
     #[should_panic]
     fn departure_admission_rejects_a_place_past_the_actual_table() {
         Departures::<11>::new(641).admit(641);
+    }
+
+    /// Runs a round over `slots` slots (the first is unused) as the audit does: a step passes
+    /// the empty slots, then takes the slot it stops at. The steps and the most empty slots one
+    /// step passed.
+    fn round(slots: usize, occupied: &[usize]) -> (usize, usize) {
+        let mut cursor = Cursor {
+            remaining: slots - 1,
+            ..Cursor::default()
+        };
+        let (mut steps, mut longest) = (0, 0);
+        while cursor.remaining != 0 {
+            let passed = cursor.skip_empty(slots, AUDIT_EMPTY_RUN, |i| !occupied.contains(&i));
+            longest = longest.max(passed);
+            cursor.complete(false, slots);
+            steps += 1;
+        }
+        (steps, longest)
+    }
+
+    #[test]
+    fn a_round_over_640_slots_ends_within_its_steps_and_no_step_passes_many_empty_slots() {
+        let layouts: [&[usize]; 6] = [
+            &[],
+            &[1],
+            &[639],
+            &[1, 2, 3, 4, 5],
+            &[10, 100, 200, 320, 321, 500, 639],
+            &[40, 41, 81, 82, 122, 163, 204, 245],
+        ];
+        for occupied in layouts {
+            let (steps, longest) = round(640, occupied);
+            let bound = 639usize.div_ceil(AUDIT_EMPTY_RUN + 1) + occupied.len();
+            assert!(steps <= bound, "{occupied:?}: {steps} steps, bound {bound}");
+            assert!(
+                longest <= AUDIT_EMPTY_RUN,
+                "{occupied:?}: {longest} slots in a step"
+            );
+        }
+        // An idle table takes ceil(639 / 41) = 16 steps.
+        assert_eq!(round(640, &[]).0, 16);
     }
 }

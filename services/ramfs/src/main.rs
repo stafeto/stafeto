@@ -25,6 +25,7 @@ use ramfs::locks::Owner;
 use ramfs::locks::simple::{Command, Response, SimpleLocks, SweepCursor};
 use ramfs::locks::simple_wait::Waits;
 use ramfs::locks::wait_receipts::Queue as WaitQueue;
+use ramfs::maintenance::AUDIT_EMPTY_RUN;
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
 use ramfs::resolve::{Intent, Progress, Resolve};
 use ramfs::storage::layers::{LAYERS_MAX, Limits};
@@ -170,13 +171,19 @@ mod own_step {
     }
 }
 
-/// The time between two steps of the audit. The audit runs on a timer
-/// between them, so that the clients below the service keep their time while
-/// it goes round: a turn after turn of the whole round held them back for as
-/// long as it took.
-const AUDIT_STEP_NS: u64 = 1_000_000;
-/// The slots with no session and no birth that one step of the audit passes.
-const AUDIT_EMPTY_RUN: usize = 160;
+/// The time between two steps of the audit: one step a period of the service's budget
+/// (`SERVICE_PERIOD_NS` in the table of init, 5 ms; this crate does not see that constant). The
+/// audit runs on a timer between its steps, so that the clients below the service keep their
+/// time while it goes round, and so that no period of the budget holds more than one step: the
+/// steps of a round 1 ms apart put four to six of them, with the heartbeat, into one period and
+/// spent about 2.7 times the capacity there.
+///
+/// A round over the 640 slots takes `ceil(639 / 41)` = 16 steps and one more for each slot in
+/// use, so 80 ms with no session and 5 ms a session more; a round may take longer than the 250
+/// ms between two openings, and then rounds follow one another. The audit only collects what
+/// the separate turns of a departure missed (a cell whose client went away), so a slower round
+/// delays that collection by a few tens of milliseconds, and nothing a client waits for.
+const AUDIT_STEP_NS: u64 = 5_000_000;
 /// The share of its time that the service gives to the maintenance of locks
 /// (the sweep of the table and the evaluation of waits): at most a quarter of
 /// every window. Beyond it the service sleeps to the end of the window and
