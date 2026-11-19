@@ -266,9 +266,13 @@ pub struct Held {
 /// session when it first uses `/data`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClonePlan {
-    pub handles: [u32; p::CLONE_MAX],
+    pub handles: [u32; PLAN_MAX],
     pub count: usize,
 }
+
+/// The most descriptions a plan holds: three messages of CLONE and CLONE_MORE (the service may
+/// hold more than the 32 it guarantees).
+pub const PLAN_MAX: usize = 3 * p::CLONE_MAX;
 
 impl ClonePlan {
     pub fn needed(&self) -> bool {
@@ -278,16 +282,21 @@ impl ClonePlan {
     pub fn handles(&self) -> &[u32] {
         &self.handles[..self.count]
     }
+
+    /// The messages the plan goes in: the first is CLONE, the rest CLONE_MORE.
+    pub fn messages(&self) -> impl Iterator<Item = &[u32]> {
+        self.handles().chunks(p::CLONE_MAX)
+    }
 }
 
 /// Plans a CLONE from the descriptions of the table and the current directory's.
 pub fn clone_plan(held: impl IntoIterator<Item = Held>, cwd: Option<u32>) -> ClonePlan {
     let mut plan = ClonePlan {
-        handles: [0; p::CLONE_MAX],
+        handles: [0; PLAN_MAX],
         count: 0,
     };
     let mut add = |handle: u32| {
-        if plan.count < p::CLONE_MAX && !plan.handles[..plan.count].contains(&handle) {
+        if plan.count < PLAN_MAX && !plan.handles[..plan.count].contains(&handle) {
             plan.handles[plan.count] = handle;
             plan.count += 1;
         }
@@ -314,8 +323,9 @@ pub mod oflag {
     pub const TRUNC: i32 = 0o1000;
     pub const APPEND: i32 = 0o2000;
     pub const DIRECTORY: i32 = 65536;
-    /// O_DSYNC and O_SYNC of the platform: either asks for every write to be durable.
-    pub const SYNC: i32 = 0o4010000;
+    /// The layer's own bit for O_DSYNC and O_SYNC of the platform (either asks for every write to be
+    /// durable); the RAM file service never sees it.
+    pub const SYNC: i32 = 1 << 25;
 }
 
 /// What an `open` of a path of the volume sends: the flags of the protocol, the mode with the
@@ -745,14 +755,28 @@ mod tests {
         assert!(!clone_plan([], None).needed());
         // The current directory alone is enough.
         assert_eq!(clone_plan([], Some(3)).handles(), [3]);
-        // No more than a message carries.
-        let many: Vec<Held> = (0..40)
+        // More than a message carries go in more messages, up to three.
+        let many: Vec<Held> = (0..100)
             .map(|handle| Held {
                 handle,
                 clofork: false,
             })
             .collect();
-        assert_eq!(clone_plan(many, None).count, p::CLONE_MAX);
+        let plan = clone_plan(many, None);
+        assert_eq!(plan.count, PLAN_MAX);
+        let sizes: Vec<usize> = plan.messages().map(<[u32]>::len).collect();
+        assert_eq!(sizes, [p::CLONE_MAX, p::CLONE_MAX, p::CLONE_MAX]);
+        let forty: Vec<Held> = (0..40)
+            .map(|handle| Held {
+                handle,
+                clofork: false,
+            })
+            .collect();
+        let sizes: Vec<usize> = clone_plan(forty, None)
+            .messages()
+            .map(<[u32]>::len)
+            .collect();
+        assert_eq!(sizes, [32, 8]);
     }
 
     #[test]

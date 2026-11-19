@@ -15,6 +15,9 @@ pub fn synchronize(number: i32) -> Result<(), i32> {
         let fd = u32::try_from(number).map_err(|_| EBADF)?;
         crate::shared::with_fd(fd, |files| {
             let target = files.target(fd).map_err(crate::error)?;
+            if let Target::Data(data) = target {
+                return crate::data::fsync(data);
+            }
             let Target::Ram(exact) = target else {
                 return Err(EINVAL);
             };

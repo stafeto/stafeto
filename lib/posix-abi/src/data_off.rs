@@ -61,11 +61,7 @@ pub fn route(_dirfd: c_int, _path: &[u8]) -> Result<Option<Vol>, i32> {
     Ok(None)
 }
 
-pub fn refuse_change(_dirfd: c_int, _path: &[u8]) -> Result<(), i32> {
-    Ok(())
-}
-
-pub fn open(_vol: &Vol, _flags: c_int) -> Result<c_int, i32> {
+pub fn open(_vol: &Vol, _flags: c_int, _mode: u32, _umask: u32) -> Result<c_int, i32> {
     Err(EIO)
 }
 
@@ -130,4 +126,62 @@ pub fn clone_for_child(
     _with_cwd: bool,
 ) -> Result<Option<Handle<Channel>>, i32> {
     Ok(None)
+}
+
+pub fn write(_handle: u32, _bytes: &[u8]) -> Result<usize, i32> {
+    Err(EBADF)
+}
+
+pub fn pwrite(_handle: u32, _offset: u64, _bytes: &[u8]) -> Result<usize, i32> {
+    Err(EBADF)
+}
+
+pub fn truncate(_handle: u32, _size: u64) -> Result<(), i32> {
+    Err(EBADF)
+}
+
+pub fn fsync(_target: DataTarget) -> Result<(), i32> {
+    Err(EBADF)
+}
+
+pub fn data_target(_fd: c_int) -> Option<DataTarget> {
+    None
+}
+
+pub fn status_flags(_fd: c_int, _set: Option<c_int>) -> Result<Option<c_int>, i32> {
+    Ok(None)
+}
+
+pub fn mkdir(_vol: &Vol, _mode: u32, _umask: u32) -> Result<(), i32> {
+    Err(EIO)
+}
+
+pub fn unlink(_vol: &Vol, _directory: bool) -> Result<(), i32> {
+    Err(EIO)
+}
+
+pub fn rename(_from: &Vol, _to: &Vol) -> Result<(), i32> {
+    Err(EIO)
+}
+
+pub fn pair(
+    _old_dirfd: c_int,
+    _old: &[u8],
+    _new_dirfd: c_int,
+    _new: &[u8],
+) -> Result<Option<(Vol, Vol)>, i32> {
+    Ok(None)
+}
+
+pub fn link(_old: &Vol) -> Result<(), i32> {
+    Err(EIO)
+}
+
+pub fn change(
+    _op: proto_fs::ChangeOp,
+    _dirfd: c_int,
+    _path: &[u8],
+    _args: [u64; 4],
+) -> Result<bool, i32> {
+    Ok(false)
 }

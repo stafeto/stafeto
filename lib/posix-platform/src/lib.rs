@@ -260,6 +260,10 @@ fn open_flags(flags: c_int) -> Result<c_int, c_int> {
             mapped |= local;
         }
     }
+    // Either flag of durability is the layer's one: the data volume keeps it in the description.
+    if flags & O_SYNC_FLAGS != 0 {
+        mapped |= posix_abi::constants::O_SYNC;
+    }
     Ok(mapped)
 }
 

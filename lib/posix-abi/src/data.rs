@@ -36,10 +36,24 @@
 //! * The current directory under `/data` holds a description of the directory opened for search
 //!   only, so that the service refuses to rename or remove it (EBUSY) and the string of the layer
 //!   stays true. A forked child shares it; an exec or a spawn opens it again at the first path call.
-//! * Everything that changes the volume is EROFS in this part of the layer. The limits the service
-//!   keeps show as these errnos: at most 32 descriptions a session holds (EMFILE), a clone refused
-//!   for its tree's clones or the table (EAGAIN), and at most 1,024 metadata pairs on a volume (a
-//!   later part's MKDIR over it answers ENOSPC).
+//! * Writes. `open` takes O_CREAT, O_EXCL, O_TRUNC, O_APPEND and O_SYNC (`posix_fs::data::open_plan`:
+//!   an open for reading with O_TRUNC is an open for writing of its own that truncates and closes,
+//!   then the reading open), the creation mode has the umask applied here. `write` and `pwrite` go
+//!   in messages of at most 1,012 bytes, each one atomic against the other writers and readers of
+//!   the file, and the end of an O_APPEND file is taken for each message: a write of more than one
+//!   message can have another writer's bytes between its messages (the service has no longer
+//!   atomic unit). The result is the sum of the messages that went; a failure after some (ENOSPC,
+//!   EFBIG, EINTR) is that sum, the next call meets the error again, and the first message alone
+//!   fails with the error (the limit of the file size gives SIGXFSZ then). `rename` takes two
+//!   names of the volume (EXDEV across the mount), `link` of a file is EMLINK (a name of the volume
+//!   has one), `symlink`, `mkfifo` and `mknod` are EPERM, `unlink` of a directory is EISDIR, and
+//!   record locks are ENOLCK. A program is never run from the volume (EACCES).
+//! * Limits. At most 32 descriptions a session holds (EMFILE), a clone refused for its tree's clones
+//!   or the table (EAGAIN), at most 2,048 metadata pairs a volume and 1,024 directories (ENOSPC for
+//!   MKDIR, the creation of a file and a RENAME into another directory; removal, writes, truncation
+//!   and changes of mode and times are never refused by these caps), no inline data (a file takes
+//!   4 KiB at least), and a reserve of 64 blocks that refuses writes, creation, rename and changes
+//!   of attributes to users other than root (ENOSPC), never removal.
 
 use crate::constants::*;
 use core::ffi::c_int;
@@ -50,6 +64,14 @@ use proto_data as p;
 use proto_wire::{Reader, Status, Writer};
 use rt::abi::{Error, MESSAGE_MAX, Rights};
 use rt::handle::{Channel, Handle};
+
+// The flags the volume's rules (posix-fs) name are the layer's.
+const _: () = {
+    use posix_fs::data::oflag as o;
+    assert!(o::ACCMODE == O_ACCMODE && o::WRONLY == O_WRONLY && o::RDWR == O_RDWR);
+    assert!(o::CREAT == O_CREAT && o::EXCL == O_EXCL && o::TRUNC == O_TRUNC);
+    assert!(o::APPEND == O_APPEND && o::DIRECTORY == O_DIRECTORY && o::SYNC == O_SYNC);
+};
 
 /// A path of the volume with the slash of its end noted: what the service takes.
 pub struct Vol {
@@ -353,6 +375,11 @@ fn call_with(request: &[u8], take: bool) -> Result<Answer, i32> {
             pause()?;
             continue;
         }
+        // The limit of the process's file size: the layer sends SIGXFSZ for it once the locks are
+        // let go (`finish_file_size` of the call that asked).
+        if status == p::FILE_SIZE_LIMIT {
+            return Err(crate::FILE_SIZE_REFUSAL);
+        }
         return Err(errno_of(status));
     }
 }
@@ -443,14 +470,6 @@ fn join(volume: &[u8], out: &mut [u8; crate::names::MAX_PATH + 1]) -> Result<usi
         at = end;
     }
     Ok(at)
-}
-
-/// Refuses a change of a path of the service: EROFS. The paths elsewhere pass.
-pub fn refuse_change(dirfd: c_int, path: &[u8]) -> Result<(), i32> {
-    match route(dirfd, path)? {
-        Some(_) => Err(EROFS),
-        None => Ok(()),
-    }
 }
 
 /// stat of a path of the volume: `follow` makes no difference (the volume has no links).
@@ -583,6 +602,9 @@ fn ensure_cwd() -> Result<(), i32> {
     Ok(())
 }
 
+/// A CLOSE of a description failed while the session was there.
+static CLOSE_FAILED: AtomicBool = AtomicBool::new(false);
+
 // ---------------------------------------------------------------- descriptions
 
 /// OPEN of a directory with no access bits: the service holds its path and no place of the volume.
@@ -591,9 +613,27 @@ fn open_search(path: &[u8]) -> Result<u32, i32> {
     answer.reader().u32().map_err(|_| EIO)
 }
 
-/// open of a path of the volume for reading: `flags` are the C flags. A write, a create or a
-/// truncate is EROFS. The descriptor is the lowest free one.
-pub fn open(vol: &Vol, flags: c_int) -> Result<c_int, i32> {
+/// The requests of an OPEN: the path, the protocol's flags and mode. The answer is the handle and
+/// whether it names a directory. A directory opened for reading with no O_DIRECTORY gets
+/// IS_DIRECTORY from the service for a file open: the layer asks again for a listing.
+fn open_raw(vol: &Vol, flags: u32, mode: u32) -> Result<(u32, bool), i32> {
+    let (answer, listing) = match ask(|w| p::open(vol.bytes(), flags, mode, w)) {
+        Ok(answer) => (answer, flags & p::DIRECTORY != 0),
+        Err(EISDIR) if flags & (p::WRITE | p::DIRECTORY) == 0 => (
+            ask(|w| p::open(vol.bytes(), flags | p::DIRECTORY, mode, w))?,
+            true,
+        ),
+        Err(errno) => return Err(errno),
+    };
+    let mut r = answer.reader();
+    let handle = r.u32().map_err(|_| EIO)?;
+    let kind = r.u32().map_err(|_| EIO)?;
+    Ok((handle, listing || kind == p::KIND_DIRECTORY))
+}
+
+/// open of a path of the volume: `flags` are the layer's, the mode and the creation mask are the
+/// caller's (`posix_fs::data::open_plan` translates them). The descriptor is the lowest free one.
+pub fn open(vol: &Vol, flags: c_int, mode: u32, umask: u32) -> Result<c_int, i32> {
     // The flags the file service takes, and no others.
     let known = O_ACCMODE
         | O_DIRECTORY
@@ -606,44 +646,28 @@ pub fn open(vol: &Vol, flags: c_int) -> Result<c_int, i32> {
         | O_EXCL
         | O_TRUNC
         | O_APPEND
-        | O_NOFOLLOW;
-    if flags & !known != 0 || flags & O_ACCMODE == O_ACCMODE {
+        | O_NOFOLLOW
+        | O_SYNC;
+    if flags & !known != 0 {
         return Err(EINVAL);
     }
-    // Reading is all the volume gives in this part of the layer.
-    // A write mode and a truncation need a writable volume. O_APPEND on a read-only description
-    // is legal and means nothing; O_CREAT makes a file only when there is none (below).
-    if flags & O_ACCMODE != 0 || flags & O_TRUNC != 0 {
-        return Err(EROFS);
+    let mut plan = pure::open_plan(flags, mode, umask)?;
+    // A name that ends in a slash is a directory: no file is made or opened for it.
+    if vol.trailing_slash && flags & O_CREAT != 0 {
+        return Err(EISDIR);
     }
-    let mut asked = p::READ;
-    if flags & O_DIRECTORY != 0 {
-        asked |= p::DIRECTORY;
+    if plan.truncate_first {
+        // The truncation (and the creation) is an open for writing of its own, which closes at
+        // once; the caller's description is the reading one that follows.
+        let first = pure::truncating_open(plan);
+        let (handle, _) = open_raw(vol, first.flags, first.mode)?;
+        close_description(handle);
+        plan = pure::reading_open(plan);
     }
-    // A directory opened with O_RDONLY and no O_DIRECTORY: the service says IS_DIRECTORY for a file
-    // open, and the layer asks for a listing.
-    let (answer, directory) = match ask(|w| p::open(vol.bytes(), asked, 0, w)) {
-        Ok(answer) => (answer, flags & O_DIRECTORY != 0),
-        Err(EISDIR) if flags & O_DIRECTORY == 0 => (
-            ask(|w| p::open(vol.bytes(), asked | p::DIRECTORY, 0, w))?,
-            true,
-        ),
-        // No file there and O_CREAT asks for one: the volume cannot be written.
-        Err(ENOENT) if flags & O_CREAT != 0 => return Err(EROFS),
-        Err(errno) => return Err(errno),
-    };
-    let mut r = answer.reader();
-    let handle = r.u32().map_err(|_| EIO)?;
-    let kind = r.u32().map_err(|_| EIO)?;
-    let directory = directory || kind == p::KIND_DIRECTORY;
+    let (handle, directory) = open_raw(vol, plan.flags, plan.mode)?;
     if vol.trailing_slash && !directory {
         close_description(handle);
         return Err(ENOTDIR);
-    }
-    // O_CREAT with O_EXCL on a file that is there (XSH open()).
-    if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
-        close_description(handle);
-        return Err(EEXIST);
     }
     let target = DataTarget { handle, directory };
     let flags_of = crate::descriptor_flags(flags);
@@ -668,8 +692,13 @@ pub fn close_description(handle: u32) {
     // A process with no session (the old one died with its instance) holds nothing the service
     // knows: the close succeeds with no call, and no session is taken for it.
     let mut w = Writer::new();
-    if p::handle_call(p::Method::Close, handle, &mut w).is_ok() {
-        let _ = call_with(w.as_bytes(), false);
+    if p::handle_call(p::Method::Close, handle, &mut w).is_ok()
+        && session().is_some()
+        && call_with(w.as_bytes(), false).is_err()
+    {
+        // The description stays in the session: an exec must not hand the session to an image that
+        // could read it by guessing the handle (`session_for_exec`).
+        CLOSE_FAILED.store(true, Ordering::Release);
     }
 }
 
@@ -728,6 +757,231 @@ pub fn fstat(handle: u32) -> Result<proto_fs::NodeInfo, i32> {
     let answer = ask(|w| p::handle_call(p::Method::Fstat, handle, w))?;
     let stat = p::Stat::from_bytes(&answer.bytes[..answer.len]).map_err(|_| EIO)?;
     Ok(pure::node_info(&stat))
+}
+
+// ---------------------------------------------------------------- writes
+
+/// write to the description at its position, in messages of the service's largest size: the bytes
+/// written. A message the service took short ends the write; a failure after some messages is
+/// their sum (the next call meets it again: ENOSPC, EFBIG), and the error of the first alone when
+/// none went (FILE_SIZE_REFUSAL is the layer's mark for SIGXFSZ). Each message is atomic against
+/// other writers of the file (and the end of an O_APPEND write is taken per message); a write of
+/// more than one message can have another writer's bytes between its messages.
+pub fn write(handle: u32, bytes: &[u8]) -> Result<usize, i32> {
+    let mut split = pure::Splitter::new(bytes.len(), p::MAX_WRITE);
+    while let Some(n) = split.next_len() {
+        let at = split.at();
+        let sent = ask(|w| p::write(handle, &bytes[at..at + n], w))
+            .and_then(|answer| answer.reader().u32().map_err(|_| EIO));
+        match sent {
+            Ok(wrote) => {
+                if !split.took(n, wrote as usize) {
+                    break;
+                }
+            }
+            Err(errno) => return split.failed(errno),
+        }
+    }
+    Ok(split.written())
+}
+
+/// pwrite at `offset`, the position of the description untouched, in messages as `write`.
+pub fn pwrite(handle: u32, offset: u64, bytes: &[u8]) -> Result<usize, i32> {
+    let mut split = pure::Splitter::new(bytes.len(), p::MAX_WRITE);
+    while let Some(n) = split.next_len() {
+        let at = split.at();
+        let sent = ask(|w| p::pwrite(handle, offset + at as u64, &bytes[at..at + n], w))
+            .and_then(|answer| answer.reader().u32().map_err(|_| EIO));
+        match sent {
+            Ok(wrote) => {
+                if !split.took(n, wrote as usize) {
+                    break;
+                }
+            }
+            Err(errno) => return split.failed(errno),
+        }
+    }
+    Ok(split.written())
+}
+
+/// ftruncate of the description: the file is `size` bytes, grown with zeros.
+pub fn truncate(handle: u32, size: u64) -> Result<(), i32> {
+    ask(|w| p::truncate(handle, size, w)).map(drop)
+}
+
+/// fsync and fdatasync: the bytes, the size, the name and the times of the file are durable when
+/// it returns. A directory has nothing to do (its operations are durable when they answer).
+pub fn fsync(target: DataTarget) -> Result<(), i32> {
+    if target.directory {
+        return Ok(());
+    }
+    ask(|w| p::handle_call(p::Method::Fsync, target.handle, w)).map(drop)
+}
+
+/// The data descriptor `fd` names, if it names one.
+pub fn data_target(fd: c_int) -> Option<DataTarget> {
+    let fd = u32::try_from(fd).ok()?;
+    match crate::shared::with_fd(fd, |files| files.target(fd).map_err(crate::error)) {
+        Ok(Target::Data(d)) => Some(d),
+        _ => None,
+    }
+}
+
+/// The status flags of the platform: O_APPEND and the layer's durability bit (O_DSYNC and
+/// O_SYNC), as relibc has them.
+const NATIVE_APPEND: c_int = 0o2000;
+const NATIVE_SYNC: c_int = 0o4010000;
+
+/// F_GETFL (`set` None) and F_SETFL of a descriptor of the volume: None for any other descriptor.
+/// F_GETFL says the access mode of the description and O_APPEND and O_SYNC when it has them;
+/// F_SETFL changes those two (the service keeps them in the description, which a duplicate and a
+/// child share) and takes the rest for what it is, a flag that means nothing for a regular file.
+pub fn status_flags(fd: c_int, set: Option<c_int>) -> Result<Option<c_int>, i32> {
+    let Some(target) = data_target(fd) else {
+        return Ok(None);
+    };
+    match set {
+        None => {
+            let answer = ask(|w| p::handle_call(p::Method::GetFlags, target.handle, w))?;
+            let flags = answer.reader().u32().map_err(|_| EIO)?;
+            let mut out = match (flags & p::READ != 0, flags & p::WRITE != 0) {
+                (true, true) => 2,
+                (false, true) => 1,
+                _ => 0,
+            };
+            if flags & p::APPEND != 0 {
+                out |= NATIVE_APPEND;
+            }
+            if flags & p::SYNC != 0 {
+                out |= NATIVE_SYNC;
+            }
+            Ok(Some(out))
+        }
+        Some(argument) => {
+            let mut bits = 0;
+            if argument & NATIVE_APPEND != 0 {
+                bits |= p::APPEND;
+            }
+            if argument & NATIVE_SYNC != 0 {
+                bits |= p::SYNC;
+            }
+            ask(|w| p::set_flags(target.handle, bits, w))?;
+            Ok(Some(0))
+        }
+    }
+}
+
+/// A name that is the root of the volume cannot be made, removed or moved.
+fn is_root(vol: &Vol) -> bool {
+    vol.bytes() == b"/"
+}
+
+/// mkdir: the mode with the creation mask applied.
+pub fn mkdir(vol: &Vol, mode: u32, umask: u32) -> Result<(), i32> {
+    if is_root(vol) {
+        return Err(EEXIST);
+    }
+    let mode = mode & p::MODE_MASK & !(umask & 0o777);
+    ask(|w| p::mkdir(vol.bytes(), mode, w)).map(drop)
+}
+
+/// unlink and rmdir (`directory`): a directory under unlink is EISDIR, as the RAM file service
+/// and Linux have it (XSH allows EPERM).
+pub fn unlink(vol: &Vol, directory: bool) -> Result<(), i32> {
+    if is_root(vol) {
+        return Err(if directory { EBUSY } else { EISDIR });
+    }
+    let method = if directory {
+        p::Method::Rmdir
+    } else {
+        p::Method::Unlink
+    };
+    ask(|w| p::path_call(method, vol.bytes(), w)).map(drop)
+}
+
+/// rename inside the volume.
+pub fn rename(from: &Vol, to: &Vol) -> Result<(), i32> {
+    if is_root(from) || is_root(to) {
+        return Err(EBUSY);
+    }
+    ask(|w| p::rename(from.bytes(), to.bytes(), w)).map(drop)
+}
+
+/// What a `rename` or `link` of two paths needs: the routes of both (None for a path elsewhere).
+/// EXDEV when only one is the volume's.
+pub fn pair(
+    old_dirfd: c_int,
+    old: &[u8],
+    new_dirfd: c_int,
+    new: &[u8],
+) -> Result<Option<(Vol, Vol)>, i32> {
+    let first = route(old_dirfd, old)?;
+    let second = route(new_dirfd, new)?;
+    match (first, second) {
+        (None, None) => Ok(None),
+        (Some(a), Some(b)) => Ok(Some((a, b))),
+        (a, b) => {
+            debug_assert!(pure::route_of(a.is_some(), b.is_some()) == pure::Route::Across);
+            Err(EXDEV)
+        }
+    }
+}
+
+/// link of two names of the volume: it has one name for a file (EMLINK, the first name's file must
+/// be there) and none for a directory (EPERM).
+pub fn link(old: &Vol) -> Result<(), i32> {
+    let info = stat(old)?;
+    Err(pure::link_errno(info.kind == 1))
+}
+
+/// chmod, chown and utimensat of a path of the volume, or with AT_EMPTY_PATH of the description
+/// `dirfd` names: `args` are the layer's (`names::metadata`). Ok(false) when the target is not the
+/// volume's.
+pub fn change(
+    op: proto_fs::ChangeOp,
+    dirfd: c_int,
+    path: &[u8],
+    args: [u64; 4],
+) -> Result<bool, i32> {
+    use proto_fs::ChangeOp as C;
+    if path.is_empty() {
+        let Some(target) = data_target(dirfd) else {
+            return Ok(false);
+        };
+        let h = target.handle;
+        match op {
+            C::Chmod => ask(|w| p::fchmod(h, args[0] as u32, w))?,
+            C::Chown => ask(|w| p::fchown(h, args[0] as u32, args[1] as u32, w))?,
+            C::Times => ask(|w| {
+                p::futimens(
+                    h,
+                    pure::time_spec(args[0], args[1]),
+                    pure::time_spec(args[2], args[3]),
+                    w,
+                )
+            })?,
+            _ => return Err(EINVAL),
+        };
+        return Ok(true);
+    }
+    let Some(vol) = route(dirfd, path)? else {
+        return Ok(false);
+    };
+    let at = vol.bytes();
+    match op {
+        C::Chmod => ask(|w| p::chmod(at, args[0] as u32, w))?,
+        C::Chown => ask(|w| p::chown(at, args[0] as u32, args[1] as u32, w))?,
+        C::Times => ask(|w| {
+            p::utimens(
+                at,
+                pure::time_spec(args[0], args[1]),
+                pure::time_spec(args[2], args[3]),
+                w,
+            )
+        })?,
+        _ => return Err(EINVAL),
+    };
+    Ok(true)
 }
 
 // ---------------------------------------------------------------- listings
@@ -909,22 +1163,51 @@ pub fn clone_for_child(
     if !plan.needed() {
         return Ok(None);
     }
-    let request = {
-        let mut w = Writer::new();
-        p::clone(plan.handles(), &mut w).map_err(|_| EIO)?;
-        w
-    };
     let session = session().ok_or(EIO)?;
     let channel = Handle::<Channel>::borrowed(session);
+    let mut messages = plan.messages();
+    let first = messages.next().ok_or(EIO)?;
+    let mut w = Writer::new();
+    p::clone(first, &mut w).map_err(|_| EIO)?;
+    let (child, birth) = send_clone(&channel, w.as_bytes())?;
+    let child = child.ok_or(EIO)?;
+    // The rest of the descriptions join the clone before the child sends anything.
+    for more in messages {
+        let mut w = Writer::new();
+        p::clone_more(birth, more, &mut w).map_err(|_| EIO)?;
+        if let Err(errno) = send_clone(&channel, w.as_bytes()) {
+            drop(child);
+            return Err(errno);
+        }
+    }
+    Ok(Some(child))
+}
+
+/// One CLONE or CLONE_MORE: for CLONE the new session and its birth number, for CLONE_MORE the
+/// no session.
+fn send_clone(
+    channel: &Handle<Channel>,
+    request: &[u8],
+) -> Result<(Option<Handle<Channel>>, u32), i32> {
     let mut tries = 0;
     loop {
-        let mut reply = rt::sys::send(&channel, request.as_bytes()).map_err(|_| EIO)?;
+        let mut reply = match rt::sys::send(channel, request) {
+            Ok(reply) => reply,
+            Err(Error::Interrupted) => continue,
+            Err(_) => return Err(EIO),
+        };
         let mut buffer = [0; MESSAGE_MAX];
-        let status = Reader::new(reply.bytes(&mut buffer))
-            .u32()
-            .map_err(|_| EIO)?;
+        let mut r = Reader::new(reply.bytes(&mut buffer));
+        let status = r.u32().map_err(|_| EIO)?;
         match status {
-            0 => return reply.handles.take::<Channel>(0).map(Some).map_err(|_| EIO),
+            0 => {
+                let birth = r.u32().unwrap_or(0);
+                if reply.handles.is_empty() {
+                    return Ok((None, birth));
+                }
+                let session = reply.handles.take::<Channel>(0).map_err(|_| EIO)?;
+                return Ok((Some(session), birth));
+            }
             s if s == busy_code() && tries < BUSY_TRIES => {
                 tries += 1;
                 pause()?;
@@ -943,26 +1226,36 @@ pub fn clone_for_fork() -> Result<Option<Handle<Channel>>, i32> {
     if session().is_none() {
         return Ok(None);
     }
-    let mut held = [pure::Held {
-        handle: 0,
-        clofork: true,
-    }; p::HELD_MAX];
-    let mut count = 0;
-    crate::shared::with_files(|files| {
-        for (_, target, flags) in files.descriptors() {
-            if let Target::Data(d) = target
-                && count < held.len()
-            {
-                held[count] = pure::Held {
-                    handle: d.handle,
-                    clofork: flags.close_on_fork,
-                };
-                count += 1;
+    // Another thread may close a description between the collection and the CLONE: the service
+    // says BAD_HANDLE (EBADF), and the descriptions are collected again, three times at most.
+    let mut tries = 0;
+    loop {
+        let mut held = [pure::Held {
+            handle: 0,
+            clofork: true,
+        }; pure::PLAN_MAX];
+        let mut count = 0;
+        crate::shared::with_files(|files| {
+            for (_, target, flags) in files.descriptors() {
+                if let Target::Data(d) = target
+                    && count < held.len()
+                    && !flags.close_on_fork
+                    && !held[..count].iter().any(|h| h.handle == d.handle)
+                {
+                    held[count] = pure::Held {
+                        handle: d.handle,
+                        clofork: false,
+                    };
+                    count += 1;
+                }
             }
+            Ok(())
+        })?;
+        match clone_for_child(held[..count].iter().copied(), true) {
+            Err(EBADF) if tries < 3 => tries += 1,
+            other => return other,
         }
-        Ok(())
-    })?;
-    clone_for_child(held[..count].iter().copied(), true)
+    }
 }
 
 /// The session as the new image of an exec gets it (None when there is none): the description of
@@ -973,6 +1266,11 @@ pub fn session_for_exec() -> Option<rt::abi::Handle> {
     CWD_CHECKED.store(false, Ordering::Release);
     if old != NONE {
         close_description(old);
+    }
+    // A close that failed left a description in the session with no descriptor: the new image
+    // takes a session of its own.
+    if CLOSE_FAILED.swap(false, Ordering::AcqRel) {
+        return None;
     }
     Some(raw)
 }
