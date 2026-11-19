@@ -1387,3 +1387,179 @@ fn a_commit_that_compacts_a_metadata_pair_reads_the_whole_list_of_pairs_every_se
         }
     }
 }
+
+#[test]
+fn stat_and_fstat_show_the_time_of_a_write_that_is_not_synced() {
+    let mut rig = Rig::new();
+    rig.mkdir(ROOT, b"/d", 0o777).unwrap();
+    rig.server.set_now(5_000);
+    rig.put(OWNER, b"/d/f", 0o4755, b"");
+    rig.server.set_now(9_000);
+    let h = rig.open(OWNER, b"/d/f", p::READ | p::WRITE, 0).unwrap();
+    rig.write(OWNER, h, b"x").unwrap();
+    let by_path = rig.stat(OWNER, b"/d/f").unwrap();
+    assert_eq!(
+        (by_path.mtime, by_path.ctime, by_path.size),
+        (9_000, 9_000, 1)
+    );
+    assert_eq!(
+        by_path.mode & 0o7000,
+        0,
+        "the set-ID bits go with the write"
+    );
+    let by_handle =
+        p::Stat::from_bytes(&rig.ok(OWNER, |w| p::handle_call(p::Method::Fstat, h, w))).unwrap();
+    assert_eq!((by_handle.mtime, by_handle.ctime), (9_000, 9_000));
+    assert_eq!(by_handle.mode, by_path.mode);
+    // Another session sees it too: the file is one.
+    assert_eq!(rig.stat(ROOT, b"/d/f").unwrap().mtime, 9_000);
+    // The time of a later write replaces it; the time of creation is kept as atime.
+    rig.server.set_now(9_500);
+    rig.write(OWNER, h, b"y").unwrap();
+    let st = rig.stat(OWNER, b"/d/f").unwrap();
+    assert_eq!((st.atime, st.mtime), (5_000, 9_500));
+}
+
+#[test]
+fn futimens_and_fchmod_after_a_write_survive_the_last_close() {
+    let mut rig = Rig::new();
+    rig.mkdir(ROOT, b"/d", 0o777).unwrap();
+    rig.server.set_now(5_000);
+    rig.put(OWNER, b"/d/f", 0o644, b"");
+    rig.server.set_now(9_000);
+    let h = rig.open(OWNER, b"/d/f", p::READ | p::WRITE, 0).unwrap();
+    rig.write(OWNER, h, b"x").unwrap();
+    // cp -p: the times are set by description before the close.
+    rig.call(OWNER, |w| {
+        p::futimens(h, p::TimeSpec::At(42), p::TimeSpec::At(43), w)
+    })
+    .unwrap();
+    rig.server.set_now(9_900);
+    rig.close(OWNER, h);
+    let st = rig.stat(OWNER, b"/d/f").unwrap();
+    assert_eq!((st.atime, st.mtime), (42, 43), "the explicit times stand");
+    assert_eq!(st.size, 1);
+    // install: the set-user bit asked for after the write stays.
+    let h = rig.open(OWNER, b"/d/f", p::READ | p::WRITE, 0).unwrap();
+    rig.write(OWNER, h, b"y").unwrap();
+    rig.call(OWNER, |w| p::fchmod(h, 0o4755, w)).unwrap();
+    rig.close(OWNER, h);
+    assert_eq!(rig.stat(OWNER, b"/d/f").unwrap().mode, 0o4755);
+    // CHOWN by path folds the pending write in the same way, and a write after it is a new one.
+    let h = rig.open(OWNER, b"/d/f", p::READ | p::WRITE, 0).unwrap();
+    rig.server.set_now(11_000);
+    rig.write(OWNER, h, b"z").unwrap();
+    rig.chown(ROOT, b"/d/f", p::UID_KEEP, 100).unwrap();
+    rig.close(OWNER, h);
+    let st = rig.stat(OWNER, b"/d/f").unwrap();
+    assert_eq!(st.mtime, 11_000);
+    assert_eq!(
+        st.mode & 0o6000,
+        0,
+        "the write and the chown cleared the set-ID bits"
+    );
+}
+
+/// `/d` with `DIR_ENTRIES_MAX` entries: a directory `/d/sub` and files.
+fn full_directory(rig: &mut Rig) {
+    rig.mkdir(ROOT, b"/d", 0o777).unwrap();
+    rig.mkdir(ROOT, b"/d/sub", 0o777).unwrap();
+    for i in 1..server::DIR_ENTRIES_MAX {
+        let path = std::format!("/d/n{i}");
+        let h = rig
+            .open(ROOT, path.as_bytes(), p::WRITE | p::CREATE, 0o644)
+            .unwrap();
+        rig.close(ROOT, h);
+    }
+}
+
+#[test]
+fn a_rename_of_a_directory_to_itself_does_nothing_and_opens_no_room() {
+    let mut rig = Rig::new();
+    full_directory(&mut rig);
+    let before = rig.stat(ROOT, b"/d").unwrap();
+    rig.server.set_now(77_000);
+    for _ in 0..10 {
+        rig.call(ROOT, |w| p::rename(b"/d/sub", b"/d/sub", w))
+            .unwrap();
+    }
+    // The directory's time did not move, and ten creates past the cap are all refused.
+    assert_eq!(rig.stat(ROOT, b"/d").unwrap().mtime, before.mtime);
+    for i in 0..10 {
+        let path = std::format!("/d/extra{i}");
+        assert_eq!(
+            rig.open(ROOT, path.as_bytes(), p::WRITE | p::CREATE, 0o644),
+            Err(p::code(p::NO_SPACE))
+        );
+    }
+}
+
+#[test]
+fn the_cap_holds_when_every_directory_place_is_held_and_after_a_create_with_truncate() {
+    let mut rig = Rig::new();
+    full_directory(&mut rig);
+    rig.fs.unmount().unwrap();
+    let device = rig.fs.into_device();
+    // A new instance: no count is remembered. Sixteen descriptions of directories hold every place.
+    let mut rig = Rig::on(device);
+    let held: Vec<u32> = (0..crate::DIRS)
+        .map(|_| rig.open(OTHER, b"/", p::DIRECTORY, 0).unwrap())
+        .collect();
+    let refused = rig.open(ROOT, b"/d/extra", p::WRITE | p::CREATE, 0o644);
+    assert_eq!(
+        refused,
+        Err(p::code(p::TABLE_FULL)),
+        "not let through unchecked"
+    );
+    for h in held {
+        rig.close(OTHER, h);
+    }
+    assert_eq!(
+        rig.open(ROOT, b"/d/extra", p::WRITE | p::CREATE, 0o644),
+        Err(p::code(p::NO_SPACE))
+    );
+    // A create that also truncates counts at once: the next one is refused.
+    rig.call(ROOT, |w| p::path_call(p::Method::Unlink, b"/d/n5", w))
+        .unwrap();
+    let h = rig
+        .open(ROOT, b"/d/again", p::WRITE | p::CREATE | p::TRUNCATE, 0o644)
+        .unwrap();
+    assert_eq!(
+        rig.open(ROOT, b"/d/again2", p::WRITE | p::CREATE, 0o644),
+        Err(p::code(p::NO_SPACE))
+    );
+    rig.close(ROOT, h);
+}
+
+#[test]
+fn one_root_has_one_count_for_its_clones_and_its_sessions() {
+    let mut rig = Rig::new();
+    rig.mkdir(ROOT, b"/d", 0o777).unwrap();
+    // A process tree asks SESSION as many times as a root may have sessions.
+    let mine = user(5000, 500, &[]);
+    for label in 0..server::ROOT_CLONES as u64 {
+        rig.server.bind_new(1000 + label, mine).unwrap();
+    }
+    assert_eq!(
+        rig.server.bind_new(2000, mine),
+        Err(p::code(p::TOO_MANY_OPEN)),
+        "the 33rd session of the root"
+    );
+    // CLONE from one of them sees the same count: it is refused, though it made no clone before.
+    let h = rig.open(1000, b"/d", p::DIRECTORY, 0).unwrap();
+    assert_eq!(
+        rig.clone_session(1000, 3000, &[h]),
+        Err(p::code(p::TOO_MANY_OPEN))
+    );
+    // Another root gets its session and its clone, and the table is not full for it.
+    let other = user(6000, 600, &[]);
+    rig.server.bind_new(4000, other).unwrap();
+    let g = rig.open(4000, b"/d", p::DIRECTORY, 0).unwrap();
+    rig.clone_session(4000, 4001, &[g]).unwrap();
+    // The number of a root of init's and the number of an expenditure root do not meet: a client
+    // of init whose label equals the number of the expenditure root has its own count.
+    let root_number = mine.root;
+    rig.bind(root_number, user(3000, 300, &[]));
+    let k = rig.open(root_number, b"/d", p::DIRECTORY, 0).unwrap();
+    rig.clone_session(root_number, 5000, &[k]).unwrap();
+}

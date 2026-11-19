@@ -26,7 +26,7 @@ use crate::attr::{
     ATTR_COUNTER_TYPE, ATTR_FORMAT_TYPE, ATTR_TYPE, Attr, Entry as Record, INO_BLOCK,
     RESERVE_BLOCKS, Standing, VOLUME_FORMAT, default_attr, read_entry,
 };
-use crate::binding::{self, Binding, Caller, Vouched};
+use crate::binding::{self, Binding, Caller, Root, Vouched};
 use crate::fs::{Dir, Error, File, Fs, Kind, Open, Whence};
 use crate::{BLOCK, DIRS, Device, FILES};
 use posix_perm::{self as perm, Denial, TimesRequest};
@@ -169,9 +169,10 @@ struct Session {
     /// has sent nothing (0 after its first request).
     parent: u64,
     birth: u16,
-    /// The client at the top of the tree of clones this session belongs to (its own label for a
-    /// client of init): the limits of a process tree count by it.
-    root: u64,
+    /// The client at the top of the tree of sessions this session belongs to (its own label for a
+    /// client of init, the root of the expenditure for a session made by SESSION): the limits of a
+    /// process tree count by it.
+    root: Root,
 }
 
 impl Session {
@@ -182,7 +183,7 @@ impl Session {
         binding: Binding::Unbound,
         parent: 0,
         birth: 0,
-        root: 0,
+        root: Root::Label(0),
     };
 }
 
@@ -191,7 +192,7 @@ struct Pass {
     used: bool,
     label: u64,
     /// The root of the session that made it.
-    owner: u64,
+    owner: Root,
     description: u8,
 }
 
@@ -736,7 +737,7 @@ impl Server {
             passes: [Pass {
                 used: false,
                 label: 0,
-                owner: 0,
+                owner: Root::Label(0),
                 description: 0,
             }; PASSES],
             generation: 0,
@@ -821,7 +822,7 @@ impl Server {
         self.sessions[i] = Session {
             used: true,
             label,
-            root: label,
+            root: Root::Label(label),
             binding: self.birth_binding(label),
             ..Session::EMPTY
         };
@@ -853,8 +854,18 @@ impl Server {
             .ok_or_else(|| p::code(p::TABLE_FULL))
     }
 
+    /// The sessions a root has besides its own (the session of the client of init that is the root):
+    /// the clones made under it and the sessions SESSION made for it. One count for both, so that
+    /// no process tree fills the table of sessions by either way.
+    fn tree_sessions(&self, root: Root) -> usize {
+        self.sessions
+            .iter()
+            .filter(|s| s.used && s.root == root && root != Root::Label(s.label))
+            .count()
+    }
+
     /// The distinct descriptions the sessions of the tree `root` hold.
-    fn root_held(&self, root: u64) -> u64 {
+    fn root_held(&self, root: Root) -> u64 {
         self.sessions
             .iter()
             .filter(|s| s.used && s.root == root)
@@ -1285,11 +1296,16 @@ impl Server {
                 visible(&path[..n])?;
                 self.search(fs, &caller, false, &path[..n])?;
                 let (info, entry) = self.load(fs, &path[..n])?;
+                let mut attr = entry.attr;
                 let size = match self.node_at(&path[..n]) {
-                    Some(ni) => self.size_of(fs, ni)? as u32,
+                    Some(ni) => {
+                        // The write time of what is written and not synced shows at once (XBD 4.12).
+                        self.overlay_pending(ni, &mut attr);
+                        self.size_of(fs, ni)? as u32
+                    }
                     None => info.size,
                 };
-                stat_record(info.kind, size, &entry.attr, 1).write(w)
+                stat_record(info.kind, size, &attr, 1).write(w)
             }
             Method::Fstat => {
                 let di = self.find(si, r.u32()?)?;
@@ -1301,8 +1317,10 @@ impl Server {
                         let size = self.size_of(fs, ni)?;
                         let node_path = self.nodes[ni].path;
                         let entry = entry_of(fs, node_path.get(), Kind::File)?;
+                        let mut attr = entry.attr;
+                        self.overlay_pending(ni, &mut attr);
                         let nlink = u32::from(!self.nodes[ni].orphan);
-                        stat_record(Kind::File, size as u32, &entry.attr, nlink).write(w)
+                        stat_record(Kind::File, size as u32, &attr, nlink).write(w)
                     }
                     Kind::Directory => {
                         let dir_path = self.dirs[usize::from(d.object)];
@@ -1472,12 +1490,7 @@ impl Server {
                 // A process tree has a few clones alive at once, so that one client cannot fill the
                 // table of sessions for every other.
                 let root = self.sessions[si].root;
-                let clones = self
-                    .sessions
-                    .iter()
-                    .filter(|s| s.used && s.root == root && s.parent != 0)
-                    .count();
-                if clones >= ROOT_CLONES {
+                if self.tree_sessions(root) >= ROOT_CLONES {
                     return Err(p::code(p::TOO_MANY_OPEN));
                 }
                 let ci = self.free_session()?;
@@ -1727,6 +1740,28 @@ impl Server {
         self.write_times(fs, ni)
     }
 
+    /// What the attribute of the file of node `ni` will say once its pending writes are folded in:
+    /// the time of the last write as `mtime` and `ctime`, the set-ID bits cleared (see `write_times`).
+    fn overlay_pending(&self, ni: usize, attr: &mut Attr) {
+        let n = &self.nodes[ni];
+        if n.wrote {
+            attr.mtime = n.wrote_at;
+            attr.ctime = n.wrote_at;
+            attr.mode = perm::mode_after_write(attr.mode);
+        }
+    }
+
+    /// Before a change of the attribute of the file at `path` (CHMOD, CHOWN, UTIMENS and their
+    /// variants by description): the writes still pending on its open node are folded into the
+    /// record with one commit and the mark is cleared, so that the last close does not write the time
+    /// of the writes over a time or a mode the caller just set.
+    fn fold_pending<D: Device>(&mut self, fs: &mut Fs<'_, D>, path: &[u8]) -> Res<()> {
+        match self.node_at(path) {
+            Some(ni) if self.nodes[ni].wrote => self.write_times(fs, ni),
+            _ => Ok(()),
+        }
+    }
+
     /// The attribute of the file of node `ni` takes the time of its writes (`mtime`, `ctime`) and
     /// loses its set-ID bits (rule 10 and 7). CORRUPT for a record of a format this service does not
     /// know: it is never rewritten.
@@ -1820,15 +1855,17 @@ impl Server {
     }
 
     /// The entries of the directory at `dir`, from the memory of the server or by one scan of the
-    /// directory (at most the cap of it, plus the entries of a directory that grew before). None
-    /// when no slot is free for the scan: the cap is then not enforced for this call.
-    fn dir_entries<D: Device>(&mut self, fs: &mut Fs<'_, D>, dir: &[u8]) -> Res<Option<usize>> {
+    /// directory. TABLE_FULL when every directory place of the volume is held and the scan cannot be
+    /// made.
+    fn dir_entries<D: Device>(&mut self, fs: &mut Fs<'_, D>, dir: &[u8]) -> Res<usize> {
         if let Some(c) = self.counts.iter().find(|c| c.used && c.path.get() == dir) {
-            return Ok(Some(c.entries));
+            return Ok(c.entries);
         }
         let slot = match fs.opendir(dir) {
             Ok(slot) => slot,
-            Err(Error::NoMemory) => return Ok(None),
+            // Every directory place of the volume is held by a description: the count cannot be
+            // made, and a create is not let through unchecked.
+            Err(Error::NoMemory) => return Err(p::code(p::TABLE_FULL)),
             Err(e) => return Err(status_of(e)),
         };
         let mut n = 0;
@@ -1853,14 +1890,15 @@ impl Server {
         self.counts[hand].used = true;
         self.counts[hand].path.set(dir);
         self.counts[hand].entries = n;
-        Ok(Some(n))
+        Ok(n)
     }
 
     /// A name is about to be added to `dir`: NO_SPACE when it holds `DIR_ENTRIES_MAX` entries.
     fn room_in_dir<D: Device>(&mut self, fs: &mut Fs<'_, D>, dir: &[u8]) -> Res<()> {
-        match self.dir_entries(fs, dir)? {
-            Some(n) if n >= DIR_ENTRIES_MAX => Err(p::code(p::NO_SPACE)),
-            _ => Ok(()),
+        if self.dir_entries(fs, dir)? >= DIR_ENTRIES_MAX {
+            Err(p::code(p::NO_SPACE))
+        } else {
+            Ok(())
         }
     }
 
@@ -2071,6 +2109,10 @@ impl Server {
             from_parent == to_parent,
         )
         .map_err(denied)?;
+        // A rename to itself succeeds and does nothing (XSH `rename()`): no count moves, no time.
+        if from == to {
+            return Ok(());
+        }
         // A name added to another directory counts toward its cap.
         if from_parent != to_parent && target_entry.is_none() {
             self.room_in_dir(fs, to_parent)?;
@@ -2145,6 +2187,7 @@ impl Server {
         path: &[u8],
         mode: u32,
     ) -> Res<()> {
+        self.fold_pending(fs, path)?;
         let (info, entry) = self.load(fs, path)?;
         let new = perm::chmod_result(caller.identity(false), &entry.attr.perm(info.kind), mode)
             .map_err(denied)?;
@@ -2163,6 +2206,7 @@ impl Server {
         uid: u32,
         gid: u32,
     ) -> Res<()> {
+        self.fold_pending(fs, path)?;
         let (info, entry) = self.load(fs, path)?;
         let keep = |v: u32| (v != p::UID_KEEP).then_some(v);
         let owned = perm::chown_result(
@@ -2189,6 +2233,7 @@ impl Server {
         atime: p::TimeSpec,
         mtime: p::TimeSpec,
     ) -> Res<()> {
+        self.fold_pending(fs, path)?;
         let (info, entry) = self.load(fs, path)?;
         let request = match (atime, mtime) {
             (p::TimeSpec::Omit, p::TimeSpec::Omit) => TimesRequest::Omit,
@@ -2414,6 +2459,13 @@ impl Server {
                             let _ = fs.remove(path);
                             return Err(status_of(e));
                         }
+                        // The name exists: the count and the directory's time follow now, whatever
+                        // comes after.
+                        if created.is_some() {
+                            let (parent, _) = split(path);
+                            self.count_add(parent, 1);
+                            self.touch(fs, parent);
+                        }
                         let mut node = Node {
                             used: true,
                             slot: file.0,
@@ -2439,11 +2491,6 @@ impl Server {
                 }
                 self.nodes[ni].refs += 1;
                 description.object = ni as u8;
-                if let Some((_, _)) = created {
-                    let (parent, _) = split(path);
-                    self.count_add(parent, 1);
-                    self.touch(fs, parent);
-                }
             }
         }
         self.generation = self.generation.wrapping_add(1).max(1);
@@ -2475,13 +2522,8 @@ impl Server {
         if label == 0 || self.sessions.iter().any(|s| s.used && s.label == label) {
             return Err(p::code(p::INVALID));
         }
-        let root = vouched.root;
-        let live = self
-            .sessions
-            .iter()
-            .filter(|s| s.used && s.root == root && s.root != s.label)
-            .count();
-        if live >= ROOT_CLONES {
+        let root = Root::Expense(vouched.root);
+        if self.tree_sessions(root) >= ROOT_CLONES {
             return Err(p::code(p::TOO_MANY_OPEN));
         }
         let si = self.free_session()?;

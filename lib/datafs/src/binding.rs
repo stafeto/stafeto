@@ -15,8 +15,19 @@
 use posix_perm::{Identity, Ids};
 use proto_data::Method;
 
-/// The supplementary groups a binding keeps at most (the process service's limit).
-pub const GROUPS_MAX: usize = 16;
+/// The supplementary groups a binding keeps at most: the process service's limit.
+pub const GROUPS_MAX: usize = proto_process::SUPPLEMENTARY_MAX;
+
+/// Whose limits a session counts under. A client of init is its own root (its label); a session made
+/// by SESSION counts under the root of the expenditure the process service names. The two are
+/// different kinds of number and never compare equal, whatever their values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Root {
+    /// The label of a client of init: it and the clones made under it.
+    Label(u64),
+    /// The root of the expenditure in an answer of Vouch.
+    Expense(u64),
+}
 
 /// What the process service vouched for: one process at one generation of its record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
