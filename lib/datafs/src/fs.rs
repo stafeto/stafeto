@@ -923,7 +923,7 @@ impl<D: Device> Fs<'_, D> {
     }
 
     /// The status of `path` and the attribute `attr` of the root and of every entry of the path,
-    /// in one walk of it that repeats no lookup (about two reads for each component). `entries`
+    /// in one walk of it that repeats no lookup (about 3 reads for each component, what a `stat` costs). `entries`
     /// and `bytes` receive the root and each entry in path order, `each` bytes of attribute for
     /// an entry (`bytes` holds `entries.len() * each`); the first number returned is how many
     /// were filled, also when the walk fails. The result is the status of the last entry, or the

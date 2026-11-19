@@ -538,9 +538,9 @@ struct lfs_path_attr {
 // Find info about a file or directory and the custom attributes of every entry of its path
 //
 // stafeto: lfs_stat_attr for the root and for each entry the path passes, in one
-// walk of the path with no lookup repeated: the cost is that of one lfs_stat plus about two
-// reads for each component, where lfs_stat_attr of each prefix costs a lookup from the root
-// for each and grows with the square of the depth. The attribute of the given type of the
+// walk of the path with no lookup repeated: the cost is about that of one lfs_stat, 3 reads
+// for each component, where lfs_stat_attr of each prefix costs a lookup from the root for
+// each and grows with the square of the depth. The attribute of the given type of the
 // root and of each entry the walk matches, in the order of the path, goes to out (its kind and
 // the size of the attribute on disk, or LFS_ERR_NOATTR) and to buffer (size bytes for each,
 // as lfs_getattr fills them); entries that "." and ".." make the path skip are not matched

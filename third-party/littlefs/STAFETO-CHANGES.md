@@ -37,8 +37,9 @@ NULL, so every caller of the release behaves as before.
   filled also when the call fails, so that a caller still has the attributes of the directories
   above a missing name (`LFS_ERR_NOENT`) or a file in the middle of the path (`LFS_ERR_NOTDIR`);
   a path of more entries than `capacity` gives `LFS_ERR_NAMETOOLONG`. The status of the last entry
-  is returned as `lfs_stat` does. A walk of a path of depth d costs about 3 reads for each
-  component with the read size of 4096 (the lookups of the release repeat from the root).
+  is returned as `lfs_stat` does. A walk of a path of depth d costs about what an `lfs_stat` of it costs, 3 reads for each
+  component with the read size of 4096 (26 against 27 at depth 8), where a lookup of each prefix
+  repeats from the root.
 - A private helper, `lfs_dir_getattr_`, which they use: the tail of `lfs_getattr_` over a pair
   and an id.
 
@@ -82,7 +83,7 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 6dd74dfc58ac93589f8e002bb73c0830a59206912cfe8c951c07eb2bd5fccad0  SPEC.md
 2a8b3459d74b9fa8bdd947738522c46331739405b1fc3d70f057f636a1dea768  DESIGN.md
 7fa02871d2147b6230183694e8b9efc1cfd797808cba687aa4e91e19debab557  lfs.c (with the change)
-d629440b6046fd0474e1f5c2ba8b080d932b66432f5315bb78e9eb7cde7f7f1b  lfs.h (with the change)
+9c13b195643ccfd5025961fa3fb6029bbb9be0f6ffce9488ec9be958d33163b6  lfs.h (with the change)
 ```
 
 `tools/check-littlefs.py` (run by `cargo xtask ci` as "littlefs sources") fails when a file of the
@@ -95,7 +96,12 @@ change, or when `stafeto-changes.patch` applied backwards to them does not give 
    `LICENSE.md`, `SPEC.md` and `DESIGN.md` here. Check its `LFS_VERSION`, and that `lfs_dir_read_`,
    `lfs_stat_`, `lfs_getattr_`, `lfs_dir_get` and `lfs_dir_getinfo` still have the shape the
    change relies on (`lfs_dir_read_` leaves `dir->id` one past the entry; the attribute is a tag
-   of the same pair as the entry's name).
+   of the same pair as the entry's name). Take the new release's `lfs_dir_find` and split it
+   again as the change does, and never copy the old body over it: the new body becomes
+   `lfs_dir_find_` with the `walk` argument, `lfs_dir_find` calls it with NULL, and the two
+   places that call `lfs_path_walk_visit` are right after the empty-path check (the root) and
+   right after the loop that matches the name (the entry just found, while `dir` is still the
+   pair that holds it). The rest of the body must equal the release's.
 2. Apply `stafeto-changes.patch` with `patch -p1` from the root of the repository (or by hand if
    the context moved) to the new `lfs.c` and `lfs.h`.
 3. Rebuild the patch (`diff -u` of the new release against the files here) as
@@ -104,5 +110,5 @@ change, or when `stafeto-changes.patch` applied backwards to them does not give 
    `Cargo.toml` and `src/lib.rs`.
 4. Run `cargo test -p datafs`: `tests_entry_attr.rs` compares the attribute of every entry of
    a directory with `lfs_getattr` by path, across several metadata pairs.
-5. When a release has the same functions, delete the change: remove the patch, this file, the two
-   functions' use in `lib/datafs/csrc/glue.c` and `lib/datafs/src/fs.rs`, and the check.
+5. When a release has the same functions, delete the change: remove the patch, this file, the use
+   of the three functions in `lib/datafs/csrc/glue.c` and `lib/datafs/src/fs.rs`, and the check.

@@ -708,3 +708,58 @@ fn the_walk_of_a_deep_path_is_linear_where_a_lookup_for_each_prefix_is_not() {
     let (depth, one, each) = rows[2];
     assert!(each > 10 * one, "depth {depth}: {each} reads against {one}");
 }
+
+/// A path that enters a directory of 400 subdirectories, each with an attribute: the directory
+/// spans many metadata pairs, so the entry a walk matches is in any of them, and the attribute
+/// has to come from that pair and not from the first one.
+#[test]
+fn a_walk_into_a_directory_split_over_many_pairs_gives_the_attribute_of_the_entry_matched() {
+    let mut fs = fresh();
+    fs.mkdir(b"/big").unwrap();
+    fs.setattr(b"/big", ATTR, &[0xb1u8; 48]).unwrap();
+    let count = 400usize;
+    for i in 0..count {
+        let dir = format!("/big/s{i:04}");
+        fs.mkdir(dir.as_bytes()).unwrap();
+        fs.setattr(
+            dir.as_bytes(),
+            ATTR,
+            &attribute_of(i + 1).unwrap_or_else(|| std::vec![7u8; 48]),
+        )
+        .unwrap();
+        let file = format!("{dir}/f");
+        let f = fs
+            .open(file.as_bytes(), Open::WRITE.with(Open::CREATE))
+            .unwrap();
+        fs.close(f).unwrap();
+        fs.setattr(file.as_bytes(), ATTR, &[(i % 251) as u8; 48])
+            .unwrap();
+    }
+    // Removals compact some pairs and the next creation splits them again.
+    for i in (0..count).step_by(5) {
+        let dir = format!("/big/s{i:04}");
+        fs.remove(format!("{dir}/f").as_bytes()).unwrap();
+        fs.remove(dir.as_bytes()).unwrap();
+    }
+    for i in (0..count).step_by(5) {
+        let dir = format!("/big/s{i:04}");
+        fs.mkdir(dir.as_bytes()).unwrap();
+        fs.setattr(dir.as_bytes(), ATTR, &[(i % 251) as u8 ^ 0x55; 48])
+            .unwrap();
+    }
+    let mut fs = restarted(fs);
+    // Walks from the first pair, the last and the middle, cold after a restart.
+    for i in [0usize, 1, 7, 99, 100, 199, 200, 311, 398, 399] {
+        let path = format!("/big/s{i:04}/f");
+        let walked = walk(&mut fs, &path, 8);
+        if i.is_multiple_of(5) {
+            // The file was removed with its directory, and the directory is made again.
+            assert_eq!((walked.0, walked.1), (3, Err(Error::NoEntry)), "{path}");
+            let dir = format!("/big/s{i:04}");
+            let own = walk(&mut fs, &dir, 8);
+            assert_equal_to_stat_attr(&mut fs, &dir, &own);
+        } else {
+            assert_equal_to_stat_attr(&mut fs, &path, &walked);
+        }
+    }
+}

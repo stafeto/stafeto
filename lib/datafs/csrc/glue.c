@@ -490,7 +490,7 @@ int datafs_removeattr(struct datafs *d, void *ctx, const char *path, uint8_t typ
 }
 
 // The entries of a directory with the attribute `attr` of each, and the status of a path with its
-// attribute, from the two functions of the change to littlefs (third-party/littlefs/STAFETO-CHANGES.md).
+// attribute, from the functions of the change to littlefs (third-party/littlefs/STAFETO-CHANGES.md).
 
 // As datafs_readdir, and for an entry the user attribute `attr` of the entry: its size in
 // *attr_res (LFS_ERR_NOATTR when there is none, always for "." and ".."), the bytes in `buffer`
