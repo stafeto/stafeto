@@ -38,6 +38,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod fit;
 pub mod frame;
 
 use proto_comp::{
@@ -1571,22 +1572,30 @@ impl Scene {
         let calls = OPAQUE.call * opaque + OVER.call * over + FILL.call * fill;
         let per_row = OPAQUE.row * opaque + OVER.row * over + FILL.row * fill;
         let per_point = OPAQUE.point * opaque + OVER.point * over + FILL.point * fill;
-        if per_row + per_point == 0 {
-            // Nothing to draw: the damage is black or untouched.
-            return (damage.w, BAND_ROWS);
-        }
-        let budget = u64::from(BAND_TICKS.saturating_sub(calls)) * 100;
-        let one_row = u64::from(per_row) + u64::from(damage.w) * u64::from(per_point);
-        let rows = budget / one_row;
-        if rows >= 1 {
-            // The width of the damage, as many lines as the ticks allow.
-            return (damage.w, rows.min(u64::from(BAND_ROWS)) as u32);
-        }
-        // Not even one line of the whole width: a part of a line.
-        let room = budget.saturating_sub(u64::from(per_row));
-        let w = room.checked_div(u64::from(per_point)).unwrap_or(0);
-        (w.clamp(1, u64::from(damage.w)) as u32, 1)
+        band_size(calls, per_row, per_point, damage.w)
     }
+}
+
+/// The size of a band of a damage `damage_w` wide: the layers cost `calls` ticks
+/// in all, `per_row` hundredths of a tick for each line and `per_point`
+/// hundredths for each point. The lines of the damage's width that BAND_TICKS
+/// leaves after the calls (at most BAND_ROWS), or one line's part, at least one
+/// point. Nothing to price (no row and no point) is a band of BAND_ROWS lines.
+pub fn band_size(calls: u32, per_row: u32, per_point: u32, damage_w: u32) -> (u32, u32) {
+    if per_row + per_point == 0 {
+        return (damage_w, BAND_ROWS);
+    }
+    let budget = u64::from(BAND_TICKS.saturating_sub(calls)) * 100;
+    let one_row = u64::from(per_row) + u64::from(damage_w) * u64::from(per_point);
+    let rows = budget / one_row;
+    if rows >= 1 {
+        // The width of the damage, as many lines as the ticks allow.
+        return (damage_w, rows.min(u64::from(BAND_ROWS)) as u32);
+    }
+    // Not even one line of the whole width: a part of a line.
+    let room = budget.saturating_sub(u64::from(per_row));
+    let w = room.checked_div(u64::from(per_point)).unwrap_or(0);
+    (w.clamp(1, u64::from(damage_w)) as u32, 1)
 }
 
 /// The bands a frame of one copy over the whole screen takes by the prices of
