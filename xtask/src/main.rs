@@ -624,6 +624,7 @@ const POSIX_TTY_PROGRAMS: [ImageProgram; 12] = [
 ];
 const POSIX_TTY_STEPS_PROGRAMS: [ImageProgram; 12] = {
     let mut programs = POSIX_TTY_PROGRAMS;
+    programs[1].3 = &["steps"];
     programs[2].3 = &["trust-probe", "steps"];
     programs[5].3 = &["tty-probe", "steps"];
     programs
@@ -631,6 +632,7 @@ const POSIX_TTY_STEPS_PROGRAMS: [ImageProgram; 12] = {
 /// Full terminal control steps with sixteen live POSIX clients over a PTY.
 const POSIX_TTY_CONTROL_PROGRAMS: [ImageProgram; 12] = {
     let mut programs = POSIX_TTY_STEPS_PROGRAMS;
+    programs[1].3 = &[];
     programs[2].3 = &["quiet-steps"];
     programs[5].3 = &[];
     programs[8].3 = &["quiet-control"];
@@ -824,7 +826,9 @@ const POSIX_FIFO_PROGRAMS: [ImageProgram; 10] = {
 };
 const POSIX_FIFO_STEPS_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_FIFO_PROGRAMS;
-    programs[1].3 = &["steps"];
+    // `fifo-steps` makes the probe wait idle for three seconds after its last check.
+    programs[5].3 = &["fifo-probe", "fifo-steps"];
+    programs[1].3 = &["steps", "audit-readout"];
     programs[2].3 = &["steps"];
     programs
 };
@@ -4961,6 +4965,7 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
             );
         }
         check_waits(&output.lines, &["1", "5"], "POSIX terminal steps")?;
+        check_console_driver_steps(&output.lines)?;
         let tty = longest_steps(&output.lines, "5");
         // This POSIX fixture calls Acquire, SetPgrp, GetPgrp and GetSid.
         // The separate native control probe also measures Controlling.
@@ -6633,6 +6638,7 @@ fn posix_fifo_run(steps: bool) -> Result<(), String> {
         qemu::expect_marker(&outcome, marker)?;
     }
     if steps {
+        qemu::expect_marker(&outcome, "posix-fifo: idle tail done")?;
         const FIFO_STEP_MAX: u64 = RAM_STEP_MAX * 9 / 10;
         check_waits(&outcome.lines, &["2", "4"], "FIFO service steps")?;
         let own = longest_steps(&outcome.lines, "2")
@@ -7598,6 +7604,56 @@ fn check_init_steps(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> 
 /// answered, and the service run again, within the deadline less the period.
 /// The counter of the image is 62.5 MHz (QEMU's virt), a tick 16 ns.
 const WATCH_LEFT_TICKS: u64 = (1_000 - 250) * 62_500;
+
+/// The tag of the lines of steps of the console driver (services/uart, feature `steps`).
+const CONSOLE_DRIVER_TAG: &str = "18";
+
+/// The kinds of the calls the terminal service makes to the console driver on a loan, WRITE_SOME
+/// (11) and ROOM (12), and the longest such call allowed in ticks: B_K of 150 us, 9,375 ticks of
+/// 16 ns, which the bound of the terminal's window (`tests/service-budget`) holds as the overrun
+/// at the edge.
+const CONSOLE_LOAN_KINDS: [usize; 2] = [11, 12];
+const CONSOLE_LOAN_STEP_MAX: u64 = 150_000 / TICK_NS;
+
+/// The steps of the console driver (tag 18) each under 0.9 of term B (the calls on a loan under
+/// B_K), the notices too (kind 64
+/// holds the ticks that take the kernel log, the longest of its steps): the driver has to have
+/// printed a table with a step of the log tick (kind 64 or 65) and of the calls of the terminal
+/// (WRITE_SOME, 11).
+fn check_console_driver_steps(lines: &[String]) -> Result<(), String> {
+    let rows = longest_steps(lines, CONSOLE_DRIVER_TAG);
+    for kind in [11usize] {
+        if !rows.iter().any(|(k, ..)| *k == kind) {
+            return Err(format!(
+                "the console driver printed no step of kind {kind}: {rows:?}"
+            ));
+        }
+    }
+    if !rows.iter().any(|(k, ..)| *k == 64 || *k == 65) {
+        return Err(format!(
+            "the console driver printed no step of its log tick: {rows:?}"
+        ));
+    }
+    // The calls the terminal service makes on a loan (WRITE_SOME and ROOM, when the driver runs in
+    // the background and the time goes to the terminal's budget) may not be longer than the
+    // overrun at the edge, B_K of 150 us, that the bound of the terminal's window already holds.
+    if let Some((kind, ticks, detail)) = rows.iter().find(|(kind, ticks, _)| {
+        CONSOLE_LOAN_KINDS.contains(kind) && *ticks > CONSOLE_LOAN_STEP_MAX
+    }) {
+        return Err(format!(
+            "the console driver: a call of kind {kind} served on a loan took {ticks} ticks (detail {detail}), past B_K, {CONSOLE_LOAN_STEP_MAX}"
+        ));
+    }
+    let bound = TERM_B * 9 / 10;
+    if let Some((kind, ticks, detail)) = rows.iter().find(|(_, ticks, _)| *ticks > bound) {
+        return Err(format!(
+            "the console driver: a step of kind {kind} took {ticks} ticks (detail {detail}), past 0.9 of B, {bound}"
+        ));
+    }
+    let longest = rows.iter().map(|r| r.1).max().unwrap_or(0);
+    println!("console driver steps: the longest {longest} of {bound} (0.9 B)");
+    Ok(())
+}
 
 /// The heartbeats of the services (tags 1, 2, 4, 10, 11): each has a wait
 /// until init answered it, under CALL_WAIT_MAX with the other waits
@@ -10156,6 +10212,17 @@ const TTY_STEP_KINDS: [(usize, &str); 18] = [
 /// the measure of the steps follows (`tty_steps`).
 const ENDED_TTY: &str = "init: tty-probe ended: exit code 0, not restarted";
 
+/// The echo `^C` of the INTR the probe typed and the terminal's kernel log line `tty: SIGINT, no
+/// foreground process group`, in either order. The terminal writes the log line first and the echo
+/// after it; the console driver merges the two sources at a line start, and which comes out first
+/// depends on whether the driver took the log record before it served the echo's WRITE. With the
+/// driver above every other level that was always the echo; the driver at 32 after its budget is
+/// spent can be preempted in the middle of a step by the terminal and takes the record first.
+fn expect_interrupt_echo(run: &mut qemu::Run) -> Result<(), String> {
+    run.expect_seen("tty: SIGINT, no foreground process group", DIALOG_STEP)?;
+    run.expect("^C", DIALOG_STEP)
+}
+
 fn tty_probe(vz: bool) -> Result<(), String> {
     let image = if vz {
         build_boot_image("boot-tty-vz.img", &TTY_VZ_PROGRAMS, BOOT_PROFILE)?
@@ -10168,8 +10235,7 @@ fn tty_probe(vz: bool) -> Result<(), String> {
         run.expect("tty-probe: canonical read waits", BOOT_TIMEOUT)?;
         // INTR drops what was typed before it and asks for SIGINT.
         run.type_raw(b"lost\x03")?;
-        run.expect("^C", DIALOG_STEP)?;
-        run.expect("tty: SIGINT, no foreground process group", DIALOG_STEP)?;
+        expect_interrupt_echo(&mut run)?;
         run.send("ab\x7fc")?;
         // The echo: the erase of the "b" and Enter as CR LF.
         run.expect("ab\x08 \x08c\r\n", DIALOG_STEP)?;
@@ -11422,7 +11488,8 @@ fn two_gib_boot() -> Result<(), String> {
 /// answer. A line of TYPED_AHEAD bytes typed while `bench` runs, past the
 /// driver's ring of input, comes back as its first 128 bytes (spec 13.5,
 /// 13.6), and init's SERVICES_STARTED, which reaches the log after the
-/// driver's first read and only its timer shows, comes before the crash.
+/// driver's first read and only its timer shows, comes before the crash; the driver's mark `uart:
+/// serve runs under its budget` is on the console before the burst.
 /// Then `crash uart`: the driver restarts and the shell connects
 /// again (crash_uart); `ps` shows uart running at 60/60, failed and
 /// restarted once, and the shell running, never failed or restarted;
@@ -11594,6 +11661,24 @@ fn burst_line(n: u32) -> String {
     format!("logburst {n:03} {}", "x".repeat(46))
 }
 
+/// The mark of a console driver that works under its budget, from its boot (a driver that has run
+/// for the length of a dialog has printed it by the burst): `uart:` for the PL011 and the 16550, `virtio-console:`
+/// where that driver runs.
+fn require_driver_budget_mark(lines: &[String]) -> Result<(), String> {
+    const MARKS: [&str; 2] = [
+        "uart: serve runs under its budget",
+        "virtio-console: serve runs under its budget",
+    ];
+    if lines.iter().any(|l| MARKS.iter().any(|m| l.ends_with(m))) {
+        Ok(())
+    } else {
+        Err(format!(
+            "no line {:?} before the burst: the console driver runs unbudgeted",
+            MARKS[0]
+        ))
+    }
+}
+
 /// The step of the console probes that sends `logburst`: the shell writes
 /// LOG_BURST lines into the kernel log at 2.5 lines a millisecond, while the
 /// driver of the console is idle (and has its ring of 64 records to
@@ -11604,6 +11689,7 @@ fn burst_line(n: u32) -> String {
 /// output empty (`settled`), where a step that kills or restarts the driver
 /// can start.
 pub(crate) fn log_burst(run: &mut qemu::Run) -> Result<(), String> {
+    require_driver_budget_mark(run.lines())?;
     let from = run.lines().len();
     run.send("logburst")?;
     // The shell's closing line is client output and goes out at a client's
@@ -15372,6 +15458,100 @@ mod tests {
         few.pop();
         assert!(check_init_steps(&few).unwrap_err().contains("kind 4"));
         assert!(check_init_steps(&[]).is_err());
+    }
+
+    /// The echo of INTR and the kernel's line about SIGINT come in either order.
+    #[test]
+    fn the_echo_of_intr_and_the_sigint_line_are_taken_in_either_order() {
+        let script = |first: &str, second: &str| {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c").arg(format!(
+                "echo 'tty-probe: canonical read waits'; echo '{first}'; echo '{second}'; exec cat"
+            ));
+            qemu::Run::start(cmd, qemu::Input::Pipe).unwrap()
+        };
+        let line = "tty: SIGINT, no foreground process group";
+        for (first, second) in [("^C", line), (line, "^C")] {
+            let mut run = script(first, second);
+            run.expect("canonical read waits", Duration::from_secs(5))
+                .unwrap();
+            expect_interrupt_echo(&mut run).unwrap();
+            run.stop();
+        }
+    }
+
+    /// The steps of the console driver are measured and none passes 0.9 of B, the busy tick of
+    /// the log included.
+    #[test]
+    fn console_driver_steps_are_measured_and_under_nine_tenths_of_b() {
+        let steps = |tick: u64| -> Vec<String> {
+            vec![
+                "service step: 18 kind 11 8490 ticks detail 0".to_owned(),
+                format!("service step: 18 kind 64 {tick} ticks detail 112"),
+                "service step: 18 kind 65 1851 ticks detail 0".to_owned(),
+            ]
+        };
+        assert!(check_console_driver_steps(&steps(TERM_B * 9 / 10)).is_ok());
+        // The calls on a loan stay under B_K, 9,375 ticks: 8,490 was measured.
+        assert_eq!(CONSOLE_LOAN_STEP_MAX, 9_375);
+        let mut loan = steps(13_000);
+        loan[0] = "service step: 18 kind 11 9375 ticks detail 0".to_owned();
+        assert!(check_console_driver_steps(&loan).is_ok());
+        loan[0] = "service step: 18 kind 11 9376 ticks detail 0".to_owned();
+        assert!(
+            check_console_driver_steps(&loan)
+                .unwrap_err()
+                .contains("on a loan")
+        );
+        loan[0] = "service step: 18 kind 12 12000 ticks detail 0".to_owned();
+        loan.insert(0, "service step: 18 kind 11 8490 ticks detail 0".to_owned());
+        assert!(check_console_driver_steps(&loan).is_err());
+        // Other kinds are held to 0.9 B only.
+        loan[1] = "service step: 18 kind 13 12000 ticks detail 0".to_owned();
+        assert!(check_console_driver_steps(&loan).is_ok());
+        assert!(
+            check_console_driver_steps(&steps(20_410))
+                .unwrap_err()
+                .contains("detail 112")
+        );
+        // The tick of 24 records of run 44468779564 (23,092 ticks, detail 124) is over the bound;
+        // the tick of 12 records, about 13,000, is 71 % of it.
+        let mut two = steps(13_000);
+        two[1] = "service step: 18 kind 64 23092 ticks detail 124".to_owned();
+        assert!(
+            check_console_driver_steps(&two)
+                .unwrap_err()
+                .contains("23092")
+        );
+        // The table of the service stands for lines lost in the burst.
+        let mut table = steps(13_000);
+        table[1] = "service table: 18 kind 64 13000 ticks detail 112 preempts 0".to_owned();
+        assert!(check_console_driver_steps(&table).is_ok());
+        // Without a step of the calls, or of the log tick, the table was not printed.
+        assert!(check_console_driver_steps(&steps(100)[..1]).is_err());
+        assert!(check_console_driver_steps(&[]).is_err());
+        let calls_only = &steps(100)[..1];
+        assert!(
+            check_console_driver_steps(calls_only)
+                .unwrap_err()
+                .contains("log tick")
+        );
+    }
+
+    #[test]
+    fn the_console_dialog_requires_the_mark_of_the_drivers_budget() {
+        let lines = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(require_driver_budget_mark(&lines(&["uart: serve runs under its budget"])).is_ok());
+        assert!(
+            require_driver_budget_mark(&lines(&["virtio-console: serve runs under its budget"]))
+                .is_ok()
+        );
+        assert!(
+            require_driver_budget_mark(&lines(&["uart: serve has no budget", "tty: ready"]))
+                .unwrap_err()
+                .contains("unbudgeted")
+        );
+        assert!(require_driver_budget_mark(&[]).is_err());
     }
 
     #[test]

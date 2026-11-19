@@ -11,15 +11,37 @@
 //! for the share `s = 1000 R / W` per mille. What the budgets of the services explain is
 //!
 //! ```text
-//! L <= S + E + 20 + I (+ D)
+//! L <= S + E + 20 + I (+ D + E_d)
 //! S = n C + min(C, l - n T) + B   n = l / T rounded down, B one overrun at the edge
 //! E = 2 e (k + 1)                 k the overruns of the budget in the window
 //! I                               the allowance of init for the service
-//! D                               the time of the console driver, for the terminal phase
+//! D = n_d C_d + min(C_d, l - n_d T_d) + B   the console driver's budget, for the terminal phase
+//!                                 (`service_us` with the driver's C and T: 150 us of each 10 ms)
+//! E_d = 2 e (k_d + 1)             the events of the driver's budget, k_d its overruns in the window
 //! ```
 //!
 //! `S` is the bound of the kernel (the module comment of `kcore/src/budget.rs`) for a thread
-//! that runs at its own level for `C` of each `T`.
+//! that runs at its own level for `C` of each `T`. The bound is taken over the whole window `l`:
+//! a service may take its pieces while the victim sleeps, and a bound over `l` is an upper
+//! bound.
+//!
+//! What the probe measures of the budgets is taken over the awake spans of the victim, the time
+//! the loss `L = W - R` is counted over. For each cycle `c` of the window the victim reads the
+//! counters just before its awake span (`SAMPLE_START[c]`) and just after it (`SAMPLE_END[c]`),
+//! and for `X` in the `ran` and the `overruns` of the service and of the driver
+//!
+//! ```text
+//! X_W = sum over c of (X(SAMPLE_END[c]) - X(SAMPLE_START[c]))      (`awake_sum`)
+//! left = L - serve_ran_W - drv_ran_W - 2 e (k_W + 1) - 20          k_W = serve overruns_W
+//! -e (k_W + 1) <= left                                              (`left_floor_us`)
+//! ```
+//!
+//! The same counters over the length of the window, `serve_ran_l` and `drv_ran_l`, take in the
+//! sleeps of the victim, where a service or the driver may run with the victim losing nothing,
+//! and are printed beside the awake sums for information. A timer event of the budget of the
+//! service that comes while the service or the driver runs is in their `ran` and in `E` both,
+//! which is why `left` may fall to `-e (k_W + 1)`; what is left above zero is the work of init
+//! and the heartbeats (`I`).
 
 // The probe prints the terms and the gate reads them: each uses only part of this file.
 #![allow(dead_code)]
@@ -53,9 +75,17 @@ pub const fn events_us(e: u64, k: u64) -> u64 {
 /// microseconds).
 pub const ENTRIES_US: u64 = 20;
 
-/// The bound of the loss of the window: `S + E + 20 + I + D`.
-pub const fn bound_us(service: u64, events: u64, init: u64, driver: u64) -> u64 {
-    service + events + ENTRIES_US + init + driver
+/// The bound of the loss of the window: `S + E + 20 + I + D + E_d`, where `E_d` is the timer
+/// events of the driver's own budget (`events_us` over its overruns in the window; 0 where the
+/// driver takes no part).
+pub const fn bound_us(
+    service: u64,
+    events: u64,
+    init: u64,
+    driver: u64,
+    driver_events: u64,
+) -> u64 {
+    service + events + ENTRIES_US + init + driver + driver_events
 }
 
 /// The share, per mille, the victim keeps at least when it loses no more than `bound` in a
@@ -78,6 +108,22 @@ pub const fn left_us(loss: u64, serve_ran: u64, driver_ran: u64, e: u64, overrun
         - driver_ran as i64
         - events_us(e, overruns) as i64
         - ENTRIES_US as i64
+}
+
+/// The sum over the cycles of a window of what a counter grew by between the two samples of the
+/// cycle (just before its awake span and just after it): `pairs` are `(start, end)` of each
+/// cycle. The sleeps of the victim between the cycles are not in it.
+pub fn awake_sum(pairs: impl IntoIterator<Item = (u64, u64)>) -> u64 {
+    pairs
+        .into_iter()
+        .map(|(start, end)| end.saturating_sub(start))
+        .sum()
+}
+
+/// The lowest `left` the account allows, `-e (k_W + 1)`: the timer events that come during the
+/// spans of the service or of the driver are in their `ran` and in `E`.
+pub const fn left_floor_us(e: u64, overruns: u64) -> i64 {
+    -((e * (overruns + 1)) as i64)
 }
 
 /// The terms of the control phase's worst window, where the victim runs against a spinner under
@@ -136,18 +182,18 @@ mod tests {
     #[test]
     fn the_bound_of_the_run_holds_for_ramfs_and_pipe_and_shows_the_driver_of_tty() {
         // From the note: ramfs 1029 <= 750 + 150 + 180 + 20 + 70 = 1170, pipe 412 <= 645.
-        let ramfs = bound_us(service_us(250, T, B, 10_830), events_us(E, 2), INIT, 0);
+        let ramfs = bound_us(service_us(250, T, B, 10_830), events_us(E, 2), INIT, 0, 0);
         assert_eq!(ramfs, 1170);
         assert!(over_bound(1029, ramfs) < 0);
-        let pipe = bound_us(service_us(75, T, B, 10_210), events_us(E, 2), INIT, 0);
+        let pipe = bound_us(service_us(75, T, B, 10_210), events_us(E, 2), INIT, 0, 0);
         assert_eq!(pipe, 645);
         assert!(over_bound(412, pipe) < 0);
         // tty without the driver's term is over by 22, which is what is left for the driver.
-        let tty = bound_us(service_us(75, T, B, 10_470), events_us(E, 2), INIT, 0);
+        let tty = bound_us(service_us(75, T, B, 10_470), events_us(E, 2), INIT, 0, 0);
         assert_eq!(tty, 645);
         assert_eq!(over_bound(667, tty), 22);
         // With a driver term of 22 or more it holds.
-        assert!(over_bound(667, bound_us(375, 180, INIT, 22)) <= 0);
+        assert!(over_bound(667, bound_us(375, 180, INIT, 22, 0)) <= 0);
     }
 
     #[test]
@@ -171,6 +217,193 @@ mod tests {
         assert_eq!(left_us(667, 225, 150, E, 3), 32);
         // More taken off than lost is negative.
         assert_eq!(left_us(100, 225, 0, E, 0), -205);
+    }
+
+    #[test]
+    fn the_awake_spans_leave_out_the_sleeps() {
+        // Three cycles of a victim: the counter grows 10 in each awake span and 40 in each sleep
+        // between them; the difference over the window takes in the two sleeps.
+        let pairs = [(100, 110), (150, 160), (200, 210)];
+        assert_eq!(awake_sum(pairs), 30);
+        assert_eq!(210 - 100, 110);
+        // A counter read that went backwards (a reset) counts nothing.
+        assert_eq!(awake_sum([(5, 3), (3, 9)]), 6);
+        assert_eq!(awake_sum([]), 0);
+    }
+
+    #[test]
+    fn the_terminal_window_of_run_44389680495_before_and_after_the_awake_sums() {
+        // From the issue: loss 630, serve ran 205, driver ran 538, events 480 (e 40 with 5 overruns
+        // gives it), over the whole window l: left -613 by the old formula.
+        let e = 40;
+        assert_eq!(events_us(e, 5), 480);
+        assert_eq!(left_us(630, 205, 538, e, 5), -613);
+        // The awake sums of the same window are an assumption for the example: the driver ran
+        // 120 us of its 538 while the victim was awake, the service 150 of 205, in 3 overruns.
+        // The remainder is then inside the allowance of the note, and above its floor.
+        let (serve_w, drv_w, k_w) = (150, 120, 3);
+        assert_eq!(
+            left_us(630, serve_w, drv_w, e, k_w),
+            630 - 150 - 120 - 320 - 20
+        );
+        assert_eq!(left_us(630, serve_w, drv_w, e, k_w), 20);
+        assert_eq!(left_floor_us(e, k_w), -160);
+        assert!(left_us(630, serve_w, drv_w, e, k_w) >= left_floor_us(e, k_w));
+        // The old remainder was below the floor of the awake account, which is the double count.
+        assert!(left_us(630, 205, 538, e, 5) < left_floor_us(e, 5));
+        assert_eq!(left_floor_us(e, 5), -240);
+        // The bound is taken over l. The driver's term is the bound of its own budget (150 us of
+        // each 10 ms) and no longer the time it ran: 450 us for this window, under the 538 it
+        // ran in all (its sleeps in the window included).
+        let driver = service_us(150, 10_000, B, 11_008);
+        assert_eq!(driver, 450);
+        let bound = bound_us(
+            service_us(75, T, B, 11_008),
+            events_us(e, 5),
+            INIT,
+            driver,
+            0,
+        );
+        assert_eq!(bound, 375 + 480 + 20 + 70 + 450);
+        assert_eq!(bound, 1_395);
+        // The loss of 630 us over the 8005 us the victim ran is inside it, with the share the
+        // bound promises under what the victim kept (927 per mille).
+        assert!(over_bound(630, bound) < 0);
+        assert_eq!(share_bound_permille(8005, bound), 851);
+        assert!(927 >= share_bound_permille(8005, bound));
+    }
+
+    #[test]
+    fn the_events_of_the_drivers_budget_are_in_the_bound_of_the_terminal() {
+        // The stub of the driver spends about 5 % against its 1.5 %, so its budget runs out in
+        // every period: over the window of 11,008 us it is 2 periods and an edge, say 3 overruns,
+        // each chunk with its two timer events (e 40): 2 * 40 * 4 = 320 us more of bound.
+        let e = 40;
+        assert_eq!(events_us(e, 3), 320);
+        let base = bound_us(service_us(75, T, B, 11_008), events_us(e, 5), INIT, 450, 0);
+        let with = bound_us(
+            service_us(75, T, B, 11_008),
+            events_us(e, 5),
+            INIT,
+            450,
+            events_us(e, 3),
+        );
+        assert_eq!(with - base, 320);
+        // A loss between the two bounds is inside only the second: 1,500 us against 1,395 and 1,715.
+        assert_eq!((base, with), (1_395, 1_715));
+        assert!(over_bound(1_500, base) > 0 && over_bound(1_500, with) < 0);
+        // No overruns still count one chunk: 2 e.
+        assert_eq!(events_us(e, 0), 80);
+    }
+
+    /// The terminal window of run abf7dedc is pinned with the driver's budget of 150 us of each
+    /// 10 ms (D = 450 us for its l of 11,098 us, bound 1,395 us, share 851; with the budget of
+    /// 75 us of each 5 ms it was 375 us, 1,320 us and 858).
+    /// The bound of each phase for the worst windows of two probe runs, pinned: run bd07a002
+    /// (the probe of the awake spans, before the driver's budget) and run abf7dedc (the same
+    /// formula, after it). Each row: R, l, the overruns of the service's budget over l, the
+    /// overruns of the driver's over l, the driver's term, the printed bound and its share, the
+    /// loss. The formula is the same in both runs; what differs is the overruns each window
+    /// happened to count, which E takes from the window itself.
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn the_bound_of_each_phase_is_pinned_for_two_runs() {
+        const E: u64 = 30;
+        // `k_d` is None before the driver's events were counted (run bd07a002).
+        let bound = |c: u64, l: u64, k: u64, driver: u64, k_d: Option<u64>| {
+            let events_d = k_d.map_or(0, |k_d| events_us(E, k_d));
+            bound_us(
+                service_us(c, T, B, l),
+                events_us(E, k),
+                INIT,
+                driver,
+                events_d,
+            )
+        };
+        // (name, c, R, l, k_l, driver term, k_d, bound, share, loss)
+        let rows: [(&str, u64, u64, u64, u64, u64, Option<u64>, u64, u64, u64); 6] = [
+            (
+                "bd07a002 ramfs",
+                250,
+                8017,
+                11_501,
+                6,
+                0,
+                None,
+                1_410,
+                850,
+                1_192,
+            ),
+            (
+                "bd07a002 pipe",
+                75,
+                8005,
+                10_818,
+                8,
+                0,
+                None,
+                1_005,
+                888,
+                538,
+            ),
+            (
+                "bd07a002 tty",
+                75,
+                8006,
+                11_180,
+                7,
+                531,
+                None,
+                1_476,
+                844,
+                528,
+            ),
+            (
+                "abf7dedc ramfs",
+                250,
+                8004,
+                11_470,
+                8,
+                0,
+                None,
+                1_530,
+                839,
+                1_153,
+            ),
+            ("abf7dedc pipe", 75, 8005, 11_054, 1, 0, None, 585, 931, 650),
+            (
+                "abf7dedc tty",
+                75,
+                8005,
+                11_098,
+                5,
+                450,
+                Some(1),
+                1_395,
+                851,
+                799,
+            ),
+        ];
+        for (name, c, r, l, k, driver, k_d, want, share, loss) in rows {
+            let got = bound(c, l, k, driver, k_d);
+            assert_eq!(got, want, "{name}");
+            assert_eq!(share_bound_permille(r, got), share, "{name}");
+            let _ = loss;
+        }
+        // The arithmetic only: every window of the first run is inside its bound, and so is every
+        // one of the second but the pipe's, which counted one overrun (E 120 us), kept 924 per
+        // mille where the bound promises 931 and lost 650 us, 65 over 585. The bound counts the
+        // budget of the phase's own service; the other budgets and init run above the victim too
+        // (stafeto/stafeto#493), so the gate prints that window and does not fail on it.
+        for (name, _, _, _, _, _, _, want, _, loss) in rows {
+            let over = over_bound(loss, want);
+            assert_eq!(over > 0, name == "abf7dedc pipe", "{name}: {over}");
+        }
+        assert_eq!(over_bound(650, 585), 65);
+        // Counting at least the chunks of the n + 1 periods the window touches (n = 2: 6
+        // events) takes 60 us more and leaves the pipe's window 5 us over.
+        let floor = bound_us(service_us(75, T, B, 11_054), events_us(E, 2), INIT, 0, 0);
+        assert_eq!((floor, over_bound(650, floor)), (645, 5));
     }
 
     #[test]

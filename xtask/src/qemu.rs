@@ -1085,6 +1085,11 @@ impl Run {
         {
             panic!("a layer of the image was not attached: {line}");
         }
+        // Every run of every image: a service whose budget the kernel refused serves with none
+        // (the console driver at its free level), and nothing else would notice.
+        if let Some(refused) = refused_budget(&lines) {
+            panic!("{refused}");
+        }
         Outcome {
             lines,
             status,
@@ -1093,6 +1098,21 @@ impl Run {
             tagged: self.untag.pieces(),
         }
     }
+}
+
+/// The first line of a run in which a program says its budget was refused (`<program>: the budget
+/// of <name> is refused: ...`, `rt::budget::bind`), as a message that names the program and the
+/// budget. The text may be cut by another program's line at the console, so the word `refused`
+/// is taken as far as `ref`.
+fn refused_budget(lines: &[String]) -> Option<String> {
+    lines.iter().find_map(|line| {
+        let (head, rest) = line.split_once(": the budget of ")?;
+        let (name, _) = rest.split_once(" is ref")?;
+        let program = head.rsplit(' ').next().unwrap_or(head);
+        Some(format!(
+            "the budget `{name}` of the program `{program}` was refused by the kernel, and the program serves with none: {line}"
+        ))
+    })
 }
 
 /// Runs `cmd` with /dev/null on its stdin (Input::Null), echoing and
@@ -2457,6 +2477,52 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         )
         .unwrap();
         run.expect("attached\n", Duration::from_secs(5)).unwrap();
+        run.stop();
+    }
+
+    /// Every run of every image: a program that says its budget was refused fails the run when it
+    /// ends, whatever the probe asks, with the program and the budget named.
+    #[test]
+    fn a_refused_budget_fails_every_run_and_names_the_program() {
+        let lines = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            refused_budget(&lines(&["uart: serve runs under its budget"])),
+            None
+        );
+        assert_eq!(refused_budget(&[]), None);
+        let m = refused_budget(&lines(&[
+            "init: services started",
+            "uart: the budget of serve is refused: InvalidArgs",
+        ]))
+        .unwrap();
+        assert!(m.contains("`serve`") && m.contains("`uart`"), "{m}");
+        // A line another program cut at the console still counts.
+        assert!(
+            refused_budget(&lines(&[
+                "uart: the budget of serve is refinit: uart ended"
+            ]))
+            .is_some()
+        );
+        let mut run = Run::start(
+            sh("echo 'virtio-console: the budget of serve is refused: InvalidArgs'; exec cat"),
+            Input::Pipe,
+        )
+        .unwrap();
+        run.expect("refused", Duration::from_secs(5)).unwrap();
+        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.stop()));
+        let err = ended.unwrap_err();
+        let text = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap();
+        assert!(
+            text.contains("`virtio-console`") && text.contains("`serve`"),
+            "{text}"
+        );
+        // A run without the line stops quietly.
+        let mut run = Run::start(sh("echo ready; exec cat"), Input::Pipe).unwrap();
+        run.expect("ready\n", Duration::from_secs(5)).unwrap();
         run.stop();
     }
 
