@@ -308,4 +308,23 @@ mod tests {
         assert!(!b.has_pending());
         assert_eq!(b.free() & 1, 1);
     }
+
+    /// Two buffers through the probe's whole sequence: the buffer on the
+    /// screen stays out of the free ones until a later post replaces it, so
+    /// the mask is never "both" after the first post.
+    #[test]
+    fn the_buffer_on_the_screen_stays_out_of_the_free_mask() {
+        let mut b = Buffers::new(2);
+        b.take(0).unwrap();
+        assert_eq!(b.free(), 0b10);
+        b.take(1).unwrap();
+        b.bits(0b01); // the frame of buffer 1 ended: buffer 0 is free
+        assert_eq!(b.free(), 0b01);
+        b.take(0).unwrap();
+        b.bits(0b10); // the frame of buffer 0 ended: buffer 1 is free
+        assert_eq!(b.free(), 0b10);
+        // Signals and forks change nothing of the account: the same mask.
+        assert_eq!(b.take_pending(), 0b11);
+        assert_eq!(b.free(), 0b10);
+    }
 }

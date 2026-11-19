@@ -321,6 +321,11 @@ static int run_role(void) {
         struct sigaction act;
         int status = 0, ended = 0;
         pid_t pid;
+        /* The buffer on the screen (the merged post's) is the service's until
+         * a later post replaces it: only the other one is free, and no fork or
+         * signal changes that. */
+        const uint32_t before = stafeto_window_free_buffers(0);
+        CHECK(before == STAFETO_WINDOW_BUFFER(1));
         memset(&act, 0, sizeof act);
         act.sa_handler = on_usr1;
         /* SA_RESTART: a wait ends with EINTR whatever it says. */
@@ -352,7 +357,7 @@ static int run_role(void) {
             return 21;
         }
         CHECK(ended && usr1 == 1);
-        CHECK(stafeto_window_free_buffers(0) == 3);
+        CHECK(stafeto_window_free_buffers(0) == before);
     }
     printf("posix-window: a forked child has no window, and a signal ends a wait with EINTR\n");
 
