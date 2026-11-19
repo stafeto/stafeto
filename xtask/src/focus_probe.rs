@@ -729,8 +729,9 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         text(&driver)
     );
     println!(
-        "focus-probe on {}: the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}",
+        "focus-probe on {}: {}; the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}",
         machine.name,
+        comp_probe::full_frame_text(),
         compositor::BAND_TICKS,
         comp_probe::raster_text(&comp_probe::raster_costs(
             &output.lines,
