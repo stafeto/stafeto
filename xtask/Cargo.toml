@@ -15,6 +15,7 @@ break-stamps-merge = []
 break-stamps-split = []
 
 [dependencies]
+frame-load = { path = "../tests/frame-load" }
 abi = { path = "../lib/abi" }
 console-line = { path = "../lib/console-line" }
 datafs = { path = "../lib/datafs" }

@@ -1972,6 +1972,7 @@ dependencies = [
  "entries",
  "fatfs",
  "firmware-tree",
+ "frame-load",
  "fscommon",
  "init",
  "kcore",

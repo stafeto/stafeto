@@ -50,6 +50,8 @@ const MAP_STEP: usize = 0x100_0000;
 /// The retry period for a service that is being set up, and the longest wait.
 const RETRY_NS: u64 = 5_000_000;
 const WAIT_NS: u64 = 60_000_000_000;
+/// How long after the last phase the conductor says `done`.
+const DONE_AFTER_NS: u64 = 2_000_000_000;
 /// The bytes of a buffer (the whole screen: both scenes use the same objects).
 const BUFFER_BYTES: u64 = (STRIDE * HEIGHT) as u64;
 
@@ -198,6 +200,9 @@ impl Env<'_> {
                 after.bypassed.wrapping_sub(before.bypassed)
             );
         }
+        // The other loads print their last lines as their phases end; the
+        // conductor says it is done a moment after them.
+        self.sleep_until(self.schedule.finish() + DONE_AFTER_NS);
         rt::println!("frame-load: done");
         Ok(())
     }

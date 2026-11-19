@@ -104,7 +104,7 @@ pub const COMP_INPUT_MARK: u64 = 1 << 59;
 /// in for it.
 pub const COMP_MANAGERS: &[&str] = &["wm", "focus-wm"];
 /// The programs that inject events as a device would: the probes only.
-pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject", "lvgl-inject"];
+pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject", "lvgl-inject", "frame-load"];
 
 /// The mark of the compositor's session that `client` gets by asking for
 /// `service`: the manager's, the input's, or none.
@@ -1515,6 +1515,7 @@ pub mod cycle;
 pub mod doom;
 pub mod entropy;
 pub mod focus;
+pub mod frame;
 pub mod fstack;
 pub mod gpu;
 pub mod input;
@@ -1544,6 +1545,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-busybox-dialog") as usize
     + cfg!(feature = "table-doom") as usize
     + cfg!(feature = "table-lvgl") as usize
+    + cfg!(feature = "table-frame") as usize
     + cfg!(feature = "table-base") as usize
     + cfg!(feature = "table-posix-dialog") as usize
     + cfg!(feature = "table-posix-dialog-vz") as usize
@@ -1646,6 +1648,7 @@ const _: () = assert!(
     feature = "table-busybox-dialog",
     feature = "table-doom",
     feature = "table-lvgl",
+    feature = "table-frame",
     feature = "table-base",
     feature = "table-posix-dialog",
     feature = "table-posix-dialog-vz",
@@ -1773,6 +1776,8 @@ pub const TABLE: &[Record] = ramfs::BUSYBOX_DIALOG_TABLE;
 pub const TABLE: &[Record] = doom::TABLE;
 #[cfg(feature = "table-lvgl")]
 pub const TABLE: &[Record] = lvgl::TABLE;
+#[cfg(feature = "table-frame")]
+pub const TABLE: &[Record] = frame::TABLE;
 #[cfg(feature = "table-base")]
 pub const TABLE: &[Record] = base::BASE_TABLE;
 #[cfg(feature = "table-posix-dialog")]
@@ -4033,6 +4038,16 @@ mod tests {
             Some(COMP_INPUT_MARK)
         );
         assert_eq!(comp_mark(lvgl("lvgl-inject"), b"clock"), None);
+        // The image of the frame-time measurements: the conductor alone has the
+        // input session; the paced client and the client of the first revision
+        // have ordinary ones.
+        let frame = |name: &str| frame::TABLE.iter().find(|r| r.name == name).unwrap();
+        assert_eq!(
+            comp_mark(frame("frame-load"), b"gpu"),
+            Some(COMP_INPUT_MARK)
+        );
+        assert_eq!(comp_mark(frame("frame-draw"), b"gpu"), None);
+        assert_eq!(comp_mark(frame("frame-legacy"), b"gpu"), None);
         assert_eq!(comp_mark(lvgl("gpu"), b"gpu"), None);
         assert_eq!(comp_mark(wm("wm-new"), b"gpu"), None);
         assert_eq!(comp_mark(wm("wm-old"), b"gpu"), None);

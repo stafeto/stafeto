@@ -106,6 +106,8 @@ table-busybox-dialog = []
 table-doom = []
 # The image of the LVGL demo's probe (xtask lvgl-probe).
 table-lvgl = []
+# The image for the measurements of the frame time (xtask frame-loads).
+table-frame = []
 table-base = []
 # The store of the package service in memory: the base table's disk service is the memory disk
 # (xtask pkg-probe memory).
