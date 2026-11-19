@@ -415,7 +415,8 @@ fn probe_run(
     }
     net_probe::placing_fault(&output.lines)?;
     if steps {
-        let pipe = net_probe::longest_over_starts_of(&output.lines, PIPE_TAG)?;
+        let pipe = net_probe::longest_over_starts_of(&output.lines, PIPE_TAG);
+        crate::step_line::within_b(&output.lines, PIPE_TAG, crate::step_line::Kinds::All)?;
         if let Some(row) = pipe.iter().find(|r| r.1 > net_probe::STEP_MAX) {
             return Err(format!(
                 "the pipe service: a step past 0.9 of term B ({}): {row:?}",
@@ -540,7 +541,8 @@ fn reap_counters(lines: &[String]) -> Result<Reap, String> {
 /// The longest step of each kind in the lines of a run under -icount, judged
 /// against the bound; CLONE and CLONE_MORE against the portion bound.
 fn steps_verdict(lines: &[String], whole: bool) -> Result<Vec<(usize, u64, u64)>, String> {
-    let rows = net_probe::longest_over_starts(lines)?;
+    let rows = net_probe::longest_over_starts(lines);
+    crate::step_line::within_b(lines, net_probe::NET_TAG, crate::step_line::Kinds::All)?;
     // The run of one check (POSIX_NET_ONLY) has no fork in it.
     if whole && !rows.iter().any(|r| r.0 == 19) {
         return Err(format!("no step of CLONE: {rows:?}"));

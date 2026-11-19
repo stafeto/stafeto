@@ -706,7 +706,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
         ));
     }
     if options.steps {
-        let rows = net_probe::longest_over_starts(&output.lines)?;
+        let rows = net_probe::longest_over_starts(&output.lines);
         if rows.is_empty() {
             return Err("the service printed no line of steps".into());
         }
@@ -734,7 +734,8 @@ pub fn command(args: &[String]) -> Result<(), String> {
                 rest.push(line.clone());
             }
         }
-        if let Some(row) = net_probe::longest_over_starts(&rest)?
+        crate::step_line::within_b(&rest, net_probe::NET_TAG, crate::step_line::Kinds::All)?;
+        if let Some(row) = net_probe::longest_over_starts(&rest)
             .iter()
             .find(|r| r.1 > net_probe::STEP_MAX)
         {

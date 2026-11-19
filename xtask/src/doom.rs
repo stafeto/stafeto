@@ -836,7 +836,8 @@ fn steps(machine: &'static qemu::Machine) -> Result<(), String> {
         ("input", INPUT_TAG),
         ("compositor", comp_probe::COMP_TAG),
     ] {
-        let rows = longest_steps(&output.lines, tag)?;
+        let rows = longest_steps(&output.lines, tag);
+        crate::step_line::within_b(&output.lines, tag, crate::step_line::Kinds::All)?;
         if rows.is_empty() {
             return Err(format!("doom steps: no step of the {name} service"));
         }

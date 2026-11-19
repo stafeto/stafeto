@@ -693,8 +693,13 @@ mod steps {
     static PREEMPTS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static WAITS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     /// The longest raw step of each pair (kind, preemptions): 152 bytes a kind, 10 184 for the
-    /// 67 kinds, in `.bss` of the images with this feature only.
+    /// 67 kinds, and 536 more for `KIND_LONGEST`, in `.bss` of the images with this feature only. The table at the end of a run
+    /// tells them (`print_table_line`).
     static LONGEST: super::pairs::Pairs<KINDS> = super::pairs::Pairs::new();
+    /// The longest raw step of each kind, whose growth prints the line of a new longest during
+    /// the run, as it always did: the console is slow and a probe that reads it is sensitive to
+    /// its volume.
+    static KIND_LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     /// The first count of steps from which the table of the longest steps goes out again at each
     /// power of two of the steps done (`table_steps`; 0 while it is off), and the steps done.
     static TABLE_FROM: AtomicU64 = AtomicU64::new(0);
@@ -906,12 +911,15 @@ mod steps {
             // the step: the accounting is lost, and `xtask` fails the run.
             crate::println!("service wait cut: {tag} kind {kind} {counted} ticks of {whole}");
         }
-        // A line prints when the raw time grows in the pair (kind, preemptions) of the step
-        // (`pairs`): the greatest raw time of a pair is also its greatest time less the charge of
-        // its preemptions at any charge, so a reader of the lines has the exact longest of a kind
-        // without the service knowing the charge. The bookkeeping runs here, after the sample is
-        // taken and the interval of the step is closed, so that no step of the loop pays for it.
-        if LONGEST.record(kind, took, detail, n_preempt) && printing {
+        // A line prints when the raw time of the kind grows, as it always did, and carries the
+        // preemptions of that step. The pairs (kind, preemptions) are kept apart from it
+        // (`pairs`) and go out in the table: the greatest raw time of a pair is also its greatest
+        // time less the charge of its preemptions at any charge, so a reader of the table has the
+        // exact longest of a kind without the service knowing the charge. The bookkeeping runs
+        // here, after the sample is taken and the interval of the step is closed, so that no step
+        // of the loop pays for it.
+        LONGEST.record(kind, took, detail, n_preempt);
+        if took > KIND_LONGEST[kind].fetch_max(took, Ordering::Relaxed) && printing {
             // The count is left out when it is 0 (most steps): a reader takes a missing count as
             // 0, and the console, which is slow, has less to write.
             if n_preempt == 0 {
@@ -986,7 +994,8 @@ pub fn step_after(f: fn()) {
 }
 
 /// Makes the loop of this service tell the table of its longest steps again, one line of
-/// `service table: T kind K N ticks detail D preempts P` for each kind, from each power of two of
+/// `service table: T kind K N ticks detail D preempts P` for each pair of kind and preemptions that
+/// no other pair beats (`pairs`), from each power of two of
 /// the steps it did from 128 on, one line after each of the steps that follow (feature
 /// `step-stats`; nothing without it). The line of a new longest of `report_steps` goes out once,
 /// in the burst at the start of a run, where the bounded kernel log loses records; the table

@@ -360,7 +360,8 @@ pub(crate) fn rows_of(
     name: &str,
     kinds: &[(usize, &str)],
 ) -> Result<Vec<(usize, u64, u64)>, String> {
-    let rows = longest_steps(lines, tag)?;
+    let rows = longest_steps(lines, tag);
+    crate::step_line::within_b(lines, tag, crate::step_line::Kinds::All)?;
     for (kind, what) in kinds {
         if !rows.iter().any(|(k, ..)| k == kind) {
             return Err(format!("the {name}: no step {what}: {rows:?}"));

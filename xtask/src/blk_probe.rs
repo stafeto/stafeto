@@ -215,7 +215,8 @@ fn verdict(lines: &[String], starts: usize, wanted: &[&str]) -> Result<(), Strin
 /// The steps of the service in the lines of run 1: every kind came, and
 /// every row, the heartbeat's too, stays under STEP_MAX.
 pub fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
-    let rows = longest_steps(lines, BLK_TAG)?;
+    let rows = longest_steps(lines, BLK_TAG);
+    crate::step_line::within_b(lines, BLK_TAG, crate::step_line::Kinds::All)?;
     for (kind, name) in BLK_STEP_KINDS {
         if !rows.iter().any(|(k, ..)| *k == kind) {
             return Err(format!("the disk service: no step {name}: {rows:?}"));

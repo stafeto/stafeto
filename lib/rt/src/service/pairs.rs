@@ -5,10 +5,13 @@
 //! each its own pair, and one pair for P of 8 and more (feature `step-stats`).
 //!
 //! Within one pair the greatest raw time is also the greatest time less the charge of the
-//! preemptions, at any charge, so a reader that gets the line of each pair that grew knows the
-//! exact greatest `N - P * c` of a kind without the service knowing c. The line of a kind alone,
-//! which grows with the raw time only, hid a step that was shorter raw and longer once the charge
-//! of its preemptions was taken off.
+//! preemptions, at any charge, so a reader that has the pairs knows the exact greatest
+//! `N - P * c` of a kind without the service knowing c. The line of a kind alone, which grows
+//! with the raw time only, hid a step that was shorter raw and longer once the charge of its
+//! preemptions was taken off. The pairs go out in the table at the end of a run
+//! (`service table:`), and only those no other pair beats (`next`): the console is slow, and a
+//! pair that has a pair of fewer preemptions and at least as much raw time can never be the
+//! greatest at any charge.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -47,8 +50,7 @@ impl<const KINDS: usize> Pairs<KINDS> {
         }
     }
 
-    /// Takes a step: true when its raw time is the greatest of its pair so far, which is when its
-    /// line is told.
+    /// Takes a step: true when its raw time is the greatest of its pair so far.
     pub fn record(&self, kind: usize, ticks: u64, detail: u64, preempts: u64) -> bool {
         let pair = pair_of(preempts);
         if ticks <= self.longest[kind][pair].fetch_max(ticks, Ordering::Relaxed) {
@@ -79,12 +81,20 @@ impl<const KINDS: usize> Pairs<KINDS> {
         })
     }
 
-    /// The next non-empty pair at or after the place `from` of the walk over all pairs (kind by
-    /// kind, P up by P), with the place after it.
+    /// Whether a pair of fewer preemptions has at least this pair's raw time: then
+    /// `N - P * c` of this pair is never the greatest of its kind, at any charge c.
+    fn dominated(&self, kind: usize, pair: usize, ticks: u64) -> bool {
+        (0..pair).any(|q| self.longest[kind][q].load(Ordering::Relaxed) >= ticks)
+    }
+
+    /// The next non-empty pair that no other pair beats, at or after the place `from` of the walk
+    /// over all pairs (kind by kind, P up by P), with the place after it.
     pub fn next(&self, from: usize) -> Option<(usize, Longest, usize)> {
         (from..KINDS * PAIRS).find_map(|at| {
-            self.get(at / PAIRS, at % PAIRS)
-                .map(|l| (at / PAIRS, l, at + 1))
+            let (kind, pair) = (at / PAIRS, at % PAIRS);
+            self.get(kind, pair)
+                .filter(|l| !self.dominated(kind, pair, l.ticks))
+                .map(|l| (kind, l, at + 1))
         })
     }
 
@@ -143,6 +153,24 @@ mod tests {
     }
 
     #[test]
+    fn the_table_of_the_three_steps_keeps_all_three_and_drops_a_beaten_pair() {
+        let pairs = Pairs::<2>::new();
+        for (ticks, p) in [(18_807, 3), (18_000, 1), (16_400, 0), (15_000, 2)] {
+            pairs.record(1, ticks, 0, p);
+        }
+        let mut at = 0;
+        let mut seen = [(0, 0); 4];
+        let mut count = 0;
+        while let Some((_, l, next)) = pairs.next(at) {
+            seen[count] = (l.ticks, l.preempts);
+            count += 1;
+            at = next;
+        }
+        // (15 000, P 2) has (16 400, P 0) above it with fewer preemptions: it is left out.
+        assert_eq!(seen[..count], [(16_400, 0), (18_000, 1), (18_807, 3)]);
+    }
+
+    #[test]
     fn a_pair_tells_again_only_when_its_own_maximum_grows() {
         let steps = [
             (100, 0),
@@ -178,12 +206,13 @@ mod tests {
     }
 
     #[test]
-    fn the_table_walks_every_non_empty_pair_in_the_order_of_kind_and_count() {
+    fn the_table_walks_the_pairs_no_other_pair_beats_in_the_order_of_kind_and_count() {
         let pairs = Pairs::<4>::new();
         pairs.record(2, 300, 0, 1);
         pairs.record(1, 200, 5, 0);
         pairs.record(2, 350, 0, 0);
         pairs.record(2, 900, 0, 20);
+        // (2, P 1, 300) has the pair of no preemption with 350: never the greatest at any charge.
         let mut at = 0;
         let mut seen = [(0, 0, 0); 8];
         let mut count = 0;
@@ -192,10 +221,7 @@ mod tests {
             count += 1;
             at = next;
         }
-        assert_eq!(
-            seen[..count],
-            [(1, 200, 0), (2, 350, 0), (2, 300, 1), (2, 900, 20)]
-        );
+        assert_eq!(seen[..count], [(1, 200, 0), (2, 350, 0), (2, 900, 20)]);
     }
 
     #[test]

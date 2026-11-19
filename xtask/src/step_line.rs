@@ -72,14 +72,46 @@ pub fn least(ticks: u64, preempts: u64) -> u64 {
     ticks.saturating_sub(preempts.min(PAIR_TOP).saturating_mul(PREEMPT_CHARGE_MIN))
 }
 
+/// The kinds a probe judges: the hard check against B applies to exactly those, with the
+/// exemptions the probe always had (a start-up step, a run on two CPUs, the kinds it does not
+/// bound).
+#[derive(Clone, Copy, Debug)]
+pub enum Kinds<'a> {
+    /// Every kind of the service.
+    All,
+    /// These kinds only.
+    Only(&'a [usize]),
+    /// Every kind but these.
+    Except(&'a [usize]),
+}
+
+impl Kinds<'_> {
+    pub fn has(&self, kind: usize) -> bool {
+        match self {
+            Kinds::All => true,
+            Kinds::Only(kinds) => kinds.contains(&kind),
+            Kinds::Except(kinds) => !kinds.contains(&kind),
+        }
+    }
+}
+
+/// The hard check against B (`crate::TERM_B`) of the steps of the service `tag` of the kinds a
+/// probe judges (`over_bound`): an error that names the step, for the probes to return.
+pub fn within_b(lines: &[String], tag: &str, kinds: Kinds) -> Result<(), String> {
+    match over_bound(lines, tag, crate::TERM_B, kinds) {
+        Some(over) => Err(over),
+        None => Ok(()),
+    }
+}
+
 /// The first step of the service `tag` in `lines` (a line of a new longest or of the table) whose
 /// least own work, `N - P * PREEMPT_CHARGE_MIN`, is above `bound` (B), told with the raw N, P and
 /// both judged figures. The bound stays hard for every step line.
-pub fn over_bound(lines: &[String], tag: &str, bound: u64) -> Option<String> {
+pub fn over_bound(lines: &[String], tag: &str, bound: u64, kinds: Kinds) -> Option<String> {
     lines
         .iter()
         .filter_map(|l| parse_any(l))
-        .filter(|s| s.tag == tag)
+        .filter(|s| s.tag == tag && kinds.has(s.kind))
         .find(|s| s.least() > bound)
         .map(|s| {
             format!(
@@ -239,19 +271,11 @@ pub fn warn_raw(lines: &[String], tag: &str, bound: u64) {
     }
 }
 
-/// `longest`, with the warnings of the raw times above `bound`, and an error for a step whose
-/// least own work is above B (`over_bound`): the one place the probes read their step lines
-/// through.
-pub fn longest_warned(
-    lines: &[String],
-    tag: &str,
-    bound: u64,
-) -> Result<Vec<(usize, u64, u64)>, String> {
+/// `longest`, with the warnings of the raw times above `bound`. The hard check against B is
+/// `within_b`, which each probe calls for the kinds it judges.
+pub fn longest_warned(lines: &[String], tag: &str, bound: u64) -> Vec<(usize, u64, u64)> {
     warn_raw(lines, tag, bound);
-    if let Some(over) = over_bound(lines, tag, crate::TERM_B) {
-        return Err(over);
-    }
-    Ok(longest(lines, tag))
+    longest(lines, tag)
 }
 
 /// The lines of a run whose lines of a new longest were all lost in the burst at the start and
@@ -354,7 +378,7 @@ mod tests {
         let rows = vec![format!(
             "service step: 14 kind 33 {n} ticks detail 0 preempts {p}"
         )];
-        let b = over_bound(&rows, "14", 20_410).is_none();
+        let b = over_bound(&rows, "14", 20_410, Kinds::All).is_none();
         let target = longest(&rows, "14")[0].1 <= 18_369;
         (b, target)
     }
@@ -374,27 +398,32 @@ mod tests {
     #[test]
     fn the_line_of_the_verdict_has_the_raw_figures_and_both_judged_ones() {
         let rows = lines(&["service step: 14 kind 33 21000 ticks detail 0 preempts 1"]);
-        let said = over_bound(&rows, "14", 20_410).unwrap();
+        let said = over_bound(&rows, "14", 20_410, Kinds::All).unwrap();
         assert!(
             said.contains("kind 33") && said.contains("raw 21000") && said.contains("preempts 1")
         );
         assert!(said.contains("= 19700 against 0.9 B 18369"), "{said}");
         assert!(said.contains("= 20513 against B 20410"), "{said}");
         // Another service's lines are not read.
-        assert!(over_bound(&rows, "4", 20_410).is_none());
-        // The gate of the probes reads through it.
-        assert!(longest_warned(&rows, "14", 20_410).is_err());
+        assert!(over_bound(&rows, "4", 20_410, Kinds::All).is_none());
+        // The probes call it for the kinds they judge: an exempt kind is not checked.
+        assert!(within_b(&rows, "14", Kinds::All).is_err());
+        assert!(within_b(&rows, "14", Kinds::Only(&[33])).is_err());
+        assert!(within_b(&rows, "14", Kinds::Only(&[1, 2])).is_ok());
+        assert!(within_b(&rows, "14", Kinds::Except(&[33])).is_ok());
+        assert!(within_b(&rows, "14", Kinds::Except(&[1])).is_err());
     }
 
     #[test]
     fn the_lines_of_the_pairs_of_a_kind_give_the_greatest_judged_one() {
-        // The services print a line for each pair (kind, preemptions) that grew: three steps now
-        // print three lines, and the judged maximum is the second, 16 700 (the raw maximum alone
-        // gave 14 907).
+        // The services tell the pairs (kind, preemptions) no other pair beats in the table at the
+        // end of a run (`service table:`), and the line of a new longest as the run goes on: the
+        // three steps give three lines of the table, and the judged maximum is the second,
+        // 16 700 (the raw maximum alone gave 14 907).
         let rows = lines(&[
             "service step: 17 kind 65 18807 ticks detail 0 preempts 3",
-            "service step: 17 kind 65 18000 ticks detail 1 preempts 1",
-            "service step: 17 kind 65 16400 ticks detail 2",
+            "service table: 17 kind 65 18000 ticks detail 1 preempts 1",
+            "service table: 17 kind 65 16400 ticks detail 2 preempts 0",
         ]);
         assert_eq!(longest(&rows, "17"), vec![(65, 16_700, 1)]);
         assert!(longest(&rows[..1], "17")[0].1 == 14_907);
