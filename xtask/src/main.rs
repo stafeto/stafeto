@@ -8148,6 +8148,8 @@ fn check_audit_rounds(lines: &[String]) -> Result<(), String> {
 /// volley of 112 completed renames and the held-job case that repeats a
 /// refused Start after releasing capacity. The lines go to the report output.
 fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
+    // A line of a service may land inside a long line of the probe (`rejoin_split_lines`).
+    let lines = rejoin_split_lines(lines);
     let shown: Vec<&String> = lines
         .iter()
         .filter(|line| line.starts_with("posix-procs: names "))
@@ -8281,14 +8283,17 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
 /// Published concurrent snapshots must preserve the part's memory reserve.
 /// The console takes a line of more than 64 bytes in several writes, and a
 /// line that another CPU writes meanwhile may land inside it: a line of the
-/// services' timing (`service wait:` and the like, lib/rt) or the audit
+/// services' timing (`service wait:`, `service table:`, `service heartbeat:` and the like,
+/// lib/rt) or the audit
 /// line of ramfs (`ramfs: audit round`). Such a line goes back where it
 /// came from, and the rest of the split line, the next line, joins its
 /// start.
 fn rejoin_split_lines(lines: &[String]) -> Vec<String> {
     // The exact starts of the intruders: a text such as "in the service ok" is no intruder.
-    const INTRUDERS: [&str; 6] = [
+    const INTRUDERS: [&str; 8] = [
         "service step: ",
+        "service table: ",
+        "service heartbeat: ",
         "service wait: ",
         "service wait cut: ",
         "service gap: ",
@@ -16891,6 +16896,37 @@ mod tests {
                 "posix-procs: steps done",
             ]
         );
+    }
+
+    /// A table line of a service inside the line of the reclamation commit of the names probe
+    /// (ci run of 19 November): the line goes back out, the probe's line is whole again, and the
+    /// check of the names lines reads it.
+    #[test]
+    fn a_table_line_inside_the_reclamation_line_goes_back_out() {
+        let whole = "posix-procs: names bounds reclaim: 32 nodes with pages, backlog 32 -> 33, pages 33 -> 32, commit 12488 ticks, 0 restarts";
+        let (head, tail) =
+            whole.split_at("posix-procs: names bounds reclaim: 32 nodes with pages, bac".len());
+        let table = "service table: 1 kind 28 9834 ticks detail 0 preempts 0";
+        let split: Vec<String> = [format!("{head}{table}"), tail.to_owned()].into();
+        assert_eq!(
+            rejoin_split_lines(&split),
+            [table.to_owned(), whole.to_owned()]
+        );
+        // The same with a line of the heartbeat.
+        let note =
+            "service heartbeat: a stale expiry, armed again (period 250000000 ns, priority 50)";
+        let split: Vec<String> = [format!("{head}{note}"), tail.to_owned()].into();
+        assert_eq!(
+            rejoin_split_lines(&split),
+            [note.to_owned(), whole.to_owned()]
+        );
+        // The names check reads the log with the line split.
+        let mut log = names_log(
+            "posix-procs: names volley: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 13, the most restarts of one rename 3, the longest rename 40000 ticks",
+        );
+        let at = log.iter().position(|l| l == whole).unwrap();
+        log.splice(at..=at, [format!("{head}{table}"), tail.to_owned()]);
+        assert!(names_lines(&log).is_ok(), "{:?}", names_lines(&log));
     }
 
     /// The audit line of ramfs inside a long line of posix-procs goes out
