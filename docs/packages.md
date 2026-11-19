@@ -101,6 +101,36 @@ them for the licence notes of the image.
   package without files and without a package that links it in is accepted. Its
   licence text is `COPYING` of the archive, and its notice directory
   `/usr/share/licenses/pixman/` carries it with the note of the source.
+- FreeType (`packages/freetype.toml`, FTL, 2.14.3) is an optional package of the
+  image kind `games` that installs no file: the package `lvgl` of the graphics
+  stage G4 links it and names it in `build_depends`, and until that package
+  exists `xtask/src/packages.rs` lists it in `SERVICE_LIBRARIES`.
+  `tools/build-freetype.py` fetches the pinned archive (a copy is kept in
+  `target/freetype-src/`), checks its SHA-256 and builds
+  `target/freetype/libfreetype.a` from eleven files of the source (the TrueType
+  driver with its byte-code interpreter, the sfnt container and the smooth
+  rasterizer) with the settings of `ports/freetype/{ftoption.h,ftmodule.h}`;
+  the headers a program includes are in `target/freetype/include` with those two
+  files in place, and `--host` builds the same files with the compiler of the
+  host into `target/freetype/host/`. The settings keep the glyph path integer
+  arithmetic on one thread (no assembler, no LCD filter, no variable fonts, no
+  properties read from the environment), so the same sources and the same font
+  file give the same pixels on every run. After the build the script stops when
+  an object leaves undefined a name outside the list of the C library's
+  functions the library calls (`mem*`, `str*`, `fopen`, `fread`, `fseek`,
+  `ftell`, `fclose`, `malloc`, `calloc`, `realloc`, `free`, `qsort`, `setjmp`,
+  `longjmp`, `strtol`, `snprintf`, and the two names of the stack protector),
+  when relibc's `libc.a` does not define one of them, when the library reaches
+  `getenv`, threads, the dynamic loader, `mmap` or a floating-point function of
+  libm, when `getenv` is in an object, when an object calls `FT_Property_Set`
+  from outside its own file, or when the text `FREETYPE_PROPERTIES` is in one.
+  `python3 -I tools/test_build_freetype.py` checks the configuration file and
+  these rules on samples. FTL asks a distribution to say in its documentation
+  that the software is based in part on the work of the FreeType Team: the
+  line is `ports/freetype/CREDIT.txt`, which the notices of a package that
+  links FreeType carry in `/usr/share/licenses/<name>/freetype/`; the notes of a
+  release that holds such a package quote it. FTL is not compatible with
+  GPL-2.0-only, so a GPL-2.0-only program (BusyBox) must not link FreeType.
 - F-Stack (`packages/f-stack.toml`, the TCP/IP stack of FreeBSD 15 in user
   space, BSD-2-Clause and BSD-3-Clause with files under BSD-4-Clause,
   RSA-MD, Beerware, MIT-CMU, ISC and MIT) is an optional package of the image kind `fstack` that installs only its
