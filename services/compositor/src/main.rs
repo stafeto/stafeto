@@ -141,6 +141,10 @@ const GENERATION: u64 = 0xFFFF;
 const BAND: u64 = 1;
 const WORK: u64 = 2;
 const INPUT: u64 = 4;
+/// The timer is to be armed for the start the bands put off by the cap wait
+/// for: a step of its own, so that the kernel call is not in the step of the
+/// band that reached the cap.
+const ARM: u64 = 8;
 /// The events one READ of an input service asks for.
 const READ_MAX: u32 = 32;
 /// The codes of a start that failed, and of the driver's end.
@@ -220,12 +224,14 @@ struct Pixels<'a>(&'a Scene);
 /// The detail of the longest step of the service's own work tells which
 /// work it is: the thousands (1 a band, to which the images it made are added,
 /// 2 the take of a frame, 3 the commit after the last band, 4 the end of a
-/// frame, 5 a step of the service's housekeeping).
+/// frame, 5 a step of the service's housekeeping, 6 the arming of the timer
+/// after a band reached the cap).
 const STEP_BAND: u64 = 1000;
 const STEP_TAKE: u64 = 2000;
 const STEP_COMMIT: u64 = 3000;
 const STEP_END: u64 = 4000;
 const STEP_WORK: u64 = 5000;
+const STEP_ARM: u64 = 6000;
 
 impl PixelSource for Pixels<'_> {
     fn pixels(&self, window: usize, buffer: u8) -> &[u8] {
@@ -1066,6 +1072,16 @@ impl Compositor {
         self.arm(wake);
     }
 
+    /// The step after a band reached the cap: the timer is armed for the start
+    /// the bands wait for (`Pacer::take_arm`).
+    fn arm_after_cap(&mut self) {
+        rt::service::step_own();
+        rt::service::step_detail(STEP_ARM);
+        if let Some(at) = self.pacer.take_arm() {
+            let _ = sys::timer_set(&self.timer, at);
+        }
+    }
+
     /// What the pacer says of the timer.
     fn arm(&mut self, wake: Wake) {
         match wake {
@@ -1200,9 +1216,10 @@ impl Compositor {
                 let _ = sys::notify(&self.notify, BAND);
             }
             // The cap of the period is reached: the next band waits for the
-            // start of the next one.
-            frame::Band::Defer(at) => {
-                let _ = sys::timer_set(&self.timer, at);
+            // start of the next one, and the timer is armed by a step of its
+            // own (ARM), so that the kernel call is not in the longest band.
+            frame::Band::Defer(_) => {
+                let _ = sys::notify(&self.notify, ARM);
             }
         }
     }
@@ -2225,6 +2242,13 @@ impl Service<1> for Compositor {
             Source::Session if n.label & !GENERATION == POINTER => self.read_device(Which::Pointer),
             // One piece of work to a step: when both bits came, the work's
             // goes again by the service's own bit.
+            Source::Unlabeled if n.bits & ARM != 0 => {
+                self.arm_after_cap();
+                let rest = n.bits & (BAND | WORK);
+                if rest != 0 {
+                    let _ = sys::notify(&self.notify, rest);
+                }
+            }
             Source::Unlabeled if n.bits & BAND != 0 => {
                 self.band();
                 if n.bits & WORK != 0 {

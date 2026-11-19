@@ -171,6 +171,11 @@ pub struct Pacer {
     armed: Option<u64>,
     /// Bands put off wait for the next start.
     deferred: bool,
+    /// The timer is owed its arming for the start the bands wait for: the band
+    /// that reached the cap only says so (`Band::Defer`), and a step of its own
+    /// of the caller arms the timer (`take_arm`), so that the kernel call is
+    /// not in the step of the band.
+    arm_owed: bool,
     /// The period the bands are counted in, and how many.
     band_period: u64,
     bands: u32,
@@ -190,6 +195,7 @@ impl Pacer {
             work: None,
             armed: None,
             deferred: false,
+            arm_owed: false,
             band_period: 0,
             bands: 0,
             capped_period: None,
@@ -286,6 +292,9 @@ impl Pacer {
         self.counters.wakeups += 1;
         if self.deferred {
             self.deferred = false;
+            // An expiry that comes before the arming step ran (a timer the
+            // kernel kept) went on with the bands: the arming is no longer owed.
+            self.arm_owed = false;
             return Fire::Continue;
         }
         let Some(p) = self.pending else {
@@ -353,7 +362,23 @@ impl Pacer {
         self.deferred = true;
         let at = self.clock.start(period + 1);
         self.armed = Some(at);
+        self.arm_owed = true;
         Band::Defer(at)
+    }
+
+    /// The step that follows a `Band::Defer`: the start the timer is to be
+    /// armed for, once. A start that has gone by when the step runs is armed as
+    /// it is (the kernel fires a deadline in the past within `timer_set`), and
+    /// the bands go on at once, in the period that began, with its own count.
+    /// None when the arming is not owed any more (done already, or the expiry
+    /// came first). No frame can be taken in between: a taking needs an expiry,
+    /// the timer is not armed until this step, and a change in between finds the
+    /// bands put off and arms nothing.
+    pub fn take_arm(&mut self) -> Option<u64> {
+        if !core::mem::take(&mut self.arm_owed) || !self.deferred {
+            return None;
+        }
+        self.armed
     }
 
     /// The frame's last step of work ended at `now`: its commit.
@@ -846,6 +871,71 @@ mod tests {
         );
         assert_eq!(p.counters.capped, 2);
         assert_eq!(p.counters.band_max_ns, 10);
+    }
+
+    /// The band that reaches the cap only says so; the arming of the timer is a
+    /// step of its own, owed once, and nothing between the two steps can take a
+    /// frame or arm the timer a second time.
+    #[test]
+    fn the_arming_after_the_cap_is_owed_once_and_nothing_slips_in_between() {
+        let mut p = pacer();
+        let c = *p.clock();
+        // A frame is taken at the start of period 2 and the cap is reached.
+        assert_eq!(p.change(c.start(2) - 500, None), Wake::At(c.start(2)));
+        assert_eq!(p.fire(c.start(2)), Fire::Take(2));
+        let cap = p.cap;
+        for n in 1..cap {
+            assert_eq!(p.band_done(c.start(2) + u64::from(n), 1, true), Band::Go);
+        }
+        let at = c.start(3);
+        assert_eq!(p.band_done(c.start(2) + 90, 1, true), Band::Defer(at));
+        // A request comes before the arming step: the bands are put off, so
+        // the timer is not armed by it, and no frame is taken.
+        assert_eq!(p.change(c.start(2) + 95, None), Wake::None);
+        assert_eq!(p.fire(c.start(2) + 96), Fire::Early);
+        assert!(p.busy());
+        // The arming step arms for the start, once.
+        assert_eq!(p.take_arm(), Some(at));
+        assert_eq!(p.take_arm(), None);
+        assert_eq!(p.fire(at), Fire::Continue);
+        assert_eq!(p.counters.wakeups, 2);
+        // The bands go on in the period that began and are counted in it.
+        assert_eq!(p.band_done(at + 5, 1, true), Band::Go);
+        assert_eq!(p.counters.capped, 1);
+    }
+
+    /// The start the bands wait for comes before the arming step ran: the
+    /// arming is for a time that has gone by (the kernel fires it within the call
+    /// of `timer_set`), the bands go on, and no frame is released early, because a
+    /// taking is made by an expiry of the pending change only after the frame in
+    /// work is shown.
+    #[test]
+    fn the_start_that_comes_before_the_arming_step_goes_on_with_the_bands() {
+        let mut p = pacer();
+        let c = *p.clock();
+        assert_eq!(p.change(c.start(2) - 500, None), Wake::At(c.start(2)));
+        assert_eq!(p.fire(c.start(2)), Fire::Take(2));
+        for _ in 1..p.cap {
+            p.band_done(c.start(2) + 1, 1, true);
+        }
+        let at = c.start(3);
+        assert_eq!(p.band_done(c.start(2) + 2, 1, true), Band::Defer(at));
+        // The arming step runs after the start has gone by.
+        assert_eq!(p.take_arm(), Some(at));
+        assert_eq!(p.fire(at + 7), Fire::Continue);
+        assert!(p.busy());
+        assert_eq!(p.counters.releases, 1);
+        // An expiry that came before the arming step did its work: the arming
+        // is not owed and a second timer is not set.
+        let mut q = pacer();
+        assert_eq!(q.change(c.start(2) - 500, None), Wake::At(c.start(2)));
+        assert_eq!(q.fire(c.start(2)), Fire::Take(2));
+        for _ in 1..q.cap {
+            q.band_done(c.start(2) + 1, 1, true);
+        }
+        assert_eq!(q.band_done(c.start(2) + 2, 1, true), Band::Defer(at));
+        assert_eq!(q.fire(at), Fire::Continue);
+        assert_eq!(q.take_arm(), None);
     }
 
     #[test]
