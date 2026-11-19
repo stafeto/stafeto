@@ -99,6 +99,20 @@ impl Caller {
         fsize_limit: u64::MAX,
     };
 
+    /// Nobody: what an unbound session runs as on the few requests it may make. No identifier of a
+    /// process, no groups, a file size limit of 0, and never the superuser.
+    pub const NOBODY: Caller = Caller {
+        ids: Ids {
+            uid: u32::MAX - 1,
+            euid: u32::MAX - 1,
+            gid: u32::MAX - 1,
+            egid: u32::MAX - 1,
+        },
+        groups: [0; GROUPS_MAX],
+        group_count: 0,
+        fsize_limit: 0,
+    };
+
     /// The identity of the checks: the effective pair, or the real pair when `real`.
     pub fn identity(&self, real: bool) -> Identity<'_> {
         Identity::of(self.ids, &self.groups[..self.group_count], real)
@@ -187,8 +201,9 @@ pub const fn refresh(stored: u64, now: u64) -> Refresh {
 }
 
 /// What a second vouching with the stored copy leads to: the new identity of the same process, or
-/// a lapse. An answer for another process (the pid differs: the record's identity session is
-/// another now, the process executed a new image or exited) or no answer unbinds the session.
+/// a lapse. No answer unbinds the session: the process executed a new image (`exec` keeps the pid, but
+/// the copy of the identity session of the old image vouches for nothing) or exited. An answer for
+/// another process (the pid differs) unbinds it too, as a guard against an answer about someone else.
 pub fn revouch(stored: &Vouched, answer: Option<Vouched>) -> Binding {
     match answer {
         Some(v) if v.pid == stored.pid => Binding::Bound(v),

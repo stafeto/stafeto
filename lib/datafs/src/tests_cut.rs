@@ -343,7 +343,12 @@ mod attributes {
                 let h = rig.open(ROOT, b"/d/old", p::READ, 0).unwrap();
                 assert_eq!(rig.read(ROOT, h, 10).unwrap(), b"data");
                 rig.put(OWNER, b"/d/next", 0o644, b"x");
-                assert_eq!(rig.stat(ROOT, b"/d/next").unwrap().uid, 1000);
+                let next = rig.stat(ROOT, b"/d/next").unwrap();
+                assert_eq!(next.uid, 1000);
+                // The number of the entry that survived the cut is not the next file's.
+                if let Ok(survivor) = rig.stat(ROOT, b"/d/new") {
+                    assert_ne!(survivor.ino, next.ino, "cut {cut}");
+                }
             }
         }
         assert!(

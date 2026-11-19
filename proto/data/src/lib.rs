@@ -98,7 +98,8 @@
 //! once the service has mounted again. The service never answers a request before that mount work
 //! is done. A directory that is open (or is the current directory of a client, which holds a
 //! description of it) is BUSY for RENAME and RMDIR, and so is a directory that contains one: RENAME
-//! of a directory that has an open directory description anywhere below it is BUSY.
+//! of a directory that has an open directory description anywhere below it is BUSY. So is a
+//! directory with an open file anywhere below it (the service keeps the path of an open file).
 //!
 //! # The stat record
 //!

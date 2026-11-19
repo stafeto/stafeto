@@ -433,7 +433,9 @@ pub struct Mounted {
     /// Entries that got a record (a volume of version 2 has none).
     pub converted: usize,
     /// The walk of the tree ended: the format mark was written. False when it was cut short by its
-    /// bound (`CONVERT_MAX`) or a depth; the next mount goes on.
+    /// bound (`CONVERT_MAX` records written); the next mount goes on. Entries deeper than
+    /// `CONVERT_DEPTH` directories are left with no record (they read as the closed default, which is
+    /// safe) and do not hold the mark back.
     pub complete: bool,
 }
 
@@ -458,6 +460,13 @@ impl Server {
         };
         self.ino_next = 0;
         self.ino_end = 0;
+        // What the server remembers of directories starts empty at every mount.
+        for c in &mut self.cache {
+            c.used = false;
+        }
+        for c in &mut self.counts {
+            c.used = false;
+        }
         match format {
             Some(f) if f > VOLUME_FORMAT => {
                 self.refused = true;
@@ -490,7 +499,6 @@ impl Server {
     /// Walks the tree and writes the record of every entry that has none. The root first.
     fn convert<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> Result<(usize, bool), Error> {
         let mut converted = 0;
-        let mut looked = 0;
         // The root has number 1 and the default `0755`.
         if let Ok(root) = entry_of(fs, b"/", Kind::Directory)
             && root.standing == Standing::Missing
@@ -540,11 +548,6 @@ impl Server {
                     continue;
                 }
                 done[depth] += 1;
-                looked += 1;
-                if looked > CONVERT_MAX {
-                    fs.closedir(dir)?;
-                    return Ok((converted, false));
-                }
                 let mut child = [0u8; MAX_PATH + 1 + crate::NAME_MAX];
                 child[..len].copy_from_slice(&path[..len]);
                 let mut n = len;
@@ -567,6 +570,13 @@ impl Server {
                 };
                 let mut wrote = false;
                 if rec.standing == Standing::Missing {
+                    // The bound counts the records written, so that a volume of more entries than
+                    // the bound still ends: each mount writes some, and the entries done are skipped
+                    // at no write.
+                    if converted >= CONVERT_MAX {
+                        fs.closedir(dir)?;
+                        return Ok((converted, false));
+                    }
                     let mut a = default_attr(entry.kind, child_path);
                     // A number from the counter; a failed reserve leaves the entry for the next mount.
                     match self.next_ino(fs) {
@@ -1175,7 +1185,9 @@ impl Server {
         if binding::needs_binding(method) && who.is_none() {
             return Err(p::code(p::NOT_BOUND));
         }
-        let caller = who.unwrap_or(Caller::SERVICE);
+        // An unbound session has no identity: the methods it may make read none, and a change that
+        // made one read it would see nobody, never the superuser.
+        let caller = who.unwrap_or(Caller::NOBODY);
         let mut path = [0u8; MAX_PATH];
         match method {
             Method::Open => {
@@ -1279,11 +1291,13 @@ impl Server {
                 if size > p::FILE_MAX {
                     return Err(p::code(p::TOO_BIG));
                 }
-                if size > caller.fsize_limit {
-                    return Err(p::code(p::FILE_SIZE_LIMIT));
-                }
                 let ni = usize::from(d.object);
                 let current = self.size_of(fs, ni)?;
+                // The limit is for a file that grows past it: a file already larger may be made
+                // smaller (the check of `inode_newsize_ok` of Linux, XSH `ftruncate()`).
+                if size > current && size > caller.fsize_limit {
+                    return Err(p::code(p::FILE_SIZE_LIMIT));
+                }
                 if size > current {
                     // Growing is blocks: the reserve and the room apply as to a write.
                     let room = self.room_bytes(fs, &caller)?;
@@ -1718,7 +1732,12 @@ impl Server {
         }
         // The blocks the write adds: the part past the end of the file, up to the room.
         let room = self.room_bytes(fs, caller)?;
-        let fits = size.saturating_sub(start).saturating_add(room);
+        // Over the end of the file the gap between the end and `pos` is zeros that take blocks too.
+        let fits = if start < size {
+            (size - start).saturating_add(room)
+        } else {
+            room.saturating_sub(start - size)
+        };
         if (allowed as u64) > fits {
             allowed = fits as usize;
             if allowed == 0 && !data.is_empty() {
@@ -2085,7 +2104,7 @@ impl Server {
         from: &[u8],
         to: &[u8],
     ) -> Res<()> {
-        if from == b"/" || to == b"/" || within(to, from) && to != from {
+        if from == b"/" || to == b"/" {
             return Err(p::code(p::INVALID));
         }
         visible(from)?;
@@ -2097,6 +2116,11 @@ impl Server {
         let from_attr = self.dir_perm(fs, from_parent)?;
         let to_attr = self.dir_perm(fs, to_parent)?;
         let (source, source_entry) = self.load(fs, from)?;
+        // A directory into its own subtree is INVALID; a file has no subtree (a path through it
+        // already failed the search with NOT_DIRECTORY).
+        if source.kind == Kind::Directory && within(to, from) && to != from {
+            return Err(p::code(p::INVALID));
+        }
         let replaced = fs.stat(to);
         let target_entry = match replaced {
             Ok(target) if target.kind != source.kind => {
@@ -2416,6 +2440,10 @@ impl Server {
                     return Err(p::code(p::INVALID));
                 }
                 let existing = match fs.stat(path) {
+                    // O_CREAT with O_EXCL names an entry that exists: EEXIST, whatever it is.
+                    Ok(_) if flags & p::CREATE != 0 && flags & p::EXCLUSIVE != 0 => {
+                        return Err(p::code(p::EXISTS));
+                    }
                     Ok(info) if info.kind == Kind::Directory => {
                         return Err(p::code(p::IS_DIRECTORY));
                     }
@@ -2529,6 +2557,8 @@ impl Server {
             return Err(p::code(p::INVALID));
         }
         self.sessions[si].binding = Binding::Bound(vouched);
+        // The child has sent its first request: CLONE_MORE of the parent is over.
+        self.sessions[si].birth = 0;
         Ok(())
     }
 

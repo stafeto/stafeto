@@ -873,20 +873,32 @@ fn a_write_at_the_edge_of_the_room_stops_short_with_the_count() {
     let mut rig = Rig::new();
     rig.put(ROOT, b"/keep", 0o666, b"");
     fill_to_the_reserve(&mut rig);
-    // The room of another user is what is above the reserve: a write of more than that stops short.
+    // The room of another user is what is above the reserve; a write of more stops short at it.
     let h = rig.open(OWNER, b"/keep", p::WRITE, 0).unwrap();
-    let room = (rig
-        .fs
-        .free_blocks()
-        .unwrap()
-        .saturating_sub(crate::attr::RESERVE_BLOCKS))
-        * crate::BLOCK as u64;
-    let big = vec![7u8; (room as usize + 4000).min(p::MAX_WRITE)];
-    let n = rig.write(OWNER, h, &big);
-    match n {
-        Ok(n) => assert!(u64::from(n) <= room.max(1) || u64::from(n) <= big.len() as u64),
-        Err(e) => assert_eq!(e, p::code(p::NO_SPACE)),
+    let free = rig.fs.free_blocks().unwrap();
+    let room = free.saturating_sub(crate::attr::RESERVE_BLOCKS) * crate::BLOCK as u64;
+    let big = vec![7u8; p::MAX_WRITE];
+    let want = (big.len() as u64).min(room);
+    match rig.write(OWNER, h, &big) {
+        Ok(n) => {
+            assert!(want > 0, "written with no room");
+            assert_eq!(
+                u64::from(n),
+                want,
+                "stops short at the room: {free} free blocks"
+            );
+        }
+        Err(e) => {
+            assert_eq!(want, 0, "refused with room");
+            assert_eq!(e, p::code(p::NO_SPACE));
+        }
     }
+    // A write that leaves no room at all is NO_SPACE with nothing written.
+    let at = room + 100_000;
+    assert_eq!(
+        rig.call(OWNER, |w| p::pwrite(h, at, b"x", w)),
+        Err(p::code(p::NO_SPACE))
+    );
 }
 
 #[test]
@@ -1624,5 +1636,65 @@ fn in_the_reserve_rename_and_attribute_changes_are_the_superusers_and_rmdir_pass
             w
         ))
         .is_ok()
+    );
+}
+
+#[test]
+fn small_rules_of_open_truncate_rename_and_bind() {
+    let mut rig = Rig::new();
+    rig.mkdir(ROOT, b"/d", 0o777).unwrap();
+    // O_CREAT|O_EXCL on an existing directory is EEXIST.
+    assert_eq!(
+        rig.open(ROOT, b"/d", p::WRITE | p::CREATE | p::EXCLUSIVE, 0o644),
+        Err(p::code(p::EXISTS))
+    );
+    // A file larger than the limit may be made smaller; growing past it is refused.
+    let mut limited = user(1000, 100, &[]);
+    limited.fsize_limit = 1000;
+    rig.bind(60, limited);
+    let h = rig
+        .open(ROOT, b"/d/big", p::WRITE | p::CREATE, 0o666)
+        .unwrap();
+    for _ in 0..3 {
+        rig.write(ROOT, h, &[1u8; 900]).unwrap();
+    }
+    rig.close(ROOT, h);
+    let h = rig.open(60, b"/d/big", p::WRITE, 0).unwrap();
+    rig.ok(60, |w| p::truncate(h, 1500, w));
+    assert_eq!(
+        rig.call(60, |w| p::truncate(h, 1600, w)),
+        Err(p::code(p::FILE_SIZE_LIMIT))
+    );
+    // A file renamed into a path under itself finds a part of the path that is no directory.
+    rig.put(ROOT, b"/d/file", 0o644, b"x");
+    assert_eq!(
+        rig.call(ROOT, |w| p::rename(b"/d/file", b"/d/file/inner", w))
+            .err(),
+        Some(p::code(p::NOT_DIRECTORY))
+    );
+    // A directory into its own subtree is INVALID.
+    rig.mkdir(ROOT, b"/d/a", 0o777).unwrap();
+    assert_eq!(
+        rig.call(ROOT, |w| p::rename(b"/d/a", b"/d/a/b", w)).err(),
+        Some(p::code(p::INVALID))
+    );
+    // After BIND the birth window is shut: the parent's CLONE_MORE no longer reaches the child.
+    let g = rig.open(OWNER, b"/d", p::DIRECTORY, 0).unwrap();
+    let mut w = Writer::new();
+    p::clone(&[g], &mut w).unwrap();
+    let reply = rig.server.handle(&mut rig.fs, OWNER, 700, w.as_bytes());
+    let birth = u32::from_le_bytes(
+        p::reply(reply.as_bytes())
+            .unwrap()
+            .bytes(4)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    rig.server.bind(700, user(1000, 100, &[])).unwrap();
+    let h2 = rig.open(OWNER, b"/d", p::DIRECTORY, 0).unwrap();
+    assert_eq!(
+        rig.call(OWNER, |w| p::clone_more(birth, &[h2], w)).err(),
+        Some(p::code(p::BAD_HANDLE))
     );
 }
