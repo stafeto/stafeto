@@ -1072,6 +1072,21 @@ const PACKAGE_PROGRAMS: [ImageProgram; 12] = [
     // scripts of LVGL and FreeType.
     ("lvgl-demo", "lvgl-demo", 0, &[]),
 ];
+/// The static package programs: those of PACKAGE_PROGRAMS without the feature
+/// `dynamic`, which their own crate's build links with relibc's `libc.a`
+/// (no `DT_NEEDED`, no interpreter, no undefined name), with the size of the
+/// `PT_GNU_STACK` that crate's build script asks for (the stack of a program
+/// started from its file). The checks of a dynamic program (the needed
+/// libraries, the symbol versions against libc.so) do not apply to them, and
+/// these (`check_static_elf`) do.
+const STATIC_PROGRAMS: [(&str, u32); 1] = [("lvgl-demo", 256 * 1024)];
+
+/// The stack a static package program's build asks for, or `None` for a
+/// program that is not static.
+fn static_stack(program: &str) -> Option<u32> {
+    STATIC_PROGRAMS.iter().find(|p| p.0 == program).map(|p| p.1)
+}
+
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
 /// (5d); the files of /bin are BusyBox's applets build. The programs are
@@ -3720,7 +3735,7 @@ fn write_boot_image_files(
             .iter()
             .filter(|p| is_dynamic(p.3))
             .map(|p| dynamic_name(p.1, p.3))
-            .collect();
+            .collect::<Result<_, _>>()?;
         if !dynamic.is_empty() {
             dynamic_programs(&dynamic)?;
         }
@@ -3729,7 +3744,7 @@ fn write_boot_image_files(
                 target
                     .join("libc-so")
                     .join("programs")
-                    .join(dynamic_name(package, features))
+                    .join(dynamic_name(package, features)?)
             } else {
                 cargo_output(&target, PROGRAM_TARGET, profile, package)
             };
@@ -3771,9 +3786,67 @@ fn write_boot_image_files(
 
 /// Strips the symbols and the non-loadable sections off `elf`, the image's
 /// copy of the linker's file.
-/// The programs whose shipped file must hold no path of the directory they
-/// were built in (their C sources are built with `-fmacro-prefix-map`).
-const NO_BUILD_PATH: [&str; 1] = ["lvgl-demo"];
+/// The checks of a static program's linked file, before it is stripped: no
+/// `PT_INTERP` and no `PT_DYNAMIC` (so no `DT_NEEDED`), a `PT_GNU_STACK` of
+/// `stack` bytes, and no undefined name.
+fn check_static_elf(elf: &Path, stack: u32) -> Result<(), String> {
+    let bytes = std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?;
+    static_headers(&bytes, stack).map_err(|e| format!("{}: {e}", elf.display()))?;
+    let nm = Command::new(llvm_tool("llvm-nm")?)
+        .args(["-u", "--format=just-symbols"])
+        .arg(elf)
+        .output()
+        .map_err(|e| format!("llvm-nm: {e}"))?;
+    let undefined = String::from_utf8_lossy(&nm.stdout).into_owned();
+    if !undefined.trim().is_empty() {
+        return Err(format!(
+            "{}: a static program leaves names undefined: {}",
+            elf.display(),
+            undefined.split_whitespace().collect::<Vec<_>>().join(" ")
+        ));
+    }
+    Ok(())
+}
+
+/// The program headers of a static program's ELF file: none of the types
+/// PT_INTERP (3) and PT_DYNAMIC (2), and a PT_GNU_STACK (0x6474e551) whose
+/// memory size is `stack`.
+fn static_headers(bytes: &[u8], stack: u32) -> Result<(), String> {
+    let word = |at: usize, len: usize| -> Option<u64> {
+        let field = bytes.get(at..at + len)?;
+        Some(field.iter().rev().fold(0, |n, b| n << 8 | u64::from(*b)))
+    };
+    if bytes.get(..4) != Some(b"\x7fELF".as_slice()) {
+        return Err("is no ELF file".to_owned());
+    }
+    let (Some(table), Some(size), Some(count)) = (word(32, 8), word(54, 2), word(56, 2)) else {
+        return Err("has no program headers".to_owned());
+    };
+    let mut gnu_stack = None;
+    for i in 0..count {
+        let at = (table + i * size) as usize;
+        match word(at, 4) {
+            Some(3) => {
+                return Err("names an interpreter (PT_INTERP): it is dynamically linked".to_owned());
+            }
+            Some(2) => {
+                return Err(
+                    "has a dynamic section (PT_DYNAMIC): it may name libraries (DT_NEEDED)"
+                        .to_owned(),
+                );
+            }
+            Some(0x6474_e551) => gnu_stack = word(at + 40, 8),
+            _ => {}
+        }
+    }
+    match gnu_stack {
+        Some(n) if n == u64::from(stack) => Ok(()),
+        Some(n) => Err(format!(
+            "has a stack segment of {n} bytes, {stack} expected"
+        )),
+        None => Err("has no stack segment (PT_GNU_STACK)".to_owned()),
+    }
+}
 
 /// Fails when the file at `elf` holds the text of `root`, the build directory.
 fn no_build_path(elf: &Path, root: &Path) -> Result<(), String> {
@@ -3855,6 +3928,9 @@ fn write_elf_image(
         let why = |e: String| format!("{}: {e}", elf.display());
         disasm::erratum_835769(elf, &objdump)?;
         disasm::erratum_843419(elf)?;
+        if let Some(stack) = static_stack(file) {
+            check_static_elf(elf, stack)?;
+        }
         if *file == "ramfs" {
             disasm::ram_main_frame(elf, &objdump)?;
         }
@@ -3865,7 +3941,7 @@ fn write_elf_image(
             .windows(READY_MARK.len())
             .any(|w| w == READY_MARK);
         strip_elf(elf, &objcopy)?;
-        if NO_BUILD_PATH.contains(file) {
+        if static_stack(file).is_some() {
             no_build_path(elf, &root())?;
         }
     }
@@ -5191,8 +5267,8 @@ fn is_dynamic(features: &[&str]) -> bool {
 /// The name of the dynamic program of `package` under target/libc-so/programs:
 /// the small BusyBox of the probes, the one with the utilities of the shell
 /// image, or the package's own.
-fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
-    match (package, features.contains(&"utilities")) {
+fn dynamic_name(package: &str, features: &[&str]) -> Result<&'static str, String> {
+    Ok(match (package, features.contains(&"utilities")) {
         ("busybox-probe", false) => "busybox",
         ("busybox-probe", true) => "busybox-utils",
         ("busybox-dyn", _) => "busybox",
@@ -5208,8 +5284,12 @@ fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
         ("dropbear", _) => "dropbear",
         ("nginx", _) => "nginx",
         ("nginx-fast", _) => "nginx-fast",
-        _ => panic!("no dynamic build of the program {package}"),
-    }
+        _ => {
+            return Err(format!(
+                "no dynamic build of the program {package} (build-libc-so.py programs links the programs of `dynamic_name`); a static program has no `dynamic` feature in PACKAGE_PROGRAMS and a line in STATIC_PROGRAMS"
+            ));
+        }
+    })
 }
 
 /// libc.so and the dynamic programs linked (after the scripts of their
@@ -14460,6 +14540,62 @@ fn ci_lints() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// The table of the static package programs and PACKAGE_PROGRAMS agree: a
+    /// program without the feature `dynamic` is in the table, with a stack,
+    /// and the table names no other.
+    #[test]
+    fn the_static_programs_are_those_without_the_dynamic_feature() {
+        let statics: Vec<&str> = super::PACKAGE_PROGRAMS
+            .iter()
+            .filter(|p| !super::is_dynamic(p.3))
+            .map(|p| p.0)
+            .collect();
+        let listed: Vec<&str> = super::STATIC_PROGRAMS.iter().map(|p| p.0).collect();
+        assert_eq!(statics, listed);
+        assert!(super::STATIC_PROGRAMS.iter().all(|p| p.1 >= 64 * 1024));
+        assert_eq!(super::static_stack("lvgl-demo"), Some(262_144));
+        assert_eq!(super::static_stack("curl"), None);
+    }
+
+    /// An ELF file of the program headers `types` (type, memory size).
+    fn elf_with(types: &[(u32, u64)]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 64 + 56 * types.len()];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&(types.len() as u16).to_le_bytes());
+        for (i, (kind, memsz)) in types.iter().enumerate() {
+            let at = 64 + 56 * i;
+            bytes[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+            bytes[at + 40..at + 48].copy_from_slice(&memsz.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// The checks of a static program's headers: no interpreter, no dynamic
+    /// section, and the stack segment the build script asked for.
+    #[test]
+    fn a_static_program_has_no_dynamic_section_and_its_stack() {
+        const LOAD: u32 = 1;
+        const DYNAMIC: u32 = 2;
+        const INTERP: u32 = 3;
+        const STACK: u32 = 0x6474_e551;
+        let good = elf_with(&[(LOAD, 0), (STACK, 262_144)]);
+        assert!(super::static_headers(&good, 262_144).is_ok());
+        let error = super::static_headers(&elf_with(&[(INTERP, 0), (STACK, 262_144)]), 262_144)
+            .unwrap_err();
+        assert!(error.contains("PT_INTERP"), "{error}");
+        let error = super::static_headers(&elf_with(&[(DYNAMIC, 0), (STACK, 262_144)]), 262_144)
+            .unwrap_err();
+        assert!(error.contains("DT_NEEDED"), "{error}");
+        let error =
+            super::static_headers(&elf_with(&[(LOAD, 0), (STACK, 65_536)]), 262_144).unwrap_err();
+        assert!(error.contains("65536 bytes, 262144 expected"), "{error}");
+        let error = super::static_headers(&elf_with(&[(LOAD, 0)]), 262_144).unwrap_err();
+        assert!(error.contains("no stack segment"), "{error}");
+        assert!(super::static_headers(b"not an elf", 1).is_err());
+    }
+
     /// A file that holds the build directory's path is refused, one that does
     /// not is passed.
     #[test]
