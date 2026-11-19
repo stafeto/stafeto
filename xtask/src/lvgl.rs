@@ -61,6 +61,13 @@ const WITHIN: Duration = Duration::from_secs(180);
 const SLOW: Duration = Duration::from_secs(1800);
 /// The whole probe may take this long.
 const PROBE_WITHIN: Duration = Duration::from_secs(600);
+/// How far the pool's largest use may differ between the guest and the host:
+/// LVGL keeps the font's path in its pool (a copy for each font), and the path
+/// differs in length (`/usr/share/fonts/LiberationSans-Regular.ttf` in the guest,
+/// the checkout's path on the host), which the allocator's rounding turns into
+/// a few dozen bytes (70120 in the guest against 70152 on the host in the first
+/// complete run). Anything past two allocator granules is a real difference.
+const MEM_TOLERANCE: u64 = 64;
 /// The rows of a band of the frame CRCs the evidence prints.
 const BAND_ROWS: usize = 16;
 
@@ -390,17 +397,18 @@ pub fn verdict(guest: &Report, host: &Report) -> Result<String, String> {
         ("state", guest.state.clone(), host.state.clone()),
         ("turns", guest.turns.to_string(), host.turns.to_string()),
         ("frames", guest.frames.to_string(), host.frames.to_string()),
-        (
-            "mem max-used",
-            guest.mem_max_used.to_string(),
-            host.mem_max_used.to_string(),
-        ),
     ] {
         if g != h {
             return Err(format!(
                 "the {what} of the guest is {g:?}, the host's {h:?}"
             ));
         }
+    }
+    if guest.mem_max_used.abs_diff(host.mem_max_used) > MEM_TOLERANCE {
+        return Err(format!(
+            "the largest use of LVGL's pool is {} bytes in the guest and {} on the host, more than {MEM_TOLERANCE} apart",
+            guest.mem_max_used, host.mem_max_used
+        ));
     }
     if guest.bands_first != host.bands_first || guest.bands_after != host.bands_after {
         return Err(format!(
@@ -989,7 +997,6 @@ mod tests {
             ("text hi", "text hhii", "state"),
             ("turns 111", "turns 112", "turns"),
             ("frames 64", "frames 66", "frames"),
-            ("max-used 70152", "max-used 70240", "mem max-used"),
         ] {
             let mut lines = guest_lines();
             for l in lines.iter_mut() {
@@ -1001,6 +1008,37 @@ mod tests {
                 "{what}: {error}"
             );
         }
+    }
+
+    /// The pool's largest use may differ by the font path's length, within the
+    /// tolerance: 70120 against 70152 passes, 70240 against 70152 does not.
+    #[test]
+    fn the_pools_largest_use_has_a_tolerance_for_the_font_path() {
+        let mut lines = guest_lines();
+        for l in lines.iter_mut() {
+            *l = l.replace("max-used 70152", "max-used 70120");
+        }
+        assert!(judged(&lines).is_ok());
+        for l in lines.iter_mut() {
+            *l = l.replace("max-used 70120", "max-used 70240");
+        }
+        let error = judged(&lines).unwrap_err();
+        assert!(error.contains("largest use of LVGL's pool"), "{error}");
+    }
+
+    /// A wait that ended for a bit of events, with the mask as it was, is no
+    /// stall; the stall line the glue prints carries the state and is a fault.
+    #[test]
+    fn the_stall_line_of_the_glue_is_a_fault() {
+        let mut lines = guest_lines();
+        lines.push(format!(
+            "{GUEST}still waiting for a free buffer: wanted 0, free mask 2, bits since the post 8, posts 5"
+        ));
+        let error = parse(&lines, GUEST).unwrap_err();
+        assert!(
+            error.contains("still waiting for a free buffer: wanted 0"),
+            "{error}"
+        );
     }
 
     #[test]

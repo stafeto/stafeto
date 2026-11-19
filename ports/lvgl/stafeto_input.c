@@ -18,7 +18,7 @@ unsigned stafeto_input_events(void *user, demo_event *out, unsigned max)
     /* A look at the channel without waiting: the bits are returned only by
      * stafeto_window_wait, so the bit for events is learned here when no
      * wait for a buffer has met it. */
-    if (stafeto_display_take_bits(io, 0) != 0) {
+    if (stafeto_display_take_bits(io, 0) < 0) {
         return 0;
     }
     if (!io->events_pending) {

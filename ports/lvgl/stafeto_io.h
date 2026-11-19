@@ -31,6 +31,7 @@ struct stafeto_io {
     unsigned seen[6];          /* events taken, by kind (1 key, 2 move, 3 button, 4 focus in, 5 focus out) */
     int gone;                  /* the service ended or took the window away */
     unsigned posts;            /* frames posted */
+    uint32_t bits_since_post;  /* the bits the waits returned since the last post */
     void (*log)(const char *line);
 };
 
@@ -44,8 +45,10 @@ int stafeto_display_post(void *user, unsigned buffer, const demo_rect *rects, un
 int stafeto_display_wait_free(void *user, unsigned buffer);
 
 /* Take the bits of the window's channel: wait at most `timeout_ns` (0 looks
- * without waiting). Notes the bit for events in `events_pending` and returns
- * 0, or -1 when the service has gone (logged). A timeout is 0 too. */
+ * without waiting). Notes the bit for events in `events_pending` and the bits
+ * in `bits_since_post`. Returns 0 when a bit came, 1 when the time ran out
+ * (or a signal ended the wait) with none, and -1 when the service has gone
+ * (logged). */
 int stafeto_display_take_bits(struct stafeto_io *io, uint64_t timeout_ns);
 
 /* The input side. */

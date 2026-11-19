@@ -45,10 +45,11 @@ int stafeto_display_take_bits(struct stafeto_io *io, uint64_t timeout_ns)
         if (bits & STAFETO_WINDOW_EVENTS) {
             io->events_pending = 1;
         }
+        io->bits_since_post |= bits;
         return 0;
     }
     if (errno == ETIMEDOUT || errno == EINTR) {
-        return 0;
+        return 1;
     }
     if (!io->gone) {
         say(io, "the display is gone (wait)", errno);
@@ -69,6 +70,7 @@ int stafeto_display_post(void *user, unsigned buffer, const demo_rect *rects, un
         return -1;
     }
     io->posts++;
+    io->bits_since_post = 0;
     return 0;
 }
 
@@ -80,11 +82,20 @@ int stafeto_display_wait_free(void *user, unsigned buffer)
         if (mask & STAFETO_WINDOW_BUFFER(buffer)) {
             return 0;
         }
-        if (stafeto_display_take_bits(io, STAFETO_IO_WAIT_NS) != 0) {
+        int took = stafeto_display_take_bits(io, STAFETO_IO_WAIT_NS);
+        if (took < 0) {
             break;
         }
-        if (stafeto_window_free_buffers(io->id) == mask) {
-            io->log("still waiting for a free buffer");
+        /* The mask is looked at again at the top of the loop, whatever bit
+         * the wait returned (a bit for events, say, leaves it as it was). Only
+         * a wait that ran out of time is a stall: the state is told then. */
+        if (took == 1) {
+            char line[200];
+            snprintf(line, sizeof line,
+                     "still waiting for a free buffer: wanted %u, free mask %u, bits since the post %u, posts %u",
+                     buffer, (unsigned)stafeto_window_free_buffers(io->id),
+                     (unsigned)io->bits_since_post, io->posts);
+            io->log(line);
         }
     }
     return -1;
@@ -101,7 +112,7 @@ uint32_t stafeto_now_ms(void *user)
 void stafeto_idle(void *user, uint32_t ms)
 {
     struct stafeto_io *io = user;
-    if (stafeto_display_take_bits(io, (uint64_t)(ms ? ms : 1) * 1000000u) != 0) {
+    if (stafeto_display_take_bits(io, (uint64_t)(ms ? ms : 1) * 1000000u) < 0) {
         /* The display is gone: nothing more to show. */
         io->log("the display service ended; the demo ends");
         stafeto_window_close(io->id);
