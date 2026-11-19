@@ -232,6 +232,12 @@ impl Pacer {
         self.work.is_some()
     }
 
+    /// Whether the bands of the frame are put off by the cap, from the band that
+    /// reached it to the expiry that goes on with them: no band is made in between.
+    pub fn deferred(&self) -> bool {
+        self.deferred
+    }
+
     /// Whether the timer is armed.
     pub fn armed(&self) -> bool {
         self.armed.is_some()
@@ -895,9 +901,12 @@ mod tests {
         assert_eq!(p.fire(c.start(2) + 96), Fire::Early);
         assert!(p.busy());
         // The arming step arms for the start, once.
+        assert!(p.deferred());
         assert_eq!(p.take_arm(), Some(at));
         assert_eq!(p.take_arm(), None);
+        assert!(p.deferred(), "the bands wait for the expiry");
         assert_eq!(p.fire(at), Fire::Continue);
+        assert!(!p.deferred());
         assert_eq!(p.counters.wakeups, 2);
         // The bands go on in the period that began and are counted in it.
         assert_eq!(p.band_done(at + 5, 1, true), Band::Go);
@@ -921,6 +930,7 @@ mod tests {
         let at = c.start(3);
         assert_eq!(p.band_done(c.start(2) + 2, 1, true), Band::Defer(at));
         // The arming step runs after the start has gone by.
+        assert!(p.deferred());
         assert_eq!(p.take_arm(), Some(at));
         assert_eq!(p.fire(at + 7), Fire::Continue);
         assert!(p.busy());

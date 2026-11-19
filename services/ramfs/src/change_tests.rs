@@ -3555,3 +3555,37 @@ fn change_step_reclaims_one_paid_page_only_at_the_backlog_threshold() {
         env.release(&mut fds, OWNER, start.key).unwrap();
     }
 }
+
+#[test]
+fn a_change_step_at_the_backlog_threshold_frees_inode_work_and_leaves_the_parked_pages() {
+    let mut env = Env::new();
+    let mut fds = session();
+    for i in 0..32 {
+        let name = format!("garbage{i}");
+        let token = env.node(ROOT, name.as_bytes(), REG, 0o644);
+        env.ram
+            .storage
+            .write(token, FIXTURE, 0, &[0x5a; crate::storage::PAGE])
+            .unwrap();
+        env.ram
+            .storage
+            .unlink(ROOT, name.as_bytes(), FIXTURE)
+            .unwrap();
+    }
+    assert_eq!(env.ram.storage.reclaim_backlog(), 32);
+    // 64 lock pages wait on the parking stack.
+    for _ in 0..64 {
+        let page = env.ram.storage.allocate_lock_page(FIXTURE).unwrap();
+        env.ram.storage.park_lock_page(page);
+    }
+    assert_eq!(env.ram.storage.parked_backlog(), 64);
+    let before = env.ram.storage.available().pages;
+    let start = op(ChangeOp::Access, b"/");
+    env.start(&mut fds, OWNER, &start).unwrap();
+    env.step(&fds, OWNER, start.key).unwrap();
+    // The step paid the one reclamation of the pace (one page of the garbage came back) and
+    // released no parked page.
+    assert_eq!(env.ram.storage.available().pages, before + 1);
+    assert_eq!(env.ram.storage.parked_backlog(), 64);
+    env.release(&mut fds, OWNER, start.key).unwrap();
+}
