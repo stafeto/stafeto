@@ -526,6 +526,35 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
 // Returns a negative error code on failure.
 int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info);
 
+// The kind and the custom attribute of one entry of a path
+//
+// stafeto: see lfs_path_attrs. res is the size of the attribute on disk, or
+// LFS_ERR_NOATTR when the entry has none.
+struct lfs_path_attr {
+    lfs_ssize_t res;
+    uint8_t type;
+};
+
+// Find info about a file or directory and the custom attributes of every entry of its path
+//
+// stafeto: lfs_stat_attr for the root and for each entry the path passes, in one
+// walk of the path with no lookup repeated: the cost is about that of one lfs_stat, 3 reads
+// for each component, where lfs_stat_attr of each prefix costs a lookup from the root for
+// each and grows with the square of the depth. The attribute of the given type of the
+// root and of each entry the walk matches, in the order of the path, goes to out (its kind and
+// the size of the attribute on disk, or LFS_ERR_NOATTR) and to buffer (size bytes for each,
+// as lfs_getattr fills them); entries that "." and ".." make the path skip are not matched
+// and have no place. *count is the number of places filled, also when the call fails. The
+// last place is the entry of the path itself, and info is filled for it as lfs_stat does.
+//
+// Returns 0, or a negative error code: LFS_ERR_NOENT for a missing entry and LFS_ERR_NOTDIR
+// for a file in the middle of the path, with *count counting the entries that were found
+// before it (the root and the directories above the missing name), and LFS_ERR_NAMETOOLONG
+// for a path with more entries than capacity (*count is capacity then).
+int lfs_path_attrs(lfs_t *lfs, const char *path, struct lfs_info *info,
+        uint8_t type, struct lfs_path_attr *out, void *buffer, lfs_size_t size,
+        lfs_size_t capacity, lfs_size_t *count);
+
 // Find info about a file or directory and one of its custom attributes
 //
 // stafeto: lfs_stat and lfs_getattr of the same path in one lookup. Fills out

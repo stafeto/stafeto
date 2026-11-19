@@ -150,17 +150,17 @@ fn word(reply: &[u8; abi::MESSAGE_MAX], at: usize) -> u32 {
 /// handle. The second: reads it back and says whether it is whole.
 fn file(session: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
     use proto_data as d;
-    match call(session, |w| d::path_call(d::Method::Mkdir, b"/stop", w)) {
+    match call(session, |w| d::mkdir(b"/stop", 0o755, w)) {
         Ok(_) | Err(Status::Unknown(d::EXISTS)) => {}
         Err(_) => return Err("mkdir"),
     }
-    match call(session, |w| d::open(b"/stop/f", d::READ, w)) {
+    match call(session, |w| d::open(b"/stop/f", d::READ, 0, w)) {
         Ok((reply, _)) => return verify(session, word(&reply, 0)),
         Err(Status::Unknown(d::NO_ENTRY)) => {}
         Err(_) => return Err("open for reading"),
     }
     let (reply, _) = call(session, |w| {
-        d::open(b"/stop/f", d::WRITE | d::CREATE | d::TRUNCATE, w)
+        d::open(b"/stop/f", d::WRITE | d::CREATE | d::TRUNCATE, 0o644, w)
     })
     .map_err(|_| "open for writing")?;
     let handle = word(&reply, 0);

@@ -37,8 +37,8 @@ UPSTREAM = {
 }
 # The two files the change touches, with the change.
 CHANGED = {
-    "lfs.c": "dcbdc815892164b427b0835e6a1f06d7a240b0cf4d66814c9bfb1448442b3726",
-    "lfs.h": "361a9b1292e01e5ef48c918caceee14c585e77be3665b711575f0f1bed277953",
+    "lfs.c": "7fa02871d2147b6230183694e8b9efc1cfd797808cba687aa4e91e19debab557",
+    "lfs.h": "9c13b195643ccfd5025961fa3fb6029bbb9be0f6ffce9488ec9be958d33163b6",
 }
 PATCH = "stafeto-changes.patch"
 DOCS = ("README.md", "STAFETO-CHANGES.md")
@@ -46,6 +46,18 @@ DOCS = ("README.md", "STAFETO-CHANGES.md")
 
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def tree_files():
+    """The files of the directory, as paths relative to it: those git tracks (the check is about
+    what is committed, so a `.DS_Store` or a build leftover of a local tree is not one), and every
+    file of the directory when the tree is not a git checkout."""
+    run = subprocess.run(["git", "ls-files", "-z", "--", str(DIR)], capture_output=True,
+                         text=True, cwd=ROOT, stdin=subprocess.DEVNULL)
+    if run.returncode == 0 and run.stdout:
+        return sorted(Path(p).relative_to(DIR.relative_to(ROOT)).as_posix()
+                      for p in run.stdout.split("\0") if p)
+    return sorted(p.relative_to(DIR).as_posix() for p in DIR.rglob("*") if p.is_file())
 
 
 def check():
@@ -82,9 +94,8 @@ def check():
     # No other file in the directory or below it.
     known = set(UPSTREAM) | {PATCH, "build.rs", "Cargo.toml", "README.md", "STAFETO-CHANGES.md",
                              "src/lib.rs"}
-    for path in sorted(DIR.rglob("*")):
-        name = path.relative_to(DIR).as_posix()
-        if path.is_file() and name not in known:
+    for name in tree_files():
+        if name not in known:
             problems.append(f"{name}: a file that is neither the release nor the change")
 
     # The documents name the same checksums.

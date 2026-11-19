@@ -5,6 +5,15 @@
 //! for: a cut of the power at every sector written leaves the last whole state.
 
 use crate::fs::{Fs, Kind, Open, Storage, Whence};
+
+/// OPEN with a mode, for the tests that did not name one (a native client's session makes it).
+pub(crate) fn opening(
+    path: &[u8],
+    flags: u32,
+    w: &mut proto_wire::Writer,
+) -> Result<(), proto_wire::Status> {
+    proto_data::open(path, flags, 0o644, w)
+}
 use crate::gpt::{self, Class};
 use crate::mem::{MemDevice, Survive};
 use crate::{Device, Error, SECTOR};
@@ -815,7 +824,7 @@ mod served {
             fs.format().unwrap();
             fs.mount().unwrap();
             let opened = call(&mut server, &mut fs, 1, |w| {
-                p::open(b"/f", p::WRITE | p::CREATE | p::TRUNCATE, w)
+                crate::tests::opening(b"/f", p::WRITE | p::CREATE | p::TRUNCATE, w)
             })
             .unwrap();
             let handle = word(&opened, 0);
@@ -875,12 +884,9 @@ mod served {
         fs.format().unwrap();
         fs.mount().unwrap();
         let s = &mut rig.server;
-        call(s, &mut fs, 1, |w| {
-            p::path_call(p::Method::Mkdir, b"/ssh", w)
-        })
-        .unwrap();
+        call(s, &mut fs, 1, |w| p::mkdir(b"/ssh", 0o755, w)).unwrap();
         let opened = call(s, &mut fs, 1, |w| {
-            p::open(b"//ssh/./key", p::WRITE | p::READ | p::CREATE, w)
+            crate::tests::opening(b"//ssh/./key", p::WRITE | p::READ | p::CREATE, w)
         })
         .unwrap();
         let handle = word(&opened, 0);
@@ -906,7 +912,8 @@ mod served {
             p::path_call(p::Method::Stat, b"/ssh/key", w)
         })
         .unwrap();
-        assert_eq!((word(&stat, 0), word(&stat, 4)), (p::KIND_FILE, 6));
+        let st = p::Stat::from_bytes(&stat).unwrap();
+        assert_eq!((st.kind, st.size), (p::KIND_FILE, 6));
         // The session goes: its files close, and the file can be renamed.
         s.gone(&mut fs, 1);
         assert_eq!(s.open_count(), 0);
@@ -917,7 +924,10 @@ mod served {
         call(s, &mut fs, 2, |w| p::rename(b"/ssh/key", b"/ssh/key2", w)).unwrap();
         // A directory, listed.
         let dir = word(
-            &call(s, &mut fs, 2, |w| p::open(b"/ssh", p::DIRECTORY, w)).unwrap(),
+            &call(s, &mut fs, 2, |w| {
+                crate::tests::opening(b"/ssh", p::DIRECTORY | p::READ, w)
+            })
+            .unwrap(),
             0,
         );
         let mut names = Vec::new();
@@ -926,10 +936,13 @@ mod served {
                 p::handle_call(p::Method::Readdir, dir, w)
             })
             .unwrap();
-            if word(&e, 0) == 0 {
+            let mut batch = p::read_dir_reply(Reader::new(&e)).unwrap();
+            while let Some(entry) = batch.next_entry().unwrap() {
+                names.push(String::from_utf8(entry.name.to_vec()).unwrap());
+            }
+            if !batch.more {
                 break;
             }
-            names.push(String::from_utf8(e[12..].to_vec()).unwrap());
         }
         assert_eq!(names, [".", "..", "key2"]);
         assert_eq!(

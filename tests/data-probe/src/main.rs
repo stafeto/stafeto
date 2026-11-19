@@ -150,7 +150,7 @@ impl Client {
     }
 
     fn open(&self, path: &[u8], flags: u32) -> Result<u32, Status> {
-        Ok(self.call(|w| p::open(path, flags, w))?.word(0))
+        Ok(self.call(|w| p::open(path, flags, 0o644, w))?.word(0))
     }
 
     fn close(&self, handle: u32) -> Result<(), Status> {
@@ -159,8 +159,7 @@ impl Client {
     }
 
     fn mkdir(&self, path: &[u8]) -> Result<(), Status> {
-        self.call(|w| p::path_call(Method::Mkdir, path, w))
-            .map(drop)
+        self.call(|w| p::mkdir(path, 0o755, w)).map(drop)
     }
 
     fn unlink(&self, path: &[u8]) -> Result<(), Status> {
@@ -341,7 +340,7 @@ fn verify(c: &Client) -> Result<(), Fail> {
         return Err("the progress is past the last step");
     }
     // The tree: every name is known and every file whole.
-    let dir = match c.open(b"/w", p::DIRECTORY) {
+    let dir = match c.open(b"/w", p::DIRECTORY | p::READ) {
         Ok(handle) => handle,
         // Nothing of the series is there yet: the cut came before the first step was durable.
         Err(_) if done == 0 => 0,
@@ -350,65 +349,75 @@ fn verify(c: &Client) -> Result<(), Fail> {
     let mut present = [false; STEPS as usize + 2];
     let mut files = 0;
     if dir != 0 {
-        loop {
-            let entry = wire(
+        let mut more = true;
+        while more {
+            let reply = wire(
                 c.call(|w| p::handle_call(Method::Readdir, dir, w)),
                 "readdir",
             )?;
-            if entry.word(0) == 0 {
-                break;
-            }
-            let (kind, size) = (entry.word(4), entry.word(8) as usize);
-            let name = &entry.bytes[16..entry.len];
-            if name == b"." || name == b".." {
-                continue;
-            }
-            let mut path = [0u8; 32];
-            path[..3].copy_from_slice(b"/w/");
-            path[3..3 + name.len()].copy_from_slice(name);
-            let path = &path[..3 + name.len()];
-            if kind != p::KIND_FILE {
-                return Err("a directory in /w");
-            }
-            files += 1;
-            if name == b"tmp" {
-                // Created and not yet written, or whole: the length of some step.
-                let handle = wire(c.open(path, p::READ), "open tmp")?;
-                let mut whole = size == 0;
-                for j in 1..=STEPS {
-                    whole |= size == length(j) && wire(c.matches(handle, size, j), "read tmp")?;
-                    if whole {
-                        break;
+            let mut batch = wire(
+                p::read_dir_reply(proto_wire::Reader::new(&reply.bytes[4..reply.len])),
+                "listing",
+            )?;
+            more = batch.more;
+            while let Some(entry) = wire(batch.next_entry(), "entry")? {
+                let (kind, name) = (entry.kind, entry.name);
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                let mut path = [0u8; 32];
+                path[..3].copy_from_slice(b"/w/");
+                path[3..3 + name.len()].copy_from_slice(name);
+                let path = &path[..3 + name.len()];
+                if kind != p::KIND_FILE {
+                    return Err("a directory in /w");
+                }
+                let stat = wire(c.call(|w| p::path_call(Method::Stat, path, w)), "stat")?;
+                let size = wire(
+                    p::Stat::from_bytes(&stat.bytes[4..stat.len]),
+                    "the stat record",
+                )?
+                .size as usize;
+                files += 1;
+                if name == b"tmp" {
+                    // Created with nothing written, or whole: the length of some step.
+                    let handle = wire(c.open(path, p::READ), "open tmp")?;
+                    let mut whole = size == 0;
+                    for j in 1..=STEPS {
+                        whole |= size == length(j) && wire(c.matches(handle, size, j), "read tmp")?;
+                        if whole {
+                            break;
+                        }
+                        wire(c.call(|w| p::seek(handle, 0, p::SEEK_SET, w)), "seek tmp")?;
                     }
-                    wire(c.call(|w| p::seek(handle, 0, p::SEEK_SET, w)), "seek tmp")?;
+                    wire(c.close(handle), "close tmp")?;
+                    if !whole {
+                        return Err("a torn tmp file");
+                    }
+                    continue;
                 }
-                wire(c.close(handle), "close tmp")?;
+                let Some(j) = name
+                    .strip_prefix(b"f")
+                    .and_then(|d| core::str::from_utf8(d).ok())
+                    .and_then(|d| d.parse::<u32>().ok())
+                    .filter(|j| (1..=STEPS).contains(j))
+                else {
+                    return Err("a file of no step");
+                };
+                if j > done + 1 {
+                    return Err("a file of a step that was not done");
+                }
+                if size != length(j) {
+                    return Err("a file of the wrong length");
+                }
+                let handle = wire(c.open(path, p::READ), "open file")?;
+                let whole = wire(c.matches(handle, size, j), "read file")?;
+                wire(c.close(handle), "close file")?;
                 if !whole {
-                    return Err("a torn tmp file");
+                    return Err("a torn file");
                 }
-                continue;
+                present[j as usize] = true;
             }
-            let Some(j) = name
-                .strip_prefix(b"f")
-                .and_then(|d| core::str::from_utf8(d).ok())
-                .and_then(|d| d.parse::<u32>().ok())
-                .filter(|j| (1..=STEPS).contains(j))
-            else {
-                return Err("a file of no step");
-            };
-            if j > done + 1 {
-                return Err("a file of a step that was not done");
-            }
-            if size != length(j) {
-                return Err("a file of the wrong length");
-            }
-            let handle = wire(c.open(path, p::READ), "open file")?;
-            let whole = wire(c.matches(handle, size, j), "read file")?;
-            wire(c.close(handle), "close file")?;
-            if !whole {
-                return Err("a torn file");
-            }
-            present[j as usize] = true;
         }
         wire(c.close(dir), "close /w")?;
     }

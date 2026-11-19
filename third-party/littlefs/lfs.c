@@ -1481,8 +1481,78 @@ static int lfs_dir_find_match(void *data,
 // - 0                  if file is found
 // - LFS_ERR_NOENT      if file or parent is not found
 // - LFS_ERR_NOTDIR     if parent is not a dir
-static lfs_stag_t lfs_dir_find(lfs_t *lfs, lfs_mdir_t *dir,
-        const char **path, uint16_t *id) {
+// stafeto: the custom attribute of entry id in the metadata pair dir, the
+// tail of lfs_getattr_. Sets *res to the size of the attribute, or to
+// LFS_ERR_NOATTR when the entry has none, and returns a negative error code
+// only when the pair could not be read.
+static int lfs_dir_getattr_(lfs_t *lfs, lfs_mdir_t *dir, uint16_t id,
+        uint8_t type, void *buffer, lfs_size_t size, lfs_ssize_t *res) {
+    lfs_stag_t tag = lfs_dir_get(lfs, dir, LFS_MKTAG(0x7ff, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_USERATTR + type,
+                id, lfs_min(size, lfs->attr_max)),
+            buffer);
+    if (tag < 0) {
+        if (tag == LFS_ERR_NOENT) {
+            *res = LFS_ERR_NOATTR;
+            return 0;
+        }
+
+        return (int)tag;
+    }
+
+    *res = lfs_tag_size(tag);
+    return 0;
+}
+
+// stafeto: what lfs_path_attrs_ has collected so far for a path: the kind and the attribute of
+// each entry lfs_dir_find passes, in the order of the path, the root first.
+struct lfs_path_walk {
+    uint8_t type;
+    struct lfs_path_attr *out;
+    uint8_t *buffer;
+    lfs_size_t size;
+    lfs_size_t capacity;
+    lfs_size_t count;
+};
+
+// stafeto: records the entry with the tag just found by lfs_dir_find: dir is the pair that
+// holds it (the root has no pair of its own at hand: its attribute is that of id 0 of the root
+// pair), so no pair is fetched again for an entry but the root.
+static int lfs_path_walk_visit(lfs_t *lfs, struct lfs_path_walk *walk,
+        lfs_mdir_t *dir, lfs_stag_t tag) {
+    if (walk->count == walk->capacity) {
+        return LFS_ERR_NAMETOOLONG;
+    }
+
+    uint16_t id = lfs_tag_id(tag);
+    lfs_mdir_t root;
+    if (id == 0x3ff) {
+        // special case for root
+        id = 0;
+        int err = lfs_dir_fetch(lfs, &root, lfs->root);
+        if (err) {
+            return err;
+        }
+
+        dir = &root;
+    }
+
+    struct lfs_path_attr *out = &walk->out[walk->count];
+    out->type = lfs_tag_type3(tag);
+    int err = lfs_dir_getattr_(lfs, dir, id, walk->type,
+            walk->buffer + walk->count*walk->size, walk->size, &out->res);
+    if (err) {
+        return err;
+    }
+
+    walk->count += 1;
+    return 0;
+}
+
+// stafeto: lfs_dir_find, and with a walk, a call of lfs_path_walk_visit for every entry it
+// matches (and the root), as it passes them.
+static lfs_stag_t lfs_dir_find_(lfs_t *lfs, lfs_mdir_t *dir,
+        const char **path, uint16_t *id, struct lfs_path_walk *walk) {
     // we reduce path to a single name if we can find it
     const char *name = *path;
 
@@ -1494,6 +1564,13 @@ static lfs_stag_t lfs_dir_find(lfs_t *lfs, lfs_mdir_t *dir,
     // empty paths are not allowed
     if (*name == '\0') {
         return LFS_ERR_INVAL;
+    }
+
+    if (walk) {
+        int err = lfs_path_walk_visit(lfs, walk, dir, tag);
+        if (err) {
+            return err;
+        }
     }
 
     while (true) {
@@ -1585,9 +1662,22 @@ nextname:
             }
         }
 
+        // stafeto: the entry is found and its pair is in dir
+        if (walk) {
+            int err = lfs_path_walk_visit(lfs, walk, dir, tag);
+            if (err) {
+                return err;
+            }
+        }
+
         // to next name
         name += namelen;
     }
+}
+
+static lfs_stag_t lfs_dir_find(lfs_t *lfs, lfs_mdir_t *dir,
+        const char **path, uint16_t *id) {
+    return lfs_dir_find_(lfs, dir, path, id, NULL);
 }
 
 // commit logic
@@ -2815,29 +2905,6 @@ static int lfs_dir_read_(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
     return true;
 }
 
-// stafeto: the custom attribute of entry id in the metadata pair dir, the
-// tail of lfs_getattr_. Sets *res to the size of the attribute, or to
-// LFS_ERR_NOATTR when the entry has none, and returns a negative error code
-// only when the pair could not be read.
-static int lfs_dir_getattr_(lfs_t *lfs, lfs_mdir_t *dir, uint16_t id,
-        uint8_t type, void *buffer, lfs_size_t size, lfs_ssize_t *res) {
-    lfs_stag_t tag = lfs_dir_get(lfs, dir, LFS_MKTAG(0x7ff, 0x3ff, 0),
-            LFS_MKTAG(LFS_TYPE_USERATTR + type,
-                id, lfs_min(size, lfs->attr_max)),
-            buffer);
-    if (tag < 0) {
-        if (tag == LFS_ERR_NOENT) {
-            *res = LFS_ERR_NOATTR;
-            return 0;
-        }
-
-        return (int)tag;
-    }
-
-    *res = lfs_tag_size(tag);
-    return 0;
-}
-
 // stafeto: lfs_dir_read_ and the custom attribute of the entry it returns,
 // taken from the metadata pair the iterator holds: no lookup by path.
 static int lfs_dir_read_attr_(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info,
@@ -3967,6 +4034,38 @@ static int lfs_stat_attr_(lfs_t *lfs, const char *path, struct lfs_info *info,
     }
 
     return lfs_dir_getattr_(lfs, &cwd, id, type, buffer, size, res);
+}
+
+// stafeto: lfs_stat_attr_ for every entry of the path in one walk of it: the attributes of the
+// root and of each entry lfs_dir_find passes go to out and buffer (size bytes each) in order, and
+// *count says how many were recorded, also when the walk fails (a missing entry, a file in the
+// middle of the path): the entries that were found before the failure are there.
+static int lfs_path_attrs_(lfs_t *lfs, const char *path, struct lfs_info *info,
+        uint8_t type, struct lfs_path_attr *out, void *buffer, lfs_size_t size,
+        lfs_size_t capacity, lfs_size_t *count) {
+    struct lfs_path_walk walk = {
+        .type = type,
+        .out = out,
+        .buffer = buffer,
+        .size = size,
+        .capacity = capacity,
+        .count = 0,
+    };
+
+    lfs_mdir_t cwd;
+    lfs_stag_t tag = lfs_dir_find_(lfs, &cwd, &path, NULL, &walk);
+    *count = walk.count;
+    if (tag < 0) {
+        return (int)tag;
+    }
+
+    // only allow trailing slashes on dirs
+    if (strchr(path, '/') != NULL
+            && lfs_tag_type3(tag) != LFS_TYPE_DIR) {
+        return LFS_ERR_NOTDIR;
+    }
+
+    return lfs_dir_getinfo(lfs, &cwd, lfs_tag_id(tag), info);
 }
 
 #ifndef LFS_READONLY
@@ -6193,6 +6292,26 @@ int lfs_stat_attr(lfs_t *lfs, const char *path, struct lfs_info *info,
     err = lfs_stat_attr_(lfs, path, info, type, buffer, size, res);
 
     LFS_TRACE("lfs_stat_attr -> %d", err);
+    LFS_UNLOCK(lfs->cfg);
+    return err;
+}
+
+int lfs_path_attrs(lfs_t *lfs, const char *path, struct lfs_info *info,
+        uint8_t type, struct lfs_path_attr *out, void *buffer, lfs_size_t size,
+        lfs_size_t capacity, lfs_size_t *count) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_path_attrs(%p, \"%s\", %p, %"PRIu8", %p, %p, %"PRIu32", "
+                "%"PRIu32", %p)",
+            (void*)lfs, path, (void*)info, type, (void*)out, buffer, size,
+            capacity, (void*)count);
+
+    err = lfs_path_attrs_(lfs, path, info, type, out, buffer, size,
+            capacity, count);
+
+    LFS_TRACE("lfs_path_attrs -> %d", err);
     LFS_UNLOCK(lfs->cfg);
     return err;
 }

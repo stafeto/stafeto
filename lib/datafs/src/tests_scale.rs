@@ -596,7 +596,9 @@ fn statfs_through_the_server_reads_nothing_after_the_first_walk() {
         proto_data::statfs(&mut w).unwrap();
         let reply = server.handle(fs, 1, 0, w.as_bytes());
         let mut r = proto_data::reply(reply.as_bytes()).unwrap();
-        (r.u64().unwrap(), r.u64().unwrap(), r.u32().unwrap())
+        let (blocks, free, avail) = (r.u64().unwrap(), r.u64().unwrap(), r.u64().unwrap());
+        assert!(avail <= free && free <= blocks);
+        (blocks, blocks - free, r.u32().unwrap())
     };
     let (blocks, used, unit) = statfs(&mut fs);
     assert_eq!((blocks, unit), (4096, 4096));
@@ -671,7 +673,7 @@ fn made(
 ) -> u32 {
     use proto_data as p;
     let h = served(server, fs, &|w| {
-        p::open(path, p::READ | p::WRITE | p::CREATE, w).unwrap()
+        p::open(path, p::READ | p::WRITE | p::CREATE, 0o644, w).unwrap()
     })
     .unwrap();
     let h = u32::from_le_bytes(h[..4].try_into().unwrap());
@@ -737,7 +739,7 @@ fn freed_blocks_are_counted_by_what_the_server_knows() {
     assert_eq!(fs.freed_estimate(), 17);
     // A directory's pair, and a failed remove counts nothing.
     served(&mut server, &mut fs, &|w| {
-        p::path_call(p::Method::Mkdir, b"/d", w).unwrap()
+        p::mkdir(b"/d", 0o755, w).unwrap()
     })
     .unwrap();
     served(&mut server, &mut fs, &|w| {
@@ -2158,11 +2160,12 @@ fn a_request_that_takes_blocks_is_named_for_the_stop_status() {
     assert!(needs_blocks(&build(&|w| p::open(
         b"/n",
         p::WRITE | p::CREATE,
+        0o644,
         w
     )
     .unwrap())));
     assert!(!needs_blocks(&build(
-        &|w| p::open(b"/n", p::READ, w).unwrap()
+        &|w| p::open(b"/n", p::READ, 0, w).unwrap()
     )));
     assert!(!needs_blocks(&build(&|w| p::pread(1, 10, 0, w).unwrap())));
     assert!(!needs_blocks(&build(&|w| p::statfs(w).unwrap())));

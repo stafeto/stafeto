@@ -835,6 +835,47 @@ is new at every boot. To make the volume larger, give the launch a mapping of th
 next boot. A different volume in the second NVMe function (the root volume where the data volume should be)
 shows another name, and the disk service leaves it alone.
 
+## The data file service
+
+This section describes what `datafs` (`services/datafs` over `lib/datafs`, protocol `proto/data`) does on this branch. The disk, the table and the first boot are described above.
+
+**Protocol version 3.** The version is `proto_data::VERSION` (3). Methods 1 to 24 are those of version 2 and never change; version 3 adds BIND, CHMOD, CHOWN, FCHMOD, FCHOWN, UTIMENS, FUTIMENS, ACCESS, WHERE, SESSION and VERIFY_SESSION (25 to 35) and the stat record of 64 bytes with a mode, an owner, a group, a file number and three times. The fifteen rules of identity, permissions, creation, times, limits and downgrade are in the text of `proto/data/src/lib.rs`; this section only summarizes them and does not restate them.
+
+**Identities.** A session has one of two kinds of client and no third. A native client of the list that init keeps has its session marked in the label (`SERVICE` set, `OWN` clear): it is user 0, group 0, with no supplementary groups and no file size limit. A POSIX program never gets the mark. Every other session is bound to a process: SESSION (through the root channel, which makes a session already bound) or BIND (on a session that CLONE made, and again after a lapse) carries a copy of the caller's identity session of the process service, and the service asks the process service through its notary session whether it vouches for it. The binding keeps the PID, the six identifiers, the supplementary groups, the file size limit and the root of the expenditure, together with the generation of the record. The generation is read again before each job, so a request sent after `setuid` returned is checked by the new identity. The binding lapses when the process service no longer vouches for the copy (the process executed a new image or exited): the session then answers NOT_BOUND to every request that needs an identity until the layer sends BIND with a fresh copy. A session made by CLONE inherits neither the mark nor the identity.
+
+**The attribute record and the closed default.** Each entry carries one user attribute (type 0x70) of exactly 48 bytes: format, owner, group, mode, file number and three times. Only a record of exactly 48 bytes is read as one. An entry with no attribute, or with an attribute of another size or format, reads as the closed default: owner 0, group 0, mode 0700 for a directory and 0600 for a file (the root 0755), and a number derived from its path. Such an entry is never rewritten by the service: a request that would write its attribute (CHMOD, CHOWN, UTIMENS, the time of a write) answers CORRUPT. A cut between the commit that names a new entry and the commit that writes its attribute leaves an entry of this kind. The root carries a format mark (type 0x66) and the counter of file numbers (type 0x69), which the service takes in blocks of `INO_BLOCK`.
+
+**The volume formats.** A volume of the 0.5 release has no attributes and no mark. At the first mount of this service, before the first request, a walk of the tree writes the closed default and a number on every entry that has none, and then the mark at the root; a cut in between starts the walk again at the next mount and the entries done keep their records. One run writes at most `CONVERT_MAX` (8192) records and goes to a depth of 32 directories; a larger tree is finished by the next mount, and deeper entries stay on the default, which is safe. A volume whose mark is above the format of this service was written by a later one: the service mounts nothing of it, writes nothing and answers NOT_READY to every request.
+
+**Limits.** The service holds 64 sessions and 64 descriptions at most. A session holds at least `HELD_MAX` (32) descriptions, a process tree at most 32 live clones, 48 distinct descriptions and 8 unspent passes; these are minimums that the service may raise inside the frozen series. A directory holds at most 1,024 entries (a create past it is NO_SPACE). A path is at most 506 bytes, which is 253 components of one letter, and a name at most 255 bytes. A file is at most 2^31 - 1 bytes. The service runs 12 jobs at once, of which 4 places are kept for native clients, and a session may have 4 in flight; a request that finds no place answers BUSY. The reserve of 64 blocks (`RESERVE_BLOCKS`): with fewer free blocks left, a caller other than user 0 gets NO_SPACE for a create, a rename and a change of attributes, and for a write after the bytes that fit, because each of these may split or compact a pair of metadata blocks. User 0 does all of them into the reserve, and UNLINK and RMDIR pass always.
+
+**Times.** The service takes the time of the next job from the page of CLOCK_REALTIME of the clock service, which it maps read-only and reads with no call. A time never goes back. A machine with no clock service (the tables of the volume probes) has no page, and the times are the monotonic count of the machine in nanoseconds since it started: small numbers that differ between boots, as if the volume were made in January 1970.
+
+**Paths: `.` and `..`.** The service drops a `.` component and an empty one, and answers INVALID for a `..` component. It walks each path once from the root, and the entries of the walk must be the components one for one. littlefs resolves `..` lexically and never looks up the name it skips, so `/a/ghost/..` would resolve to `/a` and hide that `ghost` is missing. The POSIX layer normalizes a path before it sends it. Search permission is checked on every directory the walk reached before any answer about a name, so a refused directory answers ACCESS whatever is below it.
+
+**The vendored littlefs.** The copy of littlefs in `third-party/littlefs` is the release 2.11.3 with one change: three functions that only read (`lfs_dir_read_attr`, `lfs_stat_attr`, `lfs_path_attrs`) and a split of `lfs_dir_find`, which add no field and change nothing on the disk. They let a lookup and a directory listing read the attribute of an entry from the pair already fetched. The change, its diff and its licence notes are in `third-party/littlefs/STAFETO-CHANGES.md`.
+
+**Costs.** Block reads of the host test `tests_perm::costs_of_the_common_jobs` (a user 1000, reads of 4096 bytes, one walk of the path, a read costing 0.1 ms in the derived column of the table):
+
+| Job | Reads | Programs | Erases |
+|---|---:|---:|---:|
+| stat at depth 2 | 8 | 0 | 0 |
+| stat at depth 9, cold | 29 | 0 | 0 |
+| open and close an existing file | 14 | 0 | 0 |
+| create a file with its attribute | 37 | 4 | 1 |
+| mkdir with its attribute | 23 | 4 | 1 |
+| chmod | 12 | 1 | 1 |
+| unlink | 16 | 2 | 0 |
+| rename in a directory | 28 | 2 | 0 |
+| readdir of 100 entries, all batches | 28 | 0 | 0 |
+| readdir of 1,000 entries, all batches | 197 | 0 | 0 |
+| create in a directory of 1,000, first | 759 | 3 | 0 |
+| create in it again | 572 | 3 | 1 |
+
+A walk costs about three reads a component (a cold stat at depth 200 is held under 3 * 200 + 20 reads by a test). A listing reads each entry's attribute from the iterator, so it grows with the entries and no longer with the place of an entry in the directory. Create in a large directory stays dear: the first create counts the entries of the directory (a scan of its pairs, which the service keeps for 8 directories), and every create pays the lookup of littlefs itself, which reads the pairs of the directory from the start until it finds the place of the name. A pair of metadata blocks that fills is compacted, which costs a walk of the directory's pairs every second time.
+
+**Not yet.** The POSIX layer does not use `/data` yet: the next steps of the plan connect it, with SESSION and BIND at the first open. A directory description that holds only search (opened with no access bits) keeps a slot of littlefs for as long as it is open; the volume has 16 directory slots (and 24 for files), and the service answers TABLE_FULL when they are used up.
+
 ## The package service
 
 `services/pkgd` (the service `pkgd`) keeps the packages of a running system on the disk and attaches

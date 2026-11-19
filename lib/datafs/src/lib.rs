@@ -17,6 +17,8 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod admit;
+pub mod attr;
+pub mod binding;
 pub mod fs;
 pub mod gpt;
 pub mod idle;
@@ -33,11 +35,14 @@ mod tests_entry_attr;
 #[cfg(test)]
 mod tests_open;
 #[cfg(test)]
+mod tests_perm;
+#[cfg(test)]
 mod tests_scale;
 pub mod volume;
+pub mod vouching;
 pub mod watch;
 
-pub use fs::{Dir, Entry, Error, File, Fs, Info, Kind, Open, Storage, Whence};
+pub use fs::{Dir, Entry, Error, File, Fs, Info, Kind, Open, PathEntry, Storage, Whence};
 
 use core::fmt;
 
@@ -47,8 +52,8 @@ pub const BLOCK: usize = 4096;
 /// The sectors of a block.
 pub const BLOCK_SECTORS: u64 = (BLOCK / SECTOR) as u64;
 /// The files and directories open at once.
-pub const FILES: usize = 8;
-pub const DIRS: usize = 4;
+pub const FILES: usize = 24;
+pub const DIRS: usize = 16;
 /// The longest name of one component, in bytes.
 pub const NAME_MAX: usize = 255;
 /// The smallest volume that holds the file system: the superblock pair and room to write.

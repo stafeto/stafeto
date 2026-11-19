@@ -487,6 +487,17 @@ pub const DATAFS: Record = Record {
     broken_after: Some((6, 2)),
 };
 
+/// The data file service in the tables that have the clock service: it also connects to `clock`, whose
+/// page of CLOCK_REALTIME stamps the times of files. The tables of the probes of the volume have no
+/// clock service and keep `DATAFS`, whose times the service stamps from its own count. Its identity
+/// questions go to the process service through the notary session init gives a service of `VOUCHERS`
+/// that asks for `posix` by name (`connects` has no `posix`: a record that connects to it is a POSIX
+/// process, and a notary session goes to no such record).
+pub const DATAFS_CLOCKED: Record = Record {
+    connects: &["datadisk", "clock"],
+    ..DATAFS
+};
+
 /// The probe of the data file service (tests/data-probe): a client at 30 with a session of the
 /// service by name. It starts when the service said READY, the volume mounted or not.
 pub const DATA_PROBE: Record = Record {

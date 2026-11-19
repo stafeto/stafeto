@@ -62,7 +62,7 @@ pub const STOP_TABLE: &[Record] = &[
     super::ramfs::POSIX_ABI_TABLE[2],
     super::aws::ENTROPY,
     super::pkg::NVME_QEMU_DATA,
-    super::pkg::DATAFS,
+    super::pkg::DATAFS_CLOCKED,
     posix_program("stop-handle", b"relibc-stop\0handle\0", true),
     posix_program("stop-ignore", b"relibc-stop\0ignore\0", false),
     // The writer is in the last tier of the stop (`log`: the tier of the console), so its session
