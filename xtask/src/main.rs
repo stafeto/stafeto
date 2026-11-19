@@ -10848,6 +10848,7 @@ fn host_tests() -> Result<(), String> {
         "tools/test_ca_bundle.py",
         "tools/test_build_freetype.py",
         "tools/test_build_lvgl.py",
+        "tools/test_lvgl_port.py",
         "tools/test_pkg_source.py",
         "tools/test_pkg_mirror.py",
         "tools/test_dist.py",

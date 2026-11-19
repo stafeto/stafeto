@@ -20,8 +20,10 @@ target/lvgl/lvgl-<version> (with `-I` for it, ports/lvgl and
 target/freetype/include); the font and the licences are copied to
 target/lvgl/ (LiberationSans-Regular.ttf, LiberationSans-LICENSE.txt,
 LICENCE.txt). `--host` builds the same files with the compiler of the host
-(`-funsigned-char`, as the char of AArch64 Linux, which the guest build has too) into target/lvgl/host/, for
-the sample that compares the host's pixels with the guest's.
+(`-funsigned-char`, as the char of AArch64 Linux, which the guest build has too)
+into target/lvgl/host/ and then the reference program target/lvgl/host/lvgl-ref
+(tools/lvgl-ref/main.c with the demo of ports/lvgl), whose CRCs the probe of the
+guest compares with.
 
 FreeType (tools/build-freetype.py, run first) is what the library's font
 module links; its library and headers are those of target/freetype.
@@ -151,6 +153,51 @@ OFF_NAMES = (
 )
 
 
+# The files of the port the library is built from.
+LIBRARY_PORT = ("lv_conf.h", "lv_assert_handler.h")
+# The reference program of the host (tools/lvgl-ref): the demo, its schedule,
+# key table and CRC, with the host's LVGL and FreeType.
+HOST_DIR = WORK / "host"
+REFERENCE = HOST_DIR / "lvgl-ref"
+REFERENCE_SOURCES = ("demo.c", "schedule.c", "keys.c", "crc.c")
+
+
+def reference_flags(port_dir: Path) -> list[str]:
+    """The flags of the host build of the library and the reference: the char
+    of AArch64 Linux, wrapping overflow, no fused multiply-add."""
+    return ["-std=gnu11", "-O2", "-funsigned-char", "-fwrapv", "-ffp-contract=off",
+            f"-I{port_dir}", f"-I{HOST_DIR / SOURCE_DIR}",
+            f"-I{ROOT / 'target' / 'freetype' / 'host' / 'include'}"]
+
+
+def build_reference(port_dir: Path = PORT_DIR, output: Path = REFERENCE,
+                    main: Path = ROOT / "tools" / "lvgl-ref" / "main.c") -> Path:
+    """Build the reference program from the sources of `port_dir` and the
+    host's libraries (built by `build-lvgl.py --host`); the path of the
+    program. Rebuilt only when a source, the compiler flags or a library
+    changed."""
+    library = HOST_DIR / "liblvgl.a"
+    ft = ROOT / "target" / "freetype" / "host" / "libfreetype.a"
+    if not library.exists() or not ft.exists():
+        raise SystemExit("build the libraries first: tools/build-lvgl.py --host")
+    sources = [port_dir / name for name in REFERENCE_SOURCES] + [main]
+    headers = sorted(port_dir.glob("*.h"))
+    text = sha256(b"".join(p.read_bytes() for p in sources + headers + [library, ft, Path(__file__)])
+                  ).hexdigest() + "\n"
+    stamp = output.with_suffix(".stamp")
+    if output.exists() and stamp.exists() and stamp.read_text() == text:
+        print(f"lvgl-ref ready: {output}")
+        return output
+    clang = freetype.tool("clang", "llvm")
+    log = output.with_suffix(".log")
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("")
+    run(log, clang, *reference_flags(port_dir), *sources, library, ft, "-o", output)
+    stamp.write_text(text)
+    print(f"lvgl-ref ready: {output}")
+    return output
+
+
 def run(log: Path, *args, cwd: Path | None = None) -> None:
     freetype.run(log, *args, cwd=cwd)
 
@@ -236,7 +283,9 @@ def sources(root: Path) -> list[Path]:
 
 def main() -> None:
     script = sha256(Path(__file__).read_bytes()).hexdigest()
-    port = sha256(b"".join(p.read_bytes() for p in sorted(PORT_DIR.rglob("*")) if p.is_file())).hexdigest()
+    # The library depends on its configuration files only; the sources of the
+    # demo (the rest of ports/lvgl) are the reference program's business.
+    port = sha256(b"".join((PORT_DIR / name).read_bytes() for name in LIBRARY_PORT)).hexdigest()
     libc = RELIBC / "lib" / "libc.a"
     if not HOST and (not (RELIBC / "include" / "stdio.h").exists() or not libc.exists()):
         raise SystemExit("build relibc with cargo xtask relibc first")
@@ -251,6 +300,8 @@ def main() -> None:
     text += "\n"
     if stamp.exists() and stamp.read_text() == text and OUTPUT.exists():
         print(f"lvgl ready: {OUTPUT}")
+        if HOST:
+            build_reference()
         return
     archive = fetch()
     shutil.rmtree(BUILD, ignore_errors=True)
@@ -308,6 +359,8 @@ def main() -> None:
     shutil.copy(root / "LICENCE.txt", BUILD / "LICENCE.txt")
     stamp.write_text(text)
     print(f"lvgl ready: {OUTPUT}")
+    if HOST:
+        build_reference()
 
 
 if __name__ == "__main__":
