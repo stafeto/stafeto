@@ -4073,6 +4073,10 @@ mod tests {
     #[test]
     fn the_games_table_is_the_dialog_with_the_quota_of_doom() {
         assert!(check(doom::TABLE).is_ok());
+        // The compositor of the games image runs free (no frame clock), so
+        // that the frames a second of `doom-measure` stay comparable.
+        let compositor = doom::TABLE.iter().find(|r| r.name == "gpu").unwrap();
+        assert_eq!(compositor.args, comp::FREE_RUN);
         let games = order_of(doom::TABLE);
         let at = |name: &str| games.iter().position(|&n| n == name).unwrap();
         assert!(at("input") < at("display"));
