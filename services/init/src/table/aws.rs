@@ -854,7 +854,11 @@ mod tests {
         const KERNEL_PAGES: u64 = (64 << 20) / PAGE;
         const INIT_FREE: u64 = crate::table::base::INIT_RESERVE_PAGES;
         let held = pages_held(TABLE);
-        let need = held + IMAGE_PAGES + KERNEL_PAGES + INIT_FREE;
+        // The segments of the programs are paid at the load besides the quotas, and the 96 MiB of
+        // the image are the files; the zeroed statics are not in them. The data file service's
+        // allocator window is the one that grew with the volume: 128 KiB for a volume of 4 GiB.
+        const DATAFS_WINDOW_PAGES: u64 = 32;
+        let need = held + IMAGE_PAGES + KERNEL_PAGES + INIT_FREE + DATAFS_WINDOW_PAGES;
         assert!(
             need <= T4G_SMALL_PAGES,
             "the table holds {held} pages and with the image, the kernel and init's free pages {need} of the {T4G_SMALL_PAGES} of a t4g.small"

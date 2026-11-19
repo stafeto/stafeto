@@ -10,6 +10,10 @@ use core::fmt;
 
 /// The longest path the interface takes, in bytes (the file service's `MAX_PATH`).
 pub const PATH_MAX: usize = 511;
+/// The most blocks of a volume the allocator's window covers: one bit for each, in 128 KiB (4 GiB).
+/// A larger volume would walk the tree on every STATFS and every wrap of the allocator, so
+/// `volume::open` refuses it.
+pub const BLOCKS_MAX: u64 = 1 << 20;
 /// The bytes of memory a volume uses at most (`Storage`); the C structure is checked against it.
 pub const STORAGE_BYTES: usize = (56 + 128) * 1024;
 
@@ -517,16 +521,40 @@ impl<'a, D: Device> Fs<'a, D> {
         if capacity < self.blocks() {
             return Ok(self.blocks().saturating_sub(self.used_blocks()?));
         }
-        if u64::from(self.window_state().2) != self.blocks() {
+        // An empty window (after the mount, or after a walk that was stopped) is filled by a walk.
+        // A window that was filled in the middle of a request is as long as the checkpoint allowed
+        // (shorter than the volume at times); its bits give a count that is low, never high, and the
+        // worker walks again in the idle (`Fs::window_short`).
+        if self.window_state().2 == 0 {
             self.walk()?;
         }
         Ok(self.window_free())
     }
 
-    /// The blocks that removes and truncations gave back since the last walk, estimated from the
-    /// sizes of the files (a file's blocks, rounded up). The worker walks again when it is large.
+    /// The window is filled and holds less than the volume: the allocator walked in the middle of a
+    /// request and the checkpoint cut the window short. The free count from the bits is low until
+    /// a walk fills it whole.
+    pub fn window_short(&self) -> bool {
+        let size = u64::from(self.window_state().2);
+        size != 0 && size < self.blocks()
+    }
+
+    /// The blocks that removes, truncations and renames over a file gave back since the last walk,
+    /// as far as the callers told (`note_freed_file`, `note_freed_blocks`) and truncation counts. The
+    /// worker walks again in the idle when it is large and the window is low.
     pub fn freed_estimate(&self) -> u64 {
         self.freed
+    }
+
+    /// A file of `bytes` left the tree: its blocks come back at the next walk. A file small enough to
+    /// live inside its directory's metadata (`INLINE_MAX` bytes or fewer) owns no block.
+    pub fn note_freed_file(&mut self, bytes: u64) {
+        self.freed += file_blocks(bytes);
+    }
+
+    /// `blocks` blocks came back (a directory's pair, for one).
+    pub fn note_freed_blocks(&mut self, blocks: u64) {
+        self.freed += blocks;
     }
 
     pub fn open(&mut self, path: &[u8], flags: Open) -> Res<File> {
@@ -578,7 +606,7 @@ impl<'a, D: Device> Fs<'a, D> {
         let before = self.size(file).unwrap_or(0);
         // SAFETY: as above.
         check(self.call(|d, ctx| unsafe { datafs_truncate(d, ctx, c_int::from(file.0), size) }))?;
-        self.freed += blocks_of(before).saturating_sub(blocks_of(u64::from(size)));
+        self.freed += file_blocks(before).saturating_sub(file_blocks(u64::from(size)));
         Ok(())
     }
 
@@ -595,20 +623,9 @@ impl<'a, D: Device> Fs<'a, D> {
 
     /// Removes a file or an empty directory.
     pub fn remove(&mut self, path: &[u8]) -> Res<()> {
-        let gives = match self.stat(path) {
-            Ok(Info {
-                kind: Kind::File,
-                size,
-            }) => blocks_of(u64::from(size)),
-            // A directory of two blocks, and the entry.
-            Ok(_) => 2,
-            Err(_) => 0,
-        };
         let path = CPath::new(path)?;
         // SAFETY: as above.
-        check(self.call(|d, ctx| unsafe { datafs_remove(d, ctx, path.ptr()) }))?;
-        self.freed += gives;
-        Ok(())
+        check(self.call(|d, ctx| unsafe { datafs_remove(d, ctx, path.ptr()) })).map(drop)
     }
 
     /// Renames, replacing a file or an empty directory at `to` of the same kind. One commit of the
@@ -709,6 +726,19 @@ fn kind_of(kind: u8) -> Res<Kind> {
         1 => Ok(Kind::File),
         2 => Ok(Kind::Directory),
         _ => Err(Error::Corrupt),
+    }
+}
+
+/// The largest file littlefs keeps inside the metadata of its directory: the smaller of the cache
+/// (4096), the attribute limit (1022) and an eighth of the block (512). Such a file owns no block.
+pub const INLINE_MAX: u64 = 512;
+
+/// The blocks a file of `bytes` owns: none when it is inline, else its bytes in blocks, rounded up.
+pub const fn file_blocks(bytes: u64) -> u64 {
+    if bytes <= INLINE_MAX {
+        0
+    } else {
+        blocks_of(bytes)
     }
 }
 

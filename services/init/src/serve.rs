@@ -1449,8 +1449,11 @@ impl Init {
         };
         match verdict {
             None => println!("init: {name} {what}, not restarted"),
-            Some(Verdict::Broken) if self.stuck_streak(place) => {
-                println!("init: {name} {what}; stuck twice in a row, marked broken")
+            Some(Verdict::Broken) if self.exit_streak(place).is_some() => {
+                let (code, times) = self.exit_streak(place).unwrap_or_default();
+                println!(
+                    "init: {name} {what}; exit code {code} {times} times in a row, marked broken"
+                )
             }
             Some(Verdict::Broken) => println!(
                 "init: {name} {what}; broken: {BREAK_AFTER} failures in {} s",
@@ -1463,12 +1466,13 @@ impl Init {
         self.settle(place, gone, verdict, work);
     }
 
-    /// The record at `place` has a `broken_after` rule and its last failures were that exit code
-    /// as many times as the rule says.
-    fn stuck_streak(&self, place: usize) -> bool {
-        table::table()[place]
-            .broken_after
-            .is_some_and(|(_, times)| self.entries[place].failures.same_code() >= times)
+    /// The exit code and the count of the streak that marked the record at `place` broken: it has
+    /// a `broken_after` rule and its last failures were that exit code as many times as the rule
+    /// says.
+    fn exit_streak(&self, place: usize) -> Option<(u64, u32)> {
+        let (code, times) = table::table()[place].broken_after?;
+        let seen = self.entries[place].failures.same_code();
+        (seen >= times).then_some((code, seen))
     }
 
     /// Records a failure of the record at `place` at `now`, of an instance

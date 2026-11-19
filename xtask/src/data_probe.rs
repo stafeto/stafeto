@@ -188,10 +188,11 @@ fn datafs_line(lines: &[String], prefix: &str) -> Option<String> {
 }
 
 /// The line of the first walk of the volume (`datafs: first walk N blocks used, M reads, T ms`, or
-/// that a request made it), which the worker prints once after READY, when its queue is empty. The
+/// that a request or the mount work made it), which the worker prints once after READY, when its queue
+/// is empty (a walk that a request stopped is tried again and prints its line when it ends). The
 /// lines of the services come glued to the lines of a step under -icount, so the text is looked for
 /// inside the line. Returns the text from `first walk` on.
-fn first_walk(lines: &[String], what: &str) -> Result<String, String> {
+pub(crate) fn first_walk(lines: &[String], what: &str) -> Result<String, String> {
     let said: Vec<&str> = lines
         .iter()
         .filter_map(|l| l.find("datafs: first walk ").map(|at| &l[at..]))

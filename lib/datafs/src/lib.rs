@@ -19,6 +19,7 @@
 pub mod admit;
 pub mod fs;
 pub mod gpt;
+pub mod idle;
 #[cfg(any(test, feature = "model"))]
 pub mod mem;
 pub mod server;

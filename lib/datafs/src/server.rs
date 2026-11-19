@@ -345,6 +345,26 @@ pub fn bump_epoch<D: Device>(fs: &mut Fs<'_, D>) -> Result<u32, Error> {
     Ok(next)
 }
 
+/// Whether the request may take blocks from the allocator: a write, a new directory, a file made or
+/// grown, a rename (which may split a directory). With an empty window such a request walks the
+/// whole volume to find its blocks; the worker answers it with the stop status instead while the
+/// service stops (`services/datafs`), where a walk would not fit in the time of the stop.
+pub fn needs_blocks(request: &[u8]) -> bool {
+    let mut r = Reader::new(request);
+    let Ok(header) = Header::read(&mut r) else {
+        return false;
+    };
+    match Method::from_number(header.method) {
+        Some(
+            Method::Write | Method::Pwrite | Method::Mkdir | Method::Truncate | Method::Rename,
+        ) => true,
+        Some(Method::Open) => r
+            .u32()
+            .is_ok_and(|flags| flags & (p::CREATE | p::TRUNCATE) != 0),
+        _ => false,
+    }
+}
+
 /// Deals with what a stop or a cut of the power left under `ORPHANS`, once after the mount and
 /// before the first request. A file that a rename over an open file moved there carries a mark
 /// (its token, which its name spells, and its home name): when the home name is missing, the rename
@@ -630,13 +650,19 @@ impl Server {
         }
         let n = *n;
         self.nodes[ni].used = false;
+        // The size of an orphan, before its file closes: the bytes it held come back with its name.
+        let size = if n.orphan && !n.broken {
+            fs.size(File(n.slot)).unwrap_or(0)
+        } else {
+            0
+        };
         let closed = if n.broken {
             Ok(())
         } else {
             fs.close(File(n.slot))
         };
-        if n.orphan {
-            let _ = fs.remove(n.path.get());
+        if n.orphan && fs.remove(n.path.get()).is_ok() {
+            fs.note_freed_file(size);
         }
         closed
     }
@@ -970,12 +996,24 @@ impl Server {
                     if self.dir_in_use(path) {
                         return Err(p::code(p::BUSY));
                     }
-                    return volume(fs.remove(path));
+                    let removed = volume(fs.remove(path));
+                    if removed.is_ok() {
+                        // The two blocks of its pair come back at the next walk.
+                        fs.note_freed_blocks(2);
+                    }
+                    return removed;
                 }
                 match self.node_at(path) {
-                    // Open: the descriptions keep the file, which leaves the tree.
+                    // Open: the descriptions keep the file, which leaves the tree; its blocks are
+                    // counted when the last description closes (`node_unref`).
                     Some(ni) => self.orphan(fs, ni, None),
-                    None => volume(fs.remove(path)),
+                    None => {
+                        let removed = volume(fs.remove(path));
+                        if removed.is_ok() {
+                            fs.note_freed_file(u64::from(info.size));
+                        }
+                        removed
+                    }
                 }
             }
             Method::Rename => {
@@ -991,7 +1029,8 @@ impl Server {
                 visible(to)?;
                 // The kinds must agree, as rename(2) has it.
                 let source = volume(fs.stat(from))?;
-                match fs.stat(to) {
+                let replaced = fs.stat(to);
+                match replaced {
                     Ok(target) if target.kind != source.kind => {
                         return Err(p::code(match target.kind {
                             Kind::Directory => p::IS_DIRECTORY,
@@ -1025,6 +1064,10 @@ impl Server {
                     Some(ni) => self.move_node(fs, ni, to, None),
                     None => volume(fs.rename(from, to)),
                 };
+                // A file the rename replaced and that nobody had open gave its blocks back.
+                if let (Ok(()), None, Ok(old)) = (&moved, target, replaced) {
+                    fs.note_freed_file(u64::from(old.size));
+                }
                 if let Some(t) = target {
                     let at = self.nodes[t].path;
                     match &moved {

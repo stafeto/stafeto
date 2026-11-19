@@ -7,10 +7,11 @@
 //! caught in a loop on a damaged volume. A job can legitimately run for minutes (the walk of the
 //! whole file system that fills the allocator's window: the first one after the mount, the refresh
 //! walk after many removals, and the one a write or `Statfs` makes when it arrives first; a volume
-//! of 2 GiB takes 14 to 50 s at 10,000 reads a second), so the age of a job tells nothing. What a healthy worker does all the time is complete disk calls. The worker
-//! stamps the instant of every completed disk call, and the request thread ends the service when a
-//! job is in the table and no disk call has completed for `STUCK_NS`: init starts a new instance,
-//! which mounts the volume again.
+//! of 2 GiB takes 14 to 50 s at 10,000 reads a second), so the age of a job tells nothing. What a
+//! healthy worker does all the time is complete disk calls. The worker stamps the instant of every
+//! completed disk call, and the request thread ends the service when a job is in the table and no
+//! disk call has completed for `STUCK_NS`: init starts a new instance, which mounts the volume
+//! again.
 
 /// The longest the worker may go without completing a disk call while a job is in the table: 20 s.
 /// One disk call (at most 16 KiB, or a flush) takes milliseconds on a healthy volume and a bounded

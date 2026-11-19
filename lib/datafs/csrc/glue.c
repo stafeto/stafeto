@@ -9,6 +9,8 @@
 
 #include "lfs.h"
 
+// The label of a cache that holds no block (littlefs's own LFS_BLOCK_NULL, which lfs.c keeps private).
+#define NO_BLOCK ((lfs_block_t)-1)
 #define BLOCK 4096u
 #define SECTOR 512u
 // The allocator's window holds one bit for every block of the volume, up to this many bytes (the
@@ -51,11 +53,35 @@ size_t datafs_state_align(void) { return _Alignof(struct datafs); }
 int datafs_files(void) { return DATAFS_FILES; }
 int datafs_dirs(void) { return DATAFS_DIRS; }
 
+// littlefs labels a read cache with the block, offset and size of a read before it calls the
+// device, and keeps the label when the read fails, so the next read of that block would take the
+// stale bytes of the cache for the block. When a read fails, the caches that carry its block lose
+// the label: the cache of the volume, and the cache of an open file that is reading (a file that is
+// writing keeps its cache: that holds data not yet written). Every entry point of this file that
+// reads goes through here, so a failed read (a device that failed, a walk stopped on purpose, a
+// stop notice) leaves a state that can be used on.
+static void forget_failed_read(struct datafs *d, lfs_block_t block)
+{
+    if (d->lfs.rcache.block == block) {
+        d->lfs.rcache.block = NO_BLOCK;
+    }
+    for (int i = 0; i < DATAFS_FILES; i++) {
+        if (d->file_used[i] && (d->file[i].flags & LFS_F_READING) &&
+            d->file[i].cache.block == block) {
+            d->file[i].cache.block = NO_BLOCK;
+        }
+    }
+}
+
 static int dev_read(const struct lfs_config *c, lfs_block_t block, lfs_off_t off, void *buffer,
                     lfs_size_t size)
 {
     struct datafs *d = c->context;
-    return datafs_rs_read(d->ctx, block, off, buffer, size);
+    int err = datafs_rs_read(d->ctx, block, off, buffer, size);
+    if (err) {
+        forget_failed_read(d, block);
+    }
+    return err;
 }
 
 static int dev_prog(const struct lfs_config *c, lfs_block_t block, lfs_off_t off,
@@ -168,7 +194,13 @@ int datafs_walk(struct datafs *d, void *ctx)
     d->lfs.lookahead.size = 0;
     d->lfs.lookahead.next = 0;
     d->lfs.lookahead.ckpoint = d->lfs.block_count;
-    return lfs_fs_gc(&d->lfs);
+    int err = lfs_fs_gc(&d->lfs);
+    if (err) {
+        // A walk that failed (or was stopped) leaves the window empty (littlefs drops it) and
+        // no cache labelled with a block it did not load.
+        d->lfs.rcache.block = NO_BLOCK;
+    }
+    return err;
 }
 
 int datafs_format(struct datafs *d, void *ctx)

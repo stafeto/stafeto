@@ -73,7 +73,8 @@ impl Failures {
     /// failure ended with exit code `ended_with` (None for a fault, a kill, the watchdog's word or
     /// a start that did not load). `times` failures in a row that all ended with `code` make the
     /// record broken at once; a failure that ended in another way starts the count again, so a stuck
-    /// exit followed by an ordinary one is no streak. The record's failures also count toward
+    /// exit followed by an ordinary one is no streak, and so does a failure of an instance that lived
+    /// WINDOW_NS or longer. The record's failures also count toward
     /// BREAK_AFTER in WINDOW_NS as for any record.
     pub fn failed_with(
         &mut self,
@@ -82,6 +83,12 @@ impl Failures {
         ended_with: Option<u64>,
         broken_after: Option<(u64, u32)>,
     ) -> Verdict {
+        // An instance that lived WINDOW_NS or longer ran healthy (the same span that starts the
+        // pause again and drops old failures from the count of BREAK_AFTER): a stall after it is
+        // the first of a new streak, so two stalls weeks apart never mark the record broken.
+        if lived >= WINDOW_NS {
+            self.same_code = 0;
+        }
         let streak = match (broken_after, ended_with) {
             (Some((code, _)), Some(got)) if got == code => self.same_code.saturating_add(1),
             _ => 0,
@@ -228,6 +235,34 @@ mod tests {
         // The next stuck exit after a stuck one breaks it.
         assert_eq!(
             f.failed_with(150 * S, 25 * S, Some(STUCK), rule),
+            Verdict::Broken
+        );
+    }
+
+    #[test]
+    fn a_long_healthy_life_between_two_stuck_exits_starts_the_count_again() {
+        let rule = Some((STUCK, 2));
+        let mut f = Failures::new();
+        let day = 86_400 * S;
+        // A stall, then a long healthy life, then a stall weeks later: restarted, counted as the first.
+        assert!(matches!(
+            f.failed_with(day, 25 * S, Some(STUCK), rule),
+            Verdict::Restart { .. }
+        ));
+        assert_eq!(f.same_code(), 1);
+        let later = f.failed_with(20 * day, 19 * day, Some(STUCK), rule);
+        assert_eq!(later, Verdict::Restart { pause_ns: 100 * MS });
+        assert_eq!(f.same_code(), 1);
+        // The next stall right after it is the second of the streak.
+        assert_eq!(
+            f.failed_with(20 * day + 30 * S, 25 * S, Some(STUCK), rule),
+            Verdict::Broken
+        );
+        // A life of one nanosecond under the window does not reset.
+        let mut g = Failures::new();
+        g.failed_with(0, 25 * S, Some(STUCK), rule);
+        assert_eq!(
+            g.failed_with(2 * WINDOW_NS, WINDOW_NS - 1, Some(STUCK), rule),
             Verdict::Broken
         );
     }
