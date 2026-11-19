@@ -795,6 +795,100 @@ pub fn band_splits(lines: &[String], tag: &str) -> Vec<BandSplit> {
     out
 }
 
+/// The line `service band floor: T layers L n N total least A compose C ops O
+/// above-gate G`: for the bands of L layers, the band whose own code took least (the
+/// floor: what a band costs when nothing else happened in it), the ticks of its
+/// `compose` and of its operations, and how many bands passed the gate of a band
+/// (a preempted band does too).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BandFloor {
+    pub layers: u64,
+    pub n: u64,
+    pub least: u64,
+    pub compose: u64,
+    pub ops: u64,
+    pub above_gate: u64,
+}
+
+impl BandFloor {
+    fn parse(line: &str, tag: &str) -> Option<BandFloor> {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let [
+            "service",
+            "band",
+            "floor:",
+            t,
+            "layers",
+            layers,
+            "n",
+            n,
+            "total",
+            "least",
+            a,
+            "compose",
+            c,
+            "ops",
+            o,
+            "above-gate",
+            g,
+        ] = w.as_slice()
+        else {
+            return None;
+        };
+        if *t != tag {
+            return None;
+        }
+        Some(BandFloor {
+            layers: layers.parse().ok()?,
+            n: n.parse().ok()?,
+            least: a.parse().ok()?,
+            compose: c.parse().ok()?,
+            ops: o.parse().ok()?,
+            above_gate: g.parse().ok()?,
+        })
+    }
+}
+
+/// The last floor line of each count of layers of the service `tag`.
+pub fn band_floors(lines: &[String], tag: &str) -> Vec<BandFloor> {
+    let mut out: Vec<BandFloor> = Vec::new();
+    for c in lines.iter().filter_map(|l| BandFloor::parse(l, tag)) {
+        match out.iter_mut().find(|o| o.layers == c.layers) {
+            Some(old) => *old = c,
+            None => out.push(c),
+        }
+    }
+    out.sort_by_key(|b| b.layers);
+    out
+}
+
+/// The bands by layers and their floors, told together: the split of each count
+/// and the least band of it, which tells whether a band over the gate is the
+/// band of its scene or an excess that came to it.
+pub fn band_report(lines: &[String], tag: &str) -> String {
+    let floors = band_floors(lines, tag);
+    let text = band_split_text(&band_splits(lines, tag));
+    if floors.is_empty() {
+        return text;
+    }
+    let parts: Vec<String> = floors
+        .iter()
+        .map(|f| {
+            format!(
+                "{} layers ({} bands): the least band {} ticks of which compose {} and the operations {}, {} past the gate {}",
+                f.layers,
+                f.n,
+                f.least,
+                f.compose,
+                f.ops,
+                f.above_gate,
+                compositor::BAND_GATE
+            )
+        })
+        .collect();
+    format!("{text}; floors of the bands: {}", parts.join("; "))
+}
+
 /// The bands the service made, by layers: what a band spends around its
 /// operations (`compose` less the calls, least and greatest, the greatest includes a
 /// preemption in the middle), and the band whose own code took longest: its ticks,
@@ -1111,7 +1205,7 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         raster_text(&raster_costs(&output.lines, COMP_TAG)),
         calibration_text(&calibrations(&output.lines, COMP_TAG)),
         fit_text(&shape_costs(&output.lines, COMP_TAG)),
-        band_split_text(&band_splits(&output.lines, COMP_TAG))
+        band_report(&output.lines, COMP_TAG)
     );
     Ok(())
 }
@@ -1451,6 +1545,30 @@ mod tests {
             "8 layers (200 bands): around the operations 3000..3500 ticks, the model's 2948 (375..437 a layer)"
         ));
         assert!(band_split_text(&[]).contains("no lines"));
+    }
+
+    #[test]
+    fn the_floor_of_the_bands_is_read_and_told_with_the_split() {
+        let lines: Vec<String> = [
+            "service band floor: 17 layers 8 n 1 total least 15900 compose 14800 ops 12000 above-gate 1",
+            "service band floor: 17 layers 8 n 4 total least 15400 compose 14300 ops 11800 above-gate 3",
+            "service band floor: 12 layers 8 n 1 total least 1 compose 1 ops 1 above-gate 0",
+            "service band floor: 17 layers 8 n 4 total least 15400",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let floors = band_floors(&lines, COMP_TAG);
+        assert_eq!(floors.len(), 1);
+        assert_eq!(
+            (floors[0].n, floors[0].least, floors[0].above_gate),
+            (4, 15_400, 3)
+        );
+        let text = band_report(&lines, COMP_TAG);
+        assert!(text.contains(
+            "8 layers (4 bands): the least band 15400 ticks of which compose 14300 and the operations 11800, 3 past the gate 16328"
+        ));
+        // The line of the split keeps its own fields.
+        assert!(band_splits(&lines, COMP_TAG).is_empty());
     }
 
     #[test]

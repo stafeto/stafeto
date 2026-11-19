@@ -127,6 +127,14 @@ pub mod cost {
         total_greatest: AtomicU64,
         compose_at_greatest: AtomicU64,
         ops_at_greatest: AtomicU64,
+        /// The band whose own code took least (the floor of the count of
+        /// layers: what a band costs when nothing else happened in it), its
+        /// `compose` and operations, and how many bands passed the gate of a
+        /// band (a preempted band does too).
+        total_least: AtomicU64,
+        compose_at_least: AtomicU64,
+        ops_at_least: AtomicU64,
+        above_gate: AtomicU64,
     }
 
     static SPLIT: [Split; MAX_LAYERS] = [const {
@@ -137,8 +145,16 @@ pub mod cost {
             total_greatest: AtomicU64::new(0),
             compose_at_greatest: AtomicU64::new(0),
             ops_at_greatest: AtomicU64::new(0),
+            total_least: AtomicU64::new(u64::MAX),
+            compose_at_least: AtomicU64::new(0),
+            ops_at_least: AtomicU64::new(0),
+            above_gate: AtomicU64::new(0),
         }
     }; MAX_LAYERS];
+    /// A count of two layers or more has made its 1st, 2nd, 4th, 8th... band:
+    /// the lines of the bands are told, whatever the frame (the bands of a long
+    /// frame of the overload come after the frames the totals are told at).
+    static BANDS_DUE: AtomicU32 = AtomicU32::new(0);
     /// The operations of the band in progress: their ticks and the layers (the
     /// operations other than the black).
     static BAND_OPS: AtomicU64 = AtomicU64::new(0);
@@ -157,7 +173,18 @@ pub mod cost {
         let layers = (BAND_LAYERS.load(Ordering::Relaxed) as usize).min(MAX_LAYERS - 1);
         let s = &SPLIT[layers];
         let outside = compose.saturating_sub(ops);
-        s.n.fetch_add(1, Ordering::Relaxed);
+        let n = s.n.fetch_add(1, Ordering::Relaxed) + 1;
+        if layers >= 2 && n.is_power_of_two() {
+            BANDS_DUE.store(1, Ordering::Relaxed);
+        }
+        if total > u64::from(compositor::BAND_GATE) {
+            s.above_gate.fetch_add(1, Ordering::Relaxed);
+        }
+        if total < s.total_least.load(Ordering::Relaxed) {
+            s.total_least.store(total, Ordering::Relaxed);
+            s.compose_at_least.store(compose, Ordering::Relaxed);
+            s.ops_at_least.store(ops, Ordering::Relaxed);
+        }
         s.outside_least.fetch_min(outside, Ordering::Relaxed);
         s.outside_greatest.fetch_max(outside, Ordering::Relaxed);
         // The service is one thread: the three go together.
@@ -248,16 +275,16 @@ pub mod cost {
     /// each class: C the call in ticks, R the row and P the point in hundredths of
     /// a tick.
     pub fn tell() {
-        if DUE.swap(0, Ordering::Relaxed) == 0 {
-            return;
-        }
-        if !FRAMES.load(Ordering::Relaxed).is_power_of_two() {
+        let frames =
+            DUE.swap(0, Ordering::Relaxed) != 0 && FRAMES.load(Ordering::Relaxed).is_power_of_two();
+        let bands = BANDS_DUE.swap(0, Ordering::Relaxed) != 0;
+        if !frames && !bands {
             return;
         }
         let zero = |v: u64| if v == u64::MAX { 0 } else { v };
         for (k, name) in KINDS.iter().zip(NAMES) {
             let calls = k.calls.load(Ordering::Relaxed);
-            if calls == 0 {
+            if calls == 0 || !frames {
                 continue;
             }
             rt::println!(
@@ -292,6 +319,16 @@ pub mod cost {
                 s.total_greatest.load(Ordering::Relaxed),
                 s.compose_at_greatest.load(Ordering::Relaxed),
                 s.ops_at_greatest.load(Ordering::Relaxed),
+            );
+            // The floor of the count: the least band, with its compose and
+            // operations, and the bands past the gate (a separate line, so that
+            // the line above keeps its fields).
+            rt::println!(
+                "service band floor: 17 layers {layers} n {n} total least {} compose {} ops {} above-gate {}",
+                zero(s.total_least.load(Ordering::Relaxed)),
+                s.compose_at_least.load(Ordering::Relaxed),
+                s.ops_at_least.load(Ordering::Relaxed),
+                s.above_gate.load(Ordering::Relaxed),
             );
         }
     }
@@ -689,9 +726,17 @@ pub mod calibration {
 
     /// The shapes of the bands of layers, width by height, and the counts of layers
     /// (9 is eight windows and the pointer's picture, the most the service lays).
-    /// The widths are the ones a band of layers gets (a part of a line of about 100
+    /// The widths are the ones a band of layers gets (a part of a line of about 45
     /// points for eight, more lines for fewer) and a few others.
-    const LAYER_SHAPES: [(u32, u32); 6] = [(16, 1), (64, 1), (150, 1), (150, 4), (76, 8), (8, 8)];
+    const LAYER_SHAPES: [(u32, u32); 7] = [
+        (16, 1),
+        (45, 1),
+        (64, 1),
+        (150, 1),
+        (150, 4),
+        (76, 8),
+        (8, 8),
+    ];
     const LAYER_COUNTS: [usize; 5] = [1, 2, 4, 8, 9];
     /// The windows of the bands are the size of the overload's: 320 by 200 points,
     /// a stride of 1 280 bytes, painted with points of every alpha, each from a
