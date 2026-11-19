@@ -84,9 +84,6 @@ impl Server {
         self.ino_next = 0;
         self.ino_end = 0;
         // What the server remembers of directories starts empty at every mount.
-        for c in &mut self.cache {
-            c.used = false;
-        }
         for c in &mut self.counts {
             c.used = false;
         }

@@ -27,7 +27,7 @@ use crate::attr::{
     RESERVE_BLOCKS, Standing, VOLUME_FORMAT, default_attr, read_entry,
 };
 use crate::binding::{self, Binding, Caller, Root, Vouched};
-use crate::fs::{Dir, Error, File, Fs, Kind, Open, Whence};
+use crate::fs::{Dir, Error, File, Fs, Kind, Open, PathEntry, Whence};
 use crate::{BLOCK, DIRS, Device, FILES};
 use posix_perm::{self as perm, Denial, TimesRequest};
 use proto_data as p;
@@ -60,8 +60,6 @@ pub const ROOT_DESCRIPTIONS: usize = p::ROOT_DESCRIPTIONS;
 pub const DIR_ENTRIES_MAX: usize = p::DIR_ENTRIES_MAX;
 /// The passes alive at once.
 pub const PASSES: usize = 16;
-/// The directories whose attributes the server remembers between requests (the search of a path).
-const DIR_CACHE: usize = 32;
 /// The directories whose count of entries the server remembers.
 const COUNT_CACHE: usize = 8;
 /// The hidden directory of the files that are unlinked and still open.
@@ -212,13 +210,20 @@ struct Pending {
     len: usize,
 }
 
-/// A directory whose permission attributes the server remembers.
-#[derive(Clone, Copy)]
-struct Cached {
-    used: bool,
-    path: PathBuf,
-    attr: perm::Attr,
+/// The table a walk of a path fills (`Fs::path_attrs`): the root and each entry of the longest path
+/// the protocol accepts (`MAX_PATH` bytes is at most `ceil(MAX_PATH / 2)` components of one letter
+/// and a slash), with the bytes of the attribute of each. About 16 KiB, in the server's static, never
+/// on the worker's stack.
+struct PathWalk {
+    entries: [PathEntry; WALK_ENTRIES],
+    bytes: [u8; WALK_ENTRIES * WALK_EACH],
 }
+
+/// The places of the table: the root and the most components a path can have.
+const WALK_ENTRIES: usize = 1 + MAX_PATH.div_ceil(2);
+/// The bytes of attribute kept for an entry: the record of 48 bytes, with room to see that an
+/// attribute on the volume is longer (a record of exactly `ATTR_LEN` bytes is trusted, no other).
+const WALK_EACH: usize = 56;
 
 /// A directory whose count of entries the server remembers.
 #[derive(Clone, Copy)]
@@ -231,8 +236,7 @@ struct Counted {
 pub struct Server {
     descriptions: [Description; DESCRIPTIONS],
     pending: [Option<Pending>; DIRS],
-    cache: [Cached; DIR_CACHE],
-    cache_hand: usize,
+    walk: PathWalk,
     counts: [Counted; COUNT_CACHE],
     counts_hand: usize,
     /// The present moment in nanoseconds, which the service sets before each job (the clock page).
@@ -422,17 +426,10 @@ impl Server {
         Self {
             descriptions: [Description::EMPTY; DESCRIPTIONS],
             pending: [None; DIRS],
-            cache: [Cached {
-                used: false,
-                path: PathBuf::EMPTY,
-                attr: perm::Attr {
-                    kind: perm::Kind::File,
-                    mode: 0,
-                    uid: 0,
-                    gid: 0,
-                },
-            }; DIR_CACHE],
-            cache_hand: 0,
+            walk: PathWalk {
+                entries: [PathEntry::EMPTY; WALK_ENTRIES],
+                bytes: [0; WALK_ENTRIES * WALK_EACH],
+            },
             counts: [Counted {
                 used: false,
                 path: PathBuf::EMPTY,
@@ -1020,8 +1017,8 @@ impl Server {
             Method::Stat => {
                 let n = canonical(r.bytes(r.left())?, &mut path)?;
                 visible(&path[..n])?;
-                self.search(fs, &caller, false, &path[..n])?;
-                let (info, entry) = self.load(fs, &path[..n])?;
+                let found = self.lookup(fs, &caller, false, &path[..n])?;
+                let (info, entry) = found.last.ok_or_else(|| p::code(p::NO_ENTRY))?;
                 let mut attr = entry.attr;
                 let size = match self.node_at(&path[..n]) {
                     Some(ni) => {
@@ -1135,48 +1132,45 @@ impl Server {
                 let (mode, raw) = p::read_mode_path(r)?;
                 let n = canonical(raw, &mut path)?;
                 visible(&path[..n])?;
-                self.search(fs, &caller, false, &path[..n])?;
-                self.change_mode(fs, &caller, &path[..n], mode)
+                self.change_mode(fs, &caller, true, &path[..n], mode)
             }
             Method::Chown => {
                 let (uid, gid, raw) = p::read_chown(r)?;
                 let n = canonical(raw, &mut path)?;
                 visible(&path[..n])?;
-                self.search(fs, &caller, false, &path[..n])?;
-                self.change_owner(fs, &caller, &path[..n], uid, gid)
+                self.change_owner(fs, &caller, true, &path[..n], uid, gid)
             }
             Method::Utimens => {
                 let (atime, mtime, raw) = p::read_utimens(r)?;
                 let n = canonical(raw, &mut path)?;
                 visible(&path[..n])?;
-                self.search(fs, &caller, false, &path[..n])?;
-                self.change_times(fs, &caller, &path[..n], atime, mtime)
+                self.change_times(fs, &caller, true, &path[..n], atime, mtime)
             }
             Method::Fchmod => {
                 let di = self.find(si, r.u32()?)?;
                 let mode = p::read_fchmod(r)?;
                 let at = self.path_of(di)?;
-                self.change_mode(fs, &caller, at.get(), mode)
+                self.change_mode(fs, &caller, false, at.get(), mode)
             }
             Method::Fchown => {
                 let di = self.find(si, r.u32()?)?;
                 let (uid, gid) = p::read_fchown(r)?;
                 let at = self.path_of(di)?;
-                self.change_owner(fs, &caller, at.get(), uid, gid)
+                self.change_owner(fs, &caller, false, at.get(), uid, gid)
             }
             Method::Futimens => {
                 let di = self.find(si, r.u32()?)?;
                 let (atime, mtime) = p::read_futimens(r)?;
                 let at = self.path_of(di)?;
-                self.change_times(fs, &caller, at.get(), atime, mtime)
+                self.change_times(fs, &caller, false, at.get(), atime, mtime)
             }
             Method::Access => {
                 let (bits, flags, raw) = p::read_access(r)?;
                 let n = canonical(raw, &mut path)?;
                 visible(&path[..n])?;
                 let real = flags & p::ACCESS_REAL != 0;
-                self.search(fs, &caller, real, &path[..n])?;
-                let (info, entry) = self.load(fs, &path[..n])?;
+                let found = self.lookup(fs, &caller, real, &path[..n])?;
+                let (info, entry) = found.last.ok_or_else(|| p::code(p::NO_ENTRY))?;
                 if bits == 0 {
                     return Ok(());
                 }
@@ -1537,8 +1531,8 @@ impl Server {
             .iter()
             .position(|d| !d.used)
             .ok_or_else(|| p::code(p::TABLE_FULL))?;
-        // Search on every directory of the path first (rule 3).
-        self.search(fs, caller, false, path)?;
+        // One walk of the path, with search on every directory of it first (rule 3).
+        let found = self.lookup(fs, caller, false, path)?;
         let id = caller.identity(false);
         let kind = if flags & p::DIRECTORY != 0 {
             Kind::Directory
@@ -1556,7 +1550,7 @@ impl Server {
                 if flags & (p::WRITE | p::CREATE | p::TRUNCATE | p::APPEND) != 0 {
                     return Err(p::code(p::IS_DIRECTORY));
                 }
-                let (info, entry) = self.load(fs, path)?;
+                let (info, entry) = found.last.ok_or_else(|| p::code(p::NO_ENTRY))?;
                 if info.kind != Kind::Directory {
                     return Err(p::code(p::NOT_DIRECTORY));
                 }
@@ -1591,24 +1585,21 @@ impl Server {
                 if flags & p::TRUNCATE != 0 && !description.write {
                     return Err(p::code(p::INVALID));
                 }
-                let existing = match fs.stat(path) {
+                let existing = match found.last {
                     // O_CREAT with O_EXCL names an entry that exists: EEXIST, whatever it is.
-                    Ok(_) if flags & p::CREATE != 0 && flags & p::EXCLUSIVE != 0 => {
+                    Some(_) if flags & p::CREATE != 0 && flags & p::EXCLUSIVE != 0 => {
                         return Err(p::code(p::EXISTS));
                     }
-                    Ok(info) if info.kind == Kind::Directory => {
+                    Some((info, _)) if info.kind == Kind::Directory => {
                         return Err(p::code(p::IS_DIRECTORY));
                     }
-                    Ok(info) => Some(info),
-                    Err(Error::NoEntry) => None,
-                    Err(e) => return Err(status_of(e)),
+                    last => last,
                 };
                 let mut created = None;
-                if existing.is_some() {
+                if let Some((_, entry)) = existing {
                     if flags & p::CREATE != 0 && flags & p::EXCLUSIVE != 0 {
                         return Err(p::code(p::EXISTS));
                     }
-                    let entry = entry_of(fs, path, Kind::File)?;
                     let mut wanted = 0;
                     if flags & p::READ != 0 {
                         wanted |= perm::READ;
@@ -1625,7 +1616,11 @@ impl Server {
                     }
                     // A new file needs write and search on its parent, room in it, and the reserve.
                     let (parent, _) = split(path);
-                    let parent_attr = self.dir_perm(fs, parent)?;
+                    let parent_attr = found
+                        .parent
+                        .ok_or_else(|| p::code(p::NO_ENTRY))?
+                        .attr
+                        .perm(Kind::Directory);
                     perm::place_allowed(id, &parent_attr, None).map_err(denied)?;
                     self.room_in_dir(fs, parent)?;
                     self.reserve_allows(fs, caller)?;

@@ -1698,3 +1698,110 @@ fn small_rules_of_open_truncate_rename_and_bind() {
         Some(p::code(p::BAD_HANDLE))
     );
 }
+
+#[test]
+fn a_refused_directory_answers_access_before_anything_is_said_of_the_names_below_it() {
+    let mut rig = Rig::new();
+    rig.tree(0o700);
+    // /d is closed to the group: whatever is asked below it, the answer is the access error.
+    for path in [
+        &b"/d/f"[..],
+        b"/d/ghost",
+        b"/d/ghost/deeper",
+        b"/d/f/inside",
+        b"/d/sub/x",
+    ] {
+        assert_eq!(rig.stat(GROUP, path).map(drop), Err(ACCESS), "{path:?}");
+    }
+    // With search allowed the errors of the names come: a missing directory, a file in the middle.
+    rig.chmod(ROOT, b"/d", 0o755).unwrap();
+    assert_eq!(
+        rig.stat(GROUP, b"/d/ghost/deeper").map(drop),
+        Err(p::code(p::NO_ENTRY))
+    );
+    assert_eq!(
+        rig.stat(GROUP, b"/d/ghost").map(drop),
+        Err(p::code(p::NO_ENTRY))
+    );
+    assert_eq!(
+        rig.stat(GROUP, b"/d/f/inside").map(drop),
+        Err(p::code(p::NOT_DIRECTORY))
+    );
+    // A directory refused below an existing one shows its access error before the missing name.
+    rig.chmod(ROOT, b"/d/sub", 0o700).unwrap();
+    assert_eq!(rig.stat(GROUP, b"/d/sub/ghost/x").map(drop), Err(ACCESS));
+    // The create path: a missing last name in a directory the caller may not write.
+    assert_eq!(
+        rig.open(GROUP, b"/d/new", p::WRITE | p::CREATE, 0o644),
+        Err(ACCESS)
+    );
+}
+
+#[test]
+fn an_attribute_that_is_not_exactly_48_bytes_is_not_trusted() {
+    let mut rig = Rig::new();
+    rig.mkdir(ROOT, b"/d", 0o700).unwrap();
+    rig.put(ROOT, b"/d/f", 0o644, b"x");
+    // A valid record with bytes added: it is longer than a record, so it reads as the closed default
+    // (user 0, 0700 for a directory); the owner 1000 with mode 0777 it names is never seen.
+    let mut longer = Attr {
+        uid: 1000,
+        gid: 100,
+        mode: 0o777,
+        ino: 99,
+        atime: 0,
+        mtime: 0,
+        ctime: 0,
+    }
+    .to_bytes()
+    .to_vec();
+    longer.extend_from_slice(&[0u8; 8]);
+    rig.fs.setattr(b"/d", ATTR_TYPE, &longer).unwrap();
+    assert_eq!(
+        rig.stat(OWNER, b"/d/f").map(drop),
+        Err(ACCESS),
+        "a longer attribute is not a record"
+    );
+    // The root's record is read the same way: its own format.
+    let st = rig.stat(ROOT, b"/").unwrap();
+    assert_eq!((st.mode, st.uid), (0o755, 0));
+}
+
+/// A chain of `depth` directories named `a`, and the path to the last.
+fn deep(rig: &mut Rig, depth: usize) -> Vec<u8> {
+    let mut path = Vec::new();
+    for _ in 0..depth {
+        path.extend_from_slice(b"/a");
+        rig.mkdir(ROOT, &path, 0o755).unwrap();
+    }
+    path
+}
+
+#[test]
+fn a_cold_stat_at_depth_200_costs_about_three_reads_a_level_and_depth_253_is_accepted() {
+    let mut rig = Rig::new();
+    let path = deep(&mut rig, 200);
+    rig.fs.unmount().unwrap();
+    let device = rig.fs.into_device();
+    let mut rig = Rig::on(device);
+    rig.fs.walk().unwrap();
+    let before = rig.fs.device().reads;
+    rig.stat(OTHER, &path).unwrap();
+    let reads = rig.fs.device().reads - before;
+    assert!(
+        reads <= 3 * 200 + 20,
+        "a cold stat of depth 200 read {reads} blocks"
+    );
+    // The longest path the protocol takes (506 bytes, 253 components) walks too: no name-too-long.
+    let mut rig = Rig::new();
+    let longest = deep(&mut rig, 253);
+    assert_eq!(longest.len(), p::MAX_PATH);
+    assert!(rig.stat(OTHER, &longest).is_ok());
+    // One more is too long for the protocol before it reaches the walk.
+    let mut over = longest.clone();
+    over.extend_from_slice(b"/a");
+    assert_eq!(
+        rig.stat(OTHER, &over).map(drop),
+        Err(p::code(p::NAME_TOO_LONG))
+    );
+}

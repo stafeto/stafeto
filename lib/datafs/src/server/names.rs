@@ -11,72 +11,115 @@ use super::*;
 impl Server {
     // ---- The attribute of an entry, the search of a path, and what a directory holds ----
 
-    /// The kind and size of the entry at `path`, and its record.
+    /// The kind and size of the entry at `path`, and its record, in one lookup (no right is checked:
+    /// the callers that name a description, which has its path from the server, use this).
     pub(super) fn load<D: Device>(
         &mut self,
         fs: &mut Fs<'_, D>,
         path: &[u8],
     ) -> Res<(crate::fs::Info, Record)> {
-        let info = volume(fs.stat(path))?;
-        let entry = entry_of(fs, path, info.kind)?;
-        Ok((info, entry))
+        let mut buf = [0u8; WALK_EACH];
+        let (info, size) = volume(fs.stat_attr(path, ATTR_TYPE, &mut buf))?;
+        Ok((info, record_of(info.kind, path, size, &buf)))
     }
 
-    /// The permission attributes of the directory at `path`, from the memory of the server or the
-    /// volume. NO_ENTRY when it is not there, NOT_DIRECTORY when it is a file.
-    pub(super) fn dir_perm<D: Device>(
+    /// The kind and record of the entry a change of attributes names: by path, with search on every
+    /// directory of it; by description (the path is the server's own), with no walk of rights.
+    fn load_for_change<D: Device>(
         &mut self,
         fs: &mut Fs<'_, D>,
+        caller: &Caller,
+        by_path: bool,
         path: &[u8],
-    ) -> Res<perm::Attr> {
-        if let Some(c) = self.cache.iter().find(|c| c.used && c.path.get() == path) {
-            return Ok(c.attr);
+    ) -> Res<(crate::fs::Info, Record)> {
+        if by_path {
+            let found = self.lookup(fs, caller, false, path)?;
+            found.last.ok_or_else(|| p::code(p::NO_ENTRY))
+        } else {
+            self.load(fs, path)
         }
-        let info = volume(fs.stat(path))?;
-        if info.kind != Kind::Directory {
-            return Err(p::code(p::NOT_DIRECTORY));
-        }
-        let entry = entry_of(fs, path, Kind::Directory)?;
-        let attr = entry.attr.perm(Kind::Directory);
-        let hand = self.cache_hand;
-        self.cache_hand = (hand + 1) % DIR_CACHE;
-        self.cache[hand].used = true;
-        self.cache[hand].path.set(path);
-        self.cache[hand].attr = attr;
-        Ok(attr)
     }
 
-    /// Search permission on every directory of `path` but its last component (rule 3), with the real
-    /// or the effective identifiers.
-    pub(super) fn search<D: Device>(
+    /// Walks `path` once, from the root, and checks search permission (rule 3) with the real or the
+    /// effective identifiers on every directory the path passes, before any answer about a name:
+    /// a directory that is refused answers ACCESS whatever is below it, so a denied ancestor reveals
+    /// nothing about the names under it. The walk gives the kind and record of the root and of every
+    /// entry (`Fs::path_attrs`, about 3 reads a component, no lookup repeated).
+    ///
+    /// The path is canonical: the service takes no `.` or `..` component (`canonical` drops `.` and
+    /// answers INVALID for `..`; the POSIX layer normalises a path before it sends it, and littlefs
+    /// would resolve `/a/ghost/..` lexically without looking `ghost` up), so the entries of the
+    /// walk are the root and one for each component.
+    ///
+    /// The name at the end may be missing: `last` is then None and `parent` is the directory it
+    /// would be in (a create checks write and search on it). A missing directory above it is
+    /// NO_ENTRY, a file in the middle of the path NOT_DIRECTORY.
+    pub(super) fn lookup<D: Device>(
         &mut self,
         fs: &mut Fs<'_, D>,
         caller: &Caller,
         real: bool,
         path: &[u8],
-    ) -> Res<()> {
+    ) -> Res<Found> {
+        let comps = if path == b"/" {
+            0
+        } else {
+            path.iter().filter(|&&b| b == b'/').count()
+        };
+        let (count, status) = fs.path_attrs(
+            path,
+            ATTR_TYPE,
+            &mut self.walk.entries,
+            &mut self.walk.bytes,
+            WALK_EACH,
+        );
         let id = caller.identity(real);
-        for (i, &b) in path.iter().enumerate() {
-            if b != b'/' || path.len() == 1 {
-                continue;
+        // Search on every ancestor the walk reached, before anything is said of what follows.
+        for i in 0..count.min(comps) {
+            let kind = volume(self.walk.entries[i].kind())?;
+            if kind != Kind::Directory {
+                return Err(p::code(p::NOT_DIRECTORY));
             }
-            let dir = if i == 0 { &path[..1] } else { &path[..i] };
-            let attr = self.dir_perm(fs, dir)?;
-            if !perm::permits(id, &attr, perm::EXEC) {
+            let entry = self.walk_record(path, i, kind, comps);
+            if !perm::permits(id, &entry.attr.perm(Kind::Directory), perm::EXEC) {
                 return Err(p::code(p::ACCESS));
             }
         }
-        Ok(())
+        let parent = |this: &Self| {
+            (comps > 0 && count >= comps)
+                .then(|| this.walk_record(path, comps - 1, Kind::Directory, comps))
+        };
+        match status {
+            Ok(info) => {
+                let entry = self.walk_record(path, comps, info.kind, comps);
+                Ok(Found {
+                    last: Some((info, entry)),
+                    parent: parent(self),
+                })
+            }
+            // Only the last name is missing: every ancestor was reached.
+            Err(Error::NoEntry) if count == comps && comps > 0 => Ok(Found {
+                last: None,
+                parent: parent(self),
+            }),
+            Err(Error::NoEntry) => Err(p::code(p::NO_ENTRY)),
+            Err(e) => Err(status_of(e)),
+        }
     }
 
-    /// What the server remembers of the directories at `path` or under it is dropped: their
-    /// attributes may have changed, or the names under them moved.
+    /// The record of entry `i` of the last walk of `path` (`comps` components). An attribute of
+    /// exactly `ATTR_LEN` bytes is trusted; any other length is a record this service does not know
+    /// (it comes back zero-padded and would read as user 0), and no attribute is the default.
+    fn walk_record(&self, path: &[u8], i: usize, kind: Kind, comps: usize) -> Record {
+        let prefix = walk_prefix(path, i, comps);
+        let size = self.walk.entries[i].attr_size().unwrap_or(Some(usize::MAX));
+        let at = i * WALK_EACH;
+        record_of(kind, prefix, size, &self.walk.bytes[at..at + WALK_EACH])
+    }
+
+    /// What the server remembers of the counts of the directories at `path` or under it is dropped:
+    /// the names under them moved.
     pub(super) fn forget(&mut self, path: &[u8]) {
-        for c in &mut self.cache {
-            if c.used && within(c.path.get(), path) {
-                c.used = false;
-            }
-        }
         for c in &mut self.counts {
             if c.used && within(c.path.get(), path) {
                 c.used = false;
@@ -231,11 +274,15 @@ impl Server {
         if path == b"/" {
             return Err(p::code(p::EXISTS));
         }
-        self.search(fs, caller, false, path)?;
+        let found = self.lookup(fs, caller, false, path)?;
         let (parent, _) = split(path);
-        let parent_attr = self.dir_perm(fs, parent)?;
+        let parent_attr = found
+            .parent
+            .ok_or_else(|| p::code(p::NO_ENTRY))?
+            .attr
+            .perm(Kind::Directory);
         perm::place_allowed(caller.identity(false), &parent_attr, None).map_err(denied)?;
-        if fs.stat(path).is_ok() {
+        if found.last.is_some() {
             return Err(p::code(p::EXISTS));
         }
         self.room_in_dir(fs, parent)?;
@@ -263,10 +310,14 @@ impl Server {
         if path == b"/" {
             return Err(p::code(p::BUSY));
         }
-        self.search(fs, caller, false, path)?;
+        let found = self.lookup(fs, caller, false, path)?;
         let (parent, _) = split(path);
-        let parent_attr = self.dir_perm(fs, parent)?;
-        let (info, entry) = self.load(fs, path)?;
+        let parent_attr = found
+            .parent
+            .ok_or_else(|| p::code(p::NO_ENTRY))?
+            .attr
+            .perm(Kind::Directory);
+        let (info, entry) = found.last.ok_or_else(|| p::code(p::NO_ENTRY))?;
         perm::remove_allowed(
             caller.identity(false),
             &parent_attr,
@@ -314,29 +365,36 @@ impl Server {
         }
         visible(from)?;
         visible(to)?;
-        self.search(fs, caller, false, from)?;
-        self.search(fs, caller, false, to)?;
+        let from_found = self.lookup(fs, caller, false, from)?;
+        let to_found = self.lookup(fs, caller, false, to)?;
         let (from_parent, _) = split(from);
         let (to_parent, _) = split(to);
-        let from_attr = self.dir_perm(fs, from_parent)?;
-        let to_attr = self.dir_perm(fs, to_parent)?;
-        let (source, source_entry) = self.load(fs, from)?;
+        let from_attr = from_found
+            .parent
+            .ok_or_else(|| p::code(p::NO_ENTRY))?
+            .attr
+            .perm(Kind::Directory);
+        let to_attr = to_found
+            .parent
+            .ok_or_else(|| p::code(p::NO_ENTRY))?
+            .attr
+            .perm(Kind::Directory);
+        let (source, source_entry) = from_found.last.ok_or_else(|| p::code(p::NO_ENTRY))?;
         // A directory into its own subtree is INVALID; a file has no subtree (a path through it
         // already failed the search with NOT_DIRECTORY).
         if source.kind == Kind::Directory && within(to, from) && to != from {
             return Err(p::code(p::INVALID));
         }
-        let replaced = fs.stat(to);
-        let target_entry = match replaced {
-            Ok(target) if target.kind != source.kind => {
+        let replaced = to_found.last.map(|(info, _)| info);
+        let target_entry = match to_found.last {
+            Some((target, _)) if target.kind != source.kind => {
                 return Err(p::code(match target.kind {
                     Kind::Directory => p::IS_DIRECTORY,
                     Kind::File => p::NOT_DIRECTORY,
                 }));
             }
-            Ok(target) => Some(entry_of(fs, to, target.kind)?),
-            Err(Error::NoEntry) => None,
-            Err(error) => return Err(status_of(error)),
+            Some((_, entry)) => Some(entry),
+            None => None,
         };
         perm::rename_allowed(
             caller.identity(false),
@@ -387,7 +445,7 @@ impl Server {
                 None => volume(fs.rename(from, to)),
             };
             // A file the rename replaced and that nobody had open gave its blocks back.
-            if let (Ok(()), None, Ok(old)) = (&moved, target, replaced) {
+            if let (Ok(()), None, Some(old)) = (&moved, target, replaced) {
                 fs.note_freed_file(u64::from(old.size));
             }
             if let Some(t) = target {
@@ -427,11 +485,12 @@ impl Server {
         &mut self,
         fs: &mut Fs<'_, D>,
         caller: &Caller,
+        by_path: bool,
         path: &[u8],
         mode: u32,
     ) -> Res<()> {
         self.fold_pending(fs, path)?;
-        let (info, entry) = self.load(fs, path)?;
+        let (info, entry) = self.load_for_change(fs, caller, by_path, path)?;
         let new = perm::chmod_result(caller.identity(false), &entry.attr.perm(info.kind), mode)
             .map_err(denied)?;
         self.reserve_allows(fs, caller)?;
@@ -446,12 +505,13 @@ impl Server {
         &mut self,
         fs: &mut Fs<'_, D>,
         caller: &Caller,
+        by_path: bool,
         path: &[u8],
         uid: u32,
         gid: u32,
     ) -> Res<()> {
         self.fold_pending(fs, path)?;
-        let (info, entry) = self.load(fs, path)?;
+        let (info, entry) = self.load_for_change(fs, caller, by_path, path)?;
         let keep = |v: u32| (v != p::UID_KEEP).then_some(v);
         let owned = perm::chown_result(
             caller.identity(false),
@@ -474,12 +534,13 @@ impl Server {
         &mut self,
         fs: &mut Fs<'_, D>,
         caller: &Caller,
+        by_path: bool,
         path: &[u8],
         atime: p::TimeSpec,
         mtime: p::TimeSpec,
     ) -> Res<()> {
         self.fold_pending(fs, path)?;
-        let (info, entry) = self.load(fs, path)?;
+        let (info, entry) = self.load_for_change(fs, caller, by_path, path)?;
         let request = match (atime, mtime) {
             (p::TimeSpec::Omit, p::TimeSpec::Omit) => TimesRequest::Omit,
             (p::TimeSpec::Now, p::TimeSpec::Now) => TimesRequest::Now,
@@ -648,5 +709,44 @@ pub(super) fn stat_record(kind: Kind, size: u32, attr: &Attr, nlink: u32) -> p::
         mtime: attr.mtime,
         ctime: attr.ctime,
         nlink,
+    }
+}
+
+/// What a walk of a path found: the last name's kind and record when it is there, and the record of
+/// the directory it is in (None for the root).
+#[derive(Clone, Copy)]
+pub(super) struct Found {
+    pub last: Option<(crate::fs::Info, Record)>,
+    pub parent: Option<Record>,
+}
+
+/// The path of entry `i` of a walk: the root for 0, the path up to the end of component `i`.
+fn walk_prefix(path: &[u8], i: usize, comps: usize) -> &[u8] {
+    if i == 0 {
+        return &path[..1];
+    }
+    if i >= comps {
+        return path;
+    }
+    let end = path
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b == b'/')
+        .nth(i)
+        .map_or(path.len(), |(at, _)| at);
+    &path[..end]
+}
+
+/// The record of an entry from the size of its attribute on the volume and the bytes read. A record
+/// of exactly `ATTR_LEN` bytes is read as one; no attribute is the default; any other size is a
+/// record of another format (`usize::MAX` stands for one the walk could not size).
+fn record_of(kind: Kind, path: &[u8], size: Option<usize>, bytes: &[u8]) -> Record {
+    match size {
+        None => read_entry(kind, path, None),
+        Some(n) if n == crate::attr::ATTR_LEN => {
+            read_entry(kind, path, Some(&bytes[..crate::attr::ATTR_LEN]))
+        }
+        // A length that is not 48: a wrong-length slice, which reads as foreign.
+        Some(_) => read_entry(kind, path, Some(&bytes[..1])),
     }
 }

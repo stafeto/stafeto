@@ -14,7 +14,11 @@
 //! The service holds the files of the volume mounted at `/data`: paths are absolute from the root of
 //! the volume (`/ssh/host_key` for `/data/ssh/host_key`), canonical, with no `.` and `..`, at most
 //! `MAX_PATH` bytes (so that `/data` and a path reach `proto_fs::MAX_PATH`, 511), and each name at
-//! most `NAME_MAX`. A file is at most `FILE_MAX` bytes: an offset or size past it is TOO_BIG. An
+//! most `NAME_MAX`. The layer normalises a path before it sends it. The service drops a `.`
+//! component and an empty one, and answers INVALID for a `..` component: it walks the volume once,
+//! from the root, and the entries of that walk must be the components of the path one for one
+//! (littlefs resolves `..` lexically, without looking up the name before it, so a `..` would hide a
+//! missing directory). A file is at most `FILE_MAX` bytes: an offset or size past it is TOO_BIG. An
 //! open file or directory is a description: it has its own position and flags, and a count of the
 //! sessions (and passes) that hold it. The number of a description (a handle, one u32) is the same
 //! in every session that holds it, and a session that does not hold it gets BAD_HANDLE. A handle is
