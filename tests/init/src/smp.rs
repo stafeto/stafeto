@@ -738,7 +738,8 @@ fn ring_has_line(prefix: &[u8], n: usize) -> Result<bool, &'static str> {
 /// thread on CPU 2 writes a line, which lands in the ring of CPU 2, and CPU 0
 /// reads that ring with `log_peek_other`, as the driver of the UART does,
 /// finds the line there and in no other ring, and finds it again at the same
-/// cursor: the read changed nothing.
+/// cursor (a look moves no cursor of the ring). A third read as the console
+/// does it, from a process with no device window, is a look too.
 fn log_across_cpus() -> Outcome {
     let n = cpus()?;
     if n < 3 {
@@ -753,13 +754,16 @@ fn log_across_cpus() -> Outcome {
     let mut records: [[u8; abi::LOG_RECORD]; abi::LOG_BATCH] =
         [[0; abi::LOG_RECORD]; abi::LOG_BATCH];
     let mut found = [0u32; 8];
-    for _pass in 0..2 {
+    for pass in 0..3 {
         for (k, slot) in found.iter_mut().enumerate().take(n).skip(1) {
             let mut next = 1;
             loop {
-                let Ok((batch, after)) =
+                let read = if pass == 2 {
+                    sys::log_peek_console(&resource(), k as u64, next, &mut records)
+                } else {
                     sys::log_peek_other(&resource(), k as u64, next, &mut records)
-                else {
+                };
+                let Ok((batch, after)) = read else {
                     return Err("log_peek_other failed for a CPU that is up");
                 };
                 for r in &records[..(batch.count as usize).min(abi::LOG_BATCH)] {
@@ -776,18 +780,20 @@ fn log_across_cpus() -> Outcome {
             }
         }
     }
-    // The kth other CPU of CPU 0 is CPU k: the line is in ring 2, twice (two
-    // passes), and in no other.
+    // The kth other CPU of CPU 0 is CPU k: the line is in ring 2, three times
+    // (three passes, the last as the console reads), and in no other.
     check(
-        found[2] == 2 && found[1] == 0 && found[3] == 0,
-        "the line of CPU 2 was not in its ring alone, twice",
+        found[2] == 3 && found[1] == 0 && found[3] == 0,
+        "the line of CPU 2 was not in its ring alone, three times",
     )?;
     let past = sys::log_peek_other(&resource(), n as u64, 1, &mut records);
     check(
         past == Err(Error::InvalidArgs),
         "a peek at a CPU that does not exist was not refused",
     )?;
-    println!("smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 twice");
+    println!(
+        "smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 three times"
+    );
     Ok(())
 }
 

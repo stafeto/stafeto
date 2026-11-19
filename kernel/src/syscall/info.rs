@@ -222,20 +222,27 @@ fn label_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 /// LOG: x2 is 0 to take the records of this CPU's ring, or a cursor plus 1 to
 /// peek at them; with k > 0 in the top byte of x2 (bits 56-63, SMP stage 4)
 /// the peek reads the ring of the kth other CPU, INVALID_ARGS for a k past
-/// the CPUs. A take is of the CPU's own ring alone.
+/// the CPUs; with abi::LOG_PEEK_SEEN set as well, and a caller with a device
+/// window, it counts as shown (the ring's `seen` cursor). A take is of the
+/// CPU's own ring alone.
 fn log_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     lookup(thread, a[0], Rights::KSTATS, Object::resource)?;
     let (k, cursor) = (
         a[2] >> abi::LOG_OTHER_SHIFT,
-        a[2] & ((1 << abi::LOG_OTHER_SHIFT) - 1),
+        a[2] & (abi::LOG_PEEK_SEEN - 1),
     );
     if k != 0 {
         if cursor == 0 {
             return Err(Error::InvalidArgs);
         }
+        // Only the console, a process with a device window, moves the
+        // ring's `seen` cursor: any other holder of KSTATS looks.
+        // SAFETY: the calling thread is alive and holds its process.
+        let advance = a[2] & abi::LOG_PEEK_SEEN != 0
+            && crate::process::device_windows(unsafe { thread.as_ref() }.process()) > 0;
         let (batch, next) = usize::try_from(k)
             .ok()
-            .and_then(|k| crate::log::peek_other(thread, k, cursor - 1))
+            .and_then(|k| crate::log::peek_other(thread, k, cursor - 1, advance))
             .ok_or(Error::InvalidArgs)?;
         let [count, lost, left] = batch.to_words();
         return Ok(Values::new(&[count, lost, left, next + 1]));

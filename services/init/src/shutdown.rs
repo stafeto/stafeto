@@ -36,6 +36,10 @@ pub const PROCESS_STOP_NS: u64 = 5_000 * MS;
 pub const FILES_STOP_NS: u64 = 3_000 * MS;
 /// A disk service exits; its device stops after that (`Record::quiesce`).
 pub const DISK_STOP_NS: u64 = 1_000 * MS;
+/// The driver of the console takes the kernel log until it is empty and the
+/// port took every byte (its stop handler): at 115 200 baud 3.4 KB leave in
+/// 300 ms, so it gets 2 s, above the 1.5 s its own bound is.
+pub const CONSOLE_STOP_NS: u64 = 2_000 * MS;
 /// The whole stop: past it init kills every record that is left at once.
 pub const OVERALL_NS: u64 = 30_000 * MS;
 
@@ -47,6 +51,7 @@ pub fn stop_ns(record: &Record) -> u64 {
     match record.name {
         PROCESS_SERVICE => PROCESS_STOP_NS,
         FILES_SERVICE => FILES_STOP_NS,
+        _ if record.log => CONSOLE_STOP_NS,
         "datadisk" | "blk" => DISK_STOP_NS,
         _ if !record.quiesce.is_empty() => DISK_STOP_NS,
         _ => DEFAULT_STOP_NS,
@@ -539,6 +544,14 @@ mod tests {
         assert_eq!(of("datafs"), Some(3_000 * MS));
         assert_eq!(of("datadisk"), Some(1_000 * MS));
         assert_eq!(of("ramfs"), Some(500 * MS));
+        assert_eq!(of("uart"), Some(2_000 * MS));
+        assert!(
+            table
+                .iter()
+                .filter(|r| r.log)
+                .all(|r| stop_ns(r) == CONSOLE_STOP_NS),
+            "every driver of the console gets the same time"
+        );
         assert_eq!(OVERALL_NS, 30_000 * MS);
     }
 
