@@ -498,14 +498,24 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
             }
         }
     }
-    // The network load is real in the phase `net`: the budgets of the network service ran out.
-    if timed
-        && !lines
-            .iter()
-            .any(|l| l.starts_with("init: netd budget ") && l.contains(" overruns"))
-    {
+    // The network load is real: the budgets of the network service ran out. The
+    // journal of init counts them over the whole run, not by phase, and says how
+    // many times the kernel found each budget spent.
+    let overruns = netd_overruns(lines);
+    if timed && overruns.iter().all(|(_, n)| *n == 0) {
         return Err("net: no line of init about an overrun of the budgets of netd".to_owned());
     }
+    said.push(format!(
+        "frame-probe: netd: budgets spent in the run (the kernel's count of overruns){}",
+        if overruns.is_empty() {
+            ": none reported".to_owned()
+        } else {
+            overruns
+                .iter()
+                .map(|(name, n)| format!(", {name} {n}"))
+                .collect::<String>()
+        }
+    ));
     if full_judged_as_load {
         said.push(
             "frame-probe: the whole-screen frame has more bands than the design allows: raise it in the report"
@@ -513,6 +523,31 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
         );
     }
     Ok(said)
+}
+
+/// The overruns of the budgets of the network service by the lines of init's
+/// journal (`init: netd budget NAME: ... kernel counts N`): the greatest count
+/// of each budget.
+pub fn netd_overruns(lines: &[String]) -> Vec<(String, u64)> {
+    let mut out: Vec<(String, u64)> = Vec::new();
+    for l in lines {
+        let Some(rest) = l.strip_prefix("init: netd budget ") else {
+            continue;
+        };
+        let name = rest.split(':').next().unwrap_or("").to_owned();
+        let Some(n) = rest
+            .split_once("kernel counts ")
+            .and_then(|(_, n)| n.split_whitespace().next())
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        match out.iter_mut().find(|(k, _)| *k == name) {
+            Some(e) => e.1 = e.1.max(n),
+            None => out.push((name, n)),
+        }
+    }
+    out
 }
 
 /// A share in parts per million as a decimal.
@@ -932,6 +967,29 @@ mod tests {
             .replace("skipped 0", "skipped 7");
         let said = verdict(&lines, true).unwrap();
         assert!(said.iter().any(|l| l.contains("judged as a load phase")));
+    }
+
+    #[test]
+    fn the_report_says_how_far_netd_was_loaded() {
+        let mut lines = good();
+        lines.push(
+            "init: netd budget stack0: at least 40 overruns, at least 90 in all, kernel counts 91"
+                .to_owned(),
+        );
+        assert_eq!(
+            netd_overruns(&lines),
+            [("switch".to_owned(), 5), ("stack0".to_owned(), 91)]
+        );
+        let said = verdict(&lines, true).unwrap();
+        assert!(said.iter().any(|l| l.ends_with(", switch 5, stack0 91")));
+        // Lines that say no overrun are no load.
+        let mut none = good();
+        none.retain(|l| !l.starts_with("init: netd budget"));
+        none.push(
+            "init: netd budget switch: at least 0 overruns, at least 0 in all, kernel counts 0"
+                .to_owned(),
+        );
+        assert!(verdict(&none, true).is_err());
     }
 
     #[test]
