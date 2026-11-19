@@ -547,6 +547,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 // of a service would take the label for a client's).
                 (Source::Session, proto_init::STOP_NOTICE, _) => {
                     if proto_init::wants_stop(notice.bits) {
+                        steps::stopping();
                         service.stop()
                     }
                 }
@@ -746,6 +747,49 @@ mod steps {
         TABLE_FROM.store(from.max(1), Ordering::Relaxed);
     }
 
+    /// The pairs that changed since they were last told are due at the end of this step (set by
+    /// a heartbeat, `beat`, or by the stop notice).
+    static FLUSH_DUE: AtomicBool = AtomicBool::new(false);
+    /// The clock, in nanoseconds, at the last telling at a heartbeat.
+    static LAST_FLUSH: AtomicU64 = AtomicU64::new(0);
+
+    /// A heartbeat expired and its sign of life is sent: the pairs that changed are due at the end
+    /// of the step, at most once every 250 ms (`FLUSH_GAP_NS`). Only a flag is set here; the
+    /// lines go out in `end`, after the sample is taken, so that the print is no part of the
+    /// step and comes after the sign of life.
+    pub fn beat() {
+        let now = super::time::ticks_to_ns(super::time::now());
+        if super::pairs::due(
+            now,
+            LAST_FLUSH.load(Ordering::Relaxed),
+            super::pairs::FLUSH_GAP_NS,
+        ) {
+            LAST_FLUSH.store(now, Ordering::Relaxed);
+            FLUSH_DUE.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The stop notice came: the service ends within the step, so the changed pairs go out now.
+    pub fn stopping() {
+        let tag = REPORT.load(Ordering::Relaxed);
+        if tag != 0 && !QUIET.load(Ordering::Relaxed) {
+            flush_changed(tag);
+        }
+    }
+
+    /// The `service table:` lines of the pairs that changed since they were told: as many lines
+    /// as pairs changed, none when none did.
+    fn flush_changed(tag: u8) {
+        let mut at = 0;
+        while let Some((kind, longest, next)) = LONGEST.next_changed(at) {
+            at = next;
+            let (took, detail, preempts) = (longest.ticks, longest.detail, longest.preempts);
+            crate::println!(
+                "service table: {tag} kind {kind} {took} ticks detail {detail} preempts {preempts}"
+            );
+        }
+    }
+
     /// The line of the next non-empty pair of the table, from the place `CURSOR` is at: `service
     /// table: T kind K N ticks detail D preempts P`, the longest step of that kind and count of
     /// preemptions seen. The lines of a new
@@ -938,10 +982,15 @@ mod steps {
             let done = DONE.fetch_add(1, Ordering::Relaxed) + 1;
             if done >= from && done.is_power_of_two() {
                 CURSOR.store(0, Ordering::Relaxed);
+                LONGEST.clear_changed();
             }
             if CURSOR.load(Ordering::Relaxed) < TABLE_END {
                 print_table_line(tag);
             }
+        }
+        // A heartbeat expired in this step: its sign of life went before, the changed pairs go now.
+        if FLUSH_DUE.swap(false, Ordering::Relaxed) && printing {
+            flush_changed(tag);
         }
         let gap = whole.saturating_sub(counted).saturating_sub(ran);
         if gap > GAP.fetch_max(gap, Ordering::Relaxed) && printing {
@@ -975,6 +1024,8 @@ mod steps {
     pub fn report(_: u8) {}
     pub fn after(_: fn()) {}
     pub fn table(_: u64) {}
+    pub fn beat() {}
+    pub fn stopping() {}
 }
 
 /// Makes the loop of this service print each new longest step (feature
@@ -1472,6 +1523,9 @@ impl<'a> Beat<'a> {
     fn expired(&mut self) {
         let note = expiry(&mut self.wire, &mut self.tally);
         self.say(note);
+        // The sign of life is sent: the step statistics may tell the pairs that changed once the
+        // step is over (a no-op without the feature `step-stats`).
+        steps::beat();
     }
 
     /// The turn of the loop begins: an arming that failed is tried again.

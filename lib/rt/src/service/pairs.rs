@@ -13,7 +13,7 @@
 //! pair that has a pair of fewer preemptions and at least as much raw time can never be the
 //! greatest at any charge.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 /// The pairs of a kind: P of 0 to 7, and the pair of 8 and more.
 pub const PAIRS: usize = 9;
@@ -31,6 +31,17 @@ pub struct Pairs<const KINDS: usize> {
     longest: [[AtomicU64; PAIRS]; KINDS],
     detail: [[AtomicU64; PAIRS]; KINDS],
     top_preempts: [AtomicU64; KINDS],
+    /// The pairs of each kind that grew since they were last told, a bit for each (the heartbeat
+    /// tells these between two tables).
+    changed: [AtomicU16; KINDS],
+}
+
+/// The least time between two tellings of the changed pairs at a heartbeat, in nanoseconds.
+pub const FLUSH_GAP_NS: u64 = 250_000_000;
+
+/// Whether the changed pairs are due: `gap` has passed since the last telling.
+pub fn due(now: u64, last: u64, gap: u64) -> bool {
+    now.saturating_sub(last) >= gap
 }
 
 /// A pair's longest step.
@@ -47,6 +58,7 @@ impl<const KINDS: usize> Pairs<KINDS> {
             longest: [const { [const { AtomicU64::new(0) }; PAIRS] }; KINDS],
             detail: [const { [const { AtomicU64::new(0) }; PAIRS] }; KINDS],
             top_preempts: [const { AtomicU64::new(0) }; KINDS],
+            changed: [const { AtomicU16::new(0) }; KINDS],
         }
     }
 
@@ -60,6 +72,7 @@ impl<const KINDS: usize> Pairs<KINDS> {
         if pair == PAIRS - 1 {
             self.top_preempts[kind].store(preempts, Ordering::Relaxed);
         }
+        self.changed[kind].fetch_or(1 << pair, Ordering::Relaxed);
         true
     }
 
@@ -96,6 +109,29 @@ impl<const KINDS: usize> Pairs<KINDS> {
                 .filter(|l| !self.dominated(kind, pair, l.ticks))
                 .map(|l| (kind, l, at + 1))
         })
+    }
+
+    /// The next pair that grew since it was last told and that no other pair beats, at or after
+    /// the place `from`, with the place after it. The pairs it passes, told or beaten, count as
+    /// told: a walk from 0 to the end tells each changed pair once.
+    pub fn next_changed(&self, from: usize) -> Option<(usize, Longest, usize)> {
+        (from..KINDS * PAIRS).find_map(|at| {
+            let (kind, pair) = (at / PAIRS, at % PAIRS);
+            let bit = 1u16 << pair;
+            if self.changed[kind].fetch_and(!bit, Ordering::Relaxed) & bit == 0 {
+                return None;
+            }
+            self.get(kind, pair)
+                .filter(|l| !self.dominated(kind, pair, l.ticks))
+                .map(|l| (kind, l, at + 1))
+        })
+    }
+
+    /// Marks every pair as told (a whole table is going out).
+    pub fn clear_changed(&self) {
+        for kind in &self.changed {
+            kind.store(0, Ordering::Relaxed);
+        }
     }
 
     /// The greatest raw time of a kind over its pairs, with the detail of that step.
@@ -222,6 +258,48 @@ mod tests {
             at = next;
         }
         assert_eq!(seen[..count], [(1, 200, 0), (2, 350, 0), (2, 900, 20)]);
+    }
+
+    /// What a heartbeat tells: the changed pairs, each once.
+    fn flushed<const K: usize>(pairs: &Pairs<K>) -> ([(usize, u64, u64); 8], usize) {
+        let mut out = [(0, 0, 0); 8];
+        let (mut at, mut count) = (0, 0);
+        while let Some((kind, l, next)) = pairs.next_changed(at) {
+            out[count] = (kind, l.ticks, l.preempts);
+            count += 1;
+            at = next;
+        }
+        (out, count)
+    }
+
+    #[test]
+    fn a_heartbeat_tells_the_changed_pairs_once_and_nothing_when_none_changed() {
+        let pairs = Pairs::<3>::new();
+        pairs.record(1, 18_807, 0, 3);
+        pairs.record(1, 16_400, 0, 0);
+        let (lines, count) = flushed(&pairs);
+        assert_eq!(lines[..count], [(1, 16_400, 0), (1, 18_807, 3)]);
+        // The next heartbeat has nothing to tell.
+        assert_eq!(flushed(&pairs).1, 0);
+        // A pair that grows is told again, alone.
+        pairs.record(1, 17_000, 0, 0);
+        let (lines, count) = flushed(&pairs);
+        assert_eq!(lines[..count], [(1, 17_000, 0)]);
+        // A pair beaten by one of fewer preemptions counts as told and is not printed.
+        pairs.record(1, 9_000, 0, 2);
+        assert_eq!(flushed(&pairs).1, 0);
+        // A whole table marks everything told.
+        pairs.record(0, 500, 0, 0);
+        pairs.clear_changed();
+        assert_eq!(flushed(&pairs).1, 0);
+    }
+
+    #[test]
+    fn the_changed_pairs_are_due_every_quarter_of_a_second_at_most() {
+        assert!(!due(100_000_000, 0, FLUSH_GAP_NS));
+        assert!(due(250_000_000, 0, FLUSH_GAP_NS));
+        assert!(!due(400_000_000, 300_000_000, FLUSH_GAP_NS));
+        assert!(due(550_000_000, 300_000_000, FLUSH_GAP_NS));
     }
 
     #[test]

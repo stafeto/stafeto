@@ -97,6 +97,11 @@ impl Kinds<'_> {
 
 /// The hard check against B (`crate::TERM_B`) of the steps of the service `tag` of the kinds a
 /// probe judges (`over_bound`): an error that names the step, for the probes to return.
+///
+/// A kind is exempt from B only together with its exemption from 0.9 B in the same probe, and
+/// with a stated reason (a start-up step, a run whose ticks are the timer's). A new kind of a
+/// service falls under the check by default: `Kinds::All` and `Kinds::Except` take it in, and
+/// `Kinds::Only` takes it in when its list is extended with the bound the probe puts on it.
 pub fn within_b(lines: &[String], tag: &str, kinds: Kinds) -> Result<(), String> {
     match over_bound(lines, tag, crate::TERM_B, kinds) {
         Some(over) => Err(over),
