@@ -1503,6 +1503,14 @@ mod tests {
         assert_eq!(driver.len(), DRIVER_KINDS.len());
     }
 
+    /// The gate of a band that the cap of a period divides by is the portion
+    /// gate of the probes, 0.8 of term B.
+    #[test]
+    fn the_gate_of_a_band_is_the_portion_gate() {
+        assert_eq!(u64::from(compositor::BAND_GATE), PORTION_MAX);
+        assert_eq!(compositor::frame::band_cap(16_666_667, 750_000), 47);
+    }
+
     #[test]
     fn a_step_past_the_bound_or_a_missing_kind_fails() {
         assert!(steps_verdict(&rows(Some((COMP_TAG, 20, gpu_probe::STEP_MAX + 1)), None)).is_err());

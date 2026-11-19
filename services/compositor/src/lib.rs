@@ -71,6 +71,12 @@ pub const BAND_ROWS: u32 = 16;
 /// is 45 points of a line and its step is expected near 15 500.
 pub const BAND_TICKS: u32 = 14_000;
 
+/// The gate of a band: 0.8 of term B, the most one step of a portion may take
+/// (`PORTION_MAX` of the probes, which xtask checks against this constant). The
+/// cap of the bands of a period divides by it, so that the cap means the share of
+/// a period by the gates.
+pub const BAND_GATE: u32 = 16_328;
+
 /// The price of one kind of operation (the black a band starts with, a layer
 /// copied, a layer laid over others): what one operation costs is
 /// `call + rows * row + points * point`. The call is what pixman does
