@@ -697,9 +697,25 @@ pub fn open(vol: &Vol, flags: c_int, mode: u32, umask: u32) -> Result<c_int, i32
         | O_TRUNC
         | O_APPEND
         | O_NOFOLLOW
-        | O_SYNC;
+        | O_SYNC
+        | O_SEARCH;
     if flags & !known != 0 {
         return Err(EINVAL);
+    }
+    // O_SEARCH (and O_PATH): a directory is opened to be searched alone, a description with no
+    // access bits on which only the path calls and `fchdir` act (the service refuses READDIR on
+    // it); a file named so is opened for reading as any other.
+    if flags & O_SEARCH != 0
+        && flags & (O_CREAT | O_TRUNC | O_ACCMODE) == 0
+        && let Ok(handle) = open_search(vol.bytes())
+    {
+        return insert_description(
+            DataTarget {
+                handle,
+                directory: true,
+            },
+            flags,
+        );
     }
     let mut plan = pure::open_plan(flags, mode, umask)?;
     // A name that ends in a slash is a directory: no file is made or opened for it.
@@ -719,7 +735,12 @@ pub fn open(vol: &Vol, flags: c_int, mode: u32, umask: u32) -> Result<c_int, i32
         close_description(handle);
         return Err(ENOTDIR);
     }
-    let target = DataTarget { handle, directory };
+    insert_description(DataTarget { handle, directory }, flags)
+}
+
+/// The lowest free descriptor for the description `target`, with the close-on-exec and
+/// close-on-fork bits of `flags`; the description closes when no descriptor can be made.
+fn insert_description(target: DataTarget, flags: c_int) -> Result<c_int, i32> {
     let flags_of = crate::descriptor_flags(flags);
     let inserted = crate::shared::growing(|files| {
         files
@@ -729,7 +750,7 @@ pub fn open(vol: &Vol, flags: c_int, mode: u32, umask: u32) -> Result<c_int, i32
     match inserted {
         Ok(fd) => Ok(fd as c_int),
         Err(errno) => {
-            close_description(handle);
+            close_description(target.handle);
             Err(errno)
         }
     }
@@ -1199,8 +1220,16 @@ pub fn entries(handle: u32, out: &mut [u8], position: Option<u64>) -> Result<usi
                 return Ok(None);
             };
             name[..entry.name().len()].copy_from_slice(entry.name());
+            // `..` of the root of the volume is the directory the volume is mounted in: the number
+            // `stat("/data/..")` gives, which is the RAM file service's (XSH readdir(): d_ino is
+            // the file serial number st_ino has).
+            let inode = if before == 1 && entry.name() == b".." {
+                parent_of_root(handle).unwrap_or(entry.ino)
+            } else {
+                entry.ino
+            };
             Ok(Some(posix_change::dirent::Item {
-                inode: entry.ino,
+                inode,
                 kind: entry.d_type(),
                 name_len: entry.name().len(),
                 before: before.cast_signed(),
@@ -1216,6 +1245,19 @@ pub fn entries(handle: u32, out: &mut [u8], position: Option<u64>) -> Result<usi
             Ok(())
         },
     )
+}
+
+/// The file serial number of the parent of the volume's root (the RAM file service's `/`), when
+/// `handle` is the root of the volume.
+fn parent_of_root(handle: u32) -> Option<u64> {
+    if where_is(handle).ok()?.bytes() != b"/" {
+        return None;
+    }
+    crate::shared::resolved(b"/", |transport, path| {
+        transport.stat_information(path).map_err(crate::error)
+    })
+    .ok()
+    .map(|info| info.inode)
 }
 
 /// The listing of `handle` stands at entry `want`: as it is when it stands there already, or

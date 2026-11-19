@@ -65,6 +65,39 @@ const PROGRAMS: [ImageProgram; 13] = [
     ),
 ];
 
+/// The image of the Open POSIX tests with their scratch files on the data volume (`cargo xtask
+/// open-posix --data`): the image of a suite, the disk service of the volume and the data file
+/// service, the table with them, and the runner and the tests with the paths under /data in the
+/// layer.
+pub(crate) const PROGRAMS_DATA: [ImageProgram; 15] = {
+    let mut programs = [PROGRAMS[0]; 15];
+    let mut at = 0;
+    while at < PROGRAMS.len() {
+        programs[at] = PROGRAMS[at];
+        at += 1;
+    }
+    programs[0] = (
+        "init",
+        "init",
+        crate::INIT_STACK_SIZE,
+        &["table-os-test-data"],
+    );
+    programs[7] = (
+        "os-test-run",
+        "os-test-run",
+        crate::POSIX_STACK_SIZE,
+        &["data"],
+    );
+    programs[13] = (
+        "virtio-blk",
+        "virtio-blk",
+        crate::blk_probe::BLK_STACK_SIZE,
+        &[],
+    );
+    programs[14] = ("datafsd", "datafsd", 32 * 1024, &[]);
+    programs
+};
+
 /// The end of the runner in the log, when it ended.
 const ENDED: &str = "init: os-test-run ended";
 /// The marks of the runner (tests/os-test-run/run.c).
@@ -1083,6 +1116,15 @@ impl ProbeLink {
     /// Builds the probe with `object` and reads how it was linked; `dir`
     /// keeps the object of the program.
     pub(crate) fn new(object: &str, dir: &Path) -> Result<ProbeLink, String> {
+        Self::new_with(object, dir, &[])
+    }
+
+    /// `new` with cargo features of the probe (`data`: the paths under /data in the layer).
+    pub(crate) fn new_with(
+        object: &str,
+        dir: &Path,
+        features: &[&str],
+    ) -> Result<ProbeLink, String> {
         let _building = BUILD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         // A new cfg flag makes cargo compile and link the probe again
         // even when nothing else changed, so that its link line prints.
@@ -1094,7 +1136,9 @@ impl ProbeLink {
             .arg("rustc")
             .args(BOOT_PROFILE.args())
             .args(["--target", PROGRAM_TARGET, "--package", "os-test-probe"])
-            .args(["--bin", "os-test-probe", "--"])
+            .args(["--bin", "os-test-probe"])
+            .args(features.iter().flat_map(|f| ["--features", *f]))
+            .args(["--"])
             .args(["--print", "link-args", "-C", "save-temps"])
             .args(["-A", "unexpected_cfgs", "--cfg"])
             .arg(format!("ostest_link_{stamp}"));
@@ -1283,10 +1327,26 @@ pub(crate) fn boot(
     files: Vec<rootfs::RootFile>,
     timeout: Duration,
 ) -> Result<(String, Vec<String>), String> {
-    let image = write_boot_image_files(image, &PROGRAMS, BOOT_PROFILE, &[], files)?;
+    boot_with(kernel, image, &PROGRAMS, files, timeout, None)
+}
+
+/// `boot` with the programs of the image and, for the Open POSIX tests on the data volume, the
+/// disk file the volume lives on.
+pub(crate) fn boot_with(
+    kernel: &crate::Artifacts,
+    image: &str,
+    programs: &[ImageProgram],
+    files: Vec<rootfs::RootFile>,
+    timeout: Duration,
+    disk: Option<&Path>,
+) -> Result<(String, Vec<String>), String> {
+    let image = write_boot_image_files(image, programs, BOOT_PROFILE, &[], files)?;
     carries_licence(&image)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
+    if let Some(disk) = disk {
+        cmd.args(qemu::store(disk, None));
+    }
     let run = qemu::run_until(cmd, timeout, Some(ENDED))?;
     let log = run
         .lines

@@ -30,6 +30,24 @@ use crate::{Variant, build, llvm_tool, rootfs, target_dir};
 
 /// The tests that pass: the run fails when one of them does not.
 const PASSING: &str = "tests/open-posix/pass.txt";
+/// The tests that pass with their scratch files on the data volume, and those that do not pass by
+/// design (`open-posix --data`).
+const DATA_PASSING: &str = "tests/open-posix/data-pass.txt";
+const DATA_EXPECTED: &str = "tests/open-posix/data-expected-not-pass.txt";
+/// The sections of the suite whose tests keep scratch files (they name them through the suite's
+/// tempfile.h and so through `TMPDIR`): fsync, aio_*, lio_listio, mmap and munmap.
+const DATA_SECTIONS: [&str; 6] = [
+    "conformance/interfaces/fsync/",
+    "conformance/interfaces/fdatasync/",
+    "conformance/interfaces/aio_",
+    "conformance/interfaces/lio_listio/",
+    "conformance/interfaces/mmap/",
+    "conformance/interfaces/munmap/",
+];
+/// The directory of the volume the tests' `TMPDIR` names (tools: the suite's tempfile.h reads it).
+/// The disk of one boot on the data volume.
+const DATA_DISK_BYTES: u64 = 64 << 20;
+const DATA_TMP: &str = "/data/tmp";
 /// The name of the suite's licence in an image.
 const LICENCE: &str = "OPEN-POSIX-COPYING";
 /// A batch of tests, as in the full basic run: the RAM service keeps half
@@ -189,6 +207,72 @@ pub fn compare(list: &str, rows: &[Row]) -> (Vec<String>, Vec<String>) {
     )
 }
 
+/// The tests listed in `expected` (name, outcome, reason): the outcome is the suite's own or `ANY`
+/// for anything but PASS.
+pub fn expected_of(expected: &str) -> Vec<(String, String)> {
+    expected
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            Some((words.next()?.to_owned(), words.next()?.to_owned()))
+        })
+        .collect()
+}
+
+/// What a run on the data volume found.
+#[derive(Debug, PartialEq, Eq, Default)]
+pub struct DataVerdict {
+    /// The tests that passed, of the tests the run covered.
+    pub passed: usize,
+    pub total: usize,
+    /// The tests listed as not passing by design that were run.
+    pub listed: usize,
+    /// Tests of the list of passes that did not pass.
+    pub lost: Vec<String>,
+    /// Tests that failed and are on neither list: defects of the layer or of the tests.
+    pub unexpected: Vec<String>,
+    /// Listed tests that passed, or ended otherwise than listed.
+    pub now_passing: Vec<String>,
+    pub other_outcome: Vec<String>,
+}
+
+/// The verdict of `rows` against the list of passes and the list of the tests that do not pass
+/// by design.
+pub fn data_verdict(pass: &str, expected: &str, rows: &[Row]) -> DataVerdict {
+    let (lost, _) = compare(pass, rows);
+    let expected = expected_of(expected);
+    let passes: BTreeSet<&str> = pass
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    let mut verdict = DataVerdict {
+        total: rows.len(),
+        passed: rows.iter().filter(|r| r.result == "PASS").count(),
+        lost,
+        ..DataVerdict::default()
+    };
+    for row in rows {
+        match expected.iter().find(|(name, _)| *name == row.name) {
+            Some((_, outcome)) => {
+                verdict.listed += 1;
+                if row.result == "PASS" {
+                    verdict.now_passing.push(row.name.clone());
+                } else if outcome != "ANY" && outcome != row.result {
+                    verdict.other_outcome.push(row.name.clone());
+                }
+            }
+            None if row.result != "PASS" && !passes.contains(row.name.as_str()) => {
+                verdict.unexpected.push(row.name.clone());
+            }
+            None => {}
+        }
+    }
+    verdict
+}
+
 fn entries(names: &[&str]) -> usize {
     let mut directories = BTreeSet::new();
     for name in names {
@@ -331,6 +415,7 @@ fn run_batch(
     kernel: &crate::Artifacts,
     number: usize,
     mut tests: Vec<(String, Vec<u8>)>,
+    data: bool,
 ) -> (Vec<Row>, Vec<String>) {
     let mut rows = Vec::new();
     let mut problems = Vec::new();
@@ -339,14 +424,36 @@ fn run_batch(
             break;
         }
         let limits: Vec<u64> = tests.iter().map(|t| limit_of(&t.0)).collect();
-        let budget = limits.iter().sum::<u64>() / 1000 + 180;
+        // A blank volume is formatted before the runner starts: a minute more.
+        let budget = limits.iter().sum::<u64>() / 1000 + 180 + if data { 60 } else { 0 };
         let image = format!("open-posix-{number}-{attempt}.img");
-        let log = match ostest::boot(
-            kernel,
-            &image,
-            rootfs::open_posix(&tests, &limits),
-            Duration::from_secs(budget),
-        ) {
+        let booted = if data {
+            // A disk of its own for each boot, blank, removed afterwards.
+            let disk = std::env::temp_dir().join(format!(
+                "stafeto-open-posix-data-{}-{number}-{attempt}.img",
+                std::process::id()
+            ));
+            let made = crate::qemu::store_file(&disk, DATA_DISK_BYTES, true).and_then(|()| {
+                ostest::boot_with(
+                    kernel,
+                    &image,
+                    &ostest::PROGRAMS_DATA,
+                    rootfs::open_posix_data(&tests, &limits, DATA_TMP),
+                    Duration::from_secs(budget),
+                    Some(&disk),
+                )
+            });
+            let _ = std::fs::remove_file(&disk);
+            made
+        } else {
+            ostest::boot(
+                kernel,
+                &image,
+                rootfs::open_posix(&tests, &limits),
+                Duration::from_secs(budget),
+            )
+        };
+        let log = match booted {
             Ok((log, _)) => log,
             Err(error) => {
                 problems.push(format!("batch {number}: {error}"));
@@ -432,9 +539,38 @@ pub fn run(select: Select, jobs: usize) -> Result<(), String> {
 /// run of the sorted list cut into `count` runs), run and checked on
 /// their own (`cargo xtask ci --group open-posix-N`).
 pub fn run_part(select: Select, jobs: usize, part: Option<(usize, usize)>) -> Result<(), String> {
+    run_inner(select, jobs, part, false)
+}
+
+/// `cargo xtask open-posix --data`: the file-related tests (fsync, aio_*, lio_listio, mmap and
+/// munmap) with their scratch files on the data volume. The image has the data file service and a
+/// disk of its own for each batch, the tests' `TMPDIR` is /data/tmp, and the layer of the runner
+/// and of every test sends the paths under /data to the service. The run fails when a test of
+/// tests/open-posix/data-pass.txt does not pass, and reports a test that failed and is on neither
+/// list.
+pub fn run_data(select: Select, jobs: usize) -> Result<(), String> {
+    run_inner(select, jobs, None, true)
+}
+
+fn run_inner(
+    select: Select,
+    jobs: usize,
+    part: Option<(usize, usize)>,
+    data: bool,
+) -> Result<(), String> {
     let pinned = matches!(select, Select::Pinned);
+    let expected_text = if data {
+        std::fs::read_to_string(crate::root().join(DATA_EXPECTED))
+            .map_err(|e| format!("{DATA_EXPECTED}: {e}"))?
+    } else {
+        String::new()
+    };
+    let expected_names: Vec<(String, String)> = expected_of(&expected_text);
     let wanted_name = |name: &str, listed: &BTreeSet<&str>| match &select {
-        Select::Pinned => listed.contains(name),
+        Select::Pinned => {
+            listed.contains(name) || expected_names.iter().any(|(listed, _)| listed == name)
+        }
+        Select::Full if data => DATA_SECTIONS.iter().any(|s| name.starts_with(s)),
         Select::Full => true,
         Select::Prefix(prefix) => name.starts_with(prefix.as_str()),
     };
@@ -444,8 +580,9 @@ pub fn run_part(select: Select, jobs: usize, part: Option<(usize, usize)>) -> Re
     crate::run_cmd(Command::new("python3").arg(crate::root().join("tools/build-open-posix.py")))?;
     let work = target_dir().join("open-posix");
     ostest::use_licence(LICENCE, work.join("source/COPYING"));
-    let list = std::fs::read_to_string(crate::root().join(PASSING))
-        .map_err(|e| format!("{PASSING}: {e}"))?;
+    let passing = if data { DATA_PASSING } else { PASSING };
+    let list = std::fs::read_to_string(crate::root().join(passing))
+        .map_err(|e| format!("{passing}: {e}"))?;
     let list = match part {
         Some((index, count)) => part_of(&list, index, count),
         None => list,
@@ -490,7 +627,12 @@ pub fn run_part(select: Select, jobs: usize, part: Option<(usize, usize)>) -> Re
             .arg("--bootstrap")
             .arg(&bootstrap),
     )?;
-    let link = ProbeLink::new(&bootstrap.display().to_string(), &work.join("probe"))?;
+    let features: &[&str] = if data { &["data"] } else { &[] };
+    let link = ProbeLink::new_with(
+        &bootstrap.display().to_string(),
+        &work.join("probe"),
+        features,
+    )?;
     let common = std::fs::read_to_string(work.join("common.txt")).map_err(|e| e.to_string())?;
     let linked = link_all(&link, &work, common.trim(), &to_run)?;
     let mut batches: Vec<Vec<(String, Vec<u8>)>> = Vec::new();
@@ -540,7 +682,7 @@ pub fn run_part(select: Select, jobs: usize, part: Option<(usize, usize)>) -> Re
         boots.push(crate::jobs::job(
             &format!("open-posix {number}"),
             move || {
-                let (done, trouble) = run_batch(&kernel, number, tests);
+                let (done, trouble) = run_batch(&kernel, number, tests, data);
                 problems
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -567,7 +709,7 @@ pub fn run_part(select: Select, jobs: usize, part: Option<(usize, usize)>) -> Re
     let partial = matches!(select, Select::Prefix(_));
     if !pinned && !partial {
         for name in &new {
-            println!("open-posix {name} passes and is not in {PASSING}");
+            println!("open-posix {name} passes and is not in {passing}");
         }
     }
     let count = |what: &str| rows.iter().filter(|r| r.result == what).count();
@@ -590,9 +732,29 @@ pub fn run_part(select: Select, jobs: usize, part: Option<(usize, usize)>) -> Re
     if !problems.is_empty() {
         return Err(format!("open-posix boot trouble: {}", problems.join("; ")));
     }
+    if data && !partial {
+        let verdict = data_verdict(&list, &expected_text, &rows);
+        println!(
+            "open-posix --data: PASS {} of {}, expected not passing {} listed",
+            verdict.passed, verdict.total, verdict.listed
+        );
+        for name in &verdict.now_passing {
+            println!("open-posix --data {name} passes and is listed as not passing");
+        }
+        for name in &verdict.other_outcome {
+            println!("open-posix --data {name} ended otherwise than the list says");
+        }
+        if !verdict.unexpected.is_empty() {
+            return Err(format!(
+                "open-posix --data: {} tests fail and are on neither list (a defect of the layer or of the test): {}",
+                verdict.unexpected.len(),
+                verdict.unexpected.join(", ")
+            ));
+        }
+    }
     if !lost.is_empty() && !partial {
         return Err(format!(
-            "open-posix: {} of {PASSING} no longer pass: {}",
+            "open-posix: {} of {passing} no longer pass: {}",
             lost.len(),
             lost.join(", ")
         ));
@@ -703,5 +865,161 @@ mod tests {
         let names: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
         assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(names.iter().all(|n| n.contains('/')));
+    }
+
+    const EXPECTED: &str = "# c\nm/1 ANY shared\nm/2 FAIL shared\n";
+
+    #[test]
+    fn the_expected_list_names_tests_and_outcomes() {
+        assert_eq!(
+            expected_of(EXPECTED),
+            [
+                ("m/1".to_owned(), "ANY".to_owned()),
+                ("m/2".to_owned(), "FAIL".to_owned())
+            ]
+        );
+        assert!(expected_of("# only a comment\n\n").is_empty());
+    }
+
+    #[test]
+    fn a_run_on_the_volume_counts_what_passed_and_what_is_listed() {
+        let rows = [
+            row("a/1", "PASS"),
+            row("a/2", "PASS"),
+            row("m/1", "FAIL"),
+            row("m/2", "UNRESOLVED"),
+        ];
+        let verdict = data_verdict("a/1\na/2\n", EXPECTED, &rows);
+        assert_eq!((verdict.passed, verdict.total, verdict.listed), (2, 4, 2));
+        assert!(verdict.lost.is_empty() && verdict.unexpected.is_empty());
+        // m/2 is listed as FAIL and ended UNRESOLVED.
+        assert_eq!(verdict.other_outcome, ["m/2"]);
+        assert!(verdict.now_passing.is_empty());
+    }
+
+    #[test]
+    fn a_failure_on_neither_list_is_a_defect_and_a_lost_pass_is_lost() {
+        let rows = [
+            row("a/1", "FAIL"),
+            row("a/2", "PASS"),
+            row("b/1", "TIMEOUT"),
+            row("m/1", "PASS"),
+        ];
+        let verdict = data_verdict("a/1\na/2\n", EXPECTED, &rows);
+        assert_eq!(verdict.lost, ["a/1"]);
+        // a/1 is on the list of passes, so it is lost and never unexpected; b/1 is on neither.
+        assert_eq!(verdict.unexpected, ["b/1"]);
+        assert_eq!(verdict.now_passing, ["m/1"]);
+    }
+
+    #[test]
+    fn the_lists_of_the_volume_are_sorted_apart_and_inside_the_sections() {
+        let read = |path: &str| std::fs::read_to_string(crate::root().join(path)).unwrap();
+        let pass = read(DATA_PASSING);
+        let names: Vec<&str> = pass.lines().filter(|l| !l.starts_with('#')).collect();
+        assert!(names.windows(2).all(|p| p[0] < p[1]));
+        let expected = expected_of(&read(DATA_EXPECTED));
+        let listed: Vec<&str> = expected.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(listed.windows(2).all(|p| p[0] < p[1]));
+        assert!(names.iter().all(|n| !listed.contains(n)));
+        assert!(
+            names
+                .iter()
+                .chain(listed.iter())
+                .all(|n| DATA_SECTIONS.iter().any(|s| n.starts_with(s)))
+        );
+        // The two lists are the 111 tests of those sections that pass on the RAM file service.
+        let ram = read(PASSING);
+        let ram: Vec<&str> = ram
+            .lines()
+            .filter(|n| DATA_SECTIONS.iter().any(|s| n.starts_with(s)))
+            .collect();
+        assert_eq!(names.len() + listed.len(), ram.len());
+        assert!(names.iter().chain(listed.iter()).all(|n| ram.contains(n)));
+    }
+}
+
+/// The scenario that replaces the plan's `vi` one: a file saved the way `sed -i` saves it (a
+/// temporary file in the directory, the mode of the original, fsync, rename over it) under
+/// /data, and the same file read back after a second boot on the same disk. The runner of the
+/// Open POSIX tests does both (`save-write` and `save-verify` of its list), so the boot, the
+/// volume and the layer are those of `open-posix --data`.
+pub fn data_save() -> Result<(), String> {
+    crate::relibc()?;
+    crate::busybox_build()?;
+    crate::run_cmd(Command::new("python3").arg(crate::root().join("tools/build-open-posix.py")))?;
+    let work = target_dir().join("open-posix");
+    ostest::use_licence(LICENCE, work.join("source/COPYING"));
+    let kernel = build(Variant::Normal)?;
+    let disk = std::env::temp_dir().join(format!("stafeto-data-save-{}.img", std::process::id()));
+    let boot = |script: &str, name: &str, fresh: bool| -> Result<String, String> {
+        crate::qemu::store_file(&disk, DATA_DISK_BYTES, fresh)?;
+        let (log, _) = ostest::boot_with(
+            &kernel,
+            name,
+            &ostest::PROGRAMS_DATA,
+            rootfs::data_save(script),
+            Duration::from_secs(300),
+            Some(&disk),
+        )?;
+        Ok(log)
+    };
+    let result = (|| {
+        let first = boot("save-write /data/tmp/saved\n", "data-save-1.img", true)?;
+        data_save_verdict(&first, "os-test-run: data-save written")?;
+        // The same file of the disk: the volume is mounted and never formatted again.
+        let second = boot("save-verify /data/tmp/saved\n", "data-save-2.img", false)?;
+        data_save_verdict(&second, "os-test-run: data-save verified")?;
+        if second.contains("data volume formatted") {
+            return Err("data-save: the second boot formatted the volume again".to_owned());
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&disk);
+    result?;
+    println!("data-save: saved with a temporary file and rename, read back after a reboot ok");
+    Ok(())
+}
+
+/// The log of a boot says `done` and no line of a failed step of the scenario or a fault.
+fn data_save_verdict(log: &str, done: &str) -> Result<(), String> {
+    if let Some(line) = log
+        .lines()
+        .find(|l| l.starts_with("os-test-run: save-") || l.starts_with("os-test-run: mkdir"))
+    {
+        return Err(format!("data-save: {line}"));
+    }
+    if !log.lines().any(|l| l == done) {
+        return Err(format!("data-save: no line `{done}` in the log"));
+    }
+    if log.contains("process fault:") || log.contains("KERNEL PANIC") {
+        return Err("data-save: the guest faulted".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::*;
+
+    #[test]
+    fn the_save_scenario_is_judged_by_its_lines() {
+        let done = "os-test-run: data-save written";
+        assert!(data_save_verdict(&format!("a\n{done}\nb\n"), done).is_ok());
+        assert!(data_save_verdict("a\n", done).is_err());
+        let failed = format!("os-test-run: save-write: the temporary file failed: x\n{done}\n");
+        assert!(
+            data_save_verdict(&failed, done)
+                .unwrap_err()
+                .contains("temporary file")
+        );
+        assert!(data_save_verdict(&format!("{done}\nprocess fault: x\n"), done).is_err());
+        assert!(
+            data_save_verdict(
+                &format!("os-test-run: mkdir /data/tmp failed: x\n{done}\n"),
+                done
+            )
+            .is_err()
+        );
     }
 }
