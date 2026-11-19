@@ -1042,6 +1042,106 @@ pub fn change(
     Ok(true)
 }
 
+// ---------------------------------------------------------------- passes (SCM_RIGHTS)
+
+/// EXPORT of the description `handle`: a pass for it (a channel that can only be handed on) to
+/// send in an SCM_RIGHTS message; the service holds one reference for it until it is adopted.
+pub fn export(handle: u32) -> Result<Handle<Channel>, i32> {
+    let mut w = Writer::new();
+    p::handle_call(p::Method::Export, handle, &mut w).map_err(|_| EIO)?;
+    let session = ensure()?;
+    let channel = Handle::<Channel>::borrowed(session);
+    let mut tries = 0;
+    loop {
+        let mut reply = match rt::sys::send(&channel, w.as_bytes()) {
+            Ok(reply) => reply,
+            Err(Error::Interrupted) => continue,
+            Err(Error::PeerClosed) => {
+                forget(session);
+                return Err(EIO);
+            }
+            Err(_) => return Err(EIO),
+        };
+        let mut buffer = [0; MESSAGE_MAX];
+        let status = Reader::new(reply.bytes(&mut buffer))
+            .u32()
+            .map_err(|_| EIO)?;
+        match status {
+            0 => return reply.handles.take::<Channel>(0).map_err(|_| EIO),
+            s if s == busy_code() && tries < BUSY_TRIES => {
+                tries += 1;
+                pause()?;
+            }
+            p::TABLE_FULL | p::TOO_MANY_OPEN => return Err(EMFILE),
+            _ => return Err(errno_of(status)),
+        }
+    }
+}
+
+/// ADOPT of a pass of the data file service received in an SCM_RIGHTS message: the description
+/// becomes a descriptor of this process (the lowest free one), with its rights as they were. The
+/// pass is spent, or closes with the error.
+pub fn adopt(pass: Handle<Channel>, cloexec: bool) -> Result<c_int, i32> {
+    let mut w = Writer::new();
+    p::adopt(&mut w).map_err(|_| EIO)?;
+    let session = ensure()?;
+    let channel = Handle::<Channel>::borrowed(session);
+    let mut pass = pass;
+    let mut tries = 0;
+    let answer = loop {
+        let mut reply = match rt::sys::send_handles(&channel, w.as_bytes(), [pass.erase()]) {
+            Ok(reply) => reply,
+            Err(refused) => {
+                if refused.error == Error::PeerClosed {
+                    forget(session);
+                }
+                return Err(EIO);
+            }
+        };
+        let mut buffer = [0; MESSAGE_MAX];
+        let bytes = reply.bytes(&mut buffer);
+        let mut r = Reader::new(bytes);
+        let status = r.u32().map_err(|_| EIO)?;
+        if status == 0 {
+            let handle = r.u32().map_err(|_| EIO)?;
+            let kind = r.u32().map_err(|_| EIO)?;
+            break (handle, kind);
+        }
+        // A refusal for a limit the caller can lift gives the pass back in the reply.
+        let back = reply.handles.take::<Channel>(0);
+        match back {
+            Ok(back) if status == busy_code() && tries < BUSY_TRIES => {
+                tries += 1;
+                pass = back;
+                pause()?;
+            }
+            _ => {
+                return Err(match status {
+                    p::TABLE_FULL | p::TOO_MANY_OPEN => EMFILE,
+                    _ => errno_of(status),
+                });
+            }
+        }
+    };
+    let target = DataTarget {
+        handle: answer.0,
+        directory: answer.1 == p::KIND_DIRECTORY,
+    };
+    let flags = crate::descriptor_flags(if cloexec { O_CLOEXEC } else { 0 });
+    let inserted = crate::shared::growing(|files| {
+        files
+            .insert(Target::Data(target), flags)
+            .map_err(crate::shared::page_error)
+    });
+    match inserted {
+        Ok(fd) => Ok(fd as c_int),
+        Err(errno) => {
+            close_description(answer.0);
+            Err(errno)
+        }
+    }
+}
+
 // ---------------------------------------------------------------- listings
 
 /// The listings of the directory descriptions that have been read: one buffer for each (a batch of

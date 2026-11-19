@@ -185,3 +185,11 @@ pub fn change(
 ) -> Result<bool, i32> {
     Ok(false)
 }
+
+pub fn export(_handle: u32) -> Result<Handle<Channel>, i32> {
+    Err(crate::constants::EOPNOTSUPP)
+}
+
+pub fn adopt(_pass: Handle<Channel>, _cloexec: bool) -> Result<c_int, i32> {
+    Err(EBADF)
+}
