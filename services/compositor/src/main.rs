@@ -433,6 +433,10 @@ fn main(_: u64) -> u64 {
     // to map): the driver says CLEARING while it sets the device up, and
     // the service asks again on a timer of its own channel. A driver that
     // does not answer is asked again at a request.
+    // The prices of the bands measured on shapes of their own, before the
+    // first request (the run under -icount, `steps` alone).
+    #[cfg(feature = "steps")]
+    service.raster.calibrate();
     service.open_screen_waiting(level);
     // The periods start when the screen is open.
     service.pacer = Pacer::new(now_ns(), period, cap);

@@ -489,6 +489,115 @@ pub fn raster_text(costs: &[RasterCost]) -> String {
 /// The most bands of a full frame the period of 60 Hz holds without load.
 pub const FULL_FRAME_BANDS_MAX: u32 = 45;
 
+/// One class of the calibration: the least and the greatest figure, the
+/// operations that counted and the shape of the greatest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Class {
+    pub least: u64,
+    pub greatest: u64,
+    pub n: u64,
+    pub w: u64,
+    pub h: u64,
+}
+
+/// The line `service calibration: T KIND call L G N W H row L G N W H point L G
+/// N W H preempted K` of the service under its steps feature (`px::calibration`):
+/// the prices of a kind measured on shapes chosen for each class, with the
+/// operations a higher level preempted left out. The call is ticks, the row and
+/// the point hundredths of a tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Calibration {
+    pub kind: String,
+    pub call: Class,
+    pub row: Class,
+    pub point: Class,
+    pub preempted: u64,
+}
+
+impl Calibration {
+    fn parse(line: &str, tag: &str) -> Option<Calibration> {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let ["service", "calibration:", t, kind, "call", c @ ..] = w.as_slice() else {
+            return None;
+        };
+        if *t != tag || c.len() != 5 + 1 + 5 + 1 + 5 + 2 {
+            return None;
+        }
+        let class = |s: &[&str]| -> Option<Class> {
+            Some(Class {
+                least: s[0].parse().ok()?,
+                greatest: s[1].parse().ok()?,
+                n: s[2].parse().ok()?,
+                w: s[3].parse().ok()?,
+                h: s[4].parse().ok()?,
+            })
+        };
+        if c[5] != "row" || c[11] != "point" || c[17] != "preempted" {
+            return None;
+        }
+        Some(Calibration {
+            kind: (*kind).to_owned(),
+            call: class(&c[0..5])?,
+            row: class(&c[6..11])?,
+            point: class(&c[12..17])?,
+            preempted: c[18].parse().ok()?,
+        })
+    }
+}
+
+/// The last calibration line of each kind of the service `tag`.
+pub fn calibrations(lines: &[String], tag: &str) -> Vec<Calibration> {
+    let mut out: Vec<Calibration> = Vec::new();
+    for c in lines.iter().filter_map(|l| Calibration::parse(l, tag)) {
+        match out.iter_mut().find(|o| o.kind == c.kind) {
+            Some(old) => *old = c,
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+/// The calibration against the table, per kind: each price as the least and the
+/// greatest over its class (the greatest goes into the table as the measure, and
+/// the spread between them tells a cost of a shape from a stray), the shape of the
+/// greatest, and the operations a preemption left out.
+pub fn calibration_text(costs: &[Calibration]) -> String {
+    if costs.is_empty() {
+        return "no calibration lines (a run without the steps feature)".to_owned();
+    }
+    let hundredths = |v: u64| format!("{}.{:02}", v / 100, v % 100);
+    costs
+        .iter()
+        .map(|c| {
+            let p = price(&c.kind);
+            format!(
+                "{}: call least {} greatest {} ({} operations, at {}x{}; table {}), row least {} greatest {} ({}, at {}x{}; table {}), point least {} greatest {} ({}, at {}x{}; table {}), {} preempted and left out",
+                c.kind,
+                c.call.least,
+                c.call.greatest,
+                c.call.n,
+                c.call.w,
+                c.call.h,
+                p.call_measured,
+                hundredths(c.row.least),
+                hundredths(c.row.greatest),
+                c.row.n,
+                c.row.w,
+                c.row.h,
+                hundredths(u64::from(p.row_measured)),
+                hundredths(c.point.least),
+                hundredths(c.point.greatest),
+                c.point.n,
+                c.point.w,
+                c.point.h,
+                hundredths(u64::from(p.point_measured)),
+                c.preempted
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// The bands of a frame of one copy over the whole screen by the table, and
 /// the words that say whether the period holds them.
 pub fn full_frame_text() -> String {
@@ -633,11 +742,12 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         text(&driver)
     );
     println!(
-        "comp-probe on {}: {}; the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}",
+        "comp-probe on {}: {}; the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}; the calibration of the prices on shapes of their own: {}",
         machine.name,
         full_frame_text(),
         compositor::BAND_TICKS,
-        raster_text(&raster_costs(&output.lines, COMP_TAG))
+        raster_text(&raster_costs(&output.lines, COMP_TAG)),
+        calibration_text(&calibrations(&output.lines, COMP_TAG))
     );
     Ok(())
 }
@@ -863,6 +973,41 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("within the 45"));
+    }
+
+    #[test]
+    fn the_calibration_lines_are_read_and_told_against_the_table() {
+        let lines: Vec<String> = [
+            "service calibration: 17 copy call 700 780 48 8 1 row 1500 2100 72 16 8 point 150 170 120 64 32 preempted 3",
+            "service calibration: 17 black call 200 212 48 8 1 row 800 900 72 4 32 point 40 49 120 152 8 preempted 0",
+            "service calibration: 12 copy call 1 1 1 1 1 row 1 1 1 1 1 point 1 1 1 1 1 preempted 0",
+            "service calibration: 17 over call 1 2 3",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        let costs = calibrations(&lines, COMP_TAG);
+        assert_eq!(costs.len(), 2);
+        assert_eq!(costs[0].kind, "copy");
+        assert_eq!(
+            costs[0].call,
+            Class {
+                least: 700,
+                greatest: 780,
+                n: 48,
+                w: 8,
+                h: 1
+            }
+        );
+        assert_eq!(costs[0].point.greatest, 170);
+        assert_eq!(costs[0].preempted, 3);
+        let text = calibration_text(&costs);
+        assert!(
+            text.contains("copy: call least 700 greatest 780 (48 operations, at 8x1; table 851)")
+        );
+        assert!(text.contains("point least 1.50 greatest 1.70 (120, at 64x32; table 1.90)"));
+        assert!(text.contains("3 preempted and left out"));
+        assert!(calibration_text(&[]).contains("no calibration lines"));
     }
 
     #[test]
