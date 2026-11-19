@@ -614,6 +614,9 @@ mod tests {
             (2, 2500),
             (3, 900),
             (8, 2000),
+            (9, 1500),
+            (10, 2500),
+            (11, 3000),
             (65, 5000),
             (64, 4000),
         ]
@@ -621,7 +624,7 @@ mod tests {
         .map(|&(k, t)| step(k, t))
         .collect();
         let lost = crate::step_line::tabled(&lines);
-        assert_eq!(steps_verdict(&lost).map(|r| r.len()), Ok(6));
+        assert_eq!(steps_verdict(&lost).map(|r| r.len()), Ok(9));
         let mut missing = lost.clone();
         missing.remove(3);
         assert!(steps_verdict(&missing).unwrap_err().contains("Clone"));
