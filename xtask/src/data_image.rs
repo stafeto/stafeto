@@ -279,17 +279,30 @@ pub fn make_v051(path: &Path, size: u64, key: &[u8]) -> Result<(), String> {
         .map_err(|_| format!("{}: flush failed", path.display()))
 }
 
-/// `cargo xtask data-image <path> [--size 2G]`.
+/// `cargo xtask data-image <path> [--size 2G] [--fill]`: with `--fill` the volume also holds the
+/// files of `FILL_1G` (about 770 MiB: for a volume of 1 GiB or more), the layout an older release
+/// leaves, for the measurement of a walk and of the first mount on a device (the first boot of this
+/// release converts it).
 pub fn run(args: &[String]) -> Result<(), String> {
-    let usage = "usage: xtask data-image <path> [--size 2G]";
+    let usage = "usage: xtask data-image <path> [--size 2G] [--fill]";
     let path = args.first().filter(|a| !a.starts_with("--")).ok_or(usage)?;
-    let size = match args.get(1).map(String::as_str) {
-        None => DEFAULT_SIZE,
-        Some("--size") => parse_size(args.get(2).ok_or(usage)?)?,
-        Some(_) => return Err(usage.to_string()),
-    };
-    if args.len() > 3 {
-        return Err(usage.to_string());
+    let mut size = DEFAULT_SIZE;
+    let mut fill = false;
+    let mut rest = args[1..].iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--size" => size = parse_size(rest.next().ok_or(usage)?)?,
+            "--fill" => fill = true,
+            _ => return Err(usage.to_string()),
+        }
+    }
+    if fill {
+        if size < 1 << 30 {
+            return Err("--fill needs --size 1G or more".to_string());
+        }
+        make_filled(Path::new(path), size, FILL_1G)?;
+        println!("data-image: {path}, {size} bytes, filled: Partitioned");
+        return Ok(());
     }
     let did = make(Path::new(path), size)?;
     println!("data-image: {path}, {size} bytes: {did:?}");
