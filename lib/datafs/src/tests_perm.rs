@@ -1392,6 +1392,71 @@ fn a_commit_that_compacts_a_metadata_pair_reads_the_whole_list_of_pairs_every_se
     }
 }
 
+/// The cost of the jobs that change the tree, in volumes with more and more directories (a directory
+/// is a pair of metadata blocks): a commit that splits or relocates a pair looks for the pair before
+/// it in the list of every pair of the volume (`lfs_fs_pred`), so the worst of them grows with the
+/// directories while the common one does not. Prints, for the table 4.2 of the plan, the common and
+/// the worst reads of 120 CHMODs, 120 MKDIRs (each followed by its RMDIR) and the derived time of the
+/// worst at 0.1 ms a read.
+#[test]
+#[ignore = "prints a table; run by name"]
+fn the_worst_commit_grows_with_the_directories_of_the_volume() {
+    fn stats(reads: &mut [u64]) -> (u64, u64) {
+        reads.sort_unstable();
+        (reads[reads.len() / 2], reads[reads.len() - 1])
+    }
+    std::println!(
+        "| directories | chmod common | chmod worst | mkdir common | mkdir worst | rmdir new common | rmdir new worst | rmdir of the oldest | worst ms |"
+    );
+    std::println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for dirs in [0u32, 500, 2_000, 6_000] {
+        let mut rig = Rig::on(MemDevice::new(262_144));
+        for parent in 0..8 {
+            rig.mkdir(ROOT, std::format!("/p{parent}").as_bytes(), 0o755)
+                .unwrap();
+        }
+        for n in 0..dirs {
+            let path = std::format!("/p{}/d{n}", n % 8);
+            rig.mkdir(ROOT, path.as_bytes(), 0o755).unwrap();
+        }
+        rig.mkdir(ROOT, b"/a", 0o777).unwrap();
+        rig.put(OWNER, b"/a/f", 0o644, b"x");
+        let (mut chmods, mut makes, mut removes) = (Vec::new(), Vec::new(), Vec::new());
+        for n in 0..120u32 {
+            let before = rig.fs.device().reads;
+            rig.chmod(OWNER, b"/a/f", if n % 2 == 0 { 0o600 } else { 0o644 })
+                .unwrap();
+            chmods.push(rig.fs.device().reads - before);
+            let name = std::format!("/a/m{n}");
+            let before = rig.fs.device().reads;
+            rig.mkdir(OWNER, name.as_bytes(), 0o755).unwrap();
+            makes.push(rig.fs.device().reads - before);
+            let before = rig.fs.device().reads;
+            rig.call(OWNER, |w| {
+                p::path_call(p::Method::Rmdir, name.as_bytes(), w)
+            })
+            .unwrap();
+            removes.push(rig.fs.device().reads - before);
+        }
+        // The oldest directories are the far end of the list of pairs: removing one looks the pair
+        // before it up from the head.
+        let mut oldest = 0;
+        for n in 0..8.min(dirs) {
+            let path = std::format!("/p{}/d{n}", n % 8);
+            let before = rig.fs.device().reads;
+            rig.call(ROOT, |w| p::path_call(p::Method::Rmdir, path.as_bytes(), w))
+                .unwrap();
+            oldest = oldest.max(rig.fs.device().reads - before);
+        }
+        let ((cc, cw), (mc, mw), (rc, rw)) =
+            (stats(&mut chmods), stats(&mut makes), stats(&mut removes));
+        std::println!(
+            "| {dirs} | {cc} | {cw} | {mc} | {mw} | {rc} | {rw} | {oldest} | {:.1} |",
+            cw.max(mw).max(rw).max(oldest) as f64 * 0.1
+        );
+    }
+}
+
 #[test]
 fn stat_and_fstat_show_the_time_of_a_write_that_is_not_synced() {
     let mut rig = Rig::new();

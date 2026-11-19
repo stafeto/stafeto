@@ -210,7 +210,14 @@ pub fn make_filled(path: &Path, size: u64, profile: Profile) -> Result<(), Strin
         fs.mkdir(p.as_bytes())
             .map_err(|e| format!("{p}: mkdir {e:?}"))
     };
-    for top in ["/small", "/big", "/rd", "/rm"] {
+    // The empty directories come first: the oldest pairs are at the far end of the list of pairs of
+    // the volume, where RMDIR looks up the pair before the one it removes (its worst case, which the
+    // probe measures on `/rm/e0`).
+    dir(&mut fs, "/rm")?;
+    for e in 0..profile.empty {
+        dir(&mut fs, &format!("/rm/e{e}"))?;
+    }
+    for top in ["/small", "/big", "/rd"] {
         dir(&mut fs, top)?;
     }
     for d in 0..profile.small_dirs {
@@ -229,9 +236,6 @@ pub fn make_filled(path: &Path, size: u64, profile: Profile) -> Result<(), Strin
     }
     for r in 0..profile.listed {
         put(&mut fs, &format!("/rd/r{r}"), 0, 0)?;
-    }
-    for e in 0..profile.empty {
-        dir(&mut fs, &format!("/rm/e{e}"))?;
     }
     fs.unmount()
         .map_err(|e| format!("{}: unmount: {e:?}", path.display()))?;
