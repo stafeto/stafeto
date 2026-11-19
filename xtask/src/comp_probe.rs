@@ -8,7 +8,14 @@
 //! rectangle posted alone, a second window over the first) and ends holding
 //! them; the second waits for them to go, finds the black screen they left,
 //! and asks for the screen as a program of proto_gpu's first revision does
-//! (OPEN, a pattern, FLUSH).
+//! (OPEN, a pattern, FLUSH). Its window covers the screen with nothing above
+//! it, so the display shows the window's buffer (the driver's pool) as it
+//! is: the service's `bands` stay as they were over three FLUSHes while
+//! `bypassed` grows by three. A third client then puts a window over it
+//! (the frame is put together, and the screenshot has the CRC of that
+//! screen) and ends (the pool is shown again). QEMU's trace of the display
+//! must show the scanout on resources 1, 2, 1, 2 and 1 in this order: the
+//! target, the pool, the target, the pool, the target.
 //!
 //! While each client waits after a frame, xtask asks the monitor of QEMU
 //! for a `screendump` and takes the CRC-32 of the colours: it equals the
@@ -74,13 +81,16 @@ const OVERLAP: &str = "comp-probe: overlap crc ";
 const BLACK: &str = "comp-probe: black crc ";
 const LEGACY: &str = "comp-probe: legacy crc ";
 const LEGACY_PARTIAL: &str = "comp-probe: legacy partial crc ";
+const ABOVE: &str = "comp-probe: above crc ";
+const LEGACY_BACK: &str = "comp-probe: legacy back crc ";
 const ENDED: &str = "init: comp-probe ended: exit code 0, not restarted";
+const ENDED_C: &str = "init: comp-probe-c ended: exit code 0, not restarted";
 const ENDED_B: &str = "init: comp-probe-b ended: exit code 0, not restarted";
 const B_ENDS: &str = "init: comp-probe-b ended: ";
 
 /// The lines each client prints once per check that passed, and how many
 /// times a run has each.
-const CHECKS: [(&str, usize); 20] = [
+const CHECKS: [(&str, usize); 26] = [
     ("comp-probe: the screen is 640x400, no window yet", 1),
     (
         "comp-probe: windows outside the screen or of another format are refused",
@@ -124,8 +134,26 @@ const CHECKS: [(&str, usize); 20] = [
         "comp-probe: FLUSH of a rectangle outside the screen is INVALID",
         1,
     ),
+    (
+        "comp-probe: three FLUSHes were shown from the pool, no band was put together",
+        1,
+    ),
+    ("comp-probe: the window below is shown from its pool", 1),
+    (
+        "comp-probe: a window above the pool made the service put the frame together",
+        1,
+    ),
+    (
+        "comp-probe: the window above went and the pool was shown again with no band",
+        1,
+    ),
+    (
+        "comp-probe: the client over the pool ends with its window",
+        1,
+    ),
     ("comp-probe: the program ends with its window", 1),
-    ("comp-probe: ok", 2),
+    ("comp-probe: ok", 3),
+    (ENDED_C, 1),
     (DRIVER_LINE, 1),
     (DRIVER_READY, 1),
 ];
@@ -147,14 +175,15 @@ const COMP_KINDS: [(usize, &str); 7] = [
     (65, "a band of a frame and the end of a frame"),
 ];
 /// The driver's: SUBSCRIBE, COMMIT, PIPELINES and SOURCE (the compositor
-/// asks both when it opens the screen, to put the pointer on the cursor
-/// pipeline), and its own (the interrupt). LAYERS needs the pointer, which
-/// this image has none of (focus-probe's does).
-const DRIVER_KINDS: [(usize, &str); 5] = [
+/// asks them when it opens the screen: the cursor pipeline and the pool),
+/// LAYERS (the frames shown directly from the pool and the frame that
+/// takes the screen back), and its own (the interrupt).
+const DRIVER_KINDS: [(usize, &str); 6] = [
     (5, "Subscribe"),
     (6, "Commit"),
     (9, "Pipelines"),
     (10, "Source"),
+    (11, "Layers"),
     (65, "the interrupt"),
 ];
 
@@ -335,6 +364,35 @@ pub fn raster_text(costs: &[RasterCost]) -> String {
         .join("; ")
 }
 
+/// The device's trace against what the probe did: the scanout was set to
+/// the target (OPEN), the pool (the window of the first revision shown
+/// directly), the target (a window came over it), the pool again (it went)
+/// and the target at last (the window closed), all on the whole screen, in
+/// this order.
+pub fn bypass_trace_verdict(events: &[qemu::GpuTrace]) -> Result<(), String> {
+    let scanouts: Vec<u32> = events
+        .iter()
+        .filter_map(|e| match e {
+            qemu::GpuTrace::Scanout {
+                id: 0,
+                res,
+                w: 640,
+                h: 400,
+                x: 0,
+                y: 0,
+            } => Some(*res),
+            _ => None,
+        })
+        .collect();
+    if gpu_probe::contains_in_order(&scanouts, &[1, 2, 1, 2, 1]) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the trace of SET_SCANOUT shows resources {scanouts:?}, 1, 2, 1, 2, 1 in order expected"
+        ))
+    }
+}
+
 /// Follows the run: the screenshots against the guest's CRC-lines, then
 /// the end of both clients.
 fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
@@ -350,6 +408,11 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
     // The first client ends, and the second finds the black screen it left.
     run.expect_line(ENDED, |l| l == ENDED, WITHIN)?;
     for prefix in [BLACK, LEGACY, LEGACY_PARTIAL] {
+        compare(run, &mut monitor, prefix)?;
+    }
+    // The third client's window over the window of the first revision (the
+    // frame is put together), and the pool shown again once it has gone.
+    for prefix in [ABOVE, LEGACY_BACK] {
         compare(run, &mut monitor, prefix)?;
     }
     run.expect_line(ENDED_B, |l| l == ENDED_B, WITHIN)?;
@@ -373,13 +436,19 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
         scratch.socket().display()
     ));
     cmd.args(qemu::GPU);
+    cmd.args(qemu::gpu_trace(&scratch.trace()));
     let mut run = Run::start(cmd, Input::Null)?;
     let driven = drive(&mut run, &scratch);
     let outcome = run.stop();
     driven.map_err(|e| format!("comp-probe on {}: {e}", machine.name))?;
     verdict(&outcome.lines).map_err(|e| format!("comp-probe on {}: {e}", machine.name))?;
+    let text = std::fs::read_to_string(scratch.trace())
+        .map_err(|e| format!("comp-probe on {}: the trace file: {e}", machine.name))?;
+    let events =
+        qemu::parse_gpu_trace(&text).map_err(|e| format!("comp-probe on {}: {e}", machine.name))?;
+    bypass_trace_verdict(&events).map_err(|e| format!("comp-probe on {}: {e}", machine.name))?;
     println!(
-        "comp-probe on {}: the screen matched the guest's frames for a window, a rectangle of it, two windows, the black screen after a process ended and a window of the first revision",
+        "comp-probe on {}: the screen matched the guest's frames for a window, a rectangle of it, two windows, the black screen after a process ended, a window of the first revision shown from the pool (the trace shows the scanout on resource 2, no band put together over three FLUSHes), a window over it (resource 1) and the pool again (resource 2)",
         machine.name
     );
     if !machine.is_hvf() {
@@ -491,6 +560,56 @@ mod tests {
         ));
         lines.push(" kept".to_owned());
         assert_eq!(verdict(&lines), Ok(()));
+    }
+
+    fn scanout(res: u32) -> qemu::GpuTrace {
+        qemu::GpuTrace::Scanout {
+            id: 0,
+            res,
+            w: 640,
+            h: 400,
+            x: 0,
+            y: 0,
+        }
+    }
+
+    #[test]
+    fn the_trace_of_the_direct_frames_needs_the_pool_twice_with_the_target_between() {
+        let good: Vec<_> = [1, 2, 1, 2, 1].map(scanout).to_vec();
+        assert_eq!(bypass_trace_verdict(&good), Ok(()));
+        // A pointer's move and the like in between do not matter.
+        let mut noisy = good.clone();
+        noisy.insert(
+            2,
+            qemu::GpuTrace::Cursor {
+                update: false,
+                x: 1,
+                y: 1,
+                res: 3,
+            },
+        );
+        assert_eq!(bypass_trace_verdict(&noisy), Ok(()));
+        // The pool never shown, shown once only, or never given back.
+        for bad in [
+            [1, 1, 1].as_slice(),
+            &[1, 2, 1],
+            &[1, 2, 1, 2],
+            &[2, 1, 2, 1],
+        ] {
+            let events: Vec<_> = bad.iter().map(|r| scanout(*r)).collect();
+            assert!(bypass_trace_verdict(&events).is_err(), "{bad:?}");
+        }
+        // A scanout of another size is not the screen's.
+        let mut small = good.clone();
+        small[1] = qemu::GpuTrace::Scanout {
+            id: 0,
+            res: 2,
+            w: 320,
+            h: 200,
+            x: 0,
+            y: 0,
+        };
+        assert!(bypass_trace_verdict(&small).is_err());
     }
 
     fn step(tag: &str, kind: usize, ticks: u64) -> String {

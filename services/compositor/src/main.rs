@@ -9,8 +9,12 @@
 //! and tells the driver to show the changed rectangle (COMMIT of proto_gpu's
 //! second revision, which answers at once; the end comes as a bit). A
 //! program of the first revision, which knows only OPEN and FLUSH, gets a
-//! window of the whole screen with a buffer the service makes, so that
-//! Doom runs here as it runs on the driver.
+//! window of the whole screen whose buffer is the driver's pool source
+//! (proto_gpu revision 3), so that Doom runs here as it runs on the driver.
+//! While that window covers the whole screen with nothing above it, and the
+//! pointer is not in the frame, the service puts nothing together: it binds
+//! the pool to the primary pipeline (LAYERS) and the display shows the
+//! window's buffer as it is (the direct frame, `Scene::plan`).
 //!
 //! The service never waits for a client or for the device inside a step.
 //! A frame is taken at its start (the posted buffer of every window), made
@@ -47,7 +51,7 @@
 
 use abi::{Access, Error, MESSAGE_MAX, Rights, Source};
 use compositor::{
-    Band, Format, MAX_WINDOWS, Refusal, SCREEN, Scene, Source as PixelSource, compose,
+    Band, Format, FrameKind, MAX_WINDOWS, Refusal, SCREEN, Scene, Source as PixelSource, compose,
 };
 use core::mem::ManuallyDrop;
 use core::slice;
@@ -56,9 +60,10 @@ use proto_comp::{
     MAX_EVENTS, Method as Comp, Post, Rect, SHOWN, WindowRecord, manage,
 };
 use proto_gpu::{
-    BUFFER_BYTES, BUSY, CLEARING, FORMATS_ARGB8888, FRAME_FAILED, FRAME_SHOWN, HEIGHT, IO,
-    KIND_CURSOR, Layers, Method as Gpu, NO_DEVICE, NO_INPUT, NOT_ALLOWED, Pipelines, SCREEN_BYTES,
-    SOURCE_KIND_CURSOR, Screen, SourceInfo, VERSION, WIDTH, code,
+    BUFFER_BYTES, BUSY, CLEARING, FORMATS_ARGB8888, FORMATS_XRGB8888, FRAME_FAILED, FRAME_SHOWN,
+    HEIGHT, IO, KIND_CURSOR, KIND_PRIMARY, LayerRow, Layers, Method as Gpu, NO_DEVICE, NO_INPUT,
+    NOT_ALLOWED, PIPELINE_FULL_SCREEN, Pipelines, SCREEN_BYTES, SOURCE_KIND_CURSOR,
+    SOURCE_KIND_POOL, SOURCE_POOL, SOURCE_TARGET, Screen, SourceInfo, VERSION, WIDTH, code,
 };
 use proto_init::ServiceArgs;
 use proto_input::{ABS_MAX, ABS_X, ABS_Y, EV_ABS, EV_KEY, Method as InputMethod};
@@ -77,16 +82,20 @@ rt::entry!(main);
 /// windows (each place of a window has three spans of BUFFER_MAX).
 const FB_AT: usize = 0x10_0100_0000;
 const BUF_AT: usize = 0x11_0000_0000;
-/// Where the service maps the buffer it made for the window of the first
-/// revision, for reading and writing, for its whole life.
-const LEGACY_AT: usize = 0x12_0000_0000;
+/// Where the service maps the pool (source 2 of the driver), the buffer of
+/// the window of the first revision, for reading and writing, for its whole
+/// life. The mapping is the 250 pages the source describes (POOL_LEN), not
+/// the whole 256 pages of the object, so it ends at 0x12_000F_A000 and the
+/// six pages up to CURSOR_AT stay unmapped: a guard gap between the two
+/// objects. Both lie in the 2 MiB span 0x12_0000_0000 to 0x12_0020_0000, one
+/// page table, the one the service's own buffer of the first revision used
+/// to need, so the gap and the cursor's four pages cost no page-table page.
+const POOL_AT: usize = 0x12_0000_0000;
 /// Where the service maps the cursor's picture (source 3 of the driver),
-/// past the legacy buffer inside the same 2 MiB span, so that its page
-/// table is the one the legacy buffer already pays for. The legacy buffer
-/// at LEGACY_AT ends at 0x12_000F_A000; a mapping of 1 MiB placed at
-/// LEGACY_AT would end exactly at CURSOR_AT, with no gap. The bypass step
-/// must place its pool elsewhere or keep the gap.
+/// past the pool inside the same 2 MiB span.
 const CURSOR_AT: usize = 0x12_0010_0000;
+// The pool's mapping ends before the cursor's with a gap of at least a page.
+const _: () = assert!(POOL_AT + POOL_LEN + PAGE <= CURSOR_AT);
 const PAGE: usize = 4096;
 /// The pages one step of the service maps or unmaps at most: a page costs
 /// the kernel about 200 ticks of a mapping and 80 of an unmapping, and a
@@ -95,11 +104,8 @@ const CHUNK: usize = 32;
 /// The tries and the pause of the first OPEN of the driver.
 const OPEN_TRIES: u32 = 150;
 const OPEN_PAUSE_NS: u64 = 5_000_000;
-/// The bytes of the buffer of the first revision: the screen's, 250 pages.
-const LEGACY_LEN: usize = SCREEN_BYTES as usize;
-/// The references the service itself holds to the buffer of the first
-/// revision: its handle and its mapping.
-const LEGACY_REFS: u64 = 2;
+/// The bytes of the pool the service maps: the screen's, 250 pages.
+const POOL_LEN: usize = SCREEN_BYTES as usize;
 /// The bytes of it one step clears.
 const CLEARED: usize = 16 * 1024;
 /// The sessions of the service's channel: the contexts, the windows, and
@@ -213,7 +219,7 @@ impl PixelSource for Pixels<'_> {
             .window(window)
             .map_or(0, |w| w.stride as usize * w.rect.h as usize);
         let at = if self.0.window(window).is_some_and(|w| w.legacy) {
-            LEGACY_AT
+            POOL_AT
         } else {
             buf_at(window, buffer as usize)
         };
@@ -273,6 +279,18 @@ struct Job {
     at: Band,
 }
 
+/// The pool: the buffer of the window of the first revision, the driver's
+/// source 2, mapped at POOL_AT for the service's life (to read the window's
+/// pixels when a frame is put together, and to clear them). The handle has
+/// DUPLICATE (the driver gives it to the owner so), and each window gets a
+/// copy without it; `refs` is the number of references the object had right
+/// after the mapping (init's, the driver's two and the service's two): more
+/// of them mean a program kept a copy of an earlier window's buffer.
+struct Pool {
+    handle: Handle<Memory>,
+    refs: u64,
+}
+
 struct Compositor {
     channel: ManuallyDrop<Handle<Channel>>,
     /// A copy of the channel with NOTIFY: the bands start themselves
@@ -301,10 +319,14 @@ struct Compositor {
     manager: Option<Handle<Channel>>,
     /// The label of the session that subscribed: only its end clears it.
     manager_label: u64,
-    /// The buffer of the window of the first revision: the service's own
-    /// object, mapped at LEGACY_AT for good, cleared a step at a time when
-    /// its window goes (`cleared`: the bytes done, None when it is clean).
-    legacy: Handle<Memory>,
+    /// The buffer of the window of the first revision, None when the driver
+    /// gave none (OPEN is BUSY then). It is cleared a step at a time once its
+    /// window has gone and the display does not show it (`cleared`: the
+    /// bytes done, None when it is clean).
+    pool: Option<Pool>,
+    /// The id of the driver's primary pipeline, when the display can show
+    /// the pool.
+    primary: u32,
     cleared: Option<usize>,
     attaching: Option<Attaching>,
 }
@@ -327,17 +349,6 @@ fn main(_: u64) -> u64 {
     let Ok(notify) = sys::handle_duplicate(&channel, Rights::NOTIFY) else {
         return NOT_REGISTERED;
     };
-    // The buffer of the window of the first revision, made here, outside
-    // any step (the kernel clears its 250 pages in the call).
-    let Ok(legacy) = sys::mem_create(LEGACY_LEN as u64) else {
-        return NOT_REGISTERED;
-    };
-    let rw = Access::ReadWrite;
-    if sys::mem_map(&s.process, &legacy, 0, LEGACY_LEN as u64, LEGACY_AT, rw).is_err()
-        || sys::memory_info(&legacy).map_or(true, |info| info.refs != LEGACY_REFS)
-    {
-        return NOT_REGISTERED;
-    }
     let mut service = Compositor {
         channel: Handle::borrowed(channel.raw()),
         notify,
@@ -358,7 +369,8 @@ fn main(_: u64) -> u64 {
         axes: Axes::default(),
         manager: None,
         manager_label: 0,
-        legacy,
+        pool: None,
+        primary: 0,
         cleared: None,
         attaching: None,
     };
@@ -492,7 +504,7 @@ impl Compositor {
         }
         // The mapping keeps the object; the handle is not needed.
         drop(fb);
-        self.take_cursor_plane(&owner);
+        self.take_planes(&owner);
         self.screen = Some(owner);
         rt::println!(
             "compositor: screen ready, {}x{}, stride {}",
@@ -503,29 +515,105 @@ impl Compositor {
         Ok(())
     }
 
-    /// Puts the pointer on the display's cursor pipeline when the driver has
-    /// one: PIPELINES, the record of kind CURSOR, SOURCE of the cursor
-    /// picture, the object mapped, the arrow drawn into it once. Any
-    /// refusal leaves the pointer drawn into the frame, as before. Two
-    /// calls to the driver and a mapping of four pages, so it belongs to the
-    /// opening of the screen, which no frame is waiting for.
-    fn take_cursor_plane(&mut self, owner: &Handle<Channel>) {
-        match self.cursor_picture(owner) {
+    /// What the driver's pipelines let the service do, once the screen is
+    /// open: the pointer goes onto the cursor pipeline, and the pool
+    /// becomes the buffer of the window of the first revision. Both are
+    /// calls to the driver and mappings (a pool of 250 pages), so they
+    /// belong to the opening of the screen, which no frame is waiting for.
+    /// Any refusal leaves the old way: the pointer drawn into the frame,
+    /// no direct frame, and OPEN BUSY (the pool is the only buffer of a
+    /// window of the first revision).
+    fn take_planes(&mut self, owner: &Handle<Channel>) {
+        let list = {
+            let mut buffer = [0; MESSAGE_MAX];
+            let mut request = Writer::new();
+            Pipelines::write_request(&mut request)
+                .map_err(|_| "PIPELINES")
+                .and_then(|()| sys::send(owner, request.as_bytes()).map_err(|_| "PIPELINES failed"))
+                .and_then(|reply| {
+                    Pipelines::read(reply.bytes(&mut buffer)).map_err(|_| "no PIPELINES")
+                })
+        };
+        let list = match list {
+            Ok(list) => list,
+            Err(why) => {
+                rt::println!("compositor: the pointer is drawn in the frame: {why}");
+                rt::println!("compositor: no pool for the window of the first revision: {why}");
+                return;
+            }
+        };
+        match self.cursor_picture(owner, &list) {
             Ok(plane) => {
                 self.scene.set_cursor_plane(Some(plane));
                 rt::println!("compositor: the pointer is on the cursor pipeline");
             }
             Err(why) => rt::println!("compositor: the pointer is drawn in the frame: {why}"),
         }
+        match self.pool_source(owner, &list) {
+            Ok(()) => rt::println!("compositor: the pool is the buffer of the first revision"),
+            Err(why) => {
+                rt::println!("compositor: no pool for the window of the first revision: {why}");
+            }
+        }
+    }
+
+    /// The pool: SOURCE of kind pool, the object mapped at POOL_AT, and the
+    /// scene told the display can show it. The primary pipeline must take
+    /// the screen's whole size.
+    fn pool_source(
+        &mut self,
+        owner: &Handle<Channel>,
+        list: &Pipelines,
+    ) -> Result<(), &'static str> {
+        let primary = *list
+            .as_slice()
+            .iter()
+            .find(|p| {
+                p.kind == KIND_PRIMARY
+                    && p.has(PIPELINE_FULL_SCREEN)
+                    && p.formats & FORMATS_XRGB8888 != 0
+            })
+            .ok_or("no primary pipeline that takes the whole screen")?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let mut request = Writer::new();
+        SourceInfo::write_request(SOURCE_KIND_POOL, &mut request).map_err(|_| "SOURCE")?;
+        let mut reply = sys::send(owner, request.as_bytes()).map_err(|_| "SOURCE failed")?;
+        let source = SourceInfo::read(reply.bytes(&mut buffer)).map_err(|_| "SOURCE refused")?;
+        let object = reply.handles.take::<Memory>(0).map_err(|_| "no object")?;
+        if source.id != SOURCE_POOL
+            || !source.suits(&primary)
+            || u64::from(source.stride) * u64::from(source.height) != POOL_LEN as u64
+        {
+            return Err("the pool source does not suit");
+        }
+        sys::mem_map(
+            &self.process,
+            &object,
+            0,
+            POOL_LEN as u64,
+            POOL_AT,
+            Access::ReadWrite,
+        )
+        .map_err(|_| "the pool cannot be mapped")?;
+        let refs = sys::memory_info(&object)
+            .map_err(|_| "the pool's references")?
+            .refs;
+        self.pool = Some(Pool {
+            handle: object,
+            refs,
+        });
+        self.primary = primary.id;
+        self.scene.set_direct(true);
+        Ok(())
     }
 
     /// The pipeline and the source of the cursor, with the picture in place.
-    fn cursor_picture(&mut self, owner: &Handle<Channel>) -> Result<(u32, u32), &'static str> {
+    fn cursor_picture(
+        &mut self,
+        owner: &Handle<Channel>,
+        list: &Pipelines,
+    ) -> Result<(u32, u32), &'static str> {
         let mut buffer = [0; MESSAGE_MAX];
-        let mut request = Writer::new();
-        Pipelines::write_request(&mut request).map_err(|_| "PIPELINES")?;
-        let reply = sys::send(owner, request.as_bytes()).map_err(|_| "PIPELINES failed")?;
-        let list = Pipelines::read(reply.bytes(&mut buffer)).map_err(|_| "no PIPELINES")?;
         let pipeline = *list
             .as_slice()
             .iter()
@@ -844,12 +932,15 @@ impl Compositor {
                 self.extra[i].wait = self.extra[i].queued.take();
             }
         }
+        // A direct frame has no band: its one step is the end of the frame.
+        let row = if self.scene.frame_kind() == FrameKind::Bypass {
+            damage.y + damage.h
+        } else {
+            damage.y
+        };
         self.job = Some(Job {
             damage,
-            at: Band {
-                row: damage.y,
-                col: 0,
-            },
+            at: Band { row, col: 0 },
         });
         let _ = sys::notify(&self.notify, BAND);
     }
@@ -882,17 +973,34 @@ impl Compositor {
             &Pixels(&self.scene),
             &mut self.raster,
         );
+        self.scene.band_done();
         let _ = sys::notify(&self.notify, BAND);
     }
 
-    /// COMMIT of the frame's rectangle: the driver answers at once and says
-    /// the end by a bit.
+    /// The frame goes to the driver, which answers at once and says the end
+    /// by a bit: COMMIT of the rectangle for a frame composed in the
+    /// target the screen shows; LAYERS with a row of the primary pipeline
+    /// bound to the target, after bands over the whole screen, when the
+    /// screen shows the pool; LAYERS bound to the pool, with the changed
+    /// area, for a direct frame. It is the step after the last band (the
+    /// first step of a direct frame) and no band is in it.
     fn commit(&mut self, damage: Rect) {
         let Some(owner) = &self.screen else {
             return;
         };
+        let kind = self.scene.frame_kind();
         let mut request = Writer::new();
-        let wrote = damage.write_as(Gpu::Commit, &mut request);
+        let wrote = match kind {
+            FrameKind::Compose => damage.write_as(Gpu::Commit, &mut request),
+            FrameKind::Rebind => {
+                Layers::new(&[LayerRow::primary(self.primary, SOURCE_TARGET, Some(SCREEN))])
+                    .and_then(|layers| layers.write(&mut request))
+            }
+            FrameKind::Bypass => {
+                Layers::new(&[LayerRow::primary(self.primary, SOURCE_POOL, Some(damage))])
+                    .and_then(|layers| layers.write(&mut request))
+            }
+        };
         let sent = wrote
             .map_err(|_| Error::InvalidArgs)
             .and_then(|()| sys::send(owner, request.as_bytes()));
@@ -903,6 +1011,11 @@ impl Compositor {
                     self.committed = true;
                 } else {
                     rt::println!("compositor: COMMIT refused");
+                    // A driver that refuses the pool is asked no more: the
+                    // frames are put together from now on.
+                    if kind == FrameKind::Bypass {
+                        self.scene.set_direct(false);
+                    }
                     self.finish(false);
                 }
             }
@@ -936,6 +1049,8 @@ impl Compositor {
                 rt::println!("gpu: screen released");
             }
         }
+        // The pool is cleared once the frame that unbound it is shown.
+        self.start_clearing();
         self.kick();
     }
 
@@ -964,10 +1079,21 @@ impl Compositor {
         }
         if w.legacy {
             self.released += 1;
-            self.cleared = Some(0);
         }
+        self.start_clearing();
         let _ = sys::notify(&self.notify, WORK);
         self.kick();
+    }
+
+    /// The clearing of the pool starts when the window of the first
+    /// revision has gone and the display does not show the pool (the scene
+    /// says so: after the frame that returned the screen to the target is
+    /// shown, never before).
+    fn start_clearing(&mut self) {
+        if self.scene.take_pool_clear() {
+            self.cleared = Some(0);
+            let _ = sys::notify(&self.notify, WORK);
+        }
     }
 
     /// The places that cannot take a new window: those whose pages are
@@ -995,14 +1121,14 @@ impl Compositor {
         rt::service::step_own();
         self.regrant();
         if let Some(done) = self.cleared {
-            let len = CLEARED.min(LEGACY_LEN - done);
+            let len = CLEARED.min(POOL_LEN - done);
             // SAFETY: the service's own read and write mapping of the
-            // legacy buffer, LEGACY_LEN long, of which `len` bytes from
+            // legacy buffer, POOL_LEN long, of which `len` bytes from
             // `done` are in it; no window uses it while it is being
             // cleared (OPEN says CLEARING).
-            unsafe { core::ptr::write_bytes((LEGACY_AT + done) as *mut u8, 0, len) };
+            unsafe { core::ptr::write_bytes((POOL_AT + done) as *mut u8, 0, len) };
             let done = done + len;
-            self.cleared = (done < LEGACY_LEN).then_some(done);
+            self.cleared = (done < POOL_LEN).then_some(done);
         } else if let Some(i) = self.extra.iter().position(|e| e.dying) {
             self.unmap_chunk(i);
         } else if self.attaching.is_some() {
@@ -1147,15 +1273,19 @@ impl Compositor {
         if self.scene.has_legacy() {
             return Answer::Status(code(BUSY));
         }
-        // A client that closed its window and kept its handle, mapped or
-        // not, or sent a copy on, still reaches the buffer: the service
-        // holds the only two references it may have, its handle and its
-        // mapping.
-        if sys::memory_info(&self.legacy).is_ok_and(|info| info.refs > LEGACY_REFS) {
+        // The pool is the window's buffer. A client that closed its window and
+        // kept its handle, mapped or not, or sent a copy on, still reaches
+        // it: the service holds the only references it may have, its handle
+        // and its mapping. A service without the pool has no buffer to give.
+        let Some(pool) = &self.pool else {
+            return Answer::Status(code(BUSY));
+        };
+        if sys::memory_info(&pool.handle).is_ok_and(|info| info.refs > pool.refs) {
             return Answer::Status(code(BUSY));
         }
-        // The last window's buffer is being cleared: ask again.
-        if self.cleared.is_some() {
+        // The last window's buffer is being cleared, or waits for the frame
+        // that takes the screen back from it: ask again.
+        if self.cleared.is_some() || self.scene.pool_release_pending() {
             return Answer::Status(code(CLEARING));
         }
         let Ok((label, session)) = self.window_session() else {
@@ -1166,12 +1296,6 @@ impl Compositor {
             Ok(i) => i,
             Err(refusal) => return Answer::Status(Compositor::refusal(refusal)),
         };
-        let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
-        let Ok(client) = sys::handle_duplicate(&self.legacy, rights) else {
-            self.destroy(i);
-            return Answer::Status(Status::Kernel(Error::NoMemory));
-        };
-        let mut handles: Outgoing = [client.erase(), session.erase()].into();
         // The keyboard's focus is the compositor's always; the program reads
         // the keys of its window from a session of the compositor's own, so
         // they go to it while the window has the focus. An image without a
@@ -1189,12 +1313,22 @@ impl Compositor {
         } else {
             code(NO_INPUT)
         };
-        if let Some(focus) = focus {
-            let _ = handles.push(focus.erase());
-        }
         if Screen::FIXED.write(status, r.reply()).is_err() {
             self.destroy(i);
             return Answer::Status(Status::BadSize);
+        }
+        let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
+        let client = self
+            .pool
+            .as_ref()
+            .and_then(|pool| sys::handle_duplicate(&pool.handle, rights).ok());
+        let Some(client) = client else {
+            self.destroy(i);
+            return Answer::Status(Status::Kernel(Error::NoMemory));
+        };
+        let mut handles: Outgoing = [client.erase(), session.erase()].into();
+        if let Some(focus) = focus {
+            let _ = handles.push(focus.erase());
         }
         Answer::Reply(handles)
     }
@@ -1274,6 +1408,8 @@ impl Compositor {
             created: self.scene.created(),
             frames: self.scene.frames(),
             busy: u32::from(self.scene.busy()),
+            bypassed: self.scene.bypassed(),
+            bands: self.scene.bands(),
         };
         match d.write(r.reply()) {
             Ok(()) => Answer::Reply(Outgoing::new()),

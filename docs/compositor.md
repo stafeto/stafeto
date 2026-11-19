@@ -57,27 +57,38 @@ and the header version 1 of both.
   path of the device's own event.
 - `proto_gpu` first revision (`proto/gpu`): OPEN, FLUSH, CLOSE and CLONE, as
   `libc.so` speaks them (`stafeto_display_open` and `stafeto_display_flush`).
-  OPEN makes a window of the whole screen over the one buffer the compositor
-  made at its start (it cannot make one in a step: the kernel clears the
-  megabyte inside the call); FLUSH posts a rectangle of it and its reply comes
-  once the frame that shows it is on the screen. Doom runs as it did on the
-  driver, without a rebuild. One such window lives at a time; a second OPEN is
-  BUSY, as it was. When the window goes the buffer is cleared in portions of
-  16 KiB, OPEN says CLEARING meanwhile, and the next window finds it zero.
+  OPEN makes a window of the whole screen over the driver's pool, the one
+  buffer of the window of the first revision (a source of the driver,
+  `SOURCE_KIND_POOL`: 250 pages of the 256 of its object, 640 by 400, XRGB8888,
+  asked for and mapped when the screen is opened, outside any step); FLUSH
+  posts a rectangle of it and its reply comes once the frame that shows it is on
+  the screen. Doom runs as it did on the driver, without a rebuild. One such
+  window lives at a time; a second OPEN is BUSY, as it was. When the window goes
+  the pool is cleared in portions of 16 KiB once the display no longer shows it
+  (see "The direct frame": the frame that returns the screen to the service's
+  target must be shown first), OPEN says CLEARING meanwhile, and the next window
+  finds it zero. The driver gives the owner of the screen a handle of the pool
+  with DUPLICATE (the cursor's picture has none), so the compositor hands a
+  copy without it to each window.
   The buffer is shared with its client: CLOSE, or dropping the window's
   session, leaves a client that kept the handle, mapped or not, or sent a copy
   of it to another process, able to read and write the next window of the
   first revision's pixels, and the next window's alone, as the screen is never
   mapped by a client. OPEN therefore says BUSY while the object has more
-  references than the compositor's own two, its handle and its mapping
+  references than the compositor had right after it mapped the pool
   (`object_info` of a memory object returns the count in x4: handles in any
   process, mappings, handles in transit and long calls). This closes the
   case of a kept handle, mapped or not, and of a copy handed on. The price
   is availability of the old path alone: a former client that keeps its
   handle blocks the first revision's OPEN until it exits or closes the
   handle, and the second revision (ATTACH) is unaffected. The driver
-  (`virtio-gpu`) makes the same check for its `fb` in OPEN, with three
-  references of its own: its handle, its mapping and init's handle.
+  (`virtio-gpu`) makes the same check for its `fb` in OPEN, and for the pool
+  and the cursor's picture in SOURCE, with three references of its own: its
+  handle, its mapping and init's handle. A driver that gives no pool (an older
+  one, or a pool a program kept from an earlier screen) leaves OPEN BUSY.
+  The pool's mapping sits at 0x12_0000_0000 and ends at 0x12_000F_A000; the
+  cursor's four pages are at 0x12_0010_0000, so six unmapped pages lie between
+  them, in the same 2 MiB span and the same page table.
 
 ## The window manager
 
@@ -226,6 +237,57 @@ soon as the commands are in the device's queue, and the driver says
 FLUSH of the first revision still waits inside the driver, for the programs
 that speak to the driver directly (the image of `gpu-probe`).
 
+## The direct frame
+
+When one window of the first revision covers the whole screen with nothing
+above it, the screen needs no composition: its buffer is the pool, and the
+service binds the pool to the display's primary pipeline (LAYERS with a row of
+source 2 and the changed area) and puts nothing together. The frame has no
+band; its one step is the end of the frame, which is the LAYERS call. The
+decision is `Scene::plan`, made when a frame starts, after the posted buffers
+are taken, and it holds when all of these do:
+
+1. the driver has a primary pipeline that takes the screen's whole size
+   (FULL_SCREEN, XRGB8888) and gave the service the pool;
+2. the topmost shown window is of the first revision (its buffer is the
+   pool), opaque, and covers the whole screen (windows under it are not seen);
+3. no shown window is above it (a hidden window, or one with nothing taken
+   yet, is not shown);
+4. the pointer is not drawn in the frame: it is on the cursor pipeline or not
+   seen yet. After the driver refused the cursor row for good
+   (`Scene::cursor_refused`) the pointer is back in the frame and this reads
+   false from then on.
+
+A frame the rule does not allow is composed as before. The transitions:
+
+- composed to direct: no band, one LAYERS row with the pool and the changed
+  area (the driver transfers the whole pool when the source changes, whatever
+  the area says); the target is marked stale, for it is not kept while the pool
+  is shown;
+- direct to direct: the changed area alone, no band, no copy of the service;
+- direct to composed (a window came over it, it was hidden or went, the
+  pointer came back into the frame): the area becomes the whole screen, the
+  bands put it together in the target, and after the last band LAYERS binds
+  the primary pipeline to the target (source 1). The screen shows the last
+  frame of the window until the new one is whole, so there is no empty frame,
+  and the way back costs one frame of composition, as the design asks. A
+  composed frame after a direct one (the target stale) also carries the whole
+  screen.
+
+A window of the first revision that goes while the screen shows the pool is
+followed by that frame; the pool is cleared in portions only once the frame
+that unbound it is shown (`Scene::take_pool_clear`), and a program that reads
+the pool at once sees it go to zero then. The driver of a board whose
+controller reads memory continuously needs this order; virtio-gpu keeps its own
+copy at the host and would not.
+
+DESCRIBE's `bypassed` counts the frames shown directly and `bands` the bands
+put together, both since the service started: a probe that finds `bands`
+unchanged over a number of FLUSHes while `bypassed` grew by that number knows
+they cost the service no copy. The host still copies the pool into its own
+image on each transfer (virtio-gpu has no other way without `udmabuf`), so
+"no copy" means none by the service.
+
 The header version of proto_gpu stays 1 in revision 2. The loop of a service
 takes one version, and the series 0.5 of the ABI (`packages/abi.txt`) holds
 the version in the programs built for it. `proto_gpu::REVISION` is 3.
@@ -276,16 +338,22 @@ rely on it:
 
 ## Checks
 
-`cargo xtask comp-probe` runs two clients on QEMU and compares QEMU's
+`cargo xtask comp-probe` runs three clients on QEMU and compares QEMU's
 screenshot with the CRC-32 the guest computed for the screen it should show:
 a window, a rectangle of it posted alone, two windows, the black screen after
 the first client ended, and a window of the first revision (pattern and a
-rectangle). Under `-icount` it measures the steps of the compositor and of
+rectangle), which the display shows from the pool: `bands` stay as they were
+over three FLUSHes and `bypassed` grows by three, a third client's window over
+it makes the frame composed (its CRC, resource 1 in QEMU's trace of
+SET_SCANOUT) and the pool is the screen again when that window goes
+(resource 2). Under `-icount` it measures the steps of the compositor and of
 the driver: every step stays under 0.9 of term B, and a band of a frame, like
 a portion of the driver's clearing, under 16 328 ticks, and tells what each kind of layer costs a point inside
 the bands (`service raster` lines of `px::cost`; the constants of
 `Scene::tile` are set from them). `cargo xtask
-doom-probe` runs Doom through the compositor. The compositor asks PIPELINES
+doom-probe` runs Doom through the compositor: the title's CRC is the one of the
+direct path, and QEMU's trace shows the scanout on Doom's buffer (resource 2).
+`cargo xtask doom-measure` reports Doom's frames a second. The compositor asks PIPELINES
 and SOURCE of the driver at the opening of the screen, so the driver's steps
 of those kinds are required in `comp-probe`'s table.
 
@@ -320,5 +388,6 @@ The period of a frame and its counters, a window's resize, the constants of
 the bands set from the NEON costs (the probes report them), the window manager
 and the keyboard in the base image (the manager's image is the probe's), the
 pointer in the base image, the layers of the display
-controller and the bypass of the composition for one window, and the C
+controller, a window of the second revision shown directly (the flag `SCANOUT`
+of WINDOW_CREATE is reserved), and the C
 functions for windows in `libc.so` (a change of the ABI series).

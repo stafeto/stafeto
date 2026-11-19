@@ -14,14 +14,17 @@
 //!
 //! The compositor holds the one buffer of the screen the driver gave it,
 //! the buffers of its windows' clients (mapped for reading) and, for a
-//! program that knows no windows, the 250 pages of the buffer it makes at
-//! its start (`mem_create`, in its own quota): the quota is those, its
-//! program (about 57 pages with pixman, which the windows are put together
-//! by), the arena of pixman's allocations (8 pages), the rings of events
-//! (3 pages), the tables of its mappings and its 64 KiB stack. The base
-//! image keeps 16 384 free pages after its services started (`cargo xtask
-//! pkg-identity`), and init takes each record's quota from them: this one
-//! is what is left of the 429 pages the base image has over.
+//! program that knows no windows, the driver's pool (a source of the driver's,
+//! mapped for reading and writing, whose handle goes to that program): the
+//! pool is the driver's object and its pages are the driver's, so the quota
+//! holds the service's program (about 57 pages with pixman, which the windows
+//! are put together by), the arena of pixman's allocations (8 pages), the
+//! rings of events (3 pages), the tables of its mappings and its 64 KiB stack.
+//! The 250 pages of a buffer of its own that the quota held until the direct
+//! frame are gone: the quota is 250 pages smaller, and the process service's
+//! pool, which init counts at the start, is 250 pages larger. The base image
+//! keeps 16 384 free pages after its services started (`cargo xtask
+//! pkg-identity`), and init takes each record's quota from them.
 //!
 //! Level 32 (design of graphics, 'Processes'): above the processes of POSIX
 //! (31 and below), whose clients call it, and below the driver (33) and the
@@ -52,7 +55,7 @@ pub const COMPOSITOR: Record = Record {
     }),
     priority: 32,
     ceiling: 32,
-    quota: 400 * PAGE,
+    quota: 150 * PAGE,
     handle_limit: 128,
     restart: Restart::Always,
     console: true,
@@ -123,5 +126,13 @@ const PROBE_B: Record = Record {
     ..PROBE
 };
 
+/// The third probe (role `x`): waits until the second one's window is shown
+/// directly from its pool, then puts a window of its own over it and ends.
+const PROBE_C: Record = Record {
+    name: "comp-probe-c",
+    args: b"x",
+    ..PROBE
+};
+
 /// The probe's image on QEMU.
-pub const TABLE: &[Record] = &[DISPLAY, COMPOSITOR, PROBE, PROBE_B];
+pub const TABLE: &[Record] = &[DISPLAY, COMPOSITOR, PROBE, PROBE_B, PROBE_C];
