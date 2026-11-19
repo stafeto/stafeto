@@ -31,6 +31,9 @@ pub struct Options {
     pub root: Option<PathBuf>,
     pub check: bool,
     pub official: bool,
+    /// `--check` trusts the development root and the official roots: the dry
+    /// run of an update holds packages signed by both (carried and built).
+    pub with_official: bool,
     pub dir: Option<PathBuf>,
     /// The directory or address of the published index to carry from.
     pub previous: Option<String>,
@@ -62,6 +65,7 @@ impl Default for Options {
             root: None,
             check: false,
             official: false,
+            with_official: false,
             dir: None,
             previous: None,
             from: None,
@@ -80,7 +84,10 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
-        let wants_value = flag != "--no-sources" && flag != "--check" && flag != "--official";
+        let wants_value = flag != "--no-sources"
+            && flag != "--check"
+            && flag != "--official"
+            && flag != "--with-official";
         let value = if wants_value {
             i += 1;
             args.get(i)
@@ -118,6 +125,7 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
             "--dir" => o.dir = Some(value.into()),
             "--check" => o.check = true,
             "--official" => o.official = true,
+            "--with-official" => o.with_official = true,
             other => return Err(format!("{other}: unknown argument")),
         }
         i += 1;
@@ -616,6 +624,9 @@ pub fn run(o: &Options) -> Result<PathBuf, String> {
     if o.official && o.root.is_some() {
         return Err("--official takes the roots of keys/ and goes without --root".into());
     }
+    if o.with_official && (!o.check || o.official || o.root.is_some()) {
+        return Err("--with-official goes with --check and without --official or --root".into());
+    }
     if o.from.is_some() && (o.check || o.previous.is_some() || o.dir.is_some()) {
         return Err(
             "--from writes next to the files it reads: no --check, --previous or --dir".into(),
@@ -655,7 +666,13 @@ pub fn run(o: &Options) -> Result<PathBuf, String> {
                     .map_err(|e| format!("{}: {e}", path.display()))?,
             ]
         }
-        None => vec![keys::dev_keys(&tree)?.root],
+        None => {
+            let mut roots = vec![keys::dev_keys(&tree)?.root];
+            if o.with_official {
+                roots.extend(keys::official_roots()?);
+            }
+            roots
+        }
     };
     if let Some(base) = &o.remote {
         if !o.check || o.dir.is_some() {
@@ -1033,6 +1050,16 @@ mod tests {
         assert!(bad(&["--from", "x"]).contains("--serial"));
         assert!(parse_options(&args(&["--perturb", "x"])).is_err());
         assert!(bad(&["--official", "--root", "r.pub"]).contains("--official"));
+        assert!(
+            parse_options(&args(&["--check", "--with-official"]))
+                .unwrap()
+                .with_official
+        );
+        assert!(bad(&["--with-official"]).contains("--check"));
+        assert!(bad(&["--check", "--with-official", "--official"]).contains("--with-official"));
+        assert!(
+            bad(&["--check", "--with-official", "--root", "r.pub"]).contains("--with-official")
+        );
     }
 
     #[test]

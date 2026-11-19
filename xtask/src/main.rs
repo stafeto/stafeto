@@ -2233,7 +2233,8 @@ commands:
             (`--check` checks one; `--no-sources` skips the source archives; `--dir D` puts it
             in another directory, which must be empty or new, or under target/; `--previous INDEX`
             carries; `--from DIR [--storage NAME]` writes the index of the files of DIR without a
-            build; `--check --official` checks with the roots of keys/)
+            build; `--check --official` checks with the roots of keys/; `--check --with-official` trusts
+            the development root and those roots)
   pkg-identity  check that the flat images and the packages give the same bytes at the same
             paths, that the repository is whole and that a package builds again to the same bytes
   dist-licenses  check that the release archives carry the notices of the packages they
