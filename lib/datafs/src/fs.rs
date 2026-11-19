@@ -793,3 +793,204 @@ impl<D: Device> Fs<'_, D> {
         check(slot).map(|slot| File(slot as u8))
     }
 }
+
+// The entries of a directory and the status of a path with a user attribute, in one read of the
+// metadata pair (third-party/littlefs/STAFETO-CHANGES.md).
+unsafe extern "C" {
+    fn datafs_readdir_attr(
+        d: *mut c_void,
+        ctx: *mut c_void,
+        slot: c_int,
+        kind: *mut u8,
+        size: *mut u32,
+        name: *mut u8,
+        attr: u8,
+        buffer: *mut u8,
+        bufsize: u32,
+        attr_res: *mut i32,
+    ) -> c_int;
+    fn datafs_path_attrs(
+        d: *mut c_void,
+        ctx: *mut c_void,
+        path: *const c_char,
+        kind: *mut u8,
+        size: *mut u32,
+        name: *mut u8,
+        attr: u8,
+        out: *mut PathEntry,
+        buffer: *mut u8,
+        each: u32,
+        capacity: u32,
+        count: *mut u32,
+    ) -> c_int;
+    fn datafs_stat_attr(
+        d: *mut c_void,
+        ctx: *mut c_void,
+        path: *const c_char,
+        kind: *mut u8,
+        size: *mut u32,
+        name: *mut u8,
+        attr: u8,
+        buffer: *mut u8,
+        bufsize: u32,
+        attr_res: *mut i32,
+    ) -> c_int;
+}
+
+/// The size of the attribute on disk, or None when the entry has none (the code of
+/// `Error::NoAttr`).
+fn attribute_size(found: i32) -> Res<Option<usize>> {
+    match found {
+        n if n == Error::NoAttr.code() => Ok(None),
+        n if n >= 0 => Ok(Some(n as usize)),
+        n => Err(Error::from_code(n)),
+    }
+}
+
+impl<D: Device> Fs<'_, D> {
+    /// The next entry of `dir` and its attribute `attr` (at most `out.len()` bytes into `out`):
+    /// the entry and the size of the attribute on disk, which is None for an entry with no such
+    /// attribute and always for `.` and `..`. None at the end of the directory.
+    pub fn readdir_attr(
+        &mut self,
+        dir: Dir,
+        attr: u8,
+        out: &mut [u8],
+    ) -> Res<Option<(Entry, Option<usize>)>> {
+        let (mut kind, mut size, mut name) = (0u8, 0u32, [0u8; NAME_MAX + 1]);
+        let mut found = Error::NoAttr.code();
+        let room = u32::try_from(out.len()).unwrap_or(u32::MAX);
+        // SAFETY: as `readdir`; `out` holds `room` bytes and `found` is a word.
+        let more = check(self.call(|d, ctx| unsafe {
+            datafs_readdir_attr(
+                d,
+                ctx,
+                c_int::from(dir.0),
+                &mut kind,
+                &mut size,
+                name.as_mut_ptr(),
+                attr,
+                out.as_mut_ptr(),
+                room,
+                &mut found,
+            )
+        }))?;
+        if more == 0 {
+            return Ok(None);
+        }
+        let len = name.iter().position(|&b| b == 0).unwrap_or(NAME_MAX);
+        let entry = Entry {
+            kind: kind_of(kind)?,
+            size,
+            name,
+            len,
+        };
+        Ok(Some((entry, attribute_size(found)?)))
+    }
+
+    /// The status of `path` and its attribute `attr` (at most `out.len()` bytes into `out`): the
+    /// size of the attribute on disk, or None for an entry with no such attribute.
+    pub fn stat_attr(
+        &mut self,
+        path: &[u8],
+        attr: u8,
+        out: &mut [u8],
+    ) -> Res<(Info, Option<usize>)> {
+        let path = CPath::new(path)?;
+        let (mut kind, mut size, mut name) = (0u8, 0u32, [0u8; NAME_MAX + 1]);
+        let mut found = Error::NoAttr.code();
+        let room = u32::try_from(out.len()).unwrap_or(u32::MAX);
+        // SAFETY: as `stat`; `out` holds `room` bytes and `found` is a word.
+        check(self.call(|d, ctx| unsafe {
+            datafs_stat_attr(
+                d,
+                ctx,
+                path.ptr(),
+                &mut kind,
+                &mut size,
+                name.as_mut_ptr(),
+                attr,
+                out.as_mut_ptr(),
+                room,
+                &mut found,
+            )
+        }))?;
+        let info = Info {
+            kind: kind_of(kind)?,
+            size,
+        };
+        Ok((info, attribute_size(found)?))
+    }
+
+    /// The status of `path` and the attribute `attr` of the root and of every entry of the path,
+    /// in one walk of it that repeats no lookup (about 3 reads for each component, what a `stat` costs). `entries`
+    /// and `bytes` receive the root and each entry in path order, `each` bytes of attribute for
+    /// an entry (`bytes` holds `entries.len() * each`); the first number returned is how many
+    /// were filled, also when the walk fails. The result is the status of the last entry, or the
+    /// error: `NoEntry` for a missing name and `NotDirectory` for a file in the middle of the path
+    /// with the entries above it filled, and `NameTooLong` for a path with more entries than
+    /// `entries` holds.
+    pub fn path_attrs(
+        &mut self,
+        path: &[u8],
+        attr: u8,
+        entries: &mut [PathEntry],
+        bytes: &mut [u8],
+        each: usize,
+    ) -> (usize, Res<Info>) {
+        let path = match CPath::new(path) {
+            Ok(path) => path,
+            Err(e) => return (0, Err(e)),
+        };
+        let capacity = entries
+            .len()
+            .min(bytes.len().checked_div(each).unwrap_or(usize::MAX));
+        let (mut kind, mut size, mut name) = (0u8, 0u32, [0u8; NAME_MAX + 1]);
+        let mut count = 0u32;
+        // SAFETY: as `stat`; `entries` holds `capacity` records and `bytes` holds `capacity * each`
+        // bytes, which the C side fills for the entries it counts.
+        let status = self.call(|d, ctx| unsafe {
+            datafs_path_attrs(
+                d,
+                ctx,
+                path.ptr(),
+                &mut kind,
+                &mut size,
+                name.as_mut_ptr(),
+                attr,
+                entries.as_mut_ptr(),
+                bytes.as_mut_ptr(),
+                u32::try_from(each).unwrap_or(u32::MAX),
+                u32::try_from(capacity).unwrap_or(u32::MAX),
+                &mut count,
+            )
+        });
+        let count = count as usize;
+        match check(status).and_then(|_| kind_of(kind)) {
+            Ok(kind) => (count, Ok(Info { kind, size })),
+            Err(e) => (count, Err(e)),
+        }
+    }
+}
+
+/// One entry of a path as `Fs::path_attrs` gives it: its kind and the size of its attribute.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PathEntry {
+    res: i32,
+    kind: u8,
+}
+
+impl PathEntry {
+    /// A record to fill an array with.
+    pub const EMPTY: PathEntry = PathEntry { res: 0, kind: 0 };
+
+    pub fn kind(&self) -> Res<Kind> {
+        kind_of(self.kind)
+    }
+
+    /// The size of the attribute on disk, or None when the entry has none.
+    pub fn attr_size(&self) -> Res<Option<usize>> {
+        attribute_size(self.res)
+    }
+}

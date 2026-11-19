@@ -119,7 +119,10 @@ void datafs_setup(struct datafs *d, uint32_t blocks)
     d->cfg.prog = dev_prog;
     d->cfg.erase = dev_erase;
     d->cfg.sync = dev_sync;
-    d->cfg.read_size = SECTOR;
+    // A read of a block is one request of the device (8 sectors in one cell of the disk service).
+    // With a read size of one sector, a metadata get that walks back through the log of a pair
+    // reads once for each sector it crosses: up to 24 reads for each entry of a directory listing.
+    d->cfg.read_size = BLOCK;
     d->cfg.prog_size = SECTOR;
     d->cfg.block_size = BLOCK;
     d->cfg.block_count = blocks;
@@ -388,6 +391,8 @@ int datafs_stat(struct datafs *d, void *ctx, const char *path, uint8_t *type, ui
                 char *name)
 {
     struct lfs_info info;
+    // lfs_stat leaves the size of a directory and of the root as it was: start from zero.
+    memset(&info, 0, sizeof(info));
     d->ctx = ctx;
     int err = lfs_stat(&d->lfs, path, &info);
     if (err < 0) {
@@ -482,4 +487,77 @@ int datafs_removeattr(struct datafs *d, void *ctx, const char *path, uint8_t typ
 {
     d->ctx = ctx;
     return lfs_removeattr(&d->lfs, path, type);
+}
+
+// The entries of a directory with the attribute `attr` of each, and the status of a path with its
+// attribute, from the functions of the change to littlefs (third-party/littlefs/STAFETO-CHANGES.md).
+
+// As datafs_readdir, and for an entry the user attribute `attr` of the entry: its size in
+// *attr_res (LFS_ERR_NOATTR when there is none, always for "." and ".."), the bytes in `buffer`
+// (at most `bufsize`).
+int datafs_readdir_attr(struct datafs *d, void *ctx, int slot, uint8_t *type, uint32_t *size,
+                        char *name, uint8_t attr, void *buffer, uint32_t bufsize,
+                        int32_t *attr_res)
+{
+    struct lfs_info info;
+    lfs_ssize_t found = LFS_ERR_NOATTR;
+    d->ctx = ctx;
+    if (!dir_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    int res = lfs_dir_read_attr(&d->lfs, &d->dir[slot], &info, attr, buffer, bufsize, &found);
+    if (res > 0) {
+        *type = info.type;
+        *size = info.size;
+        for (size_t i = 0; i <= LFS_NAME_MAX; i++) {
+            name[i] = info.name[i];
+        }
+        *attr_res = (int32_t)found;
+    }
+    return res;
+}
+
+// As datafs_stat, and the user attribute `attr` of the entry as datafs_readdir_attr gives it.
+int datafs_stat_attr(struct datafs *d, void *ctx, const char *path, uint8_t *type, uint32_t *size,
+                     char *name, uint8_t attr, void *buffer, uint32_t bufsize, int32_t *attr_res)
+{
+    struct lfs_info info;
+    lfs_ssize_t found = LFS_ERR_NOATTR;
+    memset(&info, 0, sizeof(info));
+    d->ctx = ctx;
+    int err = lfs_stat_attr(&d->lfs, path, &info, attr, buffer, bufsize, &found);
+    if (err < 0) {
+        return err;
+    }
+    *type = info.type;
+    *size = info.size;
+    for (size_t i = 0; i <= LFS_NAME_MAX; i++) {
+        name[i] = info.name[i];
+    }
+    *attr_res = (int32_t)found;
+    return 0;
+}
+
+// The status of `path` and the user attribute `attr` of the root and of every entry of the path in
+// one walk of it (lfs_path_attrs): `out` and `buffer` (`each` bytes for an entry) have room for
+// `capacity` entries, and *count says how many are filled, also when the call fails.
+int datafs_path_attrs(struct datafs *d, void *ctx, const char *path, uint8_t *type, uint32_t *size,
+                      char *name, uint8_t attr, struct lfs_path_attr *out, uint8_t *buffer,
+                      uint32_t each, uint32_t capacity, uint32_t *count)
+{
+    struct lfs_info info;
+    lfs_size_t filled = 0;
+    memset(&info, 0, sizeof(info));
+    d->ctx = ctx;
+    int err = lfs_path_attrs(&d->lfs, path, &info, attr, out, buffer, each, capacity, &filled);
+    *count = filled;
+    if (err < 0) {
+        return err;
+    }
+    *type = info.type;
+    *size = info.size;
+    for (size_t i = 0; i <= LFS_NAME_MAX; i++) {
+        name[i] = info.name[i];
+    }
+    return 0;
 }

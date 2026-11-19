@@ -31,6 +31,8 @@ mod tests;
 #[cfg(test)]
 mod tests_cut;
 #[cfg(test)]
+mod tests_entry_attr;
+#[cfg(test)]
 mod tests_open;
 #[cfg(test)]
 mod tests_perm;
@@ -40,7 +42,7 @@ pub mod volume;
 pub mod vouching;
 pub mod watch;
 
-pub use fs::{Dir, Entry, Error, File, Fs, Info, Kind, Open, Storage, Whence};
+pub use fs::{Dir, Entry, Error, File, Fs, Info, Kind, Open, PathEntry, Storage, Whence};
 
 use core::fmt;
 
