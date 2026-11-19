@@ -56,6 +56,24 @@
 //!   of attributes to users other than root (ENOSPC), never removal.
 
 use crate::constants::*;
+
+/// A line that says why a call of the data volume failed, in a layer built with the feature
+/// `trace` (the measurement build of libc.so): the step and the status or error behind an errno.
+#[cfg(feature = "trace")]
+macro_rules! why {
+    ($($arg:tt)*) => {
+        rt::println!("posix-abi: data: {}", format_args!($($arg)*))
+    };
+}
+#[cfg(not(feature = "trace"))]
+macro_rules! why {
+    // Checked and then dropped: the variables the lines name stay in use.
+    ($($arg:tt)*) => {
+        if false {
+            let _ = format_args!($($arg)*);
+        }
+    };
+}
 use core::ffi::c_int;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use posix_fs::data::{self as pure, errno_of};
@@ -159,24 +177,39 @@ fn take_root() -> Result<Handle<Channel>, Attempt> {
             .write(&mut request)
         })
         .map_err(|_| Attempt::Failed(EIO))?;
-    let mut reply = crate::process::send_again(&request).map_err(|_| Attempt::Failed(EIO))?;
+    let mut reply = crate::process::send_again(&request).map_err(|error| {
+        why!("TakeRoot not sent: {error:?}");
+        Attempt::Failed(EIO)
+    })?;
     let mut buffer = [0; MESSAGE_MAX];
     match Reader::new(reply.bytes(&mut buffer)).u32() {
-        Ok(0) => reply
-            .handles
-            .take::<Channel>(0)
-            .map_err(|_| Attempt::Failed(EIO)),
-        Ok(proto_process::UNREGISTERED) => Err(Attempt::Retry),
-        _ => Err(Attempt::Failed(EIO)),
+        Ok(0) => reply.handles.take::<Channel>(0).map_err(|error| {
+            why!("TakeRoot gave no root handle: {error:?}");
+            Attempt::Failed(EIO)
+        }),
+        Ok(proto_process::UNREGISTERED) => {
+            why!("TakeRoot: UNREGISTERED, no root yet");
+            Err(Attempt::Retry)
+        }
+        other => {
+            why!("TakeRoot refused: {other:?}");
+            Err(Attempt::Failed(EIO))
+        }
     }
 }
 
 /// A copy of the identity session for a request of the service to carry (it moves with the call).
 fn identity_copy() -> Result<rt::handle::Handle<rt::handle::Any>, i32> {
-    let identity = crate::process::identity().ok_or(EIO)?;
+    let Some(identity) = crate::process::identity() else {
+        why!("no identity session in the start data of this process");
+        return Err(EIO);
+    };
     rt::sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER)
         .map(Handle::erase)
-        .map_err(|_| EIO)
+        .map_err(|error| {
+            why!("copy of the identity session refused: {error:?}");
+            EIO
+        })
 }
 
 /// A session from the root: SESSION with a copy of the identity session, which the service vouches
@@ -187,16 +220,22 @@ fn take_session(root: &Handle<Channel>) -> Result<Handle<Channel>, Attempt> {
     let mut reply = match rt::sys::send_handles(root, &request, [copy]) {
         Ok(reply) => reply,
         Err(refused) if refused.error == Error::Interrupted => return Err(Attempt::Retry),
-        Err(_) => return Err(Attempt::Failed(EIO)),
+        Err(refused) => {
+            why!("SESSION not sent to the root: {:?}", refused.error);
+            return Err(Attempt::Failed(EIO));
+        }
     };
     let mut buffer = [0; MESSAGE_MAX];
     match Reader::new(reply.bytes(&mut buffer)).u32() {
-        Ok(0) => reply
-            .handles
-            .take::<Channel>(0)
-            .map_err(|_| Attempt::Failed(EIO)),
+        Ok(0) => reply.handles.take::<Channel>(0).map_err(|error| {
+            why!("SESSION gave no session handle: {error:?}");
+            Attempt::Failed(EIO)
+        }),
         Ok(status) if status == busy_code() => Err(Attempt::Retry),
-        Ok(status) => Err(Attempt::Failed(errno_of(status))),
+        Ok(status) => {
+            why!("SESSION refused with status {status}");
+            Err(Attempt::Failed(errno_of(status)))
+        }
         Err(_) => Err(Attempt::Failed(EIO)),
     }
 }
@@ -235,7 +274,10 @@ fn ensure() -> Result<rt::abi::Handle, i32> {
                 tries += 1;
                 pause()?;
             }
-            Attempt::Retry => return Err(EIO),
+            Attempt::Retry => {
+                why!("no session after a second of tries");
+                return Err(EIO);
+            }
             Attempt::Failed(errno) => return Err(errno),
         }
     }
@@ -342,6 +384,7 @@ fn call_with(request: &[u8], take: bool) -> Result<Answer, i32> {
             Ok(reply) => reply,
             Err(Error::Interrupted) => continue,
             Err(Error::PeerClosed) => {
+                why!("the session closed: the service went");
                 forget(session);
                 // A path call goes on at once with a session of the new instance; a call on a
                 // description of the old one is told STALE there (EIO).
@@ -351,7 +394,10 @@ fn call_with(request: &[u8], take: bool) -> Result<Answer, i32> {
                 }
                 return Err(EIO);
             }
-            Err(_) => return Err(EIO),
+            Err(error) => {
+                why!("request not sent to the session: {error:?}");
+                return Err(EIO);
+            }
         };
         let mut buffer = [0; MESSAGE_MAX];
         let bytes = reply.bytes(&mut buffer);
@@ -364,6 +410,9 @@ fn call_with(request: &[u8], take: bool) -> Result<Answer, i32> {
             };
             answer.bytes[..bytes.len() - 4].copy_from_slice(&bytes[4..]);
             return Ok(answer);
+        }
+        if status != 0 {
+            why!("call answered with status {status}");
         }
         if status == p::NOT_BOUND && !bound {
             bound = true;

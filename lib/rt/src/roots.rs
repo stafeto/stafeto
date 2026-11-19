@@ -28,19 +28,34 @@ pub fn register(
     label: u64,
     level: u8,
 ) -> Result<(), Error> {
+    register_status(notary, channel, label, level).map_err(|status| match status {
+        proto_wire::Status::Kernel(error) => error,
+        _ => Error::BadState,
+    })
+}
+
+/// `register`, with the status the process service refused with.
+pub fn register_status(
+    notary: &Handle<Channel>,
+    channel: &Handle<Channel>,
+    label: u64,
+    level: u8,
+) -> Result<(), proto_wire::Status> {
     let root = sys::handle_label(
         channel,
         Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER,
         label,
         level,
-    )?;
+    )
+    .map_err(proto_wire::Status::Kernel)?;
     let request = proto_process::Method::Register.header().bytes();
-    let reply =
-        sys::send_handles(notary, &request, [root.erase()]).map_err(|refused| refused.error)?;
+    let reply = sys::send_handles(notary, &request, [root.erase()])
+        .map_err(|refused| proto_wire::Status::Kernel(refused.error))?;
     let mut buffer = [0; MESSAGE_MAX];
     match proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() {
         Ok(0) => Ok(()),
-        _ => Err(Error::BadState),
+        Ok(code) => Err(proto_wire::Status::from_code(code)),
+        Err(status) => Err(status),
     }
 }
 
@@ -79,17 +94,34 @@ pub fn keep(
     let waits = sys::channel_create(level)
         .and_then(|own| Waiter::new(&own, 0, level).map(|timer| (own, timer)));
     let mut retry = Retry::new();
+    let mut why = proto_wire::Status::Ok;
     loop {
         let ok = match notary(parent) {
-            Notary::Session(notary) => register(&notary, channel, label, level).is_ok(),
+            Notary::Session(notary) => match register_status(&notary, channel, label, level) {
+                Ok(()) => true,
+                Err(status) => {
+                    why = status;
+                    false
+                }
+            },
             // No process service in the image: nothing to register with.
-            Notary::Absent => sys::thread_exit(),
-            Notary::Failed => false,
+            Notary::Absent => {
+                crate::println!(
+                    "{who}: no notary session with the process service (ACCESS_DENIED): the root is not registered"
+                );
+                sys::thread_exit()
+            }
+            Notary::Failed => {
+                why = proto_wire::Status::Kernel(Error::BadState);
+                false
+            }
         };
         match retry.record(time::ticks_to_ns(time::now()), ok) {
             Attempt::Registered { failures } => {
                 if failures > 0 {
                     crate::println!("{who}: root registered after {failures} failed attempts");
+                } else {
+                    crate::println!("{who}: root registered with the process service");
                 }
                 sys::thread_exit()
             }
@@ -100,7 +132,8 @@ pub fn keep(
             } => {
                 if report {
                     crate::println!(
-                        "{who}: registering the root failed ({count} so far), trying again in {} s",
+                        "{who}: registering the root failed ({count} so far, status {}), trying again in {} s",
+                        why.code(),
                         wait_ns / 1_000_000_000
                     );
                 }
