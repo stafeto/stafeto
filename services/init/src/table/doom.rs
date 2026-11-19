@@ -8,7 +8,7 @@
 //! service (which may grant the focus), and a session with the display
 //! service in the launcher's `connects`, which every child of the shell
 //! inherits as its place `Display`. The display service the launcher names
-//! (`gpu`) is the compositor (`comp::COMPOSITOR_KEYS`): Doom draws in a
+//! (`gpu`) is the compositor (`comp::COMPOSITOR_KEYS_FREE`, in the free run so that the frames a second of `doom-measure` stay comparable with the series): Doom draws in a
 //! buffer the compositor makes and the compositor puts it on the screen of
 //! the driver (`comp::DISPLAY`), which has the compositor as its one
 //! client. Doom
@@ -57,5 +57,5 @@ pub const TABLE: &[Record] = &[
     BUSYBOX_DIALOG_TABLE[8],
     input::INPUT,
     comp::DISPLAY,
-    comp::COMPOSITOR_KEYS,
+    comp::COMPOSITOR_KEYS_FREE,
 ];

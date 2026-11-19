@@ -661,6 +661,85 @@ pub fn row_costs(costs: &[ShapeCost], kind: &str) -> Vec<(u32, u64, u64)> {
     out
 }
 
+/// The cost of the layers of a band beyond their operations, from the bands of
+/// one, two, four and eight layers on the same rows (the shapes of the kinds
+/// `layers1` to `layers8`): each count's greatest excess of the band's ticks over
+/// the black and the layers by the fits of the operations, the excess of one
+/// layer taken off, for each layer added, and the greatest of those (the term of
+/// a layer, `compositor::LAYER_MEASURED`). The first of the pair is the excess of
+/// a band of one layer, which the model of the operations has no term for.
+pub struct LayerTerm {
+    /// The greatest excess of a band of one layer, in ticks (0 when none).
+    pub one: i64,
+    /// For each count above 1: the count and the greatest excess of a layer added.
+    pub by_count: Vec<(u64, i64)>,
+    /// The greatest of those.
+    pub term: i64,
+}
+
+pub fn layer_term(costs: &[ShapeCost]) -> Option<LayerTerm> {
+    let (black, _) = fit_of(costs, "black")?;
+    let (over, _) = fit_of(costs, "over")?;
+    let ticks = |f: compositor::fit::Fit, w: u32, h: u32| -> i64 {
+        let (w, h) = (i64::from(w), i64::from(h));
+        f.call as i64 + (f.row as i64 * h + f.point as i64 * w * h + 99) / 100
+    };
+    let band = |count: u64, w: u32, h: u32| {
+        costs
+            .iter()
+            .find(|c| c.kind == format!("layers{count}") && c.w == w && c.h == h)
+    };
+    let excess = |count: u64, c: &ShapeCost| {
+        c.greatest as i64 - ticks(black, c.w, c.h) - count as i64 * ticks(over, c.w, c.h)
+    };
+    let mut one = i64::MIN;
+    let mut by_count = Vec::new();
+    for c in costs.iter().filter(|c| c.kind == "layers1") {
+        one = one.max(excess(1, c));
+    }
+    if one == i64::MIN {
+        return None;
+    }
+    for count in [2u64, 4, 8] {
+        let mut greatest = i64::MIN;
+        for c in costs.iter().filter(|c| c.kind == format!("layers{count}")) {
+            if let Some(single) = band(1, c.w, c.h) {
+                greatest =
+                    greatest.max((excess(count, c) - excess(1, single)) / (count as i64 - 1));
+            }
+        }
+        if greatest != i64::MIN {
+            by_count.push((count, greatest));
+        }
+    }
+    let term = by_count.iter().map(|(_, g)| *g).max()?;
+    Some(LayerTerm {
+        one: one.max(0),
+        by_count,
+        term: term.max(0),
+    })
+}
+
+/// The term of a layer told against the table.
+pub fn layer_text(costs: &[ShapeCost]) -> String {
+    let Some(t) = layer_term(costs) else {
+        return "layers: no lines of bands of layers (a run without the steps feature)".to_owned();
+    };
+    let counts: Vec<String> = t
+        .by_count
+        .iter()
+        .map(|(n, g)| format!("{n} layers {g}"))
+        .collect();
+    format!(
+        "layers: the greatest excess of a band of one layer over its operations is {} ticks, and of each layer added {} ticks (by count: {}; a term that is the same at 2, 4 and 8 is a constant a layer, one that grows with the count is not); the table has {} measured ({} with the margin)",
+        t.one,
+        t.term,
+        counts.join(", "),
+        compositor::LAYER_MEASURED,
+        compositor::LAYER
+    )
+}
+
 /// The fit of each kind and what it means for the bands that matter, told
 /// against the table: the fitted prices (hundredths of a tick for a row and a
 /// point) and their constants with the margin, the greatest overstatement of a
@@ -715,7 +794,8 @@ pub fn fit_text(costs: &[ShapeCost]) -> String {
         let (cw, ch) = band_size(cc, cr, cp, 12);
         let (tw, th) = band_size(cc, cr, cp, 200);
         // Eight windows with an alpha over the whole screen, and the black.
-        let (ew, er) = band_size(8 * oc + bc, 8 * or + br, 8 * op + bp, 640);
+        let term = compositor::LAYER * 7;
+        let (ew, er) = band_size(8 * oc + bc + term, 8 * or + br, 8 * op + bp, 640);
         let worst = |calls: u32, row: u32, point: u32, w: u32, h: u32| {
             u64::from(calls)
                 + (u64::from(row) * u64::from(h) + u64::from(point) * u64::from(w) * u64::from(h))
@@ -724,9 +804,10 @@ pub fn fit_text(costs: &[ShapeCost]) -> String {
         parts.push(format!(
             "by the fitted constants: a copy over the whole width is a band of {w} by {rows} and a frame of the whole screen {full} bands (the table gives {}); a damage of the cursor's size a band of {cw} by {ch}, of a line of text {tw} by {th}; eight windows with an alpha a band of {ew} by {er} costing {} ticks by the model (the gate of a band is {BAND_TICKS})",
             compositor::full_screen_bands(),
-            worst(8 * oc + bc, 8 * or + br, 8 * op + bp, ew, er)
+            worst(8 * oc + bc + term, 8 * or + br, 8 * op + bp, ew, er)
         ));
     }
+    parts.push(layer_text(costs));
     parts.join("; ")
 }
 
@@ -1239,6 +1320,49 @@ mod tests {
         assert!(text.contains("eight windows with an alpha"));
         // Shapes that are missing are said so, and no price is made up.
         assert!(fit_text(&shapes[..2]).contains("no fit"));
+    }
+
+    #[test]
+    fn the_term_of_a_layer_is_the_excess_of_each_layer_added() {
+        let mut lines = Vec::new();
+        let mut shape = |kind: &str, w: u32, h: u32, ticks: u64| {
+            lines.push(format!(
+                "service shape: 17 {kind} {w} {h} least {} greatest {ticks} n 12",
+                ticks - 1
+            ));
+        };
+        // Operations on a plane: black 200 + 1 a point, over 800 + 4 a point.
+        for (w, h) in [
+            (8u32, 1u32),
+            (64, 1),
+            (150, 1),
+            (64, 16),
+            (150, 8),
+            (16, 8),
+            (4, 32),
+        ] {
+            let p = u64::from(w) * u64::from(h);
+            shape("black", w, h, 200 + p);
+            shape("over", w, h, 800 + 4 * p);
+        }
+        // Bands of layers: each layer after the first costs 300 more.
+        for (w, h) in [(64u32, 1u32), (150, 1)] {
+            let p = u64::from(w) * u64::from(h);
+            for n in [1u64, 2, 4, 8] {
+                shape(
+                    &format!("layers{n}"),
+                    w,
+                    h,
+                    200 + p + n * (800 + 4 * p) + 300 * (n - 1),
+                );
+            }
+        }
+        let t = layer_term(&shape_costs(&lines, COMP_TAG)).unwrap();
+        assert_eq!(t.one, 0);
+        assert_eq!(t.term, 300);
+        assert_eq!(t.by_count, vec![(2, 300), (4, 300), (8, 300)]);
+        assert!(layer_text(&shape_costs(&lines, COMP_TAG)).contains("each layer added 300"));
+        assert!(layer_text(&[]).contains("no lines"));
     }
 
     #[test]
