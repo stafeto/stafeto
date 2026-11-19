@@ -38,6 +38,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod frame;
+
 use proto_comp::{
     BUFFERS, BUTTON, CLOSE, CREATE, Event, FOCUS_IN, FOCUS_OUT, KEY, MAX_RECTS, MOVE, RING, Rect,
     union,
@@ -251,6 +253,9 @@ pub struct Window {
     pub visible: bool,
     /// Whether a buffer was ever taken: the first take gives the focus.
     pub shown_once: bool,
+    /// The window's promise of an interval and its counts (stage G5): the
+    /// service sets and reads them; the scene keeps them with the window.
+    pub pace: frame::Pace,
 }
 
 /// What the primary pipeline of the display shows.
@@ -721,6 +726,7 @@ impl Scene {
             posted: None,
             current: None,
             retired: None,
+            pace: frame::Pace::new(),
             in_frame: false,
             visible: true,
             shown_once: false,
