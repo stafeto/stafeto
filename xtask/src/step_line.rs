@@ -92,6 +92,14 @@ pub fn over_bound(lines: &[String], tag: &str, bound: u64) -> Option<String> {
         })
 }
 
+/// Tells the observed own work of a kind (`clean_longest`) beside the judged maximum: a report
+/// line, no verdict.
+pub fn say_clean(lines: &[String], tag: &str, name: &str, kind: usize) {
+    if let Some(clean) = clean_longest(lines, tag, kind) {
+        println!("{name}: the longest kind {kind} step with no preemption took {clean} ticks");
+    }
+}
+
 /// The greatest raw time of a step of kind `kind` of the service `tag` that no preemption
 /// touched (`preempts 0`), the figure of the work of the step itself. None when every line of the
 /// kind has a preemption.

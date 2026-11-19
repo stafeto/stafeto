@@ -372,15 +372,14 @@ pub(crate) fn rows_of(
             gpu_probe::STEP_MAX
         ));
     }
-    // The portion is the step's own work: the steps no preemption touched say it (`step_line`);
-    // a step with preemptions is judged by B and 0.9 B above.
-    if let Some(clean) =
-        crate::step_line::clean_longest(lines, tag, 65).filter(|&c| c > PORTION_MAX)
-    {
+    // A portion is a target of the kind of 0.9 B and is judged the same way: the greatest by
+    // kind of N - P * PREEMPT_CHARGE. The work no preemption touched is told beside it.
+    if let Some(row) = rows.iter().find(|r| r.0 == 65 && r.1 > PORTION_MAX) {
         return Err(format!(
-            "the {name}: a portion or an interrupt past {PORTION_MAX}: kind 65 took {clean} ticks with no preemption"
+            "the {name}: a portion or an interrupt past {PORTION_MAX}: {row:?}"
         ));
     }
+    crate::step_line::say_clean(lines, tag, name, 65);
     Ok(rows)
 }
 
