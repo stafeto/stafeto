@@ -30,8 +30,10 @@
 //! on CPU 1, where the network service's switch thread (a budget of CPU 0)
 //! is not; with one CPU the mask falls back to it.
 //!
-//! The loads are clients at 30 (the CPU load at 31, the highest level of the
-//! POSIX processes): they sleep until their phases (`frame_load::phases`) and
+//! The programs that keep time (the conductor, the paced client, the client of
+//! the first revision) are clients at 31, the loads of files and network at 30
+//! and the CPU load at 29, so that a loop that never sleeps keeps off the
+//! processor none of the others: they sleep until their phases (`frame_load::phases`) and
 //! work while the phase lasts. `frame-load` (the conductor) holds the input
 //! session of the compositor (`COMP_INJECTORS`).
 
@@ -102,10 +104,11 @@ const COMPOSITOR: Record = Record {
 
 /// What every program of the image is: a client at 31 with a session of one
 /// service. The clients that must run on time (the conductor, the paced
-/// client, the client of the first revision) stand at 31, above the loads at
-/// 30: a load that never sleeps (the CPU loop) would otherwise keep them off
-/// the processor, since a higher number runs first and the service at 32
-/// stands above both.
+/// client, the client of the first revision) stand at 31, above the loads of
+/// files and network at 30, and those above the CPU loop at 29. A higher number
+/// runs first and a thread runs until it blocks or one above it wakes, so a
+/// loop that never sleeps keeps off the processor every thread at its own level
+/// or below it. The service at 32 stands above all of them.
 const LOAD: Record = Record {
     name: "frame-load",
     program: "frame-load",
@@ -158,12 +161,13 @@ pub const LEGACY: Record = Record {
     ..LOAD
 };
 
-/// The CPU load: a loop at 30, with no session.
+/// The CPU load: a loop at 29, below every other program of the image, with no
+/// session.
 pub const CPU: Record = Record {
     name: "frame-cpu",
     args: b"cpu",
-    priority: 30,
-    ceiling: 30,
+    priority: 29,
+    ceiling: 29,
     connects: &[],
     ..LOAD
 };
@@ -305,9 +309,10 @@ mod tests {
         for timed in ["frame-load", "frame-draw", "frame-legacy"] {
             assert_eq!(level(timed), (31, 31), "{timed}");
         }
-        for load in ["frame-cpu", "frame-files", "frame-net"] {
+        for load in ["frame-files", "frame-net"] {
             assert_eq!(level(load), (30, 30), "{load}");
         }
+        assert_eq!(level("frame-cpu"), (29, 29));
         assert!(named("gpu").priority > 31);
     }
 
