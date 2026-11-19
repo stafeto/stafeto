@@ -688,8 +688,12 @@ pub mod calibration {
     const LAYER_TARGET_W: u32 = 328;
     const LAYER_TARGET_H: u32 = 12;
     const LAYER_TARGET_BYTES: usize = (LAYER_TARGET_W * LAYER_TARGET_H * 4) as usize;
-    /// The lines of the window at which the bands are made.
-    const LAYER_ROWS: [u32; 2] = [0, 96];
+    /// The line of the window at which the bands are made (a source offset of
+    /// its own), and the timed repeats of a band after the warm-up. The run
+    /// before the first request is bounded: the watchdog of init kills a service
+    /// silent for about 1.3 s, and the three kinds take the first half of that.
+    const LAYER_ROW: u32 = 96;
+    const LAYER_REPEAT: u32 = 2;
     const _: () = assert!(LAYER_TARGET_BYTES <= BYTES);
 
     /// The pixel operations of a band of the calibration: pixman's, on a
@@ -795,13 +799,19 @@ pub mod calibration {
             };
             let (head, tail) = fb.split_at_mut(LAYERS_AT);
             let target = &mut head[..LAYER_TARGET_BYTES];
-            let region = &mut tail[..LAYER_WINDOW_BYTES + 8 * LAYER_SRC_STEP];
-            paint(region);
-            let region: &[u8] = region;
+            let len = LAYER_WINDOW_BYTES + 8 * LAYER_SRC_STEP;
+            paint(&mut tail[..len]);
+            let region: &[u8] = &tail[..len];
             for &count in &LAYER_COUNTS {
                 for &(w, h) in &LAYER_SHAPES {
+                    // The tall shapes of many layers are left out (a band of
+                    // many layers is a part of a line), the ninth layer is
+                    // told on the one line shapes of 64 points or more.
+                    if (count >= 4 && h >= 8) || (count == 9 && (h != 1 || w < 64)) {
+                        continue;
+                    }
                     let (mut least, mut greatest, mut n) = (u64::MAX, 0u64, 0u64);
-                    for dy in LAYER_ROWS {
+                    for dy in [LAYER_ROW] {
                         for dx in 4..8u32 {
                             for sx in 0..4u32 {
                                 // The windows lie `sx` points to the left of the
@@ -833,7 +843,7 @@ pub mod calibration {
                                 let _ = scene.begin();
                                 scene.end(true);
                                 let damage = proto_comp::Rect { x: dx, y: dy, w, h };
-                                for turn in 0..=REPEAT {
+                                for turn in 0..=LAYER_REPEAT {
                                     let mut plain = Plain {
                                         images: &mut self.images,
                                         target: &mut *target,
@@ -874,7 +884,9 @@ pub mod calibration {
                     }
                 }
             }
+            // The target of the service holds zero before its first frame.
             target.fill(0);
+            tail[..len].fill(0);
         }
     }
 
