@@ -284,7 +284,7 @@ them for the licence notes of the image.
   alone, so the script prints the command line it starts), the fingerprint on the console,
   connections held before authentication with an HTTP request and a login still answered after
   them, and the pseudo terminals.
-- nginx 1.30.6 (`/bin/nginx`, BSD-2-Clause, with `/etc/nginx/mime.types` and
+- nginx 1.30.7 (`/bin/nginx`, BSD-2-Clause, with `/etc/nginx/mime.types` and
   `/etc/nginx/nginx.conf`) and PCRE2 10.49 (BSD-3-Clause with the PCRE2
   exception, linked into nginx, no file of its own) are network packages
   too. An image with nginx carries `NGINX-LICENSE`, `NGINX-SOURCE`,

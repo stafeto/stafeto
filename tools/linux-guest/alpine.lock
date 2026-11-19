@@ -65,8 +65,8 @@ license = "Apache-2.0"
 
 [[package]]
 name = "nginx"
-version = "1.30.6-r0"
-sha256 = "d2b69ba1998378febf33a7e6c239c94117f34661a1e9b1d3f80889242ddb7779"
+version = "1.30.7-r0"
+sha256 = "ec34912913d550beb102cc046a10771befedd556826889b5d91adf10ac4df123"
 license = "BSD-2-Clause"
 
 [[package]]
