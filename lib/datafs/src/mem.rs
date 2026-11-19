@@ -24,6 +24,11 @@ pub struct MemDevice {
     pub written: u64,
     /// The flushes so far.
     pub flushes: u64,
+    /// The calls of `read` and the sectors they read, the calls of `write` (programs), for the
+    /// measurements of the cost of a job.
+    pub reads: u64,
+    pub read_sectors: u64,
+    pub programs: u64,
     cut_after: Option<u64>,
     dead: bool,
 }
@@ -46,6 +51,9 @@ impl MemDevice {
             cache: BTreeMap::new(),
             written: 0,
             flushes: 0,
+            reads: 0,
+            read_sectors: 0,
+            programs: 0,
             cut_after: None,
             dead: false,
         }
@@ -98,6 +106,9 @@ impl MemDevice {
             cache: BTreeMap::new(),
             written: 0,
             flushes: 0,
+            reads: 0,
+            read_sectors: 0,
+            programs: 0,
             cut_after: None,
             dead: false,
         }
@@ -117,6 +128,8 @@ impl Device for MemDevice {
         if sector + count > self.sectors() {
             return Err(DeviceError);
         }
+        self.reads += 1;
+        self.read_sectors += count;
         for i in 0..count {
             let at = (sector + i) as usize;
             let piece = &mut out[i as usize * SECTOR..][..SECTOR];
@@ -136,6 +149,7 @@ impl Device for MemDevice {
         if sector + count > self.sectors() {
             return Err(DeviceError);
         }
+        self.programs += 1;
         for i in 0..count {
             if self.cut_after == Some(self.written) {
                 self.dead = true;

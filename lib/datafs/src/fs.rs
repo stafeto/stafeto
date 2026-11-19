@@ -89,6 +89,25 @@ unsafe extern "C" {
     fn datafs_removeattr(d: *mut c_void, ctx: *mut c_void, path: *const c_char, kind: u8) -> c_int;
 }
 
+// The host measurements (`tests_scale`): the window of the allocator, the erase count and a file
+// opened with an attribute in its configuration.
+#[cfg(test)]
+unsafe extern "C" {
+    fn datafs_set_lookahead(d: *mut c_void, buffer: *mut u8, size: u32);
+    fn datafs_erases(d: *const c_void) -> u32;
+    fn datafs_window_state(d: *const c_void, out: *mut u32);
+    fn datafs_window_free(d: *const c_void) -> i64;
+    fn datafs_open_attr(
+        d: *mut c_void,
+        ctx: *mut c_void,
+        path: *const c_char,
+        flags: c_int,
+        kind: u8,
+        buffer: *const u8,
+        size: u32,
+    ) -> c_int;
+}
+
 /// The device of the volume as the C side calls back: `ctx` is a pointer to a `&mut dyn Device`
 /// that `Fs::call` makes for the length of one call.
 type Ctx = *mut c_void;
@@ -630,4 +649,65 @@ fn kind_of(kind: u8) -> Res<Kind> {
 /// The blocks of 4 KiB `bytes` take, rounded up.
 pub const fn blocks_of(bytes: u64) -> u64 {
     bytes.div_ceil(BLOCK as u64)
+}
+
+/// Calls only the host measurements make: a test-only switch for the allocator's window, the
+/// counters, and the free count read from the window's bits.
+#[cfg(test)]
+impl<D: Device> Fs<'_, D> {
+    /// Sets the allocator's window to `buffer` (a multiple of 8 bytes) before the next format or
+    /// mount. The service keeps its own 128 bytes.
+    pub fn set_lookahead(&mut self, buffer: &'static mut [u8]) {
+        assert!(buffer.len().is_multiple_of(8) && !buffer.is_empty());
+        // SAFETY: the buffer lives for the rest of the process, and littlefs reads the pointer
+        // only at the next format or mount.
+        unsafe {
+            datafs_set_lookahead(
+                self.state.0.as_mut_ptr().cast(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+            )
+        };
+    }
+
+    /// The erases littlefs has asked for since the volume was set up.
+    pub fn erases(&self) -> u64 {
+        // SAFETY: reads a counter of the state.
+        u64::from(unsafe { datafs_erases(self.state.0.as_ptr().cast()) })
+    }
+
+    /// The allocator's window: its first block, the next block it hands out and its size in
+    /// blocks. The next block goes back to 0 at each walk of the volume.
+    pub fn window_state(&self) -> (u32, u32, u32) {
+        let mut out = [0u32; 3];
+        // SAFETY: reads fields of the state into three words.
+        unsafe { datafs_window_state(self.state.0.as_ptr().cast(), out.as_mut_ptr()) };
+        (out[0], out[1], out[2])
+    }
+
+    /// The free blocks the window still holds, counted from its bits: no device access.
+    pub fn window_free(&self) -> u64 {
+        // SAFETY: reads the window of the state.
+        unsafe { datafs_window_free(self.state.0.as_ptr().cast()) as u64 }
+    }
+
+    /// Opens a file with the attribute `kind` in its configuration: littlefs writes it at the
+    /// sync of the file.
+    pub fn open_with_attr(&mut self, path: &[u8], flags: Open, kind: u8, data: &[u8]) -> Res<File> {
+        let path = CPath::new(path)?;
+        let size = data.len() as u32;
+        // SAFETY: as `open`; the C side copies the attribute (at most 64 bytes) into its state.
+        let slot = self.call(|d, ctx| unsafe {
+            datafs_open_attr(
+                d,
+                ctx,
+                path.ptr(),
+                flags.0 as c_int,
+                kind,
+                data.as_ptr(),
+                size,
+            )
+        });
+        check(slot).map(|slot| File(slot as u8))
+    }
 }
