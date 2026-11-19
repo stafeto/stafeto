@@ -11300,7 +11300,8 @@ fn two_gib_boot() -> Result<(), String> {
 /// answer. A line of TYPED_AHEAD bytes typed while `bench` runs, past the
 /// driver's ring of input, comes back as its first 128 bytes (spec 13.5,
 /// 13.6), and init's SERVICES_STARTED, which reaches the log after the
-/// driver's first read and only its timer shows, comes before the crash.
+/// driver's first read and only its timer shows, comes before the crash; the driver's mark `uart:
+/// serve runs under its budget` is on the console before the burst.
 /// Then `crash uart`: the driver restarts and the shell connects
 /// again (crash_uart); `ps` shows uart running at 60/60, failed and
 /// restarted once, and the shell running, never failed or restarted;
@@ -11472,6 +11473,24 @@ fn burst_line(n: u32) -> String {
     format!("logburst {n:03} {}", "x".repeat(46))
 }
 
+/// The mark of a console driver that works under its budget, from its boot (a driver that has run
+/// for the length of a dialog has printed it by the burst): `uart:` for the PL011 and the 16550, `virtio-console:`
+/// where that driver runs.
+fn require_driver_budget_mark(lines: &[String]) -> Result<(), String> {
+    const MARKS: [&str; 2] = [
+        "uart: serve runs under its budget",
+        "virtio-console: serve runs under its budget",
+    ];
+    if lines.iter().any(|l| MARKS.iter().any(|m| l.ends_with(m))) {
+        Ok(())
+    } else {
+        Err(format!(
+            "no line {:?} before the burst: the console driver runs unbudgeted",
+            MARKS[0]
+        ))
+    }
+}
+
 /// The step of the console probes that sends `logburst`: the shell writes
 /// LOG_BURST lines into the kernel log at 2.5 lines a millisecond, while the
 /// driver of the console is idle (and has its ring of 64 records to
@@ -11482,6 +11501,7 @@ fn burst_line(n: u32) -> String {
 /// output empty (`settled`), where a step that kills or restarts the driver
 /// can start.
 pub(crate) fn log_burst(run: &mut qemu::Run) -> Result<(), String> {
+    require_driver_budget_mark(run.lines())?;
     let from = run.lines().len();
     run.send("logburst")?;
     // The shell's closing line is client output and goes out at a client's
@@ -15221,6 +15241,22 @@ mod tests {
                 .unwrap_err()
                 .contains("log tick")
         );
+    }
+
+    #[test]
+    fn the_console_dialog_requires_the_mark_of_the_drivers_budget() {
+        let lines = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(require_driver_budget_mark(&lines(&["uart: serve runs under its budget"])).is_ok());
+        assert!(
+            require_driver_budget_mark(&lines(&["virtio-console: serve runs under its budget"]))
+                .is_ok()
+        );
+        assert!(
+            require_driver_budget_mark(&lines(&["uart: serve has no budget", "tty: ready"]))
+                .unwrap_err()
+                .contains("unbudgeted")
+        );
+        assert!(require_driver_budget_mark(&[]).is_err());
     }
 
     #[test]
