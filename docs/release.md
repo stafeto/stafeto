@@ -136,7 +136,11 @@ in the request that sets the version of a release without a suffix, and
 `release-build` wants a frozen file of the series of the version for such a
 release. After `0.N.0` a change that moves the fingerprint raises `main` to
 `0.(N+1).0-pre.0` in the same request; a patch release `0.N.P` comes from a
-branch `release-0.N` cut at the tag.
+branch `release-0.N` cut at the tag. An update of packages (below) for a series
+that `main` has left is cut from that branch too: the change of the package goes
+there in a request of its own, with the workflow files and `tools/pages.py` when
+they differ from `main`, and the tag is set on the commit of the branch. The
+environment `packages` lets in the tag `v0.N-pkgs.<k>` as it lets in `v0.N.P`.
 
 The line `<series> <serial>` in `packages/published-serial.txt` records that a
 series is published and the serial of its index at that time. `release-build`
@@ -144,6 +148,187 @@ carries from the pages when the line is there, builds everything new when
 neither the line nor the pages know the series, and stops when the pages list
 a series the file does not record. Add the line in the request after the first
 publication of a series.
+
+## Packages-only updates
+
+A package of a published series can change without a new version of the system:
+a security fix of nginx, a rebuild after a revoked key. The packages-only path
+runs the same signing pipeline as a release and publishes the changed packages
+under the index of the series, raising its serial. No image, kernel or archive
+of the system is made. The tag is `v<series>-pkgs.<k>` (`v0.5-pkgs.1`), where `k`
+counts the updates of the series from 1; the serial of the index is not in the
+name, because the weekly signature raises it every Monday and the serial taken
+at signing is the one that counts.
+
+An update is also an anchor: the release `v<series>-pkgs.<k>` in
+`stafeto/stafeto` carries a signed copy of the new index
+(`stafeto-<series>-pkgs.<k>-INDEX` and `.sig`), and the records of the series
+come from the copy with the highest serial among the releases `v<series>.<patch>`
+and `v<series>-pkgs.<k>`. The next build, the publication and the weekly
+signature all follow it.
+
+### How to cut one
+
+1. Merge the change of the package (its `packages/<name>.toml`, its port or its
+   script) to `main` and wait for a green `ci`. When `main` has moved to the next
+   series (`abi.txt` says `series 0.6`), the change goes to the branch
+   `release-0.N` of the series in a request of its own and the tag is set on the
+   commit of that branch (see "Series and ABI").
+2. Write the notes `docs/releases/<series>-pkgs.<k>.md` in the same request or in
+   one before the tag (format below). `release-build` stops without the file.
+3. Run the dry run (below) on the commit and read its summary: the list of the
+   packages carried and built must be the packages the update is meant to
+   change. A list that holds more means that the tools drifted or that a recipe
+   changed by accident: find the cause before the tag.
+4. Set the annotated tag on that commit and push it:
+
+       git tag -a v0.5-pkgs.1 -m "stafeto 0.5 packages update 1"
+       git push origin v0.5-pkgs.1
+
+5. `packages-update.yml` runs four jobs with the boundaries of `release.yml`.
+   - `ci`: the groups of `ci` on the tagged commit, called with no secret.
+   - `build`: no secret and no environment. It runs
+     `cargo xtask release-build --packages-only --tag <tag> --previous anchor/<series>`.
+     Before any package is built it checks that the tag has the form
+     `v<major>.<minor>-pkgs.<k>` (`k` from 1, no leading zero), that its series is
+     the series of the version in `Cargo.toml` at the commit, that the notes file
+     exists, and that `cargo xtask abi --check --release` passes (a frozen
+     `packages/abi.txt` of the series; any change of the fingerprint fails the
+     build, whatever suffix the version has). The packages are carried from the
+     newest anchor of the series when their `recipe` is that of its index and
+     built otherwise; the `release` of a rebuilt package is that of the anchor plus
+     one for the same version and 1 for a new version. Then the refusals below
+     apply. The step summary lists each package as carried or built.
+   - `sign`: the clean machine of `release.yml`, holding the release key alone.
+     `cargo xtask release-check --packages-only --tag <tag>` refuses every file
+     of the artifact except `pkg/` with package files, `src/` and `carried.txt`
+     before the key is written. It signs the packages again
+     (`pkg-sign`), writes the index (`repo --from --official --serial-after
+     https://stafeto.github.io/packages/<series>/aarch64 --storage
+     v<series>-pkgs.<k>-aarch64`: the serial is that of the index on the pages plus
+     one), removes the key, checks the repository with the roots of the tree
+     (`repo --check --official`) and packs the files (`release-pack
+     --packages-only`).
+   - `draft`: the token of `stafeto/packages` alone. It stops when
+     `stafeto/stafeto` holds any draft of the series (`v<series>.<patch>` or
+     `v<series>-pkgs.<k>`) or any release named like the tag, and when
+     `stafeto/packages` has a release `v<series>-pkgs.<k>-aarch64`. Then it makes
+     the draft release `v<series>-pkgs.<k>` in `stafeto/stafeto` (`--latest=false`,
+     so that the latest release of the repository stays the release of the system)
+     and the draft storage release `v<series>-pkgs.<k>-aarch64` in
+     `stafeto/packages` with the new packages and their source archives. A carried
+     package is not copied: its entry points into the storage release it came from.
+6. Read the notes and the files of the draft and publish the release
+   `v<series>-pkgs.<k>` of `stafeto/stafeto`. That is the approval.
+   `publish-packages.yml` starts as for a release of the system: it checks the
+   signed copy of the index, checks every attachment of the draft storage release
+   against it, publishes the storage release, tries every address, writes the
+   index into the pages with a serial above the one there and writes
+   `<series>/aarch64/anchor`. A run of the same workflow on the tag `v*-pkgs.*` is
+   covered by the ruleset "release tags" and by the environment `packages` as a
+   tag of a release is.
+7. On the devices of the series `pkg update` takes the new index and `pkg upgrade`
+   replaces the packages whose file changed.
+
+`release.yml` does not start on a tag `v*-pkgs.*`, and the notes of a release of
+the system link to the changes since the previous tag that is not one of them.
+
+### The dry run
+
+    gh workflow run packages-update.yml --repo stafeto/stafeto --ref <branch>
+
+The workflow file has to be on `main` for GitHub to accept the dispatch; `--ref`
+names the commit whose code runs, which can be the branch of a request or
+`release-0.N`. The input `series` (`-f series=0.5`) may name the series of the
+commit's version and defaults to it. The run does `ci` and `build` as for a tag,
+then the job `trial`, which has no environment and no secret: it signs with the
+development key (`pkg-sign --dir`), writes the index with the serial of the pages
+plus one and the storage name `v<series>-pkgs.trial-aarch64`
+(`repo --from --serial-after`), checks it with the development root and the roots
+of the tree (`repo --check --with-official`: carried packages carry the release
+key), packs the files and the notes (`release-pack --packages-only --trial`,
+`tools/release-notes.py --packages`). The files are in the artifacts
+`packages-input` and `packages-trial` for three days, the notes and the list of
+carried and built packages are in the summary of the run, and nothing is public.
+It proves the carrying, the refusals, the ABI check, the tag-less steps of the
+pipeline and the shape of the notes; the real key is proved by the dry run of
+`release.yml`. Set no tag before a dry run of the same commit has built the
+packages the update is meant to change.
+
+### What an update refuses
+
+Each refusal is one line of `release-build`, and nothing is written.
+
+- No package is built: there is nothing to update.
+- A package of kind `base` would be built. Base packages are in both images and
+  `pkg` does not replace a package of the image; such a rebuild is almost always a
+  drift of the tools (`tool clang`, `pin relibc`), and its place is a release of the
+  system.
+- A package that is not in the index would be built (a new package) or a package of
+  the index has no description any more (a package leaves). Adding and removing
+  packages of a series is the work of a release of the system.
+- The version of a rebuilt package is lower than that of the index (both made of
+  numbers and dots). A package of a series goes forward only: a bad update is
+  corrected by a new update with a higher `release` or a new version.
+- A carried package that has programs names another relibc than the pin of the
+  tree: a package is linked with the relibc of its series.
+
+A package rebuilt because its key was revoked (`built <name> -N (key revoked)` in the
+summary) is allowed: it is how a revocation reaches the packages without a release.
+
+### Numbers and names
+
+| What | Value |
+| --- | --- |
+| Tag, draft release in `stafeto/stafeto` | `v<series>-pkgs.<k>` |
+| Storage release in `stafeto/packages` | `v<series>-pkgs.<k>-aarch64` |
+| Files of the release | `stafeto-<series>-pkgs.<k>-INDEX`, `stafeto-<series>-pkgs.<k>-INDEX.sig`, `stafeto-<series>-pkgs.<k>-sbom.spdx.json`, `SHA256SUMS` |
+| Serial of the index | the serial on the pages plus one, taken at signing; at publication `max(pages + 1, serial of the copy)` |
+| Anchor of the series | the copy with the highest serial among the releases of the series |
+| Notes | `docs/releases/<series>-pkgs.<k>.md` |
+
+The SBOM lists every package of the new index (carried and built), each with the
+SHA-256 of its `.stpkg` as a second checksum. The source archives of the new GPL
+packages are in the storage release and named by their entries. The files of the
+dry run use the name `<series>-pkgs.trial`.
+
+### The notes
+
+`tools/release-notes.py --packages <series>-pkgs.<k> <tag> <previous tag> <new index>
+<previous index>` writes the notes: the text of `docs/releases/<series>-pkgs.<k>.md`,
+the table of the packages whose entry changed between the copy of the previous
+anchor and the new copy (name, `version-release` before and after, storage
+release), the table of the files and the link to the changes since the previous
+tag. Write the text so:
+
+    The update 1 of the packages of the series 0.5 closes <n> CVEs in <package> <version>.
+
+    ## What it closes
+
+    - CVE-0000-00000: one line about it.
+
+    ## Who is affected
+
+    Systems of the series that have the package on their disk. A system that
+    boots the full image has the package in the image, and `pkg upgrade` does not
+    replace a package of the image; it gets the fix with the next release of
+    the system.
+
+    ## How to get it
+
+    Run `pkg update` and then `pkg upgrade`. `pkg update` fetches the new index and
+    `pkg upgrade` replaces the packages whose file changed.
+
+### What the owner approves at the first update
+
+The tag of the first update is set on the word of the owner, after the dry run of
+the commit has listed the expected packages. Publishing the draft of
+`stafeto/stafeto` approves the files: the packages, their sources, the index with
+the new serial, the notes. Two facts belong to the decision. A system that
+boots a full image does not get an update of a package that the image holds, so
+a fix for such a system comes with a release of the system (a patch release
+`0.N.P` carries the new package from the anchor into its images). And an update
+cannot be taken back: the index goes forward only.
 
 ## What the pages and the weekly signature do
 
@@ -153,7 +338,8 @@ releases of `stafeto/packages` and the index names them by address.
 `series.txt` lists the series that get a weekly signature. The pages only
 deliver: whoever holds `PACKAGES_TOKEN` can write them. The records of a series
 are those of the signed index that its newest release in `stafeto/stafeto`
-carries (`stafeto-<version>-INDEX` and `.sig`); the carrying of a build and
+carries (`stafeto-<version>-INDEX` and `.sig`; an update of packages is such a
+release too): the one whose copy has the highest serial. The carrying of a build and
 the weekly signature take them from there, with the roots accepting that
 signature. An index lives 30 days, so a signature every Monday at 03:17 UTC
 (`cargo xtask repo resign --anchor COPY`) keeps it valid for three weeks past a
@@ -217,7 +403,7 @@ two rulesets and, when GitHub offers it, one setting. The first ruleset covers t
 
 The setting is "Immutable releases" (repository settings, General, Releases): the files of a published release can no longer be replaced. The signed copy of the index in a release is the anchor of the records of its series, and a holder of the right to write could swap it; turn the setting on, if GitHub offers it, before the first release is published.
 
-What the publication checks, with or without that setting: the copy of the index of the release follows the list of revocations of the tree, its series is the series of the tag, the tag is the newest published release of that series, and the serial of the copy is above that of the copy of every other published release of the series. Those four rest on what `stafeto/stafeto` shows, and a holder of the right to write can change that (draft the newest release, then publish an older one), so the publication also keeps the version of the release it last published in `<series>/aarch64/release` on the pages, where only `PACKAGES_TOKEN` writes: a version below it is refused, and the same version only when the records of the copy are those on the pages. The weekly signature reads the same file and refuses an anchor older than it, and applies the series and serial checks to the copy it anchors on. Rolling a series back therefore takes both the right to write to `stafeto/stafeto` and the token of `stafeto/packages`. What the weekly signature still lacks is a judgment of the anchor by the list of revocations: a copy signed by a revoked key, swapped into the newest release while the setting is off and with the token also in the wrong hands, passes. That is the reason to turn the setting on.
+What the publication checks, with or without that setting: the copy of the index of the release follows the list of revocations of the tree, its series is the series of the tag, the tag is the newest published release of its kind in that series (by version for a release of the system, by counter for an update of packages), and the serial of the copy is above that of the copy of every other published release of the series. Those four rest on what `stafeto/stafeto` shows, and a holder of the right to write can change that (draft the newest release, then publish an older one), so the publication also keeps the version of the release it last published in `<series>/aarch64/release` on the pages, where only `PACKAGES_TOKEN` writes: a version below it is refused, and the same version only when the records of the copy are those on the pages. Every publication, of either kind, also writes `<series>/aarch64/anchor` with the tag and the serial of its copy, and a copy with a lower serial is refused, one with the same serial only for the same tag and the records of the pages; a release of the system keeps its version check besides. The weekly signature reads the same files and refuses an anchor older than them, and applies the series and serial checks to the copy it anchors on. Rolling a series back therefore takes both the right to write to `stafeto/stafeto` and the token of `stafeto/packages`. What the weekly signature still lacks is a judgment of the anchor by the list of revocations: a copy signed by a revoked key, swapped into the newest release while the setting is off and with the token also in the wrong hands, passes. That is the reason to turn the setting on.
 
 The agents that work on the repository push branches and open pull requests, and the
 coordinator creates tags only on the word of the owner. A leaked token of the owner's

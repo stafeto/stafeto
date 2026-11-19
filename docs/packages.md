@@ -514,6 +514,12 @@ link programs (for a package with programs) and `build-depends <name>
   address is checked to be a location an index can hold). The downloads use
   `curl -q` with https for every redirection and TLS 1.2 and above, as the
   tool on the device does.
+- `cargo xtask release-build --packages-only (--tag TAG | --trial) --previous INDEX`
+  runs this carrying for a packages-only update of a published series
+  (docs/release.md, "Packages-only updates"): every package of the series is
+  carried or built by its `recipe`, with no image, kernel or stage, and the build
+  refuses a base package, a new package, a package that leaves, a lower version and
+  a carried package linked with another relibc than the tree pins.
 - `cargo xtask repo --from DIR [--storage NAME]` writes `INDEX`, `INDEX.sig`,
   `revoked` and `revoked.sig` next to the package files of `DIR`, from their
   `meta`, without a build; with `--storage v0.3.0-aarch64` the new files and
@@ -524,7 +530,9 @@ link programs (for a package with programs) and `build-depends <name>
   of `keys/` and `--official` takes `keys/revoked` and `keys/revoked.sig`
   as the list. `repo --check --official --remote ADDRESS` fetches the index, the list and every
   package file of the repository at `ADDRESS` (the pages of a published series) and checks them as a
-  directory is checked, except for the source archives.
+  directory is checked, except for the source archives; `--check --with-official` trusts the
+  development root and the official roots (the dry run of an update, whose carried
+  packages carry the release key and whose new packages the development key).
 - `cargo xtask repo resign --index F --anchor COPY --serial N --out D [--sig F.sig] [--expires-days D]
   [--key K.key --cert K.cert] [--root R.pub] [--min-certificate-days N] [--strict]` signs a published index
   again: the roots of `keys/` (or the root of a probe) accept the signature of the index and of `COPY`, the
