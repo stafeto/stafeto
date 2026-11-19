@@ -23,6 +23,9 @@ pub const GROUPS_MAX: usize = 16;
 pub struct Vouched {
     /// The process the identity session names.
     pub pid: u32,
+    /// The place of the process's record, whose word on the page of generations is read again
+    /// before each job of the session.
+    pub index: u32,
     /// The generation of the process's record when it was vouched for. Reading the generation again
     /// before each job and asking again when it moved is what makes a request sent after `setuid`
     /// returned run under the new identity.
@@ -194,6 +197,7 @@ mod tests {
     fn vouched(pid: u32, generation: u64, euid: u32) -> Vouched {
         Vouched {
             pid,
+            index: 3,
             generation,
             uid: euid,
             euid,

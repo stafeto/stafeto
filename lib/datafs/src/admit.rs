@@ -31,6 +31,9 @@ pub enum Held {
     /// The pass a client spent in ADOPT: it goes back to the client when the service refused for a
     /// limit that the client can lift (the pass was not spent), and closes otherwise.
     Spent,
+    /// The session a client offered to VERIFY_SESSION: it goes back in the reply when the service
+    /// says it is a live session of its own, and closes otherwise.
+    Offered,
 }
 
 /// What becomes of a held handle once the worker has answered with `reply`: true when it goes to
@@ -38,7 +41,8 @@ pub enum Held {
 pub fn carries(held: Held, reply: &[u8]) -> bool {
     matches!(
         (held, status_of(reply)),
-        (Held::Made, Some(0)) | (Held::Spent, Some(p::TOO_MANY_OPEN | p::TABLE_FULL))
+        (Held::Made | Held::Offered, Some(0))
+            | (Held::Spent, Some(p::TOO_MANY_OPEN | p::TABLE_FULL))
     )
 }
 
@@ -153,6 +157,14 @@ mod tests {
         assert!(!carries(Held::Spent, &reply(p::BAD_HANDLE)));
         assert!(!carries(Held::Spent, &reply(p::IO)));
         assert!(!carries(Held::Spent, &[]));
+    }
+
+    #[test]
+    fn an_offered_session_goes_back_with_a_yes_and_closes_with_anything_else() {
+        assert!(carries(Held::Offered, &reply(0)));
+        assert!(!carries(Held::Offered, &reply(p::BAD_HANDLE)));
+        assert!(!carries(Held::Offered, &reply(p::TABLE_FULL)));
+        assert!(!carries(Held::Offered, &[]));
     }
 
     #[test]

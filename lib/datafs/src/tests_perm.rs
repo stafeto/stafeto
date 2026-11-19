@@ -32,6 +32,7 @@ pub(crate) fn user(uid: u32, gid: u32, groups: &[u32]) -> Vouched {
     g[..groups.len()].copy_from_slice(groups);
     Vouched {
         pid: uid + 100,
+        index: 0,
         generation: 1,
         uid,
         euid: uid,
@@ -1299,8 +1300,14 @@ fn costs_of_the_common_jobs() {
     row("mkdir with its attribute", &mut rig, &mut |r| {
         r.mkdir(OWNER, b"/a/dir1", 0o755).unwrap()
     });
+    row("stat /a/f (before the chmod)", &mut rig, &mut |r| {
+        r.stat(OWNER, b"/a/f").unwrap();
+    });
     row("chmod", &mut rig, &mut |r| {
         r.chmod(OWNER, b"/a/f", 0o600).unwrap()
+    });
+    row("chmod again", &mut rig, &mut |r| {
+        r.chmod(OWNER, b"/a/f", 0o640).unwrap()
     });
     row("unlink", &mut rig, &mut |r| {
         r.call(OWNER, |w| p::path_call(p::Method::Unlink, b"/a/new1", w))
@@ -1341,4 +1348,42 @@ fn costs_of_the_common_jobs() {
             r.put(ROOT, b"/big1000/extra2", 0o644, b"");
         },
     );
+}
+
+/// A commit that compacts a metadata pair (one erase) costs 8 reads, or about the number of metadata
+/// pairs of the volume every second time: `lfs_dir_commit` looks for the predecessor of the pair it
+/// moved (`lfs_fs_pred`, lfs.c). Prints the cost of the first six.
+#[test]
+#[ignore = "prints numbers; run by name"]
+fn a_commit_that_compacts_a_metadata_pair_reads_the_whole_list_of_pairs_every_second_time() {
+    let mut rig = Rig::on(MemDevice::new(32768));
+    rig.mkdir(ROOT, b"/big", 0o777).unwrap();
+    for i in 0..600 {
+        rig.put(ROOT, std::format!("/big/e{i:04}").as_bytes(), 0o644, b"");
+    }
+    rig.mkdir(ROOT, b"/a", 0o777).unwrap();
+    rig.put(OWNER, b"/a/f", 0o644, b"x");
+    let mut seen = 0;
+    for n in 0..200u32 {
+        let (r0, e0, p0) = (
+            rig.fs.device().reads,
+            rig.fs.erases(),
+            rig.fs.device().programs,
+        );
+        rig.fs.setattr(b"/a/f", ATTR_TYPE, &[n as u8; 48]).unwrap();
+        let (r1, e1, p1) = (
+            rig.fs.device().reads,
+            rig.fs.erases(),
+            rig.fs.device().programs,
+        );
+        if e1 > e0 && seen < 6 {
+            std::println!(
+                "setattr {n}: {} reads, {} programs, {} erases",
+                r1 - r0,
+                p1 - p0,
+                e1 - e0
+            );
+            seen += 1;
+        }
+    }
 }

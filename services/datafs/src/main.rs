@@ -12,6 +12,8 @@
 #![no_std]
 #![no_main]
 
+mod clock;
+mod identity;
 mod shared;
 mod worker;
 
@@ -88,6 +90,7 @@ fn main(_: u64) -> u64 {
             blk.map_or(abi::Handle(0), |h| h.into_raw()),
         ),
         (worker::WAKE, done.into_raw()),
+        (worker::PARENT, s.parent.raw()),
     ] {
         worker::RAW[i].store(raw.0, Release);
     }
@@ -119,6 +122,7 @@ fn main(_: u64) -> u64 {
         again,
         pending: [const { None }; JOBS],
         outgoing: [const { None }; JOBS],
+        carried: [const { None }; JOBS],
         forgotten: Forgotten::new(),
         ready: false,
         since: 0,
@@ -183,6 +187,9 @@ struct Datafs {
     /// The handle a job's reply carries when the worker says yes: the session of CLONE, the pass of
     /// EXPORT. A job the worker refuses lets it go.
     outgoing: [Option<(Held, Handle<Any>)>; JOBS],
+    /// The handle a request brought for its job to use (the identity session of BIND and SESSION),
+    /// open until the job is done: the worker works on the raw handle, so the thread keeps it.
+    carried: [Option<Handle<Channel>>; JOBS],
     /// The labels that went while every job was in use: what they held closes when a job is free.
     forgotten: Forgotten<FORGOTTEN>,
     /// READY went to init (once the worker's start is over, the volume mounted or not).
@@ -241,6 +248,7 @@ impl Datafs {
         job.kind = kind;
         job.owner = owner;
         job.aux = aux;
+        job.carried = self.carried[i].as_ref().map_or(0, |h| h.raw().0);
         job.request_len = bytes.len();
         job.request[..bytes.len()].copy_from_slice(bytes);
         job.ticket.store(next_ticket(), Release);
@@ -317,6 +325,38 @@ impl Datafs {
         Answer::Deferred
     }
 
+    /// BIND, SESSION and VERIFY_SESSION: the one handle of the request. For BIND it is the caller's
+    /// identity session (kept for the job); for SESSION it is that too, and the reply carries a new
+    /// session of the service (a label of its own and a copy of the channel); for VERIFY_SESSION it
+    /// is the session offered, which goes back in the reply when the worker says it is live. The
+    /// result is what `request` takes: the label for the worker, the handle the reply may carry, and
+    /// the handle the job uses.
+    #[allow(clippy::type_complexity)]
+    fn identity_call(
+        &mut self,
+        r: &mut Request<'_>,
+    ) -> Result<(u64, (Option<(Held, Handle<Any>)>, Option<Handle<Channel>>)), Answer> {
+        if r.handles.len() != 1 {
+            return Err(Answer::Status(Status::BadSize));
+        }
+        let Ok(brought) = r.handles.take::<Channel>(0) else {
+            return Err(Answer::Status(Status::Kernel(abi::Error::WrongType)));
+        };
+        match Method::from_number(r.method()) {
+            Some(Method::Bind) => Ok((0, (None, Some(brought)))),
+            Some(Method::Session) => match self.make(Rights::SEND | Rights::TRANSFER) {
+                Ok(made) => Ok((made.0, (Some((Held::Made, made.1)), Some(brought)))),
+                Err(e) => Err(Answer::Status(Status::Kernel(e))),
+            },
+            _ => {
+                let Ok(label) = sys::copy_label(&self.channel, &brought) else {
+                    return Err(Answer::Status(proto_data::code(proto_data::BAD_HANDLE)));
+                };
+                Ok((label, (Some((Held::Offered, brought.erase())), None)))
+            }
+        }
+    }
+
     /// Sends the reply of every finished job and frees it.
     /// At most `SETTLE_AT_ONCE` replies go in one step, so that a step stays short whatever the worker
     /// has finished; when more are done, the service tells itself again and the rest follow.
@@ -344,6 +384,9 @@ impl Datafs {
                 };
                 let _ = pending.answer(reply, handles);
             }
+            // The identity session the request brought closes with the job (the worker kept a copy
+            // of it for a session that stays bound).
+            self.carried[i] = None;
             state(i).store(FREE, Release);
         }
         if more {
@@ -373,20 +416,29 @@ impl Service<0> for Datafs {
         // The calls that bring or make a handle are the request thread's: a kernel call each, no disk.
         let (aux, handle) = match Method::from_number(r.method()) {
             Some(Method::Clone) => match self.make(Rights::SEND | Rights::TRANSFER) {
-                Ok(made) => (made.0, Some((Held::Made, made.1))),
+                Ok(made) => (made.0, (Some((Held::Made, made.1)), None)),
                 Err(e) => return Answer::Status(Status::Kernel(e)),
             },
             Some(Method::Export) => match self.make(Rights::TRANSFER) {
-                Ok(made) => (made.0, Some((Held::Made, made.1))),
+                Ok(made) => (made.0, (Some((Held::Made, made.1)), None)),
                 Err(e) => return Answer::Status(Status::Kernel(e)),
             },
-            _ => (0, None),
+            // BIND, SESSION and VERIFY_SESSION bring one handle: the identity session of the caller
+            // (a copy for the worker to vouch for) or the session offered for verification.
+            Some(Method::Bind | Method::Session | Method::VerifySession) => {
+                match self.identity_call(r) {
+                    Ok(made) => made,
+                    Err(answer) => return answer,
+                }
+            }
+            _ => (0, (None, None)),
         };
         let Some(pending) = r.defer() else {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
         self.pending[i] = Some(pending);
-        self.outgoing[i] = handle;
+        self.outgoing[i] = handle.0;
+        self.carried[i] = handle.1;
         self.queue(i, REQUEST, owner, aux, r.bytes());
         Answer::Deferred
     }

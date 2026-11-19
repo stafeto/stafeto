@@ -37,6 +37,7 @@ mod tests_perm;
 #[cfg(test)]
 mod tests_scale;
 pub mod volume;
+pub mod vouching;
 pub mod watch;
 
 pub use fs::{Dir, Entry, Error, File, Fs, Info, Kind, Open, Storage, Whence};

@@ -2457,14 +2457,10 @@ impl Server {
     // ---- What the service's worker does for a session ----
 
     /// Binds the session of `label` to the identity the process service vouched for (BIND, after
-    /// the worker asked it): INVALID for a session that is still bound, BAD_HANDLE for one that is
-    /// not there. A session of a native client is never bound this way.
+    /// the worker asked it): INVALID for a session that is still bound. A session of a native client is never bound this way.
     pub fn bind(&mut self, label: u64, vouched: Vouched) -> Result<(), Status> {
-        let si = self
-            .sessions
-            .iter()
-            .position(|s| s.used && s.label == label)
-            .ok_or_else(bad_handle)?;
+        // A session the service has not seen is made (a client that connected and sent BIND first).
+        let si = self.session(label)?;
         if !binding::may_bind(&self.sessions[si].binding) {
             return Err(p::code(p::INVALID));
         }

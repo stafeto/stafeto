@@ -188,6 +188,7 @@ dependencies = [
  "littlefs",
  "posix-perm",
  "proto-data",
+ "proto-process",
  "proto-wire",
 ]
 
@@ -197,9 +198,12 @@ version = "0.5.1"
 dependencies = [
  "abi",
  "datafs",
+ "posix-clock",
  "proto-blk",
+ "proto-clock",
  "proto-data",
  "proto-init",
+ "proto-process",
  "proto-wire",
  "rt",
 ]

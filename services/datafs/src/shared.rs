@@ -51,6 +51,10 @@ pub struct Job {
     /// The label the request thread made for the call (CLONE, EXPORT) or read from the pass the call
     /// brought (ADOPT); 0 for the rest.
     pub aux: u64,
+    /// The raw handle of the identity session (BIND, SESSION) or the offered session
+    /// (VERIFY_SESSION) the request brought, which the request thread keeps open until the job is
+    /// done; 0 for the rest.
+    pub carried: u64,
     pub request_len: usize,
     pub request: [u8; abi::MESSAGE_MAX],
     pub reply_len: usize,
@@ -66,6 +70,7 @@ impl Job {
             kind: REQUEST,
             owner: 0,
             aux: 0,
+            carried: 0,
             request_len: 0,
             request: [0; abi::MESSAGE_MAX],
             reply_len: 0,
