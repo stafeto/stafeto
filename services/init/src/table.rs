@@ -610,20 +610,20 @@ pub fn on_cpus(cpus: u8, up: u8) -> (u8, bool) {
 
 /// The CPU the first thread of an instance is asked for (the loader's
 /// `Params::cpu`: 0 for none, else the CPU plus one) when its mask is `mask`:
-/// the driver of the console and its log (`log`) goes to CPU 1 when the mask
-/// has it, and every other instance, or one whose mask lacks CPU 1, is asked
-/// for none, so that the kernel puts it on the CPU of the caller or the
-/// lowest of the mask. An explicit CPU outside the mask is ACCESS_DENIED.
-pub fn first_cpu(log: bool, mask: u8) -> u8 {
-    if log && mask & 0b0010 != 0 { 2 } else { 0 }
+/// none for every instance. The driver of the console and its log (`log`) stays on the lowest CPU
+/// of its mask like the others (the variant of the comparison of the frequency of the silence of
+/// the terminal service on two CPUs: it went to CPU 1 when the mask had it). An explicit CPU
+/// outside the mask is ACCESS_DENIED.
+pub fn first_cpu(_log: bool, _mask: u8) -> u8 {
+    0
 }
 
 /// The CPU a budget of `record` is made on for an instance with the mask `mask` of CPUs that are
 /// up: the table's CPU for every record but the console driver. The driver (the record with `log`)
-/// stands on the CPU `first_cpu` asks for, CPU 1 on a machine that has it, and a budget binds only
+/// stands on the CPU `first_cpu` asks for (none now), and a budget binds only
 /// to a thread of its own CPU (thread_bind_budget answers INVALID_ARGS otherwise), so its budget
-/// is made where the thread is: CPU 1 when `first_cpu` asks for it, else the lowest CPU of the
-/// mask, where the loader leaves a thread it was asked nothing for.
+/// is made where the thread is: the lowest CPU of the mask, where the loader leaves a thread it
+/// was asked nothing for.
 pub fn budget_cpu(log: bool, mask: u8, table_cpu: u8) -> u8 {
     if !log {
         return table_cpu;
@@ -2023,14 +2023,10 @@ mod tests {
         tables
     }
 
-    /// The CPU a thread is left on when the loader is asked nothing for it, and the CPU asked for the
-    /// driver of the console, written out apart from `budget_cpu`.
-    fn thread_cpu(log: bool, mask: u8) -> u8 {
-        if log && mask & 0b0010 != 0 {
-            1
-        } else {
-            mask.trailing_zeros() as u8
-        }
+    /// The CPU a thread is left on when the loader is asked nothing for it (every thread now, the
+    /// console driver's included), written out apart from `budget_cpu`.
+    fn thread_cpu(_log: bool, mask: u8) -> u8 {
+        mask.trailing_zeros() as u8
     }
 
     /// Every record of every table whose program takes a budget at its start (the console drivers
@@ -3271,13 +3267,13 @@ mod tests {
     /// The image of the measurement of stage P7 is the network image of VZ
     /// with the launcher of the shell on all four CPUs; the network service
     /// stays on the boot CPU and the services on the CPUs of the services.
-    /// The log driver's first thread asks for CPU 1 only when its mask has
-    /// it: the image `cpu0` keeps every program but the process service on
-    /// CPU 0 and must start on two CPUs or more.
+    /// The log driver's first thread asks for no CPU (the variant that keeps it on the lowest CPU
+    /// of its mask): the image `cpu0` keeps every program but the process service on CPU 0 and
+    /// must start on two CPUs or more.
     #[test]
     fn the_first_cpu_of_the_log_driver_is_in_its_mask() {
-        assert_eq!(first_cpu(true, GENERAL_CPUS), 2);
-        assert_eq!(first_cpu(true, BENCH_CPUS), 2);
+        assert_eq!(first_cpu(true, GENERAL_CPUS), 0);
+        assert_eq!(first_cpu(true, BENCH_CPUS), 0);
         assert_eq!(first_cpu(false, NETD_CPUS), 0);
         assert_eq!(first_cpu(true, RT_CPUS), 0);
         assert_eq!(first_cpu(false, GENERAL_CPUS), 0);
