@@ -499,7 +499,7 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
         }
     }
     // The network load is real: the budgets of the network service ran out. The
-    // journal of init counts them over the whole run, not by phase, and says how
+    // journal of init counts them over the whole run (no count by phase exists) and says how
     // many times the kernel found each budget spent.
     let overruns = netd_overruns(lines);
     if timed && overruns.iter().all(|(_, n)| *n == 0) {
