@@ -923,6 +923,17 @@ pub fn check_owners(
             }
         }
     }
+    // The data volume is mounted at /data (the layer sends the paths there to the data file
+    // service): a file of the image at or below it would be hidden, and so is the target of a
+    // link that named a place there (a link names a file of its own directory, below).
+    for f in files {
+        if f.path == "/data" || f.path.starts_with("/data/") {
+            wrong.push(format!(
+                "{} is at or below /data, which the data volume covers",
+                f.path
+            ));
+        }
+    }
     // A link names a file of its own directory that the image has and that
     // is no link itself.
     for f in files {
@@ -2811,6 +2822,27 @@ mod tests {
             .push(("/bin/again".into(), "link:cat".into()));
         let error = check_owners(image, &chained, &owned).unwrap_err();
         assert!(error.contains("/bin/again links to /bin/cat"), "{error}");
+    }
+
+    /// The data volume covers /data: a file of the image there would never be reached.
+    #[test]
+    fn no_file_of_the_image_is_under_the_data_volume() {
+        let image = "boot-ash-dialog.img";
+        let packages = crate::packages::of_image(image).unwrap();
+        // The image has none now; `/bin/data` and `/database` are other names.
+        check_owners(image, &files_of(image), &packages).unwrap();
+        let mut covered = files_of(image);
+        covered.push(of("/data/keep", 0o644, ROOT, Source::Bytes("keep", b"x")));
+        let mut owned = packages.clone();
+        owned[0].files.push(("/data/keep".into(), "keep".into()));
+        let error = check_owners(image, &covered, &owned).unwrap_err();
+        assert!(error.contains("/data/keep is at or below /data"), "{error}");
+        let mut near = files_of(image);
+        near.push(of("/database", 0o644, ROOT, Source::Bytes("near", b"x")));
+        let mut owned = packages.clone();
+        owned[0].files.push(("/database".into(), "near".into()));
+        let error = check_owners(image, &near, &owned).err().unwrap_or_default();
+        assert!(!error.contains("at or below /data"), "{error}");
     }
 
     #[test]
