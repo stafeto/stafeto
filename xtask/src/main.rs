@@ -2203,8 +2203,12 @@ commands:
             key (docs/release.md)
   release-build [--previous INDEX] [--no-abi]  the first half of a release in target/stafeto-release: the
             packages (carried from INDEX), both images, the kernel and the stage of tools/dist.py
-  release-check [DIR]  refuse what the build job left that is not a file of a release
-  release-pack  the archives of a release in target/dist from target/stafeto-release after it is signed
+            With --packages-only (--tag TAG | --trial) it carries and builds the packages of a
+            published series and nothing else: a packages-only update (docs/release.md)
+  release-check [--packages-only [--tag TAG | --trial]] [DIR]  refuse what the build job left that is not a
+            file of a release (of an update)
+  release-pack [--packages-only (--tag TAG | --trial)]  the archives of a release (the files of an update)
+            in target/dist from target/stafeto-release after it is signed
   ash-shell-exit  check that `exit 3` ends the machine and gives 3
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
   image base|full [run]
@@ -2749,7 +2753,7 @@ fn main() {
         Some("dist") => release::dist(),
         Some("release-build") => release::build_command(&args[1..]),
         Some("release-check") => release::check_command(&args[1..]),
-        Some("release-pack") => release::pack(&target_dir().join("dist")),
+        Some("release-pack") => release::pack_command(&args[1..]),
         Some("ash-shell-exit") => ash_shell_exit(),
         Some("bash-shell-exit") => bash_dialog::bash_shell_exit(),
         Some("bash-dialog") => bash_dialog::bash_dialog(),

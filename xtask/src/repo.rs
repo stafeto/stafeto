@@ -47,6 +47,8 @@ pub struct Options {
     pub remote: Option<String>,
     /// Packages whose recipe is changed on purpose (the carrying probe of `pkg-identity`).
     pub perturb: Vec<String>,
+    /// The build is a packages-only update (`pkg::Options::packages_only`).
+    pub packages_only: bool,
 }
 
 impl Default for Options {
@@ -68,6 +70,7 @@ impl Default for Options {
             serial_after: None,
             remote: None,
             perturb: Vec::new(),
+            packages_only: false,
         }
     }
 }
@@ -678,6 +681,7 @@ pub fn run(o: &Options) -> Result<PathBuf, String> {
         cert: o.cert.clone(),
         previous: o.previous.clone(),
         perturb: o.perturb.clone(),
+        packages_only: o.packages_only,
         ..pkg::Options::default()
     })?;
     // The serial after the one of the index carried from, unless given.
