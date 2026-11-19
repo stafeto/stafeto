@@ -1762,15 +1762,15 @@ impl Server {
                         (ni, true)
                     }
                 };
-                // While the conversion job has not ended a file may be inline (its bytes inside the
-                // pair of its directory), and littlefs 2.11.3 loses a write at its start or in its
-                // middle with inline data off. A file about to be written or truncated is moved out
-                // first (seek to the end, write no byte: one commit) through the node's file, which
-                // every description of the path shares.
-                if self.conversion.is_some()
-                    && existing.is_some()
-                    && flags & (p::WRITE | p::TRUNCATE) != 0
-                {
+                // A file may be inline (its bytes inside the pair of its directory) whatever the
+                // format mark says: a volume of an older build, an entry the conversion job has not
+                // reached or never reaches (a job that was abandoned), a volume that was marked and
+                // then written by an older build. littlefs 2.11.3 loses a write at the start or in
+                // the middle of such a file with inline data off. A file about to be written or
+                // truncated is moved out first (seek to the end, write no byte: one commit) through
+                // the node's file, which every description of the path shares. The flag is in
+                // memory after the open: a file that is not inline costs no read.
+                if existing.is_some() && flags & (p::WRITE | p::TRUNCATE) != 0 {
                     let file = File(self.nodes[ni].slot);
                     if volume(fs.file_inline(file))? {
                         volume(fs.seek(file, 0, Whence::End))?;

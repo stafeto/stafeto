@@ -68,8 +68,10 @@ pub struct StartWork {
     pub epoch: Result<u32, Error>,
 }
 
-/// The depth of directories the conversion goes to.
-const CONVERT_DEPTH: usize = 32;
+/// The levels of the walk: a path is at most `MAX_PATH` bytes and each level takes two (a slash and a
+/// letter), so no entry lies deeper than this. The walk keeps one directory open and one counter for
+/// each level, which is under 2 KiB; it never stops short of an entry.
+const CONVERT_DEPTH: usize = MAX_PATH / 2 + 1;
 
 /// The conversion job, one entry a step: the records of every entry that has none and the move-out
 /// of every inline file, in a walk of the tree that keeps the iterator of the directory it is in open

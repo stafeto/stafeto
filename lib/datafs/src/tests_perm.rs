@@ -2847,6 +2847,88 @@ fn a_write_to_an_inline_file_the_job_has_not_reached_is_moved_out_first_and_not_
     assert_eq!(&data[4..4 + 32], b"NEW-456789middle0123456789abcdef");
 }
 
+/// A volume with one inline file (the build with inline data on) at `levels` directories deep and
+/// the format mark `mark` (None: the mark 4 the first mount of the empty volume wrote stays).
+fn inline_file_volume(levels: usize, mark: Option<u32>) -> (MemDevice, std::string::String) {
+    use crate::attr::ATTR_FORMAT_TYPE;
+    let mut rig = Rig::new();
+    rig.fs.unmount().unwrap();
+    rig.fs.set_inline_max(0);
+    rig.fs.mount().unwrap();
+    let mut path = std::string::String::new();
+    for _ in 0..levels {
+        path.push_str("/d");
+        rig.mkdir(ROOT, path.as_bytes(), 0o755).unwrap();
+    }
+    path.push_str("/f");
+    rig.put(
+        ROOT,
+        path.as_bytes(),
+        0o644,
+        b"0123456789abcdef0123456789abcdef",
+    );
+    if let Some(mark) = mark {
+        rig.fs
+            .setattr(b"/", ATTR_FORMAT_TYPE, &mark.to_le_bytes())
+            .unwrap();
+    }
+    rig.fs.unmount().unwrap();
+    (rig.fs.into_device(), path)
+}
+
+/// A write into the middle of the file, then the whole file read back.
+fn write_in_the_middle_and_read(rig: &mut Rig, path: &str) -> std::vec::Vec<u8> {
+    let h = rig
+        .open(ROOT, path.as_bytes(), p::READ | p::WRITE, 0)
+        .unwrap();
+    rig.call(ROOT, |w| p::pwrite(h, 10, b"middle", w)).unwrap();
+    rig.call(ROOT, |w| p::handle_call(p::Method::Fsync, h, w))
+        .unwrap();
+    rig.close(ROOT, h);
+    let h = rig.open(ROOT, path.as_bytes(), p::READ, 0).unwrap();
+    let data = rig.ok(ROOT, |w| p::read(h, 64, w));
+    rig.close(ROOT, h);
+    data[4..4 + 32].to_vec()
+}
+
+const MIDDLE_KEPT: &[u8] = b"0123456789middle0123456789abcdef";
+
+#[test]
+fn the_conversion_walk_reaches_an_inline_file_at_any_depth_a_path_can_have() {
+    use crate::attr::RECORDS_FORMAT;
+    // 33 levels (the old walk stopped at 32) and 250 (a path of 503 bytes).
+    for levels in [33usize, 250] {
+        let (device, path) = inline_file_volume(levels, Some(RECORDS_FORMAT));
+        let mut rig = Rig::on(device);
+        assert!(!rig.server.conversion_pending());
+        assert_eq!(rig.fs.outline(path.as_bytes(), true), Ok(false), "{levels}");
+        assert_eq!(write_in_the_middle_and_read(&mut rig, &path), MIDDLE_KEPT);
+    }
+}
+
+#[test]
+fn a_write_into_an_inline_file_is_kept_whatever_the_mark_and_the_job_say() {
+    use crate::attr::VOLUME_FORMAT;
+    // A volume marked 4 that still holds an inline file (written by an older build after the mark):
+    // the mount work does nothing and the open moves the file out.
+    let (device, path) = inline_file_volume(2, Some(VOLUME_FORMAT));
+    let mut rig = Rig::on(device);
+    assert!(!rig.server.conversion_pending());
+    assert_eq!(write_in_the_middle_and_read(&mut rig, &path), MIDDLE_KEPT);
+    // A job that was abandoned (the volume failed under it) leaves the file inline and the mark as it
+    // was: the open of the file for writing still moves it out.
+    let (device, path) = inline_file_volume(2, Some(crate::attr::RECORDS_FORMAT));
+    let mut rig = Rig::unconverted(device);
+    assert!(rig.server.conversion_pending());
+    rig.server.abandon_conversion(&mut rig.fs);
+    assert!(!rig.server.conversion_pending());
+    assert_eq!(write_in_the_middle_and_read(&mut rig, &path), MIDDLE_KEPT);
+    // And a job that ended: the same.
+    let (device, path) = inline_file_volume(2, Some(crate::attr::RECORDS_FORMAT));
+    let mut rig = Rig::on(device);
+    assert_eq!(write_in_the_middle_and_read(&mut rig, &path), MIDDLE_KEPT);
+}
+
 #[test]
 fn ready_does_not_wait_for_the_job_and_a_request_is_served_between_its_steps() {
     // 150 inline files in 3 directories (part A's volume).
