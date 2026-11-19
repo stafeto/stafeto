@@ -47,6 +47,12 @@ pub const fn takeable(which: u32) -> bool {
     which == ROOT_DATA
 }
 
+/// The rights of the copy of the root TakeRoot gives: SEND to send the root its two requests, and
+/// TRANSFER, which the kernel asks of every handle in a message (a reply without it is refused with
+/// ACCESS_DENIED, which the client sees as its status). No DUPLICATE: the process cannot copy it.
+/// The root gives only sessions with a vouched identity, so a copy handed on is harmless.
+pub const TAKEN_RIGHTS: abi::Rights = abi::Rights::SEND.union(abi::Rights::TRANSFER);
+
 /// The registered roots, by root.
 pub struct Roots<H> {
     held: [Option<H>; ROOTS],
@@ -153,6 +159,16 @@ mod tests {
         let empty = Roots::<u32>::new();
         assert_eq!(empty.taken(ROOT_DATA), Err(UNREGISTERED));
         assert!(takeable(ROOT_DATA) && !takeable(ROOT_DATA + 1));
+    }
+
+    /// The copy TakeRoot puts in its reply can travel: a handle in a message has TRANSFER. (The
+    /// planted fault: SEND alone, which the kernel refuses and the first probe of /data met as
+    /// status 3.)
+    #[test]
+    fn the_copy_of_the_root_has_the_rights_to_travel_and_to_send() {
+        assert!(TAKEN_RIGHTS.contains(abi::Rights::TRANSFER));
+        assert!(TAKEN_RIGHTS.contains(abi::Rights::SEND));
+        assert!(!TAKEN_RIGHTS.contains(abi::Rights::DUPLICATE));
     }
 
     #[test]
