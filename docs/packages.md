@@ -93,7 +93,7 @@ them for the licence notes of the image.
   `FREEDOOM-SOURCE`), and the check of the image compares the WAD with the
   one the build script unpacked.
 - pixman (`packages/pixman.toml`, MIT) is a base package that installs no file:
-  the composition service links its portable C paths statically
+  the composition service links its AArch64 NEON and portable C paths statically
   (`tools/build-pixman.py` fetches the pinned archive, checks its SHA-256 and
   builds `target/pixman/libpixman.a` with the headers and the shim of
   `ports/pixman`; `lib/pixman` links it). Nothing but the service links it, so

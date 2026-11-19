@@ -349,6 +349,7 @@ fn main(_: u64) -> u64 {
     {
         rt::service::report_steps(17);
         rt::service::table_steps_from(16);
+        rt::service::step_after(px::cost::tell);
     }
     let config = Config {
         issued: 0,
@@ -734,6 +735,8 @@ impl Compositor {
         if job.at.row >= job.damage.y + job.damage.h {
             let damage = job.damage;
             self.job = None;
+            #[cfg(feature = "steps")]
+            px::cost::frame_done();
             self.commit(damage);
             return;
         }
