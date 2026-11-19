@@ -1375,7 +1375,7 @@ mod tests {
     }
 
     fn portion(r: &mut Rig) -> watches::Portion {
-        r.pool.portion(r.at, &mut r.p, |_| true, true).unwrap()
+        r.pool.portion(r.at, &mut r.p, |_| true).unwrap()
     }
 
     fn all_queues(r: &Rig) -> Vec<u32> {
@@ -1507,7 +1507,7 @@ mod tests {
         }
         assert_eq!(portion(&mut r).subscribed, watches::WATCH_STEP_QUEUES);
         let refused = loop {
-            match r.pool.portion(r.at, &mut r.p, |_| true, true) {
+            match r.pool.portion(r.at, &mut r.p, |_| true) {
                 Ok(p) => assert!(!p.last),
                 Err(code) => break code,
             }
@@ -1541,5 +1541,51 @@ mod tests {
             assert_eq!((only.subscribed, only.last), (n, true));
             assert_eq!(r.pool.pending(), None);
         }
+    }
+
+    #[test]
+    fn a_set_of_more_than_one_portion_is_subscribed_entirely_in_turns() {
+        let mut r = rig();
+        let queues = all_queues(&r);
+        let elements = &queues[..watches::WATCH_STEP_QUEUES + 1];
+        let (set, q) = watch_of(elements);
+        r.at = r.pool.insert(LABEL, KEY, &set, &q).unwrap();
+        // The request has subscribed nothing.
+        assert!(elements.iter().all(|&e| waiting_at(&r.p, e) == 0));
+        assert_eq!(r.pool.pending(), Some((LABEL, KEY, r.at)));
+        let turns = portions(&mut r);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].subscribed, watches::WATCH_STEP_QUEUES);
+        assert_eq!(turns[1].subscribed, 1);
+        assert!(elements.iter().all(|&e| waiting_at(&r.p, e) == 1));
+    }
+
+    #[test]
+    fn a_write_before_the_first_turn_wakes_through_the_last_check() {
+        let mut r = rig();
+        let queues = all_queues(&r);
+        let (set, q) = watch_of(&queues);
+        r.at = r.pool.insert(LABEL, KEY, &set, &q).unwrap();
+        let mut wakes = Wakes::default();
+        let wr = r.wr[0];
+        assert_eq!(r.p.write(&r.held, wr, &[1], &mut wakes), Ok(Some(1)));
+        assert!(woke(&wakes).is_empty(), "no queue is subscribed yet");
+        let turns = portions(&mut r);
+        assert!(turns[..turns.len() - 1].iter().all(|p| !p.ready));
+        assert!(turns.last().unwrap().ready);
+    }
+
+    #[test]
+    fn a_set_of_one_queue_is_subscribed_in_a_turn_too() {
+        let mut r = rig();
+        let elements = [r.rd[0]];
+        let (set, q) = watch_of(&elements);
+        r.at = r.pool.insert(LABEL, KEY, &set, &q).unwrap();
+        assert_eq!(r.pool.pending(), Some((LABEL, KEY, r.at)));
+        assert_eq!(waiting_at(&r.p, r.rd[0]), 0);
+        let turn = portion(&mut r);
+        assert_eq!((turn.subscribed, turn.last, turn.ready), (1, true, false));
+        assert_eq!(waiting_at(&r.p, r.rd[0]), 1);
+        assert_eq!(r.pool.pending(), None);
     }
 }

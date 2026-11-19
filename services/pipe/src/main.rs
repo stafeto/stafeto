@@ -526,8 +526,8 @@ impl PipeService {
         }
     }
 
-    /// The turn of the service's own for a watch whose subscriptions a
-    /// request left unfinished: one portion of at most `WATCH_STEP_QUEUES`
+    /// The turn of the service's own for a watch whose subscriptions no
+    /// step has made yet or finished: one portion of at most `WATCH_STEP_QUEUES`
     /// queues and nothing else in this turn. A refused portion marks the
     /// record (`Take` answers AGAIN) and tells the waiter. After the last
     /// portion the readiness of the set is checked once more, for a change
@@ -548,12 +548,9 @@ impl PipeService {
         }
         let ops = &self.ops;
         let named = &self.named;
-        let tell = match self.watches.portion(
-            at,
-            self.pipes,
-            |(l, k)| ops.waits(l, k) || named.alive(l, k),
-            true,
-        ) {
+        let tell = match self.watches.portion(at, self.pipes, |(l, k)| {
+            ops.waits(l, k) || named.alive(l, k)
+        }) {
             Ok(portion) => {
                 rt::service::step_detail(portion.subscribed as u64);
                 portion.ready
@@ -901,7 +898,7 @@ impl PipeService {
 
     fn watch_start(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         #[cfg(feature = "steps")]
-        let t_begin = rt::time::now();
+        let (t_begin, ran_begin) = (rt::time::now(), steps_parts::times());
         let set = match proto_pipe::WatchSet::parse(r.body()) {
             Ok(set) if r.handles.is_empty() => set,
             _ => return Answer::Status(Status::BadSize),
@@ -946,46 +943,22 @@ impl PipeService {
         let placed = self.watches.insert(label, key, &set, &queues);
         #[cfg(feature = "steps")]
         let t_insert = rt::time::now();
-        let mut refusal = if placed.is_some() {
-            None
-        } else {
-            Some(proto_pipe::AGAIN)
-        };
-        let mut more = false;
-        if let Some(at) = placed {
-            // The first portion only: the turn of the service's own
-            // subscribes the rest (`watch_turn`).
-            let ops = &self.ops;
-            let named = &self.named;
-            match self.watches.portion(
-                at,
-                self.pipes,
-                |(l, k)| ops.waits(l, k) || named.alive(l, k),
-                false,
-            ) {
-                Ok(portion) => more = !portion.last,
-                Err(code) => refusal = Some(code),
-            }
-        }
-        #[cfg(feature = "steps")]
-        let t_subscribe = rt::time::now();
-        if let Some(code) = refusal {
-            for &queue in &queues[..set.len] {
-                self.pipes.unwait(u32::from(queue), (label, key));
-            }
-            self.watches.remove(label, key);
+        if placed.is_none() {
+            // Nothing is subscribed yet: the operation only goes.
             let finished = self.ops.finish(&mut s.data.long, label, key);
             self.over(s, finished);
-            return status(code);
+            return status(proto_pipe::AGAIN);
         }
-        if more {
-            self.kick();
-        }
+        // The request subscribes to no queue: the turns of the service's own
+        // do, a portion of `WATCH_STEP_QUEUES` each (`watch_turn`), and
+        // `Take` computes the readiness of the whole set meanwhile.
+        self.kick();
         #[cfg(feature = "steps")]
-        if more {
+        if set.len > 16 {
             steps_parts::record(
-                [t_parse, t_ready, t_insert, t_subscribe, rt::time::now()],
+                [t_parse, t_ready, t_insert, rt::time::now()],
                 t_begin,
+                ran_begin,
             );
         }
         long_answer(r, long::Reply::Wait(key))
@@ -2074,31 +2047,52 @@ impl Service<0> for PipeService {
     }
 }
 
-/// The parts of the longest request step of a Watch of more than 16
-/// elements, in counter ticks, and the line the next turn of the service's
-/// own prints for them (`steps` builds only).
+/// The parts of a request step of a Watch of more than 16 elements, in
+/// counter ticks (wall time), the thread's own time and its kernel part over
+/// the request, and the line the next turn of the service's own prints for
+/// them (`steps` builds only).
 #[cfg(feature = "steps")]
 mod steps_parts {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    static PARTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static PARTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    static OWN: AtomicU64 = AtomicU64::new(0);
 
-    /// `at` are the counter at the parsed set, at the checked readiness,
-    /// at the insertion, at the first portion and at the kick.
-    pub fn record(at: [u64; 5], begin: u64) {
+    /// The thread's own time (`ran`) and its kernel part, as the step
+    /// tables read them (object_info THREAD_STATE x5 and x6).
+    pub fn times() -> (u64, u64) {
+        let mut raw = OWN.load(Ordering::Relaxed);
+        if raw == 0
+            && let Ok(own) = rt::sys::self_thread()
+        {
+            raw = own.into_raw().0;
+            OWN.store(raw, Ordering::Relaxed);
+        }
+        let own = core::mem::ManuallyDrop::new(rt::handle::Handle::<rt::handle::Thread>::borrowed(
+            rt::abi::Handle(raw),
+        ));
+        rt::sys::thread_times(&own).unwrap_or((0, 0))
+    }
+
+    /// `at` are the counter at the parsed set, at the checked readiness, at
+    /// the insertion and at the kick.
+    pub fn record(at: [u64; 4], begin: u64, times_begin: (u64, u64)) {
+        let (ran, kernel) = times();
         let mut from = begin;
         for (part, &now) in PARTS.iter().zip(&at) {
             part.store(now - from, Ordering::Relaxed);
             from = now;
         }
+        PARTS[4].store(ran - times_begin.0, Ordering::Relaxed);
+        PARTS[5].store(kernel - times_begin.1, Ordering::Relaxed);
     }
 
     pub fn print(turn: u64, live: usize, waiting: usize) {
-        let [parse, ready, insert, subscribe, kick] =
-            [0, 1, 2, 3, 4].map(|i| PARTS[i].swap(0, Ordering::Relaxed));
-        if parse | ready | insert | subscribe | kick != 0 {
+        let [parse, ready, insert, kick, ran, kernel] =
+            [0, 1, 2, 3, 4, 5].map(|i| PARTS[i].swap(0, Ordering::Relaxed));
+        if parse | ready | insert | kick != 0 {
             rt::println!(
-                "pipe: watch parts parse {parse} ready {ready} insert {insert} subscribe {subscribe} kick {kick} turn {turn} records {live} waiting {waiting}"
+                "pipe: watch parts parse {parse} ready {ready} insert {insert} kick {kick} ran {ran} kernel {kernel} turn {turn} records {live} waiting {waiting}"
             );
         }
     }
