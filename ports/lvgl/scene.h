@@ -68,9 +68,9 @@
 #define SCENE_EVENTS 22
 #define SCENE_CHANGES 16
 #define SCENE_EVENT_ROWS \
-    /* the button, twice */ \
+    /* the button, twice (the second click elsewhere on it: no event for a move to the same place) */ \
     {2, 0, 0, 90, 142}, {3, 0x110, 1, 90, 142}, {3, 0x110, 0, 90, 142}, \
-    {2, 0, 0, 90, 142}, {3, 0x110, 1, 90, 142}, {3, 0x110, 0, 90, 142}, \
+    {2, 0, 0, 100, 146}, {3, 0x110, 1, 100, 146}, {3, 0x110, 0, 100, 146}, \
     /* the check box */ \
     {2, 0, 0, 30, 200}, {3, 0x110, 1, 30, 200}, {3, 0x110, 0, 30, 200}, \
     /* the switch */ \

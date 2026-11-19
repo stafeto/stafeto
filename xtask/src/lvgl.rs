@@ -67,8 +67,12 @@ const BAND_ROWS: usize = 16;
 /// The scene header, the one source of the scenario's events.
 const SCENE: &str = include_str!("../../ports/lvgl/scene.h");
 
-/// How many events of each kind the scenario has: keys, moves, buttons,
-/// counted in the rows of `SCENE_EVENT_ROWS`.
+/// How many events of each kind the compositor delivers to the demo for the
+/// scenario of the header: keys, moves, buttons, counted in the rows of
+/// `SCENE_EVENT_ROWS`. The compositor delivers no MOVE to the place the
+/// pointer is already at (`Scene::pointer_to` returns at once), so a move to
+/// the same place as the one before is not counted: the second click on the
+/// same button has no move of its own.
 fn scene_kinds() -> (u32, u32, u32) {
     let start = SCENE
         .find("#define SCENE_EVENT_ROWS")
@@ -77,11 +81,31 @@ fn scene_kinds() -> (u32, u32, u32) {
         .find("#define SCENE_STATE_FORMAT")
         .map_or(SCENE.len(), |n| start + n);
     let (mut keys, mut moves, mut buttons) = (0, 0, 0);
+    let mut pointer: Option<(i32, i32)> = None;
     for group in SCENE[start..end].split('{').skip(1) {
-        match group.split(',').next().map(str::trim) {
-            Some("1") => keys += 1,
-            Some("2") => moves += 1,
-            Some("3") => buttons += 1,
+        let numbers: Vec<i32> = group
+            .split('}')
+            .next()
+            .unwrap_or("")
+            .split(',')
+            .filter_map(|n| {
+                let n = n.trim();
+                match n.strip_prefix("0x") {
+                    Some(hex) => i32::from_str_radix(hex, 16).ok(),
+                    None => n.parse().ok(),
+                }
+            })
+            .collect();
+        match numbers.first() {
+            Some(1) => keys += 1,
+            Some(2) if numbers.len() == 5 => {
+                let at = (numbers[3], numbers[4]);
+                if pointer != Some(at) {
+                    moves += 1;
+                }
+                pointer = Some(at);
+            }
+            Some(3) => buttons += 1,
             _ => {}
         }
     }
@@ -168,7 +192,8 @@ fn after(text: &str, word: &str) -> Result<u32, String> {
 
 /// The lines of the demo that are faults whatever their place: the demo
 /// says so itself, or LVGL logged a warning, an error or an assertion.
-const FAULTS: [&str; 14] = [
+const FAULTS: [&str; 15] = [
+    "received ",
     "LOST",
     "lvgl: [",
     "cannot open the window",
@@ -179,7 +204,7 @@ const FAULTS: [&str; 14] = [
     "the display service ended",
     "did not settle",
     "did not finish",
-    "input events came",
+    "changes came",
     "did not reach the screen",
     "evidence failed",
     "cannot open the font",
@@ -824,6 +849,7 @@ mod tests {
 
     #[test]
     fn the_scenario_has_four_keys_six_moves_and_twelve_buttons() {
+        // Every move row is delivered: none moves to the place the pointer is at.
         assert_eq!(scene_kinds(), (4, 6, 12));
     }
 
@@ -884,7 +910,8 @@ mod tests {
         for odd in [
             "lvgl: [Warn] lv_obj_remove_flag: Deprecated lv_obj.c:447",
             "still waiting for a free buffer",
-            "only 17 of 22 input events came",
+            "only 12 of 16 changes came",
+            "received 21 events, 15 of 16 changes: M90,142 B110/1",
             "cannot open the window: errno 16",
         ] {
             let mut lines = guest_lines();

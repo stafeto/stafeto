@@ -148,9 +148,28 @@ fn the_clicks_land_inside_their_widgets() {
         at.0 >= x && at.0 < x + w && at.1 >= y && at.1 < y + h
     };
     assert!(inside(BUTTON_AT, BUTTON_X, BUTTON_Y, BUTTON_W, BUTTON_H));
+    assert!(inside(BUTTON_AGAIN, BUTTON_X, BUTTON_Y, BUTTON_W, BUTTON_H));
     assert!(inside(SWITCH_AT, SWITCH_X, SWITCH_Y, SWITCH_W, SWITCH_H));
     assert!(inside(SLIDER_AT, SLIDER_X, SLIDER_Y, SLIDER_W, SLIDER_H));
     assert!(inside(AREA_AT, AREA_X, AREA_Y, AREA_W, AREA_H));
     assert_eq!(SLIDER_AT.0 - SLIDER_X, SLIDER_W * 3 / 4);
     assert_eq!(CHECK_AT, (30, 200));
+}
+
+/// No row is a move the compositor drops: a MOVE to the place the pointer is
+/// already at makes no event (`Scene::pointer_to` returns at once), so the
+/// demo would wait for a row that never comes.
+#[test]
+fn no_row_is_a_move_to_the_place_the_pointer_is_at() {
+    let mut at: Option<(i32, i32)> = None;
+    for (i, row) in scenario::ROWS.iter().enumerate() {
+        if row.kind == scenario::MOVE {
+            assert_ne!(
+                at,
+                Some((row.x, row.y)),
+                "row {i} moves to where the pointer is"
+            );
+            at = Some((row.x, row.y));
+        }
+    }
 }

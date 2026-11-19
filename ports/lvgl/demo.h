@@ -111,7 +111,11 @@ typedef struct demo_result {
  * through the host's idle, against a real-time deadline: a late key-up would
  * otherwise become a long press), hand them in one change at a time, settle,
  * take the CRC and the state. 0, or -1 when the frame does not settle or the
- * events do not come (the log says how many came). */
+ * events do not come (the log says how many came). The wait ends when every
+ * change of the scenario (SCENE_CHANGES keys and buttons going down or up) has
+ * come: the compositor does not deliver a move to the place the pointer is
+ * already at, so the number of events is no end condition. When the deadline
+ * passes, the log lists the events that did come, in order. */
 int demo_probe(demo *d, demo_result *result);
 
 /* The CRC of each band of 16 rows of the two frames of `result`, as lines of

@@ -24,6 +24,9 @@ _Static_assert(KEYS_BACKSPACE == LV_KEY_BACKSPACE && KEYS_ENTER == LV_KEY_ENTER,
 _Static_assert(KEYS_NEXT == LV_KEY_NEXT && KEYS_HOME == LV_KEY_HOME && KEYS_END == LV_KEY_END,
                "key values");
 
+/* How many events the probe remembers for its report of what came. */
+#define SEEN_MAX 48
+
 /* The milliseconds the virtual clock of the probe advances in a turn. */
 #define TURN_MS 16
 /* The turns the probe waits for a frame to settle before it gives up. */
@@ -53,6 +56,8 @@ struct demo {
     unsigned posted;            /* frames posted */
     unsigned last_posted;       /* the buffer of the last post */
     unsigned turns;
+    demo_event seen[SEEN_MAX];  /* the first events that came, for the probe's report */
+    unsigned seen_count;
 };
 
 /* The callbacks of LVGL carry no argument of ours: one demo at a time. */
@@ -314,9 +319,9 @@ void demo_close(demo *d)
 }
 
 /* Hand the events that arrived to the queue, as long as a call returns as many
- * as it was asked for. The input events (not the focus) among them are added
- * to `*inputs`. */
-static void pull_events(demo *d, unsigned *inputs)
+ * as it was asked for. The changes among them (a key or a button going down or
+ * up) are added to `*changes`. */
+static void pull_events(demo *d, unsigned *changes)
 {
     if (!d->host.events) {
         return;
@@ -332,11 +337,11 @@ static void pull_events(demo *d, unsigned *inputs)
         }
         unsigned n = d->host.events(d->host.user, batch, room);
         for (unsigned i = 0; i < n; i++) {
-            if (batch[i].kind == DEMO_EVENT_KEY || batch[i].kind == DEMO_EVENT_MOVE
-                || batch[i].kind == DEMO_EVENT_BUTTON) {
-                if (inputs) {
-                    (*inputs)++;
-                }
+            if (changes && (batch[i].kind == DEMO_EVENT_KEY || batch[i].kind == DEMO_EVENT_BUTTON)) {
+                (*changes)++;
+            }
+            if (d->seen_count < SEEN_MAX) {
+                d->seen[d->seen_count++] = batch[i];
             }
             sched_push(&d->sched, &batch[i]);
         }
@@ -346,29 +351,78 @@ static void pull_events(demo *d, unsigned *inputs)
     }
 }
 
+/* The events that came, in order, in one or two lines: K code/value for a key,
+ * M x,y for a move, B code/value for a button, F+ and F- for the focus. */
+static void report_seen(demo *d, unsigned changes)
+{
+    char line[200];
+    size_t at = 0;
+    unsigned line_no = 0;
+    snprintf(line, sizeof line, "received %u events, %u of %d changes:", d->seen_count, changes,
+             SCENE_CHANGES);
+    at = strlen(line);
+    for (unsigned i = 0; i < d->seen_count; i++) {
+        char token[24];
+        const demo_event *e = &d->seen[i];
+        switch (e->kind) {
+        case DEMO_EVENT_KEY:
+            snprintf(token, sizeof token, " K%u/%d", (unsigned)e->code, (int)e->value);
+            break;
+        case DEMO_EVENT_MOVE:
+            snprintf(token, sizeof token, " M%d,%d", (int)e->x, (int)e->y);
+            break;
+        case DEMO_EVENT_BUTTON:
+            snprintf(token, sizeof token, " B%x/%d", (unsigned)e->code, (int)e->value);
+            break;
+        case DEMO_EVENT_FOCUS_IN:
+            snprintf(token, sizeof token, " F+");
+            break;
+        case DEMO_EVENT_FOCUS_OUT:
+            snprintf(token, sizeof token, " F-");
+            break;
+        default:
+            snprintf(token, sizeof token, " ?%u", (unsigned)e->kind);
+        }
+        if (at + strlen(token) + 1 >= sizeof line || (i == 24 && line_no == 0)) {
+            say(d, "demo: %s", line);
+            line_no++;
+            line[0] = '\0';
+            at = 0;
+        }
+        snprintf(line + at, sizeof line - at, "%s", token);
+        at += strlen(token);
+    }
+    say(d, "demo: %s", line);
+}
+
 /* The real-time wait of the probe for the events of the scenario: the longest
  * it waits, and how often it looks. */
 #define COLLECT_MS 30000
 #define COLLECT_LOOKS 2000
 
-/* Collect all the input events of the scenario before the clock of LVGL
- * runs again: the clock does not move while the program waits, so the time an
- * event takes to arrive cannot show in the pixels. */
+/* Collect the events of the scenario before the clock of LVGL runs again: the
+ * clock does not move while the program waits, so the time an event takes to
+ * arrive cannot show in the pixels. The end of the wait follows the
+ * scenario: every change of it (the keys and the buttons, SCENE_CHANGES) has
+ * come. The moves before the last change came before it, and the service may
+ * not deliver a move to the place the pointer already is, so the count of
+ * events is no measure of the scenario. */
 static int collect_inputs(demo *d)
 {
-    unsigned inputs = 0;
+    unsigned changes = 0;
     uint32_t start = d->host.now_ms ? d->host.now_ms(d->host.user) : 0;
     for (unsigned looks = 0;; looks++) {
-        pull_events(d, &inputs);
-        if (inputs >= SCENE_EVENTS) {
+        pull_events(d, &changes);
+        if (changes >= SCENE_CHANGES) {
             return 0;
         }
         int late = d->host.now_ms ? d->host.now_ms(d->host.user) - start > COLLECT_MS
                                   : looks > COLLECT_LOOKS;
         if (late || d->stopped) {
             char line[120];
-            snprintf(line, sizeof line, "only %u of %d input events came", inputs, SCENE_EVENTS);
+            snprintf(line, sizeof line, "only %u of %d changes came", changes, SCENE_CHANGES);
             say(d, "demo: %s", line);
+            report_seen(d, changes);
             return -1;
         }
         if (d->host.idle) {

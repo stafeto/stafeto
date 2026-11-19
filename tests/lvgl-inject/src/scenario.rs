@@ -50,6 +50,10 @@ pub const AREA_H: i32 = 44;
 /// check box (10 points in), the middle of the switch, three quarters along
 /// the slider, the middle of the text area.
 pub const BUTTON_AT: (i32, i32) = (BUTTON_X + BUTTON_W / 2, BUTTON_Y + BUTTON_H / 2);
+/// The second click on the button lands at another point of it: the
+/// compositor makes no event for a motion to the place the pointer is at, so a
+/// second move to BUTTON_AT would be dropped.
+pub const BUTTON_AGAIN: (i32, i32) = (BUTTON_AT.0 + 10, BUTTON_AT.1 + 4);
 pub const CHECK_AT: (i32, i32) = (CHECK_X + 10, CHECK_Y + 10);
 pub const SWITCH_AT: (i32, i32) = (SWITCH_X + SWITCH_W / 2, SWITCH_Y + SWITCH_H / 2);
 pub const SLIDER_AT: (i32, i32) = (SLIDER_X + SLIDER_W * 3 / 4, SLIDER_Y + SLIDER_H / 2);
@@ -90,16 +94,16 @@ const fn key(code: u16, value: i32) -> Row {
     }
 }
 
-/// The scenario, in the order it is injected: the button twice, the check
-/// box, the switch, the slider, the text area (each a move, a press and a
+/// The scenario, in the order it is injected: the button twice (at two
+/// points), the check box, the switch, the slider, the text area (each a move, a press and a
 /// release), then h and i.
 pub const ROWS: [Row; EVENTS] = [
     mv(BUTTON_AT),
     button(1, BUTTON_AT),
     button(0, BUTTON_AT),
-    mv(BUTTON_AT),
-    button(1, BUTTON_AT),
-    button(0, BUTTON_AT),
+    mv(BUTTON_AGAIN),
+    button(1, BUTTON_AGAIN),
+    button(0, BUTTON_AGAIN),
     mv(CHECK_AT),
     button(1, CHECK_AT),
     button(0, CHECK_AT),

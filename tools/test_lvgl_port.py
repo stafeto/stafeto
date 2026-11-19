@@ -26,7 +26,9 @@ and the test of all events at once failed; with the second, the reference
 printed "presses 0 option 0 switch 0 slider 20 text hi" (and a different
 second CRC), and the test of the state line failed; with the third, feeding one
 event every 20, 30 and 40 looks gave "text hi", "text hhii" and "text hhhiii"
-and other CRCs, turns and frames (the first frame is the same)."""
+and other CRCs, turns and frames (the first frame is the same). With a
+wait that counts events (22) and a service that delivers 21, the reference
+failed at the deadline after listing the 21 events in order."""
 
 import importlib.util
 from pathlib import Path
@@ -50,6 +52,13 @@ spec.loader.exec_module(builder)
 CC = shutil.which("clang") or shutil.which("cc") or "cc"
 STATE = "presses 2 option 1 switch 1 slider 75 text hi"
 BUSY = 10
+# The second click of the scenario, as an earlier header had it (at the point of
+# the first, so that the second move is a duplicate), for the tests of a service
+# that drops duplicate moves.
+DUPLICATE_ROW = (
+    "{2, 0, 0, 100, 146}, {3, 0x110, 1, 100, 146}, {3, 0x110, 0, 100, 146}",
+    "{2, 0, 0, 90, 142}, {3, 0x110, 1, 90, 142}, {3, 0x110, 0, 90, 142}",
+)
 # The values of the reference, pinned: a difference between the machine of the
 # CI (arm64 Linux) and a developer's Mac shows in the host job.
 FIRST_CRC = "450D7460"
@@ -271,6 +280,26 @@ class ReferenceTests(unittest.TestCase):
         for gap in ("20", "30", "40"):
             self.assertEqual(self.lines("--feed", "gap", gap), batch, gap)
 
+    def test_a_service_that_merges_moves_gives_the_same_frames(self):
+        batch = self.lines("--feed", "batch")
+        for extra in (["--drop-same-move"], ["--merge-moves"],
+                      ["--drop-same-move", "--merge-moves", "--feed", "gap", "30"]):
+            self.assertEqual(self.lines(*extra), batch, extra)
+
+    def test_a_duplicate_move_the_service_drops_changes_nothing(self):
+        # The scenario has no such row (the compositor makes no event for a
+        # move to the place the pointer is at). A copy of the header with the
+        # old second click, at the same point as the first, has one; the
+        # service's 21 events give the frames of the 22.
+        with tempfile.TemporaryDirectory() as tmp:
+            port = mutated(PORT, "scene.h", DUPLICATE_ROW[0], DUPLICATE_ROW[1], Path(tmp))
+            ref = builder.build_reference(port, Path(tmp) / "ref")
+            batch = self.lines("--feed", "batch", ref=ref)
+            self.assertEqual(batch["first crc"], FIRST_CRC)
+            self.assertEqual(batch["after crc"], AFTER_CRC)
+            for extra in (["--drop-same-move"], ["--drop-same-move", "--feed", "gap", "40"]):
+                self.assertEqual(self.lines(*extra, ref=ref), batch, extra)
+
     def test_the_evidence_of_the_glyph_path_is_the_pinned_one(self):
         def evidence():
             out = subprocess.run([str(self.ref), "--evidence", str(self.font)], capture_output=True,
@@ -304,6 +333,23 @@ class ReferenceTests(unittest.TestCase):
             self.assertNotEqual(got["state"], STATE)
             self.assertIn("text hhhiii", got["state"])
             self.assertNotEqual(got["after crc"], AFTER_CRC)
+
+    def test_planted_fault_the_wait_ends_on_the_number_of_events_and_lists_what_came(self):
+        # The end condition that counts all 22 events: with a duplicate move
+        # the compositor delivers 21, so the wait ends at the deadline
+        # (shortened here), and the demo lists the events that did come, in
+        # order.
+        with tempfile.TemporaryDirectory() as tmp:
+            port = mutated(PORT, "scene.h", DUPLICATE_ROW[0], DUPLICATE_ROW[1], Path(tmp))
+            (port / "demo.c").write_text((port / "demo.c").read_text()
+                .replace("if (changes >= SCENE_CHANGES) {", "if (changes >= SCENE_EVENTS) {")
+                .replace("#define COLLECT_MS 30000", "#define COLLECT_MS 200"))
+            ref = builder.build_reference(port, Path(tmp) / "ref")
+            done = subprocess.run([str(ref), "--drop-same-move", str(self.font)],
+                                  capture_output=True, text=True)
+            self.assertNotEqual(done.returncode, 0)
+            self.assertIn("received 21 events", done.stdout)
+            self.assertIn("M90,142 B110/1 B110/0 B110/1 B110/0 M30,200", done.stdout)
 
     def test_planted_fault_x_and_y_swapped_in_the_hand_out_of_the_point(self):
         with tempfile.TemporaryDirectory() as tmp:

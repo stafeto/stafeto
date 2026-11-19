@@ -8,12 +8,16 @@
  * after the scenario, and the state line. The guest's probe prints the same
  * lines and the expected values are these.
  *
- *   lvgl-ref [--feed batch|single|gap N] [--evidence] [--out DIR] FONT
+ *   lvgl-ref [--feed batch|single|gap N] [--drop-same-move] [--merge-moves] [--evidence] [--out DIR] FONT
  *
  * --feed batch hands in all the events of the scenario at once; single hands
  * in one event at each look of the demo; gap N hands in one event at every Nth
  * look (a slow injector). The result is the same: the demo collects all the
  * events before its clock runs.
+ * --drop-same-move leaves out a MOVE to the place the pointer is already at,
+ * as the compositor does (it delivers no such move), and --merge-moves merges
+ * two MOVEs with nothing between them into the later one (a service that
+ * coalesces motion). The demo reaches the same frames with either.
  * --evidence also prints the determinism evidence of the glyph path.
  * --out DIR writes ref.txt (the two CRCs and the state line) and the two
  * frames as PPM files for the eye. */
@@ -42,7 +46,34 @@ struct ref {
     int stage;                  /* pauses of stage 0 seen */
 };
 
-static const demo_event scenario[SCENE_EVENTS] = {SCENE_EVENT_ROWS};
+static const demo_event scenario_rows[SCENE_EVENTS] = {SCENE_EVENT_ROWS};
+/* The events the reference hands in: the rows of the scenario, less the moves
+ * the chosen mode leaves out. */
+static demo_event scenario[SCENE_EVENTS];
+static unsigned scenario_count;
+
+static void make_scenario(int drop_same, int merge)
+{
+    int have_point = 0;
+    int32_t px = 0, py = 0;
+    scenario_count = 0;
+    for (unsigned i = 0; i < SCENE_EVENTS; i++) {
+        const demo_event *e = &scenario_rows[i];
+        if (e->kind == DEMO_EVENT_MOVE) {
+            if (drop_same && have_point && e->x == px && e->y == py) {
+                continue;
+            }
+            have_point = 1;
+            px = e->x;
+            py = e->y;
+            if (merge && scenario_count > 0 && scenario[scenario_count - 1].kind == DEMO_EVENT_MOVE) {
+                scenario[scenario_count - 1] = *e;
+                continue;
+            }
+        }
+        scenario[scenario_count++] = *e;
+    }
+}
 
 static int post(void *user, unsigned buffer, const demo_rect *rects, unsigned count)
 {
@@ -69,7 +100,7 @@ static unsigned events(void *user, demo_event *out, unsigned max)
     if (r->single && r->gap > 1 && r->calls % r->gap != 0) {
         return 0;
     }
-    while (n < limit && n < max && r->fed < SCENE_EVENTS) {
+    while (n < limit && n < max && r->fed < scenario_count) {
         out[n++] = scenario[r->fed++];
     }
     return n;
@@ -129,7 +160,7 @@ int main(int argc, char **argv)
     struct ref r;
     memset(&r, 0, sizeof r);
     const char *font = NULL, *out = NULL;
-    int evidence = 0;
+    int evidence = 0, drop_same = 0, merge = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--feed") && i + 1 < argc) {
             const char *mode = argv[++i];
@@ -137,6 +168,10 @@ int main(int argc, char **argv)
             if (!strcmp(mode, "gap") && i + 1 < argc) {
                 r.gap = (unsigned)atoi(argv[++i]);
             }
+        } else if (!strcmp(argv[i], "--drop-same-move")) {
+            drop_same = 1;
+        } else if (!strcmp(argv[i], "--merge-moves")) {
+            merge = 1;
         } else if (!strcmp(argv[i], "--evidence")) {
             evidence = 1;
         } else if (!strcmp(argv[i], "--out") && i + 1 < argc) {
@@ -149,6 +184,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: lvgl-ref [--feed batch|single] [--evidence] [--out DIR] FONT\n");
         return 2;
     }
+    make_scenario(drop_same, merge);
     for (int i = 0; i < 2; i++) {
         r.buffer[i] = calloc(1, DEMO_BUFFER_BYTES);
     }
