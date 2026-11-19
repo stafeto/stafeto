@@ -303,6 +303,16 @@ pub fn compare(
     line: &str,
     prefix: &str,
 ) -> Result<(), String> {
+    compare_shot(monitor, picture, line, prefix).map(drop)
+}
+
+/// As `compare`, and the CRC-32 of the screenshot.
+pub fn compare_shot(
+    monitor: &mut Monitor,
+    picture: &Path,
+    line: &str,
+    prefix: &str,
+) -> Result<u32, String> {
     let wanted = crc_of(line, prefix)?;
     let shot = monitor.screendump(picture)?;
     if (shot.width, shot.height) != (640, 400) {
@@ -323,7 +333,7 @@ pub fn compare(
         prefix.trim(),
         shot.colours()
     );
-    Ok(())
+    Ok(shot.crc32())
 }
 
 /// Follows the run: the screenshots against the guest's CRC-lines, then

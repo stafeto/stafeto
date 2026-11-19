@@ -16,7 +16,8 @@
 //! piece* (spec 3, 7.3), a DMA object, the process's shared buffer with
 //! the network service, the *network buffer piece*, and the buffer through
 //! which the file service fills the large reads, the *file buffer piece*; the
-//! pieces of a claimed network device (`Kind::Fast`) are of a kind of their own as well.
+//! pieces of a claimed network device (`Kind::Fast`) and the buffers of a window of the composition
+//! service (`Kind::Window`) are of a kind of their own as well.
 //! `fork` copies none of them into the child (`Map::inherited` leaves them out, so the
 //! child has a hole there), `munmap` and `mprotect` refuse them (`Refused::Special`,
 //! EINVAL), and only `unmap_kind` takes one out. The handle type is a parameter, so
@@ -249,6 +250,13 @@ pub enum Kind {
     /// stay until the process ends; `fork` and `exec` are refused while
     /// the map has one.
     Fast,
+    /// A buffer of the process's window of the composition service
+    /// (`posix_abi::window`): one piece for each of the one to three
+    /// buffers, writable, never shared with a child (a forked child has no
+    /// window, so `inherited` leaves them out), refused by `munmap`,
+    /// `mprotect` and `MAP_FIXED`, and taken out by `unmap_kind` when the
+    /// window closes, at `exec` and at the end of the process.
+    Window,
     /// The bitmap of a room that grew (`space::Space::extend`): `munmap`,
     /// `mprotect` and `MAP_FIXED` refuse it as they refuse the others, and
     /// `fork` copies it, since the child's copy of the room's states
@@ -1160,6 +1168,47 @@ mod tests {
         assert_eq!(map.display_piece(), Some((0x2000_0000, 250)));
         assert!(map.unmap_kind(Kind::NetBuffer).is_none());
         assert!(!map.meets_special(0x4000_0000, 64));
+    }
+
+    /// The buffers of a window (one piece each, up to three) follow the rule of the display
+    /// piece: a forked child gets none, `munmap`, `mprotect` and a range that meets them are
+    /// refused, and `unmap_kind` takes them out one at a time, giving each object back.
+    #[test]
+    fn the_window_buffers_are_not_copied_and_refuse_munmap() {
+        let mut map = with_screen();
+        for (n, at) in [0x5000_0000usize, 0x5010_0000, 0x5020_0000]
+            .into_iter()
+            .enumerate()
+        {
+            let mut object = Object::new(20 + n as u32, false, None);
+            object.kind = Kind::Window;
+            map.push(at, 100, Access::ReadWrite, 0, object).unwrap();
+        }
+        let child: Vec<usize> = map.inherited().map(|p| p.address).collect();
+        assert_eq!(child, [0x1000_0000, 0x3000_0000]);
+        assert_eq!(map.kind_pieces(Kind::Window).count(), 3);
+        for at in [0x5000_0000usize, 0x5010_0000, 0x5020_0000] {
+            let piece = map.find(at).unwrap();
+            assert!(map.meets_special(at, 1));
+            assert_eq!(map.unmap(piece, at, 100), Err(Refused::Special));
+            assert_eq!(map.unmap_keep(piece, at, 1), Err(Refused::Special));
+            assert_eq!(
+                map.protect(piece, at, 100, Access::Read),
+                Err(Refused::Special)
+            );
+        }
+        // The display piece is a kind of its own.
+        assert_eq!(map.display_piece(), Some((0x2000_0000, 250)));
+        let mut handles = Vec::new();
+        while let Some((_, pages, object)) = map.unmap_kind(Kind::Window) {
+            assert_eq!((pages, object.kind), (100, Kind::Window));
+            handles.push(object.handle);
+        }
+        handles.sort();
+        assert_eq!(handles, [20, 21, 22]);
+        assert!(map.unmap_kind(Kind::Window).is_none());
+        assert!(!map.meets_special(0x5000_0000, 100));
+        assert_eq!(map.display_piece(), Some((0x2000_0000, 250)));
     }
 
     /// A map with the heap's chunk, the display piece (250 pages) and a

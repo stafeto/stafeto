@@ -251,6 +251,8 @@ table-posix-random-net = []
 table-posix-random-net2 = []
 # The C probe of the display service's place in a process (xtask posix-display).
 table-posix-display = []
+# The C probe of the window library (xtask posix-window).
+table-posix-window = []
 # The C probe of the screen and the keys on libc.so (xtask display-probe).
 table-display = []
 

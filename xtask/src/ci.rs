@@ -307,6 +307,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("posix-random-net-two", 20),
     ("posix-random-net-two-steps", 25),
     ("posix-display", 20),
+    ("posix-window", 25),
     ("display-probe", 25),
 ];
 const DEFAULT_WEIGHT: u32 = 20;

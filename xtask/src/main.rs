@@ -119,6 +119,7 @@ mod pkg_slot;
 mod pkg_states;
 mod posix_display;
 mod posix_net;
+mod posix_window;
 mod probe_ca;
 mod qemu;
 mod release;
@@ -2438,6 +2439,7 @@ commands:
   posix-random-net-two-steps the same under -icount, the steps of both instances
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
+  posix-window run the C probe of the window library (<stafeto/window.h>) in QEMU: a window with two buffers, the bits that free them, events, fork, a signal and close, the frames compared with QEMU's screenshot
   display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
   layer-probe [steps] attach and detach layers of the RAM file service in QEMU; steps
             measures the steps of the layer calls under -icount
@@ -2832,6 +2834,7 @@ fn main() {
         Some("posix-random-net-two") => entropy::random_net_two(false),
         Some("posix-random-net-two-steps") => entropy::random_net_two(true),
         Some("posix-display") => posix_display::probe(&qemu::VIRT),
+        Some("posix-window") => posix_window::probe(&qemu::VIRT),
         Some("display-probe") => display_probe::probe(&qemu::VIRT),
         Some("help") | None => {
             println!("{USAGE}");
@@ -10689,6 +10692,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             entropy::random_net_two(true)
         }),
         job("posix-display", || posix_display::probe(&qemu::VIRT)),
+        // The window library of C programs against QEMU's screenshots.
+        job("posix-window", || posix_window::probe(&qemu::VIRT)),
         // The screen and the keys of libc.so against QEMU's screenshots and
         // the keys of its monitor.
         job("display-probe", || display_probe::probe(&qemu::VIRT)),
@@ -14331,6 +14336,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "posix-display-probe",
         "--package",
+        "posix-window-probe",
+        "--package",
         "pkg-slot-probe",
         "--package",
         "display-run",
@@ -16636,6 +16643,7 @@ mod entropy_in_images_tests {
             ),
             ("pkg_slot::PROGRAMS", &crate::pkg_slot::PROGRAMS),
             ("posix_display::PROGRAMS", &crate::posix_display::PROGRAMS),
+            ("posix_window::PROGRAMS", &crate::posix_window::PROGRAMS),
             ("store_probe::PROGRAMS", &crate::store_probe::PROGRAMS),
             // The images whose lists are built at run time, EC2's among them.
             ("main::shell_programs", shell_programs()),
