@@ -2271,11 +2271,15 @@ commands:
             --one NAME, one test in a boot of its own, with its log;
             a FAIL verdict from --one returns a nonzero exit status
             --full-basic runs the complete pinned basic corpus in bounded batches
-  open-posix [--full | --only PREFIX] [--jobs N] run the Open POSIX Test Suite (LTP 20260930)
+  open-posix [--data] [--full | --only PREFIX] [--jobs N] run the Open POSIX Test Suite (LTP 20260930)
             on relibc in bounded batches, N boots at a time; without --full only
             the tests of tests/open-posix/pass.txt, which must all pass; --only
             runs the tests whose names start with PREFIX and shows their logs; the
-            table goes to target/measure/open-posix.tsv
+            table goes to target/measure/open-posix.tsv; --data runs the file-related
+            tests (fsync, aio_*, lio_listio, mmap, munmap) with their scratch files on
+            the data volume (data file service, TMPDIR /data/tmp): the tests of
+            tests/open-posix/data-pass.txt must pass, those of data-expected-not-pass.txt
+            do not by design, any other failure is a defect
   os-test-headers compile and link the pinned include corpus and check namespace
   posix-tty run the C probe of the terminal: termios, isatty, ttyname and the
             names of terminals through the terminal service, with typed input
@@ -2631,14 +2635,25 @@ fn main() {
         },
         Some("os-test-headers") => os_test_headers(&args[1..]),
         Some("open-posix") => {
-            let (select, rest) = match &args[1..] {
+            // `--data` first: the file-related tests with their scratch files on the data volume.
+            let (data, args) = match &args[1..] {
+                [flag, rest @ ..] if flag == "--data" => (true, rest),
+                rest => (false, rest),
+            };
+            let (select, rest) = match args {
                 [flag, rest @ ..] if flag == "--full" => (openposix::Select::Full, rest),
                 [flag, prefix, rest @ ..] if flag == "--only" => {
                     (openposix::Select::Prefix(prefix.clone()), rest)
                 }
                 rest => (openposix::Select::Pinned, rest),
             };
-            jobs::parse_jobs("open-posix", rest).and_then(|jobs| openposix::run(select, jobs))
+            jobs::parse_jobs("open-posix", rest).and_then(|jobs| {
+                if data {
+                    openposix::run_data(select, jobs)
+                } else {
+                    openposix::run(select, jobs)
+                }
+            })
         }
         Some("posix-map") => match args.get(1).map(String::as_str) {
             None => posix_map_probe(),

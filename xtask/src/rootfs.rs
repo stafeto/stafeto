@@ -1277,6 +1277,21 @@ pub fn os_test_with_fixtures(
 /// of its own file with its time limit in milliseconds (`limits`, one for
 /// each test).
 pub fn open_posix(tests: &[(String, Vec<u8>)], limits: &[u64]) -> Vec<RootFile> {
+    open_posix_with(tests, limits, None)
+}
+
+/// The files of a boot of the Open POSIX tests with their scratch files on the data volume: the
+/// list starts with the directory `tmp` names, made on the volume, and the variable `TMPDIR` the
+/// suite's tests read.
+pub fn open_posix_data(tests: &[(String, Vec<u8>)], limits: &[u64], tmp: &str) -> Vec<RootFile> {
+    open_posix_with(tests, limits, Some(tmp))
+}
+
+fn open_posix_with(
+    tests: &[(String, Vec<u8>)],
+    limits: &[u64],
+    tmp: Option<&str>,
+) -> Vec<RootFile> {
     /// Tests that print a usage line without an argument: the number of
     /// threads the suite's README gives them.
     const ARGUMENTS: [(&str, &str); 2] = [
@@ -1294,6 +1309,9 @@ pub fn open_posix(tests: &[(String, Vec<u8>)], limits: &[u64]) -> Vec<RootFile> 
     files.push(of("/bin/sleep", 0o755, ROOT, Source::Elf("busybox-probe")));
     files.push(of("/bin/ls", 0o755, ROOT, Source::Elf("busybox-probe")));
     let mut list = String::new();
+    if let Some(tmp) = tmp {
+        list.push_str(&format!("mkdir {tmp}\nenv TMPDIR {tmp}\n"));
+    }
     let mut limit = None;
     for ((name, _), ms) in tests.iter().zip(limits) {
         if limit != Some(*ms) {
