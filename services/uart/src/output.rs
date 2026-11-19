@@ -49,9 +49,12 @@ pub struct Output {
     log: [u8; LOG_RING],
     log_start: usize,
     log_len: usize,
-    /// The bytes of the log that went out since a client's line last had
-    /// its turn: at a line start the log goes first only below LOG_BYTES.
-    log_run: usize,
+    /// The bytes of the log that go before the waiting client bytes: the
+    /// log text queued when they came, at most LOG_BYTES of it. Log text
+    /// that comes later goes after them, so a client's line and the log
+    /// lines of the kernel keep the order they were written in, and a client
+    /// waits for a bounded part of the log, whatever stream follows.
+    log_owed: usize,
     at: At,
     /// Bytes that go before all others: the CR LF that ends a line cut
     /// short, the LF after the CR of a newline.
@@ -85,7 +88,7 @@ impl Output {
             log: [0; LOG_RING],
             log_start: 0,
             log_len: 0,
-            log_run: 0,
+            log_owed: 0,
             at: At::Start,
             pending: &[],
             pending_client: false,
@@ -152,6 +155,11 @@ impl Output {
     fn put_as(&mut self, bytes: &[u8], raw: bool) -> bool {
         if bytes.len() > self.room() {
             return false;
+        }
+        if self.ring_len == 0 {
+            // Bytes that find no other waiting: the log text queued now goes
+            // before them, what comes later after them.
+            self.log_owed = self.log_len.min(LOG_BYTES);
         }
         // In one or two runs of the ring, a copy and the bits of each.
         let mut done = 0;
@@ -302,15 +310,13 @@ impl Output {
             }
             match self.at {
                 At::Start => {
-                    // The log goes first at a line start, unless a client's
-                    // line waits and a batch of log text (LOG_BYTES) went out
-                    // since the last turn of the clients: they alternate.
-                    let clients_turn = self.ring_len > 0 && self.log_run >= LOG_BYTES;
+                    // The log goes first at a line start while it owes text
+                    // to the clients' bytes that wait (`log_owed`).
+                    let clients_turn = self.ring_len > 0 && self.log_owed == 0;
                     if self.log_has() && (self.fence.is_none() || self.cut) && !clients_turn {
                         self.at = At::Log;
                     } else if self.cut {
                         self.cut = false;
-                        self.log_run = 0;
                         self.at = At::Client;
                         if self.long {
                             self.line_len = 0;
@@ -319,7 +325,6 @@ impl Output {
                             self.repeat = Some(0);
                         }
                     } else if self.ring_len > 0 {
-                        self.log_run = 0;
                         self.at = At::Client;
                     } else {
                         return None;
@@ -355,7 +360,7 @@ impl Output {
                         let b = self.log[self.log_start];
                         self.log_start = (self.log_start + 1) % LOG_RING;
                         self.log_len -= 1;
-                        self.log_run = self.log_run.saturating_add(1);
+                        self.log_owed = self.log_owed.saturating_sub(1);
                         if b == b'\n' {
                             self.at = At::Start;
                             self.pending = b"\n";
@@ -379,6 +384,13 @@ impl Output {
     fn client_byte(&mut self, b: u8, raw: bool) -> u8 {
         if b == b'\n' {
             self.at = At::Start;
+            // Clients' bytes still wait: the log has its turn again, up to a
+            // batch of text.
+            self.log_owed = if self.ring_len > 0 {
+                self.log_len.min(LOG_BYTES)
+            } else {
+                0
+            };
             self.line_len = 0;
             self.long = false;
             if raw {
@@ -628,10 +640,12 @@ mod tests {
         assert!(o.put(b"abc\n"));
         assert!(!o.log_done());
         assert_eq!(drain(&mut o), b"nel line\r\nabc\r\n");
-        // At the start of a line the log goes first.
+        // At the start of a line the log text queued before the client's
+        // bytes goes first, what is queued after goes after them.
+        assert!(o.put_log(b"before\n"));
         assert!(o.put(b"client\n"));
-        assert!(o.put_log(b"log\n"));
-        assert_eq!(drain(&mut o), b"log\r\nclient\r\n");
+        assert!(o.put_log(b"after\n"));
+        assert_eq!(drain(&mut o), b"before\r\nclient\r\nafter\r\n");
     }
 
     #[test]
@@ -788,5 +802,64 @@ mod tests {
         assert!(lines.iter().filter(|l| **l == "stafeto> ").count() >= 1);
         assert!(notice < lines.len() - 1);
         assert_eq!(*lines.last().unwrap(), "stafeto> ");
+    }
+
+    /// The terminal dialog under a steady stream of log lines (the services'
+    /// tables, the budgets' notices) that goes on while a client's lines are
+    /// written: each client line comes out in the order it was written
+    /// against the log lines (those queued before it first, those after it
+    /// after it), and none waits for more than the log text queued when it
+    /// was written, at most LOG_BYTES, however long the stream goes on.
+    #[test]
+    fn client_lines_keep_their_place_in_a_steady_stream_of_log_lines() {
+        let mut o = Output::new();
+        let mut text = Vec::new();
+        let mut written = 0usize; // log lines written so far
+        let mut client_at = Vec::new(); // log lines written when each client line was
+        let mut step = 0;
+        while step < 3000 || !o.is_idle() {
+            // A log line every 40 bytes sent (faster than the port takes them)
+            // while the stream lasts.
+            if step < 3000 && step % 40 == 0 {
+                let line =
+                    format!("log {written:04}                                                 \n");
+                if o.put_log(line.as_bytes()) {
+                    written += 1;
+                }
+            }
+            // A client line now and then, three in all.
+            if step % 700 == 350 && client_at.len() < 3 {
+                let n = client_at.len();
+                if o.put(format!("client {n}\n").as_bytes()) {
+                    client_at.push(written);
+                }
+            }
+            if let Some(b) = o.next_byte() {
+                text.push(b);
+            }
+            step += 1;
+            assert!(step < 20_000);
+        }
+        let text = String::from_utf8(text).unwrap();
+        let lines: Vec<&str> = text.split("\r\n").collect();
+        for (n, &logs_before) in client_at.iter().enumerate() {
+            let at = lines
+                .iter()
+                .position(|l| *l == format!("client {n}"))
+                .unwrap();
+            let log_lines_before = lines[..at].iter().filter(|l| l.starts_with("log ")).count();
+            // Never before the log lines written before it, bar the part of
+            // that log past LOG_BYTES, and never after the lines written after
+            // it by more than the text it waited for.
+            let owed = logs_before.min(LOG_BYTES / 61 + 2);
+            assert!(
+                log_lines_before >= owed.saturating_sub(1),
+                "{n}: {log_lines_before} < {owed}"
+            );
+            assert!(
+                log_lines_before <= logs_before + 1,
+                "{n}: {log_lines_before} > {logs_before}"
+            );
+        }
     }
 }
