@@ -472,6 +472,7 @@ dependencies = [
  "pci",
  "power",
  "proto-comp",
+ "proto-data",
  "proto-fs",
  "proto-init",
  "proto-pipe",

@@ -262,6 +262,7 @@ table-display = []
 abi = { path = "../../lib/abi" }
 console-line = { path = "../../lib/console-line" }
 bootimg = { path = "../../lib/bootimg" }
+proto-data = { path = "../../proto/data" }
 proto-fs = { path = "../../proto/fs" }
 proto-init = { path = "../../proto/init" }
 proto-pipe = { path = "../../proto/pipe" }
