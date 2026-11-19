@@ -11306,6 +11306,16 @@ fn host_tests() -> Result<(), String> {
         "virtio-net",
         "--features",
         "virtio-net/ffi",
+    ]))?;
+    // The tests of the runtime library: its manifest sets `test = false` for the library, so
+    // only an explicit `--lib` runs them, and the feature keeps its panic handler off the host.
+    run_cmd(cargo().args([
+        "test",
+        "--package",
+        "rt",
+        "--features",
+        "host-tests",
+        "--lib",
     ]))
 }
 

@@ -1351,7 +1351,8 @@ trait Beating {
     fn reached(&self) -> bool;
     /// HEARTBEAT to init.
     fn send(&mut self);
-    /// The timer armed again for the deadline it has.
+    /// The timer armed again for the deadline it has: a deadline already reached fires within
+    /// the call itself.
     fn arm_again(&mut self) -> Result<(), Error>;
     /// The timer armed at the first deadline after now.
     fn arm_next(&mut self) -> Result<(), Error>;
