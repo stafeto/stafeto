@@ -2096,3 +2096,140 @@ fn rename_of_an_old_directory_and_rm_rf_of_trees_of_directories() {
         );
     }
 }
+
+/// M6 of the review of step 5, with no inline data: how many entries a pair holds for names of 8 and of
+/// 255 bytes (each with its 48-byte record), which operations split pairs, UNLINK in a directory of
+/// 1,024 files behind 500 directories, and the removal of every directory of a volume at the cap.
+/// Prints the figures for the table 4.2 and for the limit of names.
+#[test]
+#[ignore = "prints figures; run by name"]
+fn what_makes_pairs_without_inline_data() {
+    fn pairs(rig: &mut Rig) -> u64 {
+        rig.fs.metadata_pairs().unwrap()
+    }
+    fn reads(rig: &mut Rig) -> u64 {
+        rig.fs.device().reads
+    }
+    rig_pairs_per_name_length();
+    // The effect of single operations on 1,000 files of a directory: pairs before and after.
+    let mut rig = Rig::on(MemDevice::new(262_144));
+    rig.server.set_pairs_max(1_000_000);
+    rig.mkdir(ROOT, b"/d", 0o755).unwrap();
+    for n in 0..1000u32 {
+        rig.put(ROOT, std::format!("/d/f{n:04}").as_bytes(), 0o644, b"");
+    }
+    let base = pairs(&mut rig);
+    std::println!("1,000 empty files of 5 bytes of name: {base} pairs");
+    let write_at = |rig: &mut Rig, len: usize| {
+        for n in 0..1000u32 {
+            let path = std::format!("/d/f{n:04}");
+            let h = rig.open(ROOT, path.as_bytes(), p::WRITE, 0).unwrap();
+            let data = std::vec![7u8; len];
+            for chunk in data.chunks(900) {
+                rig.write(ROOT, h, chunk).unwrap();
+            }
+            rig.close(ROOT, h);
+        }
+    };
+    write_at(&mut rig, 500);
+    std::println!("after writing 500 bytes to each: {} pairs", pairs(&mut rig));
+    write_at(&mut rig, 4096);
+    std::println!(
+        "after writing 4,096 bytes to each: {} pairs",
+        pairs(&mut rig)
+    );
+    for n in 0..1000u32 {
+        let path = std::format!("/d/f{n:04}");
+        let h = rig.open(ROOT, path.as_bytes(), p::WRITE, 0).unwrap();
+        rig.call(ROOT, |w| p::truncate(h, 100, w)).unwrap();
+        rig.close(ROOT, h);
+    }
+    std::println!(
+        "after truncating each to 100 bytes: {} pairs",
+        pairs(&mut rig)
+    );
+    for n in 0..1000u32 {
+        let path = std::format!("/d/f{n:04}");
+        rig.chmod(ROOT, path.as_bytes(), 0o600).unwrap();
+    }
+    std::println!(
+        "after a CHMOD of each (an attribute of the same size): {} pairs",
+        pairs(&mut rig)
+    );
+    for n in 0..1000u32 {
+        let from = std::format!("/d/f{n:04}");
+        let to = std::format!("/d/{}{n:04}", "r".repeat(240));
+        rig.call(ROOT, |w| p::rename(from.as_bytes(), to.as_bytes(), w))
+            .unwrap();
+    }
+    std::println!(
+        "after renaming each to a name of 244 bytes: {} pairs",
+        pairs(&mut rig)
+    );
+    // UNLINK of 1,024 files of a directory behind 500 directories.
+    let mut rig = Rig::on(MemDevice::new(262_144));
+    rig.server.set_pairs_max(1_000_000);
+    for n in 0..500u32 {
+        rig.mkdir(ROOT, std::format!("/p{}", n % 8).as_bytes(), 0o755)
+            .ok();
+        rig.mkdir(ROOT, std::format!("/p{}/d{n}", n % 8).as_bytes(), 0o755)
+            .unwrap();
+    }
+    rig.mkdir(ROOT, b"/big", 0o755).unwrap();
+    for n in 0..1023u32 {
+        rig.put(ROOT, std::format!("/big/f{n:04}").as_bytes(), 0o644, b"x");
+    }
+    let total = pairs(&mut rig);
+    let (mut sum, mut worst) = (0, 0);
+    for n in 0..1023u32 {
+        let before = reads(&mut rig);
+        rig.call(ROOT, |w| {
+            p::path_call(
+                p::Method::Unlink,
+                std::format!("/big/f{n:04}").as_bytes(),
+                w,
+            )
+        })
+        .unwrap();
+        let spent = reads(&mut rig) - before;
+        sum += spent;
+        worst = worst.max(spent);
+    }
+    std::println!(
+        "UNLINK of 1,023 files of /big behind 500 directories ({total} pairs): {sum} reads in all, {worst} the worst"
+    );
+}
+
+/// Entries a pair holds: files with a name of `len` bytes and their records, until the pairs of the
+/// directory number 20.
+fn rig_pairs_per_name_length() {
+    for len in [8usize, 12, 16, 24, 32, 64, 128, 255] {
+        let mut rig = Rig::on(MemDevice::new(65_536));
+        rig.server.set_pairs_max(1_000_000);
+        rig.mkdir(ROOT, b"/d", 0o755).unwrap();
+        let before = rig.fs.metadata_pairs().unwrap();
+        let mut made = 0u32;
+        while made < 1000 {
+            let name = std::format!("{made:0>width$}", width = len);
+            rig.put(ROOT, std::format!("/d/{name}").as_bytes(), 0o644, b"");
+            made += 1;
+        }
+        let after = rig.fs.metadata_pairs().unwrap();
+        std::println!(
+            "names of {len} bytes: {made} entries in {} pairs, {:.1} an entry per pair",
+            after - before,
+            f64::from(made) / (after - before) as f64
+        );
+    }
+}
+
+#[test]
+fn a_file_of_500_bytes_has_a_block_of_its_own() {
+    let mut rig = Rig::new();
+    rig.mkdir(ROOT, b"/d", 0o755).unwrap();
+    let before = rig.fs.used_blocks().unwrap();
+    rig.put(ROOT, b"/d/small", 0o644, &[7u8; 500]);
+    let after = rig.fs.used_blocks().unwrap();
+    // The block of the data; with inline data the file lives in the pair and adds none.
+    assert!(after >= before + 1, "{before} blocks before, {after} after");
+}

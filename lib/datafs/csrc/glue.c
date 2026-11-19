@@ -129,6 +129,11 @@ void datafs_setup(struct datafs *d, uint32_t blocks)
     // A virtual disk wears no block out: no relocation by erase count.
     d->cfg.block_cycles = -1;
     d->cfg.cache_size = BLOCK;
+    // No data inside a pair of metadata: a file of any size has a block of its own. A file of up to
+    // 500 bytes or so lived in the pair of its directory, which made a directory of 1,024 small
+    // files 513 pairs and a removal in it walk the list of pairs. A volume of an older release that
+    // has such a file reads it as before; the first write moves it out to a block.
+    d->cfg.inline_max = (lfs_size_t)-1;
     // One bit for each block, a multiple of 8 bytes, at least 8 and at most LOOKAHEAD_MAX.
     uint32_t window = ((blocks + 63u) / 64u) * 8u;
     if (window < 8u) {

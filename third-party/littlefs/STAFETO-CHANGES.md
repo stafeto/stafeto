@@ -107,6 +107,13 @@ change, or when `stafeto-changes.patch` applied backwards to them does not give 
    places that call `lfs_path_walk_visit` are right after the empty-path check (the root) and
    right after the loop that matches the name (the entry just found, while `dir` is still the
    pair that holds it). The rest of the body must equal the release's.
+   `lfs_fs_pairs` relies on three things of the release: the threaded list of metadata pairs
+   starts at the superblock's pair `{0, 1}` and each pair's `tail` names the next (the list
+   `lfs_fs_traverse_` walks); `lfs_tortoise_detectcycles` is the cycle check of that walk; and
+   `lfs_dir_fetch` of a pair gives the `tail` of the directory it holds, the same shape as in
+   `lfs_fs_pred`. Check that the new release's `lfs_fs_traverse_` still begins its walk with
+   `dir.tail = {0, 1}`, runs the cycle check before each fetch and goes on to `dir.tail`, and keep
+   the function in step with it.
 2. Apply `stafeto-changes.patch` with `patch -p1` from the root of the repository (or by hand if
    the context moved) to the new `lfs.c` and `lfs.h`.
 3. Rebuild the patch (`diff -u` of the new release against the files here) as

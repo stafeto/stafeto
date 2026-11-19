@@ -271,11 +271,15 @@
 //! is one pair and a large directory splits into more, and removing an old directory costs about
 //! three reads for each pair of the volume. The service counts the pairs (one fetch of each,
 //! about two reads for each) the first time it is asked for a MKDIR after the mount and again when
-//! its own bound reaches the cap: the count of the last walk plus 2 for each MKDIR and 1 for each
-//! create or rename since (every such commit may split one pair), so the bound is never below the
-//! number of pairs that those commits made. A volume that holds more pairs than the cap (a volume of
-//! an older release) mounts and works: only MKDIR answers NO_SPACE, and the cost of a RMDIR is that
-//! of its pairs. Splits that a rewrite of an attribute causes are seen at the next walk.
+//! its own estimate reaches the cap: the count of the last walk plus 2 for each MKDIR and 1 for each
+//! create or rename since. The estimate is not an upper bound: a file is not a pair, but many files
+//! in a directory are many pairs (a directory of 1,024 files with data inside the pairs took 513),
+//! and a removal that empties a pair a directory was split into walks the list of pairs just as a
+//! RMDIR does, about 3.2 reads for each pair of the volume. The service therefore keeps data out of
+//! the pairs (a file of any size has a block of its own), and the cap is decided on an exact count,
+//! never on the estimate alone. A volume that holds more pairs than the cap (a volume of an older
+//! release) mounts and works: only MKDIR answers NO_SPACE, and the cost of a RMDIR is that of its
+//! pairs.
 //!
 //! # The attribute of an entry
 //!
