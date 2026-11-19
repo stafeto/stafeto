@@ -905,7 +905,12 @@ fn vouch_and_bind(
         return status(p::ACCESS);
     }
     let brought = Handle::<Channel>::borrowed(abi::Handle(carried));
-    let Ok(kept) = sys::handle_duplicate(&brought, Rights::NOTIFY | Rights::TRANSFER) else {
+    // The copy the worker keeps has DUPLICATE too: `Notary::vouch` copies it for every Vouch, the
+    // first and each one after a change of generation.
+    let Ok(kept) = sys::handle_duplicate(
+        &brought,
+        Rights::NOTIFY | Rights::TRANSFER | Rights::DUPLICATE,
+    ) else {
         return status(p::TABLE_FULL);
     };
     let Some(who) = notary.vouch(&kept) else {

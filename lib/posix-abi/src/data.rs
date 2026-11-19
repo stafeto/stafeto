@@ -204,12 +204,17 @@ fn identity_copy() -> Result<rt::handle::Handle<rt::handle::Any>, i32> {
         why!("no identity session in the start data of this process");
         return Err(EIO);
     };
-    rt::sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER)
-        .map(Handle::erase)
-        .map_err(|error| {
-            why!("copy of the identity session refused: {error:?}");
-            EIO
-        })
+    // DUPLICATE as well: the service copies the handle it keeps for each Vouch (the kernel copies
+    // only a handle that has the right).
+    rt::sys::handle_duplicate(
+        identity,
+        Rights::NOTIFY | Rights::TRANSFER | Rights::DUPLICATE,
+    )
+    .map(Handle::erase)
+    .map_err(|error| {
+        why!("copy of the identity session refused: {error:?}");
+        EIO
+    })
 }
 
 /// A session from the root: SESSION with a copy of the identity session, which the service vouches
