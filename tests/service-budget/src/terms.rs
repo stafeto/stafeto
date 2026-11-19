@@ -15,7 +15,8 @@
 //! S = n C + min(C, l - n T) + B   n = l / T rounded down, B one overrun at the edge
 //! E = 2 e (k + 1)                 k the overruns of the budget in the window
 //! I                               the allowance of init for the service
-//! D                               the time of the console driver, for the terminal phase
+//! D = n_d C_d + min(C_d, l - n_d T_d) + B   the console driver's budget, for the terminal phase
+//!                                 (`service_us` with the driver's C and T: 75 us of each 5 ms)
 //! ```
 //!
 //! `S` is the bound of the kernel (the module comment of `kcore/src/budget.rs`) for a thread
@@ -242,11 +243,18 @@ mod tests {
         // The old remainder was below the floor of the awake account, which is the double count.
         assert!(left_us(630, 205, 538, e, 5) < left_floor_us(e, 5));
         assert_eq!(left_floor_us(e, 5), -240);
-        // The bound is taken over l and does not change.
-        assert_eq!(
-            bound_us(service_us(75, T, B, 11_008), events_us(e, 5), INIT, 538),
-            375 + 480 + 20 + 70 + 538
-        );
+        // The bound is taken over l. The driver's term is the bound of its own budget (75 us of
+        // each 5 ms) and no longer the time it ran: 375 us for this window, 163 under the 538 it
+        // ran in all (its sleeps in the window included).
+        let driver = service_us(75, T, B, 11_008);
+        assert_eq!(driver, 375);
+        let bound = bound_us(service_us(75, T, B, 11_008), events_us(e, 5), INIT, driver);
+        assert_eq!(bound, 375 + 480 + 20 + 70 + 375);
+        // The loss of 630 us over the 8005 us the victim ran is inside it, with the share the
+        // bound promises under what the victim kept (927 per mille).
+        assert!(over_bound(630, bound) < 0);
+        assert_eq!(share_bound_permille(8005, bound), 858);
+        assert!(927 >= share_bound_permille(8005, bound));
     }
 
     #[test]

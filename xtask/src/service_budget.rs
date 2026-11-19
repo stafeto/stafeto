@@ -323,9 +323,9 @@ pub struct One {
     pub median10: u64,
     pub c_us: u64,
     pub e_us: u64,
-    /// The counting budget of the console driver's stub: whether the probe had a copy, and the
-    /// time it ran and the times it ran out over the phase (its overruns stay 0 when the count is
-    /// whole).
+    /// The budget of the console driver's stub (`CONSOLE_BUDGETS`): whether the probe had a copy,
+    /// and the time it ran and the times it ran out over the phase. The driver's part of the
+    /// loss is bounded by that budget (`terms::service_us`), so its overruns are no special case.
     pub driver_budget: bool,
     pub driver_ran_us: u64,
     pub driver_overruns: u64,
@@ -535,12 +535,6 @@ pub fn verdict_starve(all: &[One]) -> Result<(), String> {
                 "{name}: the victim made {} cycles, under 100",
                 o.cycles
             ));
-        }
-        if o.driver_budget && o.driver_overruns > 0 {
-            println!(
-                "service-budget: {name}: the console driver's counting budget ran out {} times in the phase, so its time is counted in part (printed for information)",
-                o.driver_overruns
-            );
         }
         let Some(w) = &o.worst else {
             println!("service-budget: {name}: no window of ten cycles to judge");
@@ -975,7 +969,7 @@ mod tests {
         // driver 120, 3 overruns) leave 20, inside the allowance.
         let mut lines = run_lines(2175);
         lines[1] = lines[1].replace("e_us=30", "e_us=40");
-        lines[2] = "svcbudget1 tty worst R_us=8005 W_us=8635 l_us=11008 n=2 loss_us=630 serve_ran_us=150 serve_overruns=3 serve_ran_l_us=205 serve_overruns_l=5 pending_max=3 drv_ran_us=120 drv_overruns=0 drv_ran_l_us=538 beats=na c_us=75 e_us=40 s_us=375 events_us=480 entries_us=20 init_us=70 d_us=538 bound_loss_us=1483 bound_share=843 share=927 x_us=20".to_owned();
+        lines[2] = "svcbudget1 tty worst R_us=8005 W_us=8635 l_us=11008 n=2 loss_us=630 serve_ran_us=150 serve_overruns=3 serve_ran_l_us=205 serve_overruns_l=5 pending_max=3 drv_ran_us=120 drv_overruns=0 drv_ran_l_us=538 beats=na c_us=75 e_us=40 s_us=375 events_us=480 entries_us=20 init_us=70 d_us=375 bound_loss_us=1320 bound_share=858 share=927 x_us=20".to_owned();
         let one = parse_starve_only(&lines, "tty").unwrap();
         let w = one.worst.clone().unwrap();
         assert_eq!(
@@ -999,6 +993,12 @@ mod tests {
             w.left_us
         );
         assert!(w.left_us >= w.left_floor_us(40));
+        // The driver's term is the bound of its budget (75 us of each 5 ms over l = 11,008 us
+        // with one overrun at the edge), no longer the 538 us it ran: the loss of 630 us is
+        // inside the bound of 1,320 us and the share of 927 above the 858 it promises.
+        assert_eq!(w.driver_term_us, terms::service_us(75, 5_000, 150, w.l_us));
+        assert_eq!((w.over_us(), w.bound_share), (-690, 858));
+        assert!(w.share >= w.bound_share);
         assert!(verdict_starve(&[one.clone(), one.clone(), one]).is_ok());
     }
 

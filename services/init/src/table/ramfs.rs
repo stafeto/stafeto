@@ -1100,21 +1100,18 @@ pub const TTY_STEPS_TABLE: &[Record] = &[
 /// The probe of the time budgets of the RAM, pipe and terminal services (tests/service-budget,
 /// xtask service-budget, under -icount on one CPU, and with two CPUs for the numbers printed
 /// for information): the three services as the shell image has them, with their budgets; the
-/// console's driver as the quiet stub of the steps of the terminal; and the probe, whose threads
+/// console's driver as the quiet stub of the steps of the terminal, with the driver's budget; and the probe, whose threads
 /// stand at 20, 34 (the victim, above the demoted level 32) and 40.
 pub const SERVICE_BUDGET_TABLE: &[Record] = &[
     Record {
-        // A counting budget for the stub (2 ms of each 5 ms at its own level 60, never
-        // demoted): the probe reads what the driver ran for the terminal service in each window
-        // of the victim (`BudgetInfo::ran`) and that it never ran out (`overruns` 0), which makes
-        // the count whole. The stub binds it to its request thread (tests/tty stub).
-        budgets: &[Budget {
-            name: "serve",
-            cpu: 0,
-            c_ns: 2 * MS,
-            t_ns: SERVICE_PERIOD_NS,
-            low: 60,
-        }],
+        // The stub of the console driver has the budget of the real driver, `CONSOLE_BUDGETS`
+        // (75 us of each 5 ms at its own level 60, then 32), and the free level of its record,
+        // so that the probe's account of the terminal phase holds the driver to what the table
+        // gives it: the probe reads what the stub ran (`BudgetInfo::ran`) for the figures it
+        // prints, and bounds the driver's part of the loss by its budget. The stub binds it to
+        // its request thread (tests/tty stub).
+        budgets: CONSOLE_BUDGETS,
+        free: SERVICE_FREE,
         ..TTY_STEPS_TABLE[0]
     },
     RAM_LEGACY,
