@@ -1931,110 +1931,6 @@ fn a_refused_change_of_a_file_with_a_pending_write_writes_nothing() {
     assert_eq!((st.mode, st.mtime), (0o640, 9_000));
 }
 
-#[test]
-fn mkdir_stops_at_the_cap_of_metadata_pairs_and_passes_again_after_removals() {
-    let mut rig = Rig::new();
-    rig.server.set_pairs_max(40);
-    let mut made = 0u32;
-    let refused = loop {
-        let path = std::format!("/d{made}");
-        match rig.mkdir(ROOT, path.as_bytes(), 0o755) {
-            Ok(()) => made += 1,
-            Err(status) => break status,
-        }
-        assert!(made < 100, "no cap in sight");
-    };
-    assert_eq!(refused, p::code(p::NO_SPACE));
-    // The superblock's pair, the root's and the hidden directory's are there from the start: the
-    // cap leaves room for about 40 less those.
-    assert!(
-        (30..=40).contains(&made),
-        "{made} directories before the cap"
-    );
-    let counted = rig.fs.metadata_pairs().unwrap();
-    assert!(counted >= 40, "refused at {counted} pairs");
-    // Nothing else is refused at the cap: a file, a rename, a CHMOD, the removal of a directory.
-    rig.put(ROOT, b"/f", 0o644, b"x");
-    rig.chmod(ROOT, b"/d0", 0o700).unwrap();
-    rig.call(ROOT, |w| p::rename(b"/d1", b"/d1x", w)).unwrap();
-    for n in 2..8 {
-        let path = std::format!("/d{n}");
-        rig.call(ROOT, |w| p::path_call(p::Method::Rmdir, path.as_bytes(), w))
-            .unwrap();
-    }
-    // Six pairs came back: MKDIR is accepted again (the bound of the server is above the cap, so it
-    // counts the pairs again and finds room), and the pairs never went far over the cap.
-    rig.mkdir(ROOT, b"/again", 0o755).unwrap();
-    let now = rig.fs.metadata_pairs().unwrap();
-    assert!(
-        now <= 41,
-        "{now} pairs after the removals and one more directory"
-    );
-}
-
-#[test]
-fn a_volume_over_the_cap_mounts_and_works_and_only_mkdir_is_refused() {
-    let mut rig = Rig::new();
-    for n in 0..30 {
-        rig.mkdir(ROOT, std::format!("/d{n}").as_bytes(), 0o755)
-            .unwrap();
-    }
-    // The cap comes down under the pairs the volume has (an older release made it).
-    rig.server.set_pairs_max(10);
-    assert_eq!(rig.mkdir(ROOT, b"/new", 0o755), Err(p::code(p::NO_SPACE)));
-    assert!(rig.stat(ROOT, b"/d29").is_ok());
-    rig.chmod(ROOT, b"/d3", 0o700).unwrap();
-    rig.put(ROOT, b"/file", 0o644, b"data");
-    rig.call(ROOT, |w| p::path_call(p::Method::Rmdir, b"/d0", w))
-        .unwrap();
-}
-
-#[test]
-fn the_pairs_are_counted_once_and_again_only_at_the_bound() {
-    let mut rig = Rig::new();
-    rig.server.set_pairs_max(1000);
-    rig.mkdir(ROOT, b"/a", 0o755).unwrap();
-    // The first MKDIR counted the pairs; the next ones, far under the cap, read nothing for it.
-    let before = rig.fs.device().reads;
-    rig.mkdir(ROOT, b"/b", 0o755).unwrap();
-    let one = rig.fs.device().reads - before;
-    rig.server.set_pairs_max(1_000_000);
-    let before = rig.fs.device().reads;
-    rig.mkdir(ROOT, b"/c", 0o755).unwrap();
-    assert_eq!(
-        rig.fs.device().reads - before,
-        one,
-        "no count between the cap and the bound"
-    );
-}
-
-#[test]
-fn the_bound_of_the_pairs_is_never_below_the_pairs_the_commits_made() {
-    let mut rig = Rig::new();
-    rig.mkdir(ROOT, b"/big", 0o755).unwrap();
-    for n in 0..400u32 {
-        // Long names: a pair of 4 KiB holds about 40 entries, so the directory splits again and again.
-        let name = std::format!("/big/{n:04}-{}", "x".repeat(60));
-        rig.put(ROOT, name.as_bytes(), 0o644, b"");
-        if n % 25 == 0 {
-            rig.mkdir(ROOT, std::format!("/d{n}").as_bytes(), 0o755)
-                .unwrap();
-            rig.call(ROOT, |w| {
-                p::rename(name.as_bytes(), std::format!("/d{n}/m").as_bytes(), w)
-            })
-            .unwrap();
-        }
-        let bound = rig.server.pairs_bound().unwrap();
-        let exact = rig.fs.metadata_pairs().unwrap();
-        assert!(
-            bound >= exact,
-            "after {n} files the bound {bound} is under the {exact} pairs"
-        );
-    }
-    // The directory did split: more pairs than directories.
-    assert!(rig.fs.metadata_pairs().unwrap() > 20);
-}
-
 /// The cost of RENAME of an old directory and of `rm -rf` of a tree of directories, for the table 4.2
 /// of the plan. The tree is `N` empty directories under 8 parents; `rm -rf` removes them in the order
 /// of their making (the oldest pairs are at the far end of the list of pairs: the worst order) and
@@ -2105,7 +2001,7 @@ fn rename_of_an_old_directory_and_rm_rf_of_trees_of_directories() {
 #[ignore = "prints figures; run by name"]
 fn what_makes_pairs_without_inline_data() {
     fn pairs(rig: &mut Rig) -> u64 {
-        rig.fs.metadata_pairs().unwrap()
+        rig.fs.metadata_pairs().unwrap().0
     }
     fn reads(rig: &mut Rig) -> u64 {
         rig.fs.device().reads
@@ -2207,14 +2103,14 @@ fn rig_pairs_per_name_length() {
         let mut rig = Rig::on(MemDevice::new(65_536));
         rig.server.set_pairs_max(1_000_000);
         rig.mkdir(ROOT, b"/d", 0o755).unwrap();
-        let before = rig.fs.metadata_pairs().unwrap();
+        let before = rig.fs.metadata_pairs().unwrap().0;
         let mut made = 0u32;
         while made < 1000 {
             let name = std::format!("{made:0>width$}", width = len);
             rig.put(ROOT, std::format!("/d/{name}").as_bytes(), 0o644, b"");
             made += 1;
         }
-        let after = rig.fs.metadata_pairs().unwrap();
+        let after = rig.fs.metadata_pairs().unwrap().0;
         std::println!(
             "names of {len} bytes: {made} entries in {} pairs, {:.1} an entry per pair",
             after - before,
@@ -2231,5 +2127,330 @@ fn a_file_of_500_bytes_has_a_block_of_its_own() {
     rig.put(ROOT, b"/d/small", 0o644, &[7u8; 500]);
     let after = rig.fs.used_blocks().unwrap();
     // The block of the data; with inline data the file lives in the pair and adds none.
-    assert!(after >= before + 1, "{before} blocks before, {after} after");
+    assert!(after > before, "{before} blocks before, {after} after");
+}
+
+/// A rig whose caps are lowered so that a small volume reaches them.
+fn capped(pairs: u64, dirs: u64) -> Rig {
+    let mut rig = Rig::new();
+    rig.server.set_pairs_max(pairs);
+    rig.server.set_dirs_max(dirs);
+    rig
+}
+
+fn no_space() -> Status {
+    p::code(p::NO_SPACE)
+}
+
+fn rmdir(rig: &mut Rig, path: &str) -> Result<(), Status> {
+    rig.call(ROOT, |w| p::path_call(p::Method::Rmdir, path.as_bytes(), w))
+        .map(drop)
+}
+
+/// Directories until MKDIR is refused: how many were made.
+fn mkdirs_until_refused(rig: &mut Rig, prefix: &str) -> u32 {
+    for n in 0..500u32 {
+        if let Err(status) = rig.mkdir(ROOT, std::format!("{prefix}{n}").as_bytes(), 0o755) {
+            assert_eq!(status, no_space());
+            return n;
+        }
+    }
+    panic!("no cap in sight");
+}
+
+/// Files until a creation is refused: how many were made.
+fn files_until_refused(rig: &mut Rig, prefix: &str) -> u32 {
+    for n in 0..2000u32 {
+        let name = std::format!("{prefix}{n:0>100}");
+        let made = rig.open(ROOT, name.as_bytes(), p::WRITE | p::CREATE, 0o644);
+        match made {
+            Ok(h) => rig.close(ROOT, h),
+            Err(status) => {
+                assert_eq!(status, no_space());
+                return n;
+            }
+        }
+    }
+    panic!("no cap in sight");
+}
+
+#[test]
+fn every_creation_stops_at_the_cap_of_pairs_and_the_other_requests_pass() {
+    let mut rig = capped(30, 1000);
+    rig.mkdir(ROOT, b"/keep", 0o755).unwrap();
+    rig.put(ROOT, b"/keep/old", 0o644, b"data");
+    rig.mkdir(ROOT, b"/other", 0o755).unwrap();
+    // Long names fill the pairs of /keep: files are refused at the cap.
+    let made = files_until_refused(&mut rig, "/keep/f");
+    assert!(made > 0, "the cap came before the first file");
+    let (pairs, _) = rig.fs.metadata_pairs().unwrap();
+    assert!(pairs >= 30, "refused at {pairs} pairs");
+    // MKDIR, the creation of a file and RENAME into another directory are NO_SPACE.
+    assert_eq!(rig.mkdir(ROOT, b"/new", 0o755), Err(no_space()));
+    assert_eq!(
+        rig.open(ROOT, b"/keep/another", p::WRITE | p::CREATE, 0o644),
+        Err(no_space())
+    );
+    assert_eq!(
+        rig.call(ROOT, |w| p::rename(b"/keep/old", b"/other/old", w))
+            .map(drop),
+        Err(no_space())
+    );
+    // At the cap a RENAME to a longer name in its own directory is refused too, and to a name of the
+    // same length or a shorter one it passes.
+    let long = std::format!("/keep/{}", "L".repeat(200));
+    assert_eq!(
+        rig.call(ROOT, |w| p::rename(b"/keep/old", long.as_bytes(), w))
+            .map(drop),
+        Err(no_space())
+    );
+    rig.call(ROOT, |w| p::rename(b"/keep/old", b"/keep/odd", w))
+        .unwrap();
+    rig.call(ROOT, |w| p::rename(b"/keep/odd", b"/keep/o", w))
+        .unwrap();
+    // Never refused: a write to an existing file, a truncation, CHMOD, CHOWN, UTIMENS, the removal.
+    let h = rig.open(ROOT, b"/keep/o", p::WRITE, 0).unwrap();
+    rig.write(ROOT, h, &[1u8; 700]).unwrap();
+    rig.call(ROOT, |w| p::truncate(h, 10, w)).unwrap();
+    rig.close(ROOT, h);
+    rig.chmod(ROOT, b"/keep/o", 0o600).unwrap();
+    rig.chown(ROOT, b"/keep/o", 5, 6).unwrap();
+    rig.call(ROOT, |w| {
+        p::utimens(b"/keep/o", p::TimeSpec::At(1), p::TimeSpec::At(2), w)
+    })
+    .unwrap();
+    rig.call(ROOT, |w| p::path_call(p::Method::Unlink, b"/keep/o", w))
+        .unwrap();
+    // The removals make room: the service counts again at the next creation, finds the pairs under
+    // the cap and the creation passes.
+    for n in 0..made {
+        let name = std::format!("/keep/f{n:0>100}");
+        rig.call(ROOT, |w| {
+            p::path_call(p::Method::Unlink, name.as_bytes(), w)
+        })
+        .unwrap();
+    }
+    rig.put(ROOT, b"/keep/after", 0o644, b"x");
+}
+
+#[test]
+fn the_cap_of_directories_refuses_only_mkdir_with_the_pairs_under_their_cap() {
+    let mut rig = capped(1_000_000, 12);
+    let made = mkdirs_until_refused(&mut rig, "/d");
+    // The root and the hidden directory of the service count among the 12.
+    assert_eq!(made, 12 - 2);
+    assert_eq!(rig.server.dirs_known(), Some(12));
+    // Files, renames and changes pass at the cap of directories.
+    rig.put(ROOT, b"/file", 0o644, b"x");
+    rig.call(ROOT, |w| p::rename(b"/file", b"/d0/file", w))
+        .unwrap();
+    rig.chmod(ROOT, b"/d1", 0o700).unwrap();
+    // RMDIR gives one back and MKDIR passes once; the next is refused again.
+    rmdir(&mut rig, "/d2").unwrap();
+    assert_eq!(rig.server.dirs_known(), Some(11));
+    rig.mkdir(ROOT, b"/again", 0o755).unwrap();
+    assert_eq!(rig.mkdir(ROOT, b"/once-more", 0o755), Err(no_space()));
+    // A directory a rename replaced is a removed directory.
+    rig.mkdir(ROOT, b"/gone", 0o755).ok();
+    rig.call(ROOT, |w| p::rename(b"/d3", b"/d4", w)).unwrap();
+    assert_eq!(rig.server.dirs_known(), Some(11));
+}
+
+#[test]
+fn the_cap_of_pairs_does_not_refuse_a_rename_that_does_not_lengthen_the_name() {
+    // The cap of directories is far; the cap of pairs is where the files stop.
+    let mut rig = capped(30, 1000);
+    rig.mkdir(ROOT, b"/a", 0o755).unwrap();
+    rig.mkdir(ROOT, b"/b", 0o755).unwrap();
+    rig.put(ROOT, b"/a/same", 0o644, b"");
+    files_until_refused(&mut rig, "/a/f");
+    rig.call(ROOT, |w| p::rename(b"/a/same", b"/a/sama", w))
+        .unwrap();
+    rig.call(ROOT, |w| p::rename(b"/a/sama", b"/a/s", w))
+        .unwrap();
+    // Into another directory it is a new name there: refused.
+    assert_eq!(
+        rig.call(ROOT, |w| p::rename(b"/a/s", b"/b/s", w)).map(drop),
+        Err(no_space())
+    );
+}
+
+#[test]
+fn a_refusal_is_made_only_after_an_exact_recount() {
+    let mut rig = capped(1_000_000, 1_000_000);
+    rig.mkdir(ROOT, b"/a", 0o755).unwrap();
+    let (exact, _) = rig.fs.metadata_pairs().unwrap();
+    // The estimate is far over the exact count (every creation adds 1 to it): a creation made when
+    // the estimate reaches the cap counts again, finds room and passes; it is not refused.
+    rig.server.set_pairs_max(exact + 6);
+    for n in 0..12 {
+        rig.put(ROOT, std::format!("/a/s{n}").as_bytes(), 0o644, b"");
+    }
+    let bound = rig.server.pairs_bound().unwrap();
+    assert!(bound < exact + 6 + 12, "no recount happened: bound {bound}");
+    // The count is told once for each recount.
+    assert!(rig.server.take_pairs_report().is_some());
+    assert!(rig.server.take_pairs_report().is_none());
+}
+
+#[test]
+fn after_a_confirmed_refusal_the_pairs_are_not_counted_again_until_a_removal() {
+    let mut rig = capped(30, 1000);
+    rig.mkdir(ROOT, b"/a", 0o755).unwrap();
+    let made = files_until_refused(&mut rig, "/a/f");
+    // The refusal that confirmed the cap counted the pairs (told in a line); the next ones do not.
+    rig.server.take_pairs_report();
+    assert_eq!(rig.mkdir(ROOT, b"/x", 0o755), Err(no_space()));
+    assert_eq!(rig.mkdir(ROOT, b"/y", 0o755), Err(no_space()));
+    assert_eq!(
+        rig.server.take_pairs_report(),
+        None,
+        "a refused loop counts again"
+    );
+    // The removals let the next creation count again: with the files gone it passes.
+    for n in 0..made {
+        let name = std::format!("/a/f{n:0>100}");
+        rig.call(ROOT, |w| {
+            p::path_call(p::Method::Unlink, name.as_bytes(), w)
+        })
+        .ok();
+    }
+    rig.put(ROOT, b"/a/new", 0o644, b"x");
+    assert!(rig.server.take_pairs_report().is_some());
+}
+
+#[test]
+fn the_directories_are_counted_by_soft_tails_not_by_every_tail() {
+    let mut rig = capped(1_000_000, 1_000_000);
+    // One directory split into many pairs by long names, and thirty small ones.
+    rig.mkdir(ROOT, b"/big", 0o755).unwrap();
+    for n in 0..60u32 {
+        rig.put(ROOT, std::format!("/big/{n:0>150}").as_bytes(), 0o644, b"");
+    }
+    for n in 0..30 {
+        rig.mkdir(ROOT, std::format!("/d{n}").as_bytes(), 0o755)
+            .unwrap();
+    }
+    let (pairs, dirs) = rig.fs.metadata_pairs().unwrap();
+    // The root, the hidden directory of the service, /big and thirty more: pairs of /big that go on
+    // with a hard tail are no directories.
+    assert_eq!(dirs, 3 + 30);
+    assert!(
+        pairs > dirs + 5,
+        "{pairs} pairs of {dirs} directories: /big did not split"
+    );
+    assert_eq!(rig.server.dirs_known(), Some(dirs));
+}
+
+#[test]
+fn a_volume_over_the_caps_mounts_and_works_and_only_the_creations_are_refused() {
+    let mut rig = Rig::new();
+    for n in 0..30 {
+        rig.mkdir(ROOT, std::format!("/d{n}").as_bytes(), 0o755)
+            .unwrap();
+    }
+    rig.server.set_pairs_max(10);
+    rig.server.set_dirs_max(10);
+    // The service has not counted since: the estimate is under the new caps until it counts, which
+    // the next creation does at once (no count yet is a count to make).
+    rig.server.recount_for_test(&mut rig.fs);
+    assert_eq!(rig.mkdir(ROOT, b"/new", 0o755), Err(no_space()));
+    assert!(rig.stat(ROOT, b"/d29").is_ok());
+    rig.chmod(ROOT, b"/d3", 0o700).unwrap();
+    rmdir(&mut rig, "/d0").unwrap();
+    // Still over: the file is refused until enough is removed.
+    assert!(
+        rig.open(ROOT, b"/file", p::WRITE | p::CREATE, 0o644)
+            .is_err()
+    );
+}
+
+#[test]
+fn a_file_of_500_bytes_keeps_its_data_out_of_the_pair() {
+    let mut rig = Rig::new();
+    rig.mkdir(ROOT, b"/d", 0o755).unwrap();
+    let before = rig.fs.metadata_pairs().unwrap().0;
+    for n in 0..300u32 {
+        rig.put(
+            ROOT,
+            std::format!("/d/f{n:04}").as_bytes(),
+            0o644,
+            &[7u8; 500],
+        );
+    }
+    // 300 files of 500 bytes with short names: with their data in the pairs they would take about
+    // 150; with the data in blocks of their own about 20 pairs of names.
+    let made = rig.fs.metadata_pairs().unwrap().0 - before;
+    assert!(made < 40, "{made} pairs for 300 files");
+}
+
+#[test]
+fn a_volume_with_an_inline_file_reads_and_a_write_moves_the_file_out() {
+    // A file made the way an older release made it (small, inside the pair of its directory).
+    let mut rig = Rig::new();
+    rig.fs.unmount().unwrap();
+    rig.fs.set_inline_for_test(0);
+    rig.fs.mount().unwrap();
+    rig.mkdir(ROOT, b"/d", 0o755).unwrap();
+    rig.put(ROOT, b"/d/small", 0o644, b"inline bytes");
+    let inline_blocks = rig.fs.used_blocks().unwrap();
+    // The service of this release mounts the same volume with the inline limit off.
+    rig.fs.unmount().unwrap();
+    rig.fs.set_inline_for_test(u32::MAX);
+    rig.fs.mount().unwrap();
+    let h = rig.open(ROOT, b"/d/small", p::READ, 0).unwrap();
+    let data = rig.ok(ROOT, |w| p::read(h, 64, w));
+    assert_eq!(&data[4..4 + 12], b"inline bytes");
+    rig.close(ROOT, h);
+    // A write moves it out to a block of its own; the pair loses the data.
+    let h = rig
+        .open(ROOT, b"/d/small", p::WRITE | p::APPEND, 0)
+        .unwrap();
+    rig.write(ROOT, h, b" and more").unwrap();
+    rig.close(ROOT, h);
+    assert!(rig.fs.used_blocks().unwrap() >= inline_blocks + 1);
+    let h = rig.open(ROOT, b"/d/small", p::READ, 0).unwrap();
+    let data = rig.ok(ROOT, |w| p::read(h, 64, w));
+    assert_eq!(&data[4..4 + 21], b"inline bytes and more");
+    rig.close(ROOT, h);
+}
+
+/// `rm -rf` at the caps: 1,018 empty directories made first (the oldest pairs, the far end of the
+/// list) behind about 1,000 pairs of files with long names, removed oldest first. Prints the sum of
+/// the reads and the pairs the volume had, for the constant of the fill probe (the review estimated
+/// 2 to 3 million reads).
+#[test]
+#[ignore = "prints figures; run by name"]
+fn rm_rf_of_1024_directories_behind_a_thousand_pairs_of_files() {
+    let mut rig = Rig::on(MemDevice::new(524_288));
+    rig.server.set_pairs_max(1_000_000);
+    rig.server.set_dirs_max(1_000_000);
+    for parent in 0..8 {
+        rig.mkdir(ROOT, std::format!("/p{parent}").as_bytes(), 0o755)
+            .unwrap();
+    }
+    for n in 0..1010u32 {
+        rig.mkdir(ROOT, std::format!("/p{}/d{n:05}", n % 8).as_bytes(), 0o755)
+            .unwrap();
+    }
+    for dir in 0..4 {
+        rig.mkdir(ROOT, std::format!("/files{dir}").as_bytes(), 0o755)
+            .unwrap();
+        for n in 0..800u32 {
+            let name = std::format!("/files{dir}/{n:0>240}");
+            rig.put(ROOT, name.as_bytes(), 0o644, b"");
+        }
+    }
+    let (pairs, dirs) = rig.fs.metadata_pairs().unwrap();
+    let before = rig.fs.device().reads;
+    for n in 0..1010u32 {
+        let path = std::format!("/p{}/d{n:05}", n % 8);
+        rmdir(&mut rig, &path).unwrap();
+    }
+    let sum = rig.fs.device().reads - before;
+    std::println!(
+        "rm -rf of 1,010 directories (the volume has {dirs} directories in {pairs} pairs): {sum} reads, {:.2} a pair for each directory, {} s at 3,000 reads a second",
+        sum as f64 / (1010.0 * pairs as f64),
+        sum / 3000
+    );
 }

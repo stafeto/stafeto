@@ -58,8 +58,10 @@ pub const ROOT_CLONES: usize = p::ROOT_CLONES;
 pub const ROOT_DESCRIPTIONS: usize = p::ROOT_DESCRIPTIONS;
 /// The entries of one directory at most (the service keeps the minimum of the protocol).
 pub const DIR_ENTRIES_MAX: usize = p::DIR_ENTRIES_MAX;
-/// The metadata pairs at which MKDIR stops (see `proto_data::PAIRS_MAX`).
+/// The metadata pairs at which a creation stops, and the directories at which MKDIR stops (see
+/// `proto_data::PAIRS_MAX`).
 pub const PAIRS_MAX: u64 = p::PAIRS_MAX;
+pub const DIRS_MAX: u64 = p::DIRS_MAX;
 /// The passes alive at once.
 pub const PASSES: usize = 16;
 /// The directories whose count of entries the server remembers.
@@ -212,19 +214,28 @@ struct Pending {
     len: usize,
 }
 
-/// What the server knows of the number of metadata pairs: the count of the last walk of the list and
-/// the most that the commits since have added (each MKDIR 2: its own pair and a split of its
-/// parent's; each create or rename 1: a split of the pair the name goes in).
+/// What the server knows of the metadata pairs and the directories of the volume: the count of the
+/// last walk of the list, the most that the commits since have added to the pairs (each MKDIR 2: its
+/// own pair and a split of its parent's; each creation, each RENAME into another directory and each
+/// RENAME to a longer name 1), the directories (exact: counted with the pairs, then 1 for each MKDIR
+/// and RMDIR), whether a refusal was made on an exact count and no removal has come since, and the
+/// count the worker has not yet told in its line.
 #[derive(Clone, Copy)]
 struct Pairs {
     known: Option<u64>,
     since: u64,
+    dirs: Option<u64>,
+    refused: bool,
+    report: Option<(u64, u64)>,
 }
 
 impl Pairs {
     const NONE: Pairs = Pairs {
         known: None,
         since: 0,
+        dirs: None,
+        refused: false,
+        report: None,
     };
 }
 
@@ -260,8 +271,9 @@ pub struct Server {
     /// The count of the metadata pairs of the volume: what the last walk of the list found
     /// (None before the first MKDIR after the mount) and the pairs the commits since may have added.
     pairs: Pairs,
-    /// The cap (`PAIRS_MAX`; a test lowers it).
+    /// The caps (`PAIRS_MAX` and `DIRS_MAX`; the tests lower them).
     pairs_max: u64,
+    dirs_max: u64,
     /// The present moment in nanoseconds, which the service sets before each job (the clock page).
     now: i64,
     /// The next file number to hand out and the end of the block reserved in the counter.
@@ -461,6 +473,7 @@ impl Server {
             counts_hand: 0,
             pairs: Pairs::NONE,
             pairs_max: PAIRS_MAX,
+            dirs_max: DIRS_MAX,
             now: 0,
             ino_next: 0,
             ino_end: 0,
@@ -1645,6 +1658,7 @@ impl Server {
                     let parent_attr = parent_record.attr.perm(Kind::Directory);
                     perm::place_allowed(id, &parent_attr, None).map_err(denied)?;
                     self.room_in_dir(fs, parent)?;
+                    self.room_for_pair(fs)?;
                     self.reserve_allows(fs, caller)?;
                     created = Some((
                         parent_record,
@@ -1791,9 +1805,24 @@ const _: () = assert!(HEADER_LEN == 8);
 
 #[cfg(test)]
 impl Server {
-    /// Tests: the cap of the pairs of the volume, lowered so that a small volume reaches it.
+    /// Tests: the caps of the pairs and of the directories, lowered so that a small volume reaches
+    /// them.
     pub(crate) fn set_pairs_max(&mut self, n: u64) {
         self.pairs_max = n;
+    }
+
+    pub(crate) fn set_dirs_max(&mut self, n: u64) {
+        self.dirs_max = n;
+    }
+
+    /// Tests: count the pairs and the directories now, as the mount does.
+    pub(crate) fn recount_for_test(&mut self, fs: &mut Fs<'_, crate::mem::MemDevice>) {
+        self.recount(fs).unwrap();
+    }
+
+    /// Tests: the server's count of the directories, None before the first count.
+    pub(crate) fn dirs_known(&self) -> Option<u64> {
+        self.pairs.dirs
     }
 
     /// Tests: the server's upper bound of the pairs, None before the first count.

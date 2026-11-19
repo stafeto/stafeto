@@ -1,5 +1,5 @@
 diff --git a/third-party/littlefs/lfs.c b/third-party/littlefs/lfs.c
-index c83c7e0..7072a93 100644
+index c83c7e0..cfc215b 100644
 --- a/third-party/littlefs/lfs.c
 +++ b/third-party/littlefs/lfs.c
 @@ -1481,8 +1481,78 @@ static int lfs_dir_find_match(void *data,
@@ -230,42 +230,56 @@ index c83c7e0..7072a93 100644
  #ifndef LFS_READONLY
  static int lfs_remove_(lfs_t *lfs, const char *path) {
      // deorphan if we haven't yet, needed at most once after poweron
-@@ -5195,6 +5379,34 @@ static lfs_ssize_t lfs_fs_size_(lfs_t *lfs) {
+@@ -5195,6 +5379,48 @@ static lfs_ssize_t lfs_fs_size_(lfs_t *lfs) {
      return size;
  }
  
-+// the number of metadata pairs of the filesystem: the length of the threaded
-+// list of pairs that lfs_fs_traverse_ walks, the superblock's pair first. Each
-+// pair is fetched once, no entry is looked at, so the cost is about the
-+// fetch of two blocks for each pair.
-+static lfs_ssize_t lfs_fs_pairs_(lfs_t *lfs) {
++// the number of metadata pairs of the filesystem and the number of directories: the
++// length of the threaded list of pairs that lfs_fs_traverse_ walks, the
++// superblock's pair first, and the pairs that begin a directory. A pair whose
++// tail is a hard tail (dir.split) continues its directory with the next pair,
++// any other tail (a soft tail) starts the next directory, and the first pair
++// is the root. Each pair is fetched once, no entry is looked at, so the cost is
++// about the fetch of two blocks for each pair.
++static int lfs_fs_pairs_(lfs_t *lfs, lfs_size_t *pairs, lfs_size_t *dirs) {
 +    lfs_mdir_t dir = {.tail = {0, 1}};
 +    struct lfs_tortoise_t tortoise = {
 +        .pair = {LFS_BLOCK_NULL, LFS_BLOCK_NULL},
 +        .i = 1,
 +        .period = 1,
 +    };
-+    lfs_size_t pairs = 0;
++    lfs_size_t npairs = 0;
++    lfs_size_t ndirs = 0;
++    bool continues = false;
 +    while (!lfs_pair_isnull(dir.tail)) {
 +        int err = lfs_tortoise_detectcycles(&dir, &tortoise);
 +        if (err < 0) {
 +            return LFS_ERR_CORRUPT;
 +        }
 +
++        // the pair we are about to fetch begins a directory unless the one
++        // before it said, with a hard tail, that its directory goes on
++        if (!continues) {
++            ndirs += 1;
++        }
++
 +        err = lfs_dir_fetch(lfs, &dir, dir.tail);
 +        if (err) {
 +            return err;
 +        }
-+        pairs += 1;
++        continues = dir.split;
++        npairs += 1;
 +    }
 +
-+    return pairs;
++    *pairs = npairs;
++    *dirs = ndirs;
++    return 0;
 +}
 +
  // explicit garbage collection
  #ifndef LFS_READONLY
  static int lfs_fs_gc_(lfs_t *lfs) {
-@@ -6096,6 +6308,42 @@ int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info) {
+@@ -6096,6 +6322,42 @@ int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info) {
      return err;
  }
  
@@ -308,7 +322,7 @@ index c83c7e0..7072a93 100644
  lfs_ssize_t lfs_getattr(lfs_t *lfs, const char *path,
          uint8_t type, void *buffer, lfs_size_t size) {
      int err = LFS_LOCK(lfs->cfg);
-@@ -6391,6 +6639,23 @@ int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
+@@ -6391,6 +6653,23 @@ int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
      return err;
  }
  
@@ -332,29 +346,29 @@ index c83c7e0..7072a93 100644
  int lfs_dir_seek(lfs_t *lfs, lfs_dir_t *dir, lfs_off_t off) {
      int err = LFS_LOCK(lfs->cfg);
      if (err) {
-@@ -6462,6 +6727,20 @@ lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
+@@ -6462,6 +6741,20 @@ lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
      return res;
  }
  
-+lfs_ssize_t lfs_fs_pairs(lfs_t *lfs) {
++int lfs_fs_pairs(lfs_t *lfs, lfs_size_t *pairs, lfs_size_t *dirs) {
 +    int err = LFS_LOCK(lfs->cfg);
 +    if (err) {
 +        return err;
 +    }
-+    LFS_TRACE("lfs_fs_pairs(%p)", (void*)lfs);
++    LFS_TRACE("lfs_fs_pairs(%p, %p, %p)", (void*)lfs, (void*)pairs, (void*)dirs);
 +
-+    lfs_ssize_t res = lfs_fs_pairs_(lfs);
++    err = lfs_fs_pairs_(lfs, pairs, dirs);
 +
-+    LFS_TRACE("lfs_fs_pairs -> %"PRId32, res);
++    LFS_TRACE("lfs_fs_pairs -> %d", err);
 +    LFS_UNLOCK(lfs->cfg);
-+    return res;
++    return err;
 +}
 +
  int lfs_fs_traverse(lfs_t *lfs, int (*cb)(void *, lfs_block_t), void *data) {
      int err = LFS_LOCK(lfs->cfg);
      if (err) {
 diff --git a/third-party/littlefs/lfs.h b/third-party/littlefs/lfs.h
-index 8fbd5b4..d873c91 100644
+index 8fbd5b4..33c1a24 100644
 --- a/third-party/littlefs/lfs.h
 +++ b/third-party/littlefs/lfs.h
 @@ -526,6 +526,45 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
@@ -425,16 +439,18 @@ index 8fbd5b4..d873c91 100644
  // Change the position of the directory
  //
  // The new off must be a value previous returned from tell and specifies
-@@ -724,6 +778,13 @@ int lfs_fs_stat(lfs_t *lfs, struct lfs_fsinfo *fsinfo);
+@@ -724,6 +778,15 @@ int lfs_fs_stat(lfs_t *lfs, struct lfs_fsinfo *fsinfo);
  // Returns the number of allocated blocks, or a negative error code on failure.
  lfs_ssize_t lfs_fs_size(lfs_t *lfs);
  
-+// Counts the metadata pairs of the filesystem: the length of the threaded
-+// list of pairs, the superblock's first. Each pair is fetched once, no entry
-+// is read, so the cost grows with the number of pairs only.
++// Counts the metadata pairs of the filesystem and its directories: the length
++// of the threaded list of pairs, the superblock's first, and the pairs that
++// begin a directory (a pair that goes on with a hard tail belongs to the
++// directory before it; the root is the first). Each pair is fetched once, no
++// entry is read, so the cost grows with the number of pairs only.
 +//
-+// Returns the number of pairs, or a negative error code on failure.
-+lfs_ssize_t lfs_fs_pairs(lfs_t *lfs);
++// Returns 0 and the two counts, or a negative error code on failure.
++int lfs_fs_pairs(lfs_t *lfs, lfs_size_t *pairs, lfs_size_t *dirs);
 +
  // Traverse through all blocks in use by the filesystem
  //

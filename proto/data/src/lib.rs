@@ -267,19 +267,24 @@
 //! few directories, and follows it with each name it adds or removes; a rename, a removal of the
 //! directory or a change of its attributes drops what it kept. A restart starts with no counts.
 //!
-//! A volume holds at most `PAIRS_MAX` (1,024) metadata pairs for a MKDIR to be accepted: a directory
-//! is one pair and a large directory splits into more, and removing an old directory costs about
-//! three reads for each pair of the volume. The service counts the pairs (one fetch of each,
-//! about two reads for each) the first time it is asked for a MKDIR after the mount and again when
-//! its own estimate reaches the cap: the count of the last walk plus 2 for each MKDIR and 1 for each
-//! create or rename since. The estimate is not an upper bound: a file is not a pair, but many files
-//! in a directory are many pairs (a directory of 1,024 files with data inside the pairs took 513),
-//! and a removal that empties a pair a directory was split into walks the list of pairs just as a
-//! RMDIR does, about 3.2 reads for each pair of the volume. The service therefore keeps data out of
-//! the pairs (a file of any size has a block of its own), and the cap is decided on an exact count,
-//! never on the estimate alone. A volume that holds more pairs than the cap (a volume of an older
-//! release) mounts and works: only MKDIR answers NO_SPACE, and the cost of a RMDIR is that of its
-//! pairs.
+//! A volume holds at most `PAIRS_MAX` (2,048) metadata pairs and `DIRS_MAX` (1,024) directories. A
+//! directory is one pair and a large directory splits into more; a file has a block of its own
+//! (the data never goes inside a pair), so many files make pairs only through their names (about 16
+//! names of 8 bytes, 11 of 32 and 3 of 255 bytes to a pair, with the record of each). Removing a
+//! directory looks the pair before it up in the list of all pairs, about 3.2 reads for each pair, so
+//! the pairs bound the longest job and the directories bound the series of a `rm -rf`. MKDIR is
+//! NO_SPACE at either cap; the creation of a file and a RENAME into another directory at the cap of
+//! pairs; a RENAME within a directory to a longer name too, at the cap of pairs (a longer name splits
+//! pairs); a removal, a write, a truncation and a change of mode or times never are. The service
+//! counts pairs and directories exactly at the mount, at each refresh walk and before it first
+//! refuses (one fetch of each pair, about two reads for each: 6,000 reads at the cap), and keeps an
+//! estimate of the pairs between counts: the count plus 2 for each MKDIR, 1 for each creation, 1 for
+//! each RENAME into another directory and 1 for each RENAME that lengthens the name. A refusal is
+//! made only on an exact count; after a confirmed refusal the service does not count again until
+//! the first removal. The directories are counted exactly and followed: 1 for each MKDIR and RMDIR.
+//! The line `datafs: pairs N of 2048, directories M of 1024` tells each count. A volume that holds
+//! more than the caps (a volume of an older release) mounts and works, and only the requests above
+//! are refused.
 //!
 //! # The attribute of an entry
 //!
@@ -361,14 +366,19 @@ pub const ROOT_DESCRIPTIONS: usize = 48;
 /// The entries of one directory: a minimum the service guarantees and the service step may fix
 /// after measurement (never smaller). A create past it is NO_SPACE.
 pub const DIR_ENTRIES_MAX: usize = 1024;
-/// The metadata pairs of one volume at which MKDIR stops: a minimum the service guarantees. A
-/// removal of a directory looks the pair before its own up in the list of all the pairs (about
-/// three reads for each pair), so the cost of RMDIR and of a RENAME over a directory grows with the
-/// pairs; at the cap it is about 3,300 reads (1.1 s at 3,000 reads a second), and `rm -rf` of a tree
-/// of that many directories takes about 970,000 reads (5.4 minutes at 3,000 a second; the same tree
-/// of 2,000 directories takes 3.8 million, 21 minutes, which is why the cap is not 2,048). A MKDIR
-/// past it is NO_SPACE.
-pub const PAIRS_MAX: u64 = 1024;
+/// The metadata pairs of one volume at which a creation stops: a minimum the service guarantees. A
+/// removal of a directory looks the pair before its own up in the list of all the pairs (about 3.2
+/// reads for each pair), so the cost of the longest single job, a RMDIR, is about 3.2 reads for each
+/// pair, 6,700 at the cap and its overrun of 2,100 (2.2 s at 3,000 reads a second). A MKDIR, the
+/// creation of a file, a RENAME into another directory and, at the cap, a RENAME to a longer name are
+/// NO_SPACE past it; a removal, a write, a truncation, a change of mode or times and a RENAME that
+/// does not lengthen the name never are.
+pub const PAIRS_MAX: u64 = 2048;
+/// The directories of one volume (the root and the hidden directory of the service among them) at
+/// which MKDIR stops: a minimum. The series of removals of a tree costs about one read for each
+/// pair of the volume for each directory, so the directories bound the length of `rm -rf`: 1,024
+/// directories behind 2,000 pairs are about two million reads. Only MKDIR is refused.
+pub const DIRS_MAX: u64 = 1024;
 /// The flags of OPEN.
 pub const READ: u32 = 1;
 pub const WRITE: u32 = 2;

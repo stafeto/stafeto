@@ -98,6 +98,7 @@ impl Server {
                 });
             }
             Some(f) if f == VOLUME_FORMAT => {
+                self.count_at_mount(fs)?;
                 return Ok(Mounted {
                     refused: false,
                     converted: 0,
@@ -110,11 +111,27 @@ impl Server {
         if complete {
             fs.setattr(b"/", ATTR_FORMAT_TYPE, &VOLUME_FORMAT.to_le_bytes())?;
         }
+        self.count_at_mount(fs)?;
         Ok(Mounted {
             refused: false,
             converted,
             complete,
         })
+    }
+
+    /// The pairs and the directories are counted once the volume is in its final shape: the exact
+    /// count the service starts from (about two reads for each pair), told in the line `datafs:
+    /// pairs N of 2048, directories M of 1024`.
+    fn count_at_mount<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> Result<(), Error> {
+        let (pairs, dirs) = fs.metadata_pairs()?;
+        self.pairs = super::Pairs {
+            known: Some(pairs),
+            since: 0,
+            dirs: Some(dirs),
+            refused: false,
+            report: Some((pairs, dirs)),
+        };
+        Ok(())
     }
 
     /// Walks the tree and writes the record of every entry that has none. The root first.

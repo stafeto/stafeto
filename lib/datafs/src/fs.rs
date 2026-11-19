@@ -27,7 +27,7 @@ unsafe extern "C" {
     fn datafs_mount(d: *mut c_void, ctx: *mut c_void) -> c_int;
     fn datafs_unmount(d: *mut c_void, ctx: *mut c_void) -> c_int;
     fn datafs_used(d: *mut c_void, ctx: *mut c_void) -> i64;
-    fn datafs_pairs(d: *mut c_void, ctx: *mut c_void) -> i64;
+    fn datafs_pairs(d: *mut c_void, ctx: *mut c_void, out: *mut u32) -> c_int;
     fn datafs_open(d: *mut c_void, ctx: *mut c_void, path: *const c_char, flags: c_int) -> c_int;
     fn datafs_close(d: *mut c_void, ctx: *mut c_void, slot: c_int) -> c_int;
     fn datafs_read(d: *mut c_void, ctx: *mut c_void, slot: c_int, buf: *mut u8, size: u32) -> i64;
@@ -106,6 +106,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn datafs_set_lookahead(d: *mut c_void, buffer: *mut u8, size: u32);
     fn datafs_erases(d: *const c_void) -> u32;
+    fn datafs_set_inline(d: *mut c_void, max: u32);
     fn datafs_open_attr(
         d: *mut c_void,
         ctx: *mut c_void,
@@ -487,11 +488,13 @@ impl<'a, D: Device> Fs<'a, D> {
         check64(self.call(|d, ctx| unsafe { datafs_used(d, ctx) }))
     }
 
-    /// The metadata pairs of the volume (the list `lfs_fs_pred` walks to find the pair before the one a
+    /// The metadata pairs of the volume and its directories (the pairs are the list `lfs_fs_pred` walks to find the pair before the one a
     /// removal takes out): about two reads for each pair.
-    pub fn metadata_pairs(&mut self) -> Res<u64> {
-        // SAFETY: as above.
-        check64(self.call(|d, ctx| unsafe { datafs_pairs(d, ctx) }))
+    pub fn metadata_pairs(&mut self) -> Res<(u64, u64)> {
+        let mut out = [0u32; 2];
+        // SAFETY: as above; `out` holds the two words.
+        check(self.call(|d, ctx| unsafe { datafs_pairs(d, ctx, out.as_mut_ptr()) }))?;
+        Ok((u64::from(out[0]), u64::from(out[1])))
     }
 
     /// Walks the file system once and fills the allocator's window from it: every block the tree
@@ -793,6 +796,14 @@ impl<D: Device> Fs<'_, D> {
     }
 
     /// The erases littlefs has asked for since the volume was set up.
+    /// The inline limit of the configuration for the next mount: 0 for littlefs's default (small files
+    /// inside the pair of their directory, as an older release's volumes have them), `u32::MAX` for
+    /// none.
+    pub fn set_inline_for_test(&mut self, max: u32) {
+        // SAFETY: sets a word of the configuration of the state.
+        unsafe { datafs_set_inline(self.state.0.as_mut_ptr().cast(), max) };
+    }
+
     pub fn erases(&self) -> u64 {
         // SAFETY: reads a counter of the state.
         u64::from(unsafe { datafs_erases(self.state.0.as_ptr().cast()) })

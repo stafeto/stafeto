@@ -253,11 +253,18 @@ int64_t datafs_used(struct datafs *d, void *ctx)
 }
 
 // The metadata pairs of the volume (the pairs of the directories, the pairs that large directories
-// split into, and the superblock's), or a negative error: one fetch of each pair.
-int64_t datafs_pairs(struct datafs *d, void *ctx)
+// split into, and the superblock's) and its directories, in out[0] and out[1]: 0, or a negative
+// error. One fetch of each pair.
+int datafs_pairs(struct datafs *d, void *ctx, uint32_t *out)
 {
     d->ctx = ctx;
-    return lfs_fs_pairs(&d->lfs);
+    lfs_size_t pairs = 0, dirs = 0;
+    int err = lfs_fs_pairs(&d->lfs, &pairs, &dirs);
+    if (err == 0) {
+        out[0] = pairs;
+        out[1] = dirs;
+    }
+    return err;
 }
 
 // A file: the slot, or a negative error (LFS_ERR_NOMEM when every slot is open).
@@ -488,6 +495,13 @@ int datafs_seek_dir(struct datafs *d, void *ctx, int slot, uint32_t off)
         return LFS_ERR_BADF;
     }
     return lfs_dir_seek(&d->lfs, &d->dir[slot], off);
+}
+
+// Tests: the inline limit of the configuration, for the next mount (0 is littlefs's default, which
+// keeps a small file in its directory's pair: the layout of the volumes an older release made).
+void datafs_set_inline(struct datafs *d, uint32_t max)
+{
+    d->cfg.inline_max = max;
 }
 
 int datafs_rewinddir(struct datafs *d, void *ctx, int slot)

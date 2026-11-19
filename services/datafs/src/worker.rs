@@ -437,6 +437,7 @@ extern "C" fn work(_: u64) -> ! {
         rt::println!("datafs: no clock service, the times of files are the count since boot");
     }
     mount_work(&mut volume, &mut clock);
+    tell_pairs();
     if let Some(fs) = volume.as_mut() {
         // The time from the connection to the disk service to READY: the mount of littlefs and the
         // mount work (orphans, attributes, epoch). The count of the reads is the device's.
@@ -665,6 +666,8 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             if job.kind == REQUEST {
                 longest_job(request, began);
             }
+            // A creation that found the estimate at the cap counted the pairs: the line tells it.
+            tell_pairs();
             state(i).store(DONE, Release);
             idle.last_job = rt::time::ticks_to_ns(rt::time::now());
             if STOPPING.load(Acquire) {
@@ -731,6 +734,20 @@ fn longest_job(request: &[u8], began: u64) {
     if us > slot.load(Relaxed) {
         slot.store(us, Relaxed);
         rt::println!("datafs: job {method:?} longest {us} us");
+    }
+}
+
+/// The line of the count of pairs and directories, when the server made one since the last line:
+/// `datafs: pairs N of 2048, directories M of 1024`.
+fn tell_pairs() {
+    // SAFETY: the server is the worker's alone.
+    let server: &mut Server = unsafe { &mut *SERVER.get() };
+    if let Some((pairs, dirs)) = server.take_pairs_report() {
+        rt::println!(
+            "datafs: pairs {pairs} of {}, directories {dirs} of {}",
+            datafs::server::PAIRS_MAX,
+            datafs::server::DIRS_MAX
+        );
     }
 }
 
@@ -869,6 +886,12 @@ fn idle_walk(fs: &mut Volume, idle: &mut Idle, first: bool) {
                     "datafs: refresh walk {} blocks used, about {freed} given back, {reads} reads, {ms} ms{by}",
                     used(fs)
                 );
+                // The pairs and the directories are counted with the refresh: the estimate the
+                // creations keep between counts starts again from the exact count.
+                // SAFETY: the server is the worker's alone.
+                let server: &mut Server = unsafe { &mut *SERVER.get() };
+                let _ = server.recount(fs);
+                tell_pairs();
             }
         }
         Walked::Yielded { reads } => {

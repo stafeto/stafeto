@@ -42,11 +42,14 @@ NULL, so every caller of the release behaves as before.
   repeats from the root.
 - A private helper, `lfs_dir_getattr_`, which they use: the tail of `lfs_getattr_` over a pair
   and an id.
-- `lfs_fs_pairs(lfs)` in `lfs.h` and `lfs.c`: the number of metadata pairs, the length of the
-  threaded list of pairs that `lfs_fs_traverse_` walks (the superblock's pair first), by one
-  `lfs_dir_fetch` for each pair with the cycle check of the traversal. About two reads for each
-  pair, where `lfs_fs_pred` (which a removal of a directory uses to find the pair before the one it
-  removes) walks the same list from its head. The data service caps the pairs of a volume with it.
+- `lfs_fs_pairs(lfs, &pairs, &dirs)` in `lfs.h` and `lfs.c`: the number of metadata pairs, the length of
+  the threaded list of pairs that `lfs_fs_traverse_` walks (the superblock's pair first), and the
+  number of directories, by one `lfs_dir_fetch` for each pair with the cycle check of the
+  traversal. A pair whose tail is a hard tail (`dir.split`) continues its directory with the
+  next pair; any other tail is a soft tail and the next pair begins a directory; the first pair is
+  the root. About two reads for each pair, where `lfs_fs_pred` (which a removal of a directory uses
+  to find the pair before the one it removes) walks the same list from its head. The data service
+  caps the pairs and the directories of a volume with it.
 
 Each of the four has the public wrapper with `LFS_LOCK` and `LFS_TRACE` and the private function with a
 trailing underscore, as the functions around them do. The attribute buffer is read as
@@ -87,8 +90,8 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 0cb4ff1daf5fdc1359c6a6ee3116092f08fc100c9d58b1b77ab17bfd801f856d  LICENSE.md
 6dd74dfc58ac93589f8e002bb73c0830a59206912cfe8c951c07eb2bd5fccad0  SPEC.md
 2a8b3459d74b9fa8bdd947738522c46331739405b1fc3d70f057f636a1dea768  DESIGN.md
-26bcb854f51dd836b1cbb64830e325f4d6a7bb28f2a2daf5a574ed9c0615b8e6  lfs.c (with the change)
-61e5ef35e4b940a7204279c59530b9cc81b19f1dac9b54de2c7df47519bb891e  lfs.h (with the change)
+990fd7fc88fc4e9cff64e9fc0c946b51a658ff58c652a52bb673fbf890906bf5  lfs.c (with the change)
+89c6aa3d49725ac6cc50f98b366cdd4b6df17d423649b18fa4a84c9ee97fffc7  lfs.h (with the change)
 ```
 
 `tools/check-littlefs.py` (run by `cargo xtask ci` as "littlefs sources") fails when a file of the
@@ -111,7 +114,9 @@ change, or when `stafeto-changes.patch` applied backwards to them does not give 
    starts at the superblock's pair `{0, 1}` and each pair's `tail` names the next (the list
    `lfs_fs_traverse_` walks); `lfs_tortoise_detectcycles` is the cycle check of that walk; and
    `lfs_dir_fetch` of a pair gives the `tail` of the directory it holds, the same shape as in
-   `lfs_fs_pred`. Check that the new release's `lfs_fs_traverse_` still begins its walk with
+   `lfs_fs_pred`; the count of directories relies on `dir.split` being true exactly when the
+   pair's tail is a hard tail (a continuation of the same directory) and false for a soft tail.
+   Check that the new release's `lfs_fs_traverse_` still begins its walk with
    `dir.tail = {0, 1}`, runs the cycle check before each fetch and goes on to `dir.tail`, and keep
    the function in step with it.
 2. Apply `stafeto-changes.patch` with `patch -p1` from the root of the repository (or by hand if
