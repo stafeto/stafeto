@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
+use crate::{Pipes, Waiter};
 use proto_pipe::named::WatchSet;
 use proto_wire::watch::MAX;
 
@@ -28,6 +29,25 @@ struct Registration {
 /// 20410 (96 %); the portion of 16 brings it to about 15200, under 0.9 of
 /// the bound (18369). Should a run show more than 16500, lower this to 8.
 pub const WATCH_STEP_QUEUES: usize = 16;
+
+/// What one portion of a watch's subscriptions did (`Pool::portion`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Portion {
+    /// The queues the portion subscribed.
+    pub subscribed: usize,
+    /// No queue of the watch is left to subscribe.
+    pub last: bool,
+    /// The portion was the last, was asked to check, and an element of the
+    /// set is ready.
+    pub ready: bool,
+}
+impl Portion {
+    const NONE: Self = Self {
+        subscribed: 0,
+        last: true,
+        ready: false,
+    };
+}
 /// Each readiness operation subscribes once to an underlying queue: a ring
 /// end (0 to 127) or a socket (128 to 255).
 pub fn unique_queues(queues: &[u8]) -> impl Iterator<Item = u32> + '_ {
@@ -71,10 +91,19 @@ impl<const N: usize> Pool<N> {
     pub const fn new() -> Self {
         Self { list: [None; N] }
     }
-    pub fn insert(&mut self, label: u64, key: u64, set: WatchSet, queues: [u8; MAX]) -> bool {
-        let Some(free) = self.list.iter_mut().find(|r| r.is_none()) else {
-            return false;
-        };
+    /// Puts the record in a free place and returns the place.
+    pub fn insert(
+        &mut self,
+        label: u64,
+        key: u64,
+        set: WatchSet,
+        queues: [u8; MAX],
+    ) -> Option<usize> {
+        let (at, free) = self
+            .list
+            .iter_mut()
+            .enumerate()
+            .find(|(_, r)| r.is_none())?;
         *free = Some(Registration {
             label,
             key,
@@ -86,48 +115,85 @@ impl<const N: usize> Pool<N> {
             wanted: unique_queues(&queues[..set.len]).count() as u8,
             refused: false,
         });
-        true
+        Some(at)
     }
-    fn live_mut(&mut self, label: u64, key: u64) -> Option<&mut Registration> {
-        self.list
-            .iter_mut()
-            .flatten()
-            .find(|r| !r.retired && r.label == label && r.key == key)
+    /// The first live record with queues still to subscribe, and its place.
+    pub fn pending(&self) -> Option<(u64, u64, usize)> {
+        self.list.iter().enumerate().find_map(|(at, r)| {
+            let r = r.as_ref()?;
+            (!r.retired && !r.refused && r.registered < r.wanted).then_some((r.label, r.key, at))
+        })
     }
-    /// How many unique queues of the live record are subscribed.
-    pub fn registered(&self, label: u64, key: u64) -> Option<usize> {
-        self.list
-            .iter()
-            .flatten()
-            .find(|r| !r.retired && r.label == label && r.key == key)
-            .map(|r| usize::from(r.registered))
-    }
-    /// The record has `n` unique queues subscribed.
-    pub fn mark_registered(&mut self, label: u64, key: u64, n: usize) {
-        if let Some(r) = self.live_mut(label, key) {
-            r.registered = n as u8;
+    /// Subscribes the next portion (at most `WATCH_STEP_QUEUES` queues) of
+    /// the record at `at` (from `insert` or `pending`, in the same step).
+    /// A refusal leaves the queues subscribed so far (a cancel takes them
+    /// off). With `check`, the portion that completes the record also looks
+    /// at the readiness of every element: the queues of the portions that
+    /// came after the request's check were not subscribed when a change
+    /// happened.
+    pub fn portion(
+        &mut self,
+        at: usize,
+        pipes: &mut Pipes,
+        alive: impl Fn(Waiter) -> bool,
+        check: bool,
+    ) -> Result<Portion, u32> {
+        let Some(r) = self.list[at].as_mut() else {
+            return Ok(Portion::NONE);
+        };
+        let done = usize::from(r.registered);
+        let mut subscribed = 0;
+        for description in unique_queues(&r.queues[..r.set.len])
+            .skip(done)
+            .take(WATCH_STEP_QUEUES)
+        {
+            pipes.wait_new(description, (r.label, r.key), &alive)?;
+            subscribed += 1;
+            r.registered += 1;
         }
+        let last = r.registered >= r.wanted;
+        let ready = check
+            && last
+            && (0..r.set.len).any(|i| {
+                pipes.queue_readiness(u32::from(r.queues[i]))
+                    & (r.set.items[i].events | proto_wire::watch::ALWAYS)
+                    != 0
+            });
+        Ok(Portion {
+            subscribed,
+            last,
+            ready,
+        })
     }
-    /// The first live record with queues still to subscribe.
-    pub fn pending(&self) -> Option<(u64, u64)> {
-        self.list
-            .iter()
-            .flatten()
-            .find(|r| !r.retired && !r.refused && r.registered < r.wanted)
-            .map(|r| (r.label, r.key))
+    /// The record at `at` needs no more subscriptions.
+    pub fn complete(&mut self, at: usize) {
+        if let Some(r) = self.list[at].as_mut() {
+            r.registered = r.wanted;
+        }
     }
     /// A later portion was refused: the record stays (a `Cancel` takes it
     /// off) and `Take` answers AGAIN.
     pub fn refuse(&mut self, label: u64, key: u64) {
-        if let Some(r) = self.live_mut(label, key) {
+        if let Some(r) = self
+            .list
+            .iter_mut()
+            .flatten()
+            .find(|r| !r.retired && r.label == label && r.key == key)
+        {
             r.refused = true;
         }
     }
-    pub fn refused(&self, label: u64, key: u64) -> bool {
+    /// The set of the live record and whether a later portion was refused.
+    pub fn get_state(&self, label: u64, key: u64) -> Option<(&WatchSet, bool)> {
         self.list
             .iter()
             .flatten()
-            .any(|r| !r.retired && r.label == label && r.key == key && r.refused)
+            .find(|r| !r.retired && r.label == label && r.key == key)
+            .map(|r| (&r.set, r.refused))
+    }
+    pub fn refused(&self, label: u64, key: u64) -> bool {
+        self.get_state(label, key)
+            .is_some_and(|(_, refused)| refused)
     }
     pub fn get(&self, label: u64, key: u64) -> Option<&WatchSet> {
         self.list
@@ -208,7 +274,7 @@ mod tests {
         let mut queues = [0; MAX];
         queues[0] = 14;
         queues[1] = 27;
-        assert!(pool.insert(1, 7, set, queues));
+        assert!(pool.insert(1, 7, set, queues).is_some());
         assert_eq!(
             pool.get(1, 7).unwrap().endpoint(1).generation,
             0x2_0000_0001
