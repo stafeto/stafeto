@@ -701,7 +701,7 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             && let Some(fs) = volume.as_mut()
         {
             idle.orphans_pending = false;
-            if datafs::server::ensure_orphans(fs).is_err() {
+            if server.make_orphans(fs).is_err() {
                 rt::println!("datafs: the directory of the orphans could not be made");
             }
             tell_pairs();

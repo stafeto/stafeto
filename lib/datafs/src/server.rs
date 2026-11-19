@@ -840,6 +840,19 @@ impl Server {
         (u64::from(self.epoch) << 32) | u64::from(self.orphan_seq)
     }
 
+    /// Makes the hidden directory of the orphans when the volume has none and counts it among the
+    /// directories (the count of the mount was made before it existed).
+    pub fn make_orphans<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> Result<(), Error> {
+        match fs.mkdir(ORPHANS) {
+            Ok(()) => {
+                self.dirs_changed(1);
+                Ok(())
+            }
+            Err(Error::Exists) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The open file `ni` leaves the tree and stays readable and writable for its descriptions. With
     /// `home`, a rename is replacing it there: the mark lets a mount put it back.
     fn orphan<D: Device>(&mut self, fs: &mut Fs<'_, D>, ni: usize, home: Option<&[u8]>) -> Res<()> {
@@ -850,7 +863,8 @@ impl Server {
             // The directory is made at the mount; a volume that lost it gets it again here.
             Err(Status::Unknown(p::NO_ENTRY)) => {
                 match fs.mkdir(ORPHANS) {
-                    Ok(()) | Err(Error::Exists) => {}
+                    Ok(()) => self.dirs_changed(1),
+                    Err(Error::Exists) => {}
                     Err(e) => return Err(status_of(e)),
                 }
                 self.move_node(fs, ni, &path[..len], mark)

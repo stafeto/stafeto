@@ -60,6 +60,18 @@ impl Rig {
         Rig::on(MemDevice::new(SECTORS))
     }
 
+    /// A rig on a formatted volume with the mount work not run and no hidden directory.
+    pub fn new_unmade() -> Rig {
+        let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+        let mut fs = Fs::new(MemDevice::new(SECTORS), state).unwrap();
+        fs.format().unwrap();
+        fs.mount().unwrap();
+        let mut server = Server::new();
+        server.default_service = false;
+        server.set_now(1_000);
+        Rig { server, fs }
+    }
+
     /// A rig on `device` whose conversion job has not run: the mount work only read the mark.
     pub fn unconverted(device: MemDevice) -> Rig {
         let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
@@ -2280,6 +2292,22 @@ fn every_creation_stops_at_the_cap_of_pairs_and_the_other_requests_pass() {
         .unwrap();
     }
     rig.put(ROOT, b"/keep/after", 0o644, b"x");
+}
+
+/// The service counts at the mount and makes the hidden directory after READY: the directory is in
+/// the count, so the cap lets exactly the directories through that the volume has room for.
+#[test]
+fn the_hidden_directory_made_after_the_mount_is_counted() {
+    let mut rig = Rig::new_unmade();
+    rig.server.mount_work(&mut rig.fs).unwrap();
+    assert_eq!(rig.server.dirs_known(), Some(1));
+    rig.server.make_orphans(&mut rig.fs).unwrap();
+    assert_eq!(rig.server.dirs_known(), Some(2));
+    rig.server.make_orphans(&mut rig.fs).unwrap();
+    assert_eq!(rig.server.dirs_known(), Some(2));
+    rig.server.set_dirs_max(12);
+    let made = mkdirs_until_refused(&mut rig, "/d");
+    assert_eq!(made, 12 - 2);
 }
 
 #[test]
