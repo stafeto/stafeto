@@ -278,7 +278,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 75] = [
+const SYSTEM_PATHS: [&str; 76] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -286,6 +286,7 @@ const SYSTEM_PATHS: [&str; 75] = [
     "/libexec/ramfs",
     "/dev",
     "/proc",
+    "/data",
     "/sys",
     "/sys/devices",
     "/sys/devices/system",
@@ -627,6 +628,9 @@ fn shell_files(image: &str) -> Result<Vec<RootFile>, String> {
         file("/libexec/ramfs", 0o4750, USER, "ramfs"),
         dir("/dev"),
         dir("/proc"),
+        // The mount point of the data volume: the layer sends the paths there to the data file
+        // service by their text, and the directory shows `/data` in `ls /`.
+        dir("/data"),
         // The directory of the CPUs, which htop and `nproc --all` count: a
         // directory for each CPU the machine can have, of which the
         // listing (the layer's) names the CPUs that are up.
@@ -924,12 +928,12 @@ pub fn check_owners(
         }
     }
     // The data volume is mounted at /data (the layer sends the paths there to the data file
-    // service): a file of the image at or below it would be hidden, and so is the target of a
+    // service): a file of the image below it would be hidden, and so is the target of a
     // link that named a place there (a link names a file of its own directory, below).
     for f in files {
-        if f.path == "/data" || f.path.starts_with("/data/") {
+        if f.path.starts_with("/data/") {
             wrong.push(format!(
-                "{} is at or below /data, which the data volume covers",
+                "{} is below /data, which the data volume covers",
                 f.path
             ));
         }
@@ -2858,13 +2862,13 @@ mod tests {
         let mut owned = packages.clone();
         owned[0].files.push(("/data/keep".into(), "keep".into()));
         let error = check_owners(image, &covered, &owned).unwrap_err();
-        assert!(error.contains("/data/keep is at or below /data"), "{error}");
+        assert!(error.contains("/data/keep is below /data"), "{error}");
         let mut near = files_of(image);
         near.push(of("/database", 0o644, ROOT, Source::Bytes("near", b"x")));
         let mut owned = packages.clone();
         owned[0].files.push(("/database".into(), "near".into()));
         let error = check_owners(image, &near, &owned).err().unwrap_or_default();
-        assert!(!error.contains("at or below /data"), "{error}");
+        assert!(!error.contains("below /data"), "{error}");
     }
 
     #[test]

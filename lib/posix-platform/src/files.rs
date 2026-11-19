@@ -409,8 +409,46 @@ pub unsafe extern "C" fn stafeto_pwrite(
     if posix_abi::fastnet::is_fast(fd) {
         return -(posix_abi::fastnet::unsupported(fd) as isize);
     }
+    // A file of the data volume writes at the offset in the service's own steps.
+    // SAFETY: the caller's promise.
+    if let Some(result) = unsafe { data_pwrite(fd, buf, len, offset) } {
+        return match posix_abi::finish_file_size(result) {
+            Ok(count) => count,
+            Err(errno) => -(errno as isize),
+        };
+    }
     // SAFETY: the caller's promise.
     unsafe { write_at(Place::Fd(fd), buf, len, offset) }
+}
+
+/// pwrite of a descriptor of the data volume: None for any other. The bytes written; after some
+/// messages a failure is their sum, and the first alone is the error.
+///
+/// # Safety
+/// `buf` is readable for `len` bytes.
+unsafe fn data_pwrite(
+    fd: c_int,
+    buf: *const u8,
+    len: usize,
+    offset: i64,
+) -> Option<Result<isize, c_int>> {
+    let number = number(fd).ok()?;
+    let data = posix_abi::shared::held(number, |_, target| match target {
+        Target::Data(data) => Ok(Some(data)),
+        _ => Ok(None),
+    })
+    .ok()
+    .flatten()?;
+    let Ok(start) = u64::try_from(offset) else {
+        return Some(Err(EINVAL));
+    };
+    // SAFETY: the caller's promise.
+    let bytes = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { core::slice::from_raw_parts(buf, len) }
+    };
+    Some(posix_abi::data::pwrite(data.handle, start, bytes).map(|n| n as isize))
 }
 
 /// # Safety
@@ -526,6 +564,15 @@ pub extern "C" fn stafeto_fcntl(fd: c_int, command: c_int, argument: u64) -> c_i
             unsafe { posix_abi::file_lock(fd, command, argument as *mut u8) }
         })
         .unwrap_or_else(|errno| -errno);
+    }
+    // The status flags of a file of the data volume are its description's, in the service.
+    if command == F_GETFL || command == F_SETFL {
+        let set = (command == F_SETFL).then_some(argument as c_int);
+        match call(|| posix_abi::data::status_flags(fd, set)) {
+            Ok(Some(flags)) => return flags,
+            Ok(None) => {}
+            Err(errno) => return -errno,
+        }
     }
     // A pipe's status flags are its description's, in the pipe service:
     // the request goes outside the lock of the files.
@@ -1222,10 +1269,15 @@ pub unsafe extern "C" fn stafeto_clock_settime(
 pub extern "C" fn stafeto_ftruncate(fd: c_int, length: i64) -> c_int {
     let result = call(|| {
         posix_abi::shared::held(number(fd)?, |_, target| {
+            let length = u64::try_from(length).map_err(|_| EINVAL)?;
+            if let Target::Data(data) = target {
+                // The service says EBADF for a description opened without write: EINVAL here too.
+                return posix_abi::data::truncate(data.handle, length)
+                    .map_err(|errno| if errno == EBADF { EINVAL } else { errno });
+            }
             let Target::Ram(target) = target else {
                 return Err(EINVAL);
             };
-            let length = u64::try_from(length).map_err(|_| EINVAL)?;
             // A descriptor that is open but not for writing is EINVAL (the
             // file service says EBADF; a closed number was refused above).
             posix_abi::change::truncate(target, length)

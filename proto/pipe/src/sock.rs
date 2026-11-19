@@ -29,8 +29,9 @@
 //!   peer), then the bytes. READY with the count u32 sent.
 //! - SOCK_RECV, SOCK_RECV_TAKE: the socket, flags u32, the most bytes u32,
 //!   the most descriptions u32. READY with the flags of the message u32
-//!   (OUT_TRUNC, OUT_CTRUNC), the count of descriptions u32 and each one
-//!   u32, the sender's address, then the bytes.
+//!   (OUT_TRUNC, OUT_CTRUNC), the count of descriptions u32, the word of their
+//!   kinds (`KIND_NONE`, `KIND_NET`, `KIND_DATA`, 4 bits each) and each
+//!   description u32, the sender's address, then the bytes.
 //!
 //! An address is kind u32 (NONE, INET, UNIX), port u32, the file node u64,
 //! the length of the path u32 and the path (at most NAME_MAX bytes).
@@ -54,6 +55,44 @@ pub const FDS_MAX: usize = 8;
 pub const PASS: u32 = 0xFFFF_FFE0;
 /// The handles of passes one message carries at most.
 pub const PASSES_PER_MESSAGE: usize = 4;
+
+/// What service a pass belongs to, stated for each description of a message in the word `kinds`
+/// (4 bits each, the first description in the lowest): `KIND_NONE` for a description of this
+/// service (a socket or a pipe: its number is in the list), `KIND_NET` for a socket of the network
+/// service and `KIND_DATA` for a description of the data file service (a pass of each, listed as
+/// `PASS + k`). The number a pass is listed under says nothing of its kind. A receiver that finds a
+/// kind it does not serve closes the pass, and no pass is ever offered to another service than its
+/// own.
+pub const KIND_NONE: u32 = 0;
+pub const KIND_NET: u32 = 1;
+pub const KIND_DATA: u32 = 2;
+
+/// The kind of description `i` in `kinds`.
+pub const fn kind_of(kinds: u32, i: usize) -> u32 {
+    kinds >> (4 * i) & 0xF
+}
+
+/// `kinds` with the kind of description `i` set to `kind`.
+pub const fn with_kind(kinds: u32, i: usize, kind: u32) -> u32 {
+    kinds & !(0xF << (4 * i)) | (kind & 0xF) << (4 * i)
+}
+
+/// Whether `kinds` states exactly what `fds` list: a pass (`PASS` and above) has a kind of a
+/// service that has passes, any other description has none, and the kinds of the places past the
+/// list are zero.
+pub fn kinds_fit(fds: &[u32], kinds: u32) -> bool {
+    if fds.len() > FDS_MAX || (fds.len() < 8 && kinds >> (4 * fds.len()) != 0) {
+        return false;
+    }
+    fds.iter().enumerate().all(|(i, &fd)| {
+        let kind = kind_of(kinds, i);
+        if fd >= PASS {
+            kind == KIND_NET || kind == KIND_DATA
+        } else {
+            kind == KIND_NONE
+        }
+    })
+}
 /// The handles of passes the service holds at most: those of messages that
 /// wait in a socket, of sends that wait for room, and of messages whose
 /// socket went and whose handles are not closed yet.
@@ -70,7 +109,7 @@ const _: () = assert!(PASS > (1 << 31));
 // A READY reply of SOCK_RECV (the long reply's two words, the flags, the count,
 // the numbers, the address and the bytes) always fits a message, so a reply that
 // carries handles is never refused for its size after the message left the socket.
-const _: () = assert!(8 + 8 + 4 * FDS_MAX + ADDR_MAX + SEND_MAX <= abi::MESSAGE_MAX);
+const _: () = assert!(8 + 8 + 4 + 4 * FDS_MAX + ADDR_MAX + SEND_MAX <= abi::MESSAGE_MAX);
 /// The most bytes of a path in an address (sun_path).
 pub const NAME_MAX: usize = 108;
 /// The sockets that wait for an accept at one listener at most.
@@ -228,13 +267,19 @@ pub struct Send<'a> {
     pub flags: u32,
     pub fds: [u32; FDS_MAX],
     pub nfds: usize,
+    /// The kind of each description (`kinds_fit`).
+    pub kinds: u32,
     pub to: Addr,
     pub bytes: &'a [u8],
 }
 
 impl<'a> Send<'a> {
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
-        if self.bytes.len() > SEND_MAX || self.nfds > FDS_MAX || self.key == Some(0) {
+        if self.bytes.len() > SEND_MAX
+            || self.nfds > FDS_MAX
+            || self.key == Some(0)
+            || !kinds_fit(&self.fds[..self.nfds], self.kinds)
+        {
             return Err(Status::BadSize);
         }
         match self.key {
@@ -247,6 +292,7 @@ impl<'a> Send<'a> {
         w.u32(self.end)?;
         w.u32(self.flags)?;
         w.u32(self.nfds as u32)?;
+        w.u32(self.kinds)?;
         for &fd in &self.fds[..self.nfds] {
             w.u32(fd)?;
         }
@@ -262,9 +308,13 @@ impl<'a> Send<'a> {
         if nfds > FDS_MAX || key == Some(0) || flags & !(PEEK | DONTWAIT | OOB) != 0 {
             return Err(Status::BadSize);
         }
+        let kinds = body.u32()?;
         let mut fds = [0; FDS_MAX];
         for fd in &mut fds[..nfds] {
             *fd = body.u32()?;
+        }
+        if !kinds_fit(&fds[..nfds], kinds) {
+            return Err(Status::BadSize);
         }
         let to = Addr::read(&mut body)?;
         let len = body.left();
@@ -278,6 +328,7 @@ impl<'a> Send<'a> {
             flags,
             fds,
             nfds,
+            kinds,
             to,
             bytes,
         })
@@ -340,6 +391,7 @@ pub struct Received<'a> {
     pub flags: u32,
     pub fds: [u32; FDS_MAX],
     pub nfds: usize,
+    pub kinds: u32,
     pub from: Addr,
     pub bytes: &'a [u8],
 }
@@ -348,6 +400,7 @@ impl<'a> Received<'a> {
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
         w.u32(self.flags)?;
         w.u32(self.nfds as u32)?;
+        w.u32(self.kinds)?;
         for &fd in &self.fds[..self.nfds] {
             w.u32(fd)?;
         }
@@ -362,6 +415,7 @@ impl<'a> Received<'a> {
         if nfds > FDS_MAX {
             return Err(Status::BadSize);
         }
+        let kinds = r.u32()?;
         let mut fds = [0; FDS_MAX];
         for fd in &mut fds[..nfds] {
             *fd = r.u32()?;
@@ -372,6 +426,7 @@ impl<'a> Received<'a> {
             flags,
             fds,
             nfds,
+            kinds,
             from,
             bytes: r.bytes(left)?,
         })
@@ -432,6 +487,7 @@ mod tests {
             flags: DONTWAIT,
             fds: [1, 2, 3, 4, 5, 6, 7, 8],
             nfds: FDS_MAX,
+            kinds: 0,
             to: Addr::unix(5, &[b'p'; NAME_MAX]).unwrap(),
             bytes: &bytes,
         };
@@ -457,8 +513,9 @@ mod tests {
         );
         let got = Received {
             flags: OUT_TRUNC,
-            fds: [9; FDS_MAX],
+            fds: [PASS + 1; FDS_MAX],
             nfds: FDS_MAX,
+            kinds: 0x2121_2121,
             from: Addr::unix(5, &[b'p'; NAME_MAX]).unwrap(),
             bytes: &bytes,
         };
@@ -471,5 +528,60 @@ mod tests {
             .unwrap();
         assert!(w.as_bytes().len() <= abi::MESSAGE_MAX);
         assert_eq!(Method::SockSend.number(), 36);
+    }
+
+    #[test]
+    fn a_pass_has_the_kind_of_its_service_and_nothing_else_has_one() {
+        let fds = [SOCK_END | 4, PASS, PASS + 1];
+        let kinds = with_kind(with_kind(0, 1, KIND_NET), 2, KIND_DATA);
+        assert_eq!(kinds, 0x210);
+        assert!(kinds_fit(&fds, kinds));
+        assert_eq!(
+            (kind_of(kinds, 0), kind_of(kinds, 1), kind_of(kinds, 2)),
+            (0, 1, 2)
+        );
+        // A pass with no kind, a kind of a service that has none, a kind on a description of the
+        // service, and a kind past the list are all refused.
+        assert!(!kinds_fit(&fds, 0x010));
+        assert!(!kinds_fit(&fds, with_kind(kinds, 1, 3)));
+        assert!(!kinds_fit(&fds, with_kind(kinds, 0, KIND_NET)));
+        assert!(!kinds_fit(&fds, with_kind(kinds, 3, KIND_NET)));
+        assert!(kinds_fit(&[], 0));
+        assert!(!kinds_fit(&[1; FDS_MAX + 1], 0));
+    }
+
+    #[test]
+    fn a_send_with_a_wrong_kind_word_does_not_parse() {
+        let bytes = [1u8; 4];
+        let mut send = Send {
+            key: None,
+            end: SOCK_END | 3,
+            flags: 0,
+            fds: [PASS, 7, 0, 0, 0, 0, 0, 0],
+            nfds: 2,
+            kinds: KIND_DATA,
+            to: Addr::NONE,
+            bytes: &bytes,
+        };
+        let mut w = Writer::new();
+        send.write(&mut w).unwrap();
+        assert_eq!(
+            Send::parse(Reader::new(&w.as_bytes()[HEADER_LEN..]), false),
+            Ok(send)
+        );
+        // The writer refuses what the service would, and so does the parser of a forged body.
+        send.kinds = 0;
+        assert_eq!(send.write(&mut Writer::new()), Err(Status::BadSize));
+        let mut forged = Writer::new();
+        forged.u32(SOCK_END | 3).unwrap();
+        forged.u32(0).unwrap();
+        forged.u32(1).unwrap();
+        forged.u32(0).unwrap();
+        forged.u32(PASS).unwrap();
+        Addr::NONE.write(&mut forged).unwrap();
+        assert_eq!(
+            Send::parse(Reader::new(forged.as_bytes()), false),
+            Err(Status::BadSize)
+        );
     }
 }

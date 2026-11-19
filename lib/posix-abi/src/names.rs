@@ -176,7 +176,9 @@ pub fn unlinkat(dirfd: c_int, path: &[u8], flags: c_int) -> Result<(), c_int> {
     if flags & !AT_REMOVEDIR != 0 {
         return Err(EINVAL);
     }
-    crate::data::refuse_change(dirfd, path)?;
+    if let Some(vol) = crate::data::route(dirfd, path)? {
+        return crate::data::unlink(&vol, flags & AT_REMOVEDIR != 0);
+    }
     let placed = place(dirfd, path)?;
     let remove_directory = flags & AT_REMOVEDIR != 0;
     check_virtual(
@@ -200,7 +202,9 @@ pub fn unlinkat(dirfd: c_int, path: &[u8], flags: c_int) -> Result<(), c_int> {
 
 /// mkdir: the mode with the creation mask of the process.
 pub fn mkdirat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
-    crate::data::refuse_change(dirfd, path)?;
+    if let Some(vol) = crate::data::route(dirfd, path)? {
+        return crate::data::mkdir(&vol, mode, umask);
+    }
     let placed = place(dirfd, path)?;
     // A name of the terminal exists even with a slash after it.
     check_virtual(Named::Mkdir, &placed, None, false)?;
@@ -211,7 +215,10 @@ pub fn mkdirat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c
 
 /// Create a FIFO inode; its ring is allocated only by a later open.
 pub fn mkfifoat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
-    crate::data::refuse_change(dirfd, path)?;
+    // The volume keeps files and directories alone.
+    if crate::data::route(dirfd, path)?.is_some() {
+        return Err(EPERM);
+    }
     let placed = place(dirfd, path)?;
     check_virtual(Named::Mkdir, &placed, None, false)?;
     let mut create = request(ChangeOp::Mkfifo, &placed);
@@ -222,7 +229,9 @@ pub fn mkfifoat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), 
 /// Create the node of kind socket that a bound socket of the pipe service
 /// names; EEXIST for a name in use.
 pub fn mksockat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
-    crate::data::refuse_change(dirfd, path)?;
+    if crate::data::route(dirfd, path)?.is_some() {
+        return Err(EPERM);
+    }
     let placed = place(dirfd, path)?;
     check_virtual(Named::Mkdir, &placed, None, false)?;
     let mut create = request(ChangeOp::Mksock, &placed);
@@ -277,8 +286,10 @@ pub fn faccessat(dirfd: c_int, path: &[u8], mode: c_int, flags: c_int) -> Result
 
 /// rename: `renameat2` without flags.
 pub fn renameat(old_dirfd: c_int, old: &[u8], new_dirfd: c_int, new: &[u8]) -> Result<(), c_int> {
-    crate::data::refuse_change(old_dirfd, old)?;
-    crate::data::refuse_change(new_dirfd, new)?;
+    // Both names on the volume, or neither (EXDEV across the mount).
+    if let Some((from, to)) = crate::data::pair(old_dirfd, old, new_dirfd, new)? {
+        return crate::data::rename(&from, &to);
+    }
     let first = place(old_dirfd, old)?;
     let second = place(new_dirfd, new)?;
     check_virtual(Named::Rename, &first, Some(&second), true)?;
@@ -299,8 +310,9 @@ pub fn linkat(
     if flags & !AT_SYMLINK_FOLLOW != 0 {
         return Err(EINVAL);
     }
-    crate::data::refuse_change(old_dirfd, old)?;
-    crate::data::refuse_change(new_dirfd, new)?;
+    if let Some((from, _)) = crate::data::pair(old_dirfd, old, new_dirfd, new)? {
+        return crate::data::link(&from);
+    }
     let first = place(old_dirfd, old)?;
     let second = place(new_dirfd, new)?;
     check_virtual(Named::Link, &first, Some(&second), true)?;
@@ -319,7 +331,10 @@ pub fn symlinkat(target: &[u8], new_dirfd: c_int, linkpath: &[u8]) -> Result<(),
     if target.len() > MAX_PATH {
         return Err(ENAMETOOLONG);
     }
-    crate::data::refuse_change(new_dirfd, linkpath)?;
+    // The volume has no symbolic links.
+    if crate::data::route(new_dirfd, linkpath)?.is_some() {
+        return Err(EPERM);
+    }
     let placed = place(new_dirfd, linkpath)?;
     check_virtual(Named::Symlink, &placed, None, false)?;
     let mut symlink = request(ChangeOp::Symlink, &placed);
@@ -402,8 +417,13 @@ fn metadata(
     at_flags: c_int,
     args: [u64; 4],
 ) -> Result<(), c_int> {
-    if !path.is_empty() {
-        crate::data::refuse_change(dirfd, path)?;
+    if at_flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
+    if (!path.is_empty() || at_flags & AT_EMPTY_PATH != 0)
+        && crate::data::change(op, dirfd, path, args)?
+    {
+        return Ok(());
     }
     let (placed, itself) = metadata_target(dirfd, path, at_flags)?;
     if !itself {

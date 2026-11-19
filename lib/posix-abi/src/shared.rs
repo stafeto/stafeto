@@ -706,8 +706,8 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
                 Target::Pipe(end) => crate::pipes::write(transport, end, bytes).map(|n| n as u64),
                 Target::Net(net) => crate::net::write(net.description, bytes).map(|n| n as u64),
                 Target::Epoll(_) => Err(EINVAL),
-                // The descriptions of the data volume are opened for reading alone.
-                Target::Data(_) => Err(EBADF),
+                // A description of the data volume: all the bytes, in messages of the service.
+                Target::Data(data) => crate::data::write(data.handle, bytes).map(|n| n as u64),
                 Target::Fifo(target) => {
                     crate::pipes::write_endpoint(transport, target.endpoint(), bytes)
                         .map(|n| n as u64)

@@ -1556,6 +1556,10 @@ pub fn spawn_search<'s, 'a>(
     if file.is_empty() {
         return Err(ENOENT);
     }
+    // A program is never run from the data volume: EACCES before any request to the loader.
+    if search.is_none() && crate::data::route(crate::names::AT_FDCWD, file)?.is_some() {
+        return Err(crate::constants::EACCES);
+    }
     let pgroup = attributes.pgroup;
     if pgroup > i32::MAX as u32 || attributes.flags & !proto_process::SPAWN_FLAGS != 0 {
         return Err(EINVAL);
@@ -1793,6 +1797,11 @@ fn exec_selected<'s>(
     use crate::constants::ENOENT;
     if matches!(source, ExecSource::Path(path) if path.is_empty()) {
         return Err(ENOENT);
+    }
+    if let ExecSource::Path(path) = source
+        && crate::data::route(crate::names::AT_FDCWD, path)?.is_some()
+    {
+        return Err(crate::constants::EACCES);
     }
     // The claimed network device stays with this image (spec 6, 3.9).
     if crate::fast::claimed() {
