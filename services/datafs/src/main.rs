@@ -29,7 +29,7 @@ use shared::*;
 rt::entry!(main);
 
 /// The sessions the loop keeps: the processes of POSIX that use `/data`, and the services beside.
-const SESSIONS: usize = 32;
+const SESSIONS: usize = 64;
 
 /// The codes of a start that failed.
 const NO_START_DATA: u64 = 1;

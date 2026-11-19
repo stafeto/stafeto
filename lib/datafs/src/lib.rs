@@ -33,6 +33,8 @@ mod tests_cut;
 #[cfg(test)]
 mod tests_open;
 #[cfg(test)]
+mod tests_perm;
+#[cfg(test)]
 mod tests_scale;
 pub mod volume;
 pub mod watch;

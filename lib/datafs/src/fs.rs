@@ -15,7 +15,7 @@ pub const PATH_MAX: usize = 511;
 /// `volume::open` refuses it.
 pub const BLOCKS_MAX: u64 = 1 << 20;
 /// The bytes of memory a volume uses at most (`Storage`); the C structure is checked against it.
-pub const STORAGE_BYTES: usize = (56 + 128) * 1024;
+pub const STORAGE_BYTES: usize = (56 + 68 + 128) * 1024;
 
 unsafe extern "C" {
     fn datafs_state_size() -> usize;

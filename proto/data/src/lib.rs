@@ -252,17 +252,17 @@
 //!
 //! A directory has at most `DIR_ENTRIES_MAX` entries (1024), a minimum the service guarantees; the
 //! service step may fix a different value after measurement, never a smaller one. The count does
-//! not live in the directory's 48-byte attribute record (`Attr`): that record has no free byte,
-//! and it does not grow here. The proposal is a second user attribute of the directory, a u32
-//! count, that the service updates with the directory's time update of the same name operation
-//! (one commit, if it writes both attributes together in `glue.c`), with a scan of the directory
-//! (at most the cap) as the fallback when it is missing; the choice belongs to the service step.
+//! not live on the volume: the 48-byte attribute record has no free byte, and a second attribute
+//! on the directory would cost one more commit of it for every name that is made, removed or
+//! renamed. The service counts the entries of a directory by one scan (a few hundred device
+//! reads for 1,000 entries) the first time a name is added to it, keeps the count in memory for a
+//! few directories, and follows it with each name it adds or removes; a rename, a removal of the
+//! directory or a change of its attributes drops what it kept. A restart starts with no counts.
 //!
 //! # The attribute of an entry
 //!
 //! The constants `ATTR_*`, `VOLUME_FORMAT`, `INO_BLOCK`, `RESERVE_BLOCKS` and the `Attr` record are
-//! the format of the volume and not of the protocol; they stay here until the service step moves
-//! them to `lib/datafs`.
+//! the format of the volume and live in `lib/datafs/src/attr.rs`; the table below is their text.
 //!
 //! The service keeps each entry's record (`Attr`, `ATTR_LEN` 48 bytes) as the user attribute
 //! `ATTR_TYPE` (0x70) of the entry in the volume; the volume's `format` mark is the attribute
@@ -339,12 +339,6 @@ pub const ROOT_DESCRIPTIONS: usize = 48;
 /// The entries of one directory: a minimum the service guarantees and the service step may fix
 /// after measurement (never smaller). A create past it is NO_SPACE.
 pub const DIR_ENTRIES_MAX: usize = 1024;
-/// The free blocks below which only user 0 writes or creates (rule 14). Format of the volume.
-pub const RESERVE_BLOCKS: u32 = 64;
-/// The file numbers the service reserves with one commit of the counter (rule 11). Format of the
-/// volume.
-pub const INO_BLOCK: u64 = 1024;
-
 /// The flags of OPEN.
 pub const READ: u32 = 1;
 pub const WRITE: u32 = 2;
@@ -404,17 +398,8 @@ pub const fn is_root(label: u64) -> bool {
     label == ROOT
 }
 
-/// The record of an entry in the volume and the format mark (see the module text).
-pub const ATTR_TYPE: u8 = 0x70;
-pub const ATTR_FORMAT_TYPE: u8 = 0x66;
-pub const ATTR_COUNTER_TYPE: u8 = 0x69;
-/// The `format` word of an `Attr`.
-pub const ATTR_FORMAT: u32 = 1;
-/// The format mark of the volume at the root.
-pub const VOLUME_FORMAT: u32 = 3;
-/// The bytes of the stat record and of the attribute record.
+/// The bytes of the stat record.
 pub const STAT_LEN: usize = 64;
-pub const ATTR_LEN: usize = 48;
 
 /// The codes of the service (`Status::Unknown`), clear of the codes of the wire (below 512) and of the
 /// other services (blk 1101, the file service's).
@@ -693,14 +678,6 @@ pub fn open(path: &[u8], flags: u32, mode: u32, w: &mut Writer) -> Result<(), St
     start(Method::Open, w)?;
     w.u32(flags)?;
     w.u32(mode)?;
-    w.bytes(path)
-}
-
-/// OPEN as version 2 wrote it: the flags and the path, no mode. The service reads this layout
-/// until it reads the mode of version 3 (this item and `path_call` for MKDIR go with that change).
-pub fn open_v2(path: &[u8], flags: u32, w: &mut Writer) -> Result<(), Status> {
-    start(Method::Open, w)?;
-    w.u32(flags)?;
     w.bytes(path)
 }
 
@@ -1036,55 +1013,6 @@ impl Stat {
     }
 }
 
-/// The attribute of an entry in the volume (the module text has the layout).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Attr {
-    pub uid: u32,
-    pub gid: u32,
-    pub mode: u32,
-    pub ino: u64,
-    pub atime: i64,
-    pub mtime: i64,
-    pub ctime: i64,
-}
-
-impl Attr {
-    pub fn to_bytes(&self) -> [u8; ATTR_LEN] {
-        let mut b = [0u8; ATTR_LEN];
-        b[0..4].copy_from_slice(&self.uid.to_le_bytes());
-        b[4..8].copy_from_slice(&self.gid.to_le_bytes());
-        b[8..12].copy_from_slice(&self.mode.to_le_bytes());
-        b[12..16].copy_from_slice(&ATTR_FORMAT.to_le_bytes());
-        b[16..24].copy_from_slice(&self.ino.to_le_bytes());
-        b[24..32].copy_from_slice(&self.atime.to_le_bytes());
-        b[32..40].copy_from_slice(&self.mtime.to_le_bytes());
-        b[40..48].copy_from_slice(&self.ctime.to_le_bytes());
-        b
-    }
-
-    /// None for a length other than `ATTR_LEN`, a `format` other than `ATTR_FORMAT` or a mode
-    /// outside the mode bits.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Attr> {
-        if bytes.len() != ATTR_LEN {
-            return None;
-        }
-        let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-        let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
-        if u32_at(12) != ATTR_FORMAT || u32_at(8) & !MODE_MASK != 0 {
-            return None;
-        }
-        Some(Attr {
-            uid: u32_at(0),
-            gid: u32_at(4),
-            mode: u32_at(8),
-            ino: u64_at(16),
-            atime: u64_at(24) as i64,
-            mtime: u64_at(32) as i64,
-            ctime: u64_at(40) as i64,
-        })
-    }
-}
-
 /// The bytes of an entry of READDIR before its name: `ino` u64, `kind` u32, `name_len` u32.
 pub const DIR_ENTRY_HEAD: usize = 16;
 /// The bytes of a READDIR reply before its entries: the status and `more`.
@@ -1193,7 +1121,6 @@ impl<'a> DirEntries<'a> {
 // the batch of the longest names must fit the message and the numbers.
 const _: () = {
     assert!(STAT_LEN == 64);
-    assert!(ATTR_LEN == 48);
     assert!(DIR_ENTRY_HEAD == 16);
     // `/data` and a path reach the file service's longest path.
     assert!(MAX_PATH + "/data".len() == proto_fs_max_path());
@@ -1336,12 +1263,9 @@ mod tests {
             (32, 48, 32, 8, 1024)
         );
         assert_eq!((CLONE_MAX, MAX_PATH, NAME_MAX), (32, 506, 255));
-        assert_eq!((STAT_LEN, ATTR_LEN, DIR_ENTRY_HEAD), (64, 48, 16));
+        assert_eq!((STAT_LEN, DIR_ENTRY_HEAD), (64, 16));
         assert_eq!((MAX_READ, MAX_WRITE), (MESSAGE_MAX - 8, MESSAGE_MAX - 12));
-        assert_eq!(
-            (RESERVE_BLOCKS, INO_BLOCK, FILE_MAX),
-            (64, 1024, 2_147_483_647)
-        );
+        assert_eq!(FILE_MAX, 2_147_483_647);
         assert_eq!(MAX_PATH + "/data".len(), proto_fs::MAX_PATH);
     }
 
@@ -1377,42 +1301,6 @@ mod tests {
     }
 
     #[test]
-    fn the_attribute_record_is_48_bytes_and_round_trips() {
-        let attr = Attr {
-            uid: 1,
-            gid: 2,
-            mode: 0o2755,
-            ino: 0x1122_3344_5566_7788,
-            atime: 10,
-            mtime: 11,
-            ctime: 12,
-        };
-        let bytes = attr.to_bytes();
-        let mut want = [0u8; 48];
-        want[0] = 1;
-        want[4] = 2;
-        want[8..10].copy_from_slice(&0o2755u16.to_le_bytes());
-        want[12] = 1;
-        want[16..24].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
-        want[24] = 10;
-        want[32] = 11;
-        want[40] = 12;
-        assert_eq!(bytes, want);
-        assert_eq!(Attr::from_bytes(&bytes), Some(attr));
-        assert_eq!(Attr::from_bytes(&bytes[..47]), None);
-        let mut other = bytes;
-        other[12] = 2;
-        assert_eq!(Attr::from_bytes(&other), None);
-        let mut wide = bytes;
-        wide[10] = 0x10;
-        assert_eq!(Attr::from_bytes(&wide), None);
-        assert_eq!(
-            (ATTR_TYPE, ATTR_FORMAT_TYPE, ATTR_COUNTER_TYPE),
-            (0x70, 0x66, 0x69)
-        );
-    }
-
-    #[test]
     fn every_request_is_pinned_byte_for_byte() {
         let one = |f: &dyn Fn(&mut Writer) -> Result<(), Status>| {
             let mut w = Writer::new();
@@ -1422,10 +1310,6 @@ mod tests {
         assert_eq!(
             one(&|w| open(b"/a", READ | CREATE, 0o640, w)),
             bytes_of(Method::Open, &[5, 0, 0, 0, 0xa0, 0x01, 0, 0, b'/', b'a'])
-        );
-        assert_eq!(
-            one(&|w| open_v2(b"/a", READ, w)),
-            bytes_of(Method::Open, &[1, 0, 0, 0, b'/', b'a'])
         );
         assert_eq!(
             one(&|w| handle_call(Method::Close, 9, w)),
@@ -1573,9 +1457,6 @@ mod tests {
         let mut w = Writer::new();
         mkdir(b"/d", 0o755, &mut w).unwrap();
         assert_eq!(read_mode_path(body(&w)), Ok((0o755, &b"/d"[..])));
-        let mut w = Writer::new();
-        open_v2(b"/a", READ, &mut w).unwrap();
-        assert_eq!(w.as_bytes().len(), HEADER_LEN + 4 + 2);
     }
 
     #[test]

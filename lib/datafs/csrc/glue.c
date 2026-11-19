@@ -20,10 +20,10 @@
 #define LOOKAHEAD_MAX (128u * 1024u)
 
 #ifndef DATAFS_FILES
-#define DATAFS_FILES 8
+#define DATAFS_FILES 24
 #endif
 #ifndef DATAFS_DIRS
-#define DATAFS_DIRS 4
+#define DATAFS_DIRS 16
 #endif
 
 int datafs_rs_read(void *ctx, uint32_t block, uint32_t off, void *buffer, uint32_t size);

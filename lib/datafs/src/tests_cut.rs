@@ -45,7 +45,9 @@ impl Rig<'_> {
 
     fn open(&mut self, owner: u64, path: &[u8], flags: u32) -> u32 {
         word(
-            &self.call(owner, |w| p::open_v2(path, flags, w)).unwrap(),
+            &self
+                .call(owner, |w| crate::tests::opening(path, flags, w))
+                .unwrap(),
             0,
         )
     }
@@ -275,4 +277,200 @@ fn a_cut_in_the_recovery_is_finished_by_the_next_one() {
     }
     assert!(cuts > 100);
     let _ = (Error::Io, SECTORS);
+}
+
+/// The attribute of the version-3 server under the cut of the power at every sector: the creation
+/// of a file with its record, CHMOD, and the conversion of a volume of version 2.
+mod attributes {
+    use super::*;
+    use crate::fs::Open;
+    use crate::tests_perm::{OWNER, ROOT, Rig, SECTORS};
+
+    const SURVIVE: [Survive; 3] = [Survive::None, Survive::All, Survive::Random(7)];
+
+    /// The device of `rig` after the machine started again with `survive` of its cache.
+    fn restarted(rig: Rig, survive: Survive) -> Rig {
+        let mut device = rig.fs.into_device();
+        device.power_cycle(survive);
+        Rig::on(device)
+    }
+
+    /// A fresh device with `/d` (mode 0777), settled, as the base of a cut.
+    fn base() -> MemDevice {
+        let mut rig = Rig::new();
+        rig.mkdir(ROOT, b"/d", 0o777).unwrap();
+        rig.put(OWNER, b"/d/old", 0o644, b"data");
+        rig.fs.unmount().unwrap();
+        rig.fs.into_device()
+    }
+
+    #[test]
+    fn a_cut_in_the_creation_of_a_file_leaves_no_entry_the_whole_entry_or_an_empty_closed_one() {
+        // How many sectors the creation writes, uncut.
+        let mut probe = Rig::on(base());
+        let before = probe.fs.device().written;
+        probe.put(OWNER, b"/d/new", 0o640, b"");
+        let sectors = probe.fs.device().written - before;
+        assert!(sectors >= 2);
+        let (mut none, mut whole, mut closed) = (0, 0, 0);
+        for cut in 0..=sectors {
+            for survive in SURVIVE {
+                let mut rig = Rig::on(base());
+                rig.fs.device().cut_after(Some(cut));
+                let _ = rig.open(OWNER, b"/d/new", p::WRITE | p::CREATE, 0o640);
+                let mut rig = restarted(rig, survive);
+                match rig.stat(ROOT, b"/d/new") {
+                    Err(_) => none += 1,
+                    Ok(st) if (st.uid, st.gid, st.mode) == (1000, 100, 0o640) => {
+                        assert_eq!(st.size, 0);
+                        whole += 1;
+                    }
+                    Ok(st) => {
+                        // The name was committed and the record was not: the closed default.
+                        assert_eq!(
+                            (st.uid, st.gid, st.mode, st.size),
+                            (0, 0, 0o600, 0),
+                            "cut {cut}"
+                        );
+                        assert_eq!(
+                            rig.open(OWNER, b"/d/new", p::READ, 0),
+                            Err(p::code(p::ACCESS))
+                        );
+                        closed += 1;
+                    }
+                }
+                // The file that was there still reads, and the volume takes the next create.
+                let h = rig.open(ROOT, b"/d/old", p::READ, 0).unwrap();
+                assert_eq!(rig.read(ROOT, h, 10).unwrap(), b"data");
+                rig.put(OWNER, b"/d/next", 0o644, b"x");
+                assert_eq!(rig.stat(ROOT, b"/d/next").unwrap().uid, 1000);
+            }
+        }
+        assert!(
+            none > 0 && whole > 0,
+            "{none} none, {whole} whole, {closed} closed"
+        );
+    }
+
+    #[test]
+    fn a_cut_in_chmod_leaves_the_old_mode_or_the_new_and_nothing_else_changed() {
+        let mut probe = Rig::on(base());
+        let before = probe.fs.device().written;
+        probe.chmod(OWNER, b"/d/old", 0o600).unwrap();
+        let sectors = probe.fs.device().written - before;
+        let (mut old, mut new) = (0, 0);
+        for cut in 0..=sectors {
+            for survive in SURVIVE {
+                let mut rig = Rig::on(base());
+                rig.fs.device().cut_after(Some(cut));
+                let _ = rig.chmod(OWNER, b"/d/old", 0o600);
+                let mut rig = restarted(rig, survive);
+                let st = rig.stat(ROOT, b"/d/old").unwrap();
+                assert!(
+                    st.mode == 0o644 || st.mode == 0o600,
+                    "cut {cut}: {:o}",
+                    st.mode
+                );
+                assert_eq!((st.uid, st.gid, st.size), (1000, 100, 4));
+                if st.mode == 0o600 {
+                    new += 1;
+                } else {
+                    old += 1;
+                }
+            }
+        }
+        assert!(old > 0 && new > 0);
+    }
+
+    /// A volume as the 0.5 service left it: no attribute anywhere.
+    fn version_two() -> MemDevice {
+        let mut state = Storage::new();
+        let mut fs = Fs::new(MemDevice::new(SECTORS), &mut state).unwrap();
+        fs.format().unwrap();
+        fs.mount().unwrap();
+        for dir in [&b"/ssh"[..], b"/etc", b"/etc/inner"] {
+            fs.mkdir(dir).unwrap();
+        }
+        for (path, data) in [
+            (&b"/ssh/host_key"[..], &b"secret"[..]),
+            (b"/etc/conf", b"c"),
+            (b"/etc/inner/deep", b"d"),
+            (b"/top", b"t"),
+        ] {
+            let f = fs.open(path, Open::WRITE.with(Open::CREATE)).unwrap();
+            fs.write(f, data).unwrap();
+            fs.close(f).unwrap();
+        }
+        fs.unmount().unwrap();
+        fs.into_device()
+    }
+
+    #[test]
+    fn a_cut_in_the_conversion_of_a_volume_of_version_2_starts_again_and_ends() {
+        let paths: [&[u8]; 8] = [
+            b"/",
+            b"/ssh",
+            b"/ssh/host_key",
+            b"/etc",
+            b"/etc/conf",
+            b"/etc/inner",
+            b"/etc/inner/deep",
+            b"/top",
+        ];
+        // The sectors of the whole conversion, uncut.
+        let device = version_two();
+        let mut state = Storage::new();
+        let mut fs = Fs::new(device, &mut state).unwrap();
+        fs.mount().unwrap();
+        let mut server = server::Server::new();
+        let before = fs.device().written;
+        let report = server.mount_work(&mut fs).unwrap();
+        assert!(report.complete && report.converted >= 8, "{report:?}");
+        let sectors = fs.device().written - before;
+        assert!(sectors >= 9, "{sectors} sectors");
+        for cut in 0..=sectors {
+            for survive in SURVIVE {
+                let mut state = Storage::new();
+                let mut fs = Fs::new(version_two(), &mut state).unwrap();
+                fs.mount().unwrap();
+                let mut server = server::Server::new();
+                fs.device().cut_after(Some(cut));
+                let _ = server.mount_work(&mut fs);
+                let mut device = fs.into_device();
+                device.power_cycle(survive);
+                // The next start finishes it: every entry has its record, the mark is there, the
+                // numbers are all different, and the key is still closed.
+                let mut rig = Rig::on(device);
+                let mut numbers = Vec::new();
+                for path in paths {
+                    let st = rig.stat(ROOT, path).unwrap();
+                    let (mode, want) = (
+                        st.mode,
+                        if path == b"/" {
+                            0o755
+                        } else if st.kind == p::KIND_DIRECTORY {
+                            0o700
+                        } else {
+                            0o600
+                        },
+                    );
+                    assert_eq!(mode, want, "cut {cut} {}", String::from_utf8_lossy(path));
+                    assert_eq!((st.uid, st.gid), (0, 0));
+                    numbers.push(st.ino);
+                }
+                numbers.sort_unstable();
+                numbers.dedup();
+                assert_eq!(numbers.len(), paths.len(), "cut {cut}: {numbers:?}");
+                let mut mark = [0u8; 4];
+                rig.fs
+                    .getattr(b"/", crate::attr::ATTR_FORMAT_TYPE, &mut mark)
+                    .unwrap();
+                assert_eq!(u32::from_le_bytes(mark), 3);
+                assert_eq!(
+                    rig.open(OWNER, b"/ssh/host_key", p::READ, 0),
+                    Err(p::code(p::ACCESS))
+                );
+            }
+        }
+    }
 }

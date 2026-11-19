@@ -186,6 +186,7 @@ dependencies = [
  "abi",
  "cc",
  "littlefs",
+ "posix-perm",
  "proto-data",
  "proto-wire",
 ]

@@ -188,7 +188,7 @@ mod served {
         }
 
         fn try_open(&mut self, owner: u64, path: &[u8], flags: u32) -> Res {
-            self.call(owner, 0, |w| p::open_v2(path, flags, w))
+            self.call(owner, 0, |w| crate::tests::opening(path, flags, w))
         }
 
         fn write(&mut self, owner: u64, h: u32, data: &[u8]) -> u32 {
@@ -233,20 +233,26 @@ mod served {
         }
 
         fn path(&mut self, owner: u64, method: p::Method, path: &[u8]) -> Res {
-            self.call(owner, 0, |w| p::path_call(method, path, w))
+            self.call(owner, 0, |w| match method {
+                p::Method::Mkdir => p::mkdir(path, 0o755, w),
+                _ => p::path_call(method, path, w),
+            })
         }
 
         fn list(&mut self, owner: u64, path: &[u8]) -> Vec<String> {
-            let dir = self.open(owner, path, p::DIRECTORY);
+            let dir = self.open(owner, path, p::DIRECTORY | p::READ);
             let mut names = Vec::new();
             loop {
                 let e = self
                     .call(owner, 0, |w| p::handle_call(p::Method::Readdir, dir, w))
                     .unwrap();
-                if word(&e, 0) == 0 {
+                let mut batch = p::read_dir_reply(proto_wire::Reader::new(&e)).unwrap();
+                while let Some(entry) = batch.next_entry().unwrap() {
+                    names.push(String::from_utf8(entry.name.to_vec()).unwrap());
+                }
+                if !batch.more {
                     break;
                 }
-                names.push(String::from_utf8(e[12..].to_vec()).unwrap());
             }
             self.close(owner, dir).unwrap();
             names
@@ -548,7 +554,8 @@ mod served {
         let mut t = Rig::new(&mut state);
         let mut held = Vec::new();
         for i in 0..crate::server::HELD_MAX {
-            held.push(t.open(1, std::format!("/f{i}").as_bytes(), RW));
+            // Descriptions of eight files, so that the table of open files is not the limit met.
+            held.push(t.open(1, std::format!("/f{}", i % 8).as_bytes(), RW));
         }
         assert_eq!(t.try_open(1, b"/more", RW), Err(p::code(p::TOO_MANY_OPEN)));
         // The refusal took nothing: the same descriptions are all there is.
@@ -736,7 +743,7 @@ mod served {
         let mut state = Storage::new();
         let mut t = Rig::new(&mut state);
         let f = t.open(1, b"/f", RW);
-        assert_eq!(f >> 13, 7);
+        assert_eq!(f >> 16, 7);
         // The service restarts: a new instance over the same volume, epoch 8.
         let mut next = Server::with_epoch(8);
         let ask = |s: &mut Server, fs: &mut Fs<'_, MemDevice>, h: u32| {
@@ -747,14 +754,14 @@ mod served {
         assert_eq!(ask(&mut next, &mut t.fs, f), Err(p::code(p::STALE)));
         // The new instance's own handle works, and the old one still does on the old instance.
         let mut w = Writer::new();
-        p::open_v2(b"/f", p::READ, &mut w).unwrap();
+        crate::tests::opening(b"/f", p::READ, &mut w).unwrap();
         let r = next.handle(&mut t.fs, 1, 0, w.as_bytes());
         let g = word(p::reply(r.as_bytes()).unwrap().bytes(8).unwrap(), 0);
-        assert_eq!(g >> 13, 8);
+        assert_eq!(g >> 16, 8);
         assert_eq!(ask(&mut next, &mut t.fs, g), Ok(()));
         assert_eq!(ask(&mut next, &mut t.fs, 0), Err(p::code(p::BAD_HANDLE)));
         assert_eq!(
-            ask(&mut next, &mut t.fs, (8 << 13) | 99),
+            ask(&mut next, &mut t.fs, (8 << 16) | 99),
             Err(p::code(p::BAD_HANDLE))
         );
         // A handle that is current but held by another session is BAD_HANDLE.
@@ -805,7 +812,8 @@ mod served {
         let size = t
             .call(2, 0, |w| p::handle_call(p::Method::Fstat, g, w))
             .unwrap();
-        assert_eq!((word(&size, 0), word(&size, 8)), (p::KIND_FILE, 1));
+        let st = p::Stat::from_bytes(&size).unwrap();
+        assert_eq!((st.kind, st.nlink), (p::KIND_FILE, 1));
         // The owner's bytes were not dropped: its own fsync, with the disk back, puts them on the volume.
         t.call(1, 0, |w| p::handle_call(p::Method::Fsync, f, w))
             .unwrap();
@@ -890,7 +898,7 @@ mod served {
         let mut a = Server::with_epoch(one);
         let mut b = Server::with_epoch(3);
         let mut w = Writer::new();
-        p::open_v2(b"/x", p::READ | p::WRITE | p::CREATE, &mut w).unwrap();
+        crate::tests::opening(b"/x", p::READ | p::WRITE | p::CREATE, &mut w).unwrap();
         let h = word(
             p::reply(a.handle(&mut fs, 1, 0, w.as_bytes()).as_bytes())
                 .unwrap()
@@ -904,7 +912,7 @@ mod served {
         assert_eq!(p::reply(r.as_bytes()).map(drop), Err(p::code(p::STALE)));
         // The epoch fills the bits a handle has for it and never reads as 0.
         assert_eq!(Server::with_epoch(1 << server::EPOCH_BITS).open_count(), 0);
-        assert_eq!(h >> 13, one);
+        assert_eq!(h >> 16, one);
     }
 
     #[test]
@@ -916,7 +924,7 @@ mod served {
             .unwrap();
         let mut mine = Vec::new();
         for i in 0..crate::server::HELD_MAX {
-            mine.push(t.open(2, std::format!("/g{i}").as_bytes(), RW));
+            mine.push(t.open(2, std::format!("/g{}", i % 8).as_bytes(), RW));
         }
         // The session is full: the pass is not spent, and a retry after a close works.
         assert_eq!(t.call(2, 900, p::adopt), Err(p::code(p::TOO_MANY_OPEN)));
@@ -979,7 +987,8 @@ mod served {
             let r = t
                 .call(1, 0, |w| p::handle_call(p::Method::Fstat, f, w))
                 .unwrap();
-            (word(&r, 0), word(&r, 4), word(&r, 8))
+            let st = p::Stat::from_bytes(&r).unwrap();
+            (st.kind, st.size as u32, st.nlink)
         };
         t.write(1, f, b"abc");
         assert_eq!(fstat(&mut t), (p::KIND_FILE, 3, 1));
@@ -989,7 +998,8 @@ mod served {
         let r = t
             .call(1, 0, |w| p::handle_call(p::Method::Fstat, d, w))
             .unwrap();
-        assert_eq!((word(&r, 0), word(&r, 8)), (p::KIND_DIRECTORY, 1));
+        let st = p::Stat::from_bytes(&r).unwrap();
+        assert_eq!((st.kind, st.nlink), (p::KIND_DIRECTORY, 1));
     }
 
     /// An orphan that cannot be removed (a directory that is not empty, which nothing makes) does
