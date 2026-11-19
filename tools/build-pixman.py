@@ -6,12 +6,23 @@
 pinned source archive, unchanged, as one static library.
 
 The service is a program with no C library, so the build is freestanding:
-the portable C paths of pixman (no SIMD, no threads, no timers) compiled
+pixman with its AArch64 NEON paths (pixman-arm-neon.c and the two assembly
+files pixman-arma64-neon-asm.S and pixman-arma64-neon-asm-bilinear.S, which
+the meson option `a64-neon` builds) and its portable C paths (no threads,
+no timers) behind them, compiled
 with the headers of ports/pixman/include standing for a C library's, and
 ports/pixman/shim.c, which gives pixman the arena it allocates from and the
 few functions of <math.h> and <string.h> it calls. The result is
 target/pixman/libpixman.a, which lib/pixman's build script links, and
 target/pixman/COPYING, the licence the notices of the package carry.
+
+The NEON paths are the default. STAFETO_PIXMAN_PORTABLE=1 in the environment
+(or `--portable` on the command line) builds the portable C paths alone, as
+the first version of the service did. pixman picks its implementations when
+its tables are built: for a build with USE_ARM_A64_NEON it adds the NEON one
+with no test of the CPU (pixman-arm.c: "neon is a part of aarch64"), so the
+choice is made here, at build time, and nothing reads /proc or the auxiliary
+vector.
 
 pixman is under the MIT licence: the archive is fetched at build time with
 its SHA-256 checked, as the other C ports are, and the notice of the package
@@ -27,6 +38,7 @@ from pathlib import Path
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
 from urllib.request import urlopen
 
@@ -41,6 +53,11 @@ ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "pixman"
 PORT = ROOT / "ports" / "pixman"
 OUTPUT = WORK / "libpixman.a"
+# The portable C paths alone, with no NEON.
+PORTABLE = os.environ.get("STAFETO_PIXMAN_PORTABLE") == "1" or "--portable" in sys.argv[1:]
+# The AArch64 NEON paths: meson.build's `simds` entry for have_a64neon.
+NEON_C = "pixman-arm-neon"
+NEON_ASM = ["pixman-arma64-neon-asm", "pixman-arma64-neon-asm-bilinear"]
 # The files of `pixman_files` in pixman/meson.build.
 SOURCES = [
     "pixman", "pixman-access", "pixman-arm",
@@ -87,7 +104,8 @@ def main() -> None:
     script = sha256(Path(__file__).read_bytes()).hexdigest()
     port = sha256(b"".join(p.read_bytes() for p in sorted(PORT.rglob("*")) if p.is_file())).hexdigest()
     stamp = WORK / "stamp"
-    text = f"{VERSION} {SHA256} {script} {port}\n"
+    mode = "portable" if PORTABLE else "neon"
+    text = f"{VERSION} {SHA256} {script} {port} {mode}\n"
     if stamp.exists() and stamp.read_text() == text and OUTPUT.exists():
         print(f"pixman ready: {OUTPUT}")
         return
@@ -113,6 +131,10 @@ def main() -> None:
         template = template.replace(f"@PIXMAN_VERSION_{key}@", value)
     (include / "pixman-version.h").write_text(template)
     shutil.copy(PORT / "pixman-config.h", include / "pixman-config.h")
+    if not PORTABLE:
+        # What meson's config.set10('USE_ARM_A64_NEON', true) writes.
+        with (include / "pixman-config.h").open("a") as config:
+            config.write("#define USE_ARM_A64_NEON 1\n")
     shutil.copy(source / "pixman" / "pixman.h", include / "pixman.h")
     shutil.copy(source / "COPYING", WORK / "COPYING")
     resource = subprocess.run([str(clang), "-print-resource-dir"], capture_output=True,
@@ -129,6 +151,16 @@ def main() -> None:
         obj = WORK / "obj" / f"{name}.o"
         run(log, *cc, "-c", source / "pixman" / f"{name}.c", "-o", obj)
         objects.append(obj)
+    if not PORTABLE:
+        obj = WORK / "obj" / f"{NEON_C}.o"
+        run(log, *cc, "-c", source / "pixman" / f"{NEON_C}.c", "-o", obj)
+        objects.append(obj)
+        # The assembly goes through the C preprocessor with the same flags
+        # (the integrated assembler of the compiler, as meson would call it).
+        for name in NEON_ASM:
+            obj = WORK / "obj" / f"{name}.o"
+            run(log, *cc, "-c", source / "pixman" / f"{name}.S", "-o", obj)
+            objects.append(obj)
     shim = WORK / "obj" / "shim.o"
     run(log, *cc, "-fno-builtin", "-fno-math-errno", "-c", PORT / "shim.c", "-o", shim)
     objects.append(shim)

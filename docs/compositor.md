@@ -46,8 +46,10 @@ and the header version 1 of both.
   table's `COMP_MANAGERS`) lists the windows, moves them, raises them, shows and
   hides them and gives one the focus, and reads CREATE and CLOSE of every window
   in a ring of its own. While it has subscribed (DESCRIBE's `flags` bit 0), the
-  Alt keys and the keys pressed with Alt held are its alone, so Alt and Tab can
-  switch the windows without the window with the focus seeing them.
+  Super keys and the keys pressed with Super held are its alone, so Super and
+  Tab can switch the windows without the window with the focus seeing them. The
+  Alt, Ctrl and Shift keys stay the windows' (Doom binds all three). The
+  program `wm` (`apps/wm`, below) is the manager of the images that have one.
 - The input session (`INJECT`, INPUT_MARK, `COMP_INJECTORS`: the probes only)
   injects a key, the pointer's place on the screen or a button, which takes the
   path of the device's own event.
@@ -75,6 +77,26 @@ and the header version 1 of both.
   (`virtio-gpu`) makes the same check for its `fb` in OPEN, with three
   references of its own: its handle, its mapping and init's handle.
 
+## The window manager
+
+`apps/wm` is the manager as a program of its own: a client of init's table
+named `wm` (`table::COMP_MANAGERS`), which gets the manager's session of the
+compositor, subscribes, and answers the events of its ring. What it decides is
+in its library and tested on the host. A new window (CREATE) gets the focus and
+the top place (FOCUS does both). Super and Tab give them to the next shown
+window by number, wrapping (Super, Shift and Tab to the previous one: Shift is
+pressed after Super); Super and Q end the manager when the chord is released.
+It uses the manager requests that exist (SUBSCRIBE, LIST, FOCUS) and adds none.
+A click is the compositor's: it gives the window under the pointer the focus and
+the top place itself, so the manager does nothing for a click and nothing is
+done twice. Super is the modifier because Doom binds Alt, Ctrl and Shift, and
+the shell reads the console's keys and never this keyboard's. Tab alone and Q
+alone are the windows'. The manager's calls are the compositor's ordinary steps: LIST
+has at most MAX_WINDOWS records, no loop is added to a step. When the manager
+ends, the compositor goes on by its own rule: the window that has the focus
+keeps it, the first window shown takes it when no manager has subscribed, a click
+moves it, and a window that goes passes it to the one on top.
+
 ## Input
 
 The compositor is the client of two input services of init's table: the
@@ -82,11 +104,24 @@ keyboard's (`input`) and the pointer's (`pointer`, a second instance of
 `virtio-input` on a virtio-tablet). It asks each for the focus with a channel
 of its own in GRANT, and the driver sends that channel the bit 1 whenever a
 step put events into the ring; the compositor reads them (READ, up to 32 at a
-time, without waiting) in its own step. The keyboard's focus is the first
-revision's window's while that window lives: the keyboard then goes straight to
-it whatever window has the focus (Doom reads its keys from the service itself,
-as before; no image with a manager and a first-revision window exists, and the
-base image has no manager) and the compositor's again when it goes. The tablet
+time, without waiting) in its own step. The keyboard's focus is the
+compositor's always. A program of the first revision (Doom) reads its keys
+from the session of focus that OPEN gives, which is a session of the
+compositor itself: its READ (proto_input's, up to 64 keys at a time) takes the
+KEY events of the window's ring, so the keys reach the window while it has the
+focus and no other time (a window of the first revision takes no pointer
+events, so a stream of moves never pushes a key out of its ring). The keyboard's
+driver sees one holder of its focus, the compositor, which routes the keys by
+the rule of every window; where the image has no keyboard OPEN says NO_INPUT and
+gives no session of focus. A key's release goes where its press went (a window, the
+manager or nobody), so a tap of Super while a window holds a key leaves the
+release with the window; when the focus leaves a window of the first revision,
+which sees no FOCUS_OUT, the keys it still holds are released in its ring first
+and their real releases are dropped. When an input driver ends and init starts
+it again, the compositor takes its focus again (each grant's label carries a
+generation, so the end of an old grant is told from the new one), at its next
+own step and at OPEN; the connection to a driver that is starting again waits
+for it. The tablet
 reports `EV_ABS` `ABS_X` and `ABS_Y` from 0 to 32 767 across the screen and
 `BTN_LEFT` as a key; the compositor scales them to the screen's 640 by 400. The
 image of the probe (`table::focus`) has the tablet on the transport 13; the
@@ -98,15 +133,24 @@ only.
 The windows are put together by pixman 0.46.4 (MIT), built from its pinned
 source by `tools/build-pixman.py` (`packages/pixman.toml`: version, URL and
 SHA-256 of the archive) as a static library that `lib/pixman` links into the
-compositor: its portable C paths, with no SIMD, no threads and no timers, over
-the headers and the shim of `ports/pixman` (an arena of 32 KiB that pixman
+compositor: its AArch64 NEON paths (`pixman-arm-neon.c` and the two assembly
+files of meson's `a64-neon`) over its portable C paths, with no threads and no
+timers, over the headers and the shim of `ports/pixman` (an arena of 32 KiB that pixman
 allocates from, and the few functions of a C library it calls). Two files of
 pixman are left out and replaced by one function each in the shim: the
 combiners of the wide formats and the accessors of images, which windows of 8
 bits to the channel never reach. The package installs no file: its licence
 notice is the one the distribution carries for it
 (`/usr/share/licenses/pixman/`), and `xtask packages` accepts it as a library
-of a service (`SERVICE_LIBRARIES`). The copy of a band and the lay of a band over
+of a service (`SERVICE_LIBRARIES`). pixman adds its NEON implementation to its
+table with no test of the CPU when it is built with `USE_ARM_A64_NEON` (every
+AArch64 CPU has the instructions), so nothing reads `/proc` or the auxiliary
+vector, and programs may use the FP and SIMD registers: the kernel saves and
+loads them at every switch between threads (`karch/src/fpsimd.S`,
+`kernel/src/thread.rs`, `run`), and programs are built for
+`aarch64-unknown-none`, with FP and SIMD. `STAFETO_PIXMAN_PORTABLE=1` (or
+`tools/build-pixman.py --portable`) builds the portable C paths alone. The
+copy of a band and the lay of a band over
 the screen are pixman's SRC and OVER; the glue is `lib/pixman` and
 `services/compositor/src/px.rs`.
 
@@ -202,7 +246,9 @@ a window, a rectangle of it posted alone, two windows, the black screen after
 the first client ended, and a window of the first revision (pattern and a
 rectangle). Under `-icount` it measures the steps of the compositor and of
 the driver: every step stays under 0.9 of term B, and a band of a frame, like
-a portion of the driver's clearing, under 16 328 ticks. `cargo xtask
+a portion of the driver's clearing, under 16 328 ticks, and tells what each kind of layer costs a point inside
+the bands (`service raster` lines of `px::cost`; the constants of
+`Scene::tile` are set from them). `cargo xtask
 doom-probe` runs Doom through the compositor.
 
 `cargo xtask focus-probe` (stage G2) runs the compositor with a tablet, two
@@ -214,14 +260,22 @@ on Alt and Tab, and the screen after the second client ended and the first
 went on untouched. Each client's events must be exactly the list it expects:
 the keys only while it had the focus, the focus changes, the click in its own
 coordinates. QEMU's tablet then moves and presses through the monitor, and the
-surviving window must see the click. Under `-icount` it measures the steps of
+surviving window must see the click. The same command then runs the image of the
+window manager (`table::focus::WM_TABLE`: the program `wm`, a keyboard's
+driver, a native client and a client of the first revision): the manager gives
+each new window the focus, Super and Tab switch the windows twice, and the keys
+reach the window with the focus only, the window of the first revision among
+them; the manager then ends on Super and Q, the compositor answers and keeps
+the focus where it was, and the focus passes to the window on top by the
+compositor's own rule when the first client ends. Under `-icount` it measures the steps of
 the compositor and of the tablet's driver (each under 0.9 of term B, a band
 under 16 328 ticks).
 
 ## Not yet
 
-The period of a frame and its counters, a window's resize, NEON paths of
-pixman, a window manager as a program of its own (the probe's manager is a role
-of `focus-probe`), the pointer in the base image, the layers of the display
+The period of a frame and its counters, a window's resize, the constants of
+the bands set from the NEON costs (the probes report them), the window manager
+and the keyboard in the base image (the manager's image is the probe's), the
+pointer in the base image, the layers of the display
 controller and the bypass of the composition for one window, and the C
 functions for windows in `libc.so` (a change of the ABI series).
