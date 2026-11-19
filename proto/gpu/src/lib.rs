@@ -88,6 +88,12 @@
 //! The rules the driver keeps in the order of the device's commands, so
 //! that a service of composition may rely on them:
 //!
+//! - A row may bind the pool (source 2) or the cursor picture (source 3)
+//!   only after SOURCE gave that kind to this owner: otherwise the whole
+//!   request is INVALID, as for a source the device does not have. A
+//!   program that holds a copy of the pool from an earlier owner of the
+//!   screen therefore cannot have its drawing shown through a later
+//!   owner's session. Source 1, the target, is always the owner's.
 //! - A primary row that binds a source other than the one bound now makes
 //!   the driver transfer the whole of the new source to the host, set the
 //!   scanout to it, and only then flush the whole screen: the transfer is
@@ -105,7 +111,10 @@
 //!   the cursor update. A transfer that waits for a frame's work in the
 //!   control queue goes after it.
 //! - A cursor row with source 0 hides the cursor. A cursor row that only
-//!   moves is a move of the cursor.
+//!   moves is a move of the cursor, which carries the resource of the
+//!   picture (the device takes the resource of every cursor command as
+//!   the pointer's on flag). A new hot spot alone is an update with no
+//!   transfer, since the device takes the hot spot on updates only.
 //! - The device reads the cursor's points only on its update command. A
 //!   cursor row with the same source and a nonzero changed area therefore
 //!   makes the driver transfer the whole picture again with a fence and

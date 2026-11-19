@@ -15,11 +15,16 @@
 //! 0; the driver checks the magic and the ID at its address before it
 //! writes.
 //!
-//! The service holds two DMA objects: `dma` (16 pages, uncached: the
-//! queue, then the commands and their answers) and `fb` (a megabyte of
+//! The service holds four DMA objects: `dma` (16 pages, uncached: the two
+//! queues, then the commands and their answers), `fb` (a megabyte of
 //! cached memory: the screen's buffer, which the owner of the screen
-//! maps), the second with DUPLICATE so that the owner gets a copy with
-//! MAP_READ and MAP_WRITE only. The device masters the bus with no SMMU
+//! maps), `pool` (another megabyte of cached memory: a buffer the owner may
+//! have shown directly, the device's resource 2) and `cursor` (4 pages,
+//! uncached: the cursor's picture of 64 by 64 points, resource 3), the
+//! last three with DUPLICATE so that the owner gets a copy with MAP_READ and
+//! MAP_WRITE only. Their physical addresses come first in the own
+//! arguments, in this order, and the transport's address after them
+//! (offset 32). The device masters the bus with no SMMU
 //! (spec 9): the driver is trusted, and init stops the device before the
 //! objects of an instance that ended go: Status 0, which reads 0 once the
 //! reset is done.
@@ -39,8 +44,8 @@ pub const LINE: u32 = 48 + 23;
 /// `Status` of a virtio-mmio transport (Virtio 1.2, 4.2.2).
 const MMIO_STATUS: u64 = 0x70;
 
-/// The objects of an instance: the queue and the commands, and the buffer
-/// of the screen.
+/// The objects of an instance: the queues and the commands, the buffer of
+/// the screen, the pool and the cursor's picture.
 pub const DMA: &[Dma] = &[
     Dma {
         name: "dma",
@@ -52,6 +57,18 @@ pub const DMA: &[Dma] = &[
         name: "fb",
         size: 256 * PAGE,
         uncached: false,
+        duplicate: true,
+    },
+    Dma {
+        name: "pool",
+        size: 256 * PAGE,
+        uncached: false,
+        duplicate: true,
+    },
+    Dma {
+        name: "cursor",
+        size: 4 * PAGE,
+        uncached: true,
         duplicate: true,
     },
 ];
