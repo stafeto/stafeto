@@ -584,6 +584,18 @@ impl Pipes {
         }
     }
 
+    /// How many operations wait at a ring end (the timing line of `steps`
+    /// builds); 0 for a socket.
+    #[cfg(feature = "steps")]
+    pub fn queue_waiters(&self, queue: u32) -> usize {
+        if (queue as usize) < DESCRIPTIONS {
+            let (index, is_write) = proto_pipe::end_of(queue);
+            usize::from(self.pipes[index].ends[usize::from(is_write)].count)
+        } else {
+            0
+        }
+    }
+
     fn readiness_at(&self, index: usize, end: usize) -> u32 {
         use proto_wire::watch;
         let pipe = &self.pipes[index];
@@ -1370,8 +1382,22 @@ mod tests {
         r.wr.iter().chain(&r.rd).copied().collect()
     }
 
+    /// Subscribes the portions of the record in `r` up to the last, and
+    /// returns what each one subscribed.
+    fn portions(r: &mut Rig) -> Vec<watches::Portion> {
+        let mut all = Vec::new();
+        loop {
+            let one = portion(r);
+            all.push(one);
+            if one.last {
+                return all;
+            }
+            assert!(all.len() <= 32, "the portions end");
+        }
+    }
+
     #[test]
-    fn a_set_of_32_queues_is_subscribed_in_two_portions_of_16() {
+    fn a_set_of_32_queues_is_subscribed_in_portions_of_the_step_bound() {
         let mut r = rig();
         let queues = all_queues(&r);
         let (set, q) = watch_of(&queues);
@@ -1380,18 +1406,23 @@ mod tests {
         let first = portion(&mut r);
         assert_eq!(
             (first.subscribed, first.last, first.ready),
-            (16, false, false)
+            (watches::WATCH_STEP_QUEUES, false, false)
         );
         assert_eq!(
             queues.iter().filter(|&&q| waiting_at(&r.p, q) == 1).count(),
-            16
+            watches::WATCH_STEP_QUEUES
         );
         assert_eq!(r.pool.pending(), Some((LABEL, KEY, r.at)));
-        let second = portion(&mut r);
-        assert_eq!(
-            (second.subscribed, second.last, second.ready),
-            (16, true, false)
+        let rest = portions(&mut r);
+        assert!(
+            rest.iter()
+                .all(|p| p.subscribed <= watches::WATCH_STEP_QUEUES)
         );
+        assert_eq!(
+            first.subscribed + rest.iter().map(|p| p.subscribed).sum::<usize>(),
+            32
+        );
+        assert!(rest.iter().rev().skip(1).all(|p| !p.last && !p.ready));
         assert!(queues.iter().all(|&q| waiting_at(&r.p, q) == 1));
         assert_eq!(r.pool.pending(), None);
     }
@@ -1400,21 +1431,21 @@ mod tests {
     fn a_description_repeated_across_the_boundary_is_subscribed_once() {
         let mut r = rig();
         let q = all_queues(&r);
-        // 16 distinct, then repeats of the last and the first of them, then
-        // 14 more distinct: 32 elements, 30 queues.
-        let mut elements: Vec<u32> = q[..16].to_vec();
-        elements.extend([q[15], q[0]]);
-        elements.extend(&q[16..30]);
-        assert_eq!(elements.len(), 32);
+        // The queues of the first portion, repeats of the last and the
+        // first of them, then 14 more distinct ones.
+        let mut elements: Vec<u32> = q[..watches::WATCH_STEP_QUEUES].to_vec();
+        elements.extend([q[watches::WATCH_STEP_QUEUES - 1], q[0]]);
+        elements.extend(&q[watches::WATCH_STEP_QUEUES..watches::WATCH_STEP_QUEUES + 14]);
         let (set, queues) = watch_of(&elements);
         r.at = r.pool.insert(LABEL, KEY, set, queues).unwrap();
-        assert_eq!(portion(&mut r).subscribed, 16);
-        assert_eq!(portion(&mut r).subscribed, 14);
+        assert_eq!(portion(&mut r).subscribed, watches::WATCH_STEP_QUEUES);
+        let rest: usize = portions(&mut r).iter().map(|p| p.subscribed).sum();
+        assert_eq!(rest, 14);
         assert_eq!(r.pool.pending(), None);
-        for &queue in &q[..30] {
+        for &queue in &q[..watches::WATCH_STEP_QUEUES + 14] {
             assert_eq!(waiting_at(&r.p, queue), 1, "queue {queue}");
         }
-        assert_eq!(waiting_at(&r.p, q[30]), 0);
+        assert_eq!(waiting_at(&r.p, q[watches::WATCH_STEP_QUEUES + 14]), 0);
     }
 
     #[test]
@@ -1452,29 +1483,38 @@ mod tests {
         let (set, q) = watch_of(&queues);
         r.at = r.pool.insert(LABEL, KEY, set, q).unwrap();
         portion(&mut r);
-        // The read ends are in the second portion: nobody is subscribed.
+        // The read ends are in the later portions: nobody is subscribed.
         let mut wakes = Wakes::default();
         let wr = r.wr[3];
         assert_eq!(r.p.write(&r.held, wr, &[7], &mut wakes), Ok(Some(1)));
         assert!(woke(&wakes).is_empty());
-        let last = portion(&mut r);
+        let rest = portions(&mut r);
+        let last = rest.last().unwrap();
         assert!(last.last);
         assert!(last.ready, "the waiter is told after the last portion");
     }
 
     #[test]
-    fn a_refusal_in_the_second_portion_marks_the_record() {
+    fn a_refusal_in_a_later_portion_marks_the_record() {
         let mut r = rig();
         let queues = all_queues(&r);
         let (set, q) = watch_of(&queues);
         r.at = r.pool.insert(LABEL, KEY, set, q).unwrap();
-        // Fill a read end, which the second portion subscribes to.
+        // Fill a read end, which a later portion subscribes to.
+        assert!(queues.iter().position(|&q| q == r.rd[5]).unwrap() >= watches::WATCH_STEP_QUEUES);
         for i in 0..WAITERS as u64 {
             r.p.wait_new(r.rd[5], (9, i), |_| true).unwrap();
         }
-        assert_eq!(portion(&mut r).subscribed, 16);
-        assert_eq!(r.pool.portion(r.at, &mut r.p, |_| true, true), Err(AGAIN));
+        assert_eq!(portion(&mut r).subscribed, watches::WATCH_STEP_QUEUES);
+        let refused = loop {
+            match r.pool.portion(r.at, &mut r.p, |_| true, true) {
+                Ok(p) => assert!(!p.last),
+                Err(code) => break code,
+            }
+        };
+        assert_eq!(refused, AGAIN);
         assert!(!r.pool.refused(LABEL, KEY));
+        assert_eq!(r.pool.pending(), Some((LABEL, KEY, r.at)));
         r.pool.refuse(LABEL, KEY);
         assert!(r.pool.refused(LABEL, KEY));
         assert_eq!(r.pool.pending(), None);
@@ -1483,6 +1523,7 @@ mod tests {
         }
         r.pool.remove(LABEL, KEY);
         assert!(!r.pool.refused(LABEL, KEY));
+        assert_eq!(r.pool.pending(), None);
         for &queue in &queues {
             let own = waiting_at(&r.p, queue);
             assert_eq!(own, if queue == r.rd[5] { WAITERS } else { 0 });
@@ -1490,8 +1531,8 @@ mod tests {
     }
 
     #[test]
-    fn a_set_of_16_or_fewer_has_no_continuation() {
-        for n in [1usize, 5, 16] {
+    fn a_set_within_one_portion_has_no_continuation() {
+        for n in [1usize, 5, watches::WATCH_STEP_QUEUES] {
             let mut r = rig();
             let elements: Vec<u32> = all_queues(&r)[..n].to_vec();
             let (set, q) = watch_of(&elements);

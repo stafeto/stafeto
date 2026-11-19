@@ -21,14 +21,23 @@ struct Registration {
     refused: bool,
 }
 
+impl Registration {
+    /// A live record with queues still to subscribe.
+    fn open(&self) -> bool {
+        !self.retired && !self.refused && self.registered < self.wanted
+    }
+}
+
 /// The most queues one step of the service subscribes a watch to. A request
-/// subscribes the first portion and answers `Wait`, and a turn of the
-/// service's own subscribes each next portion, so no step grows with the
-/// size of the set (at most `MAX` = 32 elements). In `posix-poll` the
-/// request step of a set of 32 was 19563 ticks against the bound of
-/// 20410 (96 %); the portion of 16 brings it to about 15200, under 0.9 of
-/// the bound (18369). Should a run show more than 16500, lower this to 8.
-pub const WATCH_STEP_QUEUES: usize = 16;
+/// subscribes the first portion and answers `Wait`, and a turn of its own
+/// subscribes each next portion, so no step grows with the size of the set
+/// (at most `MAX` = 32 elements). In `posix-poll` the request step of a set
+/// of 32 took 19563 ticks against the bound of 20410 (96 %). Parsing and
+/// the readiness check of 32 elements are 7200 of them whatever the split,
+/// and a subscription costs 270 ticks and more with each operation already
+/// waiting at the queue (up to 8), so a portion of 8 keeps the step under
+/// 16500 where a portion of 16 reached 18501 (0.9 of the bound is 18369).
+pub const WATCH_STEP_QUEUES: usize = 8;
 
 /// What one portion of a watch's subscriptions did (`Pool::portion`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +76,9 @@ pub fn unique_queues(queues: &[u8]) -> impl Iterator<Item = u32> + '_ {
 
 pub struct Pool<const N: usize> {
     list: [Option<Registration>; N],
+    /// How many records are open (`Registration::open`): `pending` costs no
+    /// scan of the places while none is.
+    open: u16,
 }
 impl<const N: usize> Default for Pool<N> {
     fn default() -> Self {
@@ -89,7 +101,10 @@ impl<const N: usize> Pool<N> {
     }
 
     pub const fn new() -> Self {
-        Self { list: [None; N] }
+        Self {
+            list: [None; N],
+            open: 0,
+        }
     }
     /// Puts the record in a free place and returns the place.
     pub fn insert(
@@ -115,13 +130,17 @@ impl<const N: usize> Pool<N> {
             wanted: unique_queues(&queues[..set.len]).count() as u8,
             refused: false,
         });
+        self.open += 1;
         Some(at)
     }
     /// The first live record with queues still to subscribe, and its place.
     pub fn pending(&self) -> Option<(u64, u64, usize)> {
+        if self.open == 0 {
+            return None;
+        }
         self.list.iter().enumerate().find_map(|(at, r)| {
             let r = r.as_ref()?;
-            (!r.retired && !r.refused && r.registered < r.wanted).then_some((r.label, r.key, at))
+            r.open().then_some((r.label, r.key, at))
         })
     }
     /// Subscribes the next portion (at most `WATCH_STEP_QUEUES` queues) of
@@ -152,6 +171,9 @@ impl<const N: usize> Pool<N> {
             r.registered += 1;
         }
         let last = r.registered >= r.wanted;
+        if last {
+            self.open -= 1;
+        }
         let ready = check
             && last
             && (0..r.set.len).any(|i| {
@@ -168,6 +190,9 @@ impl<const N: usize> Pool<N> {
     /// The record at `at` needs no more subscriptions.
     pub fn complete(&mut self, at: usize) {
         if let Some(r) = self.list[at].as_mut() {
+            if r.open() {
+                self.open -= 1;
+            }
             r.registered = r.wanted;
         }
     }
@@ -180,6 +205,9 @@ impl<const N: usize> Pool<N> {
             .flatten()
             .find(|r| !r.retired && r.label == label && r.key == key)
         {
+            if r.open() {
+                self.open -= 1;
+            }
             r.refused = true;
         }
     }
@@ -203,11 +231,15 @@ impl<const N: usize> Pool<N> {
             .map(|r| &r.set)
     }
     pub fn remove(&mut self, label: u64, key: u64) -> Option<WatchSet> {
-        self.list
+        let record = self
+            .list
             .iter_mut()
             .find(|r| r.is_some_and(|r| !r.retired && r.label == label && r.key == key))?
-            .take()
-            .map(|r| r.set)
+            .take()?;
+        if record.open() {
+            self.open -= 1;
+        }
+        Some(record.set)
     }
     pub fn queues(&self, label: u64, key: u64) -> Option<&[u8; MAX]> {
         self.list
@@ -218,8 +250,16 @@ impl<const N: usize> Pool<N> {
     }
     pub fn retire(&mut self, label: u64) {
         for r in self.list.iter_mut().flatten().filter(|r| r.label == label) {
+            if r.open() {
+                self.open -= 1;
+            }
             r.retired = true;
         }
+    }
+    /// The places in use (the timing line of `steps` builds).
+    #[cfg(feature = "steps")]
+    pub fn live(&self) -> usize {
+        self.list.iter().flatten().count()
     }
     pub fn cleanup_due(&self) -> bool {
         self.list.iter().flatten().any(|r| r.retired)
@@ -254,6 +294,36 @@ mod tests {
             unique_queues(&[128, 255, 128, 0, 255]).collect::<Vec<_>>(),
             [128, 255, 0]
         );
+    }
+
+    #[test]
+    fn open_records_are_counted_through_each_way_out() {
+        let mut pool = Pool::<4>::new();
+        let mut set = WatchSet::new();
+        set.len = 2;
+        let mut queues = [0; MAX];
+        queues[1] = 1;
+        assert_eq!(pool.pending(), None);
+        let a = pool.insert(1, 1, set, queues).unwrap();
+        let b = pool.insert(1, 2, set, queues).unwrap();
+        let c = pool.insert(2, 3, set, queues).unwrap();
+        let d = pool.insert(3, 4, set, queues).unwrap();
+        assert_eq!(pool.pending(), Some((1, 1, a)));
+        pool.complete(a);
+        assert_eq!(pool.pending(), Some((1, 2, b)));
+        pool.refuse(1, 2);
+        assert_eq!(pool.pending(), Some((2, 3, c)));
+        pool.retire(2);
+        assert_eq!(pool.pending(), Some((3, 4, d)));
+        assert!(pool.remove(3, 4).is_some());
+        assert_eq!(pool.pending(), None);
+        assert_eq!(pool.open, 0);
+        // The second refusal, retirement or removal of the same record
+        // does not count it out twice.
+        pool.refuse(1, 2);
+        pool.retire(1);
+        pool.retire(2);
+        assert_eq!(pool.open, 0);
     }
 
     #[test]

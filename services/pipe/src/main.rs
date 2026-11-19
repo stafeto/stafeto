@@ -568,7 +568,20 @@ impl PipeService {
         }
         self.kick();
         #[cfg(feature = "steps")]
-        steps_parts::print(rt::time::now() - began);
+        {
+            let turn = rt::time::now() - began;
+            let live = self.watches.live();
+            let waiting = match (
+                self.watches.queues(label, key),
+                self.watches.get(label, key),
+            ) {
+                (Some(queues), Some(set)) => pipe::watches::unique_queues(&queues[..set.len])
+                    .map(|queue| self.pipes.queue_waiters(queue))
+                    .sum(),
+                _ => 0,
+            };
+            steps_parts::print(turn, live, waiting);
+        }
         true
     }
 
@@ -2080,12 +2093,12 @@ mod steps_parts {
         }
     }
 
-    pub fn print(turn: u64) {
+    pub fn print(turn: u64, live: usize, waiting: usize) {
         let [parse, ready, insert, subscribe, kick] =
             [0, 1, 2, 3, 4].map(|i| PARTS[i].swap(0, Ordering::Relaxed));
         if parse | ready | insert | subscribe | kick != 0 {
             rt::println!(
-                "pipe: watch parts parse {parse} ready {ready} insert {insert} subscribe {subscribe} kick {kick} turn {turn}"
+                "pipe: watch parts parse {parse} ready {ready} insert {insert} subscribe {subscribe} kick {kick} turn {turn} records {live} waiting {waiting}"
             );
         }
     }
