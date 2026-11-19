@@ -276,11 +276,11 @@ fork, a signal and close are checked by the program.
 
 One process can take all 8 window places through clones of its session. A
 client at level 1 that posts without pause drives composition at level 32
-with no budget. The frame clock caps the work of a period (the cap above), so the
-service leaves the rest of the period to the levels below it. The cap bounds the CPU
-the service takes in all, so one client that posts without pause can still fill every
-period's cap. The cap is the one bound of the service's share until the budgets of
-stage 5.
+with no budget. On the frame clock the cap bounds the work of a period (the cap
+below), so the service leaves the rest of the period to the levels below it, and one
+client that posts without pause can still fill every period's cap. The cap is the one
+bound of the service's share until the budgets of stage 5. In the free run (the image
+of the measures) there is no cap and no period.
 
 ## Steps
 
@@ -303,7 +303,7 @@ each shown window that touches the damage is a call of pixman, a price for each
 of its lines and a price for each of its points (`compositor::PRICES`: the call
 in ticks, the line and the point in hundredths of a tick, for a copy, a layer
 laid over others and the black; the upper fit of the model over the greatest
-ticks measured on 23 shapes of operations under -icount, with a margin of 15 %:
+ticks measured on 26 shapes of operations under -icount, with a margin of 15 %:
 the model errs only high), and a band holds the lines of the damage's width that
 14 000 ticks (`BAND_TICKS`, the work of a band by the model: the step around it costs about 1 080 ticks more, so a band of eight windows stays under 15 800 of the gate of 16 328) leave after its calls, a fixed term for every band (`BAND_FIXED`, 644 ticks: what `compose` spends around its operations in a band of no layer, 560 measured, with the margin) and a term for every layer (`LAYER`, 288 ticks: 250 measured on the real bands, with the margin), down the damage and across it, so that eight windows in one band stay
 under the bound (the shapes measured go up to the width of the screen), and then goes to the driver
@@ -334,8 +334,12 @@ A change (a POST, a window going) waits for the start of the next period: an
 absolute timer of the service's own channel fires at it and takes the frame
 (`timer_set` on the `clock_now` scale), and a stale expiry (a timer that fires after
 the frame it was set for was taken some other way) does nothing. A period holds
-at most the cap of work: 750 000 millionths of T, in bands of 14 000 ticks of 16 ns,
-which is 55 bands at 60 Hz. The bands the cap puts off go on at the start of the
+at most the cap of work: 750 000 millionths of T, counted in bands at the gate of a
+band (`BAND_GATE`, 16 328 ticks of 16 ns, 0.8 of term B, the same number as the portion
+gate of the probes), which is 47 bands at 60 Hz (`frame::band_cap`, the one function the
+service and the probes use). The service then takes at most 47 bands at their gates and
+three steps of 18 369 ticks, 822 523 ticks or about 79 % of a period, and the levels
+below it keep the rest. The cap is not in the free run. The bands the cap puts off go on at the start of the
 next period, so a large frame spans several periods and the clients' requests,
 and the service's own steps, pass between its bands as before.
 
@@ -345,18 +349,38 @@ post after the start it was awaited at as late and a window that posted nothing 
 the next start as missed (a window of the first revision has no interval). STATS
 (a session of the manager or the input service may add RESET) answers the 17
 counters of the clock (`proto_comp::Stats`: frames, late, skipped, capped, wakeups,
-the longest take, compose, device wait and frame in microseconds, and others), a histogram of the time from the start of a period
+the longest take, compose, device wait and frame in microseconds, and others; the
+definitions are below), a histogram of the time from the start of a period
 to the frame shown (33 buckets of T/16, the last for 2T and more) and a record of
 32 bytes for each window (its id, interval, posts, takes, replaced buffers, late, missed and the
 greatest lateness in microseconds). Both are in `proto/comp` with their layout and the rule for the
 client's free buffers: it keeps its own mask for the life of the window and posts
 only a buffer whose bit is set.
 
+The counters are these. The time of a frame is the time from the start t(k) of the
+period a frame was taken at to the step that sees FRAME_SHOWN; the time to compose is
+from t(k) to the commit; the delay of a taking is from t(k) to the step that takes the
+frame; the time of the device is from the commit to FRAME_SHOWN. `late` counts frames
+shown strictly after t(k+1); `skipped` the starts of a period at which a change waited
+and nothing was taken (damage that had gone, windows held for their intervals);
+`capped` the periods in which the cap put bands off; `wakeups` the firings of the
+frame's timer that did something; `failed` the frames the device failed; `band_max_us`
+is the longest step of a band by the wall. `period_us` is the period, 0 in the free
+run, and `cap_us` is the value of the model: the cap's bands at their gate, at 16 ns a
+tick (the counter of a run under -icount, 62.5 MHz). On HVF and on a board `cap_us`
+does not match the wall.
+
+An expiry of the timer that arrives before the time the timer is armed for is
+`Fire::Early`: the kernel delivers the expiry of an earlier deadline that `timer_set`
+has moved since. The service does nothing, the timer stays armed and no wakeup is
+counted.
+
 The free run is a period of 0: no timer, a frame as soon as the device is ready and
 no cap, the behaviour before the clock. The record `COMPOSITOR_KEYS_FREE` of
-`services/init/src/table/comp.rs` has it, and the games image uses it so that the
-frames a second of `doom-measure` stay comparable with the series; every other
-image runs at 60 Hz. The pure part of the clock is `services/compositor/src/frame.rs`
+`services/init/src/table/comp.rs` has it, and only the image of the measures
+(`boot-doom-steps.img`, the table `table-doom-free` of init, which `doom-measure`
+boots) uses it so that the frames a second stay comparable with the series; the
+games image of the release (`boot-doom.img`) and every other image run at 60 Hz. The pure part of the clock is `services/compositor/src/frame.rs`
 (the periods, the cap, the windows' pace, the histogram and the response-time bound
 `frame::bound` with the terms of the tables), which the host tests pin; the wiring is
 in `main.rs`.
@@ -521,8 +545,11 @@ what else it compares and how.
 A window's resize, a frame clock that follows the display's own vertical blank
 (the period is the service's, and the free run is the only way without it), the
 sharing of the cap between clients, a call of pixman for the parts of windows that
-do not overlap (eight translucent windows on one place cost eight calls a band and
-30 periods a frame at 60 Hz under -icount), the window manager
+do not overlap (eight translucent windows on one place cost eight calls a band, and
+the worst scene, eight of them over the whole screen, is 15 bands a line and 6 000 bands
+a frame: 128 periods at the cap of 47, 2.1 s at 60 Hz under -icount; eight of 320 by
+200 points are 1 600 bands and 35 periods; a copy of the whole screen that no window
+covers is 50 bands and 2 periods), the window manager
 and the keyboard in the base image (the manager's image is the probe's), the
 pointer in the base image, the layers of the display
 controller, a window of the second revision shown directly (the flag `SCANOUT`
