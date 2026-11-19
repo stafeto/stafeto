@@ -733,8 +733,10 @@ static int write_pwrite_and_read_back(void) {
 }
 
 #define APPEND_LINES 1000
+/* "%c%04d-%.44s\n": a letter, four digits, a dash, 44 characters and the newline. */
+#define APPEND_LINE_BYTES 51
 
-/* One process appends APPEND_LINES lines of a letter, each of about 60 bytes (one message). */
+/* One process appends APPEND_LINES lines of a letter, each of 51 bytes (one message). */
 static int append_lines(const char *path, char letter) {
     int fd = open(path, O_WRONLY | O_APPEND);
     if (fd < 0) return 1;
@@ -755,7 +757,7 @@ static int append_from_two_processes(void) {
     DATA_CHECK(posix_spawn(&pid, "/bin/posix-data", NULL, NULL, argv, environ) == 0);
     DATA_CHECK(append_lines("/data/w-append", 'A') == 0);
     DATA_CHECK(wait_ok(pid) == 0);
-    /* 2,000 lines of 56 bytes, whole: none cut by the other writer, each number once per letter. */
+    /* 2,000 lines of 51 bytes, whole: none cut by the other writer, each number once per letter. */
     static unsigned char seen[2][APPEND_LINES];
     memset(seen, 0, sizeof seen);
     FILE *f = fopen("/data/w-append", "r");
@@ -764,7 +766,7 @@ static int append_from_two_processes(void) {
     int lines = 0;
     while (fgets(line, sizeof line, f) != NULL) {
         int number = 0;
-        if (strlen(line) != 56 || (line[0] != 'A' && line[0] != 'B') || line[5] != '-') {
+        if (strlen(line) != APPEND_LINE_BYTES || (line[0] != 'A' && line[0] != 'B') || line[5] != '-') {
             printf("posix-data: a line is cut or mixed: %.60s\n", line);
             fclose(f);
             return 20;
