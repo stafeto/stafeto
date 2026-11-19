@@ -39,6 +39,9 @@ use rt::handle::{Channel, Resource};
 use rt::sys::Received;
 use rt::{Handle, sys};
 
+mod names;
+use names::decimal;
+
 rt::entry!(main);
 
 const MODE: &str = match option_env!("STAFETO_DATA_PROBE_MODE") {
@@ -283,16 +286,6 @@ fn name(j: u32, out: &mut [u8; 16]) -> usize {
         v /= 10;
     }
     4 + digits
-}
-
-fn decimal(j: u32, out: &mut [u8; 4]) -> usize {
-    let digits = if j >= 10 { 2 } else { 1 };
-    let mut v = j;
-    for i in (0..digits).rev() {
-        out[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    digits
 }
 
 fn wire<T>(r: Result<T, Status>, why: Fail) -> Result<T, Fail> {
@@ -681,12 +674,9 @@ fn measure_fill(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
     let begun = now_us();
     for n in 1..200u32 {
         let mut name = [0u8; 16];
-        name[..5].copy_from_slice(b"/rm/e");
-        let mut digits = [0u8; 4];
-        let d = decimal(n, &mut digits);
-        name[5..5 + d].copy_from_slice(&digits[..d]);
+        let len = names::rm_name(n, &mut name);
         wire(
-            c.call(|w| p::path_call(Method::Rmdir, &name[..5 + d], w)),
+            c.call(|w| p::path_call(Method::Rmdir, &name[..len], w)),
             "rmdir e",
         )?;
     }
@@ -727,12 +717,9 @@ fn measure_fill(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
     let (begun, mut longest) = (now_us(), 0u64);
     for b in 0..24u32 {
         let mut name = [0u8; 16];
-        name[..6].copy_from_slice(b"/big/b");
-        let mut digits = [0u8; 4];
-        let d = decimal(b, &mut digits);
-        name[6..6 + d].copy_from_slice(&digits[..d]);
+        let len = names::big_name(b, &mut name);
         let at = now_us();
-        wire(c.unlink(&name[..6 + d]), "unlink big")?;
+        wire(c.unlink(&name[..len]), "unlink big")?;
         longest = longest.max(now_us() - at);
     }
     rt::println!(

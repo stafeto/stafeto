@@ -971,8 +971,34 @@ pub fn command(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// The names the probe program builds, the file itself (plain code without an allocator).
+#[cfg(test)]
+#[path = "../../tests/data-probe/src/names.rs"]
+mod probe_names;
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_names_of_the_removals_are_the_names_the_fill_volume_made() {
+        use super::probe_names::{big_name, decimal, rm_name};
+        // The fill makes /rm/e0 to /rm/e199 and /big/b0 to /big/b31, in decimal.
+        for n in 0..200u32 {
+            let mut name = [0u8; 16];
+            let len = rm_name(n, &mut name);
+            assert_eq!(&name[..len], format!("/rm/e{n}").as_bytes(), "{n}");
+        }
+        for n in 0..32u32 {
+            let mut name = [0u8; 16];
+            let len = big_name(n, &mut name);
+            assert_eq!(&name[..len], format!("/big/b{n}").as_bytes(), "{n}");
+        }
+        for n in [0u32, 9, 10, 99, 100, 199, 999, 1000, 9999] {
+            let mut digits = [0u8; 4];
+            let d = decimal(n, &mut digits);
+            assert_eq!(&digits[..d], n.to_string().as_bytes(), "{n}");
+        }
+    }
+
     fn lines(text: &[&str]) -> Vec<String> {
         text.iter().map(|l| (*l).to_owned()).collect()
     }
