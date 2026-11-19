@@ -32,8 +32,13 @@ use abi::{Access, MESSAGE_MAX, Rights, Source};
 use core::cell::Cell;
 use frame_load::paint::{self, STRIPE_ROWS};
 use frame_load::phases::{ORDER, PERIOD_NS, Phase, Scene, Schedule};
-use frame_load::report::{CpuLine, loops_per_second};
-use proto_comp::{Attach, Create, Description, FORMAT_XRGB8888, Method, Post, Rect};
+use frame_load::report::{
+    BandsLine, Counters, CpuLine, HistLine, PhaseLine, WindowCounters, WindowLine, loops_per_second,
+};
+use proto_comp::{
+    Attach, Create, Description, FORMAT_XRGB8888, INTERVAL, Method, Post, RESET, Rect, SetBody,
+    StatsReply,
+};
 use proto_gpu::{HEIGHT, STRIDE, WIDTH};
 use proto_init::ServiceArgs;
 use proto_wire::{Status, Writer};
@@ -152,6 +157,16 @@ impl Env<'_> {
         Description::read(reply.bytes(&mut buffer))
     }
 
+    /// STATS of the service, with its counters reset when `reset`.
+    fn stats(display: &Handle<Channel>, reset: bool) -> Result<StatsReply, Fail> {
+        let mut w = Writer::new();
+        proto_comp::write_stats(if reset { RESET } else { 0 }, &mut w)
+            .map_err(say("STATS's bytes"))?;
+        let reply = sys::send(display, w.as_bytes()).map_err(say("STATS"))?;
+        let mut buffer = [0; MESSAGE_MAX];
+        StatsReply::read(reply.bytes(&mut buffer)).map_err(say("STATS's reply"))
+    }
+
     /// DESCRIBE until the service has its screen.
     fn describe_when_ready(&self, display: &Handle<Channel>) -> Result<Description, Fail> {
         let end = now() + WAIT_NS;
@@ -206,18 +221,47 @@ impl Env<'_> {
         for phase in ORDER {
             self.sleep_until(self.schedule.start_of(phase));
             self.woke_in_time("ctl", phase)?;
+            // The counters start again with the phase.
+            Self::stats(&display, true)?;
             let before = Self::describe(&display).map_err(say("DESCRIBE"))?;
             self.sleep_until(self.schedule.end_of(phase));
             let after = Self::describe(&display).map_err(say("DESCRIBE"))?;
-            // The counters of the service's own statistics replace this line
-            // when the method that reads them is in (the line of `report`).
+            let reply = Self::stats(&display, false)?;
+            let s = &reply.stats;
+            let counters = Counters {
+                releases: s.releases,
+                frames: s.frames,
+                direct: s.direct,
+                late: s.late,
+                skipped: s.skipped,
+                failed: s.failed,
+                capped: s.capped,
+                wakeups: s.wakeups,
+                take_max_us: s.take_max_us,
+                compose_max_us: s.compose_max_us,
+                device_max_us: s.device_max_us,
+                frame_max_us: s.frame_max_us,
+                band_max_us: s.band_max_us,
+            };
+            rt::println!("{}", PhaseLine(phase, &counters));
+            rt::println!("{}", HistLine(phase, &s.hist));
             rt::println!(
-                "frame-load: phase {} frames {} bands {} bypassed {}",
-                phase.name(),
-                after.frames.wrapping_sub(before.frames),
-                after.bands.wrapping_sub(before.bands),
-                after.bypassed.wrapping_sub(before.bypassed)
+                "{}",
+                BandsLine(phase, after.bands.wrapping_sub(before.bands))
             );
+            for w in reply.windows() {
+                let w = WindowCounters {
+                    id: w.id,
+                    interval: w.interval,
+                    posts: w.posts,
+                    taken: w.taken,
+                    replaced: w.replaced,
+                    late: w.late,
+                    missed: w.missed,
+                    late_max_us: w.late_max_us,
+                };
+                rt::println!("{}", WindowLine(phase, &w));
+            }
         }
         // The other loads print their last lines as their phases end; the
         // conductor says it is done a moment after them.
@@ -300,8 +344,21 @@ impl Env<'_> {
             .map_err(|r| say("ATTACH")(r.error))?;
         let mut buffer = [0; MESSAGE_MAX];
         match reply.bytes(&mut buffer).get(..4) {
+            Some(b) if u32::from_le_bytes([b[0], b[1], b[2], b[3]]) == 0 => {}
+            _ => return Err("ATTACH was refused"),
+        }
+        // One post a period: the service judges the window against its start.
+        let mut w = Writer::new();
+        SetBody {
+            property: INTERVAL,
+            value: 1,
+        }
+        .write(&mut w)
+        .map_err(say("SET's bytes"))?;
+        let reply = sys::send(&session, w.as_bytes()).map_err(say("SET"))?;
+        match reply.bytes(&mut buffer).get(..4) {
             Some(b) if u32::from_le_bytes([b[0], b[1], b[2], b[3]]) == 0 => Ok(session),
-            _ => Err("ATTACH was refused"),
+            _ => Err("SET of the interval was refused"),
         }
     }
 
@@ -392,7 +449,7 @@ impl Env<'_> {
                 step += 1;
             }
             rt::println!(
-                "frame-load: window {} draw posts {posts} no-free-buffer {idle}",
+                "frame-load: draw {} posts {posts} no-free-buffer {idle}",
                 phase.name()
             );
         }
@@ -472,10 +529,7 @@ impl Env<'_> {
             }
             let close = proto_gpu::Method::Close.header().bytes();
             sys::send(&owner, &close).map_err(say("CLOSE"))?;
-            rt::println!(
-                "frame-load: window {} legacy flushes {flushes}",
-                phase.name()
-            );
+            rt::println!("frame-load: legacy {} flushes {flushes}", phase.name());
         }
         Ok(())
     }

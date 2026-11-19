@@ -141,7 +141,7 @@ pub fn loads_verdict(lines: &[String]) -> Result<String, String> {
         }
         match phase.scene() {
             Scene::P | Scene::F => {
-                let prefix = format!("frame-load: window {name} draw ");
+                let prefix = format!("frame-load: draw {name} ");
                 match number_after(lines, &prefix, "posts") {
                     Some(n) if n > 0 => said.push(format!("{name} posts {n}")),
                     _ => {
@@ -152,7 +152,7 @@ pub fn loads_verdict(lines: &[String]) -> Result<String, String> {
                 }
             }
             Scene::D => {
-                let prefix = format!("frame-load: window {name} legacy ");
+                let prefix = format!("frame-load: legacy {name} ");
                 match number_after(lines, &prefix, "flushes") {
                     Some(n) if n > 0 => said.push(format!("{name} flushes {n}")),
                     _ => return Err("the client of the first revision flushed nothing".to_owned()),
@@ -172,13 +172,9 @@ pub fn loads_verdict(lines: &[String]) -> Result<String, String> {
     Ok(said.join(", "))
 }
 
-/// `cargo xtask frame-loads [steps]`.
-pub fn loads(args: &[String]) -> Result<(), String> {
-    let steps = match args {
-        [] => false,
-        [word] if word == "steps" => true,
-        _ => return Err("frame-loads [steps]".to_owned()),
-    };
+/// Boots the image (the one of the measures under -icount when `steps`), runs
+/// the phases and returns the lines of the run, the lines of the loads printed.
+pub fn run(steps: bool) -> Result<Vec<String>, String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
     let (name, list) = if steps {
@@ -214,7 +210,18 @@ pub fn loads(args: &[String]) -> Result<(), String> {
     }) {
         println!("{line}");
     }
-    let said = loads_verdict(&output.lines).map_err(|e| format!("frame-loads: {e}"))?;
+    Ok(output.lines)
+}
+
+/// `cargo xtask frame-loads [steps]`.
+pub fn loads(args: &[String]) -> Result<(), String> {
+    let steps = match args {
+        [] => false,
+        [word] if word == "steps" => true,
+        _ => return Err("frame-loads [steps]".to_owned()),
+    };
+    let lines = run(steps)?;
+    let said = loads_verdict(&lines).map_err(|e| format!("frame-loads: {e}"))?;
     println!(
         "frame-loads on {}: the loads are alive: {said}",
         qemu::VIRT.name
@@ -239,9 +246,9 @@ mod tests {
             }
             match phase.scene() {
                 Scene::P | Scene::F => lines.push(format!(
-                    "frame-load: window {name} draw posts 239 no-free-buffer 0"
+                    "frame-load: draw {name} posts 239 no-free-buffer 0"
                 )),
-                Scene::D => lines.push(format!("frame-load: window {name} legacy flushes 77")),
+                Scene::D => lines.push(format!("frame-load: legacy {name} flushes 77")),
                 Scene::None => {}
             }
         }
@@ -270,10 +277,10 @@ mod tests {
         for (cut, want) in [
             ("cpu stress", "CPU load in the phase stress"),
             (
-                "window net draw",
+                "draw net posts",
                 "paced client posted nothing in the phase net",
             ),
-            ("legacy flushes", "first revision flushed nothing"),
+            ("legacy direct flushes", "first revision flushed nothing"),
             ("load rounds", "no round"),
             ("load ops", "no operation"),
             ("phase files", "no line of the phase files"),

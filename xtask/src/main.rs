@@ -69,6 +69,7 @@ mod fast_scale;
 mod fast_switch;
 mod focus_probe;
 mod frame_image;
+mod frame_probe;
 mod fstack_device;
 mod fstack_probe;
 mod gpu_probe;
@@ -2355,6 +2356,10 @@ commands:
             check that every load is alive: the paced client posts, the client of the first
             revision flushes, the CPU loop turns, files are written and the network loop makes
             rounds, each in its phases
+  frame-probe [counters] the frame time under the loads: boot-frame-steps.img under -icount, the eight
+            phases judged against the bounds of the analysis (late, skipped, the time to
+            compose, the steps of the services); with counters, boot-frame.img on QEMU's clock
+            and the counts alone
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
@@ -2842,6 +2847,7 @@ fn main() {
         Some("lvgl") => lvgl::window(&args[1..]),
         Some("frame-image") => frame_image::images(),
         Some("frame-loads") => frame_image::loads(&args[1..]),
+        Some("frame-probe") => frame_probe::probe(&args[1..]),
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {

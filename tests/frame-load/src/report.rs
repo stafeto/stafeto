@@ -13,7 +13,9 @@ use crate::phases::Phase;
 /// statistics that the line names), in the units of the line: microseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
+    pub releases: u32,
     pub frames: u32,
+    pub direct: u32,
     pub late: u32,
     pub skipped: u32,
     pub failed: u32,
@@ -31,7 +33,9 @@ impl Counters {
     /// each is the largest since the last reset).
     pub fn since(&self, before: &Counters) -> Counters {
         Counters {
+            releases: self.releases.wrapping_sub(before.releases),
             frames: self.frames.wrapping_sub(before.frames),
+            direct: self.direct.wrapping_sub(before.direct),
             late: self.late.wrapping_sub(before.late),
             skipped: self.skipped.wrapping_sub(before.skipped),
             failed: self.failed.wrapping_sub(before.failed),
@@ -50,7 +54,7 @@ impl fmt::Display for PhaseLine<'_> {
         let c = self.1;
         write!(
             f,
-            "frame-load: phase {} frames {} late {} skipped {} failed {} capped {} wakeups {} take-max-us {} compose-max-us {} device-max-us {} frame-max-us {} band-max-us {}",
+            "frame-load: phase {} frames {} late {} skipped {} failed {} capped {} wakeups {} take-max-us {} compose-max-us {} device-max-us {} frame-max-us {} band-max-us {} releases {} direct {}",
             self.0.name(),
             c.frames,
             c.late,
@@ -62,7 +66,9 @@ impl fmt::Display for PhaseLine<'_> {
             c.compose_max_us,
             c.device_max_us,
             c.frame_max_us,
-            c.band_max_us
+            c.band_max_us,
+            c.releases,
+            c.direct
         )
     }
 }
@@ -77,6 +83,50 @@ impl fmt::Display for HistLine<'_> {
             write!(f, " {bin}")?;
         }
         Ok(())
+    }
+}
+
+/// The bands the service put together in a phase (the counter of DESCRIBE).
+pub struct BandsLine(pub Phase, pub u32);
+
+impl fmt::Display for BandsLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "frame-load: bands {} {}", self.0.name(), self.1)
+    }
+}
+
+/// One window's counters in a phase, as the service's statistics give them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowCounters {
+    pub id: u32,
+    pub interval: u32,
+    pub posts: u32,
+    pub taken: u32,
+    pub replaced: u32,
+    pub late: u32,
+    pub missed: u32,
+    pub late_max_us: u32,
+}
+
+/// The line of a window in a phase.
+pub struct WindowLine<'a>(pub Phase, pub &'a WindowCounters);
+
+impl fmt::Display for WindowLine<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let w = self.1;
+        write!(
+            f,
+            "frame-load: window {} id {} interval {} posts {} taken {} replaced {} late {} missed {} late-max-us {}",
+            self.0.name(),
+            w.id,
+            w.interval,
+            w.posts,
+            w.taken,
+            w.replaced,
+            w.late,
+            w.missed,
+            w.late_max_us
+        )
     }
 }
 
@@ -134,7 +184,9 @@ mod tests {
 
     fn counters() -> Counters {
         Counters {
+            releases: 240,
             frames: 240,
+            direct: 0,
             late: 0,
             skipped: 0,
             failed: 0,
@@ -153,7 +205,29 @@ mod tests {
         let c = counters();
         assert_eq!(
             PhaseLine(Phase::Net, &c).to_string(),
-            "frame-load: phase net frames 240 late 0 skipped 0 failed 0 capped 0 wakeups 240 take-max-us 410 compose-max-us 2950 device-max-us 120 frame-max-us 3070 band-max-us 260"
+            "frame-load: phase net frames 240 late 0 skipped 0 failed 0 capped 0 wakeups 240 take-max-us 410 compose-max-us 2950 device-max-us 120 frame-max-us 3070 band-max-us 260 releases 240 direct 0"
+        );
+    }
+
+    #[test]
+    fn the_window_and_bands_lines_are_the_ones_the_probe_reads() {
+        let w = WindowCounters {
+            id: 1,
+            interval: 1,
+            posts: 241,
+            taken: 240,
+            replaced: 0,
+            late: 0,
+            missed: 0,
+            late_max_us: 0,
+        };
+        assert_eq!(
+            WindowLine(Phase::Net, &w).to_string(),
+            "frame-load: window net id 1 interval 1 posts 241 taken 240 replaced 0 late 0 missed 0 late-max-us 0"
+        );
+        assert_eq!(
+            BandsLine(Phase::Full, 9120).to_string(),
+            "frame-load: bands full 9120"
         );
     }
 
