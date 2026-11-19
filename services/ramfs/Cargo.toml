@@ -45,6 +45,7 @@ layer-probe = []
 [dependencies]
 abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
+posix-perm = { path = "../../lib/posix-perm" }
 proto-clock = { path = "../../proto/clock" }
 proto-fs = { path = "../../proto/fs" }
 proto-pipe = { path = "../../proto/pipe" }

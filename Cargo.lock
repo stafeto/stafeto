@@ -979,6 +979,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-perm"
+version = "0.1.0"
+
+[[package]]
 name = "posix-platform"
 version = "0.5.1"
 dependencies = [
@@ -1414,6 +1418,7 @@ dependencies = [
  "abi",
  "bootimg",
  "posix-clock",
+ "posix-perm",
  "proto-clock",
  "proto-fs",
  "proto-init",

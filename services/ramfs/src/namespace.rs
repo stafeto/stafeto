@@ -5,7 +5,7 @@
 //! The service retains its admitted job, authentic owner and binding stamp.
 
 use super::*;
-use crate::authority::Identity;
+use crate::authority::{Identity, attr, refusal};
 #[path = "create.rs"]
 mod create;
 pub use create::{CreateJournal, ReadLinkJournal};
@@ -185,33 +185,32 @@ impl Preparation {
         let source = storage.node(self.edges[0].target.ok_or(NO_ENTRY)?)?;
         let parent = storage.node(self.edges[0].parent)?;
         if self.removes_source() {
-            if !identity.permits(parent, 3) {
-                return Err(ACCESS_DENIED);
-            }
-            if !identity.sticky(parent, source) {
-                return Err(PERMISSION);
-            }
+            posix_perm::remove_allowed(identity.rules(), &attr(parent), &attr(source))
+                .map_err(refusal)?;
         }
         if self.has_destination() {
-            let parent = storage.node(self.edges[1].parent)?;
-            if parent.links == 0 {
+            let destination = storage.node(self.edges[1].parent)?;
+            if destination.links == 0 {
                 return Err(NO_ENTRY);
             }
-            if !identity.permits(parent, 3) {
-                return Err(ACCESS_DENIED);
-            }
-            if let Some(victim) = self.edges[1].target
-                && !identity.sticky(parent, storage.node(victim)?)
-            {
-                return Err(PERMISSION);
-            }
-            // A directory that changes its parent changes its own "..".
-            if self.intent == NamespaceIntent::Rename
-                && source.kind == crate::DIR
-                && self.edges[0].parent != self.edges[1].parent
-                && !identity.permits(source, 2)
-            {
-                return Err(ACCESS_DENIED);
+            let target = match self.edges[1].target {
+                Some(victim) => Some(attr(storage.node(victim)?)),
+                None => None,
+            };
+            if self.intent == NamespaceIntent::Rename {
+                // The source half passed above and passes again here.
+                posix_perm::rename_allowed(
+                    identity.rules(),
+                    &attr(parent),
+                    &attr(source),
+                    &attr(destination),
+                    target.as_ref(),
+                    self.edges[0].parent == self.edges[1].parent,
+                )
+                .map_err(refusal)?;
+            } else {
+                posix_perm::place_allowed(identity.rules(), &attr(destination), target.as_ref())
+                    .map_err(refusal)?;
             }
         }
         Ok(())

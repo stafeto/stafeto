@@ -184,6 +184,8 @@ fn window_valid(count: usize, at: u64, handles: usize, writable: bool, size: u64
 pub struct Who {
     pub euid: u32,
     pub egid: u32,
+    /// The supplementary groups: the group class of a file applies to a member of its group.
+    pub groups: proto_process::Groups,
 }
 
 /// A program file OpenExec found (spec 2, 3.2; 5c): the entry of the
@@ -214,6 +216,7 @@ pub fn exec_for(
     let ids = Who {
         euid: who.credentials.euid,
         egid: who.credentials.egid,
+        groups: who.groups,
     };
     Ok((ids, who.pid, loader))
 }
@@ -227,17 +230,25 @@ pub const SET_GID: u32 = 0o2000;
 /// on a node of `info`. Root may search any directory and execute a file
 /// with any execute bit.
 fn may(info: &NodeInfo, who: Who, bit: u32) -> bool {
-    if who.euid == 0 {
-        return info.kind == DIR || info.permissions & 0o111 != 0;
-    }
-    let class = if who.euid == info.uid {
-        info.permissions >> 6
-    } else if who.egid == info.gid {
-        info.permissions >> 3
-    } else {
-        info.permissions
+    let attr = posix_perm::Attr {
+        kind: if info.kind == DIR {
+            posix_perm::Kind::Directory
+        } else {
+            posix_perm::Kind::File
+        },
+        mode: info.permissions,
+        uid: info.uid,
+        gid: info.gid,
     };
-    class & bit != 0
+    posix_perm::permits(
+        posix_perm::Identity::new(
+            who.euid,
+            who.egid,
+            &who.groups.ids[..who.groups.count as usize],
+        ),
+        &attr,
+        bit,
+    )
 }
 
 /// One name of a directory as the listing gives it.
@@ -3847,7 +3858,8 @@ mod tests {
             Ok((
                 Who {
                     euid: 0,
-                    egid: 65534
+                    egid: 65534,
+                    groups: who.groups,
                 },
                 300,
                 loader
@@ -3885,12 +3897,21 @@ mod tests {
             proto_fs::Timestamp::legacy_ns(10),
             load(&bytes, &mut index).unwrap(),
         );
-        let root = Who { euid: 0, egid: 0 };
+        let root = Who {
+            euid: 0,
+            egid: 0,
+            groups: proto_process::Groups::EMPTY,
+        };
         let nobody = Who {
             euid: 65534,
             egid: 65534,
+            groups: proto_process::Groups::EMPTY,
         };
-        let owner = Who { euid: 3, egid: 9 };
+        let owner = Who {
+            euid: 3,
+            egid: 9,
+            groups: proto_process::Groups::EMPTY,
+        };
         let ash = ram.exec("/bin/ash", nobody).unwrap();
         assert_eq!((ash.mode, ash.uid, ash.gid), (0o4755, 3, 4));
         assert_eq!(ram.exec("/bin/./ash", nobody), Ok(ash));
@@ -3940,6 +3961,42 @@ mod tests {
         assert!(bin.is_err());
         assert_eq!(ram.image_read(0, 0, &mut out), Err(NO_ENTRY), "a directory");
         assert_eq!(ram.image_read(99, 0, &mut out), Err(NO_ENTRY));
+    }
+
+    /// A member of the file's group through a supplementary group executes by the group class
+    /// (XBD 4.7), and a caller with no such group does not.
+    #[test]
+    fn exec_applies_the_group_class_to_a_supplementary_group() {
+        let bytes = test_image(&[
+            entry("/grp", DIRECTORY | 0o755, 0),
+            Entry {
+                uid: 3,
+                gid: 4,
+                ..entry("/grp/tool", REGULAR | 0o750, 1)
+            },
+        ]);
+        let mut index = Index::new();
+        let ram = Ram::with_tree(
+            proto_fs::Timestamp::legacy_ns(10),
+            load(&bytes, &mut index).unwrap(),
+        );
+        let mut groups = proto_process::Groups::EMPTY;
+        groups.count = 2;
+        groups.ids[..2].copy_from_slice(&[7, 4]);
+        let member = Who {
+            euid: 65534,
+            egid: 65534,
+            groups,
+        };
+        let outsider = Who {
+            groups: proto_process::Groups::EMPTY,
+            ..member
+        };
+        assert!(ram.exec("/grp/tool", member).is_ok());
+        assert_eq!(
+            ram.exec("/grp/tool", outsider),
+            Err(proto_fs::ACCESS_DENIED)
+        );
     }
 
     /// Clone's session shares the descriptions it names: an offset one
