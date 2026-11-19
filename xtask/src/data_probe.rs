@@ -332,3 +332,25 @@ pub fn command(args: &[String]) -> Result<(), String> {
         Some(other) => Err(format!("data-probe: unknown argument {other}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_table_stands_for_the_lines_lost_in_the_burst() {
+        let lines: Vec<String> = STEP_KINDS
+            .iter()
+            .map(|(k, _)| format!("service step: {DATAFS_TAG} kind {k} 5000 ticks detail 0"))
+            .collect();
+        let lost = crate::step_line::tabled(&lines);
+        assert_eq!(
+            steps_verdict(&lost, &[]).map(|r| r.len()),
+            Ok(STEP_KINDS.len())
+        );
+        // The first run lost a line, the second run's table has the kind.
+        let (first, second) = lost.split_at(5);
+        assert!(steps_verdict(first, second).is_ok());
+        assert!(steps_verdict(first, &[]).is_err());
+    }
+}

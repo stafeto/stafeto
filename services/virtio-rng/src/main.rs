@@ -402,7 +402,10 @@ fn main(_: u64) -> u64 {
     // The line opens once the queue is up.
     let _ = sys::irq_ack(&driver.irq);
     #[cfg(feature = "steps")]
-    rt::service::report_steps(10);
+    {
+        rt::service::report_steps(10);
+        rt::service::table_steps_from(16);
+    }
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {

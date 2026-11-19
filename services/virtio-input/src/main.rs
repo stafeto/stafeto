@@ -223,7 +223,10 @@ fn main(_: u64) -> u64 {
     }
     virtio_mmio::reopen(&driver.irq);
     #[cfg(feature = "steps")]
-    rt::service::report_steps(13);
+    {
+        rt::service::report_steps(13);
+        rt::service::table_steps_from(16);
+    }
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {
