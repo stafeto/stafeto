@@ -593,6 +593,171 @@ pub mod calibration {
         );
     }
 
+    /// The shapes of the bands of layers, width by height, and the counts of layers.
+    /// The widths are the ones a band of layers gets (a part of a line of about 150
+    /// points for eight, more lines for fewer) and a few others.
+    const LAYER_SHAPES: [(u32, u32); 6] = [(16, 1), (64, 1), (150, 1), (150, 4), (76, 8), (8, 8)];
+    const LAYER_COUNTS: [usize; 4] = [1, 2, 4, 8];
+    /// Each layer's window is `LAYER_W` points wide and holds the rows of the
+    /// widest shape, 8 lines, in a source of its own: a page of 4 096 bytes holds
+    /// 6 lines of 168 points, so a source takes two pages.
+    const LAYER_W: u32 = 168;
+    const LAYER_H: u32 = 8;
+    const LAYER_SRC_BYTES: usize = 8192;
+
+    /// The pixel operations of a band of the calibration: pixman's, on a
+    /// small target of its own (the band's rows lie in its first lines), and no
+    /// cost lines of the probes.
+    struct Plain<'a> {
+        images: &'a mut pixman::Images,
+        target: &'a mut [u8],
+    }
+
+    impl compositor::Raster for Plain<'_> {
+        fn black(&mut self, _fb: &mut [u8], r: proto_comp::Rect) {
+            let mut target = Target {
+                bytes: self.target,
+                format: Px::Xrgb8888,
+                stride: LAYER_W * 4,
+                width: LAYER_W,
+                height: LAYER_H,
+            };
+            fill(&mut target, r.x, r.y, r.w, r.h, 0);
+        }
+
+        fn blit(
+            &mut self,
+            _fb: &mut [u8],
+            src: &[u8],
+            stride: u32,
+            f: compositor::Format,
+            size: (u32, u32),
+            from: (u32, u32),
+            to: (u32, u32),
+            area: (u32, u32),
+            over: bool,
+        ) {
+            let mut target = Target {
+                bytes: self.target,
+                format: Px::Xrgb8888,
+                stride: LAYER_W * 4,
+                width: LAYER_W,
+                height: LAYER_H,
+            };
+            let source = Source {
+                bytes: src,
+                format: super::format(f),
+                stride,
+                width: size.0,
+                height: size.1,
+            };
+            composite(self.images, over, &mut target, source, from, to, area);
+        }
+    }
+
+    /// The sources of the windows of a band of layers: a region each.
+    struct Regions<'a>(&'a [u8]);
+
+    impl compositor::Source for Regions<'_> {
+        fn pixels(&self, window: usize, _buffer: u8) -> &[u8] {
+            &self.0[window * LAYER_SRC_BYTES..(window + 1) * LAYER_SRC_BYTES]
+        }
+    }
+
+    impl Pixman {
+        /// Measures whole bands of 1, 2, 4 and 8 layers laid over each other on the
+        /// same rows (`compositor::compose_sized` over a scene of windows of
+        /// ARGB8888, each from a source of its own), on the shapes of
+        /// `LAYER_SHAPES` and the offsets of the target and of the sources, and tells
+        /// a line `service shape: 17 layersN W H least L greatest G n K` for each:
+        /// the ticks of the band as `compose` makes it, with the black it starts
+        /// with. What it costs beyond the prices of its operations is the term of a
+        /// layer (`compositor::LAYER`).
+        pub fn calibrate_layers(&mut self, fb: &mut [u8]) {
+            // Two regions of the buffer: the target, 168 by 8 points, and the sources.
+            const TARGET_BYTES: usize = (LAYER_W * LAYER_H * 4) as usize;
+            let need = SRC_AT + TARGET_BYTES.div_ceil(4096) * 4096 + 8 * LAYER_SRC_BYTES;
+            if fb.len() < need {
+                rt::println!("service calibration: the screen's buffer is too small for layers");
+                return;
+            }
+            let Ok(thread) = rt::sys::self_thread() else {
+                return;
+            };
+            let (head, tail) = fb[SRC_AT..need].split_at_mut(TARGET_BYTES.div_ceil(4096) * 4096);
+            let target = &mut head[..TARGET_BYTES];
+            tail.fill(0x40);
+            for &count in &LAYER_COUNTS {
+                for &(w, h) in &LAYER_SHAPES {
+                    let (mut least, mut greatest, mut n) = (u64::MAX, 0u64, 0u64);
+                    for dx in 4..8u32 {
+                        for sx in 0..4u32 {
+                            // The windows lie `sx` points to the left of the band's
+                            // first column; all of them on one place.
+                            let mut scene = compositor::Scene::new();
+                            for i in 0..count {
+                                let r = proto_comp::Rect {
+                                    x: dx - sx,
+                                    y: 0,
+                                    w: LAYER_W - 8,
+                                    h: LAYER_H,
+                                };
+                                let Ok(k) =
+                                    scene.create(i as u64 + 1, 1 + (i / 4) as u64, r, false, 0)
+                                else {
+                                    return;
+                                };
+                                scene.set_format(k, compositor::Format::Argb);
+                                if scene.attach(k, 2, (LAYER_W - 8) * 4).is_err()
+                                    || scene.post(k, 0, &[]).is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            let _ = scene.begin();
+                            scene.end(true);
+                            let damage = proto_comp::Rect { x: dx, y: 0, w, h };
+                            for turn in 0..=REPEAT {
+                                let mut plain = Plain {
+                                    images: &mut self.images,
+                                    target: &mut *target,
+                                };
+                                let regions = Regions(&*tail);
+                                let ticks = timed(&thread, || {
+                                    compositor::compose_sized(
+                                        &scene,
+                                        damage,
+                                        compositor::Band { row: 0, col: 0 },
+                                        (w, h),
+                                        &mut [],
+                                        &regions,
+                                        &mut plain,
+                                    );
+                                });
+                                // The first turn makes the images.
+                                if turn == 0 {
+                                    continue;
+                                }
+                                if let Some(ticks) = ticks {
+                                    least = least.min(ticks);
+                                    greatest = greatest.max(ticks);
+                                    n += 1;
+                                }
+                            }
+                        }
+                    }
+                    if n > 0 {
+                        rt::println!(
+                            "service shape: 17 layers{count} {w} {h} least {least} greatest {greatest} n {n}"
+                        );
+                    }
+                }
+            }
+            tail.fill(0);
+            target.fill(0);
+        }
+    }
+
     impl Pixman {
         /// Measures the three kinds on the shapes of the classes and tells a
         /// line each (`service calibration: 17 KIND call L G N W H row L G N W H
