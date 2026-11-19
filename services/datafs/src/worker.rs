@@ -583,6 +583,12 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                     #[cfg(feature = "crash")]
                     report(request);
                 }
+                // The session passed VERIFY_SESSION: the identity of its old holder is not its own.
+                (Some(_), UNBIND) => {
+                    server.unbind(job.owner);
+                    identities.remove(job.owner);
+                    job.reply_len = 0;
+                }
                 (Some(fs), _) => {
                     server.gone(fs, job.owner);
                     // The session's identity copy closes with it.
@@ -595,6 +601,8 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                     job.reply_len = bytes.len();
                 }
             }
+            // The roots of the sessions this job made or ended, for the request thread's count.
+            ROOTS.after_job(server, job.kind == GONE, job.owner, job.aux);
             state(i).store(DONE, Release);
             idle.last_job = rt::time::ticks_to_ns(rt::time::now());
             if STOPPING.load(Acquire) {

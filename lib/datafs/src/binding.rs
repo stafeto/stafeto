@@ -29,6 +29,17 @@ pub enum Root {
     Expense(u64),
 }
 
+impl Root {
+    /// The root as two plain words, for a table the other thread reads: the number and whether it
+    /// is the root of an expenditure (the two kinds never compare equal).
+    pub const fn key(self) -> (u64, bool) {
+        match self {
+            Root::Label(n) => (n, false),
+            Root::Expense(n) => (n, true),
+        }
+    }
+}
+
 /// What the process service vouched for: one process at one generation of its record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Vouched {

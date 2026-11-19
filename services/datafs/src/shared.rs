@@ -27,10 +27,15 @@ impl<T> Shared<T> {
 }
 
 /// The requests in flight at once, and the notice of a session that went.
-pub const JOBS: usize = 12;
+pub const JOBS: usize = 24;
 
 /// The jobs one session may have in flight at once: no session fills the table alone.
 pub const SESSION_JOBS: usize = 4;
+
+/// The jobs one root (a process tree, or a client of init) may have in flight at once, whatever
+/// the number of its sessions (up to `ROOT_CLONES` and one for each process of the tree): three
+/// roots fill the table, and no tree starves another.
+pub const ROOT_JOBS: usize = 8;
 
 /// The jobs only the sessions of native clients may take: the last of the table, so that the
 /// sessions of the process trees (many, each with its share) never leave `datakey` with no job.
@@ -43,6 +48,9 @@ pub const DONE: u8 = 2;
 /// What a job is: a request of a session, or the close of what a session held.
 pub const REQUEST: u8 = 0;
 pub const GONE: u8 = 1;
+/// The binding of a session that passed VERIFY_SESSION ends (`Server::unbind`): the request thread
+/// queues it with no reply to send, before it answers the loader.
+pub const UNBIND: u8 = 2;
 
 pub struct Job {
     pub state: AtomicU8,
@@ -52,6 +60,10 @@ pub struct Job {
     pub queued_at: AtomicU64,
     pub kind: u8,
     pub owner: u64,
+    /// The root the owner counts under (`roots`), as the request thread read it when it queued
+    /// the job: its number and whether it is an expenditure root.
+    pub root: u64,
+    pub expense: bool,
     /// The label the request thread made for the call (CLONE, EXPORT) or read from the pass the call
     /// brought (ADOPT); 0 for the rest.
     pub aux: u64,
@@ -73,6 +85,8 @@ impl Job {
             queued_at: AtomicU64::new(0),
             kind: REQUEST,
             owner: 0,
+            root: 0,
+            expense: false,
             aux: 0,
             carried: 0,
             request_len: 0,
@@ -145,6 +159,10 @@ pub static TICKET: AtomicU64 = AtomicU64::new(1);
 pub fn next_ticket() -> u64 {
     TICKET.fetch_add(1, Ordering::Relaxed)
 }
+
+/// The root each session counts under, which the worker publishes after each job and the request
+/// thread reads to count the jobs by root (`datafs::roots`).
+pub static ROOTS: datafs::roots::Roots<{ datafs::server::SESSIONS }> = datafs::roots::Roots::new();
 
 /// The label of the notification the worker gives the main thread (a job is done), and of the kick
 /// the main thread gives the worker (a job is queued).

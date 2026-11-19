@@ -13,6 +13,13 @@ pub fn job_for(free: Option<usize>, mine: usize, limit: usize) -> Option<usize> 
     free.filter(|_| mine < limit)
 }
 
+/// Whether a process tree (a root) that has `mine` jobs in flight may take one more when `limit` is
+/// the most a root may have: the sessions of one tree are many (up to 32), each with its own share
+/// of jobs, and no tree may fill the table for the others.
+pub fn root_has_room(mine: usize, limit: usize) -> bool {
+    mine < limit
+}
+
 /// Whether a request of a session may take a job when `free` jobs are free: a session of a native
 /// client may take any, every other session leaves the last `reserve` for the native clients. The
 /// sessions of one process tree are many (up to 32 for a root, 4 jobs each, more than the table), and
@@ -20,6 +27,12 @@ pub fn job_for(free: Option<usize>, mine: usize, limit: usize) -> Option<usize> 
 /// other native clients that no tree can use up.
 pub fn leaves_for_native(free: usize, native: bool, reserve: usize) -> bool {
     native || free > reserve
+}
+
+/// Whether the session of `label` is one VERIFY_SESSION may give back as a genuine session of a
+/// process: it is neither the root channel, nor a pass of EXPORT, nor the profile of a native client.
+pub fn verifiable(label: u64) -> bool {
+    !p::is_root(label) && !p::is_pass(label) && !p::is_service(label)
 }
 
 /// What a reply's status is: whether it is a success (the status word is zero).
@@ -143,6 +156,15 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_takes_jobs_only_inside_its_share_whatever_its_sessions_have() {
+        // Thirty-two sessions of one tree with four jobs each would be 128 jobs: the tree has the
+        // share of its root.
+        assert!(root_has_room(0, 8) && root_has_room(7, 8));
+        assert!(!root_has_room(8, 8));
+        assert!(!root_has_room(9, 8));
+    }
+
+    #[test]
     fn the_last_jobs_are_kept_for_the_native_clients() {
         assert!(leaves_for_native(5, false, 4));
         assert!(!leaves_for_native(4, false, 4));
@@ -173,6 +195,37 @@ mod tests {
         assert!(!carries(Held::Spent, &reply(p::BAD_HANDLE)));
         assert!(!carries(Held::Spent, &reply(p::IO)));
         assert!(!carries(Held::Spent, &[]));
+    }
+
+    /// SESSION without vouching: the session the loop made for it never reaches the caller, whatever
+    /// the refusal, and the answer carries no handle (the worker's replies are ACCESS, TABLE_FULL
+    /// and the rest; only success lets the made session go).
+    #[test]
+    fn a_session_call_the_worker_refuses_gives_no_session() {
+        for status in [
+            p::ACCESS,
+            p::TABLE_FULL,
+            p::TOO_MANY_OPEN,
+            p::INVALID,
+            p::NOT_READY,
+            1,
+        ] {
+            assert!(!carries(Held::Made, &reply(status)), "{status}");
+        }
+        assert!(carries(Held::Made, &reply(0)));
+    }
+
+    /// VERIFY_SESSION answers BAD_HANDLE and no handle for a channel that is no live session of the
+    /// service; of the live ones, the root, a pass and a native client's profile are not sessions
+    /// of a process.
+    #[test]
+    fn only_the_session_of_a_process_is_given_back_by_verify_session() {
+        assert!(verifiable(p::OWN | 5));
+        assert!(!verifiable(p::ROOT));
+        assert!(!verifiable(p::PASS | 5));
+        assert!(!verifiable(p::SERVICE | 3));
+        // A session of a process made by SESSION or CLONE has OWN and none of the marks.
+        assert!(verifiable(p::OWN | 1));
     }
 
     #[test]

@@ -99,8 +99,13 @@ struct Description {
     used: bool,
     generation: u8,
     kind: Kind,
-    /// A file: the index of its `Node`. A directory: its slot in the volume.
+    /// A file: the index of its `Node`. A directory: its slot in the volume, or, for one opened
+    /// only for search (`searched`), the description's own number, whose path is `searches`.
     object: u8,
+    /// A directory opened with no access bits (for `chdir`, `fchdir` and `O_SEARCH`): it holds
+    /// its path and no place of the volume, so that the current directories of many processes
+    /// never take the places a listing needs.
+    searched: bool,
     read: bool,
     write: bool,
     append: bool,
@@ -117,6 +122,7 @@ impl Description {
         generation: 0,
         kind: Kind::File,
         object: 0,
+        searched: false,
         read: false,
         write: false,
         append: false,
@@ -248,6 +254,8 @@ pub struct Server {
     refused: bool,
     nodes: [Node; FILES],
     dirs: [PathBuf; DIRS],
+    /// The paths of the directories opened for search only, by the number of the description.
+    searches: [PathBuf; DESCRIPTIONS],
     sessions: [Session; SESSIONS],
     passes: [Pass; PASSES],
     generation: u8,
@@ -442,6 +450,7 @@ impl Server {
             refused: false,
             nodes: [Node::EMPTY; FILES],
             dirs: [PathBuf::EMPTY; DIRS],
+            searches: [PathBuf::EMPTY; DESCRIPTIONS],
             sessions: [Session::EMPTY; SESSIONS],
             passes: [Pass {
                 used: false,
@@ -660,6 +669,8 @@ impl Server {
         self.descriptions[di].used = false;
         match d.kind {
             Kind::File => self.node_unref(fs, usize::from(d.object)),
+            // A directory opened for search holds no place of the volume.
+            Kind::Directory if d.searched => Ok(()),
             Kind::Directory => fs.closedir(Dir(d.object)),
         }
     }
@@ -717,10 +728,8 @@ impl Server {
         self.nodes
             .iter()
             .any(|n| n.used && !n.orphan && within(n.path.get(), path))
-            || self.descriptions.iter().any(|d| {
-                d.used
-                    && d.kind == Kind::Directory
-                    && within(self.dirs[usize::from(d.object)].get(), path)
+            || self.descriptions.iter().enumerate().any(|(di, d)| {
+                d.used && d.kind == Kind::Directory && within(self.dir_path(di).get(), path)
             })
     }
 
@@ -1046,7 +1055,7 @@ impl Server {
                         stat_record(Kind::File, size as u32, &attr, nlink).write(w)
                     }
                     Kind::Directory => {
-                        let dir_path = self.dirs[usize::from(d.object)];
+                        let dir_path = self.dir_path(di);
                         let entry = entry_of(fs, dir_path.get(), Kind::Directory)?;
                         stat_record(Kind::Directory, 0, &entry.attr, 1).write(w)
                     }
@@ -1081,6 +1090,10 @@ impl Server {
                 let d = self.descriptions[di];
                 if d.kind != Kind::Directory {
                     return Err(p::code(p::NOT_DIRECTORY));
+                }
+                // A directory opened for search has no listing to start again.
+                if d.searched {
+                    return Err(bad_handle());
                 }
                 self.pending[usize::from(d.object)] = None;
                 volume(fs.rewinddir(Dir(d.object)))
@@ -1332,8 +1345,19 @@ impl Server {
         let d = self.descriptions[di];
         Ok(match d.kind {
             Kind::File => self.nodes[usize::from(d.object)].path,
-            Kind::Directory => self.dirs[usize::from(d.object)],
+            Kind::Directory => self.dir_path(di),
         })
+    }
+
+    /// The path of the directory description `di`: from its place of the volume, or the path a
+    /// description opened for search keeps.
+    fn dir_path(&self, di: usize) -> PathBuf {
+        let d = &self.descriptions[di];
+        if d.searched {
+            self.searches[usize::from(d.object)]
+        } else {
+            self.dirs[usize::from(d.object)]
+        }
     }
 
     /// The size of a shared file, with what the descriptions wrote and has not been synced.
@@ -1564,15 +1588,22 @@ impl Server {
                 if !perm::permits(id, &entry.attr.perm(Kind::Directory), wanted) {
                     return Err(p::code(p::ACCESS));
                 }
-                let slot = match fs.opendir(path) {
-                    Ok(dir) => dir.0,
-                    Err(Error::NoMemory) => return Err(p::code(p::TABLE_FULL)),
-                    Err(e) => return Err(status_of(e)),
-                };
-                self.dirs[usize::from(slot)].set(path);
-                self.pending[usize::from(slot)] = None;
-                description.object = slot;
-                description.read = flags & p::READ != 0;
+                if flags & p::READ == 0 {
+                    // For search only: the path and no place of the volume.
+                    self.searches[di].set(path);
+                    description.searched = true;
+                    description.object = di as u8;
+                } else {
+                    let slot = match fs.opendir(path) {
+                        Ok(dir) => dir.0,
+                        Err(Error::NoMemory) => return Err(p::code(p::TABLE_FULL)),
+                        Err(e) => return Err(status_of(e)),
+                    };
+                    self.dirs[usize::from(slot)].set(path);
+                    self.pending[usize::from(slot)] = None;
+                    description.object = slot;
+                    description.read = true;
+                }
             }
             Kind::File => {
                 description.read = flags & p::READ != 0;
@@ -1744,6 +1775,31 @@ impl Server {
             .find(|s| s.used && s.label == label)
         {
             s.binding = binding;
+        }
+    }
+
+    /// The root the session of `label` counts under (a tree of processes, or a client of init
+    /// alone), None for a label that is no session. The worker publishes it for the request
+    /// thread, which counts the jobs in flight by root.
+    pub fn root_of(&self, label: u64) -> Option<Root> {
+        self.sessions
+            .iter()
+            .find(|s| s.used && s.label == label)
+            .map(|s| s.root)
+    }
+
+    /// The session of `label` passed VERIFY_SESSION, which only a loader sends, for the session a
+    /// parent gave a set-ID program: the binding of the parent's identity ends, and the program's
+    /// layer binds the session to its own (BIND). The descriptions it holds stay, with their
+    /// rights, and are read without a binding; a session of a native client keeps its profile.
+    pub fn unbind(&mut self, label: u64) {
+        if let Some(s) = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.used && s.label == label)
+            && matches!(s.binding, Binding::Bound(_))
+        {
+            s.binding = Binding::Unbound;
         }
     }
 

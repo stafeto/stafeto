@@ -652,13 +652,13 @@ mod served {
         // Directories have a table too.
         let mut dirs = Vec::new();
         for _ in 0..crate::DIRS {
-            if let Ok(d) = t.try_open(4, b"/", p::DIRECTORY) {
+            if let Ok(d) = t.try_open(4, b"/", p::READ | p::DIRECTORY) {
                 dirs.push(word(&d, 0));
             }
         }
         assert_eq!(dirs.len(), crate::DIRS);
         assert_eq!(
-            t.try_open(4, b"/", p::DIRECTORY),
+            t.try_open(4, b"/", p::READ | p::DIRECTORY),
             Err(p::code(p::TABLE_FULL))
         );
     }

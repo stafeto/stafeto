@@ -30,8 +30,9 @@ use shared::*;
 
 rt::entry!(main);
 
-/// The sessions the loop keeps: the processes of POSIX that use `/data`, and the services beside.
-const SESSIONS: usize = 64;
+/// The sessions the loop keeps: the processes of POSIX that use `/data`, and the services beside,
+/// and the root channel, which holds a session of its own like any label that sends.
+const SESSIONS: usize = datafs::server::SESSIONS + 1;
 
 /// The codes of a start that failed.
 const NO_START_DATA: u64 = 1;
@@ -140,8 +141,53 @@ fn main(_: u64) -> u64 {
     if rt::budget::bind("datafs", rt::budget::SERVE, serve, &s.thread).is_err() {
         return BUDGET;
     }
+    // The root of the service goes to the process service, which gives a copy of it to every
+    // process that asks (TakeRoot) and to the loader of a set-ID program (LoaderRoot). A thread
+    // registers it: the connection to the process service waits in init until it has started, and
+    // the loop must not wait for it.
+    PARENT.store(s.parent.raw().0, core::sync::atomic::Ordering::Release);
+    CHANNEL.store(channel.raw().0, core::sync::atomic::Ordering::Release);
+    LEVEL.store(u64::from(level), core::sync::atomic::Ordering::Release);
+    // SAFETY: REGISTRAR is the registrar's alone, and the page after the worker's message buffer
+    // is free.
+    let registrar = unsafe {
+        sys::thread_create(
+            &s.process,
+            register_root,
+            REGISTRAR.top(),
+            0,
+            level,
+            abi::Policy::Fifo,
+            REGISTRAR_BUFFER,
+        )
+    };
+    match registrar {
+        Ok(thread) if sys::thread_start(&thread).is_ok() => core::mem::forget(thread),
+        _ => rt::println!(
+            "datafs: no thread to register the root; programs get no session until it is registered"
+        ),
+    }
     let _ = rt::service::run::<Datafs, SESSIONS, 0>(&channel, &mut service, config);
     STOPPED
+}
+
+/// The registrar thread: the connection to init, the loop's channel and its level, which the root
+/// is made from, and the thread's stack and message buffer (the page after the worker's).
+static PARENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static CHANNEL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LEVEL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static REGISTRAR: rt::Stack<{ 16 * 1024 }> = rt::Stack::new();
+const REGISTRAR_BUFFER: usize = abi::INIT_MSGBUF as usize + 2 * 4096;
+
+extern "C" fn register_root(_: u64) -> ! {
+    let parent = Handle::<Channel>::borrowed(abi::Handle(
+        PARENT.load(core::sync::atomic::Ordering::Acquire),
+    ));
+    let channel = Handle::<Channel>::borrowed(abi::Handle(
+        CHANNEL.load(core::sync::atomic::Ordering::Acquire),
+    ));
+    let level = LEVEL.load(core::sync::atomic::Ordering::Acquire) as u8;
+    rt::roots::keep(&parent, &channel, proto_data::ROOT, level, "datafs")
 }
 
 /// Writes a zero into each page of the `len` bytes at `base`, so that every page is mapped. It runs
@@ -162,7 +208,7 @@ const PAGE: usize = 4096;
 /// The labels whose close waits for a free job: everything that can close while the table is full
 /// (`admit::closers`). A label that does not fit is lost, and with it a session's descriptions.
 const FORGOTTEN: usize = admit::closers(SESSIONS, datafs::server::PASSES, JOBS);
-const _: () = assert!(SESSIONS == datafs::server::SESSIONS);
+const _: () = assert!(SESSIONS == datafs::server::SESSIONS + 1);
 const _: () = assert!(FORGOTTEN >= SESSIONS + datafs::server::PASSES + 3 * JOBS);
 
 /// Bit 63 marks the labels the service gives itself (the clones of CLONE and the passes of
@@ -247,6 +293,7 @@ impl Datafs {
         let job = unsafe { &mut *job(i) };
         job.kind = kind;
         job.owner = owner;
+        (job.root, job.expense) = ROOTS.root_of(owner);
         job.aux = aux;
         job.carried = self.carried[i].as_ref().map_or(0, |h| h.raw().0);
         job.request_len = bytes.len();
@@ -286,18 +333,25 @@ impl Datafs {
         Ok((label, copy.erase()))
     }
 
-    /// A free job for a request of `owner`: None when the table is full or the session has its share
-    /// in flight (no session fills the table alone).
+    /// A free job for a request of `owner`: None when the table is full, the session has its share
+    /// in flight, or its root has (the sessions of one process tree share `ROOT_JOBS`: no session
+    /// and no tree fills the table alone).
     fn job_for(&self, owner: u64) -> Option<usize> {
-        let mine = (0..JOBS)
-            .filter(|&j| state(j).load(Acquire) != FREE)
-            // SAFETY: the owner is written before the job is QUEUED and stays until it is FREE.
-            .filter(|&j| unsafe { (*job(j)).owner } == owner)
-            .count();
+        let (root, expense) = ROOTS.root_of(owner);
+        let (mut mine, mut tree) = (0, 0);
+        for j in (0..JOBS).filter(|&j| state(j).load(Acquire) != FREE) {
+            // SAFETY: the owner and the root are written before the job is QUEUED and stay until
+            // it is FREE.
+            let (o, r, e) = unsafe { ((*job(j)).owner, (*job(j)).root, (*job(j)).expense) };
+            mine += usize::from(o == owner);
+            tree += usize::from(r == root && e == expense);
+        }
         let free = (0..JOBS)
             .filter(|&j| state(j).load(Acquire) == FREE && self.pending[j].is_none())
             .count();
-        if !admit::leaves_for_native(free, proto_data::is_service(owner), NATIVE_JOBS) {
+        if !admit::leaves_for_native(free, proto_data::is_service(owner), NATIVE_JOBS)
+            || !admit::root_has_room(tree, ROOT_JOBS)
+        {
             return None;
         }
         admit::job_for(self.free_job(), mine, SESSION_JOBS)
@@ -378,14 +432,18 @@ impl Datafs {
         };
         match sys::copy_label(&self.channel, &offered) {
             // A pass and the session of a native client are not sessions a POSIX client holds.
-            Ok(label)
-                if !proto_data::is_root(label)
-                    && !proto_data::is_pass(label)
-                    && !proto_data::is_service(label) =>
-            {
+            Ok(label) if admit::verifiable(label) => {
+                // The session came from a loader, for a set-ID program: the identity it was
+                // bound to is the parent's, so the worker ends the binding before the program's
+                // first request (the queue keeps the order). With no job free the session is not
+                // vouched for: the loader leaves the slot empty.
+                let Some(i) = self.free_job() else {
+                    return Answer::Status(proto_data::code(proto_data::BAD_HANDLE));
+                };
                 if r.reply().u32(0).is_err() {
                     return Answer::Status(Status::BadSize);
                 }
+                self.queue(i, UNBIND, label, 0, &[]);
                 Answer::Reply([offered.erase()].into())
             }
             _ => Answer::Status(proto_data::code(proto_data::BAD_HANDLE)),

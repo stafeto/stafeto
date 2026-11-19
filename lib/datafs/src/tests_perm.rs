@@ -1507,7 +1507,7 @@ fn the_cap_holds_when_every_directory_place_is_held_and_after_a_create_with_trun
     // A new instance: no count is remembered. Sixteen descriptions of directories hold every place.
     let mut rig = Rig::on(device);
     let held: Vec<u32> = (0..crate::DIRS)
-        .map(|_| rig.open(OTHER, b"/", p::DIRECTORY, 0).unwrap())
+        .map(|_| rig.open(OTHER, b"/", p::READ | p::DIRECTORY, 0).unwrap())
         .collect();
     let refused = rig.open(ROOT, b"/d/extra", p::WRITE | p::CREATE, 0o644);
     assert_eq!(
@@ -1864,4 +1864,85 @@ fn a_refused_change_of_a_file_with_a_pending_write_writes_nothing() {
     rig.close(OWNER, h);
     let st = rig.stat(OWNER, b"/d/f").unwrap();
     assert_eq!((st.mode, st.mtime), (0o640, 9_000));
+}
+
+#[test]
+fn a_directory_opened_for_search_holds_no_place_of_the_volume() {
+    let mut rig = Rig::new();
+    rig.mkdir(ROOT, b"/d", 0o755).unwrap();
+    rig.mkdir(ROOT, b"/d/sub", 0o755).unwrap();
+    rig.put(ROOT, b"/d/f", 0o644, b"x");
+    // Forty current directories (more than the sixteen places of the volume) are all granted.
+    let mut held = Vec::new();
+    for who in [ROOT, OWNER, GROUP, OTHER] {
+        for _ in 0..10 {
+            held.push((who, rig.open(who, b"/d", p::DIRECTORY, 0).unwrap()));
+        }
+    }
+    assert_eq!(held.len(), 40);
+    // The places are all free: a listing opens, and so do sixteen of them, and a create works.
+    let listings: Vec<u32> = (0..crate::DIRS)
+        .map(|_| rig.open(ROOT, b"/d", p::READ | p::DIRECTORY, 0).unwrap())
+        .collect();
+    assert_eq!(
+        rig.open(ROOT, b"/d", p::READ | p::DIRECTORY, 0),
+        Err(p::code(p::TABLE_FULL)),
+        "the listings hold the places"
+    );
+    for h in listings {
+        rig.close(ROOT, h);
+    }
+    rig.put(ROOT, b"/d/new", 0o644, b"y");
+    // What a search description does: FSTAT and WHERE answer, and no listing is there to read or
+    // to start again.
+    let (who, h) = held[0];
+    assert_eq!(
+        rig.ok(who, |w| p::handle_call(p::Method::Where, h, w)),
+        b"/d"
+    );
+    let st = rig.ok(who, |w| p::handle_call(p::Method::Fstat, h, w));
+    assert_eq!(p::Stat::from_bytes(&st).unwrap().kind, p::KIND_DIRECTORY);
+    for method in [p::Method::Readdir, p::Method::Rewind] {
+        assert_eq!(
+            rig.call(who, |w| p::handle_call(method, h, w)),
+            Err(p::code(p::BAD_HANDLE)),
+            "{method:?}"
+        );
+    }
+    // It still stops a rename of the directory, or of one above it, and goes with its close.
+    assert_eq!(
+        rig.call(ROOT, |w| p::rename(b"/d", b"/e", w)),
+        Err(p::code(p::BUSY))
+    );
+    for (who, h) in held {
+        rig.close(who, h);
+    }
+    rig.call(ROOT, |w| p::rename(b"/d", b"/e", w)).unwrap();
+}
+
+/// A session that passed VERIFY_SESSION (a loader sends it for the session a parent gave a set-ID
+/// program) loses the binding of its old holder: it keeps its descriptions and reads them, writes
+/// and path calls answer NOT_BOUND until the program binds it to its own identity, and the profile
+/// of a native client is not touched.
+#[test]
+fn a_session_that_passed_verify_session_must_be_bound_again_by_its_new_holder() {
+    let mut rig = Rig::new();
+    rig.tree(0o755);
+    let h = rig.open(OWNER, b"/d/f", p::READ | p::WRITE, 0).unwrap();
+    assert!(rig.write(OWNER, h, b"x").is_ok());
+    let not_bound = Some(p::code(p::NOT_BOUND));
+    rig.server.unbind(OWNER);
+    assert_eq!((rig.write(OWNER, h, b"y")).err(), not_bound);
+    assert_eq!((rig.stat(OWNER, b"/d/f").map(drop)).err(), not_bound);
+    assert!(
+        rig.read(OWNER, h, 10).is_ok(),
+        "what it holds is read without a binding"
+    );
+    // The new holder binds it to its own identity, which then rules.
+    rig.server.bind(OWNER, user(2000, 200, &[])).unwrap();
+    assert_eq!(rig.open(OWNER, b"/d/f", p::READ, 0), Err(ACCESS));
+    // Unbinding a profile or an unknown label does nothing.
+    rig.server.unbind(ROOT);
+    assert!(rig.open(ROOT, b"/d/f", p::READ, 0).is_ok());
+    rig.server.unbind(987_654);
 }
