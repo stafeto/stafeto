@@ -471,11 +471,17 @@ the compositor, of the tablet's driver and of the display driver, whose
 PIPELINES, SOURCE and LAYERS steps must come (each under 0.9 of term B, a band
 under 16 328 ticks).
 
+`cargo xtask lvgl-probe` (stage G4) runs the LVGL demo in a window of the second
+revision and compares each of its two frames three ways: the demo's own CRC-32,
+QEMU's screenshot and the host reference program's CRC-32. `docs/lvgl.md` tells
+what else it compares and how.
+
 ## Not yet
 
 The period of a frame and its counters, a window's resize, the window manager
 and the keyboard in the base image (the manager's image is the probe's), the
 pointer in the base image, the layers of the display
 controller, a window of the second revision shown directly (the flag `SCANOUT`
-of WINDOW_CREATE is reserved), and the C functions for windows in `libc.so` (a
-change of the ABI series; the static library above has them now).
+of WINDOW_CREATE is reserved), and the C functions for windows in `libc.so`
+(a change of the ABI series, 0.6; the static library above has them now, and
+`docs/lvgl.md` tells the program that uses them).

@@ -32,6 +32,10 @@ pub const JOBS: usize = 12;
 /// The jobs one session may have in flight at once: no session fills the table alone.
 pub const SESSION_JOBS: usize = 4;
 
+/// The jobs only the sessions of native clients may take: the last of the table, so that the
+/// sessions of the process trees (many, each with its share) never leave `datakey` with no job.
+pub const NATIVE_JOBS: usize = 4;
+
 pub const FREE: u8 = 0;
 pub const QUEUED: u8 = 1;
 pub const DONE: u8 = 2;
@@ -51,6 +55,10 @@ pub struct Job {
     /// The label the request thread made for the call (CLONE, EXPORT) or read from the pass the call
     /// brought (ADOPT); 0 for the rest.
     pub aux: u64,
+    /// The raw handle of the identity session (BIND, SESSION) or the offered session
+    /// (VERIFY_SESSION) the request brought, which the request thread keeps open until the job is
+    /// done; 0 for the rest.
+    pub carried: u64,
     pub request_len: usize,
     pub request: [u8; abi::MESSAGE_MAX],
     pub reply_len: usize,
@@ -66,6 +74,7 @@ impl Job {
             kind: REQUEST,
             owner: 0,
             aux: 0,
+            carried: 0,
             request_len: 0,
             request: [0; abi::MESSAGE_MAX],
             reply_len: 0,
@@ -119,6 +128,10 @@ pub static YIELDED: AtomicBool = AtomicBool::new(false);
 pub fn queued_job() -> bool {
     (0..JOBS).any(|i| state(i).load(Ordering::Acquire) == QUEUED)
 }
+
+/// The server's tables (descriptions, open files, sessions, the memory of directories): about 50 KiB,
+/// too much for the worker's stack, which overflowed when they lived there. The worker's alone.
+pub static SERVER: Shared<datafs::server::Server> = Shared::new(datafs::server::Server::new());
 
 /// The memory of the volume: littlefs's state, its caches and the buffers of the open files.
 pub static STORAGE: Shared<datafs::Storage> = Shared::new(datafs::Storage::new());

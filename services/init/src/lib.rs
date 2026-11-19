@@ -18,6 +18,7 @@ pub mod quota;
 pub mod resolve;
 pub mod restart;
 pub mod shutdown;
+pub mod silent;
 pub mod table;
 pub mod waits;
 pub mod watch;

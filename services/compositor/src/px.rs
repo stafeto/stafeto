@@ -22,6 +22,10 @@ pub struct Pixman {
     refused: u32,
 }
 
+// The images pixman keeps cover every buffer the scene can name: three of each
+// window, the screen, the pointer's picture and the pool.
+const _: () = assert!(pixman::KEPT >= compositor::MAX_WINDOWS * proto_comp::BUFFERS + 3);
+
 const fn format(f: Format) -> Px {
     match f {
         Format::Xrgb => Px::Xrgb8888,
@@ -349,28 +353,28 @@ impl Raster for Pixman {
 #[cfg(feature = "steps")]
 pub mod calibration {
     use super::{Pixman, Px, Source, Target, composite, fill};
-    use core::cell::UnsafeCell;
 
-    /// The scratch surfaces, in memory of the program (17 pages of the two): 648 by 13 points for
-    /// the shapes of the width of the screen (640 and the offset of up to 3
-    /// points), and the same memory as 160 by 32 points (stride of 640 bytes)
-    /// for the others.
+    /// The scratch surfaces are two regions of the screen's own buffer (the target
+    /// the service keeps, 256 pages, mapped when the screen opens): 648 by 13 points
+    /// for the shapes of the width of the screen (640 and the offset of up to 3
+    /// points), and the first 160 by 32 points of the same regions (a stride of 640
+    /// bytes) for the others. The regions are filled before the calibration (the
+    /// source with 0x40 in every byte, which is a point of alpha 0x40) and made zero
+    /// after it, which is what the target holds before the first frame; the program
+    /// holds no memory for them, so the steps build needs no more quota than the
+    /// plain one.
     const WIDE: u32 = 648;
     const WIDE_HEIGHT: u32 = 13;
     const WIDE_STRIDE: u32 = WIDE * 4;
     const BYTES: usize = (WIDE_STRIDE * WIDE_HEIGHT) as usize;
+    /// Where the two regions begin in the buffer: pages of their own.
+    const DST_AT: usize = 0;
+    const SRC_AT: usize = BYTES.div_ceil(4096) * 4096;
     const NARROW: u32 = 160;
     const NARROW_HEIGHT: u32 = 32;
     const NARROW_STRIDE: u32 = NARROW * 4;
     const NARROW_BYTES: usize = (NARROW_STRIDE * NARROW_HEIGHT) as usize;
     const _: () = assert!(NARROW_BYTES <= BYTES);
-
-    #[repr(align(64))]
-    struct Surface(UnsafeCell<[u8; BYTES]>);
-    // SAFETY: touched by the main thread, once, at the start of the service.
-    unsafe impl Sync for Surface {}
-    static DST: Surface = Surface(UnsafeCell::new([0; BYTES]));
-    static SRC: Surface = Surface(UnsafeCell::new([0x40; BYTES]));
 
     /// What one class tells: the least and the greatest of its figure, the
     /// shapes of each, and how many operations counted.
@@ -459,6 +463,7 @@ pub mod calibration {
     /// over) and tells a line for each shape and one for the classes.
     fn kind(
         px: &mut Pixman,
+        fb: &mut [u8],
         which: usize,
         name: &str,
         thread: &rt::handle::Handle<rt::handle::Thread>,
@@ -479,12 +484,13 @@ pub mod calibration {
                     for sx in 0..4u32 {
                         // One warm-up, which makes the images pixman keeps.
                         for turn in 0..=REPEAT {
-                            // SAFETY: the main thread alone touches the scratch.
-                            let (dst, src) = unsafe { (&mut *DST.0.get(), &*SRC.0.get()) };
+                            let (dst_region, rest) = fb.split_at_mut(SRC_AT);
+                            let (dst, src) =
+                                (&mut dst_region[DST_AT..DST_AT + BYTES], &rest[..BYTES]);
                             // The width of the screen on the wide surface, the
                             // others on the narrow one (the same memory).
                             let (dst, src, stride, width, height) = if w > 160 {
-                                (&mut dst[..], &src[..], WIDE_STRIDE, WIDE, WIDE_HEIGHT)
+                                (dst, src, WIDE_STRIDE, WIDE, WIDE_HEIGHT)
                             } else {
                                 (
                                     &mut dst[..NARROW_BYTES],
@@ -596,7 +602,15 @@ pub mod calibration {
         /// with the greatest call taken off, the point hundredths of a tick a
         /// point with the greatest call and the rows (at the greatest row price)
         /// taken off: the model of `compositor::PRICES`.
-        pub fn calibrate(&mut self) {
+        pub fn calibrate(&mut self, fb: &mut [u8]) {
+            if fb.len() < SRC_AT + BYTES {
+                rt::println!(
+                    "service calibration: the screen's buffer is too small for the scratch"
+                );
+                return;
+            }
+            fb[DST_AT..DST_AT + BYTES].fill(0);
+            fb[SRC_AT..SRC_AT + BYTES].fill(0x40);
             let Ok(thread) = rt::sys::self_thread() else {
                 rt::println!(
                     "service calibration: no thread of its own to read the preemptions of"
@@ -604,8 +618,11 @@ pub mod calibration {
                 return;
             };
             for (which, name) in [(0, "black"), (1, "copy"), (2, "over")] {
-                kind(self, which, name, &thread);
+                kind(self, fb, which, name, &thread);
             }
+            // The target holds zero before its first frame.
+            fb[DST_AT..DST_AT + BYTES].fill(0);
+            fb[SRC_AT..SRC_AT + BYTES].fill(0);
         }
     }
 }

@@ -64,6 +64,9 @@ DUPLICATE_ROW = (
 FIRST_CRC = "450D7460"
 AFTER_CRC = "DDBD81B9"
 TURNS, FRAMES = "111", "64"
+# The largest use of LVGL's pool, as the guest measured it (and the reference
+# does, with the font under a path as long as the guest's).
+MEM_MAX_USED = "70120"
 EVIDENCE = [
     "evidence glyph a outline points 49 contours 2 crc EFEA584D",
     "evidence glyph a bitmap width 9 rows 9 pitch 9 left 0 top 9 advance 576 crc DEA4419D",
@@ -250,13 +253,20 @@ class ReferenceTests(unittest.TestCase):
         subprocess.run([sys.executable, str(HERE / "build-lvgl.py"), "--host"], check=True,
                        stdout=subprocess.DEVNULL)
         cls.ref = builder.REFERENCE
-        cls.font = builder.HOST_DIR / builder.SOURCE_DIR / builder.FONT
+        builder.place_reference_font()
+
+    def run_ref(self, *args: str, ref: Path | None = None):
+        """Run the reference in its directory, with the font under the path
+        the pool's use depends on (as long as the guest's)."""
+        return subprocess.run([str(ref or self.ref), *args, builder.REFERENCE_FONT],
+                              cwd=builder.REFERENCE_CWD, capture_output=True, text=True)
 
     def lines(self, *args: str, ref: Path | None = None) -> dict[str, str]:
-        out = subprocess.run([str(ref or self.ref), *args, str(self.font)], capture_output=True,
-                             check=True, text=True).stdout
+        done = self.run_ref(*args, ref=ref)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        out = done.stdout
         return {m.group(1): m.group(2) for m in re.finditer(
-            r"^lvgl-ref: (first crc|after crc|state|turns) (.*)$", out, re.M)}
+            r"^lvgl-ref: (first crc|after crc|state|turns|mem max-used) (.*)$", out, re.M)}
 
     def test_the_state_after_the_scenario(self):
         self.assertEqual(self.lines()["state"], STATE)
@@ -266,6 +276,12 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(got["first crc"], FIRST_CRC)
         self.assertEqual(got["after crc"], AFTER_CRC)
         self.assertEqual(got["turns"], f"{TURNS} frames {FRAMES}")
+
+    def test_the_pools_largest_use_is_the_guests_and_the_font_path_is_as_long(self):
+        self.assertEqual(self.lines()["mem max-used"], MEM_MAX_USED)
+        guest = re.search(r'#define DEMO_FONT_PATH "([^"]+)"', (PORT / "scene.h").read_text()).group(1)
+        self.assertEqual(len(builder.REFERENCE_FONT), len(guest))
+        self.assertTrue((builder.REFERENCE_CWD / builder.REFERENCE_FONT).exists())
 
     def test_the_two_crcs_repeat(self):
         first = self.lines()
@@ -302,8 +318,7 @@ class ReferenceTests(unittest.TestCase):
 
     def test_the_evidence_of_the_glyph_path_is_the_pinned_one(self):
         def evidence():
-            out = subprocess.run([str(self.ref), "--evidence", str(self.font)], capture_output=True,
-                                 check=True, text=True).stdout
+            out = self.run_ref("--evidence").stdout
             return [l.removeprefix("lvgl-ref: ") for l in out.splitlines()
                     if "evidence" in l and "bands" not in l]
         first = evidence()
@@ -311,8 +326,7 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(first, evidence())
 
     def test_the_bands_of_the_two_frames_are_printed_with_the_evidence(self):
-        out = subprocess.run([str(self.ref), "--evidence", str(self.font)], capture_output=True,
-                             check=True, text=True).stdout
+        out = self.run_ref("--evidence").stdout
         bands = [l.split() for l in out.splitlines() if "evidence bands" in l]
         self.assertEqual([b[3] for b in bands], ["first", "after"])
         for row in bands:
@@ -345,8 +359,7 @@ class ReferenceTests(unittest.TestCase):
                 .replace("if (changes >= SCENE_CHANGES) {", "if (changes >= SCENE_EVENTS) {")
                 .replace("#define COLLECT_MS 30000", "#define COLLECT_MS 200"))
             ref = builder.build_reference(port, Path(tmp) / "ref")
-            done = subprocess.run([str(ref), "--drop-same-move", str(self.font)],
-                                  capture_output=True, text=True)
+            done = self.run_ref("--drop-same-move", ref=ref)
             self.assertNotEqual(done.returncode, 0)
             self.assertIn("received 21 events", done.stdout)
             self.assertIn("M90,142 B110/1 B110/0 B110/1 B110/0 M30,200", done.stdout)

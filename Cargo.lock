@@ -188,7 +188,9 @@ dependencies = [
  "abi",
  "cc",
  "littlefs",
+ "posix-perm",
  "proto-data",
+ "proto-process",
  "proto-wire",
 ]
 
@@ -198,9 +200,12 @@ version = "0.5.1"
 dependencies = [
  "abi",
  "datafs",
+ "posix-clock",
  "proto-blk",
+ "proto-clock",
  "proto-data",
  "proto-init",
+ "proto-process",
  "proto-wire",
  "rt",
 ]
@@ -486,6 +491,7 @@ dependencies = [
  "pci",
  "power",
  "proto-comp",
+ "proto-data",
  "proto-fs",
  "proto-init",
  "proto-pipe",
@@ -994,6 +1000,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-perm"
+version = "0.1.0"
+
+[[package]]
 name = "posix-platform"
 version = "0.5.1"
 dependencies = [
@@ -1285,6 +1295,7 @@ name = "proto-data"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "proto-fs",
  "proto-wire",
 ]
 
@@ -1429,6 +1440,7 @@ dependencies = [
  "abi",
  "bootimg",
  "posix-clock",
+ "posix-perm",
  "proto-clock",
  "proto-fs",
  "proto-init",

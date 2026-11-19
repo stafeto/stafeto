@@ -70,9 +70,17 @@ void pxs_free(void *p)
         return;
     struct block *b = (struct block *)((unsigned char *)p - HEADER);
     b->free = 1;
-    // Join the free blocks that follow.
-    for (struct block *n = next(b); n && n->free; n = next(b))
-        b->size += HEADER + n->size;
+    // Join every run of free blocks. A block freed before its neighbour does
+    // not join it backwards (the blocks have no link to the one before), so
+    // joining only the blocks that follow the one freed leaves free blocks side by
+    // side for good, and the walk of `pxs_malloc` grows with them.
+    for (struct block *c = (struct block *)arena; c; c = next(c))
+        while (c->free) {
+            struct block *n = next(c);
+            if (!n || !n->free)
+                break;
+            c->size += HEADER + n->size;
+        }
 }
 
 void *pxs_calloc(size_t a, size_t b)

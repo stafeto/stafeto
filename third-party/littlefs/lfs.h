@@ -526,6 +526,45 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
 // Returns a negative error code on failure.
 int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info);
 
+// The kind and the custom attribute of one entry of a path
+//
+// stafeto: see lfs_path_attrs. res is the size of the attribute on disk, or
+// LFS_ERR_NOATTR when the entry has none.
+struct lfs_path_attr {
+    lfs_ssize_t res;
+    uint8_t type;
+};
+
+// Find info about a file or directory and the custom attributes of every entry of its path
+//
+// stafeto: lfs_stat_attr for the root and for each entry the path passes, in one
+// walk of the path with no lookup repeated: the cost is about that of one lfs_stat, 3 reads
+// for each component, where lfs_stat_attr of each prefix costs a lookup from the root for
+// each and grows with the square of the depth. The attribute of the given type of the
+// root and of each entry the walk matches, in the order of the path, goes to out (its kind and
+// the size of the attribute on disk, or LFS_ERR_NOATTR) and to buffer (size bytes for each,
+// as lfs_getattr fills them); entries that "." and ".." make the path skip are not matched
+// and have no place. *count is the number of places filled, also when the call fails. The
+// last place is the entry of the path itself, and info is filled for it as lfs_stat does.
+//
+// Returns 0, or a negative error code: LFS_ERR_NOENT for a missing entry and LFS_ERR_NOTDIR
+// for a file in the middle of the path, with *count counting the entries that were found
+// before it (the root and the directories above the missing name), and LFS_ERR_NAMETOOLONG
+// for a path with more entries than capacity (*count is capacity then).
+int lfs_path_attrs(lfs_t *lfs, const char *path, struct lfs_info *info,
+        uint8_t type, struct lfs_path_attr *out, void *buffer, lfs_size_t size,
+        lfs_size_t capacity, lfs_size_t *count);
+
+// Find info about a file or directory and one of its custom attributes
+//
+// stafeto: lfs_stat and lfs_getattr of the same path in one lookup. Fills out
+// the info structure, then reads the attribute of the given type as lfs_getattr
+// does. *res is the size of the attribute on disk, or LFS_ERR_NOATTR when the
+// entry has none, and the buffer is as lfs_getattr leaves it. Returns 0, or a
+// negative error code on failure.
+int lfs_stat_attr(lfs_t *lfs, const char *path, struct lfs_info *info,
+        uint8_t type, void *buffer, lfs_size_t size, lfs_ssize_t *res);
+
 // Get a custom attribute
 //
 // Custom attributes are uniquely identified by an 8-bit type and limited
@@ -685,6 +724,21 @@ int lfs_dir_close(lfs_t *lfs, lfs_dir_t *dir);
 // Returns a positive value on success, 0 at the end of directory,
 // or a negative error code on failure.
 int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info);
+
+// Read an entry in the directory and one of its custom attributes
+//
+// stafeto: lfs_dir_read and lfs_getattr of the entry it returns, without a
+// lookup of its path. Returns a positive value on success, 0 at the end of
+// directory, or a negative error code on failure. After a positive return *res
+// is the size of the attribute of the entry on disk, or LFS_ERR_NOATTR when
+// the entry has none: always for "." and "..", which are not entries of a
+// metadata pair.
+//
+// When reading the attribute fails with an error of the device, the iterator
+// has already advanced past the entry: a caller that wants to try again must
+// take lfs_dir_tell before the call and lfs_dir_seek back to it.
+int lfs_dir_read_attr(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info,
+        uint8_t type, void *buffer, lfs_size_t size, lfs_ssize_t *res);
 
 // Change the position of the directory
 //

@@ -7994,6 +7994,109 @@ fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String>
     Ok(())
 }
 
+/// The figures of every repeat on the starvation line, after "; repeats: ": fields separated by
+/// "; ", each a name and three words (numbers, or yes and no for "finished").
+fn repeat_field<'a>(line: &'a str, name: &str) -> Result<Vec<&'a str>, String> {
+    let tail = line
+        .split_once("; repeats: ")
+        .ok_or_else(|| format!("the starvation line has no repeats: {line}"))?
+        .1;
+    let words = tail
+        .split("; ")
+        .find_map(|field| field.strip_prefix(name)?.strip_prefix(' '))
+        .ok_or_else(|| format!("the starvation line has no repeat field {name:?}: {line}"))?;
+    let words: Vec<&str> = words.split(' ').collect();
+    if words.len() != STARVATION_REPEATS {
+        return Err(format!(
+            "the starvation line has {} figures in {name:?} and {STARVATION_REPEATS} are due: {line}",
+            words.len()
+        ));
+    }
+    Ok(words)
+}
+
+fn repeat_numbers(line: &str, name: &str) -> Result<Vec<u64>, String> {
+    repeat_field(line, name)?
+        .iter()
+        .map(|w| {
+            w.parse()
+                .map_err(|_| format!("the starvation line has {w:?} in {name:?}: {line}"))
+        })
+        .collect()
+}
+
+/// The repeats of the long rmdir the probe makes, alone and against the flood.
+const STARVATION_REPEATS: usize = 3;
+
+/// G1: every repeat ends within 10 s, has no restart and takes the request count it takes alone
+/// (the same in every repeat, and not zero); the least time against the flood is at most 2.5 times
+/// the least time alone, and the line's own least figures are those of the repeats.
+fn starvation_line(line: &str) -> Result<(), String> {
+    let verdict = format!("finished within 10 s: {STARVATION_ENDS_WITHIN_10_S}");
+    if !line.contains(&verdict) {
+        return Err(format!(
+            "the starvation line does not say {verdict:?}: update the expectation \
+             STARVATION_ENDS_WITHIN_10_S if the change is meant: {line}"
+        ));
+    }
+    let lines = [line.to_owned()];
+    let number = |prefix: &str| {
+        qemu::number_after(&lines, prefix)
+            .ok_or_else(|| format!("the line has no number after {prefix:?}: {line}"))
+    };
+    if number("against a loop of utimensat: ")? != 0 {
+        return Err(format!("G1: the long rmdir restarted: {line}"));
+    }
+    if let Some(word) = repeat_field(line, "finished")?
+        .iter()
+        .find(|w| **w != STARVATION_ENDS_WITHIN_10_S)
+    {
+        return Err(format!(
+            "G1: a repeat of the long rmdir finished within 10 s: {word}: {line}"
+        ));
+    }
+    if let Some(n) = repeat_numbers(line, "restarts")?.iter().find(|n| **n != 0) {
+        return Err(format!(
+            "G1: a repeat of the long rmdir restarted {n} times: {line}"
+        ));
+    }
+    let requests = repeat_numbers(line, "requests")?;
+    let alone_requests = repeat_numbers(line, "alone requests")?;
+    for (i, (r, a)) in requests.iter().zip(&alone_requests).enumerate() {
+        if r != a || *r == 0 {
+            return Err(format!(
+                "G1: request count changed from {a} to {r} in repeat {}: {line}",
+                i + 1
+            ));
+        }
+    }
+    if requests
+        .iter()
+        .chain(&alone_requests)
+        .any(|n| *n != requests[0])
+    {
+        return Err(format!("G1: the repeats differ in request count: {line}"));
+    }
+    let took = repeat_numbers(line, "took")?.into_iter().min().unwrap_or(0);
+    let alone = repeat_numbers(line, "alone")?
+        .into_iter()
+        .min()
+        .unwrap_or(0);
+    if (number("took ")?, number("alone ")?) != (took, alone) {
+        return Err(format!(
+            "G1: the least figures of the line are not those of its repeats: {line}"
+        ));
+    }
+    if took.saturating_mul(2) > alone.saturating_mul(5) {
+        return Err(format!(
+            "G1: the long rmdir took {took} ticks against the flood at the least of \
+             {STARVATION_REPEATS} repeats, more than 2.5 times the {alone} ticks it takes alone at \
+             the least: {line}"
+        ));
+    }
+    Ok(())
+}
+
 /// Whether the long rmdir of the starvation line (G1 of 5i-5b) ends within
 /// ten seconds against the flood of utimensat: "no" until 5i-5b step 2 (a
 /// change of the file raised the epoch every operation proved its path in),
@@ -8065,41 +8168,17 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
     ] {
         find(row)?;
     }
-    // G1: the long rmdir against the loop of utimensat of a file of its own:
-    // It ends with the same request count and at most 2.5 times the time alone.
+    // G1: the long rmdir against the loop of utimensat of a file of its own: in every repeat it ends
+    // within 10 s with no restart and the request count it has alone, and the least time of the
+    // repeats is at most 2.5 times the least time alone. The periodic work above the clients (the
+    // heartbeats, the audit round of the file service) lands in a repeat or not by the phase of the
+    // boot, so the least of three is the figure that carries no phase.
     let starvation = find("names starvation:")?;
-    let verdict = format!("finished within 10 s: {STARVATION_ENDS_WITHIN_10_S}");
-    if !starvation.contains(&verdict) {
-        return Err(format!(
-            "the starvation line does not say {verdict:?}: update the expectation \
-             STARVATION_ENDS_WITHIN_10_S if the change is meant: {starvation}"
-        ));
-    }
-    let starvation_line = [starvation.to_owned()];
+    starvation_line(starvation)?;
     let number = |lines: &[String], prefix: &str| {
         qemu::number_after(lines, prefix)
             .ok_or_else(|| format!("the line has no number after {prefix:?}: {lines:?}"))
     };
-    if number(&starvation_line, "against a loop of utimensat: ")? != 0 {
-        return Err(format!("G1: the long rmdir restarted: {starvation}"));
-    }
-    let (took, alone) = (
-        number(&starvation_line, "took ")?,
-        number(&starvation_line, "alone ")?,
-    );
-    let requests = number(&starvation_line, ", requests ")?;
-    let alone_requests = number(&starvation_line, "alone requests ")?;
-    if requests != alone_requests || requests == 0 {
-        return Err(format!(
-            "G1: request count changed from {alone_requests} to {requests}: {starvation}"
-        ));
-    }
-    if took.saturating_mul(2) > alone.saturating_mul(5) {
-        return Err(format!(
-            "G1: the long rmdir took {took} ticks against the flood, more than 2.5 times the \
-             {alone} ticks it takes alone: {starvation}"
-        ));
-    }
     // G2 and G3: a long path of links against the creation and removal of a
     // name elsewhere, the rename of a directory under a chain of 64 against
     // the mode of a file: both end, with no restart. G4 and G5 (the same
@@ -14849,6 +14928,108 @@ mod tests {
         assert!(super::check_lock_steps("pages", &over, &[50, 65]).is_err());
     }
 
+    /// The starvation line of the probe: the figures of three repeats, and the least of them in the
+    /// words before "; repeats:".
+    fn starvation_text(
+        took: [u64; 3],
+        alone: [u64; 3],
+        restarts: [u32; 3],
+        finished: [&str; 3],
+        requests: [u32; 3],
+        alone_requests: [u32; 3],
+    ) -> String {
+        let join = |v: &[String]| v.join(" ");
+        let nums = |v: &[u64]| join(&v.iter().map(u64::to_string).collect::<Vec<_>>());
+        let small = |v: &[u32]| join(&v.iter().map(u32::to_string).collect::<Vec<_>>());
+        format!(
+            "posix-procs: names starvation: rmdir in a table of 382 names against a loop of utimensat: \
+             {} restarts, finished within 10 s: {}, took {} ticks, alone {} ticks, requests {}, alone \
+             requests {}; repeats: restarts {}; finished {}; took {}; alone {}; requests {}; alone \
+             requests {}",
+            restarts.iter().max().unwrap(),
+            if finished.iter().all(|w| *w == "yes") {
+                "yes"
+            } else {
+                "no"
+            },
+            took.iter().min().unwrap(),
+            alone.iter().min().unwrap(),
+            requests[0],
+            alone_requests[0],
+            small(&restarts),
+            finished.join(" "),
+            nums(&took),
+            nums(&alone),
+            small(&requests),
+            small(&alone_requests),
+        )
+    }
+
+    #[test]
+    fn the_starvation_gate_reads_the_least_of_three_and_checks_every_repeat() {
+        let ok = |t, a| {
+            super::starvation_line(&starvation_text(t, a, [0; 3], ["yes"; 3], [10; 3], [10; 3]))
+        };
+        // The present case: all three well inside 2.5 times.
+        assert!(ok([218_444, 230_000, 260_000], [110_180, 112_000, 120_000]).is_ok());
+        // One slow repeat among three passes when the least holds (a wave of heartbeats in it).
+        assert!(ok([359_762, 271_784, 276_662], [135_663, 140_000, 150_000]).is_ok());
+        // The boundary: 2.5 times the least alone passes, one tick more fails.
+        assert!(ok([275_450, 400_000, 400_000], [110_180, 111_000, 112_000]).is_ok());
+        assert!(ok([275_451, 400_000, 400_000], [110_180, 111_000, 112_000]).is_err());
+        // All three slow fails.
+        assert!(ok([359_762, 360_000, 370_000], [135_663, 136_000, 137_000]).is_err());
+        // A slow figure alone does not pass by a slow least: the least alone is the divisor.
+        assert!(ok([300_000, 310_000, 320_000], [100_000, 150_000, 160_000]).is_err());
+        // Every repeat is checked for restarts, for the verdict and for the request count.
+        let with = |r: [u32; 3], fin: [&str; 3], req: [u32; 3], alone: [u32; 3]| {
+            super::starvation_line(&starvation_text(
+                [218_444, 230_000, 260_000],
+                [110_180, 112_000, 120_000],
+                r,
+                fin,
+                req,
+                alone,
+            ))
+        };
+        assert!(with([0; 3], ["yes"; 3], [10; 3], [10; 3]).is_ok());
+        assert!(
+            with([0, 1, 0], ["yes"; 3], [10; 3], [10; 3]).is_err(),
+            "a repeat with a restart"
+        );
+        assert!(with([0; 3], ["yes", "yes", "no"], [10; 3], [10; 3]).is_err());
+        assert!(
+            with([0; 3], ["yes"; 3], [10, 11, 10], [10; 3]).is_err(),
+            "unequal requests"
+        );
+        assert!(with([0; 3], ["yes"; 3], [10; 3], [10, 10, 9]).is_err());
+        assert!(
+            with([0; 3], ["yes"; 3], [0; 3], [0; 3]).is_err(),
+            "no requests"
+        );
+        assert!(with([0; 3], ["yes"; 3], [11; 3], [10; 3]).is_err());
+        // A line without the repeats, or with two figures, is refused; so is a least that is not one.
+        let good = starvation_text(
+            [218_444, 230_000, 260_000],
+            [110_180, 112_000, 120_000],
+            [0; 3],
+            ["yes"; 3],
+            [10; 3],
+            [10; 3],
+        );
+        assert!(super::starvation_line(good.split("; repeats:").next().unwrap()).is_err());
+        assert!(
+            super::starvation_line(
+                &good.replace("took 218444 230000 260000", "took 218444 230000")
+            )
+            .is_err()
+        );
+        assert!(
+            super::starvation_line(&good.replace("took 218444 ticks", "took 300000 ticks"))
+                .is_err()
+        );
+    }
+
     fn names_log(repeats: &str) -> Vec<String> {
         [
             "posix-procs: names time a missing component: 73 requests, 617628 ticks",
@@ -14860,7 +15041,7 @@ mod tests {
             "posix-procs: names time rename of a directory under a chain 64 deep: 1559 requests, 15679606 ticks",
             "posix-procs: names time rmdir with a full table: 96 requests, 855238 ticks",
             "posix-procs: names thread cost: 28672 bytes (7 pages) for the first thread, 28672 bytes the last, 86016 bytes for 3, stack 20480 bytes",
-            "posix-procs: names starvation: rmdir in a table of 382 names against a loop of utimensat: 0 restarts, finished within 10 s: yes, took 218444 ticks, alone 110180 ticks, requests 10, alone requests 10",
+            &starvation_text([218_444, 230_000, 260_000], [110_180, 112_000, 120_000], [0; 3], ["yes"; 3], [10; 3], [10; 3]),
             "posix-procs: names interference G2: a path of 32 links against a name made and removed in another directory: 0 restarts, finished within 10 s: yes, result 0, took 1356992 ticks, alone 629874 ticks",
             "posix-procs: names interference G2b: a rename against a colliding name in another directory: 0 restarts, finished within 10 s: yes, result 0, took 2900000 ticks, alone 1300000 ticks",
             "posix-procs: names interference G3: the rename of a directory under a chain 64 deep against chmod of a file: 0 restarts, finished within 10 s: yes, result 0, took 2895999 ticks, alone 1308386 ticks",
@@ -14964,38 +15145,6 @@ mod tests {
             }
         }
         assert!(super::names_lines(&turned).is_err());
-        // G1 rejects restarts, extra requests and more than 2.5 times the quiet time.
-        let mut restarted = names_log(good);
-        for line in &mut restarted {
-            if line.contains("names starvation") {
-                *line = line.replace("utimensat: 0 restarts", "utimensat: 1 restarts");
-            }
-        }
-        assert!(super::names_lines(&restarted).is_err());
-        let mut slow = names_log(good);
-        for line in &mut slow {
-            if line.contains("names starvation") {
-                *line = line.replace("took 218444 ticks", "took 275451 ticks");
-            }
-        }
-        assert!(super::names_lines(&slow).is_err());
-        for replacement in [
-            ", requests 11, alone requests 10",
-            ", requests 0, alone requests 0",
-        ] {
-            let changed: Vec<String> = names_log(good)
-                .iter()
-                .map(|line| line.replace(", requests 10, alone requests 10", replacement))
-                .collect();
-            assert!(super::names_lines(&changed).is_err());
-        }
-        for ticks in [220361, 275450] {
-            let boundary: Vec<String> = names_log(good)
-                .iter()
-                .map(|line| line.replace("took 218444 ticks", &format!("took {ticks} ticks")))
-                .collect();
-            assert!(super::names_lines(&boundary).is_ok());
-        }
         // G2 and G3 end with no restart; G4 and G5 only have to be printed.
         for tag in ["G2", "G2b", "G3"] {
             let mut bad = names_log(good);

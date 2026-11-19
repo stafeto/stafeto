@@ -34,10 +34,14 @@ mod imp {
     // pixman_op_t: PIXMAN_OP_SRC and PIXMAN_OP_OVER.
     const OP_SRC: i32 = 1;
     const OP_OVER: i32 = 3;
-    /// The images kept: the screen's, the pointer's picture and the buffers
-    /// of the windows in use (three buffers of each of eight windows is more
-    /// than a frame touches at once).
-    const KEPT: usize = 16;
+    /// The images kept: the screen's, the pointer's picture, the pool of the
+    /// window of the first revision and the buffers of the windows: three buffers
+    /// of each of eight windows, 24, are all the service can hold at once, 27 in
+    /// all. A table smaller than the buffers a frame names in turn (eight windows
+    /// of two buffers and the screen are 17) makes every operation of a band
+    /// make an image again and drop another, which costs a band thousands of ticks
+    /// and fragments the arena.
+    pub const KEPT: usize = 32;
 
     unsafe extern "C" {
         fn pixman_image_create_bits(
@@ -284,7 +288,7 @@ mod imp {
 }
 
 #[cfg(target_os = "none")]
-pub use imp::Images;
+pub use imp::{Images, KEPT};
 
 /// A surface to draw on.
 #[cfg(target_os = "none")]

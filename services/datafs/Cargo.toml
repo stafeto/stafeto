@@ -26,8 +26,11 @@ break-datafs-stop = []
 [dependencies]
 abi = { path = "../../lib/abi" }
 datafs = { path = "../../lib/datafs" }
+posix-clock = { path = "../../lib/posix-clock" }
 proto-blk = { path = "../../proto/blk" }
+proto-clock = { path = "../../proto/clock" }
 proto-data = { path = "../../proto/data" }
 proto-init = { path = "../../proto/init" }
+proto-process = { path = "../../proto/process" }
 proto-wire = { path = "../../proto/wire" }
 rt = { path = "../../lib/rt" }

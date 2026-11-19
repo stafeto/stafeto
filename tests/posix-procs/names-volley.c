@@ -292,6 +292,9 @@ static void *vz_long_rmdir(void *unused) {
     return unused;
 }
 
+/* The repeats of the long rmdir, alone and against the flood; the printf of the line names three. */
+#define VZ_STARVE_REPEATS 3
+
 static int vz_starvation(void) {
     /* Names until the table of the root is full. */
     VZ_CHECK(mkdir(VZ "/e", 0755) == 0);
@@ -304,36 +307,72 @@ static int vz_starvation(void) {
     int refused = errno;
     printf("posix-procs: names: the table is full after %d more names (errno %d)\n", made, refused);
     VZ_CHECK(made > 150);
-    /* A full table: removing an empty directory looks at every name. */
-    vz_mark();
-    VZ_CHECK(rmdir(VZ "/e") == 0);
-    unsigned long long quiet_ticks = files_volley_ticks() - vz_ticks0;
-    unsigned quiet_requests = files_volley_requests() - vz_requests0;
-    vz_line("rmdir with a full table");
-    VZ_CHECK(mkdir(VZ "/e", 0755) == 0);
-    files_volley_start();
+    /* A full table: removing an empty directory looks at every name. The removal is measured alone
+     * three times, then against the flood three times, one after another: a repeat lasts a few
+     * milliseconds and the periodic work above the clients (the heartbeats of the services, the audit
+     * round of the file service) comes every 250 ms, so one of three is clean. The directory is made
+     * again before each repeat, outside the timed interval, with the table still full. */
+    unsigned long long quiet_ticks[VZ_STARVE_REPEATS];
+    unsigned quiet_requests[VZ_STARVE_REPEATS];
+    for (int r = 0; r < VZ_STARVE_REPEATS; r++) {
+        vz_mark();
+        VZ_CHECK(rmdir(VZ "/e") == 0);
+        quiet_ticks[r] = files_volley_ticks() - vz_ticks0;
+        quiet_requests[r] = files_volley_requests() - vz_requests0;
+        if (r == 0) vz_line("rmdir with a full table");
+        VZ_CHECK(mkdir(VZ "/e", 0755) == 0);
+    }
+    unsigned long long took[VZ_STARVE_REPEATS];
+    unsigned requests[VZ_STARVE_REPEATS], restarts[VZ_STARVE_REPEATS];
+    int within[VZ_STARVE_REPEATS];
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 65536);
-    pthread_t flood, remover;
-    unsigned long long begin = vz_now_ns();
-    VZ_CHECK(pthread_create(&flood, &attr, vz_flood, NULL) == 0);
-    VZ_CHECK(pthread_create(&remover, &attr, vz_long_rmdir, NULL) == 0);
-    while (!vz_rmdir_done && vz_now_ns() - begin < 10000000000ull) {
-        struct timespec delay = {0, 20000000};
-        nanosleep(&delay, NULL);
+    for (int r = 0; r < VZ_STARVE_REPEATS; r++) {
+        if (r > 0) VZ_CHECK(mkdir(VZ "/e", 0755) == 0);
+        vz_flood_stop = 0;
+        vz_rmdir_done = 0;
+        vz_rmdir_result = -2;
+        files_volley_start();
+        pthread_t flood, remover;
+        unsigned long long begin = vz_now_ns();
+        VZ_CHECK(pthread_create(&flood, &attr, vz_flood, NULL) == 0);
+        VZ_CHECK(pthread_create(&remover, &attr, vz_long_rmdir, NULL) == 0);
+        while (!vz_rmdir_done && vz_now_ns() - begin < 10000000000ull) {
+            struct timespec delay = {0, 20000000};
+            nanosleep(&delay, NULL);
+        }
+        within[r] = vz_rmdir_done;
+        /* The flood ends so that the rmdir can end; the line tells both. */
+        vz_flood_stop = vz_flood_stop ? vz_flood_stop : 1;
+        VZ_CHECK(pthread_join(flood, NULL) == 0);
+        VZ_CHECK(pthread_join(remover, NULL) == 0);
+        VZ_CHECK(vz_flood_stop == 1);
+        VZ_CHECK(vz_rmdir_result == 0);
+        took[r] = vz_rmdir_ticks;
+        requests[r] = vz_rmdir_requests;
+        restarts[r] = files_volley_restarts(VZ_OP_UNLINK);
     }
-    int within = vz_rmdir_done;
-    /* The flood ends so that the rmdir can end; the line tells both. */
-    vz_flood_stop = vz_flood_stop ? vz_flood_stop : 1;
-    VZ_CHECK(pthread_join(flood, NULL) == 0);
-    VZ_CHECK(pthread_join(remover, NULL) == 0);
-    VZ_CHECK(vz_flood_stop == 1);
-    VZ_CHECK(vz_rmdir_result == 0);
+    /* The words before "; repeats:" are the line of one repeat as before (the least times, the most
+     * restarts, "yes" when every repeat ended within 10 s, the requests of the repeat with the least
+     * time); after it come the figures of every repeat, which the gate checks one by one. */
+    int best = 0, quiet_best = 0, all_within = 1;
+    unsigned most_restarts = 0;
+    for (int r = 0; r < VZ_STARVE_REPEATS; r++) {
+        if (took[r] < took[best]) best = r;
+        if (quiet_ticks[r] < quiet_ticks[quiet_best]) quiet_best = r;
+        if (!within[r]) all_within = 0;
+        if (restarts[r] > most_restarts) most_restarts = restarts[r];
+    }
     printf("posix-procs: names starvation: rmdir in a table of %d names against a loop of utimensat: "
-           "%u restarts, finished within 10 s: %s, took %llu ticks, alone %llu ticks, requests %u, alone requests %u\n",
-           made + VZ_PAD, files_volley_restarts(VZ_OP_UNLINK), within ? "yes" : "no", vz_rmdir_ticks,
-           quiet_ticks, vz_rmdir_requests, quiet_requests);
+           "%u restarts, finished within 10 s: %s, took %llu ticks, alone %llu ticks, requests %u, alone requests %u; "
+           "repeats: restarts %u %u %u; finished %s %s %s; took %llu %llu %llu; alone %llu %llu %llu; "
+           "requests %u %u %u; alone requests %u %u %u\n",
+           made + VZ_PAD, most_restarts, all_within ? "yes" : "no", took[best], quiet_ticks[quiet_best],
+           requests[best], quiet_requests[quiet_best], restarts[0], restarts[1], restarts[2],
+           within[0] ? "yes" : "no", within[1] ? "yes" : "no", within[2] ? "yes" : "no", took[0], took[1],
+           took[2], quiet_ticks[0], quiet_ticks[1], quiet_ticks[2], requests[0], requests[1], requests[2],
+           quiet_requests[0], quiet_requests[1], quiet_requests[2]);
     for (int i = 0; i < made; i++) {
         char name[40];
         snprintf(name, sizeof name, VZ "/q%d", i);

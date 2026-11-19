@@ -438,43 +438,67 @@ impl Identity {
             groups,
         }
     }
+    /// The caller as the shared permission rules see it.
+    pub(crate) fn rules<'a>(&'a self) -> posix_perm::Identity<'a> {
+        posix_perm::Identity::new(
+            self.uid,
+            self.gid,
+            &self.groups.ids[..self.groups.count as usize],
+        )
+    }
     pub fn permits(self, node: &Node, bits: u32) -> bool {
-        if self.uid == 0 {
-            return bits & 1 == 0 || node.kind == crate::DIR || node.mode & 0o111 != 0;
-        }
-        let class = if self.uid == node.uid {
-            node.mode >> 6
-        } else if self.gid == node.gid || self.groups.contains(node.gid) {
-            node.mode >> 3
-        } else {
-            node.mode
-        };
-        class & bits == bits
+        posix_perm::permits(self.rules(), &attr(node), bits)
     }
     pub fn sticky(self, parent: &Node, victim: &Node) -> bool {
-        parent.mode & 0o1000 == 0
-            || self.uid == 0
-            || self.uid == parent.uid
-            || self.uid == victim.uid
+        posix_perm::sticky_allows(self.rules(), &attr(parent), &attr(victim))
     }
     pub fn creation(self, parent: &Node, kind: u32, mode: u32, umask: u32) -> (u32, u32, u32, u32) {
-        let gid = if parent.mode & 0o2000 != 0 {
-            parent.gid
-        } else {
-            self.gid
-        };
-        let mut mode = (mode & 0o7777 & !(umask & 0o777))
-            | if kind == crate::DIR {
-                parent.mode & 0o2000
-            } else {
-                0
-            };
-        // A non-directory created in a group the creator does not belong to (inherited from
-        // a set-group-ID parent) loses its own set-group-ID bit, as chmod does.
-        if kind != crate::DIR && self.uid != 0 && gid != self.gid && !self.groups.contains(gid) {
-            mode &= !0o2000;
-        }
-        (kind, mode, self.uid, gid)
+        let created =
+            posix_perm::creation(self.rules(), &attr(parent), perm_kind(kind), mode, umask);
+        (kind, created.mode, created.uid, created.gid)
+    }
+    /// The mode a `chmod` leaves, or whether the caller may not change it.
+    pub fn chmod(self, node: &Node, requested: u32) -> Result<u32, posix_perm::Denial> {
+        posix_perm::chmod_result(self.rules(), &attr(node), requested)
+    }
+    pub fn chown(
+        self,
+        node: &Node,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<posix_perm::Owned, posix_perm::Denial> {
+        posix_perm::chown_result(self.rules(), &attr(node), uid, gid)
+    }
+    pub fn utimens(
+        self,
+        node: &Node,
+        request: posix_perm::TimesRequest,
+    ) -> Result<(), posix_perm::Denial> {
+        posix_perm::utimens_allowed(self.rules(), &attr(node), request)
+    }
+}
+
+/// The status of a refusal of the shared rules.
+pub(crate) fn refusal(denial: posix_perm::Denial) -> u32 {
+    match denial {
+        posix_perm::Denial::Access => proto_fs::ACCESS_DENIED,
+        posix_perm::Denial::Permission => proto_fs::PERMISSION,
+    }
+}
+
+fn perm_kind(kind: u32) -> posix_perm::Kind {
+    if kind == crate::DIR {
+        posix_perm::Kind::Directory
+    } else {
+        posix_perm::Kind::File
+    }
+}
+pub(crate) fn attr(node: &Node) -> posix_perm::Attr {
+    posix_perm::Attr {
+        kind: perm_kind(node.kind),
+        mode: node.mode,
+        uid: node.uid,
+        gid: node.gid,
     }
 }
 

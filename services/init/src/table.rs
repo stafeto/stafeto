@@ -79,6 +79,26 @@ pub const BOOT_PROFILE_CLIENTS: &[&str] = &[
     "datakey-probe",
 ];
 
+/// The data file service's name (services/datafs).
+pub const DATA_SERVICE: &str = "datafs";
+/// The native clients of the data file service: init gives their sessions with it the label
+/// `proto_data::SERVICE`, which the service reads as the identity of user 0, group 0 with no
+/// supplementary groups and no file size limit. Every record of any table that connects to
+/// `datafs` and is not a POSIX process is here (a test walks the tables); a POSIX process gets
+/// its session with the service from the process service and binds it with a copy of its identity
+/// session, and never gets the label.
+pub const DATA_SERVICE_CLIENTS: &[&str] = &["datakey", "data-probe", "stop-writer"];
+
+/// The label mark of the session that `client` gets by asking for `service`: the data file
+/// service's `SERVICE` for a native client of `DATA_SERVICE_CLIENTS`, none for any other client
+/// and for every POSIX process.
+pub fn data_mark(client: &Record, service: &[u8]) -> Option<u64> {
+    (service == DATA_SERVICE.as_bytes()
+        && DATA_SERVICE_CLIENTS.contains(&client.name)
+        && !client.is_posix())
+    .then_some(proto_data::SERVICE)
+}
+
 /// The client init gives the RAM file service's layer session
 /// (`proto_fs::LAYERS`, attach and detach of package files): the diagnostic client of the
 /// layers now, the package service later. It asks for the session by the name
@@ -159,6 +179,7 @@ pub const VOUCHERS: &[&str] = &[
     NET_SERVICE,
     ENTROPY_SERVICE,
     PACKAGE_SERVICE,
+    DATA_SERVICE,
 ];
 /// The vouchers whose notary session may tell the process service that a
 /// file is set-ID (proto_process SetId, spec 2, 3.2): the file services.
@@ -4414,6 +4435,112 @@ mod tests {
         for (i, &(_, a)) in ROOT_SERVICES.iter().enumerate() {
             for &(_, b) in &ROOT_SERVICES[i + 1..] {
                 assert_ne!(a, b);
+            }
+        }
+    }
+
+    /// Every table that has the data file service (the tables of the images are `all_tables`, the
+    /// probes of the volume and the stop probe are listed beside them).
+    fn data_tables() -> Vec<&'static [Record]> {
+        let mut tables = all_tables();
+        tables.push(pkg::DATA_PROBE_TABLE);
+        tables.push(pkg::DATAKEY_PROBE_TABLE);
+        tables.push(shutdown::STOP_TABLE);
+        tables
+    }
+
+    /// The label of the data file service goes to the native clients of DATA_SERVICE_CLIENTS and
+    /// to nobody else: no other record of any table, no other service, and no POSIX process that
+    /// carries the name of a listed client.
+    #[test]
+    fn the_service_label_of_the_data_file_service_goes_to_its_native_clients_only() {
+        let mut given = 0;
+        for table in data_tables() {
+            for r in table {
+                let mark = data_mark(r, DATA_SERVICE.as_bytes());
+                let wanted = DATA_SERVICE_CLIENTS.contains(&r.name) && !r.is_posix();
+                assert_eq!(mark, wanted.then_some(proto_data::SERVICE), "{}", r.name);
+                given += usize::from(mark.is_some());
+                for other in [
+                    RAM_SERVICE,
+                    PIPE_SERVICE,
+                    NET_SERVICE,
+                    "datadisk",
+                    "posix",
+                    "gpu",
+                ] {
+                    assert_eq!(
+                        data_mark(r, other.as_bytes()),
+                        None,
+                        "{} for {other}",
+                        r.name
+                    );
+                }
+            }
+        }
+        assert!(given >= 3, "{given}");
+        // A POSIX record of the name of a listed client never gets it.
+        for name in DATA_SERVICE_CLIENTS {
+            let posix = client(name, 30, 30, &[DATA_SERVICE, PROCESS_SERVICE]);
+            assert!(posix.is_posix());
+            assert_eq!(data_mark(&posix, DATA_SERVICE.as_bytes()), None, "{name}");
+            let native = client(name, 30, 30, &[DATA_SERVICE]);
+            assert_eq!(
+                data_mark(&native, DATA_SERVICE.as_bytes()),
+                Some(proto_data::SERVICE)
+            );
+        }
+        // A session the service makes itself (OWN) never reads as a native client.
+        assert!(proto_data::is_service(proto_data::SERVICE | 7));
+        assert!(!proto_data::is_service(
+            proto_data::SERVICE | proto_data::OWN
+        ));
+    }
+
+    /// DATA_SERVICE_CLIENTS holds every native client of `datafs` in every table, and nothing that
+    /// is no client in any table: a client left out would find its session without an identity.
+    #[test]
+    fn the_list_of_native_clients_of_the_data_file_service_is_every_one_of_every_table() {
+        let mut found: Vec<&str> = Vec::new();
+        for table in data_tables() {
+            for r in table {
+                if r.connects.contains(&DATA_SERVICE) && !r.is_posix() {
+                    assert!(
+                        DATA_SERVICE_CLIENTS.contains(&r.name),
+                        "{} is a client",
+                        r.name
+                    );
+                    found.push(r.name);
+                }
+                // A POSIX process does not connect to the data service by init's table.
+                assert!(
+                    !(r.connects.contains(&DATA_SERVICE) && r.is_posix()),
+                    "{}",
+                    r.name
+                );
+            }
+        }
+        for name in DATA_SERVICE_CLIENTS {
+            assert!(found.contains(name), "{name} is in no table as a client");
+        }
+    }
+
+    /// The data file service is a voucher with the plain notary session: no mark of a root, no
+    /// right to say a file is set-ID, and it is not a POSIX process, so `connects` has no `posix`
+    /// (a record that connects to it is one, and gets no notary session).
+    #[test]
+    fn the_data_file_service_is_a_plain_voucher() {
+        assert!(VOUCHERS.contains(&DATA_SERVICE));
+        assert_eq!(notary_mark(DATA_SERVICE), proto_process::NOTARY);
+        assert!(!SET_ID_VOUCHERS.contains(&DATA_SERVICE));
+        assert!(!ROOT_SERVICES.iter().any(|(name, _)| *name == DATA_SERVICE));
+        for table in data_tables() {
+            for r in table.iter().filter(|r| r.name == DATA_SERVICE) {
+                assert!(!r.is_posix() && !r.is_client());
+                assert!(!r.connects.contains(&PROCESS_SERVICE));
+                // Where the table has a clock service, the data service connects to it.
+                let has_clock = table.iter().any(|c| c.name == CLOCK_SERVICE);
+                assert_eq!(r.connects.contains(&CLOCK_SERVICE), has_clock);
             }
         }
     }

@@ -7,6 +7,8 @@
 //! done. littlefs calls the disk in straight lines that wait in calls, so the main thread never waits
 //! for the disk and keeps answering its clients and its heartbeat.
 
+use crate::clock::Clock;
+use crate::identity::{Identities, Notary};
 use crate::shared::*;
 use abi::{Access, MESSAGE_MAX, Rights, Source};
 use core::sync::atomic::AtomicBool;
@@ -24,7 +26,7 @@ use rt::sys::{self, Received};
 
 /// The thread's stack: the volume's calls and the 1 KiB buffers of a request. The stack is an object
 /// of its own with no mapping on the page below it, so an overflow faults and ends the process.
-const STACK_SIZE: usize = 96 * 1024;
+const STACK_SIZE: usize = 128 * 1024;
 const STACK_AT: usize = 0x58_2000_0000;
 /// The thread's message buffer: the page after the main thread's.
 const MSGBUF: usize = abi::INIT_MSGBUF as usize + 4096;
@@ -32,13 +34,16 @@ const MSGBUF: usize = abi::INIT_MSGBUF as usize + 4096;
 const BUFFER_AT: usize = 0x58_1000_0000;
 
 /// The raw handles of the main thread's, kept for this thread.
-pub const HANDLES: usize = 3;
+pub const HANDLES: usize = 4;
 pub static RAW: [core::sync::atomic::AtomicU64; HANDLES] =
     [const { core::sync::atomic::AtomicU64::new(0) }; HANDLES];
 pub const PROCESS: usize = 0;
 pub const BLK_SESSION: usize = 1;
 /// The notification that wakes the main thread.
 pub const WAKE: usize = 2;
+/// The service's channel to init, for the connections the worker makes itself (the notary session
+/// and the clock).
+pub const PARENT: usize = 3;
 /// The channel the worker waits on for a kick; the main thread holds a notify handle to it.
 pub static JOBS_CHANNEL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -371,13 +376,20 @@ extern "C" fn work(_: u64) -> ! {
             None
         }
     };
+    let mut volume = volume;
+    let mut clock = Clock::new();
+    if !clock.attach(&view::<Channel>(PARENT), &process) {
+        rt::println!("datafs: no clock service, the times of files are the count since boot");
+    }
+    mount_work(&mut volume, &mut clock);
+    // A volume of a later format is refused: every request answers NOT_READY.
     READY.store(volume.is_some(), Release);
     STARTING.store(false, Release);
     #[cfg(feature = "crash")]
     ARMED.store(true, Release);
     let wake = view::<Channel>(WAKE);
     let _ = sys::notify(&wake, 1);
-    serve(volume, &wake)
+    serve(volume, clock, &wake)
 }
 
 fn open_volume(disk: Disk) -> Option<Volume> {
@@ -435,13 +447,20 @@ fn say_foreign(found: &Found) {
     );
 }
 
-/// The loop of the thread: wait for a kick, run the queued jobs in order, say each is done.
-fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
-    // The mount work, before the first request: the hidden directory of the orphans, what a stop or
-    // a cut left in it, and the epoch of this instance, a count kept on the volume (the handles of
-    // an earlier instance answer STALE). Without a volume the epoch is the clock's.
+/// The mount work, before READY and so before the first request: the clock, the hidden directory of
+/// the orphans, what a stop or a cut left in it, the attributes of the volume (`Server::mount_work`:
+/// a volume of version 2 gets its records, a later format is refused) and the epoch of this instance,
+/// a count kept on the volume (the handles of an earlier instance answer STALE). The server starts
+/// with nothing remembered of directories. Without a volume the epoch is the clock's. A conversion
+/// of the volume of the first release is a few commits (three entries); READY waits for them, and
+/// no request has been taken yet.
+fn mount_work(volume: &mut Option<Volume>, clock: &mut Clock) {
+    // SAFETY: the server is the worker's alone and lives for the life of the process.
+    let server: &mut Server = unsafe { &mut *SERVER.get() };
     let mut epoch = (rt::time::now() >> 4) as u32;
     if let Some(fs) = volume.as_mut() {
+        // The time of the first job, and of the records the mount work writes, is not 0.
+        server.set_now(clock.now_ns());
         if datafs::server::ensure_orphans(fs).is_err() {
             rt::println!("datafs: the directory of the orphans could not be made");
         }
@@ -455,12 +474,41 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
             ),
             Err(_) => rt::println!("datafs: the orphans could not be dealt with"),
         }
+        match server.mount_work(fs) {
+            Ok(done) if done.refused => {
+                rt::println!(
+                    "datafs: the volume's format is newer than this service's: left alone and refused"
+                )
+            }
+            Ok(done) if done.converted > 0 || !done.complete => rt::println!(
+                "datafs: {} entries got attributes{}",
+                done.converted,
+                if done.complete {
+                    ""
+                } else {
+                    ", more at the next mount"
+                }
+            ),
+            Ok(_) => {}
+            Err(_) => rt::println!("datafs: the attributes of the volume could not be made"),
+        }
         match datafs::server::bump_epoch(fs) {
             Ok(count) => epoch = count,
             Err(_) => rt::println!("datafs: the epoch could not be kept, the clock's is used"),
         }
     }
-    let mut server = Server::with_epoch(epoch);
+    server.set_epoch(epoch);
+}
+
+/// The loop of the thread: wait for a kick, run the queued jobs in order, say each is done.
+fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -> ! {
+    // SAFETY: as in `mount_work`.
+    let server: &mut Server = unsafe { &mut *SERVER.get() };
+    // The notary session and the identity copies of the bound sessions.
+    let parent = view::<Channel>(PARENT);
+    let process = view::<Process>(PROCESS);
+    let mut notary = Notary::new();
+    let mut identities = Identities::new();
     let kicks = Handle::<Channel>::borrowed(abi::Handle(JOBS_CHANNEL.load(Acquire)));
     // The idle work: the first walk after READY, and the walk that finds the blocks removals gave
     // back. A timer on the kick channel wakes the thread when the queue has been empty for
@@ -485,6 +533,20 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
             // until it is DONE.
             let job = unsafe { &mut *job(i) };
             let request = &job.request[..job.request_len];
+            // The time of this job, and the look at the binding of its session (rule 1): a moved
+            // generation of the client's record asks Vouch again with the stored copy.
+            if volume.is_some() {
+                server.set_now(clock.now_ns());
+                if job.kind == REQUEST && !proto_data::is_root(job.owner) {
+                    let owner = job.owner;
+                    datafs::vouching::before_job(
+                        server,
+                        owner,
+                        |index| notary.generation(index),
+                        || identities.get(owner).and_then(|copy| notary.vouch(copy)),
+                    );
+                }
+            }
             match (&mut volume, job.kind) {
                 // At the stop a job that would take blocks from an empty window would walk the
                 // whole volume inside the 3 s of the stop (an aborted walk empties the window):
@@ -498,6 +560,21 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
                     job.reply[..bytes.len()].copy_from_slice(&bytes);
                     job.reply_len = bytes.len();
                 }
+                // BIND, and the methods of the root channel: the worker vouches (it waits in calls).
+                (Some(_), REQUEST)
+                    if proto_data::is_root(job.owner) || identity_method(request) =>
+                {
+                    let ready = notary.ready(&parent, &process);
+                    let bytes = identity_job(
+                        server,
+                        &mut identities,
+                        ready,
+                        &notary,
+                        (request, job.owner, job.aux, job.carried),
+                    );
+                    job.reply[..bytes.len()].copy_from_slice(&bytes);
+                    job.reply_len = bytes.len();
+                }
                 (Some(fs), REQUEST) => {
                     let reply = server.handle(fs, job.owner, job.aux, request);
                     let bytes = reply.as_bytes();
@@ -508,6 +585,8 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
                 }
                 (Some(fs), _) => {
                     server.gone(fs, job.owner);
+                    // The session's identity copy closes with it.
+                    identities.remove(job.owner);
                     job.reply_len = 0;
                 }
                 (None, _) => {
@@ -524,7 +603,7 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
             let _ = sys::notify(wake, 1);
         }
         if STOPPING.load(Acquire) {
-            put_away(&mut server, &mut volume);
+            put_away(server, &mut volume);
             UNMOUNTED.store(true, Release);
             let _ = sys::notify(wake, 1);
             // The main thread ends the process once it has sent the replies.
@@ -749,4 +828,89 @@ fn oldest() -> Option<usize> {
         }
     }
     best.map(|(_, i)| i)
+}
+
+/// Whether the request is BIND.
+fn identity_method(request: &[u8]) -> bool {
+    request.get(..2) == Some(&proto_data::Method::Bind.number().to_le_bytes()[..])
+}
+
+/// BIND, SESSION and VERIFY_SESSION: the vouching of the process service, which only the worker may
+/// do. `call` is the request, its owner, the label the request thread made for the call and the
+/// handle it brought. The reply bytes.
+fn identity_job(
+    server: &mut Server,
+    identities: &mut Identities,
+    ready: bool,
+    notary: &Notary,
+    call: (&[u8], u64, u64, u64),
+) -> [u8; proto_wire::HEADER_LEN] {
+    use proto_data::{self as p, Method};
+    let (request, owner, aux, carried) = call;
+    let status = |code: u32| proto_wire::reply(Status::Unknown(code));
+    // The header is read whole, as the server reads it: a version other than this one is BAD_VERSION
+    // and a body on a request that has none is BAD_SIZE.
+    let mut reader = proto_wire::Reader::new(request);
+    let header = match proto_wire::Header::read(&mut reader) {
+        Ok(header) => header,
+        Err(e) => return proto_wire::reply(e),
+    };
+    if header.version != p::VERSION {
+        return proto_wire::reply(Status::BadVersion);
+    }
+    let method = Method::from_number(header.method);
+    if matches!(method, Some(Method::Session | Method::Bind)) && reader.left() != 0 {
+        return proto_wire::reply(Status::BadSize);
+    }
+    let root = p::is_root(owner);
+    match method {
+        // The root channel takes SESSION and VERIFY_SESSION and nothing else; a session takes
+        // neither. VERIFY_SESSION is answered by the request thread.
+        Some(Method::Session) if root => {
+            vouch_and_bind(server, identities, ready, notary, true, aux, carried)
+        }
+        Some(Method::Bind) if !root => {
+            vouch_and_bind(server, identities, ready, notary, false, owner, carried)
+        }
+        _ => status(p::IS_ROOT),
+    }
+}
+
+/// Vouches for the identity session brought and binds `label` to the answer (`new`: a session made
+/// by SESSION, bound at birth; otherwise BIND of an existing session). The worker keeps a copy of the
+/// identity session of its own for as long as the session is bound.
+fn vouch_and_bind(
+    server: &mut Server,
+    identities: &mut Identities,
+    ready: bool,
+    notary: &Notary,
+    new: bool,
+    label: u64,
+    carried: u64,
+) -> [u8; proto_wire::HEADER_LEN] {
+    use proto_data as p;
+    let status = |code: u32| proto_wire::reply(Status::Unknown(code));
+    if carried == 0 {
+        return proto_wire::reply(Status::BadSize);
+    }
+    if !ready {
+        return status(p::ACCESS);
+    }
+    let brought = Handle::<Channel>::borrowed(abi::Handle(carried));
+    let Ok(kept) = sys::handle_duplicate(&brought, Rights::NOTIFY | Rights::TRANSFER) else {
+        return status(p::TABLE_FULL);
+    };
+    let Some(who) = notary.vouch(&kept) else {
+        return status(p::ACCESS);
+    };
+    // An answer about a loader binds nothing (`bind_from`).
+    match datafs::vouching::bind_from(server, new, label, &who) {
+        Ok(()) if identities.put(label, kept) => proto_wire::reply(Status::Ok),
+        Ok(()) => {
+            server.set_binding(label, datafs::binding::Binding::Unbound);
+            status(p::TABLE_FULL)
+        }
+        Err(Status::Unknown(code)) => status(code),
+        Err(_) => status(p::INVALID),
+    }
 }
