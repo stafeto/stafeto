@@ -20,45 +20,53 @@ use crate::{
 };
 use std::path::PathBuf;
 
-/// The probe's image.
-pub const PROGRAMS: [ImageProgram; 11] = [
-    ("init", "init", INIT_STACK_SIZE, &["table-data-posix"]),
-    ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
-    (
-        "posix-process-service",
-        "posix-process-service",
-        64 * 1024,
-        &[],
-    ),
-    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
-    ("pipe", "pipe", crate::PIPE_STACK_SIZE, &[]),
-    ("loader", "loader", 0, &[]),
-    (
-        "virtio-blk",
-        "virtio-blk",
-        crate::blk_probe::BLK_STACK_SIZE,
-        &[],
-    ),
-    ("datafsd", "datafsd", 32 * 1024, &[]),
-    (
-        "posix-data",
-        "posix-data-probe",
-        crate::POSIX_STACK_SIZE,
-        &[],
-    ),
-    (
-        "virtio-rng",
-        "virtio-rng",
-        crate::entropy::RNG_STACK_SIZE,
-        &[],
-    ),
-    (
-        "entropy",
-        "entropy",
-        crate::entropy::ENTROPY_STACK_SIZE,
-        &[],
-    ),
-];
+/// The probe's image; the service is built to stop at a sector of the volume for the crash runs
+/// (`datafs/crash`: the point comes from `STAFETO_DATAFS_CRASH_AT`).
+const fn programs(datafs: &'static [&'static str]) -> [ImageProgram; 11] {
+    [
+        ("init", "init", INIT_STACK_SIZE, &["table-data-posix"]),
+        ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
+        (
+            "posix-process-service",
+            "posix-process-service",
+            64 * 1024,
+            &[],
+        ),
+        ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+        ("pipe", "pipe", crate::PIPE_STACK_SIZE, &[]),
+        ("loader", "loader", 0, &[]),
+        (
+            "virtio-blk",
+            "virtio-blk",
+            crate::blk_probe::BLK_STACK_SIZE,
+            &[],
+        ),
+        ("datafsd", "datafsd", 32 * 1024, datafs),
+        (
+            "posix-data",
+            "posix-data-probe",
+            crate::POSIX_STACK_SIZE,
+            &[],
+        ),
+        (
+            "virtio-rng",
+            "virtio-rng",
+            crate::entropy::RNG_STACK_SIZE,
+            &[],
+        ),
+        (
+            "entropy",
+            "entropy",
+            crate::entropy::ENTROPY_STACK_SIZE,
+            &[],
+        ),
+    ]
+}
+
+pub const PROGRAMS: [ImageProgram; 11] = programs(&[]);
+const PROGRAMS_CRASH: [ImageProgram; 11] = programs(&["crash"]);
+/// The service that ends when it is asked to open `.die` (the restart probe).
+const PROGRAMS_RESTART: [ImageProgram; 11] = programs(&["probe-restart"]);
 
 /// The modes of `cargo xtask data-posix`: each is an image of its own, with the role the C program
 /// runs (`STAFETO_DATA_POSIX_MODE`), its volume and its checks.
@@ -72,6 +80,12 @@ pub enum Mode {
     Cap,
     /// The volume filled to its reserve and emptied again (31,000 writes).
     Full,
+    /// A restart of the data service in the middle: the service built to end on a request, init
+    /// starting it again.
+    Restart,
+    /// 64 MiB written onto /data and read back, with the throughput printed (no bound): a volume
+    /// of 127 MiB.
+    Throughput,
 }
 
 impl Mode {
@@ -82,6 +96,8 @@ impl Mode {
             Mode::Write => "write-run",
             Mode::Cap => "cap-run",
             Mode::Full => "full-run",
+            Mode::Restart => "restart-run",
+            Mode::Throughput => "throughput-run",
         }
     }
 
@@ -91,6 +107,8 @@ impl Mode {
             Mode::Write => "boot-data-posix-write.img",
             Mode::Cap => "boot-data-posix-cap.img",
             Mode::Full => "boot-data-posix-full.img",
+            Mode::Restart => "boot-data-posix-restart.img",
+            Mode::Throughput => "boot-data-posix-throughput.img",
         }
     }
 
@@ -102,6 +120,13 @@ impl Mode {
             Mode::Write => &WRITE_CHECKS,
             Mode::Cap => &["directory cap"],
             Mode::Full => &["enospc at the reserve then unlink"],
+            Mode::Restart => &[
+                "stale descriptor EIO",
+                "close of a stale descriptor",
+                "open after restart",
+                "current directory reopened",
+            ],
+            Mode::Throughput => &["dd 64 MiB there and back"],
         }
     }
 
@@ -111,6 +136,8 @@ impl Mode {
             Mode::Write => "posix-data: write checks passed",
             Mode::Cap => "posix-data: cap checks passed",
             Mode::Full => "posix-data: full checks passed",
+            Mode::Restart => "posix-data: restart checks passed",
+            Mode::Throughput => "posix-data: throughput checks passed",
         }
     }
 
@@ -122,6 +149,8 @@ impl Mode {
             Mode::Write => 20 * 60,
             Mode::Cap => 40 * 60,
             Mode::Full => 20 * 60,
+            Mode::Restart => 10 * 60,
+            Mode::Throughput => 30 * 60,
         })
     }
 }
@@ -274,6 +303,28 @@ fn registered(lines: &[String]) -> Result<(), String> {
     ))
 }
 
+/// The service ended on the request of the probe and was started again: its line of the end, and its
+/// root registered twice (the old instance's and the new one's).
+pub fn restarted(lines: &[String]) -> Result<(), String> {
+    if !lines
+        .iter()
+        .any(|l| l.contains("datafs: probe-restart: the service ends"))
+    {
+        return Err("the service never said it ended on the request of the probe".into());
+    }
+    let registrations = lines
+        .iter()
+        .filter(|l| l.contains("datafs: root registered"))
+        .count();
+    if registrations < 2 {
+        return Err(format!(
+            "the new instance of the service registered its root {} times in all, two expected (one for each instance)",
+            registrations
+        ));
+    }
+    Ok(())
+}
+
 /// The disk of the run: a file of the process's name, removed at the end.
 struct Disk(PathBuf);
 
@@ -286,16 +337,21 @@ impl Drop for Disk {
 /// The size of the disk file: the layout takes 1 MiB for the table, `store` the half, and the data
 /// partition of 31 MiB holds the volume of the probe (about 1 MiB of files).
 const DISK_BYTES: u64 = 64 << 20;
+/// The throughput mode writes 64 MiB: a disk of 256 MiB has a data partition of 127 MiB.
+const THROUGHPUT_DISK_BYTES: u64 = 256 << 20;
 const ENDS: &str = "init: posix-data ended: ";
 const ENDED: &str = "init: posix-data ended: exit code 0, not restarted";
 
-/// `cargo xtask data-posix [write|cap|full]`.
+/// `cargo xtask data-posix [write|cap|full|restart|throughput|crash [N]]`.
 pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
     match args.first().map(String::as_str) {
         None => probe(Mode::Read, machine),
         Some("write") if args.len() == 1 => probe(Mode::Write, machine),
         Some("cap") if args.len() == 1 => probe(Mode::Cap, machine),
         Some("full") if args.len() == 1 => probe(Mode::Full, machine),
+        Some("restart") if args.len() == 1 => probe(Mode::Restart, machine),
+        Some("throughput") if args.len() == 1 => probe(Mode::Throughput, machine),
+        Some("crash") => crash(&args[1..], machine),
         Some(other) => Err(format!(
             "data-posix [write|cap|full]: unknown argument {other}"
         )),
@@ -307,9 +363,14 @@ pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
 pub fn probe(mode: Mode, machine: &qemu::Machine) -> Result<(), String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
+    let programs: &[ImageProgram] = if mode == Mode::Restart {
+        &PROGRAMS_RESTART
+    } else {
+        &PROGRAMS
+    };
     let image = write_boot_image_files(
         mode.image(),
-        &PROGRAMS,
+        programs,
         BOOT_PROFILE,
         &[("STAFETO_DATA_POSIX_MODE", mode.role())],
         Vec::new(),
@@ -319,12 +380,22 @@ pub fn probe(mode: Mode, machine: &qemu::Machine) -> Result<(), String> {
         std::process::id(),
         mode.role()
     )));
-    crate::data_image::make_posix_volume(&disk.0, DISK_BYTES)?;
+    crate::data_image::make_posix_volume(
+        &disk.0,
+        if mode == Mode::Throughput {
+            THROUGHPUT_DISK_BYTES
+        } else {
+            DISK_BYTES
+        },
+    )?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::store(&disk.0, None));
     let started = std::time::Instant::now();
     let output = run_until(cmd, mode.limit(), Some(ENDS), &kernel.elf)?;
     read_lines(&output.lines, mode)?;
+    if mode == Mode::Restart {
+        restarted(&output.lines)?;
+    }
     qemu::expect_stopped_on(&output, ENDED)?;
     println!(
         "data-posix {:?} on {}: {} checks of /data in the POSIX layer over the data file service in {} s: ok",
@@ -333,6 +404,201 @@ pub fn probe(mode: Mode, machine: &qemu::Machine) -> Result<(), String> {
         mode.checks().len(),
         started.elapsed().as_secs()
     );
+    Ok(())
+}
+
+/// The machine is cut after the sector the point names was written (the service built for the crash
+/// runs stops there and the host kills the machine on its line), and a second boot on the same disk
+/// verifies: every file whose line `posix-data: synced N` came out is whole, an unsynced file is
+/// absent or a prefix of what was written, the file renamed over another is one whole generation and
+/// not older than the last rename the host saw, and the volume takes a write.
+const POINTS: u64 = 12;
+
+/// The disk, the image and the boot of one crash run: the lines up to the cut or to the end.
+fn crash_boot(
+    kernel: &crate::Artifacts,
+    machine: &qemu::Machine,
+    disk: &std::path::Path,
+    name: &str,
+    env: &[(&str, &str)],
+    marker: &str,
+) -> Result<Vec<String>, String> {
+    let programs: &[ImageProgram] = if env.iter().any(|(k, _)| *k == "STAFETO_DATAFS_CRASH_AT") {
+        &PROGRAMS_CRASH
+    } else {
+        &PROGRAMS
+    };
+    let image = write_boot_image_files(name, programs, BOOT_PROFILE, env, Vec::new())?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS).args(qemu::store(disk, None));
+    let output = run_until(
+        cmd,
+        std::time::Duration::from_secs(10 * 60),
+        Some(marker),
+        &kernel.elf,
+    )?;
+    Ok(output.lines)
+}
+
+/// The sectors the sequence writes, from a run of the service built for the crash tests that does
+/// not stop (its STATFS at the end prints the count).
+fn sectors_of_the_sequence(
+    kernel: &crate::Artifacts,
+    machine: &qemu::Machine,
+) -> Result<u64, String> {
+    let disk = Disk(std::env::temp_dir().join(format!(
+        "stafeto-data-posix-{}-count.img",
+        std::process::id()
+    )));
+    crate::data_image::make_posix_volume(&disk.0, DISK_BYTES)?;
+    let lines = crash_boot(
+        kernel,
+        machine,
+        &disk.0,
+        "boot-data-posix-crash.img",
+        &[
+            ("STAFETO_DATA_POSIX_MODE", "crash-run"),
+            ("STAFETO_DATAFS_CRASH_AT", "0"),
+        ],
+        ENDS,
+    )?;
+    if !lines
+        .iter()
+        .any(|l| l.contains("posix-data: crash run finished"))
+    {
+        return Err(format!(
+            "data-posix crash: the counting run did not finish: {:?}",
+            tail(&lines)
+        ));
+    }
+    qemu::number_after(&lines, "datafs: written ").ok_or_else(|| {
+        "data-posix crash: the service did not say how many sectors the sequence wrote".into()
+    })
+}
+
+fn tail(lines: &[String]) -> Vec<&String> {
+    lines
+        .iter()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+/// The last synced file and the last rename the lines tell.
+pub fn seen_before_the_cut(lines: &[String]) -> (u32, u32) {
+    let last = |prefix: &str| {
+        lines
+            .iter()
+            .filter_map(|l| {
+                let at = l.find(prefix)?;
+                l[at + prefix.len()..]
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    (last("posix-data: synced "), last("posix-data: renamed "))
+}
+
+/// The lines of the verifying boot: the three checks with the numbers the host saw, the end.
+pub fn read_verify_lines(lines: &[String], synced: u32) -> Result<(), String> {
+    registered(lines)?;
+    if let Some(bad) = lines
+        .iter()
+        .find(|l| l.contains("posix-data: check failed") || l.contains("posix-data: verify failed"))
+    {
+        return Err(format!("the verifying boot: {bad}"));
+    }
+    for want in [
+        format!("posix-data: after cut synced files whole 1..{synced} ok"),
+        "posix-data: after cut the renamed file is one whole generation ok".to_owned(),
+        "posix-data: after cut the volume takes a write ok".to_owned(),
+        "posix-data: verify checks passed".to_owned(),
+    ] {
+        if !lines.iter().any(|l| l.contains(&want)) {
+            return Err(format!("the verifying boot has no line {want:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn crash_point(
+    kernel: &crate::Artifacts,
+    machine: &qemu::Machine,
+    point: u64,
+) -> Result<(), String> {
+    let disk = Disk(std::env::temp_dir().join(format!(
+        "stafeto-data-posix-{}-crash-{point}.img",
+        std::process::id()
+    )));
+    crate::data_image::make_posix_volume(&disk.0, DISK_BYTES)?;
+    let marker = format!("datafs: crash point {point}");
+    let cut = crash_boot(
+        kernel,
+        machine,
+        &disk.0,
+        "boot-data-posix-crash.img",
+        &[
+            ("STAFETO_DATA_POSIX_MODE", "crash-run"),
+            ("STAFETO_DATAFS_CRASH_AT", &point.to_string()),
+        ],
+        &marker,
+    )?;
+    if !cut.iter().any(|l| l.contains(&marker)) {
+        return Err(format!(
+            "data-posix crash {point}: the service never said {marker:?}: {:?}",
+            tail(&cut)
+        ));
+    }
+    let (synced, renamed) = seen_before_the_cut(&cut);
+    let lines = crash_boot(
+        kernel,
+        machine,
+        &disk.0,
+        "boot-data-posix-verify.img",
+        &[
+            ("STAFETO_DATA_POSIX_MODE", "verify-run"),
+            ("STAFETO_DATA_POSIX_MIN", &synced.to_string()),
+            ("STAFETO_DATA_POSIX_RENAMED", &renamed.to_string()),
+        ],
+        ENDS,
+    )?;
+    read_verify_lines(&lines, synced).map_err(|e| format!("data-posix crash {point}: {e}"))?;
+    println!(
+        "data-posix crash {point}: cut after sector {point} ({synced} files synced, {renamed} renames seen), the next boot found every synced file whole and the renamed file one whole generation: ok"
+    );
+    Ok(())
+}
+
+/// `cargo xtask data-posix crash [N]`: 12 points spread over the sectors of the sequence, or the one
+/// the argument names.
+pub fn crash(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
+    crate::relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let points: Vec<u64> = match args.first() {
+        Some(n) => vec![
+            n.parse()
+                .map_err(|_| format!("data-posix crash: {n} is not a number of sectors"))?,
+        ],
+        None => {
+            let total = sectors_of_the_sequence(&kernel, machine)?;
+            println!("data-posix crash: the sequence writes {total} sectors");
+            let mut points: Vec<u64> = (1..=POINTS)
+                .map(|k| (total * k / (POINTS + 1)).max(1))
+                .collect();
+            points.dedup();
+            points
+        }
+    };
+    for point in points {
+        crash_point(&kernel, machine, point)?;
+    }
     Ok(())
 }
 
@@ -451,7 +717,13 @@ mod tests {
 
     #[test]
     fn every_mode_passes_and_each_has_its_own_end() {
-        for mode in [Mode::Read, Mode::Write, Mode::Cap, Mode::Full] {
+        for mode in [
+            Mode::Read,
+            Mode::Write,
+            Mode::Cap,
+            Mode::Full,
+            Mode::Restart,
+        ] {
             assert_eq!(read_lines(&good_of(mode), mode), Ok(()), "{mode:?}");
             // The end of another mode is not the end of this one.
             let mut other = good_of(mode);
@@ -485,6 +757,8 @@ mod tests {
             ("write_run", Mode::Write),
             ("cap_run", Mode::Cap),
             ("full_run", Mode::Full),
+            ("restart_run", Mode::Restart),
+            ("throughput_run", Mode::Throughput),
         ] {
             let in_c = checks_of_function(source, role);
             assert_eq!(
@@ -493,5 +767,73 @@ mod tests {
                 "{role} of data.c and the list of {mode:?}"
             );
         }
+    }
+
+    fn verify_good(synced: u32) -> Vec<String> {
+        vec![
+            "datafs: root registered with the process service".to_owned(),
+            format!("posix-data: after cut synced files whole 1..{synced} ok"),
+            "posix-data: after cut the renamed file is one whole generation ok".to_owned(),
+            "posix-data: after cut the volume takes a write ok".to_owned(),
+            "posix-data: verify checks passed".to_owned(),
+        ]
+    }
+
+    #[test]
+    fn the_verifying_boot_must_find_what_the_host_saw_synced() {
+        assert_eq!(read_verify_lines(&verify_good(3), 3), Ok(()));
+        // The boot says 1..2 where the host saw 3 files synced: it checked too little.
+        assert!(read_verify_lines(&verify_good(2), 3).is_err());
+        for gone in 1..5 {
+            let mut lines = verify_good(3);
+            lines.remove(gone);
+            assert!(read_verify_lines(&lines, 3).is_err(), "line {gone}");
+        }
+        let mut failed = verify_good(3);
+        failed.insert(
+            2,
+            "posix-data: check failed at line 90: g >= 1 (errno 0)".to_owned(),
+        );
+        assert!(
+            read_verify_lines(&failed, 3)
+                .unwrap_err()
+                .contains("check failed")
+        );
+        let mut early = verify_good(3);
+        early.remove(0);
+        assert!(
+            read_verify_lines(&early, 3)
+                .unwrap_err()
+                .contains("not registered")
+        );
+    }
+
+    #[test]
+    fn the_host_reads_what_was_synced_and_renamed_before_the_cut() {
+        let lines: Vec<String> = [
+            "posix-data: synced 1",
+            "[ 2.1] posix-data: synced 2",
+            "posix-data: synced 3",
+            "posix-data: renamed 1",
+            "datafs: crash point 700",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        assert_eq!(seen_before_the_cut(&lines), (3, 1));
+        assert_eq!(seen_before_the_cut(&lines[..0]), (0, 0));
+    }
+
+    #[test]
+    fn a_restart_needs_the_end_of_the_old_service_and_a_second_registration() {
+        let mut lines = good_of(Mode::Restart);
+        assert!(restarted(&lines).is_err());
+        lines.insert(
+            1,
+            "datafs: probe-restart: the service ends with the exit code 1".to_owned(),
+        );
+        assert!(restarted(&lines).unwrap_err().contains("1 times"));
+        lines.push("datafs: root registered with the process service".to_owned());
+        assert_eq!(restarted(&lines), Ok(()));
     }
 }

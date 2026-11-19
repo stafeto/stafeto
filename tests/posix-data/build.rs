@@ -13,11 +13,21 @@ fn run(cmd: &mut Command) {
     assert!(status.success(), "command failed: {cmd:?}");
 }
 
+/// A number of the environment, 0 when it is not set.
+fn number(name: &str) -> u32 {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=data.c");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
     println!("cargo:rerun-if-env-changed=STAFETO_DATA_POSIX_MODE");
+    println!("cargo:rerun-if-env-changed=STAFETO_DATA_POSIX_MIN");
+    println!("cargo:rerun-if-env-changed=STAFETO_DATA_POSIX_RENAMED");
     let manifest =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"));
     let sysroot = env::var_os("STAFETO_RELIBC_SYSROOT")
@@ -69,6 +79,15 @@ fn main() {
         ])
         .arg(sysroot.join("include"))
         .arg(format!("-DDATA_POSIX_MODE=\"{mode}\""))
+        // What the host saw before the cut: the last synced file and the last rename.
+        .arg(format!(
+            "-DDATA_POSIX_MIN={}",
+            number("STAFETO_DATA_POSIX_MIN")
+        ))
+        .arg(format!(
+            "-DDATA_POSIX_RENAMED={}",
+            number("STAFETO_DATA_POSIX_RENAMED")
+        ))
         .args(["-c", "data.c", "-o"])
         .arg(out.join("data.o")));
     run(Command::new(tools.join("llvm-ar"))

@@ -576,6 +576,16 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                     job.reply_len = bytes.len();
                 }
                 (Some(fs), REQUEST) => {
+                    #[cfg(feature = "probe-restart")]
+                    if request.len() > 12
+                        && u16::from_le_bytes([request[0], request[1]]) == 1
+                        && request.ends_with(b"/.die")
+                    {
+                        rt::println!(
+                            "datafs: probe-restart: the service ends with the exit code 1"
+                        );
+                        sys::process_exit(1);
+                    }
                     let reply = server.handle(fs, job.owner, job.aux, request);
                     let bytes = reply.as_bytes();
                     job.reply[..bytes.len()].copy_from_slice(bytes);

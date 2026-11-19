@@ -20,6 +20,10 @@ bench = false
 [features]
 steps = ["rt/step-stats"]
 crash = []
+# The probe of a restart of the service: an OPEN of the name `.die` at the root ends the service with the
+# exit code 1 (init starts it again), so that a program can see the descriptors of the old instance
+# answer EIO and the new instance take new opens.
+probe-restart = []
 # The stop handler exits at once (the probe of the stop handlers must catch it).
 break-datafs-stop = []
 

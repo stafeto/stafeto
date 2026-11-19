@@ -1293,6 +1293,245 @@ static int write_run(void) {
     return 0;
 }
 
+
+/* ---- the crash role and its verifier: files written and synced, a file renamed over another ---- */
+
+#define CRASH_FILES 4
+#define CRASH_BYTES (256UL * 1024UL)
+#define CRASH_CONFIG 10000UL
+#define CRASH_GENERATIONS 3
+
+#ifndef DATA_POSIX_MIN
+#define DATA_POSIX_MIN 0
+#endif
+#ifndef DATA_POSIX_RENAMED
+#define DATA_POSIX_RENAMED 0
+#endif
+
+/* The machine may be cut at any sector of this role: each file is written, synced and closed, and
+ * its line goes out after the sync; then a file is written to a temporary name, synced and renamed
+ * over the old one, and its line goes out after the rename. */
+static int crash_run(void) {
+    char path[48];
+    for (int i = 1; i <= CRASH_FILES; i++) {
+        snprintf(path, sizeof path, "/data/c%d", i);
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0 || write_pattern(fd, CRASH_BYTES, (unsigned)i) != 0 || fsync(fd) != 0 || close(fd) != 0) {
+            printf("posix-data: crash run failed at file %d (errno %d)\n", i, errno);
+            return 20;
+        }
+        printf("posix-data: synced %d\n", i);
+    }
+    for (int g = 1; g <= CRASH_GENERATIONS; g++) {
+        int fd = open("/data/cfg.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0 || write_pattern(fd, CRASH_CONFIG, 10u + (unsigned)g) != 0 || fsync(fd) != 0 ||
+            close(fd) != 0 || rename("/data/cfg.tmp", "/data/cfg") != 0) {
+            printf("posix-data: crash run failed at generation %d (errno %d)\n", g, errno);
+            return 20;
+        }
+        printf("posix-data: renamed %d\n", g);
+    }
+    /* The count of the sectors of this run (the service built for the crash tests prints it for a
+     * STATFS). */
+    struct statvfs v;
+    if (statvfs("/data", &v) != 0) return 20;
+    printf("posix-data: crash run finished\n");
+    return 0;
+}
+
+static int verify_synced_files(void) {
+    char path[48];
+    struct stat st;
+    for (int i = 1; i <= CRASH_FILES; i++) {
+        snprintf(path, sizeof path, "/data/c%d", i);
+        if (i <= DATA_POSIX_MIN) {
+            DATA_CHECK(file_is_pattern(path, CRASH_BYTES, (unsigned)i));
+        } else if (stat(path, &st) == 0) {
+            /* Not synced when the machine was cut: absent, or the bytes it has are the pattern's. */
+            unsigned char buf[2048];
+            int fd = open(path, O_RDONLY);
+            DATA_CHECK(fd >= 0);
+            unsigned long at = 0;
+            for (;;) {
+                ssize_t r = read(fd, buf, sizeof buf);
+                DATA_CHECK(r >= 0);
+                if (r == 0) break;
+                DATA_CHECK(pattern_is(buf, at, (unsigned long)r, (unsigned)i));
+                at += (unsigned long)r;
+            }
+            DATA_CHECK(close(fd) == 0 && at <= CRASH_BYTES);
+        }
+    }
+    printf("posix-data: after cut synced files whole 1..%d ok\n", DATA_POSIX_MIN);
+    return 0;
+}
+
+static int verify_renamed_file(void) {
+    struct stat st;
+    int whole = 0;
+    if (stat("/data/cfg", &st) == 0) {
+        /* One whole generation, never a mix of two, and not older than the last rename seen. */
+        for (int g = CRASH_GENERATIONS; g >= 1 && !whole; g--) {
+            if (file_is_pattern("/data/cfg", CRASH_CONFIG, 10u + (unsigned)g)) {
+                DATA_CHECK(g >= DATA_POSIX_RENAMED);
+                whole = g;
+            }
+        }
+        DATA_CHECK(whole != 0);
+    } else {
+        DATA_CHECK(DATA_POSIX_RENAMED == 0 && errno == ENOENT);
+    }
+    printf("posix-data: after cut the renamed file is one whole generation ok\n");
+    return 0;
+}
+
+static int verify_takes_a_write(void) {
+    int fd = open("/data/after-cut", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    DATA_CHECK(fd >= 0 && write_pattern(fd, 5000, 20) == 0 && fsync(fd) == 0 && close(fd) == 0);
+    DATA_CHECK(file_is_pattern("/data/after-cut", 5000, 20));
+    printf("posix-data: after cut the volume takes a write ok\n");
+    return 0;
+}
+
+static int verify_run(void) {
+    if (verify_synced_files() != 0 || verify_renamed_file() != 0 || verify_takes_a_write() != 0) {
+        printf("posix-data: verify failed\n");
+        return 20;
+    }
+    printf("posix-data: verify checks passed\n");
+    return 0;
+}
+
+
+/* ---- the restart role: the service ends in the middle and init starts it again ---- */
+
+static int restart_checks_done;
+
+static int restart_stale_descriptor(void) {
+    unsigned char buf[100];
+    DATA_CHECK(mkdir("/data/rd", 0755) == 0);
+    int x = open("/data/rd/x", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(x >= 0 && write_pattern(x, 50, 12) == 0 && fsync(x) == 0 && close(x) == 0);
+    int fd = open("/data/rst", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && write_pattern(fd, 100, 13) == 0 && fsync(fd) == 0);
+    DATA_CHECK(lseek(fd, 0, SEEK_SET) == 0);
+    DATA_CHECK(chdir("/data/rd") == 0);
+    /* The service ends when it is asked to open the name `.die` (the build for this probe). */
+    int dead = open("/data/.die", O_RDONLY);
+    if (dead >= 0) {
+        printf("posix-data: the service did not end\n");
+        return 20;
+    }
+    /* The new instance takes a few seconds: ask again until a call under /data answers. */
+    struct stat st;
+    int up = 0;
+    for (int i = 0; i < 120 && !up; i++) {
+        pause_ms(500);
+        up = stat("/data/rst", &st) == 0;
+    }
+    DATA_CHECK(up);
+    errno = 0;
+    DATA_CHECK(read(fd, buf, sizeof buf) == -1 && errno == EIO);
+    errno = 0;
+    DATA_CHECK(pwrite(fd, "x", 1, 0) == -1 && errno == EIO);
+    restart_checks_done = fd;
+    return 0;
+}
+
+static int restart_close_of_a_stale_descriptor(void) {
+    DATA_CHECK(restart_checks_done > 0);
+    DATA_CHECK(close(restart_checks_done) == 0);
+    return 0;
+}
+
+static int restart_open_after(void) {
+    int fd = open("/data/rst", O_RDWR);
+    DATA_CHECK(fd >= 0 && file_is_pattern("/data/rst", 100, 13));
+    DATA_CHECK(write(fd, "more", 4) == 4 && fsync(fd) == 0 && close(fd) == 0);
+    int made = open("/data/after-restart", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(made >= 0 && write(made, "a", 1) == 1 && close(made) == 0);
+    return 0;
+}
+
+static int restart_current_directory(void) {
+    char cwd[PATH_MAX];
+    DATA_CHECK(getcwd(cwd, sizeof cwd) != NULL && strcmp(cwd, "/data/rd") == 0);
+    int fd = open("x", O_RDONLY); /* relative to the directory the layer opened again */
+    DATA_CHECK(fd >= 0 && close(fd) == 0);
+    errno = 0;
+    DATA_CHECK(rmdir("/data/rd") == -1 && errno == EBUSY);
+    DATA_CHECK(chdir("/") == 0);
+    return 0;
+}
+
+static int restart_run(void) {
+    run_check("stale descriptor EIO", restart_stale_descriptor);
+    run_check("close of a stale descriptor", restart_close_of_a_stale_descriptor);
+    run_check("open after restart", restart_open_after);
+    run_check("current directory reopened", restart_current_directory);
+    if (failures != 0) {
+        printf("posix-data: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("posix-data: restart checks passed\n");
+    return 0;
+}
+
+
+/* ---- the throughput role: 64 MiB onto /data and back, as `dd bs=1M` would do it ---- */
+
+#define DD_BYTES (64UL * 1024UL * 1024UL)
+#define DD_BLOCK (1024UL * 1024UL)
+
+static unsigned long long now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000ULL + (unsigned long long)t.tv_nsec / 1000000ULL;
+}
+
+static int dd_there_and_back(void) {
+    static unsigned char block[DD_BLOCK];
+    int fd = open("/data/dd-64m", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    unsigned long long began = now_ms();
+    for (unsigned long at = 0; at < DD_BYTES; at += DD_BLOCK) {
+        make_pattern(block, at, DD_BLOCK, 14);
+        unsigned long done = 0;
+        while (done < DD_BLOCK) {
+            ssize_t w = write(fd, block + done, DD_BLOCK - done);
+            DATA_CHECK(w > 0);
+            done += (unsigned long)w;
+        }
+    }
+    DATA_CHECK(fsync(fd) == 0 && close(fd) == 0);
+    unsigned long long wrote_ms = now_ms() - began;
+    printf("posix-data: dd wrote 64 MiB in %llu ms: %llu KiB/s\n", wrote_ms,
+           wrote_ms ? 65536ULL * 1000ULL / wrote_ms : 0ULL);
+    fd = open("/data/dd-64m", O_RDONLY);
+    DATA_CHECK(fd >= 0);
+    began = now_ms();
+    for (unsigned long at = 0; at < DD_BYTES; at += DD_BLOCK) {
+        DATA_CHECK(read_up_to(fd, block, DD_BLOCK) == (long)DD_BLOCK);
+        DATA_CHECK(pattern_is(block, at, DD_BLOCK, 14));
+    }
+    DATA_CHECK(close(fd) == 0);
+    unsigned long long read_ms = now_ms() - began;
+    printf("posix-data: dd read 64 MiB in %llu ms: %llu KiB/s\n", read_ms,
+           read_ms ? 65536ULL * 1000ULL / read_ms : 0ULL);
+    DATA_CHECK(unlink("/data/dd-64m") == 0);
+    return 0;
+}
+
+static int throughput_run(void) {
+    run_check("dd 64 MiB there and back", dd_there_and_back);
+    if (failures != 0) {
+        printf("posix-data: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("posix-data: throughput checks passed\n");
+    return 0;
+}
+
 /* The directory cap alone: 1,016 directories made and removed take about 3 million reads of the
  * volume (a removal looks up the pair before its own in the list of every pair). */
 static int cap_run(void) {
@@ -1398,6 +1637,10 @@ int main(int argc, char **argv) {
     if (argc > 2 && strcmp(argv[1], "child-write") == 0) return child_write(argv);
     if (argc > 1 && strcmp(argv[1], "write-run") == 0) return write_run();
     if (argc > 1 && strcmp(argv[1], "cap-run") == 0) return cap_run();
+    if (argc > 1 && strcmp(argv[1], "throughput-run") == 0) return throughput_run();
+    if (argc > 1 && strcmp(argv[1], "restart-run") == 0) return restart_run();
+    if (argc > 1 && strcmp(argv[1], "crash-run") == 0) return crash_run();
+    if (argc > 1 && strcmp(argv[1], "verify-run") == 0) return verify_run();
     if (argc > 1 && strcmp(argv[1], "full-run") == 0) return full_run();
     if (argc > 4 && strcmp(argv[1], "child-read") == 0) return child_read(argv);
     if (argc > 2 && strcmp(argv[1], "child-closed") == 0) return child_closed(argv);
