@@ -38,6 +38,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod frame;
+
 use proto_comp::{
     BUFFERS, BUTTON, CLOSE, CREATE, Event, FOCUS_IN, FOCUS_OUT, KEY, MAX_RECTS, MOVE, RING, Rect,
     union,
@@ -50,17 +52,98 @@ pub const MAX_WINDOWS: usize = 8;
 const _: () = assert!(MAX_WINDOWS <= 8);
 pub const PER_CONTEXT: usize = 4;
 /// The most lines of one band of a frame (`Scene::tile` makes a band
-/// shorter where its layers cost more).
-pub const BAND_ROWS: u32 = 8;
+/// shorter where its layers cost more). A copy band over the whole width
+/// holds nine lines at the prices below, so the limit leaves the prices to
+/// decide.
+pub const BAND_ROWS: u32 = 16;
+
 /// What a band costs the service in ticks (`Scene::tile`): at most
-/// BAND_TICKS in all, CALL_TICKS for each layer's call of pixman, and a tick
-/// count a point: a copy (measured 2.7), a layer laid over others (about 25)
-/// and the black (about 4). The step stays under 16 500.
+/// BAND_TICKS in all. The step of a band is its work and a part of about
+/// 2 400 ticks of the step itself, and the gate of a band is 16 328, so a
+/// band of 15 000 leaves the tenth of a step for the interrupts.
 pub const BAND_TICKS: u32 = 15_000;
-pub const CALL_TICKS: u32 = 1_500;
-pub const OPAQUE_TICKS: u32 = 3;
-pub const OVER_TICKS: u32 = 25;
-pub const FILL_TICKS: u32 = 4;
+
+/// The price of one kind of operation (the black a band starts with, a layer
+/// copied, a layer laid over others): what one operation costs is
+/// `call + rows * row + points * point`. The call is what pixman does
+/// whatever the size, the row what it does for each line (the entry of the
+/// loop of a line and the edges before the aligned points), the point what it
+/// does for each point. There are no prices by alignment or by the format of
+/// the source: the edges fall on the row, and a window of XRGB8888 is always a
+/// copy and one of ARGB8888 always a layer laid over others.
+///
+/// A `_measured` is the greatest figure of the probes under -icount (the line
+/// `service raster` of `px::cost`, class by class: the call over operations of
+/// one row and 8 points or fewer, the row over operations at most 16 points
+/// wide and at least 8 rows, the point over operations of 1 024 points or
+/// more, the call and the rows taken off), and the constant the scene charges
+/// is the measure with the margin of MARGIN_PERCENT, rounded up. A call is in
+/// ticks, a row and a point in hundredths of a tick. `*_estimate` marks a
+/// price no probe has measured: a figure scaled from the cost before the NEON
+/// paths of pixman (a copy 2.7 ticks a point, a layer laid over others 25) or
+/// a guess (the row), kept high on purpose until the probe's line gives it,
+/// and the table takes that. The test
+/// `the_constants_cover_the_measures_with_the_margin` holds every constant to
+/// its measure.
+///
+/// What the runs of `comp-probe` and `focus-probe` proved before the classes:
+/// the call of the black is 212, of a copy 765 to 851, of a layer laid over
+/// others 765 to 1 303; the black costs 0.45 to 0.53 ticks a point on large
+/// operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Price {
+    pub kind: &'static str,
+    pub call_measured: u32,
+    pub call: u32,
+    /// Hundredths of a tick a row.
+    pub row_measured: u32,
+    pub row: u32,
+    pub row_estimate: bool,
+    /// Hundredths of a tick a point.
+    pub point_measured: u32,
+    pub point: u32,
+    pub point_estimate: bool,
+}
+
+/// The margin over a measure, in percent.
+pub const MARGIN_PERCENT: u32 = 15;
+
+/// The constant that covers `measured` with the margin: rounded up.
+pub const fn with_margin(measured: u32) -> u32 {
+    (measured * (100 + MARGIN_PERCENT)).div_ceil(100)
+}
+
+const fn price(
+    kind: &'static str,
+    call_measured: u32,
+    row_measured: u32,
+    row_estimate: bool,
+    point_measured: u32,
+    point_estimate: bool,
+) -> Price {
+    Price {
+        kind,
+        call_measured,
+        call: with_margin(call_measured),
+        row_measured,
+        row: with_margin(row_measured),
+        row_estimate,
+        point_measured,
+        point: with_margin(point_measured),
+        point_estimate,
+    }
+}
+
+/// The prices: black, copy, over. The row is a guess of 20 ticks until the
+/// class of narrow tall operations is measured.
+pub const PRICES: [Price; 3] = [
+    price("black", 212, 2_000, true, 53, false),
+    price("copy", 851, 2_000, true, 190, true),
+    price("over", 1_303, 2_000, true, 1_750, true),
+];
+pub const FILL: Price = PRICES[0];
+pub const OPAQUE: Price = PRICES[1];
+pub const OVER: Price = PRICES[2];
 
 /// Linux's key codes the scene knows: the Super keys (the manager's
 /// modifier: Doom binds Alt, Ctrl and Shift, so a program of the first
@@ -195,6 +278,13 @@ pub struct Window {
     pub visible: bool,
     /// Whether a buffer was ever taken: the first take gives the focus.
     pub shown_once: bool,
+    /// The window's promise of an interval and its counts (stage G5): the
+    /// service sets and reads them; the scene keeps them with the window.
+    pub pace: frame::Pace,
+    /// The damage of a post that waits for the window's interval: the window's
+    /// buffer is taken at the start it is due, and the rectangle joins the
+    /// frame's damage then.
+    pub held: Option<Rect>,
 }
 
 /// What the primary pipeline of the display shows.
@@ -345,6 +435,9 @@ pub struct Scene {
     /// to the same (OWNER_NONE: no press seen).
     owner: [u8; KEYS_TRACKED],
     damage: Option<Rect>,
+    /// The earliest start a window left by the last taking is due at (the
+    /// caller says `hold` with it to the pacer).
+    held_until: Option<u64>,
     frame: bool,
     seq: u32,
     created: u32,
@@ -420,6 +513,7 @@ impl Scene {
             modifier: 0,
             owner: [OWNER_NONE; KEYS_TRACKED],
             damage: None,
+            held_until: None,
             frame: false,
             seq: 0,
             created: 0,
@@ -665,6 +759,8 @@ impl Scene {
             posted: None,
             current: None,
             retired: None,
+            pace: frame::Pace::new(),
+            held: None,
             in_frame: false,
             visible: true,
             shown_once: false,
@@ -732,6 +828,32 @@ impl Scene {
     /// buffer a posted one it replaced ("the latest wins"), which is free
     /// at once.
     pub fn post(&mut self, i: usize, buffer: u8, rects: &[Rect]) -> Result<Option<u8>, Refusal> {
+        self.post_inner(i, buffer, rects, None)
+            .map(|(replaced, _)| replaced)
+    }
+
+    /// POST at `now` on the clock of the frame: the window's promise of an
+    /// interval is judged (`frame::Pace::posted`), and a buffer that is due
+    /// at a start later than the nearest waits with its damage in the window.
+    /// The replaced buffer, and the start the buffer is due at (None: any).
+    pub fn post_paced(
+        &mut self,
+        i: usize,
+        buffer: u8,
+        rects: &[Rect],
+        clock: &frame::Clock,
+        now: u64,
+    ) -> Result<(Option<u8>, Option<u64>), Refusal> {
+        self.post_inner(i, buffer, rects, Some((clock, now)))
+    }
+
+    fn post_inner(
+        &mut self,
+        i: usize,
+        buffer: u8,
+        rects: &[Rect],
+        paced: Option<(&frame::Clock, u64)>,
+    ) -> Result<(Option<u8>, Option<u64>), Refusal> {
         if rects.len() > MAX_RECTS {
             return Err(Refusal::Invalid);
         }
@@ -749,14 +871,48 @@ impl Scene {
         if w.bufs[buffer as usize] != Buf::Free {
             return Err(Refusal::Busy);
         }
-        let damage = Scene::changed(w.rect, rects)?;
+        let mut damage = Scene::changed(w.rect, rects)?;
         w.bufs[buffer as usize] = Buf::Posted;
         let replaced = w.posted.replace(buffer);
         if let Some(j) = replaced {
             w.bufs[j as usize] = Buf::Free;
         }
+        let mut due = None;
+        match paced {
+            Some((clock, now)) => {
+                due = w.pace.posted(clock, now, replaced.is_some());
+                if due.is_some_and(|e| e > clock.next(now)) {
+                    // Not at the nearest start: the damage waits in the window.
+                    w.held = Some(union(w.held, damage));
+                    return Ok((replaced, due));
+                }
+            }
+            None => w.pace.count_post(replaced.is_some()),
+        }
+        if let Some(h) = w.held.take() {
+            damage = union(Some(damage), h);
+        }
         self.add_damage(damage);
-        Ok(replaced)
+        Ok((replaced, due))
+    }
+
+    /// Whether a change waits for a frame: damage the next frame will take.
+    pub fn damaged(&self) -> bool {
+        self.damage.is_some()
+    }
+
+    /// The start the windows a taking left are due at, the earliest.
+    pub fn held_until(&self) -> Option<u64> {
+        self.held_until
+    }
+
+    /// The pace of window `i`.
+    pub fn pace(&self, i: usize) -> Option<&frame::Pace> {
+        self.windows.get(i)?.as_ref().map(|w| &w.pace)
+    }
+
+    pub fn pace_mut(&mut self, i: usize) -> Option<&mut frame::Pace> {
+        self.windows.get_mut(i)?.as_mut().map(|w| &mut w.pace)
     }
 
     /// FLUSH of the legacy window `i`: its one buffer, whose changed
@@ -1174,8 +1330,24 @@ impl Scene {
     /// and, when no manager has subscribed, a window that has its first
     /// buffer taken gets the focus and the top place.
     pub fn begin(&mut self) -> Option<Rect> {
+        self.begin_at(u64::MAX)
+    }
+
+    /// `begin` for the frame of period `k`: a window with an interval whose
+    /// buffer is due at a later start is left posted (its damage waits in the
+    /// window, and `held_until` says the start it is due), and the others are
+    /// taken, each counted taken at `k`.
+    pub fn begin_at(&mut self, k: u64) -> Option<Rect> {
         if self.frame {
             return None;
+        }
+        self.held_until = None;
+        for w in self.windows.iter_mut().flatten() {
+            if w.pace.due(k)
+                && let Some(h) = w.held.take()
+            {
+                self.damage = Some(union(self.damage, h));
+            }
         }
         let d = self.damage.take()?;
         let x1 = (d.x + d.w).min(WIDTH);
@@ -1188,6 +1360,14 @@ impl Scene {
             let Some(w) = w else {
                 continue;
             };
+            if w.posted.is_some() && !w.pace.due(k) {
+                // Not its start: the buffer stays posted, and the frame is
+                // owed it at its start.
+                if let Some(e) = w.pace.earliest() {
+                    self.held_until = Some(self.held_until.map_or(e, |h| h.min(e)));
+                }
+                continue;
+            }
             let Some(b) = w.posted.take() else {
                 continue;
             };
@@ -1196,6 +1376,11 @@ impl Scene {
             } else {
                 w.retired = w.current.replace(b);
                 w.bufs[b as usize] = Buf::Taken;
+                if k == u64::MAX {
+                    w.pace.count_taken();
+                } else {
+                    w.pace.took(k);
+                }
             }
             w.in_frame = true;
             if !core::mem::replace(&mut w.shown_once, true) {
@@ -1321,14 +1506,14 @@ impl Scene {
     }
 
     /// The size of the next band of a frame over `damage`, as columns and
-    /// lines. A band costs a call for every layer it makes (each shown window
-    /// that touches the damage, the pointer's picture when it does, and the
-    /// black the band starts with when no window covers the damage) and
-    /// ticks for every point of each: OPAQUE_TICKS for a copy, OVER_TICKS for
-    /// a layer with an alpha or the pointer, FILL_TICKS for the black. The band
-    /// holds as many points as BAND_TICKS leaves after the calls, at least
-    /// one. The estimate counts every window that touches the damage, the
-    /// ones under a covering window too, so it never falls short.
+    /// lines. A band costs, for every layer it makes (each shown window that
+    /// touches the damage, the pointer's picture when it does, and the black
+    /// the band starts with when no window covers the damage), a call, a price
+    /// for each of its lines and a price for each of its points (`PRICES`), and
+    /// holds as many lines of the damage's width as BAND_TICKS leaves after the
+    /// calls (at most BAND_ROWS), or a part of one line, at least one point. The
+    /// estimate counts every window that touches the damage, the ones under a
+    /// covering window too, so it never falls short.
     fn tile(&self, damage: Rect) -> (u32, u32) {
         let touches = |r: Rect| {
             r.x < damage.x + damage.w
@@ -1359,19 +1544,48 @@ impl Scene {
                 && w.rect.y + w.rect.h >= damage.y + damage.h
         });
         let fill = u32::from(!covered);
-        let calls = opaque + over + fill;
-        let per_point = OPAQUE_TICKS * opaque + OVER_TICKS * over + FILL_TICKS * fill;
-        let Some(points) = BAND_TICKS
-            .saturating_sub(CALL_TICKS * calls)
-            .checked_div(per_point)
-        else {
+        // What the layers cost: the calls, a price for each line of each, a
+        // price for each point of each (hundredths of a tick where it is a
+        // line or a point).
+        let calls = OPAQUE.call * opaque + OVER.call * over + FILL.call * fill;
+        let per_row = OPAQUE.row * opaque + OVER.row * over + FILL.row * fill;
+        let per_point = OPAQUE.point * opaque + OVER.point * over + FILL.point * fill;
+        if per_row + per_point == 0 {
             // Nothing to draw: the damage is black or untouched.
             return (damage.w, BAND_ROWS);
-        };
-        let points = points.max(1);
-        let w = damage.w.min(points).max(1);
-        (w, (points / w).clamp(1, BAND_ROWS))
+        }
+        let budget = u64::from(BAND_TICKS.saturating_sub(calls)) * 100;
+        let one_row = u64::from(per_row) + u64::from(damage.w) * u64::from(per_point);
+        let rows = budget / one_row;
+        if rows >= 1 {
+            // The width of the damage, as many lines as the ticks allow.
+            return (damage.w, rows.min(u64::from(BAND_ROWS)) as u32);
+        }
+        // Not even one line of the whole width: a part of a line.
+        let room = budget.saturating_sub(u64::from(per_row));
+        let w = room.checked_div(u64::from(per_point)).unwrap_or(0);
+        (w.clamp(1, u64::from(damage.w)) as u32, 1)
     }
+}
+
+/// The bands a frame of one copy over the whole screen takes by the prices of
+/// `PRICES` (a window of XRGB8888 that covers the screen, nothing above it): the
+/// figure the probes print, and the one that must stay at 45 or fewer for the
+/// frame to fit a period of 60 Hz under -icount without load.
+pub fn full_screen_bands() -> u32 {
+    let mut s = Scene::new();
+    let screen = Rect::SCREEN;
+    let Ok(a) = s.create(1, 1, screen, true, 0) else {
+        return u32::MAX;
+    };
+    if s.flush(a, screen).is_err() {
+        return u32::MAX;
+    }
+    let Some(d) = s.begin() else {
+        return u32::MAX;
+    };
+    s.end(true);
+    HEIGHT.div_ceil(s.tile(d).1)
 }
 
 /// Where the pixels of a window's buffer are.
@@ -1872,11 +2086,11 @@ mod tests {
         while at.row < d.y + d.h {
             let next = compose(&s, d, at, &mut fb, &src, &mut Plain);
             assert_eq!(next.col, 0);
-            assert_eq!(next.row, (at.row + 7).min(HEIGHT));
+            assert_eq!(next.row, (at.row + 9).min(HEIGHT));
             at = next;
             bands += 1;
         }
-        assert_eq!(bands, HEIGHT.div_ceil(7));
+        assert_eq!(bands, HEIGHT.div_ceil(9));
         assert_eq!(at.row, HEIGHT);
         // A band past the damage is a no-op that says the frame is done.
         let done = Band {
@@ -2460,18 +2674,19 @@ mod tests {
         s.post(a, 0, &[]).unwrap();
         s.post(b, 0, &[]).unwrap();
         // A frame with an alpha window in it is made in bands of
-        // OVER_POINTS points of the layers: 30 wide, one layer, so 4 lines
-        // at most.
+        // the points the prices allow the layers: 30 wide, a copy and a
+        // layer over it, so the most lines of a band.
         let d = s.begin().unwrap();
         assert_eq!(d, rect(0, 0, 30, 30));
         let first = compose(&s, d, Band::default(), &mut fb, &src, &mut Plain);
         assert_eq!(
             first,
             Band {
-                row: BAND_ROWS,
+                row: s.tile(d).1,
                 col: 0
             }
         );
+        assert_eq!(first.row, BAND_ROWS);
         draw(&s, d, &mut fb, &src);
         s.end(true);
         // Only a: 0x80. Over a: 0x40 + 0x80 * 0x7F / 255 = 0x80.
@@ -2493,14 +2708,22 @@ mod tests {
     /// calls and the ticks the model of `Scene::tile` gives them.
     #[derive(Default)]
     struct Cost {
+        /// Ticks of the calls.
         calls: u32,
-        ticks: u32,
+        /// Hundredths of a tick.
+        centi: u32,
+    }
+
+    impl Cost {
+        fn ticks(&self) -> u32 {
+            self.centi.div_ceil(100)
+        }
     }
 
     impl Raster for Cost {
         fn black(&mut self, _: &mut [u8], r: Rect) {
-            self.calls += 1;
-            self.ticks += FILL_TICKS * r.w * r.h;
+            self.calls += FILL.call;
+            self.centi += FILL.row * r.h + FILL.point * r.w * r.h;
         }
 
         fn blit(
@@ -2515,8 +2738,9 @@ mod tests {
             area: (u32, u32),
             over: bool,
         ) {
-            self.calls += 1;
-            self.ticks += if over { OVER_TICKS } else { OPAQUE_TICKS } * area.0 * area.1;
+            let p = if over { OVER } else { OPAQUE };
+            self.calls += p.call;
+            self.centi += p.row * area.1 + p.point * area.0 * area.1;
         }
     }
 
@@ -2528,7 +2752,7 @@ mod tests {
         while at.row < d.y + d.h {
             let mut cost = Cost::default();
             at = compose(s, d, at, &mut fb, src, &mut cost);
-            worst = worst.max(cost.calls * CALL_TICKS + cost.ticks);
+            worst = worst.max(cost.calls + cost.ticks());
             bands += 1;
         }
         (worst, bands)
@@ -2542,13 +2766,17 @@ mod tests {
         let d = s.begin().unwrap();
         s.end(true);
         // One window that covers the damage: lines of the width.
-        // (the copy of a point is 3 in the model: 7 lines of 640).
-        assert_eq!(s.tile(d), (640, 7));
+        // (the copy of a point is 2.19 in the model, its call 979: 10 lines of 640).
+        assert_eq!(s.tile(d), (640, 9));
         // The pointer over it: a layer laid over others costs 25 a point.
         s.pointer_to(5, 5);
         let (w, rows) = s.tile(d);
         assert_eq!(rows, 1);
-        assert!(w < 640 && w * OVER_TICKS + 2 * CALL_TICKS <= BAND_TICKS + 3 * w);
+        assert!(
+            w < 640
+                && (w * OVER.point + OVER.row + OPAQUE.row).div_ceil(100) + OPAQUE.call + OVER.call
+                    <= BAND_TICKS + 3 * w
+        );
         // A damage nothing covers starts black: fewer lines.
         let mut t = Scene::new();
         let b = t.create(1, 1, rect(10, 10, 50, 50), true, 0).unwrap();
@@ -2556,6 +2784,116 @@ mod tests {
         t.begin().unwrap();
         assert_eq!(t.tile(rect(10, 10, 50, 50)).1, BAND_ROWS);
         assert!(t.tile(rect(0, 0, 640, 400)).1 < BAND_ROWS);
+    }
+
+    /// Every constant covers its measure with the margin, and the table says
+    /// which: a measure above its constant (a margin of nothing, an old
+    /// constant) fails here.
+    #[test]
+    fn the_constants_cover_the_measures_with_the_margin() {
+        let covers = |constant: u32, measured: u32| {
+            u64::from(constant) * 100 >= u64::from(measured) * u64::from(100 + MARGIN_PERCENT)
+        };
+        for p in PRICES {
+            assert!(covers(p.call, p.call_measured), "{} call", p.kind);
+            assert!(covers(p.row, p.row_measured), "{} row", p.kind);
+            assert!(covers(p.point, p.point_measured), "{} point", p.kind);
+            assert_eq!(p.call, with_margin(p.call_measured), "{}", p.kind);
+            assert_eq!(p.row, with_margin(p.row_measured), "{}", p.kind);
+            assert_eq!(p.point, with_margin(p.point_measured), "{}", p.kind);
+        }
+        // What the runs proved: the calls and the price of a point of the
+        // black are measures; the rows, and the points of a copy and of a layer
+        // laid over others, are estimates no run has under-run (a copy on large
+        // operations: mean 1.77; a layer laid over others: the least 7.02 with
+        // its call in it).
+        assert!(!PRICES[0].point_estimate);
+        assert!(PRICES[1].point_estimate && PRICES[2].point_estimate);
+        assert!(PRICES.iter().all(|p| p.row_estimate));
+        assert!(PRICES[0].point_measured >= 53 && PRICES[0].call_measured >= 212);
+        assert!(PRICES[1].point_measured >= 177 && PRICES[2].point_measured >= 702);
+        assert!(PRICES[1].call_measured >= 851 && PRICES[2].call_measured >= 1_303);
+        // The margin of nothing would leave a measure above the constant.
+        assert!(with_margin(190) > 190);
+    }
+
+    /// Eight windows with an alpha over the whole screen, the worst case of a
+    /// band: by the model no band costs more than BAND_TICKS, and a frame of
+    /// the whole screen of one copy is made in the bands the constants give.
+    #[test]
+    fn eight_translucent_windows_make_bands_within_the_band_ticks() {
+        let mut s = Scene::new();
+        let mut src = flat(&[]);
+        for k in 0..MAX_WINDOWS {
+            let i = s
+                .create(k as u64 + 1, 1 + (k / PER_CONTEXT) as u64, SCREEN, false, 0)
+                .unwrap();
+            s.set_format(i, Format::Argb);
+            s.attach(i, 1, 2560).unwrap();
+            src.0[i * BUFFERS] = vec![0x10; 2560 * 400];
+            s.post(i, 0, &[]).unwrap();
+        }
+        s.begin().unwrap();
+        s.end(true);
+        let (worst, bands) = worst_band(&s, SCREEN, &src);
+        assert!(
+            worst <= BAND_TICKS,
+            "a band of {worst} ticks by the model, {bands} bands"
+        );
+    }
+
+    #[test]
+    fn a_frame_of_one_copy_of_the_whole_screen_is_made_in_few_bands() {
+        let mut s = Scene::new();
+        let a = s.create(1, 1, SCREEN, true, 0).unwrap();
+        s.flush(a, SCREEN).unwrap();
+        let d = s.begin().unwrap();
+        s.end(true);
+        let src = flat(&[(a, 0, 0x10, (STRIDE * HEIGHT) as usize)]);
+        let (worst, bands) = worst_band(&s, d, &src);
+        assert!(worst <= BAND_TICKS, "{worst}");
+        // The bands of the whole screen, by the prices: loud when it passes 45.
+        assert!(bands <= 45, "{bands} bands: the full phase is no promise");
+        assert_eq!(bands, full_screen_bands());
+    }
+
+    /// A window with an interval of 2, taken at period 3, is awaited at 5.
+    /// Another window's post brings a frame at 4: the frame leaves the first
+    /// window's buffer posted, with its damage, and says the start it is due.
+    #[test]
+    fn a_frame_before_the_start_of_a_window_with_an_interval_leaves_it_posted() {
+        let clock = frame::Clock::new(0, 1_000);
+        let mut s = Scene::new();
+        let a = s.create(1, 1, rect(0, 0, 40, 40), false, 0).unwrap();
+        let b = s.create(2, 2, rect(100, 100, 40, 40), false, 0).unwrap();
+        for i in [a, b] {
+            s.attach(i, 2, 160).unwrap();
+        }
+        assert!(s.pace_mut(b).unwrap().set_interval(2));
+        s.pace_mut(b).unwrap().took(3);
+        // B posts in period 3, early: due at 5, so its damage waits in the window.
+        let (_, due) = s.post_paced(b, 0, &[], &clock, 3_200).unwrap();
+        assert_eq!(due, Some(5));
+        // A posts in period 3 (no interval): a frame at 4 takes A alone.
+        let (_, due) = s.post_paced(a, 0, &[], &clock, 3_500).unwrap();
+        assert_eq!(due, None);
+        assert!(s.damaged());
+        assert_eq!(s.begin_at(4), Some(rect(0, 0, 40, 40)));
+        s.end(true);
+        assert_eq!(s.held_until(), Some(5));
+        // (B's one taking is the setup's, at period 3.)
+        assert_eq!((s.pace(a).unwrap().taken, s.pace(b).unwrap().taken), (1, 1));
+        // At 5 the held damage joins and B is taken, with no new post.
+        let d = s.begin_at(5).unwrap();
+        assert!(d.x <= 100 && d.y <= 100 && d.x + d.w >= 140 && d.y + d.h >= 140);
+        s.end(true);
+        assert_eq!(s.held_until(), None);
+        assert_eq!(s.pace(b).unwrap().taken, 2);
+        // A post counts in the window's record whatever the clock.
+        let r = s.pace(a).unwrap().record(a as u32);
+        assert_eq!((r.posts, r.taken), (1, 1));
+        s.post(b, 1, &[]).unwrap();
+        assert_eq!(s.pace(b).unwrap().posts, 2);
     }
 
     use proto_gpu::{PIPELINE_CURSOR, SOURCE_CURSOR};
@@ -2600,7 +2938,7 @@ mod tests {
         let mut s = settled(true);
         s.pointer_to(5, 5);
         // The tile of a frame over the pointer is that of a copy alone.
-        assert_eq!(s.tile(SCREEN), (640, 7));
+        assert_eq!(s.tile(SCREEN), (640, 9));
         s.add_damage(SCREEN);
         let d = s.begin().unwrap();
         let src = flat(&[(0, 0, 0x80, 640 * 4 * 400)]);

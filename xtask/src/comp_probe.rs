@@ -274,6 +274,50 @@ pub struct RasterCost {
     pub big_worst: u64,
     pub small_best: u64,
     pub small_worst: u64,
+    /// The operations of 256 points or more, when the line has them: their
+    /// number, the least ticks a hundred points, the points of that operation
+    /// and the greatest.
+    pub large: Option<Large>,
+    /// The three prices of the model `call + rows * row + points * point`, when
+    /// the line has them.
+    pub model: Option<Model>,
+}
+
+/// The measured prices of a kind (`px::cost`): each the greatest over its class
+/// of operations, with how many there were. The call is ticks, the row and the
+/// point hundredths of a tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Model {
+    pub call: u64,
+    pub row: u64,
+    pub point: u64,
+    pub calls: u64,
+    pub rows: u64,
+    pub points: u64,
+}
+
+/// The large operations of a kind (`px::cost`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Large {
+    pub calls: u64,
+    pub best: u64,
+    pub best_points: u64,
+    pub worst: u64,
+}
+
+impl RasterCost {
+    /// The price of a point net of the call, in hundredths of a tick: the least
+    /// of the large operations, less the least call of the small ones, over the
+    /// points of the operation that made the least. None without large
+    /// operations; the whole least (call included) when no small operation came.
+    pub fn net_price(&self) -> Option<u64> {
+        let large = self.large?;
+        if large.calls == 0 || large.best_points == 0 {
+            return None;
+        }
+        let ticks = large.best * large.best_points / 100;
+        Some(ticks.saturating_sub(self.small_best) * 100 / large.best_points)
+    }
 }
 
 impl RasterCost {
@@ -296,6 +340,7 @@ impl RasterCost {
             "small",
             sb,
             sw,
+            rest @ ..,
         ] = w.as_slice()
         else {
             return None;
@@ -303,6 +348,31 @@ impl RasterCost {
         if *t != tag {
             return None;
         }
+        let (large, model) = match rest {
+            [] => (None, None),
+            ["large", n, lb, lp, lw, tail @ ..] => {
+                let large = Large {
+                    calls: n.parse().ok()?,
+                    best: lb.parse().ok()?,
+                    best_points: lp.parse().ok()?,
+                    worst: lw.parse().ok()?,
+                };
+                let model = match tail {
+                    [] => None,
+                    ["price", c, r, p, nc, nr, np] => Some(Model {
+                        call: c.parse().ok()?,
+                        row: r.parse().ok()?,
+                        point: p.parse().ok()?,
+                        calls: nc.parse().ok()?,
+                        rows: nr.parse().ok()?,
+                        points: np.parse().ok()?,
+                    }),
+                    _ => return None,
+                };
+                (Some(large), model)
+            }
+            _ => return None,
+        };
         Some(RasterCost {
             kind: (*kind).to_owned(),
             calls: calls.parse().ok()?,
@@ -312,6 +382,8 @@ impl RasterCost {
             big_worst: bw.parse().ok()?,
             small_best: sb.parse().ok()?,
             small_worst: sw.parse().ok()?,
+            large,
+            model,
         })
     }
 
@@ -334,11 +406,26 @@ pub fn raster_costs(lines: &[String], tag: &str) -> Vec<RasterCost> {
     out
 }
 
-/// The costs for the report of a probe: the ticks a point (mean, least and
-/// greatest over the big operations) and a small operation (least and
-/// greatest), against the constants of `Scene::tile`. The coordinator sets
-/// OPAQUE_TICKS (copy), OVER_TICKS (over), FILL_TICKS (black) and CALL_TICKS
-/// from the greatest of a point, rounded up, and BAND_TICKS stays.
+/// The row of the compositor's table of prices of a kind of layer.
+fn price(kind: &str) -> compositor::Price {
+    compositor::PRICES
+        .iter()
+        .copied()
+        .find(|p| p.kind == kind)
+        .unwrap_or(compositor::PRICES[2])
+}
+
+/// The costs for the report of a probe, per kind of layer: the three prices of
+/// the model of `Scene::tile` (`compositor::PRICES`: the call in ticks, the row
+/// and the point in hundredths of a tick; the measure and the constant of each,
+/// "(estimate)" where no probe measured it) against what the run measured: each
+/// the greatest over its class of operations (the call over operations of one row
+/// and 8 points or fewer, the row over those at most 16 points wide and at least 8
+/// rows with the call taken off, the point over those of 1 024 points or more with
+/// the call and the rows taken off) with the number of operations of the class.
+/// The measured figure goes into the table as the measure of its price, and the
+/// constant follows with the margin. The price of a point net of the call from
+/// the large operations (256 points or more) is printed beside them.
 pub fn raster_text(costs: &[RasterCost]) -> String {
     if costs.is_empty() {
         return "no cost lines (the log lost them, or the frames came too few)".to_owned();
@@ -347,25 +434,75 @@ pub fn raster_text(costs: &[RasterCost]) -> String {
         .iter()
         .map(|c| {
             let hundredths = |v: u64| format!("{}.{:02}", v / 100, v % 100);
+            let p = price(&c.kind);
+            let est = |e: bool| if e { " (estimate)" } else { "" };
+            let table = format!(
+                "table: call {} constant {}, row {} constant {}{}, point {} constant {}{}",
+                p.call_measured,
+                p.call,
+                hundredths(u64::from(p.row_measured)),
+                hundredths(u64::from(p.row)),
+                est(p.row_estimate),
+                hundredths(u64::from(p.point_measured)),
+                hundredths(u64::from(p.point)),
+                est(p.point_estimate),
+            );
+            let measured = match c.model {
+                Some(m) => format!(
+                    "measured: call {} ({} operations), row {} ({}), point {} ({})",
+                    m.call,
+                    m.calls,
+                    hundredths(m.row),
+                    m.rows,
+                    hundredths(m.point),
+                    m.points
+                ),
+                None => "measured: no classes in this line".to_owned(),
+            };
+            let large = match c.large {
+                Some(l) if l.calls > 0 => format!(
+                    "{} large operations: least {} at {} points, net of the call {}, greatest {}",
+                    l.calls,
+                    hundredths(l.best),
+                    l.best_points,
+                    c.net_price().map_or("none".to_owned(), hundredths),
+                    hundredths(l.worst)
+                ),
+                _ => "no large operation".to_owned(),
+            };
             format!(
-                "{} (now {}): {} calls, {} points, a point mean {} least {} greatest {}, an operation of 8 points or fewer least {} greatest {}",
+                "{} ({table}; {measured}): {} calls, {} points, {large}; call of an operation of 8 points or fewer least {} greatest {}; over 64 points or more a point mean {} least {} greatest {}",
                 c.kind,
-                match c.kind.as_str() {
-                    "black" => compositor::FILL_TICKS,
-                    "copy" => compositor::OPAQUE_TICKS,
-                    _ => compositor::OVER_TICKS,
-                },
                 c.calls,
                 c.points,
+                c.small_best,
+                c.small_worst,
                 hundredths(c.mean_per_hundred()),
                 hundredths(c.big_best),
                 hundredths(c.big_worst),
-                c.small_best,
-                c.small_worst,
             )
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// The most bands of a full frame the period of 60 Hz holds without load.
+pub const FULL_FRAME_BANDS_MAX: u32 = 45;
+
+/// The bands of a frame of one copy over the whole screen by the table, and
+/// the words that say whether the period holds them.
+pub fn full_frame_text() -> String {
+    let bands = compositor::full_screen_bands();
+    let verdict = if bands <= FULL_FRAME_BANDS_MAX {
+        format!("within the {FULL_FRAME_BANDS_MAX} the period holds")
+    } else {
+        format!(
+            "MORE THAN {FULL_FRAME_BANDS_MAX}: the full frame is no promise at 60 Hz under -icount"
+        )
+    };
+    format!(
+        "a frame of one copy over the whole screen takes {bands} bands by the table ({verdict})"
+    )
 }
 
 /// The device's trace against what the probe did: the scanout was set to
@@ -496,9 +633,9 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         text(&driver)
     );
     println!(
-        "comp-probe on {}: the cost of the layers inside the bands, ticks (CALL_TICKS {}, BAND_TICKS {}): {}",
+        "comp-probe on {}: {}; the cost of the layers inside the bands, ticks (BAND_TICKS {}): {}",
         machine.name,
-        compositor::CALL_TICKS,
+        full_frame_text(),
         compositor::BAND_TICKS,
         raster_text(&raster_costs(&output.lines, COMP_TAG))
     );
@@ -655,9 +792,77 @@ mod tests {
         assert_eq!(costs[1].big_worst, 2500);
         let text = raster_text(&costs);
         assert!(text.contains(
-            "copy (now 3): 6 calls, 1800 points, a point mean 2.77 least 2.70 greatest 3.30"
+            "copy (table: call 851 constant 979, row 20.00 constant 23.00 (estimate), point 1.90 constant 2.19 (estimate); measured: no classes in this line): 6 calls, 1800 points, no large operation; call of an operation of 8 points or fewer least 40 greatest 60; over 64 points or more a point mean 2.77 least 2.70 greatest 3.30"
         ));
         assert!(raster_text(&[]).contains("no cost lines"));
+    }
+
+    /// The line with the large operations: the price of a point net of the
+    /// call is the least of them less the least call, over its points; a line
+    /// without them (an older build) is read as before.
+    #[test]
+    fn the_large_operations_give_the_price_of_a_point_net_of_the_call() {
+        let lines: Vec<String> = [
+            "service raster: 17 copy calls 31 points 90000 ticks 159000 big 156 352 small 765 851 large 20 160 6144 352",
+            "service raster: 17 black calls 16 points 64000 ticks 28800 big 45 53 small 212 212 large 12 46 6400 53",
+            "service raster: 17 over calls 5 points 900 ticks 9000 big 700 1300 small 0 0 large 0 0 0 0",
+            "service raster: 17 copy calls 2 points 3 ticks 4 big 1 1 small 1 1 large 1 2",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        let costs = raster_costs(&lines, COMP_TAG);
+        assert_eq!(costs.len(), 3, "the line with a short tail is not read");
+        let copy = &costs[0];
+        assert_eq!(copy.large.unwrap().calls, 20);
+        // 160 a hundred over 6144 points is 9830 ticks; less the call 765, over
+        // the points: 147 a hundred.
+        assert_eq!(copy.net_price(), Some(147));
+        assert_eq!(costs[1].net_price(), Some(42));
+        assert_eq!(costs[2].net_price(), None);
+        let text = raster_text(&costs);
+        assert!(text.contains(
+            "20 large operations: least 1.60 at 6144 points, net of the call 1.47, greatest 3.52"
+        ));
+        assert!(text.contains(
+            "black (table: call 212 constant 244, row 20.00 constant 23.00 (estimate), point 0.53 constant 0.61;"
+        ));
+    }
+
+    /// The three prices of the model come in the tail of the line.
+    #[test]
+    fn the_three_prices_are_read_from_the_tail_of_the_line() {
+        let lines: Vec<String> = [
+            "service raster: 17 copy calls 31 points 90000 ticks 159000 big 156 352 small 765 851 large 20 160 6144 352 price 851 1800 205 12 5 20",
+            "service raster: 17 black calls 16 points 64000 ticks 28800 big 45 53 small 212 212 large 12 46 6400 53 price 212 900 49 4 2 12",
+            "service raster: 17 over calls 5 points 900 ticks 9000 big 700 1300 small 0 0 large 0 0 0 0 price 0 0 0 0 0 0 7",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        let costs = raster_costs(&lines, COMP_TAG);
+        assert_eq!(costs.len(), 2, "a line with a long tail is not read");
+        let m = costs[0].model.unwrap();
+        assert_eq!((m.call, m.row, m.point), (851, 1800, 205));
+        assert_eq!((m.calls, m.rows, m.points), (12, 5, 20));
+        let text = raster_text(&costs);
+        assert!(
+            text.contains("measured: call 851 (12 operations), row 18.00 (5), point 2.05 (20)")
+        );
+        assert!(text.contains("measured: call 212 (4 operations), row 9.00 (2), point 0.49 (12)"));
+    }
+
+    /// The line of the full frame says its bands and whether the period holds
+    /// them.
+    #[test]
+    fn the_full_frame_line_says_the_bands_and_the_verdict() {
+        let text = full_frame_text();
+        assert!(text.contains(&format!("takes {} bands", compositor::full_screen_bands())));
+        assert!(
+            compositor::full_screen_bands() <= FULL_FRAME_BANDS_MAX,
+            "{text}"
+        );
+        assert!(text.contains("within the 45"));
     }
 
     #[test]
