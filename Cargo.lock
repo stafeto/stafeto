@@ -174,7 +174,9 @@ name = "data-probe"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "frame-load",
  "proto-data",
+ "proto-init",
  "proto-wire",
  "rt",
 ]
@@ -400,6 +402,18 @@ dependencies = [
  "proto-gpu",
  "proto-init",
  "proto-input",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "frame-load"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-comp",
+ "proto-gpu",
+ "proto-init",
  "proto-wire",
  "rt",
 ]
@@ -639,6 +653,7 @@ name = "net-probe"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "frame-load",
  "proto-init",
  "proto-net",
  "proto-pipe",

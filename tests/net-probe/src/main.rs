@@ -42,6 +42,9 @@
 //! - `A`: 16 operations wait in one session, which asks ABANDON until none is
 //!   left: the service lets go of four in each answer.
 //! - `G` and `B`: the shared buffers (buffers.rs).
+//! - `L` and `K`: the network loads of the frame-time probe (load.rs): a TCP
+//!   round trip of 64 KiB through the loopback, again and again, in the phases
+//!   that have the network load, and a sink for the stream the host sends.
 //! - `r`: the timers: a PING that nobody answers ends in TIMEOUT, and a frame
 //!   of the loopback that is dropped is sent again by the retransmission
 //!   timer.
@@ -53,6 +56,7 @@
 #![no_main]
 
 mod buffers;
+mod load;
 
 use abi::{Error, MESSAGE_MAX};
 use proto_init::ServiceArgs;
@@ -129,6 +133,8 @@ fn main(_: u64) -> u64 {
             b'x' => probe.passes(&mut session),
             b'G' => probe.portion(&mut session),
             b'B' => probe.buffer_sessions(&mut session),
+            b'L' => probe.loopback_load(),
+            b'K' => probe.sink(),
             _ => Err("an unknown role"),
         };
         if result.is_err() {
