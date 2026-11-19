@@ -219,8 +219,10 @@
 //!     byte was written; the layer sends SIGXFSZ with FILE_SIZE_LIMIT and gives EFBIG. A TRUNCATE
 //!     past the limit has no part to write and answers the status at once.
 //! 14. **The reserve.** With fewer than `RESERVE_BLOCKS` free blocks, a caller other than user 0
-//!     gets NO_SPACE for a write (after the bytes that fit) or a create; user 0 writes into the
-//!     reserve; UNLINK and RMDIR pass always. STATFS `avail` leaves the reserve out and `free`
+//!     gets NO_SPACE for a write (after the bytes that fit), a create (OPEN with CREATE, MKDIR), a
+//!     RENAME and a change of attributes (CHMOD, CHOWN, UTIMENS and the variants by description),
+//!     because each may split or compact a pair of metadata blocks; user 0 does all of these into
+//!     the reserve; UNLINK and RMDIR pass always. STATFS `avail` leaves the reserve out and `free`
 //!     does not.
 //! 15. **The channels.** The root channel (label `ROOT`) takes SESSION and VERIFY_SESSION and
 //!     nothing else; any other session answers them, and the root answers every other method, with

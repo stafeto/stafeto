@@ -1563,3 +1563,66 @@ fn one_root_has_one_count_for_its_clones_and_its_sessions() {
     let k = rig.open(root_number, b"/d", p::DIRECTORY, 0).unwrap();
     rig.clone_session(root_number, 5000, &[k]).unwrap();
 }
+
+#[test]
+fn in_the_reserve_rename_and_attribute_changes_are_the_superusers_and_rmdir_passes() {
+    let mut rig = Rig::new();
+    rig.put(ROOT, b"/keep", 0o666, b"abc");
+    rig.mkdir(ROOT, b"/pub", 0o777).unwrap();
+    rig.mkdir(ROOT, b"/pub/emptied", 0o777).unwrap();
+    rig.put(OWNER, b"/pub/mine", 0o644, b"x");
+    fill_to_the_reserve(&mut rig);
+    let more = rig
+        .open(ROOT, b"/d/more", p::WRITE | p::CREATE, 0o666)
+        .unwrap();
+    while rig.fs.free_blocks().unwrap() >= crate::attr::RESERVE_BLOCKS {
+        rig.write(ROOT, more, &[1u8; 900]).unwrap();
+    }
+    let full = Some(p::code(p::NO_SPACE));
+    // Another user's chmod, chown of the group, utimensat and rename are refused for space.
+    assert_eq!(rig.chmod(OWNER, b"/pub/mine", 0o600).err(), full);
+    assert_eq!(rig.chown(OWNER, b"/pub/mine", p::UID_KEEP, 100).err(), full);
+    assert_eq!(
+        rig.call(OWNER, |w| p::utimens(
+            b"/pub/mine",
+            p::TimeSpec::Now,
+            p::TimeSpec::Now,
+            w
+        ))
+        .err(),
+        full
+    );
+    assert_eq!(
+        rig.call(OWNER, |w| p::rename(b"/pub/mine", b"/pub/mine2", w))
+            .err(),
+        full
+    );
+    // The same by description.
+    let h = rig.open(OWNER, b"/pub/mine", p::READ, 0).unwrap();
+    assert_eq!(rig.call(OWNER, |w| p::fchmod(h, 0o600, w)).err(), full);
+    // A refusal for lack of right still comes first: a stranger gets EPERM, not NO_SPACE.
+    assert_eq!(
+        rig.chmod(OTHER, b"/pub/mine", 0o600).err(),
+        Some(PERMISSION)
+    );
+    // The superuser does all of them into the reserve, MKDIR included.
+    rig.chmod(ROOT, b"/pub/mine", 0o600).unwrap();
+    rig.chown(ROOT, b"/pub/mine", 1000, 100).unwrap();
+    rig.call(ROOT, |w| p::rename(b"/pub/mine", b"/pub/mine2", w))
+        .unwrap();
+    rig.mkdir(ROOT, b"/made-in-the-reserve", 0o755).unwrap();
+    // RMDIR and UNLINK pass for everyone on a volume with no room.
+    assert!(
+        rig.call(OWNER, |w| p::path_call(p::Method::Unlink, b"/pub/mine2", w))
+            .is_ok()
+    );
+    rig.chmod(ROOT, b"/pub/emptied", 0o777).unwrap();
+    assert!(
+        rig.call(OWNER, |w| p::path_call(
+            p::Method::Rmdir,
+            b"/pub/emptied",
+            w
+        ))
+        .is_ok()
+    );
+}

@@ -1309,7 +1309,7 @@ impl Server {
                 let mut attr = entry.attr;
                 let size = match self.node_at(&path[..n]) {
                     Some(ni) => {
-                        // The write time of what is written and not synced shows at once (XBD 4.12).
+                        // The write time of a file written and still unsynced shows at once (XBD 4.12).
                         self.overlay_pending(ni, &mut attr);
                         self.size_of(fs, ni)? as u32
                     }
@@ -1923,8 +1923,10 @@ impl Server {
         }
     }
 
-    /// A create (rule 14): a caller other than user 0 gets NO_SPACE with fewer than
-    /// `RESERVE_BLOCKS` free blocks.
+    /// The reserve (rule 14): a caller other than user 0 gets NO_SPACE with fewer than
+    /// `RESERVE_BLOCKS` free blocks, for a create, a rename and a change of attributes: each may
+    /// split or compact a pair of metadata blocks, which takes blocks the superuser needs to remove
+    /// what fills the volume.
     fn reserve_allows<D: Device>(&mut self, fs: &mut Fs<'_, D>, caller: &Caller) -> Res<()> {
         if caller.is_superuser() || volume(fs.free_blocks())? >= RESERVE_BLOCKS {
             Ok(())
@@ -2123,6 +2125,8 @@ impl Server {
         if from == to {
             return Ok(());
         }
+        // A rename may split a directory's pair of blocks: below the reserve it is the superuser's.
+        self.reserve_allows(fs, caller)?;
         // A name added to another directory counts toward its cap.
         if from_parent != to_parent && target_entry.is_none() {
             self.room_in_dir(fs, to_parent)?;
@@ -2201,6 +2205,7 @@ impl Server {
         let (info, entry) = self.load(fs, path)?;
         let new = perm::chmod_result(caller.identity(false), &entry.attr.perm(info.kind), mode)
             .map_err(denied)?;
+        self.reserve_allows(fs, caller)?;
         self.write_changed(fs, path, info.kind, entry, |a, now| {
             a.mode = new;
             a.ctime = now;
@@ -2226,6 +2231,7 @@ impl Server {
             keep(gid),
         )
         .map_err(denied)?;
+        self.reserve_allows(fs, caller)?;
         self.write_changed(fs, path, info.kind, entry, |a, now| {
             a.mode = owned.mode;
             a.uid = owned.uid;
@@ -2255,6 +2261,7 @@ impl Server {
         if request == TimesRequest::Omit {
             return Ok(());
         }
+        self.reserve_allows(fs, caller)?;
         let pick = |t: p::TimeSpec, old: i64, now: i64| match t {
             p::TimeSpec::Now => now,
             p::TimeSpec::Omit => old,
