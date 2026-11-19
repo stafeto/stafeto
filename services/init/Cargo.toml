@@ -100,6 +100,8 @@ table-posix-pty = []
 # steps mode, xtask process-steps).
 table-posix-steps = []
 table-os-test = []
+# The Open POSIX tests with their scratch files on the data volume (xtask open-posix --data).
+table-os-test-data = []
 table-busybox = []
 table-busybox-dialog = []
 # The games image: the dialog with the quota of Doom (xtask doom-headless).

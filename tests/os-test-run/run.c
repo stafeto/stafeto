@@ -7,7 +7,9 @@
  * "./name" with that as argv[0] (the tests that exec themselves and those
  * of basic/ name their program so). The list is the file /os-test/list, a
  * line a test: its name, its directory and its path from there, apart by
- * spaces; a line `limit MS` sets the time a test may take from then on.
+ * spaces; a line `limit MS` sets the time a test may take from then on, a
+ * line `env NAME VALUE` sets a variable the tests inherit, and a line
+ * `mkdir PATH` makes a directory (the data volume's scratch place).
  *
  * A test's output goes to the console as it writes it; the runner marks
  * each test on both sides, without a newline before the second mark, so
@@ -37,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -197,6 +200,18 @@ int main(int argc, char **argv) {
         if (name && strcmp(name, "limit") == 0) {
             char *ms = strtok(NULL, " \n");
             if (ms) limit_ms = atoll(ms);
+            continue;
+        }
+        if (name && strcmp(name, "env") == 0) {
+            char *var = strtok(NULL, " \n");
+            char *value = strtok(NULL, " \n");
+            if (var && value) setenv(var, value, 1);
+            continue;
+        }
+        if (name && strcmp(name, "mkdir") == 0) {
+            char *path = strtok(NULL, " \n");
+            if (path && mkdir(path, 0777) != 0 && errno != EEXIST)
+                printf("os-test-run: mkdir %s failed: %s\n", path, strerror(errno));
             continue;
         }
         char *dir = strtok(NULL, " \n");
