@@ -6,7 +6,7 @@
 //! buffer replacing or lying over those of the screen.
 
 use compositor::{Format, Raster};
-use pixman::{Format as Px, Images, Source, Target, composite, fill};
+use pixman::{Format as Px, Images, Source, Target, composite, fill, prepare};
 use proto_comp::Rect;
 use proto_gpu::{HEIGHT, STRIDE, WIDTH};
 
@@ -261,6 +261,26 @@ impl Pixman {
             images: Images::new(),
             refused: 0,
         }
+    }
+
+    /// The image of a window's buffer is made now (a post), so that no band
+    /// pays for the first use of a surface.
+    pub fn prepare(&mut self, src: &[u8], stride: u32, f: Format, size: (u32, u32)) {
+        let source = Source {
+            bytes: src,
+            format: format(f),
+            stride,
+            width: size.0,
+            height: size.1,
+        };
+        if !prepare(&mut self.images, source) {
+            self.refuse("a surface");
+        }
+    }
+
+    /// The images made so far.
+    pub fn made(&self) -> u32 {
+        self.images.made()
     }
 
     /// One operation was refused: counted, and said the first time and at

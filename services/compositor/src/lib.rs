@@ -515,6 +515,12 @@ pub const CURSOR_HOT: (u32, u32) = (0, 0);
 struct Aligned([u8; CURSOR.len()]);
 static PICTURE: Aligned = Aligned(CURSOR);
 
+/// The pointer's picture (ARGB8888, CURSOR_W by CURSOR_H points), the bytes
+/// a band lays over a screen the pointer touches.
+pub fn pointer_picture() -> &'static [u8] {
+    &PICTURE.0
+}
+
 impl Scene {
     pub const fn new() -> Scene {
         Scene {

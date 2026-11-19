@@ -218,6 +218,16 @@ struct Attaching {
 /// The pixels of the windows' buffers, as the mappings hold them.
 struct Pixels<'a>(&'a Scene);
 
+/// The detail of the longest step of the service's own work tells which
+/// work it is: the thousands (1 a band, to which the images it made are added,
+/// 2 the take of a frame, 3 the commit after the last band, 4 the end of a
+/// frame, 5 a step of the service's housekeeping).
+const STEP_BAND: u64 = 1000;
+const STEP_TAKE: u64 = 2000;
+const STEP_COMMIT: u64 = 3000;
+const STEP_END: u64 = 4000;
+const STEP_WORK: u64 = 5000;
+
 impl PixelSource for Pixels<'_> {
     fn pixels(&self, window: usize, buffer: u8) -> &[u8] {
         let len = self
@@ -427,6 +437,14 @@ fn main(_: u64) -> u64 {
         timer,
         _timer_view: timer_view,
     };
+    // The image of the pointer's picture is made here, before the first band
+    // the pointer is in.
+    service.raster.prepare(
+        compositor::pointer_picture(),
+        compositor::CURSOR_W * 4,
+        Format::Argb,
+        (compositor::CURSOR_W, compositor::CURSOR_H),
+    );
     service.keys.link = connect_device(&service.parent, service.keys.name);
     service.pointer.link = connect_device(&service.parent, service.pointer.name);
     // The screen is opened here, outside any step (its buffer is 256 pages
@@ -1072,6 +1090,7 @@ impl Compositor {
         // The step that takes a frame is judged as a band is (under the band's
         // limit), with the steps of the service's own work.
         rt::service::step_own();
+        rt::service::step_detail(STEP_TAKE);
         let now = now_ns();
         match self.pacer.fire(now) {
             Fire::Take(k) => {
@@ -1131,6 +1150,7 @@ impl Compositor {
     /// the step of a band).
     fn band(&mut self) {
         rt::service::step_own();
+        rt::service::step_detail(STEP_BAND);
         let Some(job) = self.job.as_mut() else {
             return;
         };
@@ -1139,6 +1159,7 @@ impl Compositor {
             self.job = None;
             #[cfg(feature = "steps")]
             px::cost::frame_done();
+            rt::service::step_detail(STEP_COMMIT);
             self.commit(damage);
             return;
         }
@@ -1147,6 +1168,7 @@ impl Compositor {
         // else in this thread holds it.
         let fb = unsafe { slice::from_raw_parts_mut(FB_AT as *mut u8, SCREEN_BYTES as usize) };
         let began = now_ns();
+        let made = self.raster.made();
         job.at = compose(
             &self.scene,
             job.damage,
@@ -1155,6 +1177,10 @@ impl Compositor {
             &Pixels(&self.scene),
             &mut self.raster,
         );
+        // The images this band made (surfaces first used in it) go in the
+        // detail with the band's number, so that a long band is told from a
+        // band of images made.
+        rt::service::step_detail(STEP_BAND + u64::from(self.raster.made().wrapping_sub(made)));
         self.scene.band_done();
         let more = job.at.row < job.damage.y + job.damage.h;
         let now = now_ns();
@@ -1228,6 +1254,7 @@ impl Compositor {
     fn finish(&mut self, shown: bool) {
         let shown_at = now_ns();
         rt::service::step_own();
+        rt::service::step_detail(STEP_END);
         self.committed = false;
         let direct = self.scene.frame_kind() == FrameKind::Bypass;
         let ended = self.scene.end(shown);
@@ -1329,6 +1356,7 @@ impl Compositor {
     /// own bit.
     fn work(&mut self) {
         rt::service::step_own();
+        rt::service::step_detail(STEP_WORK);
         self.regrant();
         if let Some(done) = self.cleared {
             let len = CLEARED.min(POOL_LEN - done);
@@ -1811,6 +1839,15 @@ impl Compositor {
                     && let Some(notify) = &self.extra[i].notify
                 {
                     let _ = sys::notify(notify, 1 << b);
+                }
+                // The posted buffer's image is made here: the first band that
+                // reads the buffer would pay for it (a few hundred ticks a
+                // layer, and a band of eight windows has eight).
+                if let Some(w) = self.scene.window(i).copied() {
+                    let pixels = Pixels(&self.scene);
+                    let src = pixels.pixels(i, buffer);
+                    self.raster
+                        .prepare(src, w.stride, w.format, (w.rect.w, w.rect.h));
                 }
                 // A window with an interval is due at its start, whatever else
                 // is waiting for a frame.

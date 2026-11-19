@@ -115,6 +115,7 @@ mod imp {
     pub struct Images {
         kept: [Option<(Key, Image)>; KEPT],
         next: usize,
+        made: u32,
     }
 
     impl Images {
@@ -122,7 +123,14 @@ mod imp {
             Images {
                 kept: [const { None }; KEPT],
                 next: 0,
+                made: 0,
             }
+        }
+
+        /// The images made so far (a use of a surface the table does not
+        /// keep makes one, which costs a few thousand ticks for eight).
+        pub fn made(&self) -> u32 {
+            self.made
         }
 
         /// The image of `key`, made when it is not kept. None when pixman
@@ -146,6 +154,7 @@ mod imp {
             if image.is_null() {
                 return None;
             }
+            self.made = self.made.wrapping_add(1);
             let at = self.next;
             self.next = (self.next + 1) % KEPT;
             self.kept[at] = Some((key, Image(image)));
@@ -255,6 +264,32 @@ mod imp {
         true
     }
 
+    /// The image of a source surface is made (when the table does not keep
+    /// it), so that the first operation that reads it, in a band, does not
+    /// pay for it. False when the surface is not what its bytes hold or
+    /// pixman refuses.
+    pub fn prepare(images: &mut Images, src: (&[u8], Format, u32, u32, u32)) -> bool {
+        let (sbytes, sformat, sstride, swidth, sheight) = src;
+        if !shaped(
+            sbytes.as_ptr() as usize,
+            sbytes.len(),
+            sstride,
+            swidth,
+            sheight,
+        ) {
+            return false;
+        }
+        images
+            .image(Key {
+                bytes: sbytes.as_ptr() as usize,
+                format: sformat,
+                stride: sstride,
+                width: swidth,
+                height: sheight,
+            })
+            .is_some()
+    }
+
     /// The rectangle takes `value`; false (and nothing is drawn) when the
     /// surface is not what its bytes hold or the rectangle is not inside it.
     pub fn fill(
@@ -333,6 +368,17 @@ pub fn composite(
         (src.bytes, src.format, src.stride, src.width, src.height),
         (sx, sy, dx, dy),
         (w, h),
+    )
+}
+
+/// The image of `src` is made now when the table does not keep it (see
+/// `Images::image`): the cost of a surface's first use goes where the
+/// caller puts it. False when the surface is not what its bytes hold.
+#[cfg(target_os = "none")]
+pub fn prepare(images: &mut Images, src: Source<'_>) -> bool {
+    imp::prepare(
+        images,
+        (src.bytes, src.format, src.stride, src.width, src.height),
     )
 }
 
