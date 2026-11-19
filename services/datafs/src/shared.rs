@@ -110,7 +110,8 @@ pub static UNMOUNTED: AtomicBool = AtomicBool::new(false);
 /// at its next disk call.
 pub static WALKING: AtomicBool = AtomicBool::new(false);
 /// The walk in progress may give way to a job that is queued: its next read fails, the job is
-/// served, and the walk is tried again when the queue is empty (`YIELDED` says it was this).
+/// served, and the walk is tried again after the queue has been quiet for a while (`YIELDED` says it was
+/// this).
 pub static YIELD_OK: AtomicBool = AtomicBool::new(false);
 pub static YIELDED: AtomicBool = AtomicBool::new(false);
 

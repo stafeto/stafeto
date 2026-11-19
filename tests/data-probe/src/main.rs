@@ -14,16 +14,20 @@
 //!   it names must all be there). Every file of the tree is whole (the bytes its name says, no
 //!   torn file), the files of the steps up to the progress are there, those of the steps that
 //!   removed them are gone, and a file of a step past the next is not there. A write and a read of one
-//!   more file shows the volume takes the next writes.
+//!   more file shows the volume takes the next writes. With `STAFETO_DATA_PROBE_WAIT_S` set the probe
+//!   first sleeps that many seconds before it sends any request: the service walks the volume
+//!   once its queue has been quiet for 2 s, and the host then finds the line of that walk (with its
+//!   reads and time) before the probe's own requests.
 
 #![no_std]
 #![no_main]
 
-use abi::MESSAGE_MAX;
+use abi::{MESSAGE_MAX, Source};
 use proto_data as p;
 use proto_data::Method;
 use proto_wire::{Status, Writer};
 use rt::handle::{Channel, Resource};
+use rt::sys::Received;
 use rt::{Handle, sys};
 
 rt::entry!(main);
@@ -32,6 +36,11 @@ const MODE: &str = match option_env!("STAFETO_DATA_PROBE_MODE") {
     Some(mode) => mode,
     None => "write",
 };
+/// The seconds the probe sleeps before its first request, 0 for none (`STAFETO_DATA_PROBE_WAIT_S`).
+const WAIT_S: u64 = parse(match option_env!("STAFETO_DATA_PROBE_WAIT_S") {
+    Some(text) => text,
+    None => "0",
+}) as u64;
 /// The last step the host saw the line of, in a `verify` that follows a cut.
 const MIN: u32 = parse(match option_env!("STAFETO_DATA_PROBE_MIN") {
     Some(text) => text,
@@ -63,6 +72,14 @@ fn main(_: u64) -> u64 {
         return 2;
     };
     let client = Client { session };
+    // The wait is 0 in a build that names none.
+    #[allow(clippy::absurd_extreme_comparisons)]
+    let waits = WAIT_S > 0;
+    if waits {
+        let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
+        sleep(level, WAIT_S * 1_000_000_000);
+        rt::println!("data-probe: waited {WAIT_S} s");
+    }
     let result = match MODE {
         "write" => write(&client),
         "verify" => verify(&client),
@@ -73,6 +90,30 @@ fn main(_: u64) -> u64 {
         Err(reason) => {
             rt::println!("data-probe: failed: {reason}");
             2
+        }
+    }
+}
+
+/// Sleeps `ns` nanoseconds: a timer on a channel of its own, and the wait for its notification.
+fn sleep(level: u8, ns: u64) {
+    let Ok(channel) = sys::channel_create(level) else {
+        return;
+    };
+    let Ok(timer) = sys::timer_create(&channel, level) else {
+        return;
+    };
+    let until = rt::time::ticks_to_ns(rt::time::now()) + ns;
+    if sys::timer_set(&timer, until).is_err() {
+        return;
+    }
+    loop {
+        match sys::receive(&channel) {
+            Ok(Received::Notification {
+                source: Source::Timer,
+                ..
+            }) if rt::time::reached(until) => return,
+            Ok(_) => {}
+            Err(_) => return,
         }
     }
 }
