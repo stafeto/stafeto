@@ -611,6 +611,12 @@ fn statfs(c: &Client) -> Result<(u64, u64), Fail> {
     Ok((pair(0), pair(8)))
 }
 
+/// How long the probe keeps quiet after its removals: the service starts the refresh walk 2 s after
+/// its queue is empty, and a request that comes during the walk stops it (the reader does not wait
+/// for the walk's end: the request walks by itself), so the probe stays silent for the walk of a
+/// volume this full at the slowest device the bounds allow (60 s) and a little more.
+const QUIET_FOR_REFRESH_NS: u64 = 65_000_000_000;
+
 /// The lines of `fill` (see the head of the file): each is one measurement of the service on a volume
 /// of 1 GiB that is mostly full. The times are the client's, from the send to the reply.
 fn measure_fill(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
@@ -718,10 +724,10 @@ fn measure_fill(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
     );
     let (_, low) = statfs(c)?;
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
-    sleep(level, 4_000_000_000);
+    sleep(level, QUIET_FOR_REFRESH_NS);
     let (_, after) = statfs(c)?;
     rt::println!(
-        "data-probe: fill free blocks {before} before the removals, {low} right after, {after} after 4 s of quiet"
+        "data-probe: fill free blocks {before} before the removals, {low} right after, {after} after the quiet"
     );
     rt::println!("data-probe: fill done");
     Ok(())

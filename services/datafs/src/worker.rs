@@ -766,20 +766,14 @@ struct Idle {
 }
 
 /// Whether a walk in the idle would help: the blocks that removals, truncations and replacing
-/// renames gave back since the last walk are over a sixteenth of the volume and the window's free
-/// bits are under a sixteenth too (a walk inside a request is then about to happen, and the free
-/// count of STATFS is low by what was given back); or the window holds less than the volume (the
-/// allocator wrapped in the middle of a request) and the free count is low.
+/// renames gave back since the last walk are over a sixteenth of the volume (the free count of STATFS
+/// is low by that much), or the window holds less than the volume (the allocator wrapped in the
+/// middle of a request) and the free count is low.
 fn refresh_wanted(fs: &Volume, idle: &Idle) -> bool {
     if idle.refresh_failed || STOPPING.load(Acquire) {
         return false;
     }
-    datafs::idle::refresh_wanted(
-        fs.blocks(),
-        fs.freed_estimate(),
-        fs.window_free(),
-        fs.window_short(),
-    )
+    datafs::idle::refresh_wanted(fs.blocks(), fs.freed_estimate(), fs.window_short())
 }
 
 /// How a walk ended.

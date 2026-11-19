@@ -45,14 +45,15 @@ pub const fn walk_may_yield(first: bool, tries: u32) -> bool {
 
 /// Whether a walk in the idle would help (the refresh): the blocks that removals, truncations and
 /// replacing renames gave back since the last walk (`freed`) are over a sixteenth of the volume
-/// (`blocks`) and the window's free bits (`window_free`) are under a sixteenth too (a walk inside a
-/// request is then about to happen, and the free count of STATFS is low by what was given back); or
-/// the window holds less than the volume (`window_short`: the allocator wrapped in the middle of a
-/// request) and the free count is low. A volume with a sixteenth or less given back has no refresh:
-/// the free count is low by that much at most.
-pub const fn refresh_wanted(blocks: u64, freed: u64, window_free: u64, window_short: bool) -> bool {
-    let sixteenth = blocks / 16;
-    window_short || (freed > sixteenth && window_free < sixteenth)
+/// (`blocks`), or the window holds less than the volume (`window_short`: the allocator wrapped in the
+/// middle of a request). The free count of STATFS comes from the bits of the window, which a removal
+/// does not touch, so it is low by what was given back until a walk fills the window again; a sixteenth
+/// is the most a reader is allowed to be told too little (a `df` after a large `rm` must not lie
+/// for long, whatever the window holds). A volume with a sixteenth or less given back has no
+/// refresh. A first version also asked the window to be nearly full; a probe that removed 384 MiB
+/// from a volume with 23 percent free saw the count stay where it was.
+pub const fn refresh_wanted(blocks: u64, freed: u64, window_short: bool) -> bool {
+    window_short || freed > blocks / 16
 }
 
 #[cfg(test)]
@@ -151,17 +152,17 @@ mod tests {
 
     #[test]
     fn the_refresh_starts_above_a_sixteenth_given_back_and_not_at_a_thirty_second() {
-        let low = BLOCKS / 32;
-        assert!(refresh_wanted(BLOCKS, BLOCKS / 16 + 1, low, false));
+        assert!(refresh_wanted(BLOCKS, BLOCKS / 16 + 1, false));
         assert!(
-            !refresh_wanted(BLOCKS, BLOCKS / 16, low, false),
+            !refresh_wanted(BLOCKS, BLOCKS / 16, false),
             "exactly a sixteenth"
         );
-        assert!(!refresh_wanted(BLOCKS, BLOCKS / 32, low, false));
-        // Plenty of free bits in the window: the free count is not low, no walk helps.
-        assert!(!refresh_wanted(BLOCKS, BLOCKS / 8, BLOCKS / 2, false));
+        assert!(!refresh_wanted(BLOCKS, BLOCKS / 32, false));
+        // A lot given back refreshes the count whatever the window holds: a volume with most of its
+        // blocks free still tells too little after a large removal.
+        assert!(refresh_wanted(BLOCKS, BLOCKS / 4, false));
         // A window cut short is walked again whatever was given back.
-        assert!(refresh_wanted(BLOCKS, 0, BLOCKS / 2, true));
+        assert!(refresh_wanted(BLOCKS, 0, true));
     }
 
     /// Removals of `each` blocks one after another with a quiet time after each: the walks the rule
@@ -170,7 +171,7 @@ mod tests {
         let (mut freed, mut walks) = (0, 0);
         for _ in 0..removals {
             freed += each;
-            if refresh_wanted(BLOCKS, freed, BLOCKS / 32, false) {
+            if refresh_wanted(BLOCKS, freed, false) {
                 walks += 1;
                 freed = 0;
             }

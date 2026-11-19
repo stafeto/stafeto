@@ -539,8 +539,21 @@ fn fill_on(built: &Built, cpus: usize) -> Result<Filled, String> {
         "data-probe fill ({cpus} CPUs): the disk of 2 GiB with a data partition of 1,023 MiB made in {} s",
         started.elapsed().as_secs()
     );
-    // The first boot converts the volume and walks it in the quiet: the sleep outlasts the mount
-    // work and a walk of a volume this full at the slowest device the bounds allow.
+    // The first boot converts the volume (the mount work holds READY for the conversion, and the
+    // walk it needs fills the window then: the line says the first walk was `made at mount`, a walk
+    // with no rate). The second boot finds nothing to convert and walks in the quiet, after READY:
+    // its line has the reads and the time, which give the device rate.
+    let convert = image("boot-data-probe-convert.img", None, "settle", 0, 5)?;
+    let converted = run_to_end(
+        built,
+        machine(built, &convert, &disk.0, false),
+        "converting boot",
+    )?;
+    need_ready(&converted, "converting boot")?;
+    report(
+        &converted,
+        &format!("{cpus} CPUs, the boot that converts the volume"),
+    );
     let settle = image(
         "boot-data-probe-settle.img",
         None,
@@ -548,15 +561,11 @@ fn fill_on(built: &Built, cpus: usize) -> Result<Filled, String> {
         0,
         SETTLE_WAIT_S,
     )?;
-    let settled = run_to_end(
-        built,
-        machine(built, &settle, &disk.0, false),
-        "converting boot",
-    )?;
-    need_ready(&settled, "converting boot")?;
+    let settled = run_to_end(built, machine(built, &settle, &disk.0, false), "quiet boot")?;
+    need_ready(&settled, "quiet boot")?;
     report(
         &settled,
-        &format!("{cpus} CPUs, the boot that converts the volume"),
+        &format!("{cpus} CPUs, the boot that walks in the quiet"),
     );
     let measure = image("boot-data-probe-fill.img", None, "fill", 0, 0)?;
     let measured = run_to_end(
@@ -668,6 +677,18 @@ fn fill_checks(settled: &[String], measured: &[String], cpus: usize) -> Result<C
     }
     lines.push(format!(
         "the volume has {pairs} pairs of {PAIRS_CAP} and {dirs} directories of {DIRS_CAP}: ok"
+    ));
+    // The first call after the mount comes before the walk in the quiet starts and walks the volume
+    // itself: it takes the time of the first walk (the same reads) with a margin of 1.5 and a second.
+    let first_call = number("data-probe: fill first call ")?;
+    let bound = ms * 1000 * MARGIN_NUM / MARGIN_DEN + 1_000_000;
+    if first_call > bound {
+        return Err(format!(
+            "the first call took {first_call} us, over {bound} us (the first walk took {ms} ms, margin 1.5 and 1 s)"
+        ));
+    }
+    lines.push(format!(
+        "first call {first_call} us <= {bound} us (a first walk of {ms} ms, margin 1.5): ok"
     ));
     let rmdir = number("data-probe: fill rmdir ")?;
     let rmdir_reads = pairs * 32 / 10;
@@ -834,7 +855,7 @@ mod tests {
             "datafs: ready after 900 ms, 700 reads",
         ]);
         let mut measured = lines(&[
-            "data-probe: fill first call 90 us, 261888 blocks, 60000 free",
+            "data-probe: fill first call 15000000 us, 261888 blocks, 60000 free",
             "data-probe: fill readdir 1002 entries in 3 calls, total 30000 us, longest 20000 us",
             "data-probe: fill rmdir 150000 us",
             "data-probe: fill rm -rf 199 directories 15000000 us",
@@ -862,6 +883,9 @@ mod tests {
             let measured: Vec<String> = measured.iter().map(|l| l.replace(from, to)).collect();
             super::fill_checks(&settled, &measured, cpus)
         };
+        // The first call over 1.5 times the first walk (15 s) and a second.
+        assert!(slow("first call 15000000 us", "first call 23500000 us", 2).is_ok());
+        assert!(slow("first call 15000000 us", "first call 23500001 us", 2).is_err());
         // RMDIR over 1.5 times 3.2 x 400 pairs = 1,280 reads at 10,000 a second (192 ms).
         assert!(slow("rmdir 150000 us", "rmdir 192001 us", 2).is_err());
         assert!(slow("rmdir 150000 us", "rmdir 192000 us", 2).is_ok());
