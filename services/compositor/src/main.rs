@@ -1128,8 +1128,8 @@ impl Compositor {
                 }
             }
             Fire::Continue => {
-                #[cfg(feature = "steps")]
-                px::cost::mark_expiry();
+                #[cfg(feature = "irq-trace")]
+                px::cost::trace::mark_expiry();
                 let _ = sys::notify(&self.notify, BAND);
             }
             Fire::Idle | Fire::Early => {}
@@ -1160,8 +1160,8 @@ impl Compositor {
             damage,
             at: Band { row, col: 0 },
         });
-        #[cfg(feature = "steps")]
-        px::cost::mark_first_of_frame();
+        #[cfg(feature = "irq-trace")]
+        px::cost::trace::mark_first_of_frame();
         let _ = sys::notify(&self.notify, BAND);
         true
     }
@@ -1171,6 +1171,11 @@ impl Compositor {
     /// the step of a band).
     fn band(&mut self) {
         rt::service::step_own();
+        // The bands are put off by the cap until the expiry of the timer says to go on
+        // (which notifies the next band): a notice of a band before that does nothing.
+        if self.pacer.deferred() {
+            return;
+        }
         rt::service::step_detail(STEP_BAND);
         #[cfg(feature = "steps")]
         let band_began = rt::time::now();
@@ -1237,8 +1242,8 @@ impl Compositor {
             // start of the next one, and the timer is armed by a step of its
             // own (ARM), so that the kernel call is not in the longest band.
             frame::Band::Defer(_) => {
-                #[cfg(feature = "steps")]
-                px::cost::mark_before_cap();
+                #[cfg(feature = "irq-trace")]
+                px::cost::trace::mark_before_cap();
                 let _ = sys::notify(&self.notify, ARM);
             }
         }

@@ -1595,6 +1595,17 @@ mod tests {
         assert!(text.contains(
             "8 layers (4 bands): the least band 15400 ticks of which compose 14300 and the operations 11800, 3 past the gate 16328"
         ));
+        // A run without the feature tells no floor, place or histogram line: the report is
+        // the split alone.
+        let plain: Vec<String> =
+            ["service band: 17 layers 8 n 1 outside least 1 greatest 1 total greatest 1 compose 1 ops 1"]
+                .map(str::to_owned)
+                .to_vec();
+        assert!(band_floors(&plain, COMP_TAG).is_empty());
+        assert!(band_places(&plain, COMP_TAG).is_empty());
+        let report = band_report(&plain, COMP_TAG);
+        assert!(report.contains("8 layers (1 bands)"));
+        assert!(!report.contains("floors of the bands") && !report.contains("places of the bands"));
         let more: Vec<String> = [
             "service band place: 17 rest n 5 greatest 14000 past-gate 0",
             "service band place: 17 rest n 9 greatest 15000 past-gate 1",

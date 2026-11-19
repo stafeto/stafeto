@@ -384,10 +384,13 @@ The counters are these. The time of a frame is the time from the start t(k) of t
 period a frame was taken at to the step that sees FRAME_SHOWN; the time to compose is
 from t(k) to the commit; the delay of a taking is from t(k) to the step that takes the
 frame; the time of the device is from the commit to FRAME_SHOWN. `late` counts frames
-shown strictly after t(k+1); `skipped` the starts of a period at which a change waited
-and nothing was taken (damage that had gone, windows held for their intervals);
-`capped` the periods in which the cap put bands off; `wakeups` the firings of the
-frame's timer that did something; `failed` the frames the device failed; `band_max_us`
+shown strictly after t(k+1); `skipped` the periods between the start a change was
+owed and the start its frame is taken at, when the taking comes later: a frame was still in
+work, the cap had put its bands off, or the service got no CPU at the start (a taking that
+finds nothing to take is not a frame and gives its `releases` count back, and the periods it
+passed stay counted); `capped` the periods in which the cap put bands off; `wakeups` every
+expiry of the frame's timer except a `Fire::Early` one, the expiries that find nothing to do
+(`Fire::Idle`) included; `failed` the frames the device failed; `band_max_us`
 is the longest step of a band by the wall. `period_us` is the period, 0 in the free
 run, and `cap_us` is the value of the model: the cap's bands at their gate, at 16 ns a
 tick (the counter of a run under -icount, 62.5 MHz). On HVF and on a board `cap_us`
