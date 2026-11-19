@@ -301,7 +301,7 @@ in ticks, the line and the point in hundredths of a tick, for a copy, a layer
 laid over others and the black; the upper fit of the model over the greatest
 ticks measured on 23 shapes of operations under -icount, with a margin of 15 %:
 the model errs only high), and a band holds the lines of the damage's width that
-15 000 ticks leave after its calls, a fixed term for every band (`BAND_FIXED`,
+14 000 ticks (`BAND_TICKS`, the work of a band by the model: the step around it costs up to about 2 400 ticks more, under the gate of 16 328) leave after its calls, a fixed term for every band (`BAND_FIXED`,
 102 ticks: the work of `compose` around a band, which a narrow band does not hide)
 and a term for each layer after the first (`LAYER`, 260 ticks), down the damage and across it, so that eight windows in one band stay
 under the bound (the shapes measured go up to the width of the screen), and then goes to the driver

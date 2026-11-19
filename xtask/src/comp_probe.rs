@@ -820,9 +820,9 @@ pub fn fit_text(costs: &[ShapeCost]) -> String {
                     .div_ceil(100)
         };
         parts.push(format!(
-            "by the fitted constants: a copy over the whole width is a band of {w} by {rows} and a frame of the whole screen {full} bands (the table gives {}); a damage of the cursor's size a band of {cw} by {ch}, of a line of text {tw} by {th}; eight windows with an alpha a band of {ew} by {er} costing {} ticks by the model (the gate of a band is {BAND_TICKS})",
+            "by the fitted constants: a copy over the whole width is a band of {w} by {rows} and a frame of the whole screen {full} bands (the table gives {}); a damage of the cursor's size a band of {cw} by {ch}, of a line of text {tw} by {th}; eight windows with an alpha a band of {ew} by {er} costing {} ticks by the model (BAND_TICKS, the work of a band by the model, is {BAND_TICKS}; the step around it costs up to about 2 400 ticks more, and the gate of a band is 16 328)",
             compositor::full_screen_bands(),
-            worst(8 * oc + bc + term, 8 * or + br, 8 * op + bp, ew, er)
+            worst(8 * oc + bc + term + compositor::BAND_FIXED, 8 * or + br, 8 * op + bp, ew, er)
         ));
     }
     parts.push(layer_text(costs));
