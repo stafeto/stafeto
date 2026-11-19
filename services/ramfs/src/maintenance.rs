@@ -172,6 +172,13 @@ impl Cursor {
             self.remaining = self.remaining.saturating_sub(1);
         }
     }
+    /// Opens a round over `slots` places at `now`: every place but the last is passed before the
+    /// closing step. The time from which its first step may run is `first` later, so that the
+    /// turn that opens the round (the heartbeat's) takes no step.
+    pub fn open(&mut self, now: u64, first: u64, slots: usize) -> u64 {
+        self.remaining = slots - 1;
+        now.saturating_add(first)
+    }
     /// Whether a step of the audit goes on after it visited `visited` places in use, the last
     /// of them with the result `worked`: not after progress (the same place is tried again in
     /// the next step), not at the end of the round and not past `AUDIT_LIVE_RUN` places.
@@ -745,6 +752,17 @@ mod audit_map_tests {
             map.set(i);
         }
         map
+    }
+
+    #[test]
+    fn a_round_opens_with_its_first_step_due_a_period_later() {
+        let mut cursor = Cursor::default();
+        let due = cursor.open(1_000, 6_000, SLOTS);
+        assert_eq!(due, 7_000);
+        assert_eq!(cursor.remaining, SLOTS - 1);
+        // The opening takes no step: the position is where the last round left it.
+        assert_eq!(cursor.position, 1);
+        assert_eq!(cursor.open(u64::MAX - 1, 6_000, SLOTS), u64::MAX);
     }
 
     #[test]

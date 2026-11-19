@@ -181,6 +181,13 @@ mod own_step {
 /// the 16 to 21 steps that a shorter run of empty places would make, each with the fixed part.
 /// A shorter step and a longer gap between steps both measured worse under load.
 const AUDIT_STEP_NS: u64 = 1_000_000;
+/// The time from the opening of a round to its first step: the period of the service's budget
+/// (`SERVICE_PERIOD_NS` in the table of init, 5 ms; this crate does not see that constant) and
+/// 1 ms more. A round opens in the turn after the answer of init to the heartbeat, and the work
+/// of the heartbeat's chain (about 120 us) and the first step (about 125 us) together came to
+/// nearly the whole 250 us capacity of one period and overran it. A period later the pieces
+/// the chain spent are replenished, and the step finds a full budget.
+const AUDIT_FIRST_NS: u64 = 6_000_000;
 /// The share of its time that the service gives to the maintenance of locks
 /// (the sweep of the table and the evaluation of waits): at most a quarter of
 /// every window. Beyond it the service sleeps to the end of the window and
@@ -4101,7 +4108,11 @@ impl Fs {
         }
         if now >= self.next_audit_ns && self.maintenance.remaining == 0 {
             self.next_audit_ns = now.saturating_add(250_000_000);
-            self.maintenance.remaining = SESSIONS + BIRTHS - 1;
+            // The first step waits for its timer, a period after the heartbeat's work.
+            self.audit_ready_ns = self
+                .maintenance
+                .open(now, AUDIT_FIRST_NS, SESSIONS + BIRTHS);
+            self.audit_armed = false;
             #[cfg(feature = "audit-readout")]
             {
                 self.audit_span.open(now);
