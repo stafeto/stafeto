@@ -466,16 +466,28 @@ impl Env<'_> {
         small: &[Handle<Memory>; SMALL_OBJECTS],
         phase: Phase,
     ) -> Result<(), Fail> {
+        // The service lets one context (one session of the display) have four
+        // windows, so the eight stand in two contexts of four.
+        let second = self.display()?;
         let mut sessions: [Option<Handle<Channel>>; paint::O_WINDOWS] = [const { None }; 8];
         for (i, slot) in sessions.iter_mut().enumerate() {
-            *slot = Some(self.window_over(
-                display,
+            let context = if i < paint::O_WINDOWS / 2 {
+                display
+            } else {
+                &second
+            };
+            let made = self.window_over(
+                context,
                 paint::O_RECT,
                 FORMAT_ARGB8888,
                 SMALL_STRIDE,
                 &small[2 * i..2 * i + 2],
                 false,
-            )?);
+            );
+            if made.is_err() {
+                rt::println!("frame-load: window {i} of the overload was refused");
+            }
+            *slot = Some(made?);
         }
         let whole = paint::Rect {
             x: 0,

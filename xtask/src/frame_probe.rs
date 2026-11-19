@@ -179,6 +179,10 @@ pub enum Row {
     D,
     /// The whole screen of this many bands with no load.
     F(u64),
+    /// The whole screen of this many bands under all the loads: the sources of
+    /// the image all stand above the service, and the disk and the requests of
+    /// the clients are in the frame.
+    FullLoaded(u64),
 }
 
 /// The own work of a frame of a row, in ticks.
@@ -187,6 +191,7 @@ pub fn own(row: Row) -> u64 {
         Row::P => (P_BANDS, true, true),
         Row::D => (0, true, true),
         Row::F(bands) => (bands, false, false),
+        Row::FullLoaded(bands) => (bands, true, true),
     };
     let mut w = TAKING + bands * BAND + 2 * STEP + KERNEL + DRIVER + heartbeat_ticks();
     if disk {
@@ -388,6 +393,18 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                 // The whole screen under every load at once: the service keeps
                 // delivering frames. Skips and lateness are the report's; the
                 // frame of this scene fits a period, so none is required.
+                let per = p.bands.div_ceil(p.frames.max(1));
+                let row = Row::FullLoaded(per);
+                let bound = bound_ticks(row).ok_or_else(|| {
+                    format!("{name}: the bound of the row {row:?} does not settle")
+                })?;
+                if timed && p.compose_max_us > us(bound) {
+                    return fail(format!(
+                        "compose max {} us over the bound {} us of the whole screen of {per} bands under all the loads: the analysis does not cover the frame (a finding for the design)",
+                        p.compose_max_us,
+                        us(bound)
+                    ));
+                }
                 if timed && p.frames < STRESS_FRAMES_MIN {
                     return fail(format!(
                         "{} frames of 240 periods under all the loads ({STRESS_FRAMES_MIN} at least)",
@@ -411,10 +428,12 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                     ));
                 }
                 said.push(format!(
-                    "frame-probe: full-loaded: 240 periods, frames {}, late {}, skipped {}, cpu share {} (floor {})",
+                    "frame-probe: full-loaded: 240 periods, frames {}, late {}, skipped {}, compose max {} ms (bound {} ms, {per} bands under all the loads), cpu share {} (floor {})",
                     p.frames,
                     p.late,
                     p.skipped,
+                    ms(p.compose_max_us),
+                    ms(us(bound)),
                     frac(share),
                     frac(floor)
                 ));
@@ -660,6 +679,9 @@ mod tests {
         assert_eq!(bound_ticks(Row::F(31)), Some(689_300));
         assert_eq!(own(Row::F(33)), 677_337);
         assert_eq!(bound_ticks(Row::F(33)), Some(721_956));
+        // Under all the loads the whole screen has a bound past a period (1 041 667
+        // ticks): the analysis does not promise this frame on time.
+        assert_eq!(bound_ticks(Row::FullLoaded(31)), Some(1_710_647));
     }
 
     /// The counts the heartbeat is made of: three services above the
@@ -969,6 +991,23 @@ mod tests {
             .replace("skipped 0", "skipped 7");
         let said = verdict(&lines, true).unwrap();
         assert!(said.iter().any(|l| l.contains("judged as a load phase")));
+    }
+
+    #[test]
+    fn a_whole_screen_over_its_bound_under_all_the_loads_is_a_finding() {
+        let mut lines = good();
+        let l = lines
+            .iter_mut()
+            .find(|l| l.starts_with("frame-load: phase full-loaded "))
+            .unwrap();
+        // The bound of 40 bands is about 32 400 us.
+        *l = l.replace("compose-max-us 10000", "compose-max-us 33000");
+        let e = verdict(&lines, true).unwrap_err();
+        assert!(
+            e.starts_with("full-loaded: compose max 33000 us over the bound 32"),
+            "{e}"
+        );
+        assert!(e.contains("a finding for the design"));
     }
 
     #[test]
