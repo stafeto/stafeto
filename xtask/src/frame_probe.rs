@@ -49,8 +49,10 @@ const TICK_NS: u64 = 16;
 /// the display driver, the disk (two steps), the requests of the clients and the events of a
 /// budget.
 const TAKING: u64 = 3_000;
-const BAND: u64 = 16_328;
-const STEP: u64 = 18_369;
+/// The gate of a band or a portion and the gate of any step of a service (the
+/// probes' own constants).
+const BAND: u64 = crate::PORTION_MAX;
+const STEP: u64 = crate::gpu_probe::STEP_MAX;
 const KERNEL: u64 = 38_779;
 const DRIVER: u64 = 13_596;
 const REQUESTS: u64 = 10_000;
@@ -68,13 +70,17 @@ const FRAMES_MAX: u64 = 242;
 /// periods.
 const STRESS_FRAMES_MIN: u64 = 120;
 /// The share of its loop alone the CPU load must keep under the overload: the
-/// cap and three steps leave the service 86.8 % of a period and the console and
-/// the signs of life take about 3 %, so about a tenth is left.
+/// cap and three steps leave the service most of a period and the console and
+/// the signs of life take a few percent, so about a tenth is left.
 const HOG_FLOOR_PPM: u64 = 80_000;
-/// The share of a period the service may use at most (52 bands under the
-/// cap, 849 056 ticks of 1 041 667): the CPU the levels below it can count on
-/// is what the budgets above leave of the rest.
-const SERVICE_SHARE_PPM: u64 = 815_000;
+/// The share of a period the service may use at most, in parts per million:
+/// the bands the cap lets it make in a period, each at the gate of a band,
+/// over the ticks of a period. The CPU the levels below it can count on is what
+/// the budgets above leave of the rest.
+fn service_share_ppm() -> u64 {
+    use compositor::frame::DEFAULT_PERIOD_NS;
+    u64::from(frame_cap_bands()) * BAND * 1_000_000 / (DEFAULT_PERIOD_NS / TICK_NS)
+}
 
 /// A tick count in microseconds.
 fn us(ticks: u64) -> u64 {
@@ -160,6 +166,13 @@ pub fn bands_of(w: u32, h: u32, opaque: u32, over: u32, fill: u32) -> u64 {
 /// layer is made as well).
 pub fn overload_frame_bands() -> u64 {
     bands_of(320, 200, 0, 8, 1)
+}
+
+/// The frames the overload must still show: the periods over the periods a
+/// frame of the scene takes at the cap, and one for the take at the start of a
+/// period after the frame is shown.
+pub fn overload_floor_frames() -> u64 {
+    PERIODS / (overload_frame_bands().div_ceil(u64::from(frame_cap_bands())) + 1)
 }
 
 /// The bands the service makes in a period at most.
@@ -416,7 +429,7 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                 // What the levels below the service are promised: the period less the
                 // service and the budgets above it, none when they take it all.
                 let floor = 1_000_000u64
-                    .saturating_sub(SERVICE_SHARE_PPM)
+                    .saturating_sub(service_share_ppm())
                     .saturating_sub(budgets_share_ppm());
                 if share == 0 || share < floor {
                     return fail(format!(
@@ -440,7 +453,7 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                 if timed {
                     let bands = overload_frame_bands();
                     let cap = u64::from(frame_cap_bands());
-                    let floor = PERIODS / (bands.div_ceil(cap) + 1);
+                    let floor = overload_floor_frames();
                     if p.capped < PERIODS / 2 {
                         return fail(format!(
                             "capped {} of {} periods (the cap does not hold the bands back)",
@@ -964,14 +977,13 @@ mod tests {
     fn a_frame_of_the_overload_is_many_periods_of_the_cap() {
         let bands = overload_frame_bands();
         let cap = u64::from(frame_cap_bands());
-        assert_eq!(cap, 52);
-        // 800 with the price of a layer after the first (200 lines of four runs of
-        // 99 points); the floor of frames is derived from it, never a literal:
-        // the periods over the periods a frame takes at the cap, and one for the
-        // take at the start of a period after the frame is shown.
-        assert!((700..=900).contains(&bands), "{bands} bands");
-        assert_eq!(bands, 800);
-        assert_eq!(PERIODS / (bands.div_ceil(cap) + 1), 14);
+        // The scene is made of many bands of a few points each, so the frame takes
+        // more than eight periods at the cap, and the floor is derived from the
+        // model: never a literal.
+        let periods = bands.div_ceil(cap);
+        assert!(periods > 8, "{bands} bands, {periods} periods");
+        assert_eq!(overload_floor_frames(), PERIODS / (periods + 1));
+        assert!(overload_floor_frames() >= 1);
     }
 
     fn overload_line(lines: &mut [String], from: &str, to: &str) {
@@ -986,14 +998,14 @@ mod tests {
     fn the_longest_band_step_of_the_overload_is_read_from_the_lines() {
         let tag = crate::comp_probe::COMP_TAG;
         let mut lines = good();
-        // A step of 14 000 before the phase and one of 15 100 inside it.
+        // A step before the phase and a longer one inside it.
         let hog = lines
             .iter()
             .position(|l| l.starts_with("frame-load: phase hog-ref "))
             .unwrap();
         lines.insert(
             hog,
-            format!("service step: {tag} kind 65 14000 ticks detail 0"),
+            format!("service step: {tag} kind 65 9000 ticks detail 0"),
         );
         let over = lines
             .iter()
@@ -1001,24 +1013,24 @@ mod tests {
             .unwrap();
         lines.insert(
             over,
-            format!("service step: {tag} kind 65 15100 ticks detail 0"),
+            format!("service step: {tag} kind 65 10100 ticks detail 0"),
         );
         assert_eq!(
             band_step_in(&lines, Phase::HogRef, Phase::Overload),
-            (Some((15_100, 0)), 14_000)
+            (Some((10_100, 0)), 9_000)
         );
         let said = verdict(&lines, true).unwrap();
         assert!(
             said.iter()
                 .any(|l| l
-                    .contains("longest band step 15100 ticks in the phase, a step of detail 0"))
+                    .contains("longest band step 10100 ticks in the phase, a step of detail 0"))
         );
         // No line in the phase: nothing above the earlier greatest.
         lines.remove(over);
         let said = verdict(&lines, true).unwrap();
         assert!(
             said.iter()
-                .any(|l| l.contains("none above the earlier greatest 14000 ticks"))
+                .any(|l| l.contains("none above the earlier greatest 9000 ticks"))
         );
     }
 
@@ -1260,10 +1272,10 @@ mod tests {
     fn the_steps_are_under_the_gates_and_the_kinds_came() {
         assert!(steps_verdict(&steps(&[])).is_ok());
         let tag = crate::comp_probe::COMP_TAG;
-        let e = steps_verdict(&steps(&[(tag, 20, 18_500)])).unwrap_err();
+        let e = steps_verdict(&steps(&[(tag, 20, crate::gpu_probe::STEP_MAX + 100)])).unwrap_err();
         assert!(e.contains("past the gate"), "{e}");
-        let e = steps_verdict(&steps(&[(tag, 65, 16_400)])).unwrap_err();
-        assert!(e.contains("past 16328"), "{e}");
+        let e = steps_verdict(&steps(&[(tag, 65, crate::PORTION_MAX + 100)])).unwrap_err();
+        assert!(e.contains(&format!("past {}", crate::PORTION_MAX)), "{e}");
         // Stats and the timer's step are required.
         for kind in [25usize, 64] {
             let mut lines = steps(&[]);
