@@ -102,9 +102,8 @@ them for the licence notes of the image.
   licence text is `COPYING` of the archive, and its notice directory
   `/usr/share/licenses/pixman/` carries it with the note of the source.
 - FreeType (`packages/freetype.toml`, FTL, 2.14.3) is an optional package of the
-  image kind `games` that installs no file: the package `lvgl` of the graphics
-  stage G4 links it and names it in `build_depends`, and until that package
-  exists `xtask/src/packages.rs` lists it in `SERVICE_LIBRARIES`.
+  image kind `games` that installs no file: the package `lvgl` links it and
+  names it in `build_depends`, so the notices of `lvgl` carry its licence.
   `tools/build-freetype.py` fetches the pinned archive (a copy is kept in
   `target/freetype-src/`), checks its SHA-256 and builds
   `target/freetype/libfreetype.a` from eleven files of the source (the TrueType
@@ -206,7 +205,11 @@ them for the licence notes of the image.
   the glyph path (the hinted outline and the bitmap of `a g W 0` at 16 pixels,
   the multiple-masters flag, the kerning of `AV`, the interpreter version).
   `python3 -I tools/test_lvgl_port.py` tests the CRC, the key table and the
-  schedule, shows two planted faults failing, and runs the reference twice.
+  schedule, shows planted faults failing, and runs the reference with every way
+  of feeding the events against the pinned CRCs, turns, frames, pool use and
+  evidence lines. The reference opens the font under a relative path as long as
+  the guest's (LVGL keeps the path in its pool), so the pool's largest use is
+  the same on both. `docs/lvgl.md` tells the whole of it, with the probe.
 - F-Stack (`packages/f-stack.toml`, the TCP/IP stack of FreeBSD 15 in user
   space, BSD-2-Clause and BSD-3-Clause with files under BSD-4-Clause,
   RSA-MD, Beerware, MIT-CMU, ISC and MIT) is an optional package of the image kind `fstack` that installs only its
