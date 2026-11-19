@@ -21,6 +21,8 @@ use std::time::Instant;
 
 /// The image of the games.
 const IMAGE: &str = "boot-doom.img";
+/// The image of the measures: the games image with the free run and the counted steps.
+const STEPS_IMAGE: &str = "boot-doom-steps.img";
 /// The WAD's name in the image and the licence files it carries.
 const WAD: &str = "freedoom1.wad";
 /// Doomgeneric's and Freedoom's licences and the notes of their sources in
@@ -41,23 +43,28 @@ const REPORT: &str = "timed ";
 /// the method CRASH, which only the images of the probes have.
 pub fn programs() -> &'static [ImageProgram] {
     static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| image_programs(&[]))
+    LIST.get_or_init(|| image_programs(&[], &["table-doom"]))
 }
 
 /// The programs of the image of the measures (`boot-doom-steps.img`): the
-/// games image whose services of the screen and the keys count their steps.
+/// games image whose services of the screen and the keys count their steps, and
+/// whose compositor runs free (the table `table-doom-free`: no frame clock, so
+/// that the frames a second stay comparable with the series).
 pub fn steps_programs() -> &'static [ImageProgram] {
     static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| image_programs(&["steps"]))
+    LIST.get_or_init(|| image_programs(&["steps"], &["table-doom-free"]))
 }
 
 /// The programs of the games image, the services of the screen and the keys
 /// built with `features` besides (the image of the measures counts their
-/// steps).
-fn image_programs(features: &'static [&'static str]) -> Vec<ImageProgram> {
+/// steps), init with the table features `table`.
+fn image_programs(
+    features: &'static [&'static str],
+    table: &'static [&'static str],
+) -> Vec<ImageProgram> {
     let packages = packages::of_image(IMAGE).unwrap_or_else(|e| panic!("the games image: {e}"));
     let mut programs = SHELL_SERVICES.to_vec();
-    programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-doom"]);
+    programs[0] = ("init", "init", INIT_STACK_SIZE, table);
     for program in packages.iter().filter_map(|p| p.program.as_deref()) {
         let entry = PACKAGE_PROGRAMS
             .iter()
@@ -740,7 +747,7 @@ fn frames_per_second(tics: u64, real: u64) -> f64 {
 pub fn doom_measure(machine: &'static qemu::Machine) -> Result<(), String> {
     build_games()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image(IMAGE, programs(), BOOT_PROFILE)?;
+    let image = build_boot_image(STEPS_IMAGE, steps_programs(), BOOT_PROFILE)?;
     let scratch = Scratch::new()?;
     let cmd = probe_command(machine, &kernel.image, &image, &scratch);
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
@@ -822,7 +829,7 @@ fn drive_slowly(run: &mut qemu::Run, scratch: &Scratch) -> Result<(), String> {
 fn steps(machine: &'static qemu::Machine) -> Result<(), String> {
     let kernel = build(Variant::Normal)?;
     let programs = steps_programs();
-    let image = build_boot_image("boot-doom-steps.img", programs, BOOT_PROFILE)?;
+    let image = build_boot_image(STEPS_IMAGE, programs, BOOT_PROFILE)?;
     let scratch = Scratch::new()?;
     let mut cmd = probe_command(machine, &kernel.image, &image, &scratch);
     cmd.args(qemu::ICOUNT);
@@ -901,6 +908,9 @@ mod tests {
     fn the_games_image_runs_doom_on_the_table_of_its_quota() {
         let doom = programs().iter().find(|p| p.0 == "init").unwrap();
         assert_eq!(doom.3, &["table-doom"]);
+        // The image of the measures has the free run and the counted steps.
+        let measure = steps_programs().iter().find(|p| p.0 == "init").unwrap();
+        assert_eq!(measure.3, &["table-doom-free"]);
         assert!(
             programs()
                 .iter()
@@ -923,7 +933,7 @@ mod tests {
         // tells the two apart.
         assert!(crate::gpu_probe::PROGRAMS[1].3.contains(&"crash"));
         // The image of the measures counts steps and has no CRASH either.
-        let counting = image_programs(&["steps"]);
+        let counting = image_programs(&["steps"], &["table-doom-free"]);
         let gpu = counting.iter().find(|p| p.0 == "virtio-gpu").unwrap();
         assert_eq!(gpu.3, &["steps"]);
     }

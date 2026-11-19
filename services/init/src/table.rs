@@ -1564,6 +1564,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-busybox") as usize
     + cfg!(feature = "table-busybox-dialog") as usize
     + cfg!(feature = "table-doom") as usize
+    + cfg!(feature = "table-doom-free") as usize
     + cfg!(feature = "table-lvgl") as usize
     + cfg!(feature = "table-base") as usize
     + cfg!(feature = "table-posix-dialog") as usize
@@ -1666,6 +1667,7 @@ const _: () = assert!(
     feature = "table-busybox",
     feature = "table-busybox-dialog",
     feature = "table-doom",
+    feature = "table-doom-free",
     feature = "table-lvgl",
     feature = "table-base",
     feature = "table-posix-dialog",
@@ -1792,6 +1794,8 @@ pub const TABLE: &[Record] = ramfs::BUSYBOX_TABLE;
 pub const TABLE: &[Record] = ramfs::BUSYBOX_DIALOG_TABLE;
 #[cfg(feature = "table-doom")]
 pub const TABLE: &[Record] = doom::TABLE;
+#[cfg(feature = "table-doom-free")]
+pub const TABLE: &[Record] = doom::FREE_TABLE;
 #[cfg(feature = "table-lvgl")]
 pub const TABLE: &[Record] = lvgl::TABLE;
 #[cfg(feature = "table-base")]
@@ -1965,6 +1969,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     ceiling::TABLE,
     test::TABLE,
     doom::TABLE,
+    doom::FREE_TABLE,
     base::BASE_TABLE,
     gpu::TABLE,
     comp::TABLE,
@@ -4073,10 +4078,23 @@ mod tests {
     #[test]
     fn the_games_table_is_the_dialog_with_the_quota_of_doom() {
         assert!(check(doom::TABLE).is_ok());
-        // The compositor of the games image runs free (no frame clock), so
-        // that the frames a second of `doom-measure` stay comparable.
+        // The compositor of the games image runs on the frame clock (the
+        // defaults); the table of the measures has the free run, so that the
+        // frames a second of `doom-measure` stay comparable.
         let compositor = doom::TABLE.iter().find(|r| r.name == "gpu").unwrap();
-        assert_eq!(compositor.args, comp::FREE_RUN);
+        assert!(compositor.args.is_empty());
+        let free = doom::FREE_TABLE.iter().find(|r| r.name == "gpu").unwrap();
+        assert_eq!(free.args, comp::FREE_RUN);
+        assert!(check(doom::FREE_TABLE).is_ok());
+        assert_eq!(doom::FREE_TABLE.len(), doom::TABLE.len());
+        for (a, b) in doom::TABLE.iter().zip(doom::FREE_TABLE) {
+            assert_eq!(a.name, b.name);
+            if a.name != "gpu" {
+                assert_eq!(a.args, b.args);
+                assert_eq!(a.quota, b.quota);
+                assert_eq!(a.connects, b.connects);
+            }
+        }
         let games = order_of(doom::TABLE);
         let at = |name: &str| games.iter().position(|&n| n == name).unwrap();
         assert!(at("input") < at("display"));
