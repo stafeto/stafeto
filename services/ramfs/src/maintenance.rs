@@ -95,6 +95,19 @@ pub const fn parked_turn(
     parked && !(last_was_parked && (lock_work || audit))
 }
 
+/// Whether the turn that the parked pages yield goes straight to the lock work: pages are
+/// parked, the turn is not theirs (`parked_turn`) and lock work waits. The turn does not pass
+/// through the switch between lock work and the rest, which would give the lock work every
+/// fourth turn under pressure from the parking.
+pub const fn parked_yield_to_locks(
+    parked: bool,
+    lock_work: bool,
+    audit: bool,
+    last_was_parked: bool,
+) -> bool {
+    parked && lock_work && !parked_turn(parked, lock_work, audit, last_was_parked)
+}
+
 /// Trying a cancellation proves progress only when it retires a job or
 /// returns a page. A partial data cancellation returns one page per portion.
 pub fn orphan_progress(before: (u16, u16), after: (u16, u16)) -> bool {
@@ -1032,5 +1045,31 @@ mod audit_map_tests {
         }
         // After a turn of the other work the parked pages come again.
         assert!(parked_turn(true, true, true, false));
+    }
+
+    #[test]
+    fn the_turn_the_parking_yields_goes_to_the_lock_work_and_to_nothing_else() {
+        // Parked pages, lock work waiting, the last turn was the parked pages': locks.
+        assert!(parked_yield_to_locks(true, true, false, true));
+        assert!(parked_yield_to_locks(true, true, true, true));
+        // The parking takes its turn: no yield.
+        assert!(!parked_yield_to_locks(true, true, false, false));
+        assert!(!parked_yield_to_locks(true, true, true, false));
+        // The audit alone waits: the usual order decides.
+        assert!(!parked_yield_to_locks(true, false, true, true));
+        // Nothing parked or no lock work: no yield.
+        assert!(!parked_yield_to_locks(false, true, true, true));
+        assert!(!parked_yield_to_locks(true, false, false, true));
+        // Under constant pressure the lock work gets every second turn.
+        let mut last = false;
+        let mut lock_turns = 0;
+        for _ in 0..8 {
+            let parked = parked_turn(true, true, true, last);
+            if parked_yield_to_locks(true, true, true, last) {
+                lock_turns += 1;
+            }
+            last = parked;
+        }
+        assert_eq!(lock_turns, 4);
     }
 }

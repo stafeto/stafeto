@@ -4126,7 +4126,20 @@ impl Fs {
             self.audit_pending(),
             self.parked_turn_last,
         );
+        let yielded = ramfs::maintenance::parked_yield_to_locks(
+            self.ram.storage.parked_backlog() != 0,
+            self.lock_work_pending(),
+            self.audit_pending(),
+            self.parked_turn_last,
+        );
         self.parked_turn_last = parked_turn;
+        if yielded {
+            // The turn the parking yields is the lock work's: it does not pass through the
+            // switch between the lock work and the rest.
+            self.lock_maintenance_turn = true;
+            self.lock_turn(sessions);
+            return;
+        }
         if parked_turn {
             rt::service::step_detail(own_step::PARKED);
             self.ram.storage.release_parked_turn();

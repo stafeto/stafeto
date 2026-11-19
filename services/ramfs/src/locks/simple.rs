@@ -2237,6 +2237,101 @@ mod tests {
         assert_eq!(table.holders.lowered - before, 1);
     }
 
+    // One inode: 40 records of a dead process, 10 of the requester (a description) and 10 of a
+    // live foreign process. The unlock of the whole file, by the pass of its own and by the
+    // general path (the range ends one short of the end of the file), frees the requester's
+    // records and 16 dead ones in the first call, 16 in the second and the last 8 in the third,
+    // and both leave the same lists, revisions, totals, usage and page books after each call.
+    #[test]
+    fn the_unlock_of_the_whole_file_frees_dead_records_in_pieces_by_both_paths() {
+        let dead = Owner::Process(900);
+        let foreign = Owner::Process(901);
+        let requester = Owner::Description {
+            slot: 7,
+            generation: 3,
+        };
+        let mut ram = [
+            crate::Ram::new(proto_fs::Timestamp::ZERO),
+            crate::Ram::new(proto_fs::Timestamp::ZERO),
+        ];
+        let mut table = [fresh(), fresh()];
+        let file: Vec<Token> = ram.iter_mut().map(|ram| inode(ram, b"pieces")).collect();
+        for n in 0..2 {
+            for i in 0..60i64 {
+                let owner = match i % 6 {
+                    0..=3 => dead,
+                    4 => requester,
+                    _ => foreign,
+                };
+                table[n]
+                    .set(
+                        &mut ram[n].storage,
+                        payer(1),
+                        request(file[n], owner, 2 * i, 1, Some(Kind::Write)),
+                        |_| true,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(table[n].count(file[n]), 60);
+        }
+        let owners_in = |table: &SimpleLocks, ram: &crate::Ram<'_>, file: Token, who: Owner| {
+            list_of(table, ram, file)
+                .iter()
+                .filter(|(lock, _)| lock.owner == who)
+                .count()
+        };
+        let unlock = |table: &mut SimpleLocks, ram: &mut crate::Ram<'_>, file: Token, n: usize| {
+            let range = if n == 0 {
+                Range::relative(0, 0, 0).unwrap()
+            } else {
+                Range::relative(0, 0, i64::MAX - 1).unwrap()
+            };
+            table
+                .set(
+                    &mut ram.storage,
+                    payer(1),
+                    Request {
+                        range,
+                        ..request(file, requester, 0, 0, None)
+                    },
+                    |owner| owner != dead,
+                )
+                .unwrap();
+        };
+        // (dead records left, records of the requester left, records of the foreign process)
+        for (dead_left, revision_moves) in [(24, true), (8, true), (0, true), (0, false)] {
+            let before: Vec<u64> = (0..2).map(|n| table[n].revision(file[n])).collect();
+            for n in 0..2 {
+                unlock(&mut table[n], &mut ram[n], file[n], n);
+            }
+            for n in 0..2 {
+                assert_eq!(owners_in(&table[n], &ram[n], file[n], dead), dead_left);
+                assert_eq!(owners_in(&table[n], &ram[n], file[n], requester), 0);
+                assert_eq!(owners_in(&table[n], &ram[n], file[n], foreign), 10);
+                assert_eq!(
+                    table[n].revision(file[n]) != before[n],
+                    revision_moves,
+                    "the revision after the call with {dead_left} dead records left"
+                );
+            }
+            assert_eq!(
+                list_of(&table[0], &ram[0], file[0]),
+                list_of(&table[1], &ram[1], file[1])
+            );
+            assert_eq!(table[0].revision(file[0]), table[1].revision(file[1]));
+            assert_eq!(table[0].total(), table[1].total());
+            assert_eq!(
+                ram[0].storage.usage(payer(1)),
+                ram[1].storage.usage(payer(1))
+            );
+            for n in 0..2 {
+                ram[n].storage.assert_pages_exact(&table[n].live_pages());
+            }
+        }
+        assert_eq!(table[0].count(file[0]), 10);
+        assert_eq!(table[0].total(), 10);
+    }
+
     #[test]
     fn an_unlock_that_leaves_the_last_record_out_leaves_its_page() {
         // The count of the test above follows the range: the range that leaves the last
