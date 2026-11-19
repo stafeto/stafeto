@@ -392,7 +392,7 @@ fn open_volume(disk: Disk) -> Option<Volume> {
     match volume::open(disk, storage, seed) {
         Ok((fs, did, part)) => {
             // No count of the blocks in use here: that is a walk of the whole volume, which the
-            // worker makes after READY, when its queue is empty (`first_walk`).
+            // worker makes after READY, once its queue has been quiet (`idle_walk`).
             let how = match did {
                 Did::Partitioned => "partition table written, data volume formatted",
                 Did::Formatted => "data volume formatted",
@@ -464,7 +464,8 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
     let kicks = Handle::<Channel>::borrowed(abi::Handle(JOBS_CHANNEL.load(Acquire)));
     // The idle work: the first walk after READY, and the walk that finds the blocks removals gave
     // back. A timer on the kick channel wakes the thread when the queue has been empty for
-    // `IDLE_NS`; without one (the kernel refused it) the refresh does not happen.
+    // `datafs::idle::QUIET_NS` (the first walk and the refresh walk alike); without one (the kernel
+    // refused it) the first walk starts at once and the refresh does not happen.
     let timer = sys::timer_create(&kicks, LEVEL).ok();
     let mut idle = Idle {
         first_pending: volume.is_some(),
@@ -531,20 +532,26 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
                 let _ = sys::receive(&kicks);
             }
         }
-        // The queue is empty: the walks of the idle. Requests that came before this point were
-        // served first. A job that comes during a walk stops it at the next read, is served, and
-        // the walk is tried again when the queue is empty (`datafs::idle::MAX_YIELDS` tries; after that it runs
-        // to its end, and a request waits for it).
+        // The queue is empty. A walk (the first after the mount, or the refresh) starts after the
+        // queue has been quiet for `QUIET_NS` from the end of the last job: the requests of a boot
+        // come in bursts, and a walk beside them would only slow them. A job that comes during a
+        // try stops it at the next read and is served; the next try waits for a quiet time again,
+        // and after `datafs::idle::MAX_YIELDS` stopped tries a try runs to its end. A job that
+        // needs the window itself walks inside its request.
         if let Some(fs) = volume.as_mut() {
-            if idle.first_pending {
-                idle_walk(fs, &mut idle, true);
-                continue;
-            }
-            if refresh_wanted(fs, &idle) {
+            let first = idle.first_pending;
+            if first || refresh_wanted(fs, &idle) {
                 let now = rt::time::ticks_to_ns(rt::time::now());
-                let wait = (idle.last_job + IDLE_NS).saturating_sub(now);
+                // No quiet time for the line of a window that is already full (a directory made
+                // at mount filled it): there is no walk to wait for.
+                let wait =
+                    if first && (timer.is_none() || fs.window_state().2 as u64 == fs.blocks()) {
+                        0
+                    } else {
+                        datafs::idle::quiet_wait(now, idle.last_job)
+                    };
                 if wait == 0 {
-                    idle_walk(fs, &mut idle, false);
+                    idle_walk(fs, &mut idle, first);
                     continue;
                 }
                 if let Some(timer) = &timer {
@@ -555,10 +562,6 @@ fn serve(mut volume: Option<Volume>, wake: &Handle<Channel>) -> ! {
         let _ = sys::receive(&kicks);
     }
 }
-
-/// How long the queue stays empty before the worker walks the volume to count the blocks that
-/// removals gave back.
-const IDLE_NS: u64 = 2_000_000_000;
 
 /// What the worker keeps for its idle walks.
 struct Idle {
