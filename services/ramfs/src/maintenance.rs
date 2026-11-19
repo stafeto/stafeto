@@ -88,10 +88,10 @@ pub fn orphan_progress(before: (u16, u16), after: (u16, u16)) -> bool {
     after.0 < before.0 || after.1 > before.1
 }
 
-/// The slots with no session and no birth that one step of the audit passes: a step is at most
-/// a quarter of the capacity of the service's budget (250 us, of which a step takes about
-/// 3 900 ticks under -icount at 40 slots).
-pub const AUDIT_EMPTY_RUN: usize = 40;
+/// The slots with no session and no birth that one step of the audit passes. Passing an empty
+/// slot costs 10 to 15 ticks and the rest of a step about 7 000, so a longer run saves steps
+/// (and their fixed part) at a small price.
+pub const AUDIT_EMPTY_RUN: usize = 160;
 
 pub struct Cursor {
     pub position: usize,
@@ -670,7 +670,7 @@ mod departure_tests {
             &[639],
             &[1, 2, 3, 4, 5],
             &[10, 100, 200, 320, 321, 500, 639],
-            &[40, 41, 81, 82, 122, 163, 204, 245],
+            &[160, 161, 321, 322, 482, 483],
         ];
         for occupied in layouts {
             let (steps, longest) = round(640, occupied);
@@ -681,7 +681,7 @@ mod departure_tests {
                 "{occupied:?}: {longest} slots in a step"
             );
         }
-        // An idle table takes ceil(639 / 41) = 16 steps.
-        assert_eq!(round(640, &[]).0, 16);
+        // An idle table takes ceil(639 / 161) = 4 steps.
+        assert_eq!(round(640, &[]).0, 4);
     }
 }

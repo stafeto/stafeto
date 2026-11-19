@@ -171,19 +171,17 @@ mod own_step {
     }
 }
 
-/// The time between two steps of the audit: one step a period of the service's budget
-/// (`SERVICE_PERIOD_NS` in the table of init, 5 ms; this crate does not see that constant). The
-/// audit runs on a timer between its steps, so that the clients below the service keep their
-/// time while it goes round, and so that no period of the budget holds more than one step: the
-/// steps of a round 1 ms apart put four to six of them, with the heartbeat, into one period and
-/// spent about 2.7 times the capacity there.
+/// The time between two steps of the audit. The audit runs on a timer between its steps, so
+/// that the clients below the service keep their time while it goes round: a turn after turn of
+/// the whole round held them back for as long as it took.
 ///
-/// A round over the 640 slots takes `ceil(639 / 41)` = 16 steps and one more for each slot in
-/// use, so 80 ms with no session and 5 ms a session more; a round may take longer than the 250
-/// ms between two openings, and then rounds follow one another. The audit only collects what
-/// the separate turns of a departure missed (a cell whose client went away), so a slower round
-/// delays that collection by a few tens of milliseconds, and nothing a client waits for.
-const AUDIT_STEP_NS: u64 = 5_000_000;
+/// A step costs a fixed part of about 7 000 ticks under -icount (the notification, the pump of
+/// the layers, the turn of the jobs, the cleanup of the one place the skip stopped at, and the
+/// count of the step tables) and 10 to 15 ticks for each empty place it passes. The fixed part
+/// dominates, so a round of about 7 steps in two periods of the service's budget is cheaper than
+/// the 16 to 21 steps that a shorter run of empty places would make, each with the fixed part.
+/// A shorter step and a longer gap between steps both measured worse under load.
+const AUDIT_STEP_NS: u64 = 1_000_000;
 /// The share of its time that the service gives to the maintenance of locks
 /// (the sweep of the table and the evaluation of waits): at most a quarter of
 /// every window. Beyond it the service sleeps to the end of the window and
@@ -561,7 +559,9 @@ mod kept_budget {
     }
 }
 
-/// What the line that closes a round of the audit tells: the state at its opening.
+/// What the line that closes a round of the audit tells: the state at its opening, the state at
+/// the close of the round before it (for the gap between the two), and the longest parts of the
+/// steps of the round.
 #[cfg(feature = "steps")]
 #[derive(Default)]
 struct AuditSpan {
@@ -569,30 +569,80 @@ struct AuditSpan {
     ran_ticks: u64,
     overruns: u64,
     steps: u32,
+    /// The close of the round before: the time, the budget's `ran` and `overruns`.
+    closed_ns: u64,
+    closed_ran_ticks: u64,
+    closed_overruns: u64,
+    /// The gap from that close to this opening: the span, and the budget's `ran` (ticks) and
+    /// `overruns` over it.
+    gap_ns: u64,
+    gap_ran_ticks: u64,
+    gap_overruns: u64,
+    /// The longest turn of `reclaim_step`, the longest skip over empty places and the longest
+    /// `cleanup_step` of the place the skip stopped at, in ticks of the thread's CPU time (the
+    /// time the step tables count in).
+    reclaim_max: u64,
+    skip_max: u64,
+    cleanup_max: u64,
 }
 
 #[cfg(feature = "steps")]
 impl AuditSpan {
-    fn open(now: u64) -> Self {
+    fn open(&mut self, now: u64) {
         let (ran_ticks, overruns) = kept_budget::counters();
-        Self {
+        *self = Self {
             began_ns: now,
             ran_ticks,
             overruns,
-            steps: 0,
-        }
+            gap_ns: now.saturating_sub(self.closed_ns),
+            gap_ran_ticks: ran_ticks.saturating_sub(self.closed_ran_ticks),
+            gap_overruns: overruns.saturating_sub(self.closed_overruns),
+            closed_ns: self.closed_ns,
+            closed_ran_ticks: self.closed_ran_ticks,
+            closed_overruns: self.closed_overruns,
+            ..Self::default()
+        };
     }
 
-    fn close(&self, round: u32, now: u64) {
+    fn close(&mut self, round: u32, now: u64) {
         let (ran_ticks, overruns) = kept_budget::counters();
         rt::println!(
-            "ramfs: audit round {round} steps {} span_us {} ran_us {} overruns {}",
+            "ramfs: audit round {round} steps {} span_us {} ran_us {} overruns {} gap_us {} gap_ran_us {} gap_overruns {} reclaim_max {} skip_max {} cleanup_max {}",
             self.steps,
             now.saturating_sub(self.began_ns) / 1000,
             rt::time::ticks_to_ns(ran_ticks.saturating_sub(self.ran_ticks)) / 1000,
-            overruns.saturating_sub(self.overruns)
+            overruns.saturating_sub(self.overruns),
+            self.gap_ns / 1000,
+            rt::time::ticks_to_ns(self.gap_ran_ticks) / 1000,
+            self.gap_overruns,
+            self.reclaim_max,
+            self.skip_max,
+            self.cleanup_max,
         );
+        self.closed_ns = now;
+        self.closed_ran_ticks = ran_ticks;
+        self.closed_overruns = overruns;
     }
+}
+
+/// The CPU time of the loop's thread in ticks, the time the step tables count in (neither the
+/// waits nor the levels above that ran in the middle belong to it).
+#[cfg(feature = "steps")]
+fn cpu_ticks() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static THREAD: AtomicU64 = AtomicU64::new(0);
+    let mut raw = THREAD.load(Ordering::Relaxed);
+    if raw == 0 {
+        match rt::sys::self_thread() {
+            Ok(own) => {
+                raw = own.into_raw().0;
+                THREAD.store(raw, Ordering::Relaxed);
+            }
+            Err(_) => return 0,
+        }
+    }
+    let thread = rt::Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(raw));
+    rt::sys::thread_ran_preempts(&thread).map_or(0, |(ran, _)| ran)
 }
 
 #[cfg(feature = "profile")]
@@ -4073,7 +4123,7 @@ impl Fs {
             self.maintenance.remaining = SESSIONS + BIRTHS - 1;
             #[cfg(feature = "steps")]
             {
-                self.audit_span = AuditSpan::open(now);
+                self.audit_span.open(now);
             }
         }
         let mut work = false;
@@ -4098,7 +4148,14 @@ impl Fs {
                 let retained = false;
                 if !retained {
                     rt::service::step_detail(own_step::RECLAIM);
+                    #[cfg(feature = "steps")]
+                    let began = cpu_ticks();
                     work = self.ram.storage.reclaim_step();
+                    #[cfg(feature = "steps")]
+                    {
+                        let took = cpu_ticks().saturating_sub(began);
+                        self.audit_span.reclaim_max = self.audit_span.reclaim_max.max(took);
+                    }
                 }
             }
             // A turn of jobs that found no work and has no orphan to wait
@@ -4179,14 +4236,23 @@ impl Fs {
         // The slots with no session and no birth pass in this step.
         let departures = &self.departures;
         let births = &*self.births;
+        #[cfg(feature = "steps")]
+        let began = cpu_ticks();
         self.maintenance
             .skip_empty(SESSIONS + BIRTHS, AUDIT_EMPTY_RUN, |i| {
                 Self::slot_empty(departures, births, sessions, i)
             });
+        #[cfg(feature = "steps")]
+        {
+            let took = cpu_ticks().saturating_sub(began);
+            self.audit_span.skip_max = self.audit_span.skip_max.max(took);
+        }
         self.audit_ready_ns = now.saturating_add(AUDIT_STEP_NS);
         rt::service::step_detail(own_step::AUDIT);
         let mut client_work = false;
         let i = self.maintenance.position;
+        #[cfg(feature = "steps")]
+        let began = cpu_ticks();
         if self.departures.contains(i) {
             // Queued cells receive separate fair bounded cleanup turns.
         } else if i < SESSIONS {
@@ -4197,6 +4263,11 @@ impl Fs {
         } else if let Some((label, mut fds)) = self.births[i - SESSIONS].take() {
             client_work = self.cleanup_step(&mut fds, label);
             self.births[i - SESSIONS] = Some((label, fds));
+        }
+        #[cfg(feature = "steps")]
+        {
+            let took = cpu_ticks().saturating_sub(began);
+            self.audit_span.cleanup_max = self.audit_span.cleanup_max.max(took);
         }
         work |= client_work;
         let round_open = self.maintenance.remaining != 0;

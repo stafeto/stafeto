@@ -819,6 +819,8 @@ const POSIX_FIFO_PROGRAMS: [ImageProgram; 10] = {
 };
 const POSIX_FIFO_STEPS_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_FIFO_PROGRAMS;
+    // `fifo-steps` makes the probe wait idle for three seconds after its last check.
+    programs[5].3 = &["fifo-probe", "fifo-steps"];
     programs[1].3 = &["steps"];
     programs[2].3 = &["steps"];
     programs
@@ -6468,6 +6470,7 @@ fn posix_fifo_run(steps: bool) -> Result<(), String> {
         qemu::expect_marker(&outcome, marker)?;
     }
     if steps {
+        qemu::expect_marker(&outcome, "posix-fifo: idle tail done")?;
         const FIFO_STEP_MAX: u64 = RAM_STEP_MAX * 9 / 10;
         check_waits(&outcome.lines, &["2", "4"], "FIFO service steps")?;
         let own = longest_steps(&outcome.lines, "2")

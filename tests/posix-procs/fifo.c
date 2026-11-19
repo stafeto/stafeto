@@ -583,5 +583,11 @@ int main(int argc, char **argv) {
     custody();
     memory("complete");
     printf("posix-fifo: done failures %d\n", failures);
+#if FIFO_STEPS
+    /* The idle tail of the steps image: the services idle for three seconds, and the audit of
+       the RAM file service goes round with no client work, for its readout. */
+    sleep(3);
+    puts("posix-fifo: idle tail done");
+#endif
     return failures != 0;
 }
