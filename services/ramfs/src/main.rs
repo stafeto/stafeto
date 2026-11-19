@@ -410,13 +410,14 @@ fn main(_: u64) -> u64 {
     // The loop is this thread: it works under its budget from here on, and a budget the kernel
     // refuses is a start error, since the thread would run without a limit.
     match rt::budget::bind("ramfs", "serve", serve, &start.thread) {
-        // The handle stays, for the counters the profile prints (`calls`).
+        // The handle stays, for the counters the profile prints (`calls`) and the span of an
+        // audit round that the steps line tells.
         Ok(budget) => {
-            #[cfg(feature = "profile")]
+            #[cfg(any(feature = "profile", feature = "steps"))]
             if let Some(budget) = budget {
-                calls::keep_budget(budget);
+                kept_budget::keep(budget);
             }
-            #[cfg(not(feature = "profile"))]
+            #[cfg(not(any(feature = "profile", feature = "steps")))]
             drop(budget);
         }
         Err(_) => return 10,
@@ -443,6 +444,8 @@ fn main(_: u64) -> u64 {
         audit_ready_ns: 0,
         audit_armed: false,
         audit_rounds: 0,
+        #[cfg(feature = "steps")]
+        audit_span: AuditSpan::default(),
         lock_share: ramfs::maintenance::Share::new(LOCK_WINDOW_NS, LOCK_BUDGET_NS),
         lock_paused: false,
         lock_sweep: SweepCursor::default(),
@@ -519,6 +522,72 @@ fn main(_: u64) -> u64 {
 /// The calls the service answered (feature `profile`): every request, the reads among them
 /// (READ, READ_AT, READ_FD_INTO, READ_AT_FD_INTO) and SNAPSHOT_FD. A record goes to the console at
 /// most every 100 ms and only when a counter changed, so an idle service prints nothing.
+/// The handle of the request thread's budget, kept for the records of the profile and of the
+/// steps image.
+#[cfg(any(feature = "profile", feature = "steps"))]
+mod kept_budget {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// The value of the handle, 0 for none.
+    static BUDGET: AtomicU64 = AtomicU64::new(0);
+
+    pub fn keep(budget: rt::Handle<rt::handle::Budget>) {
+        BUDGET.store(budget.into_raw().0, Ordering::Relaxed);
+    }
+
+    /// The counters of the budget: the time its thread ran under it and the times it ran out,
+    /// both since the start.
+    /// The time in ticks and the overruns, zero when the budget is not kept.
+    #[cfg(feature = "steps")]
+    pub fn counters() -> (u64, u64) {
+        info().map_or((0, 0), |i| (i.ran, i.overruns))
+    }
+
+    pub fn info() -> Option<rt::abi::BudgetInfo> {
+        match BUDGET.load(Ordering::Relaxed) {
+            0 => None,
+            raw => {
+                let budget = rt::Handle::<rt::handle::Budget>::borrowed(rt::abi::Handle(raw));
+                rt::sys::budget_info(&budget).ok()
+            }
+        }
+    }
+}
+
+/// What the line that closes a round of the audit tells: the state at its opening.
+#[cfg(feature = "steps")]
+#[derive(Default)]
+struct AuditSpan {
+    began_ns: u64,
+    ran_ticks: u64,
+    overruns: u64,
+    steps: u32,
+}
+
+#[cfg(feature = "steps")]
+impl AuditSpan {
+    fn open(now: u64) -> Self {
+        let (ran_ticks, overruns) = kept_budget::counters();
+        Self {
+            began_ns: now,
+            ran_ticks,
+            overruns,
+            steps: 0,
+        }
+    }
+
+    fn close(&self, round: u32, now: u64) {
+        let (ran_ticks, overruns) = kept_budget::counters();
+        rt::println!(
+            "ramfs: audit round {round} steps {} span_us {} ran_us {} overruns {}",
+            self.steps,
+            now.saturating_sub(self.began_ns) / 1000,
+            rt::time::ticks_to_ns(ran_ticks.saturating_sub(self.ran_ticks)) / 1000,
+            overruns.saturating_sub(self.overruns)
+        );
+    }
+}
+
 #[cfg(feature = "profile")]
 mod calls {
     use core::sync::atomic::{AtomicU64, Ordering};
@@ -530,15 +599,6 @@ mod calls {
     static PRINTED: AtomicU64 = AtomicU64::new(0);
     static NEXT: AtomicU64 = AtomicU64::new(0);
     static ID: AtomicU64 = AtomicU64::new(0);
-    /// The budget of the request thread (the value of its handle, 0 for none), whose time and
-    /// exhaustions the record tells.
-    static BUDGET: AtomicU64 = AtomicU64::new(0);
-
-    /// Keeps the handle of the request thread's budget for the records.
-    pub fn keep_budget(budget: rt::Handle<rt::handle::Budget>) {
-        BUDGET.store(budget.into_raw().0, Ordering::Relaxed);
-    }
-
     pub fn count(method: u16) {
         CALLS.fetch_add(1, Ordering::Relaxed);
         match Method::from_number(method) {
@@ -576,15 +636,9 @@ mod calls {
         let id = ID.fetch_add(1, Ordering::Relaxed) + 1;
         // The time the request thread ran under its budget and the times the budget ran out, since
         // the start.
-        let (ran_us, overruns) = match BUDGET.load(Ordering::Relaxed) {
-            0 => (0, 0),
-            raw => {
-                let budget = rt::Handle::<rt::handle::Budget>::borrowed(rt::abi::Handle(raw));
-                rt::sys::budget_info(&budget).map_or((0, 0), |i| {
-                    (rt::time::ticks_to_ns(i.ran) / 1000, i.overruns)
-                })
-            }
-        };
+        let (ran_us, overruns) = crate::kept_budget::info().map_or((0, 0), |i| {
+            (rt::time::ticks_to_ns(i.ran) / 1000, i.overruns)
+        });
         rt::println!(
             "ramfs: prof {id} calls {calls} reads {} snaps {} budget_ran_us {ran_us} budget_overruns {overruns}",
             READS.load(Ordering::Relaxed),
@@ -635,6 +689,9 @@ struct Fs {
     audit_armed: bool,
     /// The rounds of the audit that ended.
     audit_rounds: u32,
+    /// The round of the audit that is open, as the steps line tells it.
+    #[cfg(feature = "steps")]
+    audit_span: AuditSpan,
     lock_share: ramfs::maintenance::Share,
     lock_paused: bool,
     lock_sweep: SweepCursor,
@@ -4007,6 +4064,10 @@ impl Fs {
         if now >= self.next_audit_ns && self.maintenance.remaining == 0 {
             self.next_audit_ns = now.saturating_add(250_000_000);
             self.maintenance.remaining = SESSIONS + BIRTHS - 1;
+            #[cfg(feature = "steps")]
+            {
+                self.audit_span = AuditSpan::open(now);
+            }
         }
         let mut work = false;
         self.maintenance_jobs = !self.maintenance_jobs;
@@ -4132,11 +4193,16 @@ impl Fs {
         }
         work |= client_work;
         let round_open = self.maintenance.remaining != 0;
+        #[cfg(feature = "steps")]
+        if round_open {
+            self.audit_span.steps += 1;
+        }
         self.maintenance.complete(client_work, SESSIONS + BIRTHS);
         if round_open && self.maintenance.remaining == 0 {
             self.audit_rounds = self.audit_rounds.wrapping_add(1);
             #[cfg(feature = "steps")]
-            rt::println!("ramfs: audit round {}", self.audit_rounds);
+            self.audit_span
+                .close(self.audit_rounds, rt::time::ticks_to_ns(rt::time::now()));
         }
         // A maintenance notification makes reclamation progress with no client request.
         self.legacy_pending = self.maintenance_burst.again(
