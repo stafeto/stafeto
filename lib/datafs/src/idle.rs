@@ -34,6 +34,15 @@ pub const fn may_yield(tries: u32) -> bool {
     tries < MAX_YIELDS
 }
 
+/// Whether the walk about to start may be stopped by a queued job: the first walk after the mount
+/// after `tries` stopped tries as `may_yield` says, and a refresh walk always. A refresh that runs
+/// to its end for a reader that comes late gives nothing: the free count of STATFS is low by what was
+/// given back, and the allocator walks by itself inside a request that needs a block; the reader
+/// would wait the 14 to 50 s of a walk for the exactness of `df`.
+pub const fn walk_may_yield(first: bool, tries: u32) -> bool {
+    !first || may_yield(tries)
+}
+
 /// Whether a walk in the idle would help (the refresh): the blocks that removals, truncations and
 /// replacing renames gave back since the last walk (`freed`) are over a sixteenth of the volume
 /// (`blocks`) and the window's free bits (`window_free`) are under a sixteenth too (a walk inside a
@@ -118,6 +127,18 @@ mod tests {
         for pair in starts.windows(2) {
             assert!(pair[1] - pair[0] >= QUIET_NS, "{starts:?}");
         }
+    }
+
+    #[test]
+    fn a_refresh_walk_always_yields_and_the_first_walk_yields_three_times() {
+        for tries in [0, 1, 2, 3, 4, 100, u32::MAX] {
+            assert!(
+                walk_may_yield(false, tries),
+                "a refresh after {tries} stops"
+            );
+        }
+        assert!([0, 1, 2].iter().all(|&t| walk_may_yield(true, t)));
+        assert!(!walk_may_yield(true, 3));
     }
 
     #[test]

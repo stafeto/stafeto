@@ -56,17 +56,23 @@ pub fn view<K>(i: usize) -> core::mem::ManuallyDrop<Handle<K>> {
 /// The level of the thread: below the disk service (39) it calls, below the clients' ceiling.
 pub const LEVEL: u8 = 30;
 
+/// The ticks the worker has spent in the reads of the disk (the request, the disk service's work
+/// and the answer), the steps build: a walk's own work is its time less this.
+#[cfg(feature = "steps")]
+static WAITED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// The handle of the worker's budget, 0 when it has none.
 static WORK_BUDGET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// The ticks the worker's budget has charged so far (the steps build, for the line of a walk).
+/// The ticks the worker's budget has charged so far and the overruns the kernel has counted (the
+/// steps build, for the line of a walk).
 #[cfg(feature = "steps")]
-fn work_ran() -> u64 {
+fn work_ran() -> (u64, u64) {
     match WORK_BUDGET.load(Acquire) {
-        0 => 0,
+        0 => (0, 0),
         raw => {
             let budget = Handle::<rt::handle::Budget>::borrowed(abi::Handle(raw));
-            sys::budget_info(&budget).map_or(0, |info| info.ran)
+            sys::budget_info(&budget).map_or((0, 0), |info| (info.ran, info.overruns))
         }
     }
 }
@@ -280,10 +286,14 @@ impl Device for Disk {
         self.reads += 1;
         for (i, chunk) in out.chunks_mut(CELL_BYTES as usize).enumerate() {
             let at = sector + (i * CELL_BYTES as usize / SECTOR) as u64;
+            #[cfg(feature = "steps")]
+            let asked = rt::time::now();
             let key = self
                 .io(Blk::Read, (chunk.len() / SECTOR) as u32, at)
                 .map_err(|_| DeviceError)?;
             self.finish(key).map_err(|_| DeviceError)?;
+            #[cfg(feature = "steps")]
+            WAITED.fetch_add(rt::time::now().saturating_sub(asked), Relaxed);
             // SAFETY: cell 0 of the mapped buffer; READY: the disk service wrote it, and no
             // request of it is in flight.
             unsafe {
@@ -784,14 +794,35 @@ fn walk(fs: &mut Volume, may_yield: bool) -> Walked {
     WALKING.store(true, Release);
     #[cfg(feature = "steps")]
     let ran = work_ran();
+    #[cfg(feature = "steps")]
+    let waited = WAITED.load(Relaxed);
     let ok = fs.walk().is_ok();
+    #[cfg(feature = "steps")]
+    {
+        // What the walk did besides wait for the disk: the share of its own work, on any number of
+        // CPUs (the budget tells the CPU only where there is one). It is the time of the walk less the
+        // time in the reads, so it counts what other threads took from the worker as its own.
+        let wall = rt::time::ticks_to_ns(rt::time::now()).saturating_sub(started) / 1000;
+        let wait = rt::time::ticks_to_ns(WAITED.load(Relaxed).saturating_sub(waited)) / 1000;
+        rt::println!(
+            "datafs: walk own work {} us of {wall} us, {wait} us in disk reads",
+            wall.saturating_sub(wait)
+        );
+    }
     #[cfg(feature = "steps")]
     if WORK_BUDGET.load(Acquire) != 0 {
         // The CPU the worker took in the walk against the time it lasted: the share a walk takes
-        // from the programs below 30 under the budget (at most 30 % at level 30).
-        let cpu = rt::time::ticks_to_ns(work_ran().saturating_sub(ran)) / 1000;
+        // from the programs below 30 under the budget (at most 30 % at level 30). The budget counts
+        // only the time at its own level: the time a thread spends lowered after an overrun is not in
+        // `ran`, so the overruns of the walk are told beside it, and a share is true only when there
+        // are few of them (the probe allows four for each period of the budget).
+        let (after, overruns_after) = work_ran();
+        let cpu = rt::time::ticks_to_ns(after.saturating_sub(ran.0)) / 1000;
         let wall = rt::time::ticks_to_ns(rt::time::now()).saturating_sub(started) / 1000;
-        rt::println!("datafs: walk cpu {cpu} us of {wall} us");
+        rt::println!(
+            "datafs: walk cpu {cpu} us of {wall} us, {} overruns",
+            overruns_after.saturating_sub(ran.1)
+        );
     }
     WALKING.store(false, Release);
     YIELD_OK.store(false, Release);
@@ -822,7 +853,7 @@ fn idle_walk(fs: &mut Volume, idle: &mut Idle, first: bool) {
         return;
     }
     let freed = fs.freed_estimate();
-    match walk(fs, datafs::idle::may_yield(idle.tries)) {
+    match walk(fs, datafs::idle::walk_may_yield(first, idle.tries)) {
         Walked::Done { reads, ms } => {
             let tries = idle.tries;
             idle.tries = 0;
