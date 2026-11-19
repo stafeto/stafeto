@@ -26,7 +26,9 @@ and the header version 1 of both.
   A window is XRGB8888 (opaque) or ARGB8888 (the colour already multiplied
   by the alpha, laid over what is below); the format of WINDOW_CREATE and of
   ATTACH must agree. The compositor puts the windows together with pixman
-  (below), and draws a pointer's picture over them once a pointer was seen.
+  (below). The pointer's picture is the display's cursor (below, "The
+  pointer"); a driver with no cursor pipeline makes the compositor draw the
+  picture over the windows once a pointer was seen.
 - Events (stage G2). Each window has a ring of 64 events of 16 bytes; EVENTS,
   called on a window's session, takes up to 32 of them without waiting, and
   says LOST when older ones were dropped. The bit 3 of the channel
@@ -127,6 +129,40 @@ reports `EV_ABS` `ABS_X` and `ABS_Y` from 0 to 32 767 across the screen and
 image of the probe (`table::focus`) has the tablet on the transport 13; the
 base image has no tablet record yet, so its pointer is stage G2's probe image
 only.
+
+## The pointer
+
+At the opening of the screen the compositor asks the driver for PIPELINES
+and, when it lists a pipeline of kind CURSOR that takes ARGB8888, for the
+SOURCE of kind cursor: a memory object of one 64 by 64 picture (source 3),
+which it maps and in which it draws the arrow (`proto_comp::cursor::CURSOR`,
+12 by 19 points, ARGB8888 premultiplied, the rest transparent) once. The
+arrow's hot spot is its top left point, (0, 0). DESCRIBE's `flags` then has
+bit 1, CURSOR_PLANE: the points of the screen (a screenshot, a probe's CRC)
+never hold the pointer, because the device draws it.
+
+- Until the pointer is seen the cursor is not bound, so it is hidden. After
+  a step of reading input whose events moved the pointer (and after an
+  INJECT) the compositor sends one LAYERS with one row of the cursor
+  pipeline: source 3 and the pointer's place, whose changed area is empty.
+  The driver takes the first such row for the cursor's first update (the
+  picture is transferred, then shown) and a later one for a move. However
+  many events a step read, one row goes, with the last place; the driver
+  merges moves while its cursor queue is busy. The reply comes as soon as
+  the command is queued, so a move never waits for the device, and none is
+  sent inside a frame's composition, in a band or in the end of a frame.
+  A row the driver refused is made again at the next step of input.
+- A move of the pointer damages nothing while the cursor is on the pipeline,
+  and the cost of a band counts no layer for the pointer: a frame is made
+  for the windows alone.
+- The cursor stays visible over every window, a window of the first revision
+  included: that window takes no pointer events, but the pointer is the
+  user's and the picture over it is what the frame showed before. A row of
+  source 0 would hide it, which the scene makes (`Scene::cursor_row`) only
+  for a pointer that is not seen.
+- A driver that has no cursor pipeline (PIPELINES unknown or no record of
+  kind CURSOR), refuses SOURCE, or whose picture does not suit leaves the
+  compositor drawing the pointer into the frame as before.
 
 ## pixman
 
@@ -249,7 +285,9 @@ the driver: every step stays under 0.9 of term B, and a band of a frame, like
 a portion of the driver's clearing, under 16 328 ticks, and tells what each kind of layer costs a point inside
 the bands (`service raster` lines of `px::cost`; the constants of
 `Scene::tile` are set from them). `cargo xtask
-doom-probe` runs Doom through the compositor.
+doom-probe` runs Doom through the compositor. The compositor asks PIPELINES
+and SOURCE of the driver at the opening of the screen, so the driver's steps
+of those kinds are required in `comp-probe`'s table.
 
 `cargo xtask focus-probe` (stage G2) runs the compositor with a tablet, two
 clients whose windows overlap (the second with an alpha), a manager and a
@@ -259,8 +297,12 @@ that gives the first window the focus and the top place, the manager's switch
 on Alt and Tab, and the screen after the second client ended and the first
 went on untouched. Each client's events must be exactly the list it expects:
 the keys only while it had the focus, the focus changes, the click in its own
-coordinates. QEMU's tablet then moves and presses through the monitor, and the
-surviving window must see the click. The same command then runs the image of the
+coordinates. The pointer is on the cursor pipeline, so no CRC has its picture
+(the guest requires CURSOR_PLANE); QEMU's trace of the display
+(`virtio_gpu_update_cursor`) must show the cursor's update from resource 3 at
+the place of the injected move, then a move with resource 3 to the tablet's
+place, and none with resource 0. QEMU's tablet then moves and presses through
+the monitor, and the surviving window must see the click. The same command then runs the image of the
 window manager (`table::focus::WM_TABLE`: the program `wm`, a keyboard's
 driver, a native client and a client of the first revision): the manager gives
 each new window the focus, Super and Tab switch the windows twice, and the keys
@@ -268,7 +310,8 @@ reach the window with the focus only, the window of the first revision among
 them; the manager then ends on Super and Q, the compositor answers and keeps
 the focus where it was, and the focus passes to the window on top by the
 compositor's own rule when the first client ends. Under `-icount` it measures the steps of
-the compositor and of the tablet's driver (each under 0.9 of term B, a band
+the compositor, of the tablet's driver and of the display driver, whose
+PIPELINES, SOURCE and LAYERS steps must come (each under 0.9 of term B, a band
 under 16 328 ticks).
 
 ## Not yet

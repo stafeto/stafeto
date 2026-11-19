@@ -845,13 +845,13 @@ mod tests {
     /// The memory budget of the try-out on a t4g.small (2 GiB): the quotas and DMA objects of
     /// the table, the boot image (about 96 MiB with nginx, nginx-fast, OpenSSL, curl and
     /// Dropbear: its files are in the memory of init), the kernel and its tables (64 MiB), and
-    /// the 16 384 pages init keeps free after the services started (`cargo xtask
-    /// pkg-identity` holds the base image to the same) all fit in the 524 288 pages.
+    /// the pages init keeps free after the services started (`INIT_RESERVE_PAGES`, which
+    /// `cargo xtask pkg-identity` holds the base image to) all fit in the 524 288 pages.
     #[test]
     fn the_quotas_of_the_table_with_nginx_and_nginx_fast_fit_a_t4g_small() {
         const IMAGE_PAGES: u64 = (96 << 20) / PAGE;
         const KERNEL_PAGES: u64 = (64 << 20) / PAGE;
-        const INIT_FREE: u64 = 16_384;
+        const INIT_FREE: u64 = crate::table::base::INIT_RESERVE_PAGES;
         let held = pages_held(TABLE);
         let need = held + IMAGE_PAGES + KERNEL_PAGES + INIT_FREE;
         assert!(

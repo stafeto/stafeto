@@ -4003,17 +4003,15 @@ mod tests {
             .iter()
             .find(|r| r.name == PROCESS_SERVICE)
             .unwrap();
-        // The pool of the network image less the two quotas of a command that
-        // the package service takes from init.
-        // (and the pages the compositor's pixman and the display driver's pool
-        // took).
-        assert_eq!(
-            posix.quota
-                + (16 - base::COMMAND_QUOTAS) * net::NET_COMMAND_QUOTA
-                + base::PIXMAN_PAGES
-                + base::DISPLAY_POOL_PAGES,
-            net::NET_TABLE[2].quota
-        );
+        // The record carries the least pool; init sizes the real one at boot
+        // (`Init::size_pool`). The heaviest command, a reload of nginx (nine
+        // processes, 30 440 pages) and the shell (4 096), fits what the
+        // minimum leaves of the pool after the service's own pages and the
+        // dialog pool.
+        assert_eq!(posix.quota, base::POOL_MIN_PAGES * PAGE);
+        let commands = posix.quota - ramfs::POSIX_ABI_TABLE[1].quota - ramfs::BUSYBOX_DIALOG_POOL;
+        assert!(commands >= (30_440 + 4_096) * PAGE);
+        assert_eq!(base::INIT_RESERVE_PAGES, 16_384);
         // The service of the network is the one of the network image, and the
         // disk and package services close the table: 15 of 16 records.
         assert_eq!(base::BASE_TABLE[12].name, net::NETD.name);

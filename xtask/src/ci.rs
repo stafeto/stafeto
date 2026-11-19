@@ -516,6 +516,14 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     // The quota of the network service's records covers what the service
     // charges to it (netd_quota.rs).
     steps.push(step("host", "netd quota", &[], super::netd_quota::check));
+    // The largest restart of a record of the base table fits the pages init
+    // keeps free (init_reserve.rs).
+    steps.push(step(
+        "host",
+        "init reserve",
+        &[],
+        super::init_reserve::check,
+    ));
     steps.push(step("host", "counter read sites", &[], || {
         super::disasm::check_counter_read_sites(&super::root())
     }));

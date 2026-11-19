@@ -19,7 +19,12 @@
 //!   the CRC-32 of the screen as it should look after each step (the overlap
 //!   with its transparency, a click that raises the first window, the
 //!   manager's switch, the screen after the second client ended), which xtask
-//!   compares with QEMU's screenshot; the pointer's picture is part of it.
+//!   compares with QEMU's screenshot. The service puts the pointer on the
+//!   display's cursor pipeline (DESCRIBE's CURSOR_PLANE, which this role
+//!   requires), so no CRC has the pointer's picture: the screenshot never
+//!   holds the cursor, and a service that drew it into the frame would
+//!   differ. That the cursor reached the device is the trace of QEMU's
+//!   display, which xtask reads.
 //!
 //! The image of the window manager (`focus::WM_TABLE`, the second run of
 //! xtask's focus-probe) has the program `wm` (apps/wm) as the manager, with a
@@ -47,11 +52,10 @@
 
 use abi::{Access, Error, MESSAGE_MAX, Rights, Source};
 use core::cell::Cell;
-use proto_comp::cursor::{CURSOR, CURSOR_H, CURSOR_W};
 use proto_comp::{
-    Attach, BUTTON, CREATE, Create, Description, EVENTS_BIT, Event, FOCUS_IN, FOCUS_OUT,
-    FORMAT_ARGB8888, FORMAT_XRGB8888, HAS_MANAGER, KEY, MAX_EVENTS, MOVE, Method, Post, Rect,
-    WindowRecord, manage,
+    Attach, BUTTON, CREATE, CURSOR_PLANE, Create, Description, EVENTS_BIT, Event, FOCUS_IN,
+    FOCUS_OUT, FORMAT_ARGB8888, FORMAT_XRGB8888, HAS_MANAGER, KEY, MAX_EVENTS, MOVE, Method, Post,
+    Rect, WindowRecord, manage,
 };
 use proto_gpu::{HEIGHT, WIDTH};
 use proto_init::ServiceArgs;
@@ -459,9 +463,9 @@ fn over(dst: u32, src: u32) -> u32 {
     out
 }
 
-/// What the screen shows: the windows bottom first (A, B), and the pointer's
-/// picture at `pointer` if there is one.
-fn expected_crc(order: [bool; 2], only_a: bool, pointer: Option<(u32, u32)>) -> u32 {
+/// What the screen shows: the windows bottom first (A, B). The pointer is on
+/// the display's cursor pipeline and is not in the screen's points.
+fn expected_crc(order: [bool; 2], only_a: bool) -> u32 {
     let inside = |r: Rect, x: u32, y: u32| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
     let mut crc = Crc(0xFFFF_FFFF);
     for y in 0..HEIGHT {
@@ -481,21 +485,6 @@ fn expected_crc(order: [bool; 2], only_a: bool, pointer: Option<(u32, u32)>) -> 
                 } else if !is_a && inside(B, x, y) {
                     point = over(point, b_point(x - B.x, y - B.y));
                 }
-            }
-            if let Some((px, py)) = pointer
-                && x >= px
-                && y >= py
-                && x < px + CURSOR_W
-                && y < py + CURSOR_H
-            {
-                let at = (((y - py) * CURSOR_W + (x - px)) * 4) as usize;
-                let c = u32::from_le_bytes([
-                    CURSOR[at],
-                    CURSOR[at + 1],
-                    CURSOR[at + 2],
-                    CURSOR[at + 3],
-                ]);
-                point = over(point, c);
             }
             crc.point(point);
         }
@@ -1001,14 +990,18 @@ impl Probe<'_> {
     /// screen it leaves.
     fn input(self) -> Result<(), &'static str> {
         let display = self.display()?;
-        self.describe_when_ready(&display)?;
+        let ready = self.describe_when_ready(&display)?;
+        if ready.flags & CURSOR_PLANE == 0 {
+            return Err("the pointer is not on the cursor pipeline");
+        }
+        rt::println!("focus-probe: the pointer is on the cursor pipeline");
         // Both windows on the screen, the manager subscribed.
         let d = self.until(&display, "the windows and the manager never came", |d| {
             d.open == 2 && d.created == 2 && d.frames >= 2 && d.flags & HAS_MANAGER != 0
         })?;
         rt::println!(
             "focus-probe: overlap crc {:08x}",
-            expected_crc([true, false], false, None)
+            expected_crc([true, false], false)
         );
         self.sleep(SNAPSHOT_NS);
         // A key while the second window has the focus.
@@ -1023,7 +1016,7 @@ impl Probe<'_> {
         })?;
         rt::println!(
             "focus-probe: click crc {:08x}",
-            expected_crc([false, true], false, Some((CLICK.0 as u32, CLICK.1 as u32)))
+            expected_crc([false, true], false)
         );
         self.sleep(SNAPSHOT_NS);
         self.key(&display, KEY_S)?;
@@ -1036,7 +1029,7 @@ impl Probe<'_> {
         })?;
         rt::println!(
             "focus-probe: switch crc {:08x}",
-            expected_crc([true, false], false, Some((CLICK.0 as u32, CLICK.1 as u32)))
+            expected_crc([true, false], false)
         );
         self.sleep(SNAPSHOT_NS);
         self.key(&display, KEY_D)?;
@@ -1044,7 +1037,7 @@ impl Probe<'_> {
         self.until(&display, "the second window never went", |n| n.open == 1)?;
         rt::println!(
             "focus-probe: survivor crc {:08x}",
-            expected_crc([true, false], true, Some((CLICK.0 as u32, CLICK.1 as u32)))
+            expected_crc([true, false], true)
         );
         self.sleep(SNAPSHOT_NS);
         if cfg!(feature = "quick") {

@@ -364,6 +364,9 @@ pub struct Init {
     overruns: &'static mut Overruns,
     /// The stop of the system, once SHUTDOWN came (`shutdown`).
     stopping: Option<Stop>,
+    /// The pool of the process service, sized once before the first start
+    /// (`size_pool`); none for the tables that keep the quota of their record.
+    pool: Option<quota::Pool>,
 }
 
 impl Init {
@@ -391,6 +394,7 @@ impl Init {
             started: 0,
             overruns: counts(),
             stopping: None,
+            pool: None,
         }
     }
 
@@ -417,12 +421,61 @@ impl Init {
             entry.timer_view = Some(view);
             entry.timer_label = label;
         }
+        #[cfg(feature = "table-base")]
+        self.size_pool();
         for &place in order.as_slice() {
             self.launch(place);
         }
         if table::table().is_empty() {
             println!("{STARTED}");
         }
+    }
+
+    /// Sizes the pool of the process service once, before the first start
+    /// (base and full image): what is left of init's free quota after the
+    /// other records, the program of the process service and the POSIX
+    /// records it loads for, less INIT_RESERVE_PAGES and INIT_SLACK_PAGES, and
+    /// at least POOL_MIN_PAGES. The other records and the program of the
+    /// process service cost what a start of each takes (`quota::need_with_dma`).
+    #[cfg(feature = "table-base")]
+    fn size_pool(&mut self) {
+        use table::base::{INIT_RESERVE_PAGES, INIT_SLACK_PAGES, POOL_MIN_PAGES};
+        let Ok(memory) = sys::process_memory(&self.own) else {
+            return;
+        };
+        let free = memory.quota.saturating_sub(memory.used) / PAGE;
+        let (mut others, mut own) = (0, 0);
+        for (place, record) in table::table().iter().enumerate() {
+            let Some(program) = self.programs[place] else {
+                continue;
+            };
+            if record.name == table::PROCESS_SERVICE {
+                own = quota::need_with_dma(0, &program, record.dma);
+            } else if record.is_posix() {
+                others += quota::need_pages(record.quota, &program);
+            } else {
+                others += quota::need_with_dma(record.quota, &program, record.dma);
+            }
+        }
+        let pool = quota::pool_pages(
+            free,
+            others,
+            own,
+            INIT_RESERVE_PAGES,
+            INIT_SLACK_PAGES,
+            POOL_MIN_PAGES,
+        );
+        println!(
+            "init: pool of posix {} pages, minimum {POOL_MIN_PAGES}, reserve {INIT_RESERVE_PAGES}",
+            pool.pages
+        );
+        if pool.short > 0 {
+            println!(
+                "init: the pool of posix is short by {} pages of POOL_MIN_PAGES",
+                pool.short
+            );
+        }
+        self.pool = Some(pool);
     }
 
     /// Puts the load of the record at `place` in the queue: LOADING. A
@@ -822,7 +875,8 @@ impl Init {
     }
 
     /// The quota of an instance of the record at `place` in bytes: the
-    /// record's; for the process service also what each POSIX record of
+    /// record's; for the process service the pool sized at boot (`size_pool`)
+    /// when there is one, and also what each POSIX record of
     /// the table takes from it (quota::need_pages), since the service
     /// creates and loads their processes.
     fn quota_of(&self, place: usize) -> u64 {
@@ -836,7 +890,8 @@ impl Init {
                 self.programs[p].map(|program| quota::need_pages(table::table()[p].quota, &program))
             })
             .sum();
-        record.quota + children * PAGE
+        let own = self.pool.map_or(record.quota, |pool| pool.pages * PAGE);
+        own + children * PAGE
     }
 
     /// Puts `job` in the queue. With the worker at a job, its level goes
@@ -906,7 +961,8 @@ impl Init {
     fn quota_fits(&mut self, place: usize) -> bool {
         let record = &table::table()[place];
         let quota = self.quota_of(place);
-        let need = self.programs[place].map_or(u64::MAX, |p| quota::need_pages(quota, &p));
+        let need =
+            self.programs[place].map_or(u64::MAX, |p| quota::need_with_dma(quota, &p, record.dma));
         let memory = sys::process_memory(&self.own);
         let free = memory.map_or(0, |m| m.quota.saturating_sub(m.used) / PAGE);
         // The shares of the record come off init's own (spec 7.5): free
@@ -967,7 +1023,7 @@ impl Init {
             println!("{STARTED}");
             // What is left of init's own quota once every record has its
             // own: the base and the full image watch it (cargo xtask
-            // pkg-identity keeps it from 16 384 pages). The other images
+            // pkg-identity keeps it from INIT_RESERVE_PAGES). The other images
             // print nothing more: a line at this point moves the time of
             // the boot, and posix-lock-pages measures a sleep against it.
             #[cfg(any(feature = "table-base", feature = "table-aws-qemu"))]

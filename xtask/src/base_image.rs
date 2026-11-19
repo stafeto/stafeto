@@ -43,8 +43,9 @@ pub fn programs(image: &str) -> &'static [ImageProgram] {
     programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-base"]);
     programs.extend(package_programs(&packages));
     programs.extend(SHELL_SERVICES_LAST);
-    // One instance: the image must keep 16 384 free pages after the services start, and each
-    // instance takes about 19 MiB of .bss (instances-2 left 12 221).
+    // One instance: each instance takes about 19 MiB of .bss, and the reserve init keeps
+    // free after the services start (`INIT_RESERVE_PAGES`) covers the restart of one while
+    // its clients hold the old (`cargo xtask init-reserve`).
     programs.push(("netd", "netd", net::NETD_STACK_SIZE, &[]));
     programs.push(("virtio-blk", "virtio-blk", blk_probe::BLK_STACK_SIZE, &[]));
     programs.push(("pkgd", "pkgd", store_probe::PKGD_STACK_SIZE, &[]));
@@ -100,10 +101,10 @@ pub fn memory_machine_args() -> Vec<String> {
     args
 }
 
-/// The machine of an image: the full image runs on 1 GiB, because on 512 MiB
-/// its container of 54 MB leaves init 15 837 free pages (the base image, 16 416
-/// on 512 MiB, stays there); the archive of the full image names it in its
-/// `run.sh` (spec 5, release).
+/// The machine of an image: the full image runs on 1 GiB. Init sizes the pool
+/// of the process service at boot, so the full image would fit a smaller
+/// machine; 1 GiB is the release's choice, and the archive of the full image
+/// names it in its `run.sh` (spec 5, release). The base image runs on 512 MiB.
 pub fn machine(image: &str) -> &'static qemu::Machine {
     if image == FULL_IMAGE || packages::without_name(image).is_some() {
         &qemu::VIRT_1G

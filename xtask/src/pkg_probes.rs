@@ -678,8 +678,39 @@ fn dir_size(dir: &Path) -> u64 {
 const BOOT_WITHIN: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The pages of its own quota that init keeps free after the services of an
-/// image started (the rule of the images with the network).
-const FREE_PAGES_MIN: u64 = 16_384;
+/// image started: the reserve of the base table (init sizes the pool of the
+/// process service so that this much stays free).
+const FREE_PAGES_MIN: u64 = init::table::base::INIT_RESERVE_PAGES;
+
+/// What init printed of its pages after the services started: the free pages
+/// (`init: free pages N of M`) and the pool of the process service (`init:
+/// pool of posix N pages, ...`). Fails when init says the pool is short of
+/// POOL_MIN_PAGES, or the free pages are under the reserve.
+fn init_pages<S: AsRef<str>>(name: &str, lines: &[S]) -> Result<(u64, u64), String> {
+    let number = |prefix: &str| {
+        lines.iter().find_map(|l| {
+            let rest = l.as_ref().strip_prefix(prefix)?;
+            rest.split(' ').next()?.parse::<u64>().ok()
+        })
+    };
+    let min = init::table::base::POOL_MIN_PAGES;
+    let pool = number("init: pool of posix ")
+        .ok_or_else(|| format!("{name}: init printed no line of the pool of posix"))?;
+    if let Some(short) = number("init: the pool of posix is short by ") {
+        return Err(format!(
+            "{name}: pool of posix {pool} pages, under POOL_MIN_PAGES {min} (services/init/src/table/base.rs): short by {short} pages"
+        ));
+    }
+    let free = number("init: free pages ")
+        .ok_or_else(|| format!("{name}: init printed no line of free pages"))?;
+    if free < FREE_PAGES_MIN {
+        return Err(format!(
+            "{name}: init has {free} free pages, under INIT_RESERVE_PAGES {FREE_PAGES_MIN}; raise INIT_SLACK_PAGES by {} (services/init/src/table/base.rs)",
+            FREE_PAGES_MIN - free
+        ));
+    }
+    Ok((free, pool))
+}
 
 /// The package files an image holds in its container: name and bytes.
 fn layers_of(image: &BootImage<'_>) -> Vec<(String, Vec<u8>)> {
@@ -778,7 +809,7 @@ fn boot(
     name: &str,
     path: &Path,
     check: impl FnOnce(&mut crate::qemu::Run) -> Result<(), String>,
-) -> Result<(f64, f64, u64), String> {
+) -> Result<(f64, f64, u64, u64), String> {
     let kernel = crate::build(crate::Variant::Normal)?;
     let mut cmd = crate::qemu::command(crate::base_image::machine(name), &kernel.image, Some(path));
     cmd.args(crate::qemu::HEADLESS);
@@ -801,26 +832,14 @@ fn boot(
     if let Some(line) = output.lines.iter().find(|l| l.contains("not attached")) {
         return Err(format!("{name}: {line}"));
     }
-    // What init has left of its quota once the services are up: the number
-    // stays watched as the services of the disk and of packages come.
-    let free = output
-        .lines
-        .iter()
-        .find_map(|l| {
-            let rest = l.strip_prefix("init: free pages ")?;
-            rest.split(' ').next()?.parse::<u64>().ok()
-        })
-        .ok_or_else(|| format!("{name}: init printed no line of free pages"))?;
-    if free < FREE_PAGES_MIN {
-        return Err(format!(
-            "{name}: init has {free} free pages after the services started, under {FREE_PAGES_MIN}"
-        ));
-    }
+    // What init has left of its quota once the services are up, and the pool
+    // it gave the process service: the free pages stay at the reserve.
+    let (free, pool) = init_pages(name, &output.lines)?;
     let took = started.elapsed();
     if took > BOOT_WITHIN {
         return Err(format!("{name}: the run took {:.0} s", took.as_secs_f64()));
     }
-    Ok((services, took.as_secs_f64(), free))
+    Ok((services, took.as_secs_f64(), free, pool))
 }
 
 /// The entries of `/usr/share/licenses`, as `ls -1` lists them.
@@ -941,7 +960,7 @@ pub fn identity() -> Result<(), String> {
     // 5: the full image in QEMU: the program of a package with its mode, the
     // licence of another in its directory, the directories of the notices.
     let licence = notices::licence_text("freedoom")?;
-    let (services, took, free) = boot(crate::base_image::FULL_IMAGE, &full, |run| {
+    let (services, took, free, pool) = boot(crate::base_image::FULL_IMAGE, &full, |run| {
         let listing = shell(run, "ls -l /bin/doom")?;
         let doom = with_files
             .iter()
@@ -993,11 +1012,11 @@ pub fn identity() -> Result<(), String> {
         Ok(())
     })?;
     println!(
-        "pkg-identity: {} in QEMU: ls -l /bin/doom, the licence of freedoom, the directories of the notices, no layer left out (services started after {services:.1} s, the checks done after {took:.1} s, init has {free} free pages)",
+        "pkg-identity: {} in QEMU: ls -l /bin/doom, the licence of freedoom, the directories of the notices, no layer left out (services started after {services:.1} s, the checks done after {took:.1} s, init has {free} free pages, the pool of posix {pool} pages)",
         crate::base_image::FULL_IMAGE
     );
     // 6: the base image in QEMU: no game, the notices of the base packages, the screen and the keys.
-    let (services, took, free) = boot(crate::base_image::BASE_IMAGE, &base, |run| {
+    let (services, took, free, pool) = boot(crate::base_image::BASE_IMAGE, &base, |run| {
         // The services of the screen and of the keys came up.
         for line in ["virtio-gpu: screen ready", "input: QEMU Virtio Keyboard"] {
             run.expect_bytes(line.as_bytes(), crate::DIALOG_STEP)?;
@@ -1020,7 +1039,7 @@ pub fn identity() -> Result<(), String> {
         Ok(())
     })?;
     println!(
-        "pkg-identity: {} in QEMU: no /bin/doom, the notices of the base packages and of the system, no layer left out (services started after {services:.1} s, the checks done after {took:.1} s, init has {free} free pages)",
+        "pkg-identity: {} in QEMU: no /bin/doom, the notices of the base packages and of the system, no layer left out (services started after {services:.1} s, the checks done after {took:.1} s, init has {free} free pages, the pool of posix {pool} pages)",
         crate::base_image::BASE_IMAGE
     );
     // 7: a package builds again to the same bytes.
@@ -1066,4 +1085,52 @@ pub fn ci() -> Result<(), String> {
     dist_licenses()?;
     println!("pkg-ci: {:.0} s", started.elapsed().as_secs_f64());
     Ok(())
+}
+
+#[cfg(test)]
+mod init_pages_tests {
+    use super::*;
+
+    fn lines(free: u64, pool: u64, short: Option<u64>) -> Vec<String> {
+        let mut v = vec![
+            format!("init: pool of posix {pool} pages, minimum 52120, reserve 16384"),
+            "init: services started".to_owned(),
+            format!("init: free pages {free} of 127000"),
+        ];
+        if let Some(k) = short {
+            v.insert(
+                1,
+                format!("init: the pool of posix is short by {k} pages of POOL_MIN_PAGES"),
+            );
+        }
+        v
+    }
+
+    #[test]
+    fn free_pages_at_the_reserve_and_a_pool_pass() {
+        assert_eq!(
+            init_pages("x", &lines(FREE_PAGES_MIN, 67_927, None)),
+            Ok((FREE_PAGES_MIN, 67_927))
+        );
+    }
+
+    #[test]
+    fn a_short_pool_fails_with_the_shortfall() {
+        let e = init_pages("x", &lines(FREE_PAGES_MIN, 52_120, Some(40))).unwrap_err();
+        assert!(
+            e.contains("POOL_MIN_PAGES") && e.contains("short by 40"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn free_pages_under_the_reserve_name_the_slack_to_raise() {
+        let e = init_pages("x", &lines(FREE_PAGES_MIN - 9, 60_000, None)).unwrap_err();
+        assert!(e.contains("raise INIT_SLACK_PAGES by 9"), "{e}");
+    }
+
+    #[test]
+    fn a_missing_line_fails() {
+        assert!(init_pages("x", &["init: free pages 20000 of 1".to_owned()]).is_err());
+    }
 }

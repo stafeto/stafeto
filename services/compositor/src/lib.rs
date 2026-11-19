@@ -29,7 +29,7 @@ use proto_comp::{
     BUFFERS, BUTTON, CLOSE, CREATE, Event, FOCUS_IN, FOCUS_OUT, KEY, MAX_RECTS, MOVE, RING, Rect,
     union,
 };
-use proto_gpu::{HEIGHT, STRIDE, WIDTH};
+use proto_gpu::{HEIGHT, LayerRow, STRIDE, WIDTH};
 
 /// The windows at once, and the windows of one context.
 pub const MAX_WINDOWS: usize = 8;
@@ -228,6 +228,9 @@ pub struct Scene {
     /// The pointer's place, once the pointer was seen, and the window a
     /// pressed button holds.
     pointer: Option<(i32, i32)>,
+    /// The device's cursor pipeline, when the driver has one: the pointer's
+    /// picture is then the device's, and the frame never draws it.
+    cursor: Option<CursorPlane>,
     held: Option<usize>,
     /// The Super keys held, one bit each (left, right).
     modifier: u8,
@@ -257,6 +260,28 @@ pub const SCREEN: Rect = Rect {
 
 pub use proto_comp::cursor::{CURSOR, CURSOR_H, CURSOR_W};
 
+/// What the device's cursor pipeline shows now, as the last LAYERS row the
+/// driver accepted said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shown {
+    Hidden,
+    At(i32, i32),
+}
+
+/// The pointer on the device's cursor pipeline (proto_gpu revision 3): the
+/// pipeline's id, the source that holds the picture, and what the device
+/// shows of it. The arrow's hot spot is its top left point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CursorPlane {
+    pipeline: u32,
+    source: u32,
+    shown: Shown,
+}
+
+/// The hot spot of the pointer's picture: the point that lies at the
+/// pointer's place.
+pub const CURSOR_HOT: (u32, u32) = (0, 0);
+
 /// The pointer's picture on a 4-byte boundary, as pixman wants its memory.
 #[repr(align(4))]
 struct Aligned([u8; CURSOR.len()]);
@@ -275,6 +300,7 @@ impl Scene {
             },
             focus: None,
             pointer: None,
+            cursor: None,
             held: None,
             modifier: 0,
             owner: [OWNER_NONE; KEYS_TRACKED],
@@ -329,9 +355,85 @@ impl Scene {
         self.focus
     }
 
+    /// The place of the pointer's picture in the frame: the pointer's, when
+    /// it was seen and the device's cursor pipeline does not show it.
+    fn drawn_pointer(&self) -> Option<(i32, i32)> {
+        self.pointer.filter(|_| self.cursor.is_none())
+    }
+
     /// The pointer's place, once it was seen.
     pub fn pointer(&self) -> Option<(i32, i32)> {
         self.pointer
+    }
+
+    /// The pointer goes onto the device's cursor pipeline `pipeline`, its
+    /// picture in `source` (or back into the frame, with None): from now
+    /// on a move of the pointer damages nothing and the frame draws no
+    /// picture. The picture the frame drew before is painted over.
+    pub fn set_cursor_plane(&mut self, plane: Option<(u32, u32)>) {
+        let was = self.cursor.is_some();
+        self.cursor = plane.map(|(pipeline, source)| CursorPlane {
+            pipeline,
+            source,
+            shown: Shown::Hidden,
+        });
+        if was != self.cursor.is_some()
+            && let Some(p) = self.pointer
+        {
+            self.add_damage(Scene::cursor_rect(p));
+        }
+    }
+
+    /// Whether the pointer is on the device's cursor pipeline (DESCRIBE's
+    /// CURSOR_PLANE).
+    pub fn cursor_plane(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    /// The row of LAYERS that brings the device's cursor to the pointer, or
+    /// None when it shows the pointer already, or there is no cursor
+    /// pipeline. The pointer unseen is a hidden cursor (source 0), the
+    /// pointer seen is the picture at its place; a move is the same row with
+    /// a new place, which the driver takes for a move of the cursor. At most
+    /// one row for any number of moves: the caller asks once a step of input.
+    /// `cursor_shown` tells the driver took the row.
+    pub fn cursor_row(&self) -> Option<LayerRow> {
+        let plane = self.cursor?;
+        let wanted = match self.pointer {
+            Some((x, y)) => Shown::At(x, y),
+            None => Shown::Hidden,
+        };
+        if wanted == plane.shown {
+            return None;
+        }
+        Some(match wanted {
+            Shown::Hidden => LayerRow::off(plane.pipeline),
+            Shown::At(x, y) => LayerRow::cursor(plane.pipeline, plane.source, x, y, CURSOR_HOT),
+        })
+    }
+
+    /// The driver refused a row of the cursor pipeline, for good: the
+    /// pointer goes back into the frame (`set_cursor_plane(None)`, which
+    /// damages the arrow's rectangle), and no row is made again. When the
+    /// device may be showing the cursor the row that hides it is returned,
+    /// for the caller to send and not to wait for, so that the pointer is
+    /// never in the frame and on the device both. None when the device was
+    /// never shown the cursor.
+    pub fn cursor_refused(&mut self) -> Option<LayerRow> {
+        let plane = self.cursor?;
+        self.set_cursor_plane(None);
+        (plane.shown != Shown::Hidden).then(|| LayerRow::off(plane.pipeline))
+    }
+
+    /// The driver took `row` (made by `cursor_row`).
+    pub fn cursor_shown(&mut self, row: &LayerRow) {
+        if let Some(plane) = &mut self.cursor {
+            plane.shown = if row.source == 0 {
+                Shown::Hidden
+            } else {
+                Shown::At(row.x, row.y)
+            };
+        }
     }
 
     /// Whether a window of the table is shown: it has something taken and
@@ -720,11 +822,15 @@ impl Scene {
             return;
         }
         let before = self.pointer.replace(at);
-        let mut damage = Scene::cursor_rect(at);
-        if let Some(old) = before {
-            damage = union(Some(damage), Scene::cursor_rect(old));
+        // On the device's cursor pipeline the move is the device's: the
+        // frame holds no picture, so nothing is damaged.
+        if self.cursor.is_none() {
+            let mut damage = Scene::cursor_rect(at);
+            if let Some(old) = before {
+                damage = union(Some(damage), Scene::cursor_rect(old));
+            }
+            self.add_damage(damage);
         }
-        self.add_damage(damage);
         // A window of the first revision takes no pointer: its ring holds the
         // keys, which a stream of moves would push out.
         if let Some(i) = self.held.or_else(|| self.hit(at.0, at.1))
@@ -995,7 +1101,10 @@ impl Scene {
                 }
             }
         }
-        over += u32::from(self.pointer.is_some_and(|p| touches(Scene::cursor_rect(p))));
+        over += u32::from(
+            self.drawn_pointer()
+                .is_some_and(|p| touches(Scene::cursor_rect(p))),
+        );
         let covered = self.windows.iter().flatten().any(|w| {
             Scene::shown(w)
                 && w.format == Format::Xrgb
@@ -1134,7 +1243,7 @@ pub fn compose(
             w.format == Format::Argb,
         );
     }
-    if let Some(p) = scene.pointer {
+    if let Some(p) = scene.drawn_pointer() {
         let c = Scene::cursor_rect(p);
         let (cx0, cx1) = (x0.max(c.x), x1.min(c.x + c.w));
         let (cy0, cy1) = (y0.max(c.y), y1.min(c.y + c.h));
@@ -2202,6 +2311,181 @@ mod tests {
         t.begin().unwrap();
         assert_eq!(t.tile(rect(10, 10, 50, 50)).1, BAND_ROWS);
         assert!(t.tile(rect(0, 0, 640, 400)).1 < BAND_ROWS);
+    }
+
+    use proto_gpu::{PIPELINE_CURSOR, SOURCE_CURSOR};
+
+    /// A scene with a window over the whole screen, shown and settled, and
+    /// the pointer on the device's cursor pipeline when `plane`.
+    fn settled(plane: bool) -> Scene {
+        let mut s = Scene::new();
+        let a = s.create(1, 1, SCREEN, true, 0).unwrap();
+        s.flush(a, SCREEN).unwrap();
+        s.begin().unwrap();
+        s.end(true);
+        if plane {
+            s.set_cursor_plane(Some((PIPELINE_CURSOR, SOURCE_CURSOR)));
+        }
+        s
+    }
+
+    #[test]
+    fn on_the_cursor_pipeline_a_move_of_the_pointer_damages_nothing() {
+        let mut s = settled(true);
+        s.pointer_to(10, 10);
+        s.pointer_to(300, 200);
+        assert!(!s.busy());
+        assert_eq!(s.begin(), None);
+        assert_eq!(s.pointer(), Some((300, 200)));
+        // Without the pipeline the move damages both places, as it did.
+        let mut t = settled(false);
+        t.pointer_to(10, 10);
+        assert!(t.busy());
+        t.begin().unwrap();
+        t.end(true);
+        t.pointer_to(300, 200);
+        assert_eq!(
+            t.begin(),
+            Some(rect(10, 10, 300 + CURSOR_W - 10, 200 + CURSOR_H - 10))
+        );
+    }
+
+    #[test]
+    fn on_the_cursor_pipeline_the_frame_draws_no_pointer_and_prices_none() {
+        let mut s = settled(true);
+        s.pointer_to(5, 5);
+        // The tile of a frame over the pointer is that of a copy alone.
+        assert_eq!(s.tile(SCREEN), (640, 7));
+        s.add_damage(SCREEN);
+        let d = s.begin().unwrap();
+        let src = flat(&[(0, 0, 0x80, 640 * 4 * 400)]);
+        let mut fb = screen();
+        draw(&s, d, &mut fb, &src);
+        // The arrow's '#' at (0, 0) of its picture would be black here.
+        assert_eq!(at(&fb, 5, 5), 0x80);
+        assert_eq!(at(&fb, 6, 6), 0x80);
+        // The same scene without the pipeline draws it.
+        let mut t = settled(false);
+        t.pointer_to(5, 5);
+        t.begin().unwrap();
+        t.end(true);
+        t.add_damage(SCREEN);
+        let d = t.begin().unwrap();
+        let mut fb = screen();
+        draw(&t, d, &mut fb, &src);
+        assert_eq!(at(&fb, 5, 5), 0);
+    }
+
+    #[test]
+    fn the_cursor_is_hidden_until_the_pointer_is_seen_and_then_one_row_per_ask() {
+        let mut s = settled(true);
+        // Nothing seen: the device shows nothing, no row.
+        assert_eq!(s.cursor_row(), None);
+        s.pointer_to(10, 20);
+        s.pointer_to(30, 40);
+        s.pointer_to(50, 60);
+        // Three moves before the ask: one row, the last place.
+        let row = s.cursor_row().unwrap();
+        assert_eq!(
+            row,
+            LayerRow::cursor(PIPELINE_CURSOR, SOURCE_CURSOR, 50, 60, CURSOR_HOT)
+        );
+        // Until the driver took it the same row is due again (a refusal
+        // is asked again at the next step).
+        assert_eq!(s.cursor_row(), Some(row));
+        s.cursor_shown(&row);
+        assert_eq!(s.cursor_row(), None);
+        // The same place again is no move.
+        s.pointer_to(50, 60);
+        assert_eq!(s.cursor_row(), None);
+        s.pointer_to(51, 60);
+        assert_eq!(s.cursor_row().map(|r| (r.x, r.y)), Some((51, 60)));
+    }
+
+    #[test]
+    fn a_refused_row_gives_the_pointer_back_to_the_frame_and_no_row_follows() {
+        // Never shown on the device: nothing to hide, the frame draws it.
+        let mut s = settled(true);
+        s.pointer_to(10, 10);
+        assert!(s.cursor_row().is_some());
+        assert_eq!(s.cursor_refused(), None);
+        assert!(!s.cursor_plane());
+        assert_eq!(s.cursor_row(), None);
+        s.pointer_to(30, 30);
+        assert_eq!(s.cursor_row(), None);
+        // The arrow's place is damaged at once, and a later move damages
+        // both places again.
+        assert_eq!(
+            s.begin(),
+            Some(rect(10, 10, 30 + CURSOR_W - 10, 30 + CURSOR_H - 10))
+        );
+        // The frame draws the pointer from now on.
+        assert_eq!(s.drawn_pointer(), Some((30, 30)));
+    }
+
+    #[test]
+    fn a_refusal_after_the_cursor_was_shown_hides_it_and_it_is_in_one_place_only() {
+        let mut s = settled(true);
+        s.pointer_to(10, 10);
+        let row = s.cursor_row().unwrap();
+        s.cursor_shown(&row);
+        s.pointer_to(20, 20);
+        assert_eq!(s.drawn_pointer(), None);
+        assert_eq!(s.cursor_refused(), Some(LayerRow::off(PIPELINE_CURSOR)));
+        assert_eq!(s.drawn_pointer(), Some((20, 20)));
+        assert_eq!(s.cursor_row(), None);
+        // A second refusal has nothing to say.
+        assert_eq!(s.cursor_refused(), None);
+        // The picture the device showed is painted over, and the new one
+        // drawn, by the next frame.
+        assert!(s.busy());
+    }
+
+    #[test]
+    fn the_cursor_rows_pass_the_driver_check() {
+        let mut s = settled(true);
+        for (x, y) in [(0, 0), (639, 399), (-5, 900)] {
+            s.pointer_to(x, y);
+            let row = s.cursor_row().unwrap();
+            let layers = proto_gpu::Layers::new(&[row]).unwrap();
+            assert_eq!(layers.check_virtio(), Ok(()), "{x} {y}");
+            s.cursor_shown(&row);
+        }
+    }
+
+    #[test]
+    fn a_cursor_row_hides_when_the_pointer_is_unseen_but_shown() {
+        let mut s = settled(true);
+        s.pointer_to(1, 1);
+        let row = s.cursor_row().unwrap();
+        s.cursor_shown(&row);
+        s.pointer = None;
+        let off = s.cursor_row().unwrap();
+        assert_eq!(off, LayerRow::off(PIPELINE_CURSOR));
+        s.cursor_shown(&off);
+        assert_eq!(s.cursor_row(), None);
+    }
+
+    #[test]
+    fn without_a_cursor_pipeline_there_is_no_row_and_the_pointer_is_drawn() {
+        let mut s = settled(false);
+        s.pointer_to(10, 10);
+        assert_eq!(s.cursor_row(), None);
+        assert!(!s.cursor_plane());
+        assert!(s.busy());
+    }
+
+    #[test]
+    fn taking_the_pipeline_paints_over_the_picture_the_frame_drew() {
+        let mut s = settled(false);
+        s.pointer_to(10, 10);
+        s.begin().unwrap();
+        s.end(true);
+        s.set_cursor_plane(Some((PIPELINE_CURSOR, SOURCE_CURSOR)));
+        assert_eq!(s.begin(), Some(rect(10, 10, CURSOR_W, CURSOR_H)));
+        s.end(true);
+        // The device's cursor shows nothing yet: the next ask brings it.
+        assert!(s.cursor_row().is_some());
     }
 
     #[test]

@@ -171,7 +171,7 @@ pub fn verdict(lines: &[String]) -> Result<(), String> {
 const CURSOR_PLACES: [(u32, u32); 5] = [(10, 20), (30, 40), (50, 60), (70, 80), (90, 100)];
 
 /// Whether `wanted` is a subsequence of `got`.
-fn contains_in_order<T: PartialEq>(got: &[T], wanted: &[T]) -> bool {
+pub fn contains_in_order<T: PartialEq>(got: &[T], wanted: &[T]) -> bool {
     let mut at = got.iter();
     wanted.iter().all(|w| at.any(|g| g == w))
 }

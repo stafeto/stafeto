@@ -77,10 +77,11 @@
 //! screen's coordinates (the pointer goes there) or a BUTTON.
 //!
 //! DESCRIBE's `flags` has bit 0 (HAS_MANAGER) set while a manager has
-//! subscribed. Its `open` is the windows alive now, `created` the windows ever
-//! made, `frames` the frames shown, `busy` 1 while a frame is being made
-//! or waits to be: a probe that waits for `busy` to be 0 finds the screen
-//! settled.
+//! subscribed, and bit 1 (CURSOR_PLANE) once the service put the pointer's
+//! picture on the display's cursor pipeline. Its `open` is the windows alive
+//! now, `created` the windows ever made, `frames` the frames shown, `busy` 1
+//! while a frame is being made or waits to be: a probe that waits for `busy`
+//! to be 0 finds the screen settled.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -111,6 +112,11 @@ pub const INPUT_MARK: u64 = 1 << 59;
 
 /// DESCRIBE's `flags`: a manager has subscribed.
 pub const HAS_MANAGER: u32 = 1;
+/// DESCRIBE's `flags`: the pointer's picture is on the display's cursor
+/// pipeline, so the points of the screen (the screenshot, the guest's CRC of
+/// the frames) never hold it. Without the bit the service draws the picture
+/// into the frame.
+pub const CURSOR_PLANE: u32 = 2;
 
 /// The bit the service sends a window's channel when its ring has events;
 /// bits 0 to 2 tell the buffer that is free.
