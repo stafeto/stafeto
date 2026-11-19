@@ -4832,6 +4832,7 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
             );
         }
         check_waits(&output.lines, &["1", "5"], "POSIX terminal steps")?;
+        check_console_driver_steps(&output.lines)?;
         let tty = longest_steps(&output.lines, "5");
         // This POSIX fixture calls Acquire, SetPgrp, GetPgrp and GetSid.
         // The separate native control probe also measures Controlling.
@@ -7435,6 +7436,38 @@ fn check_init_steps(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> 
 /// answered, and the service run again, within the deadline less the period.
 /// The counter of the image is 62.5 MHz (QEMU's virt), a tick 16 ns.
 const WATCH_LEFT_TICKS: u64 = (1_000 - 250) * 62_500;
+
+/// The tag of the lines of steps of the console driver (services/uart, feature `steps`).
+const CONSOLE_DRIVER_TAG: &str = "18";
+
+/// The steps of the console driver (tag 18) each under 0.9 of term B, the notices too (kind 64
+/// holds the ticks that take the kernel log, the longest of its steps): the driver has to have
+/// printed a table with a step of the log tick (kind 64 or 65) and of the calls of the terminal
+/// (WRITE_SOME, 11).
+fn check_console_driver_steps(lines: &[String]) -> Result<(), String> {
+    let rows = longest_steps(lines, CONSOLE_DRIVER_TAG);
+    for kind in [11usize] {
+        if !rows.iter().any(|(k, ..)| *k == kind) {
+            return Err(format!(
+                "the console driver printed no step of kind {kind}: {rows:?}"
+            ));
+        }
+    }
+    if !rows.iter().any(|(k, ..)| *k == 64 || *k == 65) {
+        return Err(format!(
+            "the console driver printed no step of its log tick: {rows:?}"
+        ));
+    }
+    let bound = TERM_B * 9 / 10;
+    if let Some((kind, ticks, detail)) = rows.iter().find(|(_, ticks, _)| *ticks > bound) {
+        return Err(format!(
+            "the console driver: a step of kind {kind} took {ticks} ticks (detail {detail}), past 0.9 of B, {bound}"
+        ));
+    }
+    let longest = rows.iter().map(|r| r.1).max().unwrap_or(0);
+    println!("console driver steps: the longest {longest} of {bound} (0.9 B)");
+    Ok(())
+}
 
 /// The heartbeats of the services (tags 1, 2, 4, 10, 11): each has a wait
 /// until init answered it, under CALL_WAIT_MAX with the other waits
@@ -15121,6 +15154,38 @@ mod tests {
         few.pop();
         assert!(check_init_steps(&few).unwrap_err().contains("kind 4"));
         assert!(check_init_steps(&[]).is_err());
+    }
+
+    /// The steps of the console driver are measured and none passes 0.9 of B, the busy tick of
+    /// the log included.
+    #[test]
+    fn console_driver_steps_are_measured_and_under_nine_tenths_of_b() {
+        let steps = |tick: u64| -> Vec<String> {
+            vec![
+                "service step: 18 kind 11 8490 ticks detail 0".to_owned(),
+                format!("service step: 18 kind 64 {tick} ticks detail 124"),
+                "service step: 18 kind 65 1851 ticks detail 0".to_owned(),
+            ]
+        };
+        assert!(check_console_driver_steps(&steps(TERM_B * 9 / 10)).is_ok());
+        assert!(
+            check_console_driver_steps(&steps(20_410))
+                .unwrap_err()
+                .contains("detail 124")
+        );
+        // The table of the service stands for lines lost in the burst.
+        let mut table = steps(14_000);
+        table[1] = "service table: 18 kind 64 14000 ticks detail 124 preempts 0".to_owned();
+        assert!(check_console_driver_steps(&table).is_ok());
+        // Without a step of the calls, or of the log tick, the table was not printed.
+        assert!(check_console_driver_steps(&steps(100)[..1]).is_err());
+        assert!(check_console_driver_steps(&[]).is_err());
+        let calls_only = &steps(100)[..1];
+        assert!(
+            check_console_driver_steps(calls_only)
+                .unwrap_err()
+                .contains("log tick")
+        );
     }
 
     #[test]

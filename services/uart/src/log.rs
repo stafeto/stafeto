@@ -290,14 +290,19 @@ impl Sources {
 /// bound holds with the records of the trace build, which add none. A
 /// period then costs at most STEP_BATCHES times the calls of one batch
 /// (`Sources::batch`: one object_info LOG of each source that has
-/// records), and the driver, which has no budget of its own yet, takes at
-/// most 36 records in 10 ms, 3.6 a millisecond.
-pub const STEP_BATCHES: usize = 3;
+/// records), and the driver takes at most 24 records in 5 ms, 4.8 a millisecond. A tick of three
+/// batches took up to 20,410 ticks under -icount (about 570 ticks a record if the cost is linear), as
+/// long as the longest step the system allows a service; two batches are expected to keep the
+/// longest tick near 14,000 ticks, under nine tenths of that bound (xtask posix-tty-steps checks
+/// it).
+pub const STEP_BATCHES: usize = 2;
 
 /// The period of the reads while the driver holds log text it has not put
 /// out, or the rings hold records it has not taken, in nanoseconds: a
-/// period takes up to STEP_BATCHES of 12 records.
-pub const DRAIN_NS: u64 = 10_000_000;
+/// period takes up to STEP_BATCHES of 12 records. The period was 10 ms with three batches
+/// (3.6 records a millisecond); 5 ms with two gives 4.8, above the 2.5 lines a millisecond of the
+/// console probes' burst.
+pub const DRAIN_NS: u64 = 5_000_000;
 
 /// The period of the reads while it holds none, in nanoseconds. The ring of
 /// a CPU holds 64 records, so a writer that comes while the driver is idle
@@ -708,6 +713,17 @@ mod tests {
     }
 
     #[test]
+    fn the_burst_of_the_console_probes_at_2_5_lines_a_millisecond_comes_out_whole() {
+        // apps/shell logburst: 150 lines, 5 at a time every 2 ms, so 60 ms; the driver idle, its
+        // first tick at any phase of its idle period.
+        for phase in 0..(IDLE_NS / 1_000_000) as u32 {
+            let r = run(150, 60, 1000, true, phase);
+            assert_eq!(r.lost, 0, "phase {phase}");
+            assert_eq!(r.delivered, (0..150).collect::<Vec<u32>>(), "phase {phase}");
+        }
+    }
+
+    #[test]
     fn the_same_burst_loses_records_with_one_batch_each_50_ms() {
         for phase in 0..50 {
             let r = run(150, 100, 1000, false, phase);
@@ -746,7 +762,7 @@ mod tests {
         while take_more(taken, crate::output::LOG_RING) {
             taken += 1;
         }
-        assert_eq!(taken * LOG_BATCH, 36);
+        assert_eq!(taken * LOG_BATCH, 24);
     }
 
     #[test]
