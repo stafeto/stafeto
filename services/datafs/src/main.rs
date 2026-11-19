@@ -341,16 +341,19 @@ impl Datafs {
     }
 
     /// A new label of the service's own and a copy of its channel that carries it, with `rights`.
-    fn make(&mut self, rights: Rights, pass: bool) -> Result<(u64, Handle<Any>), abi::Error> {
+    fn make(&mut self, rights: Rights, pass: bool) -> Result<(u64, Handle<Any>), Status> {
         if !pass && !admit::may_make(self.made, SESSIONS) {
-            return Err(abi::Error::LimitReached);
+            // The last places of the table are the native clients': the answer is the service's
+            // own TABLE_FULL, which the layer maps like a full table.
+            return Err(proto_data::code(proto_data::TABLE_FULL));
         }
         let label = if pass {
             proto_data::PASS | self.next_label
         } else {
             OWN | self.next_label
         };
-        let copy = sys::handle_label(&self.channel, rights, label, self.level)?;
+        let copy =
+            sys::handle_label(&self.channel, rights, label, self.level).map_err(Status::Kernel)?;
         self.next_label += 1;
         self.made += usize::from(!pass);
         Ok((label, copy.erase()))
@@ -434,7 +437,7 @@ impl Datafs {
             Some(Method::Bind) => Ok((0, (None, Some(brought)))),
             Some(Method::Session) => match self.make(Rights::SEND | Rights::TRANSFER, false) {
                 Ok(made) => Ok((made.0, (Some((Held::Made, made.1)), Some(brought)))),
-                Err(e) => Err(Answer::Status(Status::Kernel(e))),
+                Err(e) => Err(Answer::Status(e)),
             },
             _ => Err(Answer::Status(proto_data::code(proto_data::INVALID))),
         }
@@ -573,7 +576,7 @@ impl Datafs {
                     );
                 }
                 Err(e) => {
-                    let code = Status::Kernel(e).code().to_le_bytes();
+                    let code = e.code().to_le_bytes();
                     let _ = waiting.pending.answer(&code, Outgoing::new());
                 }
             }
@@ -625,11 +628,11 @@ impl Service<0> for Datafs {
         let (aux, handle) = match Method::from_number(r.method()) {
             Some(Method::Clone) => match self.make(Rights::SEND | Rights::TRANSFER, false) {
                 Ok(made) => (made.0, (Some((Held::Made, made.1)), None)),
-                Err(e) => return Answer::Status(Status::Kernel(e)),
+                Err(e) => return Answer::Status(e),
             },
             Some(Method::Export) => match self.make(Rights::TRANSFER, true) {
                 Ok(made) => (made.0, (Some((Held::Made, made.1)), None)),
-                Err(e) => return Answer::Status(Status::Kernel(e)),
+                Err(e) => return Answer::Status(e),
             },
             // BIND, SESSION and VERIFY_SESSION bring one handle: the identity session of the caller
             // (a copy for the worker to vouch for) or the session offered for verification.
