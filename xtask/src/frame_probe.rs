@@ -74,12 +74,13 @@ const STRESS_FRAMES_MIN: u64 = PERIODS / 2;
 /// the signs of life take a few percent, so about a tenth is left.
 const HOG_FLOOR_PPM: u64 = 80_000;
 /// The share of a period the service may use at most, in parts per million:
-/// the bands the cap lets it make in a period, each at the gate of a band,
-/// over the ticks of a period. The CPU the levels below it can count on is what
+/// the bands the cap lets it make in a period, each at the gate of a band, and
+/// the three steps of a frame beside them (the take, the commit and the end, each at
+/// the gate of a step), over the ticks of a period. The CPU the levels below it can count on is what
 /// the budgets above leave of the rest.
 fn service_share_ppm() -> u64 {
     use compositor::frame::DEFAULT_PERIOD_NS;
-    u64::from(frame_cap_bands()) * BAND * 1_000_000 / (DEFAULT_PERIOD_NS / TICK_NS)
+    (u64::from(frame_cap_bands()) * BAND + 3 * STEP) * 1_000_000 / (DEFAULT_PERIOD_NS / TICK_NS)
 }
 
 /// A tick count in microseconds.
@@ -181,7 +182,7 @@ pub fn overload_floor_frames() -> u64 {
 /// The bands the service makes in a period at most.
 pub fn frame_cap_bands() -> u32 {
     use compositor::frame::{DEFAULT_CAP_PPM, DEFAULT_PERIOD_NS, band_cap};
-    band_cap(DEFAULT_PERIOD_NS, DEFAULT_CAP_PPM, compositor::BAND_TICKS)
+    band_cap(DEFAULT_PERIOD_NS, DEFAULT_CAP_PPM)
 }
 
 /// The rows of the table of bounds.
@@ -463,9 +464,9 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                             p.capped, PERIODS
                         ));
                     }
-                    if p.capped < p.releases {
+                    if p.capped + 1 < p.releases {
                         return fail(format!(
-                            "capped {} periods, fewer than the {} frames released",
+                            "capped {} periods, fewer than the {} frames released (one taking allowed)",
                             p.capped, p.releases
                         ));
                     }
@@ -844,6 +845,24 @@ mod tests {
         let periods = overload_frame_bands().div_ceil(u64::from(frame_cap_bands()));
         assert_eq!(overload_floor_frames(), PERIODS / (periods + 1));
         assert!(HOG_FLOOR_PPM < 1_000_000 - service_share_ppm());
+        // The gate of a band the probe holds is the one the cap divides by.
+        assert_eq!(BAND, u64::from(compositor::BAND_GATE));
+        // The cap is the service's own function of the period and the cap in parts a million.
+        let period = compositor::frame::DEFAULT_PERIOD_NS;
+        let cap = compositor::frame::DEFAULT_CAP_PPM;
+        assert_eq!(frame_cap_bands(), compositor::frame::band_cap(period, cap));
+        // The service's share counts the bands and the three steps of a frame: 47 bands at
+        // 16 328 and 3 steps at 18 369 over a period of 1 041 666 ticks.
+        let ticks = u64::from(frame_cap_bands()) * BAND + 3 * STEP;
+        assert_eq!(service_share_ppm(), ticks * 1_000_000 / (period / TICK_NS));
+    }
+
+    /// The image the probe boots has its compositor on the frame clock at the defaults the cap is
+    /// derived from (no arguments: 60 Hz and 750 000 parts a million).
+    #[test]
+    fn the_image_of_the_probe_runs_the_compositor_on_the_clock() {
+        let record = TABLE.iter().find(|r| r.name == "gpu").unwrap();
+        assert!(record.args.is_empty());
     }
 
     /// The counts the heartbeat is made of: three services above the
@@ -1192,6 +1211,11 @@ mod tests {
         overload_line(&mut lines, &format!("releases {f}"), "releases 200");
         let e = verdict(&lines, true).unwrap_err();
         assert!(e.contains("fewer than the"), "{e}");
+        // One taking short is a read of STATS between a taking and the last band of a period.
+        let mut lines = good();
+        overload_line(&mut lines, "capped 240", "capped 120");
+        overload_line(&mut lines, &format!("releases {f}"), "releases 121");
+        assert!(verdict(&lines, true).is_ok());
         // A frame shown in its period though the scene cannot make one.
         let mut lines = good();
         let f = overload_floor_frames();
