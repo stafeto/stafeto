@@ -10,3 +10,8 @@ build = "build.rs"
 
 [lib]
 bench = false
+
+# `scan-count`: the images the table of kept images looked at in all are counted
+# (`Images::scanned`), for the measure of what a lookup costs a band.
+[features]
+scan-count = []

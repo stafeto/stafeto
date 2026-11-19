@@ -1127,6 +1127,8 @@ impl Compositor {
                 }
             }
             Fire::Continue => {
+                #[cfg(feature = "steps")]
+                px::cost::mark_expiry();
                 let _ = sys::notify(&self.notify, BAND);
             }
             Fire::Idle | Fire::Early => {}
@@ -1157,6 +1159,8 @@ impl Compositor {
             damage,
             at: Band { row, col: 0 },
         });
+        #[cfg(feature = "steps")]
+        px::cost::mark_first_of_frame();
         let _ = sys::notify(&self.notify, BAND);
         true
     }
@@ -1189,6 +1193,8 @@ impl Compositor {
         let made = self.raster.made();
         #[cfg(feature = "steps")]
         px::cost::band_begin();
+        #[cfg(feature = "irq-trace")]
+        let (times_began, scan_began) = (px::cost::trace::times(), self.raster.scanned());
         #[cfg(feature = "steps")]
         let compose_began = rt::time::now();
         job.at = compose(
@@ -1200,10 +1206,21 @@ impl Compositor {
             &mut self.raster,
         );
         #[cfg(feature = "steps")]
-        px::cost::band_end(
+        let (compose_ticks, band_ticks) = (
             rt::time::now() - compose_began,
             rt::time::now() - band_began,
         );
+        #[cfg(feature = "irq-trace")]
+        {
+            let times = px::cost::trace::times();
+            px::cost::trace::band(
+                times.0.saturating_sub(times_began.0),
+                times.1.saturating_sub(times_began.1),
+                self.raster.scanned().wrapping_sub(scan_began),
+            );
+        }
+        #[cfg(feature = "steps")]
+        px::cost::band_end(compose_ticks, band_ticks);
         // The images this band made (surfaces first used in it) go in the
         // detail with the band's number, so that a long band is told from a
         // band of images made.
@@ -1219,6 +1236,8 @@ impl Compositor {
             // start of the next one, and the timer is armed by a step of its
             // own (ARM), so that the kernel call is not in the longest band.
             frame::Band::Defer(_) => {
+                #[cfg(feature = "steps")]
+                px::cost::mark_before_cap();
                 let _ = sys::notify(&self.notify, ARM);
             }
         }
