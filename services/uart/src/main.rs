@@ -312,6 +312,11 @@ fn main(_: u64) -> u64 {
             ticks: 0,
             first: (0, 0, 0),
             said_latency: false,
+            reason: 4,
+            previous: 4,
+            last: 0,
+            reasons: [0; REASONS],
+            first_reasons: [0; REASONS],
         },
         irqs: Irq::new(),
         stop_by: None,
@@ -388,7 +393,21 @@ struct Probe {
     /// The wake-ups, the overruns and the time (ms) at the first safety tick.
     first: (u64, u64, u64),
     said_latency: bool,
+    /// The reason of the wake-up in progress (`REASON_*`), the overruns read at the end of the
+    /// last one, the overruns of each reason so far and at the first safety tick.
+    reason: usize,
+    previous: usize,
+    last: u64,
+    reasons: [u64; REASONS],
+    first_reasons: [u64; REASONS],
 }
+
+/// The reasons a wake-up of the driver is told by: the heartbeat to init (not the log's work),
+/// the kernel's notification of a record, the safety tick, a tick of the drain, the rest.
+#[cfg(feature = "quiet-probe")]
+const REASONS: usize = 5;
+#[cfg(feature = "quiet-probe")]
+const REASON_BEAT: usize = 0;
 
 /// The binding of the log's line (spec 9, 11): a copy of the driver's channel
 /// with NOTIFY and LOG_LABEL, and the binding through it at the driver's
@@ -1170,6 +1189,12 @@ impl Service<HELD> for Uart {
         #[cfg(feature = "quiet-probe")]
         {
             self.probe.wakeups += 1;
+            self.probe.reason = match (n.source, n.label) {
+                (Source::Interrupt, LOG_LABEL) => 1,
+                (Source::Timer, TIMER_LABEL) if self.safety => 2,
+                (Source::Timer, TIMER_LABEL) => 3,
+                _ => 4,
+            };
         }
         match (n.source, n.label) {
             (Source::Interrupt, LOG_LABEL) => self.log_notified(),
@@ -1200,6 +1225,21 @@ impl Service<HELD> for Uart {
     /// quiet window is over, which no other wake-up of the driver is near.
     #[cfg(feature = "quiet-probe")]
     fn maintenance(&mut self, _: &mut [Option<Session<(), HELD>>], notice: Notice) {
+        // The overruns of the budget since the last wake-up are this one's, by its reason: the
+        // heartbeat is no notification of the driver's, the rest set the reason in `notification`.
+        let reason = if notice.source == Source::Timer && notice.label == 0 {
+            REASON_BEAT
+        } else {
+            self.probe.reason
+        };
+        // The kernel counts an overrun when the budget's event fires, up to a period (10 ms)
+        // after the step that ran it out, so the ones seen now belong to the wake-up before this.
+        if let Some(now) = self.probe_overruns() {
+            self.probe.reasons[self.probe.previous] += now.wrapping_sub(self.probe.last);
+            self.probe.last = now;
+        }
+        self.probe.previous = reason;
+        self.probe.reason = 4;
         if notice.source == Source::Timer
             && notice.label == 0
             && self.state.latency.writes(self.probe.ticks)
@@ -1220,6 +1260,15 @@ impl Service<HELD> for Uart {
         // (uart::log): the next tick, within IDLE_NS, does it and checks for the
         // exit, so the stop adds no step of its own.
         self.arm();
+    }
+}
+
+#[cfg(feature = "quiet-probe")]
+impl Uart {
+    /// The overruns of the driver's budget the kernel counts, if they can be read.
+    fn probe_overruns(&self) -> Option<u64> {
+        let budget = self.probe.budget.as_ref()?;
+        sys::budget_info(budget).ok().map(|info| info.overruns)
     }
 }
 
@@ -1277,7 +1326,14 @@ impl Uart {
             let now = (self.probe.wakeups, overruns, at);
             if self.probe.ticks == 1 {
                 self.probe.first = now;
+                self.probe.first_reasons = self.probe.reasons;
             } else if self.probe.ticks == 11 {
+                let d: [u64; REASONS] =
+                    core::array::from_fn(|i| self.probe.reasons[i] - self.probe.first_reasons[i]);
+                self.say_log(format_args!(
+                    "uart: quiet reasons beat {} log {} safe {} drain {} other {}\n",
+                    d[0], d[1], d[2], d[3], d[4]
+                ));
                 let (w, o, t) = self.probe.first;
                 self.say_log(format_args!(
                     "uart: quiet window wakeups {} overruns {} ms {}\n",
