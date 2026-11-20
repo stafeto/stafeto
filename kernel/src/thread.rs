@@ -1195,10 +1195,11 @@ pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64, u64, u64) {
 }
 
 /// object_info THREAD_PLACE of `thread`, which the caller holds (spec 11): where it stands and
-/// what its CPU does. The state, the command flags and the queue count are one read under `OBJ`
-/// (the flags and the state change only there, but for the owner's `take_batch`, which is what
-/// makes the state 5); the words of the CPU are read after the section, with no lock, and agree
-/// with the state only roughly. O(MAX_CPUS), for the count of the queues.
+/// what its CPU does. The state and the command flags are one read under `OBJ`
+/// (they change only there, but for the owner's `take_batch`, which is what makes the state 5);
+/// the words of the CPU and the count of the queues (x8) are read after the section, with no lock
+/// (`OBJ` does not guard the rings), and agree with the state only roughly: a count of 0 proves
+/// the thread is not queued, a larger one does not prove it is. O(MAX_CPUS), for the count.
 pub fn place(thread: NonNull<Thread>) -> abi::ThreadPlace {
     let (state, cmds, cpu) = sched::locked(|_| {
         // SAFETY: the caller holds a reference to the thread; only its fields are read.

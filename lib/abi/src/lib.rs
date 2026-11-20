@@ -968,9 +968,11 @@ pub const INFO_BUDGET: u64 = 19;
 ///
 /// A diagnostic kind: its words and the values of x2 may change between series of this ABI, and
 /// the kernel, `rt` and the services build no decision on it beyond printing it. x1 is the CPU of
-/// the thread and never changes. x2, x3 and x8 are one read under the kernel lock, so they agree
-/// with each other. x4-x7 are the CPU's own words, read with no lock while the CPU goes on: they
-/// agree with x2 only roughly, within the microseconds the CPU needs to change its thread.
+/// the thread and never changes. x2 and x3 are one read under the kernel lock, so they agree
+/// with each other. x4-x8 are read with no lock while the CPU goes on (x4-x7 are the CPU's own
+/// words, x8 sums the heads and tails of the queues, which the lock does not guard): they agree
+/// with x2 only roughly, within the microseconds the CPU needs to change its thread. x8 = 0 proves
+/// the thread is not queued; x8 > 0 does not prove it is.
 ///
 /// x2 is a `PlaceState` code: 0 stopped, 1 running, 2 ready in the queue of its CPU, 3 waiting,
 /// 4 the wait is over and the command that wakes the thread still stands for its CPU (the flags

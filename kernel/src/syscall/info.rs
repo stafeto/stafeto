@@ -387,6 +387,10 @@ pub(super) fn debug_write(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
         // A command-less ask to CPU 1 to enter the kernel: how the test of the place of a thread
         // recovers the CPU a break left deaf.
         b"idle-probe kick" => {
+            // `kick` asks another CPU: from CPU 1 itself it would stop a debug build.
+            if crate::arch::cpu::this().index() == 1 {
+                return Err(Error::InvalidArgs);
+            }
             crate::cmd::kick(1);
             crate::cmd::flush_posted();
             return Ok(Values::new(&[a[1]]));
