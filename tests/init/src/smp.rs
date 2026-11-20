@@ -2727,7 +2727,7 @@ fn lose_a_wake_up(a: &Handle<Thread>, c: &Handle<Channel>, which: usize) -> Outc
         }
         let (first, second, stuck) = place_twice(a)?;
         if !stuck {
-            // Taken late, not lost: the next attempt.
+            // Taken late and so not lost: the next attempt.
             check(
                 wait_for(|| mark(1) > before),
                 "the thread did not take the notification",

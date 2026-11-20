@@ -7453,7 +7453,7 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// `NULL_MAX` 271 -> 275 (object_info THREAD_PLACE): every pass of `thread::run` writes the level
 /// of the thread that goes to EL0 into the line of its CPU that other CPUs read (the decision of
 /// tasks/2026-11-20-thread-place-kernel-decision.md, M3: the level must be right whatever
-/// changed it, so the store is on every pass, not on a switch); 275 measured, 4 over, a load of
+/// changed it, so the store is on every pass, whatever the switches); 275 measured, 4 over, a load of
 /// the thread's level, the store, and the test of a switch with the store of the stint start.
 /// The change is of the path, so the reviewer of the kernel decides whether it stays.
 ///
