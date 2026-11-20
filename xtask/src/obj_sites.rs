@@ -30,8 +30,10 @@ pub const OBJ_LOCK_SITES: &[(&str, usize)] = &[
     ("kernel/src/cmd.rs", 1),
     ("kernel/src/init.rs", 3),
     // The delivery of a line and that of an LPI, one take an interrupt
-    // (`wcet bound`: interrupt of a device k = 1).
-    ("kernel/src/irq.rs", 2),
+    // (`wcet bound`: interrupt of a device k = 1), and the post of the log's
+    // wake, one take a turn of the way out of the kernel that has a post to
+    // make, in a turn that makes no other take (`irq::deliver_log`).
+    ("kernel/src/irq.rs", 3),
     ("kernel/src/main.rs", 1),
     ("kernel/src/memory.rs", 3),
     ("kernel/src/mm/aspace.rs", 1),
