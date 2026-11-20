@@ -969,7 +969,7 @@ extern "C" fn exit_loop() -> ! {
             continue;
         }
         // The probe kernel's line about a new generation of ASIDs is written here, at
-        // the start of a turn, not on the way to EL0: a record there would claim the
+        // the start of a turn and never on the way to EL0: a record there would claim the
         // arming of the log's wake after this turn's poll, and its post (the SGI the
         // record sends) would come at the next entry of the kernel.
         #[cfg(feature = "asid-probe")]
