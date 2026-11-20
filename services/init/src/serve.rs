@@ -52,7 +52,8 @@ use init::quota::{self, Start};
 use init::restart::{BREAK_AFTER, Failures, Verdict, WINDOW_NS};
 use init::shutdown::{self, Decision, Expiry, Mask, Stop};
 use init::silent::{
-    BudgetLook, ChannelLook, CpuSleep, DIAG_CPUS, Diag, Look, Moment, Nudged, ThreadLook,
+    BudgetLook, ChannelLook, CpuSleep, DIAG_CPUS, Diag, Look, Moment, Nudged, PlaceLook,
+    PlaceReading, STUCK_GAP_US, ThreadLook,
 };
 use init::table::{self, MAX_RECORDS, Record, Restart};
 use init::waits::{self, Gate, Release, Standing, Step};
@@ -870,7 +871,33 @@ impl Init {
         let (cpus, up, _) = read_cpus();
         self.nudge(place);
         let at_us = now() / 1000;
-        self.nudged = Some((place, Nudged { at_us, up, cpus }));
+        let place_then = self.read_place(place);
+        self.nudged = Some((
+            place,
+            Nudged {
+                at_us,
+                up,
+                cpus,
+                place: place_then,
+            },
+        ));
+    }
+
+    /// Where the thread of the instance of `place` stands (`object_info` THREAD_PLACE through the
+    /// resource with KSTATS), with init's counter around the call. None when init holds no thread
+    /// for it or the call failed.
+    fn read_place(&self, place: usize) -> Option<PlaceReading> {
+        let thread = self.entries[place]
+            .held
+            .running()
+            .and_then(|instance| instance.thread.as_ref())?;
+        let before = time::now();
+        let reading = sys::thread_place(thread, &self.resource).ok()?;
+        Some(PlaceReading {
+            place: reading,
+            before,
+            after: time::now(),
+        })
     }
 
     fn notify_label(&self, place: usize, bits: u64) -> bool {
@@ -1526,6 +1553,7 @@ impl Init {
         } else {
             ([CpuSleep::default(); DIAG_CPUS], 0, None)
         };
+        let nudged = self.nudged.filter(|(p, _)| *p == place).map(|(_, n)| n);
         let diag = diag.then(|| {
             let (refused, last) = self.entries[place]
                 .watch
@@ -1546,7 +1574,13 @@ impl Init {
                 channel,
                 init_cpu,
                 cpus: &cpus[..up],
-                nudged: self.nudged.filter(|(p, _)| *p == place).map(|(_, n)| n),
+                nudged,
+                place: Some(PlaceLook {
+                    first: nudged.and_then(|n| n.place),
+                    second: self.read_place(place),
+                    min_gap_ticks: time::ns_to_ticks(STUCK_GAP_US * 1000),
+                    to_us: |ticks| time::ticks_to_ns(ticks) / 1000,
+                }),
             }
         });
         let look = Look {
