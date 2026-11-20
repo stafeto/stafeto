@@ -1826,10 +1826,14 @@ enum Variant {
     LiftAgainNotice,
     LiftAgainReply,
     LogSeenBreak,
+    /// The irq_ack of the log's binding that does not look at the rings
+    /// (`break-log-wake`): the kernel test of the arming must catch it
+    /// (`cargo xtask log-wake-break`, and `budget-breaks`).
+    LogWakeBreakTest,
 }
 
 impl Variant {
-    const ALL: [Variant; 77] = [
+    const ALL: [Variant; 78] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1906,6 +1910,7 @@ impl Variant {
         Variant::LiftAgainNotice,
         Variant::LiftAgainReply,
         Variant::LogSeenBreak,
+        Variant::LogWakeBreakTest,
         Variant::LiftAgainReplyTest,
     ];
 
@@ -1994,6 +1999,7 @@ impl Variant {
             Variant::LiftAgainNotice => Some("break-relift-notice"),
             Variant::LiftAgainReply => Some("break-relift-reply"),
             Variant::LogSeenBreak => Some("break-log-seen"),
+            Variant::LogWakeBreakTest => Some("ktest,break-log-wake"),
         }
     }
 
@@ -2095,6 +2101,7 @@ impl Variant {
             Variant::LiftAgainNotice => "stafeto-relift-notice",
             Variant::LiftAgainReply => "stafeto-relift-reply",
             Variant::LogSeenBreak => "stafeto-log-seen-break",
+            Variant::LogWakeBreakTest => "stafeto-ktest-log-wake-break",
         }
     }
 }
@@ -2539,6 +2546,7 @@ commands:
             notification's goes with the budget)
   budget-journal the probe of the overruns in init's journal under -icount: one line in each 10 s for a budget that overruns in every period, none for one that does not
   log-quiet [icount|tcg] the quiet probe of the kernel log's wake: an idle system for 10 s wakes the console driver at most 12 times with no overrun of its budget, and the latency of a line after its write is printed
+  log-wake-break the kernel built with break-log-wake (irq_ack of the log's binding looks at no ring) must fail the kernel test of the arming
   budget-breaks the deliberate breaks of the time budgets fail the probe, the kernel tests and the host tests
   budget-break-unbound the share probe of the network service fails on the image with no budget bound
   its-breaks the deliberate breaks of the ITS command counter and the portions of teardown fail their host tests
@@ -2619,6 +2627,7 @@ fn main() {
         Some("budget-break-unbound") => budget_hog::unbound_break(),
         Some("budget-journal") => budget_journal::run(&args[1..]),
         Some("log-quiet") => log_quiet::run(&args[1..]),
+        Some("log-wake-break") => log_quiet::breaks(),
         Some("rtbench") => match &args[1..] {
             [flag, minutes, placing @ ..] if flag == "--minutes" => minutes
                 .parse::<u64>()

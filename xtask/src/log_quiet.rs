@@ -28,7 +28,7 @@
 use std::time::Duration;
 
 use crate::{
-    BOOT_PROFILE, INIT_STACK_SIZE, ImageProgram, SHELL_STACK_SIZE, UART_STACK_SIZE,
+    BOOT_PROFILE, INIT_STACK_SIZE, ImageProgram, SHELL_STACK_SIZE, UART_STACK_SIZE, Variant, build,
     build_boot_image, probe_command, qemu,
 };
 
@@ -184,6 +184,26 @@ fn probe(icount: bool) -> Result<Report, String> {
     }
     let (said, latency) = parse(&outcome.lines);
     verdict(said, latency, icount)
+}
+
+/// The kernel test of the log's arming and the kernel built to break it
+/// (`cargo xtask log-wake-break`, part of `budget-breaks`): with the rings left out of the
+/// `irq_ack` of the log's binding, a record that waits for the first `irq_ack` is never posted,
+/// and the test must report the failure.
+pub fn breaks() -> Result<(), String> {
+    const TEST: &str = "log_wake_posts_once_for_each_arming";
+    let a = build(Variant::LogWakeBreakTest)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+    cmd.args(qemu::HEADLESS);
+    let o = qemu::run_until(cmd, Duration::from_secs(300), None)?;
+    let report = qemu::parse_report(&o.lines);
+    if !report.failed.iter().any(|(name, _)| name == TEST) {
+        return Err(format!(
+            "the kernel with no look at the rings passed {TEST}"
+        ));
+    }
+    println!("log-wake-break: a kernel whose irq_ack looks at no ring fails {TEST}");
+    Ok(())
 }
 
 /// `cargo xtask log-quiet [icount|tcg]`.
