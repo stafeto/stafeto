@@ -293,6 +293,24 @@ pub fn flush() {
     }
 }
 
+/// The command flags of `t` (object_info THREAD_PLACE), read in the section that reads its state.
+pub fn flags_of(t: NonNull<Thread>) -> u8 {
+    crate::obj::assert_held();
+    thread_cmds(t).load(Ordering::Relaxed)
+}
+
+/// The threads that stand in the queues of commands to CPU `to`, with no lock: the writers' tails
+/// and the reader's head, each read once (object_info THREAD_PLACE).
+pub fn queued_to(to: usize) -> u64 {
+    RINGS[to]
+        .iter()
+        .map(|r| {
+            let head = r.head.0.load(Ordering::Relaxed);
+            u64::from(r.tail.0.load(Ordering::Relaxed).wrapping_sub(head))
+        })
+        .sum()
+}
+
 fn thread_cmds<'a>(t: NonNull<Thread>) -> &'a AtomicU8 {
     // SAFETY: the thread is alive and in place; the field is atomic.
     unsafe { &(*t.as_ptr()).numbers.cmds }
@@ -310,6 +328,7 @@ pub const DRAIN_BATCH: usize = 8;
 /// SGI this CPU sends itself, which the next poll for an interrupt takes. On
 /// the empty kernel stack, no lock held.
 pub fn drain() {
+    local().place.drains(crate::arch::timer::now_unordered());
     let (batch, n) = take_batch();
     serve_batch(&batch[..n]);
 }

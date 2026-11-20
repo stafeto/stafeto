@@ -51,7 +51,10 @@ use init::overrun::Overruns;
 use init::quota::{self, Start};
 use init::restart::{BREAK_AFTER, Failures, Verdict, WINDOW_NS};
 use init::shutdown::{self, Decision, Expiry, Mask, Stop};
-use init::silent::{BudgetLook, ChannelLook, CpuSleep, Diag, Look, Moment, ThreadLook};
+use init::silent::{
+    BudgetLook, ChannelLook, CpuSleep, DIAG_CPUS, Diag, Look, Moment, Nudged, PlaceLook,
+    PlaceReading, STUCK_GAP_US, ThreadLook,
+};
 use init::table::{self, MAX_RECORDS, Record, Restart};
 use init::waits::{self, Gate, Release, Standing, Step};
 use init::watch::{Action, Watched};
@@ -210,9 +213,6 @@ impl Held {
     }
 }
 
-/// The CPUs whose sleep the line of a silent service tells.
-const DIAG_CPUS: usize = 8;
-
 /// What the main thread keeps for a record of the table: its state, its
 /// instance, what is left of the instance that ended until the worker
 /// takes it for its teardown, the CONNECT requests that wait for it to
@@ -325,6 +325,27 @@ fn now() -> u64 {
     time::ticks_to_ns(time::now())
 }
 
+/// What each CPU of the machine counts (up to `DIAG_CPUS`, in the order of its number), how many
+/// there are, and the CPU init runs on.
+fn read_cpus() -> ([CpuSleep; DIAG_CPUS], usize, Option<u64>) {
+    let us = |ticks| time::ticks_to_ns(ticks) / 1000;
+    let mut cpus = [CpuSleep::default(); DIAG_CPUS];
+    let mut up = 0;
+    let mut init_cpu = None;
+    while up < DIAG_CPUS {
+        let Ok(info) = sys::cpu_info(up as u64) else {
+            break;
+        };
+        init_cpu = Some(info.current);
+        cpus[up] = CpuSleep {
+            since_us: us(info.since),
+            idle_us: us(info.idle),
+        };
+        up += 1;
+    }
+    (cpus, up, init_cpu)
+}
+
 /// The room of the counts of the overruns, which live as long as init: the
 /// table of the budgets is 4 KiB, more than the stack of the main thread
 /// can spare in `Init`.
@@ -358,6 +379,10 @@ pub struct Init {
     labels: Labels,
     programs: [Option<Program<'static>>; MAX_RECORDS],
     entries: [Entry; MAX_RECORDS],
+    /// What the last first miss noted (`Nudged`) and the record it was of: one place for all, as
+    /// the room of init is short, so a silence finds the note of its own record unless another
+    /// record's first miss came between.
+    nudged: Option<(usize, Nudged)>,
     /// The job the worker does and those that wait.
     jobs: Jobs,
     /// The process service's ADOPT that waits for a POSIX process.
@@ -393,6 +418,7 @@ impl Init {
             labels,
             programs,
             entries: [Entry::NEW; MAX_RECORDS],
+            nudged: None,
             jobs: Jobs::new(),
             adoption: None,
             started: 0,
@@ -837,6 +863,41 @@ impl Init {
     /// ends nothing. False when the copy could not be made.
     fn nudge(&self, place: usize) -> bool {
         self.notify_label(place, PROBE_BIT)
+    }
+
+    /// The first miss of the service at `place`: the nudge, and a note of its instant and of the
+    /// sleep of each CPU, for the line of the silence that may follow.
+    fn nudge_and_note(&mut self, place: usize) {
+        let (cpus, up, _) = read_cpus();
+        self.nudge(place);
+        let at_us = now() / 1000;
+        let place_then = self.read_place(place);
+        self.nudged = Some((
+            place,
+            Nudged {
+                at_us,
+                up,
+                cpus,
+                place: place_then,
+            },
+        ));
+    }
+
+    /// Where the thread of the instance of `place` stands (`object_info` THREAD_PLACE through the
+    /// resource with KSTATS), with init's counter around the call. None when init holds no thread
+    /// for it or the call failed.
+    fn read_place(&self, place: usize) -> Option<PlaceReading> {
+        let thread = self.entries[place]
+            .held
+            .running()
+            .and_then(|instance| instance.thread.as_ref())?;
+        let before = time::now();
+        let reading = sys::thread_place(thread, &self.resource).ok()?;
+        Some(PlaceReading {
+            place: reading,
+            before,
+            after: time::now(),
+        })
     }
 
     fn notify_label(&self, place: usize, bits: u64) -> bool {
@@ -1487,26 +1548,12 @@ impl Init {
                 count += 1;
             }
         }
-        let mut cpus = [CpuSleep {
-            since_us: 0,
-            idle_us: 0,
-        }; DIAG_CPUS];
-        let mut up = 0;
-        let mut init_cpu = None;
-        if diag {
-            let us = |ticks| time::ticks_to_ns(ticks) / 1000;
-            while up < DIAG_CPUS {
-                let Ok(info) = sys::cpu_info(up as u64) else {
-                    break;
-                };
-                init_cpu = Some(info.current);
-                cpus[up] = CpuSleep {
-                    since_us: us(info.since),
-                    idle_us: us(info.idle),
-                };
-                up += 1;
-            }
-        }
+        let (cpus, up, init_cpu) = if diag {
+            read_cpus()
+        } else {
+            ([CpuSleep::default(); DIAG_CPUS], 0, None)
+        };
+        let nudged = self.nudged.filter(|(p, _)| *p == place).map(|(_, n)| n);
         let diag = diag.then(|| {
             let (refused, last) = self.entries[place]
                 .watch
@@ -1527,6 +1574,13 @@ impl Init {
                 channel,
                 init_cpu,
                 cpus: &cpus[..up],
+                nudged,
+                place: Some(PlaceLook {
+                    first: nudged.and_then(|n| n.place),
+                    second: self.read_place(place),
+                    min_gap_ticks: time::ns_to_ticks(STUCK_GAP_US * 1000),
+                    to_us: |ticks| time::ticks_to_ns(ticks) / 1000,
+                }),
             }
         });
         let look = Look {
@@ -1777,7 +1831,7 @@ impl Init {
                         // The first miss: a nudge, so that the line of a silence that follows
                         // has the answer of the service's heartbeat before it.
                         if first {
-                            self.nudge(place);
+                            self.nudge_and_note(place);
                         }
                     }
                     Some((Action::Silent, _)) => self.silent(place, now),

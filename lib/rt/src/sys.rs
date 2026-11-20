@@ -808,6 +808,21 @@ pub fn thread_info(thread: &Handle<Thread>) -> Result<ThreadInfo, Error> {
     Ok(ThreadInfo::from_words([x[1], x[2], x[3], x[4]]))
 }
 
+/// object_info(THREAD_PLACE): where the thread stands and what its CPU does (abi::ThreadPlace),
+/// for a holder of the system resource with KSTATS. A diagnostic: the words may change between
+/// series of the ABI, and a caller prints them and builds no decision on them beyond the rule of
+/// two readings in the description of abi::INFO_THREAD_PLACE.
+pub fn thread_place(
+    thread: &Handle<Thread>,
+    resource: &Handle<Resource>,
+) -> Result<abi::ThreadPlace, Error> {
+    let args = [thread.raw().0, abi::INFO_THREAD_PLACE, resource.raw().0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(abi::ThreadPlace::from_words([
+        x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8],
+    ]))
+}
+
 /// One owned Rights::NONE capability of this actual calling thread.
 /// Its handle-table entry is paid by this process and must be closed.
 pub fn self_thread() -> Result<Handle<Thread>, Error> {

@@ -961,6 +961,46 @@ pub const INFO_STAMPS: u64 = 18;
 /// BUDGET takes a budget's handle, with no right needed, and returns
 /// `BudgetInfo::to_words` in x1-x8.
 pub const INFO_BUDGET: u64 = 19;
+/// THREAD_PLACE takes a thread's handle in x0, with no right needed, and in x2 the system
+/// resource with KSTATS (looked up first; ACCESS_DENIED without the right). It returns
+/// `ThreadPlace::to_words` in x1-x8: where the thread stands and what the CPU it belongs to is
+/// doing (stafeto#503, tasks/2026-11-20-thread-place-kernel-decision.md).
+///
+/// A diagnostic kind: its words and the values of x2 may change between series of this ABI, and
+/// the kernel, `rt` and the services build no decision on it beyond printing it. x1 is the CPU of
+/// the thread and never changes. x2 and x3 are one read under the kernel lock, so they agree
+/// with each other. x4-x8 are read with no lock while the CPU goes on (x4-x7 are the CPU's own
+/// words, x8 sums the heads and tails of the queues, which the lock does not guard): they agree
+/// with x2 only roughly, within the microseconds the CPU needs to change its thread. x8 = 0 proves
+/// the thread is not queued; x8 > 0 does not prove it is.
+///
+/// x2 is a `PlaceState` code: 0 stopped, 1 running, 2 ready in the queue of its CPU, 3 waiting,
+/// 4 the wait is over and the command that wakes the thread still stands for its CPU (the flags
+/// in x3 are not zero), 5 the wait is over and the CPU has taken the flags but not finished
+/// serving them, 6 parked, 7 ended. x3 is the command flags of the thread (1 wake, 2 start,
+/// 4 unpark, 8 level, 16 boost, 32 end). x4 is the level of the last thread the CPU let go to
+/// EL0, 0 while the CPU idles. x5 holds the bits `PLACE_IDLE` (the CPU is in its idle loop: the
+/// window of the poll or `wfi`), `PLACE_POLLING` (it is in the window) and `PLACE_BELL` (another
+/// CPU rang and no poll has begun since). x6 is the counter ticks since the CPU last served its
+/// commands. x7 is the ticks since the thread of x4 began its stint on the CPU, or since the CPU
+/// began its idle loop. x8 is the number of threads that stand in the queues of commands to the
+/// CPU of x1.
+///
+/// A thread is stuck in the sense of a lost wake-up only when two readings at least 10 ms apart
+/// both give x2 = 4 with the same x3 and the x6 of the second is at least that of the first plus
+/// the time between them. A single x2 = 4 is the way every wake-up from another CPU passes.
+/// Pictures: x2 = 4, x8 > 0, `PLACE_IDLE` and `PLACE_BELL` set and `PLACE_POLLING` clear: the CPU
+/// was rung and sleeps in `wfi` with no SGI sent or arrived; x2 = 4, x8 > 0, `PLACE_BELL` clear
+/// and x6 growing: the poll took the bell and the commands were not served; x2 = 4 and x8 = 0:
+/// the thread never entered a queue, the command was lost on the sender's side; x2 = 5 for long
+/// on an awake CPU: the service of the commands waits for a copy of a message or for the lock.
+pub const INFO_THREAD_PLACE: u64 = 20;
+/// THREAD_PLACE x5: the CPU is in its idle loop, in the window of its poll or asleep in `wfi`.
+pub const PLACE_IDLE: u64 = 1;
+/// THREAD_PLACE x5: the CPU is in the window of its poll.
+pub const PLACE_POLLING: u64 = 2;
+/// THREAD_PLACE x5: another CPU rang, and the CPU has begun no poll since.
+pub const PLACE_BELL: u64 = 4;
 /// object_info STAMPS x2: the CPU number goes in the bits from this one up.
 pub const STAMPS_CPU_SHIFT: u32 = 48;
 /// object_info STAMPS x2: with this bit set, every ring stops taking records
@@ -1428,6 +1468,109 @@ impl ThreadInfo {
             base: words[1] as u8,
             priority: words[2] as u8,
             policy: Policy::from_raw(words[3]),
+        }
+    }
+}
+
+/// Where a thread stands (`INFO_THREAD_PLACE` x2). The values may change between series of this
+/// ABI; a code this one does not know parses as `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceState {
+    /// Made and not started, or stopped.
+    Stopped,
+    /// On the CPU.
+    Running,
+    /// In the ready queue of its CPU.
+    Ready,
+    /// Waits in a channel.
+    Waiting,
+    /// Its wait is over and the wake command still stands for its CPU.
+    WakeStanding,
+    /// Its wait is over; its CPU took the flags and has not finished serving them.
+    WakeTaken,
+    /// Parked by its process.
+    Parked,
+    /// Ended.
+    Ended,
+}
+
+impl PlaceState {
+    /// The code in x2: 0 to 7 in the order above.
+    pub const fn code(self) -> u64 {
+        match self {
+            PlaceState::Stopped => 0,
+            PlaceState::Running => 1,
+            PlaceState::Ready => 2,
+            PlaceState::Waiting => 3,
+            PlaceState::WakeStanding => 4,
+            PlaceState::WakeTaken => 5,
+            PlaceState::Parked => 6,
+            PlaceState::Ended => 7,
+        }
+    }
+
+    /// The state with this code, `None` for a code this abi does not know.
+    pub const fn from_word(word: u64) -> Option<PlaceState> {
+        match word {
+            0 => Some(PlaceState::Stopped),
+            1 => Some(PlaceState::Running),
+            2 => Some(PlaceState::Ready),
+            3 => Some(PlaceState::Waiting),
+            4 => Some(PlaceState::WakeStanding),
+            5 => Some(PlaceState::WakeTaken),
+            6 => Some(PlaceState::Parked),
+            7 => Some(PlaceState::Ended),
+            _ => None,
+        }
+    }
+}
+
+/// What `INFO_THREAD_PLACE` returns in x1-x8 (see the kind for the meaning of each word). It holds
+/// the words and no judgement: whether a thread is stuck is for the reader to decide from two
+/// readings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadPlace {
+    pub cpu: u64,
+    /// `None` for a code this abi does not know.
+    pub state: Option<PlaceState>,
+    pub cmds: u64,
+    pub level: u64,
+    pub cpu_flags: u64,
+    pub drained_ticks: u64,
+    pub stint_ticks: u64,
+    pub queued: u64,
+}
+
+impl ThreadPlace {
+    /// The words `object_info` returns in x1-x8.
+    pub const fn to_words(self) -> [u64; 8] {
+        let state = match self.state {
+            Some(s) => s.code(),
+            None => u64::MAX,
+        };
+        [
+            self.cpu,
+            state,
+            self.cmds,
+            self.level,
+            self.cpu_flags,
+            self.drained_ticks,
+            self.stint_ticks,
+            self.queued,
+        ]
+    }
+
+    /// The place from x1-x8 of `object_info`.
+    pub const fn from_words(words: [u64; 8]) -> ThreadPlace {
+        ThreadPlace {
+            cpu: words[0],
+            state: PlaceState::from_word(words[1]),
+            cmds: words[2],
+            level: words[3],
+            cpu_flags: words[4],
+            drained_ticks: words[5],
+            stint_ticks: words[6],
+            queued: words[7],
         }
     }
 }
@@ -2096,6 +2239,37 @@ mod tests {
             BUDGET_RIGHTS,
             Rights::BUDGET | Rights::DUPLICATE | Rights::TRANSFER
         );
+    }
+
+    #[test]
+    fn thread_place_words_round_trip_and_unknown_states_parse_as_none() {
+        assert_eq!(
+            (INFO_THREAD_PLACE, PLACE_IDLE, PLACE_POLLING, PLACE_BELL),
+            (20, 1, 2, 4)
+        );
+        let place = ThreadPlace {
+            cpu: 1,
+            state: Some(PlaceState::WakeStanding),
+            cmds: 1,
+            level: 0,
+            cpu_flags: PLACE_IDLE | PLACE_BELL,
+            drained_ticks: 6,
+            stint_ticks: 7,
+            queued: 1,
+        };
+        assert_eq!(place.to_words(), [1, 4, 1, 0, 5, 6, 7, 1]);
+        assert_eq!(ThreadPlace::from_words(place.to_words()), place);
+        for code in 0..8 {
+            assert_eq!(
+                PlaceState::from_word(code).map(PlaceState::code),
+                Some(code)
+            );
+        }
+        assert_eq!(PlaceState::from_word(8), None);
+        let unknown = ThreadPlace::from_words([0, 99, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(unknown.state, None);
+        assert_eq!(unknown.to_words()[1], u64::MAX);
+        const { assert!(RESULT_VALUES >= 8) };
     }
 
     #[test]

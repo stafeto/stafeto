@@ -19,7 +19,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 30] = [
+pub(crate) const TESTS: [Test; 32] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -114,6 +114,14 @@ pub(crate) const TESTS: [Test; 30] = [
     (
         "smp_request_with_a_handle_is_taken_in_one_section",
         request_with_a_handle_is_taken_in_one_section,
+    ),
+    (
+        "smp_thread_place_follows_a_thread_across_cpus",
+        thread_place_follows_a_thread,
+    ),
+    (
+        "smp_thread_place_shows_a_wake_up_a_break_lost",
+        thread_place_shows_a_lost_wake_up,
     ),
     ("smp_idle_bell_loses_no_wake_up", idle_bell_pairs),
     (
@@ -2345,6 +2353,433 @@ fn idle_bell_pairs() -> Outcome {
     close_ended(server)?;
     close(c)?;
     check(sent == BELL_PAIRS && ended, "a pair of calls failed")
+}
+
+/// The thread of the place tests: waits on the channel of `CHANNEL` on its CPU, counts what it takes
+/// in mark 1, spins while mark 2 is 0 after a notification of bit 2, and ends at a request whose
+/// first word is 0.
+extern "C" fn place_receiver(_: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    MARKS[0].store(1, Relaxed);
+    loop {
+        match sys::receive(&c) {
+            Ok(Received::Notification { bits, .. }) => {
+                if bits & 2 != 0 {
+                    MARKS[3].store(1, Relaxed);
+                    while MARKS[2].load(Relaxed) == 0 {
+                        spin_loop();
+                    }
+                }
+                MARKS[1].fetch_add(1, Relaxed);
+            }
+            Ok(Received::Message { token, words, .. }) => {
+                let _ = token.reply(&[]);
+                if words[0] == 0 {
+                    break;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    sys::thread_exit()
+}
+
+/// A thread that spins at EL0 until mark 2 is not 0: the thread above the receiver on its CPU.
+extern "C" fn place_spinner(_: u64) -> ! {
+    MARKS[0].fetch_add(1, Relaxed);
+    while MARKS[2].load(Relaxed) == 0 {
+        spin_loop();
+    }
+    sys::thread_exit()
+}
+
+/// The words of object_info THREAD_PLACE of `t`, through the resource of the tests (KSTATS).
+fn place_of(t: &Handle<Thread>) -> Result<abi::ThreadPlace, &'static str> {
+    sys::thread_place(t, &resource()).map_err(|_| "object_info THREAD_PLACE failed")
+}
+
+/// Reads the place of `t` until `want` holds or the wait is over: the reading that held, or None.
+fn place_until(
+    t: &Handle<Thread>,
+    ns: u64,
+    want: impl Fn(&abi::ThreadPlace) -> bool,
+) -> Option<abi::ThreadPlace> {
+    let limit = now() + ns;
+    loop {
+        if let Ok(p) = place_of(t)
+            && want(&p)
+        {
+            return Some(p);
+        }
+        if now() > limit {
+            return None;
+        }
+        spin_loop();
+    }
+}
+
+/// The least time between two readings for the rule of a stuck wake-up, in nanoseconds
+/// (abi::INFO_THREAD_PLACE).
+const PLACE_GAP_NS: u64 = 10_000_000;
+
+/// The rule of abi::INFO_THREAD_PLACE for a wake-up that is lost: two readings at least 10 ms
+/// apart, both with the wake standing and the same flags, and the CPU served no commands between
+/// them. `gap` is the counter ticks from the end of the first call to the start of the second.
+/// Init's own copy of the rule (services/init/src/silent.rs) has its tests on the host; this one
+/// is the test's reference.
+fn wake_is_stuck(first: &abi::ThreadPlace, second: &abi::ThreadPlace, gap: u64) -> bool {
+    use abi::PlaceState::WakeStanding;
+    gap >= time::ns_to_ticks(PLACE_GAP_NS)
+        && first.state == Some(WakeStanding)
+        && second.state == Some(WakeStanding)
+        && first.cmds == second.cmds
+        && second.drained_ticks >= first.drained_ticks.saturating_add(gap)
+}
+
+/// Two readings of `t` 10 ms apart and the rule over them.
+fn place_twice(
+    t: &Handle<Thread>,
+) -> Result<(abi::ThreadPlace, abi::ThreadPlace, bool), &'static str> {
+    let first = place_of(t)?;
+    let after = time::now();
+    pause(PLACE_GAP_NS + 500_000);
+    let before = time::now();
+    let second = place_of(t)?;
+    let stuck = wake_is_stuck(&first, &second, before.saturating_sub(after));
+    Ok((first, second, stuck))
+}
+
+/// Rounds of the place test with a thread on CPU 1 woken from CPU 0.
+const PLACE_ROUNDS: u32 = 1000;
+/// The rule is run on the first of the readings of a standing wake-up: each takes 10 ms.
+const PLACE_JUDGED: u32 = 60;
+
+/// object_info THREAD_PLACE of a thread of CPU 1 that waits in `receive` and is woken from CPU 0:
+/// the CPU, the state 3 while it waits and the sleep of its CPU, the state of each round after the
+/// notification within 1 to 5 and the thread back in `receive` after it, the rule of the stuck
+/// wake-up never true on the rounds of a sound kernel, a thread of a higher level that holds the
+/// CPU (state 2 of the thread under it, its level in x4 and the growing stint in x7), x4 that
+/// follows a change of that level with no switch of thread, the stint that starts at the wake after a
+/// sleep, and the refusals (no KSTATS, a handle of another kind).
+fn thread_place_follows_a_thread() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    reset_marks();
+    let c = channel(QUIET)?;
+    CHANNEL.store(c.raw().0, Relaxed);
+    let a = spawn_on(0, 1, place_receiver, 0, TEST_PRIORITY + 1)?;
+    let ready = wait_for_within(PAIRS_START_NS, || mark(0) == 1);
+    let result = place_rounds(&a, &c, ready);
+    // The end of the test thread is the same whatever the rounds found.
+    MARKS[2].store(1, Relaxed);
+    let _ = sys::send(&c, &[0]);
+    close_ended(a)?;
+    close(c)?;
+    result
+}
+
+fn place_rounds(a: &Handle<Thread>, c: &Handle<Channel>, ready: bool) -> Outcome {
+    use abi::PlaceState::{Ready, Running, Waiting, WakeStanding, WakeTaken};
+    check(ready, "the thread of the place test did not start")?;
+    // The refusals first: no KSTATS, a handle that is no resource, and nothing in x2.
+    let bare = copy(&resource(), Rights::NONE)?;
+    check(
+        sys::thread_place(a, &bare) == Err(Error::AccessDenied),
+        "THREAD_PLACE with no KSTATS was not refused",
+    )?;
+    close(bare)?;
+    let mut x = [0; 10];
+    x[0] = a.raw().0;
+    x[1] = abi::INFO_THREAD_PLACE;
+    x[2] = a.raw().0;
+    // SAFETY: object_info reads and writes registers only.
+    let after = unsafe { sys::raw::<{ Call::ObjectInfo.number() }>(x) };
+    check(
+        Error::from_code(after[0]) == Some(Error::WrongType),
+        "THREAD_PLACE with a thread in x2 was not WRONG_TYPE",
+    )?;
+    x[2] = 0;
+    // SAFETY: as above.
+    let after = unsafe { sys::raw::<{ Call::ObjectInfo.number() }>(x) };
+    check(
+        Error::from_code(after[0]).is_some(),
+        "THREAD_PLACE with 0 in x2 gave an answer",
+    )?;
+    // A handle of the thread with no rights is enough: x0 needs none.
+    let plain = sys::handle_duplicate(a, Rights::NONE).map_err(|_| "no copy of the thread")?;
+    let p = place_of(&plain);
+    close(plain)?;
+    p?;
+    // The thread waits on CPU 1 and the CPU idles, with level 0 (x4) and the idle bit (x5).
+    let look = place_until(a, WAIT_NS, |p| {
+        p.state == Some(Waiting) && p.cpu_flags & abi::PLACE_IDLE != 0
+    })
+    .ok_or("the thread did not wait with its CPU idle")?;
+    check(look.cpu == 1, "the thread is not on CPU 1")?;
+    check(look.level == 0, "an idle CPU runs a level")?;
+    check(
+        look.cmds == 0 && look.queued == 0,
+        "an idle CPU has commands",
+    )?;
+    // The rounds: a notification, the reading at once, and the thread back in receive.
+    let (mut standing, mut judged, mut false_stuck, mut slow) = (0, 0, 0, 0);
+    let mut seen = [0u32; 8];
+    for _ in 0..PLACE_ROUNDS {
+        place_until(a, WAIT_NS, |p| {
+            p.state == Some(Waiting) && p.cpu_flags & abi::PLACE_IDLE != 0
+        })
+        .ok_or("the thread did not wait with its CPU idle")?;
+        let before = mark(1);
+        sys::notify(c, 1).map_err(|_| "notify failed")?;
+        let first = place_of(a)?;
+        let after = time::now();
+        let Some(state) = first.state else {
+            return Err("THREAD_PLACE gave a state this abi does not know");
+        };
+        seen[state.code() as usize] += 1;
+        check(
+            matches!(state, Running | Ready | Waiting | WakeStanding | WakeTaken),
+            "the state of a thread just woken is none of 1 to 5",
+        )?;
+        let mut paused = false;
+        if state == WakeStanding {
+            standing += 1;
+            if judged < PLACE_JUDGED {
+                judged += 1;
+                paused = true;
+                pause(PLACE_GAP_NS + 500_000);
+                let gap = time::now().saturating_sub(after);
+                let second = place_of(a)?;
+                if wake_is_stuck(&first, &second, gap) {
+                    false_stuck += 1;
+                }
+            }
+        }
+        check(
+            wait_for(|| mark(1) > before),
+            "the thread did not take the notification",
+        )?;
+        let look = place_until(a, WAIT_NS, |p| p.state == Some(Waiting))
+            .ok_or("the thread did not return to receive")?;
+        if !paused && time::ticks_to_ns(look.drained_ticks) > 10_000_000 {
+            slow += 1;
+        }
+    }
+    println!(
+        "smp place: {PLACE_ROUNDS} rounds, the state after a notify 1:{} 2:{} 3:{} 4:{} 5:{}, {standing} readings of 4, {judged} judged by the rule, {false_stuck} stuck, {slow} drains longer ago than 10 ms",
+        seen[1], seen[2], seen[3], seen[4], seen[5]
+    );
+    check(
+        false_stuck == 0,
+        "a wake-up of a sound kernel was judged stuck",
+    )?;
+    check(
+        slow == 0,
+        "the drain of the CPU was older than 10 ms after a wake-up",
+    )?;
+    // A thread above the receiver spins on CPU 1; the notification leaves the receiver ready.
+    MARKS[0].store(1, Relaxed);
+    MARKS[2].store(0, Relaxed);
+    let spinner = spawn_on(1, 1, place_spinner, 0, TEST_PRIORITY + 2)?;
+    let started = wait_for(|| mark(0) == 2);
+    let outcome = place_under_a_spinner(a, c, &spinner, started);
+    MARKS[2].store(1, Relaxed);
+    close_ended(spinner)?;
+    outcome?;
+    // After a sleep of its CPU the thread that ran before it begins a stint at its wake, and
+    // its stint does not hold the sleep.
+    check(
+        wait_for(|| mark(1) > u64::from(PLACE_ROUNDS)),
+        "the receiver did not take the notification under the spinner",
+    )?;
+    // A stall of the host can hold a virtual CPU while the thread runs, and the stint is wall
+    // time: a kernel that counts the sleep in the stint fails every attempt.
+    let mut stints = [0u64; 5];
+    let mut small = None;
+    for stint in &mut stints {
+        MARKS[2].store(0, Relaxed);
+        MARKS[3].store(0, Relaxed);
+        let before = mark(1);
+        place_until(a, WAIT_NS, |p| {
+            p.state == Some(Waiting) && p.cpu_flags & abi::PLACE_IDLE != 0
+        })
+        .ok_or("the thread did not wait with its CPU idle")?;
+        pause(40_000_000);
+        sys::notify(c, 2).map_err(|_| "notify failed")?;
+        // The thread says it spins; the reading comes after that.
+        let spins = wait_for(|| mark(3) == 1);
+        let running = place_of(a);
+        MARKS[2].store(1, Relaxed);
+        check(spins, "the thread did not run after the sleep of its CPU")?;
+        let look = running?;
+        check(
+            look.state == Some(Running),
+            "a thread that spins at EL0 is not running",
+        )?;
+        check(
+            wait_for(|| mark(1) > before),
+            "the thread did not return from its spin",
+        )?;
+        *stint = time::ticks_to_ns(look.stint_ticks) / 1000;
+        check(
+            look.level == u64::from(TEST_PRIORITY + 1),
+            "the level of the running thread is not its own",
+        )?;
+        if *stint < 20_000 {
+            small = Some(*stint);
+            break;
+        }
+    }
+    println!(
+        "smp place: the stint of the thread that woke after a sleep of 40 ms read {small:?} us (attempts {stints:?})"
+    );
+    check(small.is_some(), "the stint after a sleep holds the sleep")?;
+    Ok(())
+}
+
+/// The receiver is ready under a spinner of a higher level on its CPU: its state 2, the spinner's level
+/// in x4, the stint of the spinner growing in x7, and x4 at the new level once the spinner is raised.
+fn place_under_a_spinner(
+    a: &Handle<Thread>,
+    c: &Handle<Channel>,
+    spinner: &Handle<Thread>,
+    started: bool,
+) -> Outcome {
+    check(started, "the spinner did not start")?;
+    sys::notify(c, 1).map_err(|_| "notify failed")?;
+    let look = place_until(a, WAIT_NS, |p| p.state == Some(abi::PlaceState::Ready))
+        .ok_or("the thread below the spinner did not become ready")?;
+    check(
+        look.level == u64::from(TEST_PRIORITY + 2),
+        "x4 is not the level of the spinner",
+    )?;
+    let first = look.stint_ticks;
+    pause(2_000_000);
+    let later = place_of(a)?;
+    check(
+        later.state == Some(abi::PlaceState::Ready) && later.stint_ticks > first,
+        "the stint of the spinner did not grow",
+    )?;
+    // The spinner goes up a level: no switch of thread, and x4 follows.
+    sys::thread_set_priority(spinner, TEST_PRIORITY + 3, Policy::Fifo)
+        .map_err(|_| "thread_set_priority failed")?;
+    place_until(a, WAIT_NS, |p| p.level == u64::from(TEST_PRIORITY + 3))
+        .ok_or("x4 did not follow the new level of the spinner")?;
+    Ok(())
+}
+
+/// The break of this kernel (1 `break-idle-drain`, 2 `break-idle-bell`) loses a wake-up from CPU 0
+/// to a thread on CPU 1, and THREAD_PLACE shows it: the state 4 with the flag of the wake, one thread
+/// in the queues to CPU 1, and for two readings 10 ms apart the rule of a stuck wake-up; the pictures
+/// of the two breaks differ in the bell (x5 bit 2). Then the break is lifted, `cmd::kick` asks CPU 1
+/// into the kernel, and the thread is back in `receive` at once. A kernel with no break passes
+/// at once. The break acts from `arm-place` to `disarm`, so that the pairs after this test arm it anew.
+fn thread_place_shows_a_lost_wake_up() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    // A kernel without the probe takes the text for a line of the log and answers its length.
+    let which = sys::debug_write(&resource(), b"idle-probe which").unwrap_or(0);
+    if !(1..=2).contains(&which) {
+        if which > 2 {
+            // The kernel logged the text with no end of line.
+            println!();
+        }
+        return Ok(());
+    }
+    reset_marks();
+    let c = channel(QUIET)?;
+    CHANNEL.store(c.raw().0, Relaxed);
+    let a = spawn_on(0, 1, place_receiver, 0, TEST_PRIORITY + 1)?;
+    let ready = wait_for_within(PAIRS_START_NS, || mark(0) == 1);
+    let result = if ready {
+        lose_a_wake_up(&a, &c, which)
+    } else {
+        Err("the thread of the place test did not start")
+    };
+    let _ = sys::debug_write(&resource(), b"idle-probe disarm");
+    MARKS[2].store(1, Relaxed);
+    let _ = sys::send(&c, &[0]);
+    close_ended(a)?;
+    close(c)?;
+    result
+}
+
+/// Attempts at a notify that lands in the window of the poll of CPU 1.
+const PLACE_ATTEMPTS: u32 = 400;
+
+fn lose_a_wake_up(a: &Handle<Thread>, c: &Handle<Channel>, which: usize) -> Outcome {
+    use abi::PlaceState::{Waiting, WakeStanding};
+    let _ = sys::debug_write(&resource(), b"idle-probe arm-place");
+    for attempt in 1..=PLACE_ATTEMPTS {
+        let before = mark(1);
+        place_until(a, WAIT_NS, |p| {
+            p.state == Some(Waiting) && p.cpu_flags & abi::PLACE_POLLING != 0
+        })
+        .ok_or("CPU 1 never polled")?;
+        sys::notify(c, 1).map_err(|_| "notify failed")?;
+        // A wake-up that is not lost is taken within a few milliseconds.
+        if wait_for_within(5_000_000, || mark(1) > before) {
+            continue;
+        }
+        let (first, second, stuck) = place_twice(a)?;
+        if !stuck {
+            // Taken late and so not lost: the next attempt.
+            check(
+                wait_for(|| mark(1) > before),
+                "the thread did not take the notification",
+            )?;
+            continue;
+        }
+        check(
+            first.state == Some(WakeStanding) && first.cmds & 1 != 0 && first.cpu == 1,
+            "the lost wake-up is not the state 4 with the flag of the wake on CPU 1",
+        )?;
+        check(
+            first.queued == 1,
+            "the lost wake-up is not the one thread in the queues to CPU 1",
+        )?;
+        check(
+            first.cpu_flags & abi::PLACE_IDLE != 0 && first.level == 0,
+            "the CPU of the lost wake-up is not idle",
+        )?;
+        let bell = second.cpu_flags & abi::PLACE_BELL != 0;
+        let polling = second.cpu_flags & abi::PLACE_POLLING != 0;
+        if which == 1 {
+            check(
+                !bell,
+                "the poll took the bell of the break, and x5 still has it",
+            )?;
+        } else {
+            check(
+                bell && !polling,
+                "the picture of the lost bell has the bell raised and no poll",
+            )?;
+        }
+        println!(
+            "smp place: attempt {attempt} lost the wake-up of the break {which}: state {:?}, cmds {}, queued {}, x5 {:#x}, drained {} ms ago, judged stuck by two readings {} ms apart",
+            second.state,
+            second.cmds,
+            second.queued,
+            second.cpu_flags,
+            time::ticks_to_ns(second.drained_ticks) / 1_000_000,
+            PLACE_GAP_NS / 1_000_000
+        );
+        // The break lifted, a command-less ask to CPU 1 gets it to the queues.
+        let _ = sys::debug_write(&resource(), b"idle-probe disarm");
+        let _ = sys::debug_write(&resource(), b"idle-probe kick");
+        check(
+            wait_for_within(20_000_000, || mark(1) > before),
+            "CPU 1 did not take the wake-up after the kick",
+        )?;
+        place_until(a, WAIT_NS, |p| p.state == Some(Waiting) && p.queued == 0)
+            .ok_or("THREAD_PLACE still shows the wake-up after the kick")?;
+        return Ok(());
+    }
+    Err("no notify was lost in the attempts: the break did not act")
 }
 
 /// Rounds of the wait for a timer in an idle CPU, and the time the timer
