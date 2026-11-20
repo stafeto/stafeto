@@ -173,9 +173,10 @@ pub(crate) const PROVIDER_QUOTA: u64 = LEAF_QUOTA + (child::SHARED_PAGES as u64 
 /// for the boot image and for the loader's window, pages of its pools of
 /// memory objects, shells, channels and sessions, the grandchild's
 /// objects, under 20 pages, the grandchild's LEAF_QUOTA, and 3 pages paid
-/// ahead: an estimated upper bound with room. One page more than before
-/// `reply_receive`: the loop of `rt::service` grew the child's program.
-const GRANDPARENT_QUOTA: u64 = 65 * PAGE as u64;
+/// ahead: an estimated upper bound with room. Two pages more than before
+/// `reply_receive`: the loop of `rt::service` grew the child's program, and
+/// once more with the nudge of a suspect service and the counts of the heartbeat.
+const GRANDPARENT_QUOTA: u64 = 66 * PAGE as u64;
 /// What `Kid::load` says when the child's quota fell short.
 const KID_NO_MEMORY: &str = "the child's quota fell short of its loading";
 /// The parts of a fault's ESR the tests compare (spec 7.9, [G22]): the

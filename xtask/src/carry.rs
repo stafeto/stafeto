@@ -556,6 +556,95 @@ pub fn describe(plan: &Plan, previous: Option<&Previous>, series: &str) -> Vec<S
     lines
 }
 
+/// Whether `new` is a lower version than `old`, both being numbers separated
+/// by dots (`1.30.7`). A version of another shape (a commit, a date with
+/// letters) is never called lower: changing it needs a changed recipe, which
+/// a built package has anyway.
+pub fn version_lowers(new: &str, old: &str) -> bool {
+    let numbers =
+        |v: &str| -> Option<Vec<u64>> { v.split('.').map(|p| p.parse::<u64>().ok()).collect() };
+    match (numbers(new), numbers(old)) {
+        (Some(new), Some(old)) => new < old,
+        _ => false,
+    }
+}
+
+/// The `relibc` field of the `meta` of each carried package that has programs
+/// (`-` is a package without any).
+pub fn carried_relibc(plan: &Plan) -> Result<BTreeMap<String, String>, String> {
+    let mut found = BTreeMap::new();
+    for (name, fate) in &plan.fates {
+        if let Fate::Carried { bytes, .. } = fate {
+            let file = PackageFile::parse(bytes).map_err(|e| format!("{name}: {e}"))?;
+            if file.meta.relibc != "-" {
+                found.insert(name.clone(), file.meta.relibc.to_string());
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// What a packages-only update refuses (docs/release.md), one line each; an
+/// empty list lets the update go on. `is_base` tells a package of kind base,
+/// `pin` is the `relibc` field the tree gives to a package with programs
+/// (`pin-<8 hex digits>`) and `carried` the same field of the carried packages.
+pub fn packages_only_refusals(
+    plan: &Plan,
+    previous: &Previous,
+    wanted: &[Wanted<'_>],
+    is_base: &dyn Fn(&str) -> bool,
+    pin: &str,
+    carried: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let built: Vec<(&String, &Fate)> = plan
+        .fates
+        .iter()
+        .filter(|(_, f)| matches!(f, Fate::Built { .. }))
+        .collect();
+    if built.is_empty() {
+        lines.push("no package is built: there is nothing to update".to_string());
+    }
+    for (name, fate) in &built {
+        let Fate::Built { why, .. } = fate else {
+            continue;
+        };
+        if *why == "new" {
+            lines.push(format!(
+                "{name} is new in the series: a package is added by a release of the system"
+            ));
+        }
+        if is_base(name) {
+            lines.push(format!(
+                "{name} is a base package and would be built ({why}): base packages are in both images and pkg does not replace them; a drift of the tools (tool clang, pin relibc) belongs in a release of the system"
+            ));
+        }
+        let old = previous.entries.iter().find(|e| e.name == **name);
+        let new = wanted.iter().find(|w| w.name == name.as_str());
+        if let (Some(old), Some(new)) = (old, new)
+            && version_lowers(new.version, &old.version)
+        {
+            lines.push(format!(
+                "{name} goes from {} down to {}: a package of a series never goes back; the next update raises the release or the version",
+                old.version, new.version
+            ));
+        }
+    }
+    for name in &plan.leaving {
+        lines.push(format!(
+            "{name} leaves the series: a package is removed by a release of the system"
+        ));
+    }
+    for (name, relibc) in carried {
+        if relibc != pin {
+            lines.push(format!(
+                "{name} is carried with relibc {relibc} and the tree pins {pin}: a package links the relibc of its series"
+            ));
+        }
+    }
+    lines
+}
+
 /// `--previous` for a directory or an address: the roots to verify with are
 /// the official ones, and for a directory also the development root.
 pub fn roots_for(base: &str, tree: &Path) -> Result<Vec<Key>, String> {
@@ -1131,6 +1220,203 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_none()
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    fn entry(name: &str, version: &str) -> PrevEntry {
+        PrevEntry {
+            name: name.into(),
+            version: version.into(),
+            release: "1".into(),
+            recipe: "r".into(),
+            file: format!("{name}.stpkg"),
+            fetch: format!("{name}.stpkg"),
+            source: None,
+            size: 1,
+            sha256: "s".into(),
+        }
+    }
+
+    fn only(
+        fates: &[(&str, Fate)],
+        old: &[(&str, &str)],
+        leaving: &[&str],
+        wanted_rows: &[(&str, &str)],
+        carried: &[(&str, &str)],
+    ) -> Vec<String> {
+        let plan = Plan {
+            fates: fates
+                .iter()
+                .map(|(n, f)| {
+                    let f = match f {
+                        Fate::Built { release, why } => Fate::Built {
+                            release: release.clone(),
+                            why,
+                        },
+                        Fate::Carried { .. } => unreachable!(),
+                    };
+                    (n.to_string(), f)
+                })
+                .collect(),
+            leaving: leaving.iter().map(|s| s.to_string()).collect(),
+        };
+        let previous = Previous {
+            serial: 2,
+            entries: old.iter().map(|(n, v)| entry(n, v)).collect(),
+            revocations: Vec::new(),
+        };
+        let rows: Vec<(&str, &str, &str)> =
+            wanted_rows.iter().map(|(n, v)| (*n, *v, "r")).collect();
+        let carried = carried
+            .iter()
+            .map(|(n, r)| (n.to_string(), r.to_string()))
+            .collect();
+        packages_only_refusals(
+            &plan,
+            &previous,
+            &wanted(&rows),
+            &|n| n == "busybox",
+            "pin-aaaaaaaa",
+            &carried,
+        )
+    }
+
+    fn built(why: &'static str) -> Fate {
+        Fate::Built {
+            release: "2".into(),
+            why,
+        }
+    }
+
+    #[test]
+    fn a_packages_only_update_goes_on_with_a_rebuilt_package_and_nothing_else_changed() {
+        let none = only(
+            &[("nginx", built("recipe changed"))],
+            &[("nginx", "1.30.6"), ("curl", "8.0")],
+            &[],
+            &[("nginx", "1.30.7"), ("curl", "8.0")],
+            &[("curl", "pin-aaaaaaaa")],
+        );
+        assert!(none.is_empty(), "{none:?}");
+        // A key revoked is a reason to build again, and the same version is no downgrade.
+        let revoked = only(
+            &[("nginx", built("key revoked"))],
+            &[("nginx", "1.30.7")],
+            &[],
+            &[("nginx", "1.30.7")],
+            &[],
+        );
+        assert!(revoked.is_empty(), "{revoked:?}");
+    }
+
+    #[test]
+    fn a_packages_only_update_with_nothing_built_is_refused() {
+        let lines = only(&[], &[("nginx", "1")], &[], &[("nginx", "1")], &[]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("nothing to update"));
+    }
+
+    #[test]
+    fn a_packages_only_update_refuses_a_base_package() {
+        let lines = only(
+            &[
+                ("busybox", built("recipe changed")),
+                ("nginx", built("recipe changed")),
+            ],
+            &[("busybox", "1.37"), ("nginx", "1.30.6")],
+            &[],
+            &[("busybox", "1.37"), ("nginx", "1.30.7")],
+            &[],
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("busybox is a base package"));
+    }
+
+    #[test]
+    fn a_packages_only_update_refuses_a_package_that_is_new() {
+        let lines = only(
+            &[("nginx", built("recipe changed")), ("fresh", built("new"))],
+            &[("nginx", "1.30.6")],
+            &[],
+            &[("nginx", "1.30.7"), ("fresh", "1")],
+            &[],
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("fresh is new in the series"));
+    }
+
+    #[test]
+    fn a_packages_only_update_refuses_a_package_that_leaves() {
+        let lines = only(
+            &[("nginx", built("recipe changed"))],
+            &[("nginx", "1.30.6"), ("gone", "1")],
+            &["gone"],
+            &[("nginx", "1.30.7")],
+            &[],
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("gone leaves the series"));
+    }
+
+    #[test]
+    fn a_packages_only_update_refuses_a_lower_version() {
+        let lines = only(
+            &[("nginx", built("recipe changed"))],
+            &[("nginx", "1.30.7")],
+            &[],
+            &[("nginx", "1.30.6")],
+            &[],
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("down to 1.30.6"));
+        assert!(version_lowers("1.9", "1.10"));
+        assert!(version_lowers("1.30.6", "1.30.7"));
+        assert!(!version_lowers("1.30.7", "1.30.7"));
+        assert!(!version_lowers("1.31", "1.30.9"));
+        // The version of a commit changes with the recipe and is no number.
+        assert!(!version_lowers("e257a095", "f00ba4aa"));
+        assert!(!version_lowers("1.0", "e257a095"));
+    }
+
+    #[test]
+    fn a_packages_only_update_refuses_a_carried_package_with_another_relibc() {
+        let lines = only(
+            &[("nginx", built("recipe changed"))],
+            &[("nginx", "1.30.6"), ("curl", "8.0")],
+            &[],
+            &[("nginx", "1.30.7"), ("curl", "8.0")],
+            &[("curl", "pin-bbbbbbbb")],
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("curl is carried with relibc pin-bbbbbbbb"));
+    }
+
+    #[test]
+    fn every_refusal_gets_its_own_line() {
+        let lines = only(
+            &[("busybox", built("recipe changed"))],
+            &[("busybox", "1.37"), ("gone", "1"), ("curl", "8")],
+            &["gone"],
+            &[("busybox", "1.36")],
+            &[("curl", "pin-bbbbbbbb")],
+        );
+        assert_eq!(lines.len(), 4, "{lines:?}");
+    }
+
+    #[test]
+    fn the_relibc_of_a_carried_package_is_read_from_its_meta() {
+        let dir = repository(
+            "relibc",
+            &[("alpha", "1.0", "1", &"a".repeat(64), "t-release")],
+            &[],
+        );
+        let prev = load(&base(&dir), "0.2", &fetch, &[root()], &Policy::default())
+            .unwrap()
+            .unwrap();
+        let recipe = "a".repeat(64);
+        let want = wanted(&[("alpha", "1.0", &recipe)]);
+        let plan = plan(Some(&prev), &want, &fetch, &[root()]).unwrap();
+        // The synthetic package has no programs: no relibc, nothing to compare.
+        assert!(carried_relibc(&plan).unwrap().is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

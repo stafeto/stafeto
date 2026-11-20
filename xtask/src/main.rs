@@ -69,6 +69,8 @@ mod fast_probe;
 mod fast_scale;
 mod fast_switch;
 mod focus_probe;
+mod frame_image;
+mod frame_probe;
 mod fstack_device;
 mod fstack_probe;
 mod gpu_probe;
@@ -2204,8 +2206,12 @@ commands:
             key (docs/release.md)
   release-build [--previous INDEX] [--no-abi]  the first half of a release in target/stafeto-release: the
             packages (carried from INDEX), both images, the kernel and the stage of tools/dist.py
-  release-check [DIR]  refuse what the build job left that is not a file of a release
-  release-pack  the archives of a release in target/dist from target/stafeto-release after it is signed
+            With --packages-only (--tag TAG | --trial) it carries and builds the packages of a
+            published series and nothing else: a packages-only update (docs/release.md)
+  release-check [--packages-only [--tag TAG | --trial]] [DIR]  refuse what the build job left that is not a
+            file of a release (of an update)
+  release-pack [--packages-only (--tag TAG | --trial)]  the archives of a release (the files of an update)
+            in target/dist from target/stafeto-release after it is signed
   ash-shell-exit  check that `exit 3` ends the machine and gives 3
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
   image base|full [run]
@@ -2230,7 +2236,8 @@ commands:
             (`--check` checks one; `--no-sources` skips the source archives; `--dir D` puts it
             in another directory, which must be empty or new, or under target/; `--previous INDEX`
             carries; `--from DIR [--storage NAME]` writes the index of the files of DIR without a
-            build; `--check --official` checks with the roots of keys/)
+            build; `--check --official` checks with the roots of keys/; `--check --with-official` trusts
+            the development root and those roots)
   pkg-identity  check that the flat images and the packages give the same bytes at the same
             paths, that the repository is whole and that a package builds again to the same bytes
   dist-licenses  check that the release archives carry the notices of the packages they
@@ -2356,6 +2363,19 @@ commands:
             the longest steps of the compositor, the display driver and the tablet's driver
   lvgl [--machine hvf] run the LVGL demo by hand: QEMU with the window of the screen (cocoa on a Mac)
             and the console on the terminal; at the prompt of ash type `lvgl-demo`, click its widgets
+  frame-image build the images for the measurements of the frame time (boot-frame.img and
+            boot-frame-steps.img: the screen, a disk and the network together with the loads) on
+            the host and print their sizes
+  frame-loads [steps] boot boot-frame.img (or, with steps, boot-frame-steps.img under -icount) and
+            check that every load is alive: the paced client posts, the client of the first
+            revision flushes, the CPU loop turns, files are written and the network loop makes
+            rounds, each in its phases
+  frame-probe [counters|trace] the frame time under the loads: boot-frame-steps.img under -icount, the eight
+            phases judged against the bounds of the analysis (late, skipped, the time to
+            compose, the steps of the services); with counters, boot-frame.img on QEMU's clock
+            and the counts alone; with trace, the compositor also tells the bands by place
+            and by ticks and what the long ones spent in the kernel and in the table of images
+            (two more calls of the kernel in a band: the steps are not the gates' verdict)
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
@@ -2771,7 +2791,7 @@ fn main() {
         Some("dist") => release::dist(),
         Some("release-build") => release::build_command(&args[1..]),
         Some("release-check") => release::check_command(&args[1..]),
-        Some("release-pack") => release::pack(&target_dir().join("dist")),
+        Some("release-pack") => release::pack_command(&args[1..]),
         Some("ash-shell-exit") => ash_shell_exit(),
         Some("bash-shell-exit") => bash_dialog::bash_shell_exit(),
         Some("bash-dialog") => bash_dialog::bash_dialog(),
@@ -2854,6 +2874,9 @@ fn main() {
             Some(_) => Err("lvgl-probe [--hvf]".to_owned()),
         },
         Some("lvgl") => lvgl::window(&args[1..]),
+        Some("frame-image") => frame_image::images(),
+        Some("frame-loads") => frame_image::loads(&args[1..]),
+        Some("frame-probe") => frame_probe::probe(&args[1..]),
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -6442,6 +6465,67 @@ fn ram_step_verdict(name: &str, steps: &[(usize, u64, u64)]) -> Result<(), Strin
     }
 }
 
+/// The detail of a lock request that sets (`own_step::SET` of ramfs): the locks of the inode
+/// before (bits 8 to 15) and after (bits 0 to 7).
+fn lock_set_detail(detail: u64) -> Option<(u64, u64)> {
+    (detail >> 48 == 9).then_some(((detail >> 8) & 0xff, detail & 0xff))
+}
+
+/// The detail of a close event (`own_step::CLOSE`): the records of the table before (bits 16 to
+/// 31) and after (bits 0 to 15).
+fn lock_close_detail(detail: u64) -> Option<(u64, u64)> {
+    (detail >> 48 == 10).then_some(((detail >> 16) & 0xffff, detail & 0xffff))
+}
+
+/// The two cases of the page probe in which a live owner releases 64 paid pages in one request
+/// (one unlock of the whole file, one close of the descriptor): their markers must be there, and
+/// the longest kind 50 step and the longest kind 49 step of each case, own work with its
+/// preemptions, are told. The hard checks of the probe judge them with every other step; the
+/// numbers are the measurement. A step the console did not tell stayed at or under the longest
+/// step of its kind before the case.
+fn fragment_release_report(lines: &[String]) -> Result<(), String> {
+    const CASES: [(&str, &str, &str); 2] = [
+        (
+            "unlock of the whole file",
+            "posix-procs: fragmented lock pages unlock of the whole file: begin",
+            "posix-procs: fragmented lock pages close of the descriptor: begin",
+        ),
+        (
+            "close of the descriptor",
+            "posix-procs: fragmented lock pages close of the descriptor: begin",
+            "posix-procs: fragmented lock pages ready:",
+        ),
+    ];
+    for (name, begin, next) in CASES {
+        let end = format!("posix-procs: fragmented lock pages {name}: end, all 64 pages released");
+        if !lines.iter().any(|l| l.contains(&end)) {
+            return Err(format!(
+                "fragmented lock page: the case {name:?} did not end"
+            ));
+        }
+        let unlock = |d: u64| lock_set_detail(d) == Some((64, 0));
+        let close = |d: u64| lock_close_detail(d).is_some_and(|(b, a)| b >= 64 && b - a == 64);
+        for (kind, accepts) in [
+            (50usize, &unlock as &dyn Fn(u64) -> bool),
+            (49, &close as &dyn Fn(u64) -> bool),
+        ] {
+            match step_line::longest_between(lines, begin, next, "2", kind, accepts) {
+                Some(step) => println!(
+                    "fragmented lock page, {name}: kind {kind} step {} ticks raw, {} judged, {} preemptions, detail {}",
+                    step.ticks,
+                    step.judged(),
+                    step.preempts,
+                    step.detail
+                ),
+                None => println!(
+                    "fragmented lock page, {name}: no line of a kind {kind} step with 64 records released (it did not pass the longest step of its kind)"
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<(), String> {
     relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
@@ -6468,7 +6552,12 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
     let ended = run.expect_line(
         "the PID lifetime probe to exit",
         |line| line.starts_with("init: posix-procs ended:"),
-        Duration::from_secs(30),
+        // The page probe builds its 64-page shape three times.
+        Duration::from_secs(if probe == LifetimeProbe::Pages {
+            60
+        } else {
+            30
+        }),
     );
     let mut outcome = run.stop();
     // A line of the audit of ramfs or of the services' timing may land inside a long line.
@@ -6500,6 +6589,7 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
             &outcome,
             "posix-procs: lock sweep share: clients below the service keep their time through the sweep of locked inodes",
         )?;
+        fragment_release_report(&outcome.lines)?;
         let steps = longest_steps(&outcome.lines, "2");
         step_line::within_b(&outcome.lines, "2", step_line::Kinds::All)?;
         println!("RAM fragmented lock page dispatches (B {RAM_STEP_MAX}): {steps:?}");
@@ -8171,6 +8261,8 @@ fn check_audit_rounds(lines: &[String]) -> Result<(), String> {
 /// volley of 112 completed renames and the held-job case that repeats a
 /// refused Start after releasing capacity. The lines go to the report output.
 fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
+    // A line of a service may land inside a long line of the probe (`rejoin_split_lines`).
+    let lines = rejoin_split_lines(lines);
     let shown: Vec<&String> = lines
         .iter()
         .filter(|line| line.starts_with("posix-procs: names "))
@@ -8304,14 +8396,17 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
 /// Published concurrent snapshots must preserve the part's memory reserve.
 /// The console takes a line of more than 64 bytes in several writes, and a
 /// line that another CPU writes meanwhile may land inside it: a line of the
-/// services' timing (`service wait:` and the like, lib/rt) or the audit
+/// services' timing (`service wait:`, `service table:`, `service heartbeat:` and the like,
+/// lib/rt) or the audit
 /// line of ramfs (`ramfs: audit round`). Such a line goes back where it
 /// came from, and the rest of the split line, the next line, joins its
 /// start.
 fn rejoin_split_lines(lines: &[String]) -> Vec<String> {
     // The exact starts of the intruders: a text such as "in the service ok" is no intruder.
-    const INTRUDERS: [&str; 6] = [
+    const INTRUDERS: [&str; 8] = [
         "service step: ",
+        "service table: ",
+        "service heartbeat: ",
         "service wait: ",
         "service wait cut: ",
         "service gap: ",
@@ -11354,6 +11449,8 @@ fn host_tests() -> Result<(), String> {
         "compositor",
         "--package",
         "wm",
+        "--package",
+        "frame-load",
         "--package",
         "proto-input",
         "--package",
@@ -14474,6 +14571,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "wm",
         "--package",
+        "frame-load",
+        "--package",
         "virtio-input",
         "--package",
         "virtio-blk",
@@ -14660,6 +14759,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "wm",
         "--package",
+        "frame-load",
+        "--package",
         "gpu-probe",
         "--package",
         "comp-probe",
@@ -14694,7 +14795,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "runas",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/irq-trace,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -14940,6 +15041,50 @@ mod tests {
         let mut marked = all;
         marked.insert(10, "[kernel log: 3 records lost]".into());
         assert!(burst_whole(&marked).unwrap_err().contains("lost records"));
+    }
+
+    #[test]
+    fn the_release_cases_of_the_page_probe_need_their_markers_and_read_their_steps() {
+        let set = (9u64 << 48 | 64 << 8).to_string();
+        let close = (10u64 << 48 | 1954 << 16 | 1890).to_string();
+        let marker = |text: &str| text.to_owned();
+        let lines = vec![
+            marker(
+                "posix-procs: fragmented lock pages unlock of the whole file: begin, 64 paid pages, 64 records of a live PID=7",
+            ),
+            format!("service step: 2 kind 50 17000 ticks detail {set} preempts 1"),
+            marker(
+                "posix-procs: fragmented lock pages unlock of the whole file: end, all 64 pages released",
+            ),
+            marker(
+                "posix-procs: fragmented lock pages close of the descriptor: begin, 64 paid pages, 64 records of a live PID=8",
+            ),
+            format!("service step: 2 kind 49 16000 ticks detail {close}"),
+            marker(
+                "posix-procs: fragmented lock pages close of the descriptor: end, all 64 pages released",
+            ),
+            marker(
+                "posix-procs: fragmented lock pages ready: 64 paid pages, 64 records, PID=9 root=1:1",
+            ),
+        ];
+        assert_eq!(fragment_release_report(&lines), Ok(()));
+        // A case that did not end is an error.
+        let missing: Vec<String> = lines
+            .iter()
+            .filter(|l| !l.contains("close of the descriptor: end"))
+            .cloned()
+            .collect();
+        assert!(
+            fragment_release_report(&missing)
+                .unwrap_err()
+                .contains("close of the descriptor")
+        );
+        assert_eq!(lock_set_detail(9 << 48 | 64 << 8), Some((64, 0)));
+        assert_eq!(
+            lock_close_detail(10 << 48 | 1954 << 16 | 1890),
+            Some((1954, 1890))
+        );
+        assert_eq!(lock_set_detail(10 << 48), None);
     }
 
     #[test]
@@ -16925,6 +17070,37 @@ mod tests {
                 "posix-procs: steps done",
             ]
         );
+    }
+
+    /// A table line of a service inside the line of the reclamation commit of the names probe
+    /// (ci run of 19 November): the line goes back out, the probe's line is whole again, and the
+    /// check of the names lines reads it.
+    #[test]
+    fn a_table_line_inside_the_reclamation_line_goes_back_out() {
+        let whole = "posix-procs: names bounds reclaim: 32 nodes with pages, backlog 32 -> 33, pages 33 -> 32, commit 12488 ticks, 0 restarts";
+        let (head, tail) =
+            whole.split_at("posix-procs: names bounds reclaim: 32 nodes with pages, bac".len());
+        let table = "service table: 1 kind 28 9834 ticks detail 0 preempts 0";
+        let split: Vec<String> = [format!("{head}{table}"), tail.to_owned()].into();
+        assert_eq!(
+            rejoin_split_lines(&split),
+            [table.to_owned(), whole.to_owned()]
+        );
+        // The same with a line of the heartbeat.
+        let note =
+            "service heartbeat: a stale expiry, armed again (period 250000000 ns, priority 50)";
+        let split: Vec<String> = [format!("{head}{note}"), tail.to_owned()].into();
+        assert_eq!(
+            rejoin_split_lines(&split),
+            [note.to_owned(), whole.to_owned()]
+        );
+        // The names check reads the log with the line split.
+        let mut log = names_log(
+            "posix-procs: names volley: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 13, the most restarts of one rename 3, the longest rename 40000 ticks",
+        );
+        let at = log.iter().position(|l| l == whole).unwrap();
+        log.splice(at..=at, [format!("{head}{table}"), tail.to_owned()]);
+        assert!(names_lines(&log).is_ok(), "{:?}", names_lines(&log));
     }
 
     /// The audit line of ramfs inside a long line of posix-procs goes out

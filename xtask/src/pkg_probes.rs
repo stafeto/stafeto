@@ -53,6 +53,7 @@ fn options(names: Vec<String>, out: Option<PathBuf>) -> pkg::Options {
         previous: None,
         perturb: Vec::new(),
         remove: Vec::new(),
+        packages_only: false,
     }
 }
 

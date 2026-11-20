@@ -124,7 +124,7 @@ pub const COMP_INPUT_MARK: u64 = 1 << 59;
 /// in for it.
 pub const COMP_MANAGERS: &[&str] = &["wm", "focus-wm"];
 /// The programs that inject events as a device would: the probes only.
-pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject", "lvgl-inject"];
+pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject", "lvgl-inject", "frame-load"];
 
 /// The mark of the compositor's session that `client` gets by asking for
 /// `service`: the manager's, the input's, or none.
@@ -1537,6 +1537,7 @@ pub mod cycle;
 pub mod doom;
 pub mod entropy;
 pub mod focus;
+pub mod frame;
 pub mod fstack;
 pub mod gpu;
 pub mod input;
@@ -1565,7 +1566,9 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-busybox") as usize
     + cfg!(feature = "table-busybox-dialog") as usize
     + cfg!(feature = "table-doom") as usize
+    + cfg!(feature = "table-doom-free") as usize
     + cfg!(feature = "table-lvgl") as usize
+    + cfg!(feature = "table-frame") as usize
     + cfg!(feature = "table-base") as usize
     + cfg!(feature = "table-posix-dialog") as usize
     + cfg!(feature = "table-posix-dialog-vz") as usize
@@ -1669,7 +1672,9 @@ const _: () = assert!(
     feature = "table-busybox",
     feature = "table-busybox-dialog",
     feature = "table-doom",
+    feature = "table-doom-free",
     feature = "table-lvgl",
+    feature = "table-frame",
     feature = "table-base",
     feature = "table-posix-dialog",
     feature = "table-posix-dialog-vz",
@@ -1799,8 +1804,12 @@ pub const TABLE: &[Record] = ramfs::BUSYBOX_TABLE;
 pub const TABLE: &[Record] = ramfs::BUSYBOX_DIALOG_TABLE;
 #[cfg(feature = "table-doom")]
 pub const TABLE: &[Record] = doom::TABLE;
+#[cfg(feature = "table-doom-free")]
+pub const TABLE: &[Record] = doom::FREE_TABLE;
 #[cfg(feature = "table-lvgl")]
 pub const TABLE: &[Record] = lvgl::TABLE;
+#[cfg(feature = "table-frame")]
+pub const TABLE: &[Record] = frame::TABLE;
 #[cfg(feature = "table-base")]
 pub const TABLE: &[Record] = base::BASE_TABLE;
 #[cfg(feature = "table-posix-dialog")]
@@ -1974,6 +1983,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     ceiling::TABLE,
     test::TABLE,
     doom::TABLE,
+    doom::FREE_TABLE,
     base::BASE_TABLE,
     gpu::TABLE,
     comp::TABLE,
@@ -4065,6 +4075,16 @@ mod tests {
             Some(COMP_INPUT_MARK)
         );
         assert_eq!(comp_mark(lvgl("lvgl-inject"), b"clock"), None);
+        // The image of the frame-time measurements: the conductor alone has the
+        // input session; the paced client and the client of the first revision
+        // have ordinary ones.
+        let frame = |name: &str| frame::TABLE.iter().find(|r| r.name == name).unwrap();
+        assert_eq!(
+            comp_mark(frame("frame-load"), b"gpu"),
+            Some(COMP_INPUT_MARK)
+        );
+        assert_eq!(comp_mark(frame("frame-draw"), b"gpu"), None);
+        assert_eq!(comp_mark(frame("frame-legacy"), b"gpu"), None);
         assert_eq!(comp_mark(lvgl("gpu"), b"gpu"), None);
         assert_eq!(comp_mark(wm("wm-new"), b"gpu"), None);
         assert_eq!(comp_mark(wm("wm-old"), b"gpu"), None);
@@ -4084,6 +4104,23 @@ mod tests {
     #[test]
     fn the_games_table_is_the_dialog_with_the_quota_of_doom() {
         assert!(check(doom::TABLE).is_ok());
+        // The compositor of the games image runs on the frame clock (the
+        // defaults); the table of the measures has the free run, so that the
+        // frames a second of `doom-measure` stay comparable.
+        let compositor = doom::TABLE.iter().find(|r| r.name == "gpu").unwrap();
+        assert!(compositor.args.is_empty());
+        let free = doom::FREE_TABLE.iter().find(|r| r.name == "gpu").unwrap();
+        assert_eq!(free.args, comp::FREE_RUN);
+        assert!(check(doom::FREE_TABLE).is_ok());
+        assert_eq!(doom::FREE_TABLE.len(), doom::TABLE.len());
+        for (a, b) in doom::TABLE.iter().zip(doom::FREE_TABLE) {
+            assert_eq!(a.name, b.name);
+            if a.name != "gpu" {
+                assert_eq!(a.args, b.args);
+                assert_eq!(a.quota, b.quota);
+                assert_eq!(a.connects, b.connects);
+            }
+        }
         let games = order_of(doom::TABLE);
         let at = |name: &str| games.iter().position(|&n| n == name).unwrap();
         assert!(at("input") < at("display"));
@@ -4444,6 +4481,7 @@ mod tests {
         tables.push(pkg::DATA_PROBE_TABLE);
         tables.push(pkg::DATAKEY_PROBE_TABLE);
         tables.push(shutdown::STOP_TABLE);
+        tables.push(frame::TABLE);
         tables
     }
 

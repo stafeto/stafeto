@@ -39,6 +39,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod fit;
+pub mod frame;
 
 use proto_comp::{
     BUFFERS, BUTTON, CLOSE, CREATE, Event, FOCUS_IN, FOCUS_OUT, KEY, MAX_RECTS, MOVE, RING, Rect,
@@ -69,6 +70,12 @@ pub const BAND_ROWS: u32 = 16;
 /// before the terms were set from the real bands: at 14 000 the band of eight layers
 /// is 45 points of a line and its step is expected near 15 500.
 pub const BAND_TICKS: u32 = 14_000;
+
+/// The gate of a band: 0.8 of term B, the most one step of a portion may take
+/// (`PORTION_MAX` of the probes, which xtask checks against this constant). The
+/// cap of the bands of a period divides by it, so that the cap means the share of
+/// a period by the gates.
+pub const BAND_GATE: u32 = 16_328;
 
 /// The price of one kind of operation (the black a band starts with, a layer
 /// copied, a layer laid over others): what one operation costs is
@@ -338,6 +345,13 @@ pub struct Window {
     pub visible: bool,
     /// Whether a buffer was ever taken: the first take gives the focus.
     pub shown_once: bool,
+    /// The window's promise of an interval and its counts (stage G5): the
+    /// service sets and reads them; the scene keeps them with the window.
+    pub pace: frame::Pace,
+    /// The damage of a post that waits for the window's interval: the window's
+    /// buffer is taken at the start it is due, and the rectangle joins the
+    /// frame's damage then.
+    pub held: Option<Rect>,
 }
 
 /// What the primary pipeline of the display shows.
@@ -488,6 +502,9 @@ pub struct Scene {
     /// to the same (OWNER_NONE: no press seen).
     owner: [u8; KEYS_TRACKED],
     damage: Option<Rect>,
+    /// The earliest start a window left by the last taking is due at (the
+    /// caller says `hold` with it to the pacer).
+    held_until: Option<u64>,
     frame: bool,
     seq: u32,
     created: u32,
@@ -537,6 +554,12 @@ pub const CURSOR_HOT: (u32, u32) = (0, 0);
 struct Aligned([u8; CURSOR.len()]);
 static PICTURE: Aligned = Aligned(CURSOR);
 
+/// The pointer's picture (ARGB8888, CURSOR_W by CURSOR_H points), the bytes
+/// a band lays over a screen the pointer touches.
+pub fn pointer_picture() -> &'static [u8] {
+    &PICTURE.0
+}
+
 impl Scene {
     pub const fn new() -> Scene {
         Scene {
@@ -563,6 +586,7 @@ impl Scene {
             modifier: 0,
             owner: [OWNER_NONE; KEYS_TRACKED],
             damage: None,
+            held_until: None,
             frame: false,
             seq: 0,
             created: 0,
@@ -657,9 +681,12 @@ impl Scene {
         false
     }
 
-    /// Whether a frame is in progress or damage waits for one.
+    /// Whether a frame is in progress or a change waits for one: damage of the
+    /// scene, or a buffer a window holds for the start of its interval.
     pub fn busy(&self) -> bool {
-        self.frame || self.damage.is_some()
+        self.frame
+            || self.damage.is_some()
+            || self.windows.iter().flatten().any(|w| w.held.is_some())
     }
 
     pub fn framing(&self) -> bool {
@@ -808,6 +835,8 @@ impl Scene {
             posted: None,
             current: None,
             retired: None,
+            pace: frame::Pace::new(),
+            held: None,
             in_frame: false,
             visible: true,
             shown_once: false,
@@ -875,6 +904,32 @@ impl Scene {
     /// buffer a posted one it replaced ("the latest wins"), which is free
     /// at once.
     pub fn post(&mut self, i: usize, buffer: u8, rects: &[Rect]) -> Result<Option<u8>, Refusal> {
+        self.post_inner(i, buffer, rects, None)
+            .map(|(replaced, _)| replaced)
+    }
+
+    /// POST at `now` on the clock of the frame: the window's promise of an
+    /// interval is judged (`frame::Pace::posted`), and a buffer that is due
+    /// at a start later than the nearest waits with its damage in the window.
+    /// The replaced buffer, and the start the buffer is due at (None: any).
+    pub fn post_paced(
+        &mut self,
+        i: usize,
+        buffer: u8,
+        rects: &[Rect],
+        clock: &frame::Clock,
+        now: u64,
+    ) -> Result<(Option<u8>, Option<u64>), Refusal> {
+        self.post_inner(i, buffer, rects, Some((clock, now)))
+    }
+
+    fn post_inner(
+        &mut self,
+        i: usize,
+        buffer: u8,
+        rects: &[Rect],
+        paced: Option<(&frame::Clock, u64)>,
+    ) -> Result<(Option<u8>, Option<u64>), Refusal> {
         if rects.len() > MAX_RECTS {
             return Err(Refusal::Invalid);
         }
@@ -892,14 +947,48 @@ impl Scene {
         if w.bufs[buffer as usize] != Buf::Free {
             return Err(Refusal::Busy);
         }
-        let damage = Scene::changed(w.rect, rects)?;
+        let mut damage = Scene::changed(w.rect, rects)?;
         w.bufs[buffer as usize] = Buf::Posted;
         let replaced = w.posted.replace(buffer);
         if let Some(j) = replaced {
             w.bufs[j as usize] = Buf::Free;
         }
+        let mut due = None;
+        match paced {
+            Some((clock, now)) => {
+                due = w.pace.posted(clock, now, replaced.is_some());
+                if due.is_some_and(|e| e > clock.next(now)) {
+                    // Not at the nearest start: the damage waits in the window.
+                    w.held = Some(union(w.held, damage));
+                    return Ok((replaced, due));
+                }
+            }
+            None => w.pace.count_post(replaced.is_some()),
+        }
+        if let Some(h) = w.held.take() {
+            damage = union(Some(damage), h);
+        }
         self.add_damage(damage);
-        Ok(replaced)
+        Ok((replaced, due))
+    }
+
+    /// Whether a change waits for a frame: damage the next frame will take.
+    pub fn damaged(&self) -> bool {
+        self.damage.is_some()
+    }
+
+    /// The start the windows a taking left are due at, the earliest.
+    pub fn held_until(&self) -> Option<u64> {
+        self.held_until
+    }
+
+    /// The pace of window `i`.
+    pub fn pace(&self, i: usize) -> Option<&frame::Pace> {
+        self.windows.get(i)?.as_ref().map(|w| &w.pace)
+    }
+
+    pub fn pace_mut(&mut self, i: usize) -> Option<&mut frame::Pace> {
+        self.windows.get_mut(i)?.as_mut().map(|w| &mut w.pace)
     }
 
     /// FLUSH of the legacy window `i`: its one buffer, whose changed
@@ -1317,8 +1406,32 @@ impl Scene {
     /// and, when no manager has subscribed, a window that has its first
     /// buffer taken gets the focus and the top place.
     pub fn begin(&mut self) -> Option<Rect> {
+        self.begin_at(u64::MAX)
+    }
+
+    /// `begin` for the frame of period `k`: a window with an interval whose
+    /// buffer is due at a later start is left posted (its damage waits in the
+    /// window, and `held_until` says the start it is due), and the others are
+    /// taken, each counted taken at `k`.
+    pub fn begin_at(&mut self, k: u64) -> Option<Rect> {
         if self.frame {
             return None;
+        }
+        // The start the windows this taking leaves are due at, whether or not
+        // anything else is taken: with nothing to take the caller says `hold`.
+        self.held_until = self
+            .windows
+            .iter()
+            .flatten()
+            .filter(|w| w.posted.is_some() && !w.pace.due(k))
+            .filter_map(|w| w.pace.earliest())
+            .min();
+        for w in self.windows.iter_mut().flatten() {
+            if w.pace.due(k)
+                && let Some(h) = w.held.take()
+            {
+                self.damage = Some(union(self.damage, h));
+            }
         }
         let d = self.damage.take()?;
         let x1 = (d.x + d.w).min(WIDTH);
@@ -1331,6 +1444,11 @@ impl Scene {
             let Some(w) = w else {
                 continue;
             };
+            if w.posted.is_some() && !w.pace.due(k) {
+                // Not its start: the buffer stays posted, and the frame is
+                // owed it at its start (`held_until`).
+                continue;
+            }
             let Some(b) = w.posted.take() else {
                 continue;
             };
@@ -1339,6 +1457,11 @@ impl Scene {
             } else {
                 w.retired = w.current.replace(b);
                 w.bufs[b as usize] = Buf::Taken;
+                if k == u64::MAX {
+                    w.pace.count_taken();
+                } else {
+                    w.pace.took(k);
+                }
             }
             w.in_frame = true;
             if !core::mem::replace(&mut w.shown_once, true) {
@@ -1513,6 +1636,16 @@ impl Scene {
     }
 }
 
+/// The number of the surface of buffer `buffer` of window `window` for the raster's table
+/// of images: the same in every band, and different for every buffer of every window
+/// (below `POINTER_IMAGE`).
+pub const fn image_of(window: usize, buffer: u8) -> usize {
+    window * proto_comp::BUFFERS + buffer as usize
+}
+
+/// The number of the pointer's picture, after the buffers of every window.
+pub const POINTER_IMAGE: usize = MAX_WINDOWS * proto_comp::BUFFERS;
+
 /// The size of a band of a damage `damage_w` wide: the layers cost `calls` ticks
 /// in all, `per_row` hundredths of a tick for each line and `per_point`
 /// hundredths for each point. The lines of the damage's width that BAND_TICKS
@@ -1571,7 +1704,10 @@ pub trait Raster {
     /// The points of `src` (a surface of `size` points, `stride` bytes a
     /// line, in `format`) that start at (`from.0`, `from.1`) go to the
     /// screen at `to`, `area` of them: replacing what is there when `over`
-    /// is false, laid over it (premultiplied) when it is true.
+    /// is false, laid over it (premultiplied) when it is true. `image` is the
+    /// number of the surface for the raster's own table of images (`image_of`
+    /// for a window's buffer, `POINTER_IMAGE` for the pointer's picture): the
+    /// same surface has the same number in every band.
     #[allow(clippy::too_many_arguments)]
     fn blit(
         &mut self,
@@ -1584,6 +1720,7 @@ pub trait Raster {
         to: (u32, u32),
         area: (u32, u32),
         over: bool,
+        image: usize,
     );
 }
 
@@ -1682,6 +1819,7 @@ pub fn compose_sized(
             (wx0, wy0),
             (wx1 - wx0, wy1 - wy0),
             w.format == Format::Argb,
+            image_of(k as usize, b),
         );
     }
     if let Some(p) = scene.drawn_pointer() {
@@ -1699,6 +1837,7 @@ pub fn compose_sized(
                 (cx0, cy0),
                 (cx1 - cx0, cy1 - cy0),
                 true,
+                POINTER_IMAGE,
             );
         }
     }
@@ -1752,6 +1891,7 @@ mod tests {
             to: (u32, u32),
             area: (u32, u32),
             over: bool,
+            _: usize,
         ) {
             assert_eq!(over, format == Format::Argb);
             for y in 0..area.1 {
@@ -2719,6 +2859,7 @@ mod tests {
             _: (u32, u32),
             area: (u32, u32),
             over: bool,
+            _: usize,
         ) {
             let p = if over { OVER } else { OPAQUE };
             self.calls += p.call;
@@ -2799,6 +2940,66 @@ mod tests {
             + u64::from(BAND_FIXED) * 100
             + u64::from(LAYER) * 100 * u64::from(over))
         .div_ceil(100)
+    }
+
+    /// The raster is told the number of each surface for its table of images: the
+    /// same in every band, different for every window and buffer, and the pointer's
+    /// picture after all of them.
+    #[test]
+    fn every_blit_names_its_surface_the_same_way_in_every_band() {
+        struct Names(Vec<usize>);
+        impl Raster for Names {
+            fn black(&mut self, _: &mut [u8], _: Rect) {}
+            fn blit(
+                &mut self,
+                _: &mut [u8],
+                _: &[u8],
+                _: u32,
+                _: Format,
+                _: (u32, u32),
+                _: (u32, u32),
+                _: (u32, u32),
+                _: (u32, u32),
+                _: bool,
+                image: usize,
+            ) {
+                self.0.push(image);
+            }
+        }
+        struct Nothing;
+        impl Source for Nothing {
+            fn pixels(&self, _: usize, _: u8) -> &[u8] {
+                &[]
+            }
+        }
+        let mut s = Scene::new();
+        eight_windows(&mut s, 8);
+        s.pointer_to(100, 100);
+        let d = rect(100, 100, 320, 200);
+        let mut fb = screen();
+        let mut seen: Vec<Vec<usize>> = Vec::new();
+        let mut at = Band { row: d.y, col: 0 };
+        for _ in 0..3 {
+            let mut names = Names(Vec::new());
+            at = compose(&s, d, at, &mut fb, &Nothing, &mut names);
+            seen.push(names.0);
+        }
+        // The windows have the same numbers in every band (the pointer is in the
+        // first ones only).
+        assert!(seen.iter().all(|n| n[..8] == seen[0][..8]), "{seen:?}");
+        let band = &seen[0];
+        assert_eq!(band.len(), 9);
+        let (windows, pointer) = band.split_at(8);
+        assert_eq!(pointer, [POINTER_IMAGE]);
+        let mut sorted = windows.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 8);
+        assert!(sorted.iter().all(|&i| i < POINTER_IMAGE));
+        for k in 0..8usize {
+            let w = s.window(k).unwrap();
+            assert!(windows.contains(&image_of(k, w.current.unwrap())));
+        }
     }
 
     #[test]
@@ -3022,6 +3223,111 @@ mod tests {
         // With the fixed term of a band and the term of the layer a copy over the
         // whole width is 11 lines (12 cost 14 796 by the prices): 37 bands.
         assert_eq!(bands, 37);
+    }
+
+    /// A window with an interval of 2, taken at period 3, is awaited at 5.
+    /// Another window's post brings a frame at 4: the frame leaves the first
+    /// window's buffer posted, with its damage, and says the start it is due.
+    #[test]
+    fn a_frame_before_the_start_of_a_window_with_an_interval_leaves_it_posted() {
+        let clock = frame::Clock::new(0, 1_000);
+        let mut s = Scene::new();
+        let a = s.create(1, 1, rect(0, 0, 40, 40), false, 0).unwrap();
+        let b = s.create(2, 2, rect(100, 100, 40, 40), false, 0).unwrap();
+        for i in [a, b] {
+            s.attach(i, 2, 160).unwrap();
+        }
+        assert!(s.pace_mut(b).unwrap().set_interval(2));
+        s.pace_mut(b).unwrap().took(3);
+        // B posts in period 3, early: due at 5, so its damage waits in the window.
+        let (_, due) = s.post_paced(b, 0, &[], &clock, 3_200).unwrap();
+        assert_eq!(due, Some(5));
+        // A posts in period 3 (no interval): a frame at 4 takes A alone.
+        let (_, due) = s.post_paced(a, 0, &[], &clock, 3_500).unwrap();
+        assert_eq!(due, None);
+        assert!(s.damaged());
+        assert_eq!(s.begin_at(4), Some(rect(0, 0, 40, 40)));
+        s.end(true);
+        assert_eq!(s.held_until(), Some(5));
+        // (B's one taking is the setup's, at period 3.)
+        assert_eq!((s.pace(a).unwrap().taken, s.pace(b).unwrap().taken), (1, 1));
+        // At 5 the held damage joins and B is taken, with no new post.
+        let d = s.begin_at(5).unwrap();
+        assert!(d.x <= 100 && d.y <= 100 && d.x + d.w >= 140 && d.y + d.h >= 140);
+        s.end(true);
+        assert_eq!(s.held_until(), None);
+        assert_eq!(s.pace(b).unwrap().taken, 2);
+        // A post counts in the window's record whatever the clock.
+        let r = s.pace(a).unwrap().record(a as u32);
+        assert_eq!((r.posts, r.taken), (1, 1));
+        s.post(b, 1, &[]).unwrap();
+        assert_eq!(s.pace(b).unwrap().posts, 2);
+    }
+
+    /// A taking with nothing to take that leaves a window held: the scene says
+    /// the start it is due at, the pacer is told to hold it, and the next
+    /// arming stands at that start, where the buffer is taken with no new post.
+    /// The scene is busy meanwhile, so a probe that waits for the screen to
+    /// settle does not decide it has.
+    #[test]
+    fn a_taking_with_nothing_to_take_leaves_the_held_window_a_timer() {
+        let mut p = frame::Pacer::new(0, 1_000, 52);
+        let clock = *p.clock();
+        let mut s = Scene::new();
+        let b = s.create(2, 2, rect(100, 100, 40, 40), false, 0).unwrap();
+        s.attach(b, 2, 160).unwrap();
+        assert!(s.pace_mut(b).unwrap().set_interval(2));
+        s.pace_mut(b).unwrap().took(3); // awaited at 5
+        assert!(!s.busy());
+        // B posts early, in period 3: its damage waits in the window.
+        let (_, due) = s.post_paced(b, 0, &[], &clock, 3_200).unwrap();
+        assert_eq!(due, Some(5));
+        assert!(!s.damaged() && s.busy());
+        // Another change (a window gone, the manager) brings a taking at 4.
+        assert_eq!(p.change(3_500, None), frame::Wake::At(4_000));
+        assert_eq!(p.fire(4_000), frame::Fire::Take(4));
+        // Nothing is taken, and the scene says B is due at 5.
+        assert_eq!(s.begin_at(4), None);
+        assert_eq!(s.held_until(), Some(5));
+        assert!(s.busy());
+        p.hold(s.held_until().unwrap());
+        assert_eq!(p.nothing_taken(4_100), frame::Wake::At(5_000));
+        // At 5 the buffer is taken without a new post, and the scene settles.
+        assert_eq!(p.fire(5_000), frame::Fire::Take(5));
+        assert!(s.begin_at(5).is_some());
+        assert_eq!(s.held_until(), None);
+        s.end(true);
+        assert!(!s.busy());
+        assert_eq!(s.pace(b).unwrap().taken, 2);
+    }
+
+    /// One opaque window of XRGB8888 over the whole screen covers the damage of
+    /// a frame of the whole screen, so no black is charged and a band holds
+    /// eleven lines (37 bands); a window one column short does not cover it,
+    /// the black is charged too, and a band holds eight lines (50 bands).
+    #[test]
+    fn a_window_that_covers_the_damage_pays_no_black() {
+        let bands = |w: u32| {
+            let mut s = Scene::new();
+            let a = s.create(1, 1, rect(0, 0, w, 400), false, 0).unwrap();
+            s.attach(a, 1, w * 4).unwrap();
+            s.post(a, 0, &[]).unwrap();
+            s.begin().unwrap();
+            s.end(true);
+            // The whole screen changes: the frame's damage is the screen.
+            s.add_damage(SCREEN);
+            let d = s.begin().unwrap();
+            assert_eq!(d, SCREEN);
+            let rows = s.tile(d).1;
+            s.end(true);
+            (rows, 400u32.div_ceil(rows))
+        };
+        let (rows, n) = bands(640);
+        assert_eq!((rows, n), (11, 37));
+        assert_eq!(n, full_screen_bands());
+        // One column short: the black is charged.
+        let (rows, n) = bands(639);
+        assert_eq!((rows, n), (8, 50));
     }
 
     use proto_gpu::{PIPELINE_CURSOR, SOURCE_CURSOR};

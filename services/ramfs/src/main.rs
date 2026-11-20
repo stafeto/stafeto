@@ -161,6 +161,8 @@ mod own_step {
     /// A close event: the records held in the table before (bits 16 to 31) and after.
     #[cfg(feature = "steps")]
     pub const CLOSE: u64 = 10;
+    /// A turn that releases the lock pages parked by the requests that emptied them.
+    pub const PARKED: u64 = 11;
 
     pub fn sweep(turn: &ramfs::locks::simple::Sweep) -> u64 {
         LOCK_SWEEP << 48
@@ -476,6 +478,7 @@ fn main(_: u64) -> u64 {
         segment_refusals: 0,
         lock_sweep_pending: false,
         lock_maintenance_turn: false,
+        parked_turn_last: false,
         lock_busy: 0,
         lock_turn_ran: false,
         request_began: 0,
@@ -745,6 +748,8 @@ struct Fs {
     lock_sweep: SweepCursor,
     lock_sweep_pending: bool,
     lock_maintenance_turn: bool,
+    /// Whether the last turn of the maintenance was the release of parked lock pages.
+    parked_turn_last: bool,
     /// Nanoseconds the service spent in dispatches other than lock turns
     /// since the last lock turn ended.
     lock_busy: u64,
@@ -4013,7 +4018,8 @@ impl Fs {
     }
 
     fn notify_maintenance(&self) {
-        if self.legacy_pending || self.lock_work_pending() {
+        if self.legacy_pending || self.lock_work_pending() || self.ram.storage.parked_backlog() != 0
+        {
             let _ = sys::notify(&self.channel, 1);
         }
     }
@@ -4106,6 +4112,37 @@ impl Fs {
             let now = self.time_source.now();
             self.ram.storage.layer_maintain(now, &Limits::PORTIONS);
             self.layer_pump();
+            self.legacy_pending = true;
+            self.notify_maintenance();
+            return;
+        }
+        // The lock pages that requests emptied wait on the parking stack: a turn releases up to
+        // `PARK_TURN` of them, outside any client's step.
+        // With the waking of waiters, the sweep or the audit waiting, the turn goes to them after
+        // each turn of the parked pages (`ramfs::maintenance::parked_turn`).
+        let parked_turn = ramfs::maintenance::parked_turn(
+            self.ram.storage.parked_backlog() != 0,
+            self.lock_work_pending(),
+            self.audit_pending(),
+            self.parked_turn_last,
+        );
+        let yielded = ramfs::maintenance::parked_yield_to_locks(
+            self.ram.storage.parked_backlog() != 0,
+            self.lock_work_pending(),
+            self.audit_pending(),
+            self.parked_turn_last,
+        );
+        self.parked_turn_last = parked_turn;
+        if yielded {
+            // The turn the parking yields is the lock work's: it does not pass through the
+            // switch between the lock work and the rest.
+            self.lock_maintenance_turn = true;
+            self.lock_turn(sessions);
+            return;
+        }
+        if parked_turn {
+            rt::service::step_detail(own_step::PARKED);
+            self.ram.storage.release_parked_turn();
             self.legacy_pending = true;
             self.notify_maintenance();
             return;

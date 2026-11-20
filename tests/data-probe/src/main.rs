@@ -18,6 +18,13 @@
 //!   first call, of the listing, of RMDIR, of the longest WRITE of a file of 8 MiB, of the removal of
 //!   large files and of the free count before and after the refresh walk, one line each
 //!   (`data-probe: fill ...`), then `data-probe: fill done`.
+//! - `load`: the file load of the frame-time probe (`frame_load::phases`): from the start of
+//!   the first phase that has it to the end of the last, files of 64 KiB written under a
+//!   temporary name, synced, renamed over the old file of the slot, and removed, round after
+//!   round, one operation at a time (`frame_load::loads::file_op`); the files it made go when
+//!   it stops. It takes its mode from the record's own arguments (`load`), where the other
+//!   modes are fixed at the build. Every call of the load is one of the `Client`'s methods
+//!   below, so a change of the protocol touches those and not the load.
 //! - `verify`: the tree a cut left, or a clean run left. `/progress` says the last step whose line
 //!   went out or the one after it (`STAFETO_DATA_PROBE_MIN` is the last line the host saw: the steps
 //!   it names must all be there). Every file of the tree is whole (the bytes its name says, no
@@ -100,7 +107,17 @@ fn main(_: u64) -> u64 {
         sleep(level, WAIT_S * 1_000_000_000);
         rt::println!("data-probe: waited {WAIT_S} s");
     }
-    let result = match MODE {
+    let own = proto_init::ServiceArgs::read(start.args()).map_or(&[][..], |a| a.own);
+    let mode = if own.is_empty() {
+        MODE
+    } else {
+        core::str::from_utf8(own).unwrap_or("")
+    };
+    let result = match mode {
+        "load" => {
+            let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
+            load(&client, level)
+        }
         "write" => write(&client, &start),
         "verify" => verify(&client),
         // The boot that converts a volume made by an older release and ends (the host then boots
@@ -298,6 +315,56 @@ fn wire<T>(r: Result<T, Status>, why: Fail) -> Result<T, Fail> {
 /// A step is removed by the step 3 after it when that is a multiple of 4.
 fn removes(k: u32) -> Option<u32> {
     (k % 4 == 1).then_some(k + 3)
+}
+
+/// The file load: see the header.
+fn load(c: &Client, level: u8) -> Result<(), Fail> {
+    use frame_load::loads::{self, FILE_BYTES, FileOp};
+    use frame_load::phases::Schedule;
+    let schedule = Schedule::DEFAULT;
+    let now = || rt::time::ticks_to_ns(rt::time::now());
+    match c.mkdir(loads::DIRECTORY) {
+        Ok(()) | Err(Status::Unknown(p::EXISTS)) => {}
+        Err(_) => return Err("mkdir /load"),
+    }
+    let first = schedule
+        .next_wanted(0, |p| p.loads().files)
+        .ok_or("no phase has the file load")?;
+    let wait = schedule.start_of(first).saturating_sub(now());
+    sleep(level, wait);
+    let (mut ops, mut bytes) = (0u64, 0u64);
+    while schedule.at(now()).is_some_and(|p| p.loads().files) {
+        match loads::file_op(ops) {
+            FileOp::Write { salt, .. } => {
+                wire(c.put(loads::TEMPORARY, FILE_BYTES, salt), "put tmp")?;
+                bytes += FILE_BYTES as u64;
+            }
+            FileOp::Rename { slot } => {
+                let mut n = [0u8; 16];
+                let len = loads::slot_name(slot, &mut n);
+                wire(c.rename(loads::TEMPORARY, &n[..len]), "rename tmp")?;
+            }
+            FileOp::Delete { slot } => {
+                let mut n = [0u8; 16];
+                let len = loads::slot_name(slot, &mut n);
+                match c.unlink(&n[..len]) {
+                    Ok(()) | Err(Status::Unknown(p::NO_ENTRY)) => {}
+                    Err(_) => return Err("unlink"),
+                }
+            }
+        }
+        ops += 1;
+    }
+    // What the load made goes: a file of a slot and a temporary one the stop
+    // came in the middle of.
+    for slot in 0..loads::SLOTS {
+        let mut n = [0u8; 16];
+        let len = loads::slot_name(slot, &mut n);
+        let _ = c.unlink(&n[..len]);
+    }
+    let _ = c.unlink(loads::TEMPORARY);
+    rt::println!("data-probe: load ops {ops} bytes {bytes}");
+    Ok(())
 }
 
 fn write(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {

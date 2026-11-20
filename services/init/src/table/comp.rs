@@ -87,6 +87,19 @@ pub const COMPOSITOR_KEYS: Record = Record {
     ..COMPOSITOR
 };
 
+/// The own arguments of the compositor's record that keep the free run, the
+/// frame as soon as the device is ready (a period of 0; the cap is not read):
+/// two words of 8 bytes. The image that measures the frames a second of the
+/// path (`doom-measure`) uses them, so that its series stays comparable; every
+/// other image takes the defaults of the frame clock (60 Hz).
+pub const FREE_RUN: &[u8] = &[0; 16];
+
+/// The compositor of the images that take keys, in the free run.
+pub const COMPOSITOR_KEYS_FREE: Record = Record {
+    args: FREE_RUN,
+    ..COMPOSITOR_KEYS
+};
+
 /// The probe (role `w`): a window of its own with two buffers, a pattern,
 /// then another buffer; it ends holding the window. The quota is the
 /// buffers it makes (four objects of 63 pages, a small one and a second
@@ -139,3 +152,21 @@ const PROBE_C: Record = Record {
 
 /// The probe's image on QEMU.
 pub const TABLE: &[Record] = &[DISPLAY, COMPOSITOR, PROBE, PROBE_B, PROBE_C];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The free run is two zero words as the service reads them; the record
+    /// is the compositor of the keys image with only those arguments changed.
+    #[test]
+    fn the_free_run_record_differs_in_its_arguments_alone() {
+        assert_eq!(FREE_RUN.len(), 16);
+        assert!(FREE_RUN.iter().all(|b| *b == 0));
+        assert_eq!(COMPOSITOR_KEYS_FREE.args, FREE_RUN);
+        assert_eq!(COMPOSITOR_KEYS_FREE.connects, COMPOSITOR_KEYS.connects);
+        assert_eq!(COMPOSITOR_KEYS_FREE.quota, COMPOSITOR_KEYS.quota);
+        assert_eq!(COMPOSITOR_KEYS_FREE.name, "gpu");
+        assert!(COMPOSITOR_KEYS.args.is_empty());
+    }
+}

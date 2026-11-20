@@ -1090,6 +1090,10 @@ impl Run {
         if let Some(refused) = refused_budget(&lines) {
             panic!("{refused}");
         }
+        // The console volume of the step tables, as a number the log shows.
+        if let Some(warning) = table_volume_warning(&lines) {
+            println!("{warning}");
+        }
         Outcome {
             lines,
             status,
@@ -1098,6 +1102,23 @@ impl Run {
             tagged: self.untag.pieces(),
         }
     }
+}
+
+/// The most `service table:` lines a run holds before a warning names their number: the console
+/// is slow, and a run that prints many of them can starve a service of its time.
+const TABLE_LINES_WARN: usize = 600;
+
+/// The warning for a run with more than `TABLE_LINES_WARN` lines of `service table:`.
+fn table_volume_warning(lines: &[String]) -> Option<String> {
+    let tables = lines
+        .iter()
+        .filter(|l| l.contains("service table: "))
+        .count();
+    (tables > TABLE_LINES_WARN).then(|| {
+        format!(
+            "warning: the run printed {tables} lines of service table, more than {TABLE_LINES_WARN}: the console volume may slow the services"
+        )
+    })
 }
 
 /// The first line of a run in which a program says its budget was refused (`<program>: the budget
@@ -2198,6 +2219,19 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         assert!(o.timed_out);
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(expect_stopped_on(&o, "started").is_err());
+    }
+
+    #[test]
+    fn a_run_with_many_table_lines_gets_a_warning_with_their_number() {
+        let table = "service table: 1 kind 28 9834 ticks detail 0 preempts 0".to_owned();
+        let few = vec![table.clone(); TABLE_LINES_WARN];
+        assert!(table_volume_warning(&few).is_none());
+        let many = vec![table; TABLE_LINES_WARN + 1];
+        let warning = table_volume_warning(&many).unwrap();
+        assert!(
+            warning.contains("601 lines") && warning.contains("600"),
+            "{warning}"
+        );
     }
 
     #[test]

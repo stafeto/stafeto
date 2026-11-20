@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 #
-# nginx 1.30.6 on the TCP/IP stack of F-Stack in its own process, on the
+# nginx 1.30.7 on the TCP/IP stack of F-Stack in its own process, on the
 # second network device, in the images with two devices: the object of the
 # package nginx, linked with libfstack.a, the device's driver and the glue
 # of ports/f-stack (tools/build-libc-so.py programs). The package carries
@@ -9,13 +9,13 @@
 # no other archive of the system). Format: docs/packages.md.
 
 name = "nginx-fast"
-version = "1.30.6"
+version = "1.30.7"
 kind = "optional"
 image = "fstack"
 release = "1"
 summary = "nginx on the F-Stack TCP/IP stack"
-url = "https://nginx.org/download/nginx-1.30.6.tar.gz"
-sha256 = "3cf46f5ed7504d460125866b7bea99fb357f31d887e2e63b35503310e9b8b6c8"
+url = "https://nginx.org/download/nginx-1.30.7.tar.gz"
+sha256 = "2565b5c837050e958f70fb0f73c48e2bca4542ad349fd356f46fb0c72610bc6e"
 license = "BSD-2-Clause"
 depends = ["f-stack"]
 build_depends = ["f-stack", "openssl", "pcre2"]

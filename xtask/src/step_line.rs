@@ -60,6 +60,13 @@ impl StepLine<'_> {
 /// preemptions and one pair for 8 and more (`rt::service`'s step statistics). In one pair the
 /// greatest raw time is the greatest judged time at any charge, and the pair of 8 and more is
 /// judged with 8 preemptions: stricter than the true count of the line, which is the safe side.
+///
+/// The pairs reach xtask in the tables, at powers of two of the steps done and once at an ordered
+/// stop, and a run that ends otherwise may hold a pair that beat its maximum after the last
+/// table. That understatement is accepted: a hidden step is no longer than the raw maximum printed
+/// for its kind, so it cannot pass the check against B (`over_bound`); against 0.9 B the figure
+/// is understated by at most `P * PREEMPT_CHARGE` from the printed maximum, P being the
+/// preemptions of the hidden step.
 pub const PAIR_TOP: u64 = 8;
 
 /// The time less the measured charge of `preempts` preemptions (against 0.9 B).
@@ -97,6 +104,11 @@ impl Kinds<'_> {
 
 /// The hard check against B (`crate::TERM_B`) of the steps of the service `tag` of the kinds a
 /// probe judges (`over_bound`): an error that names the step, for the probes to return.
+///
+/// A kind is exempt from B only together with its exemption from 0.9 B in the same probe, and
+/// with a stated reason (a start-up step, a run whose ticks are the timer's). A new kind of a
+/// service falls under the check by default: `Kinds::All` and `Kinds::Except` take it in, and
+/// `Kinds::Only` takes it in when its list is extended with the bound the probe puts on it.
 pub fn within_b(lines: &[String], tag: &str, kinds: Kinds) -> Result<(), String> {
     match over_bound(lines, tag, crate::TERM_B, kinds) {
         Some(over) => Err(over),
@@ -278,6 +290,28 @@ pub fn longest_warned(lines: &[String], tag: &str, bound: u64) -> Vec<(usize, u6
     longest(lines, tag)
 }
 
+/// The longest step of kind `kind` of the service `tag` among the lines (new longest or table)
+/// between the first line that contains `from` and the first line after it that contains `to`,
+/// whose detail `detail_ok` accepts: how a probe reads the steps of one of its cases, which it
+/// brackets with two marker lines. None when a marker is missing or no such line came: the
+/// console tells a step only when it passes the longest of its kind so far.
+pub fn longest_between<'a>(
+    lines: &'a [String],
+    from: &str,
+    to: &str,
+    tag: &str,
+    kind: usize,
+    detail_ok: impl Fn(u64) -> bool,
+) -> Option<StepLine<'a>> {
+    let begin = lines.iter().position(|l| l.contains(from))?;
+    let end = begin + lines[begin..].iter().position(|l| l.contains(to))?;
+    lines[begin..end]
+        .iter()
+        .filter_map(|l| parse_any(l))
+        .filter(|s| s.tag == tag && s.kind == kind && detail_ok(s.detail))
+        .max_by_key(|s| s.ticks)
+}
+
 /// The lines of a run whose lines of a new longest were all lost in the burst at the start and
 /// that kept the table of the service (for the tests of the probes that read it).
 #[cfg(test)]
@@ -300,6 +334,25 @@ mod tests {
 
     fn lines(text: &[&str]) -> Vec<String> {
         text.iter().map(|l| (*l).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_steps_of_a_case_are_read_between_its_markers_by_detail() {
+        let l = lines(&[
+            "service step: 2 kind 50 9000 ticks detail 7",
+            "case a: begin",
+            "service step: 2 kind 50 12000 ticks detail 5",
+            "service step: 2 kind 50 13000 ticks detail 7 preempts 1",
+            "service table: 2 kind 50 14000 ticks detail 7 preempts 0",
+            "service step: 2 kind 49 15000 ticks detail 7",
+            "case a: end",
+            "service step: 2 kind 50 19000 ticks detail 7",
+        ]);
+        let got = longest_between(&l, "case a: begin", "case a: end", "2", 50, |d| d == 7).unwrap();
+        assert_eq!((got.ticks, got.preempts), (14000, 0));
+        assert!(longest_between(&l, "case a: begin", "case a: end", "3", 50, |_| true).is_none());
+        assert!(longest_between(&l, "case a: begin", "case b: end", "2", 50, |_| true).is_none());
+        assert!(longest_between(&l, "case a: end", "case a: begin", "2", 50, |_| true).is_none());
     }
 
     #[test]

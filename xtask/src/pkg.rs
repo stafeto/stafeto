@@ -591,6 +591,10 @@ pub struct Options {
     /// Paths of the selected packages that the package file leaves out: the file is a variant
     /// for one image (`image_files`).
     pub remove: Vec<String>,
+    /// A packages-only update (docs/release.md): wants `previous` and every
+    /// package of the series, and refuses what only a release of the system
+    /// may do (`carry::packages_only_refusals`).
+    pub packages_only: bool,
 }
 
 pub struct Built {
@@ -646,6 +650,7 @@ pub fn image_files(
             previous: None,
             perturb: Vec::new(),
             remove: Vec::new(),
+            packages_only: false,
         })?;
     }
     let plain = crate::target_dir().join("pkg");
@@ -672,6 +677,7 @@ pub fn image_files(
                 previous: None,
                 perturb: Vec::new(),
                 remove: l.removed.iter().map(|p| (*p).to_string()).collect(),
+                packages_only: false,
             })?;
             dir
         };
@@ -763,6 +769,9 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
         return Ok(Vec::new());
     }
     let tree = crate::root();
+    if opts.packages_only && (opts.previous.is_none() || !opts.names.is_empty()) {
+        return Err("a packages-only update carries every package of a published series: it wants --previous and names no package".into());
+    }
     // The packages of a published index that did not change are carried; the
     // releases of the plan go to the descriptions.
     let mut carried: BTreeMap<String, (Vec<u8>, String, Option<String>)> = BTreeMap::new();
@@ -784,6 +793,34 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
         }
         for line in carry::describe(&plan, previous.as_ref(), &series()) {
             println!("{line}");
+        }
+        if opts.packages_only {
+            let Some(previous) = previous.as_ref() else {
+                return Err(format!(
+                    "the series {} is not published: a packages-only update has nothing to update",
+                    series()
+                ));
+            };
+            let pin = crate::script_value("tools/build-relibc.py", "COMMIT")?;
+            let is_base = |name: &str| {
+                selected
+                    .iter()
+                    .any(|p| p.name == name && p.kind == packages::Kind::Base)
+            };
+            let lines = carry::packages_only_refusals(
+                &plan,
+                previous,
+                &wanted,
+                &is_base,
+                &format!("pin-{}", &pin[..8]),
+                &carry::carried_relibc(&plan)?,
+            );
+            if !lines.is_empty() {
+                return Err(format!(
+                    "packages-only update refused:\n  {}",
+                    lines.join("\n  ")
+                ));
+            }
         }
         carry::set_releases(
             plan.fates
@@ -1004,6 +1041,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         previous: None,
         perturb: Vec::new(),
         remove: Vec::new(),
+        packages_only: false,
     };
     let mut i = 0;
     let value = |i: &mut usize| -> Result<String, String> {

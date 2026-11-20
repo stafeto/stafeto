@@ -8,6 +8,13 @@ release without one gets a short introduction. The table of release files
 and a link to the pull requests merged since the previous tag follow.
 
     release-notes.py <version> <tag> [<previous tag>]
+
+A packages-only update (docs/release.md) has its own form: the summary written
+in docs/releases/<series>-pkgs.<k>.md, the table of the packages the update
+changes (from the signed copy of its index against the copy of the previous
+anchor of the series) and the table of its files.
+
+    release-notes.py --packages <series>-pkgs.<k> <tag> <previous tag or ""> <new index> <previous index>
 """
 
 import sys
@@ -69,6 +76,74 @@ def credit_lines() -> list[str]:
     return ["## Credits", "", *[f"{sentence}\n" for sentence in sentences]]
 
 
+def index_records(path: Path) -> dict[str, dict[str, str]]:
+    """The entries of an INDEX text by package name."""
+    found = {}
+    for block in path.read_text().split("\n\n")[1:]:
+        fields = dict(line.partition(" ")[::2] for line in block.splitlines())
+        if "name" in fields:
+            found[fields["name"]] = fields
+    return found
+
+
+def storage_of(file: str) -> str:
+    """The storage release an entry's `file` points into (`v0.5-pkgs.1-aarch64`),
+    or the file itself when it is no address of the storage."""
+    parts = file.split("/")
+    return parts[-2] if file.startswith("https://") and len(parts) >= 2 else file
+
+
+def changed_table(new: Path, old: Path) -> list[str]:
+    """The rows of the table of the packages the update changes: those whose
+    entry has another SHA-256 than in the previous copy, or is new, with
+    `version-release` before and after and the storage release of the file."""
+    now, before = index_records(new), index_records(old)
+    rows = []
+    for name in sorted(now):
+        if name in before and before[name]["sha256"] == now[name]["sha256"]:
+            continue
+        was = before[name]["version"] if name in before else "-"
+        rows.append(f"| `{name}` | {was} | {now[name]['version']} | `{storage_of(now[name]['file'])}` |")
+    for name in sorted(set(before) - set(now)):
+        rows.append(f"| `{name}` | {before[name]['version']} | - | - |")
+    return rows
+
+
+def packages_summary(name: str) -> str:
+    """The summary written for this update, or a short introduction."""
+    written = ROOT / "docs" / "releases" / f"{name}.md"
+    if written.exists():
+        return written.read_text().strip()
+    series = name.split("-pkgs.")[0]
+    return (f"An update of the packages of the series {series}, with no new version of the system. "
+            "`pkg update` fetches the new index and `pkg upgrade` replaces the packages that changed.")
+
+
+def packages_notes(name: str, tag: str, previous: str | None, new: Path, old: Path) -> str:
+    repository = "https://github.com/stafeto/stafeto"
+    changes = f"{repository}/compare/{previous}...{tag}" if previous else f"{repository}/pulls?q=is%3Apr+is%3Amerged"
+    changed = changed_table(new, old)
+    lines = [
+        packages_summary(name),
+        "",
+        "## Changed packages",
+        "",
+        "| Package | Was | Now | Storage |",
+        "| --- | --- | --- | --- |",
+        *(changed or ["| - | - | - | - |"]),
+        "",
+        "## Files",
+        "",
+        "| File | Content |",
+        "| --- | --- |",
+        *["| " + ", ".join(f"`{n}`" for n in names) + f" | {content} |" for names, content in dist.packages_release_files(name)],
+        "",
+        f"Every change since the previous release is in the [merged pull requests]({changes}).",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def notes(version: str, tag: str, previous: str | None) -> str:
     repository = "https://github.com/stafeto/stafeto"
     changes = (f"{repository}/compare/{previous}...{tag}" if previous
@@ -91,6 +166,10 @@ def notes(version: str, tag: str, previous: str | None) -> str:
 
 
 def main() -> None:
+    if len(sys.argv) == 7 and sys.argv[1] == "--packages":
+        _, _, name, tag, previous, new, old = sys.argv
+        sys.stdout.write(packages_notes(name, tag, previous or None, Path(new), Path(old)))
+        return
     if len(sys.argv) not in (3, 4):
         raise SystemExit(__doc__)
     previous = sys.argv[3] if len(sys.argv) == 4 and sys.argv[3] else None

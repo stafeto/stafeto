@@ -14,6 +14,8 @@
 
 #![no_std]
 
+pub mod kept;
+
 /// The format of a surface's points.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -26,6 +28,7 @@ pub enum Format {
 #[cfg(target_os = "none")]
 mod imp {
     use super::Format;
+    use crate::kept::Kept;
     use core::ffi::c_void;
 
     // pixman.h: PIXMAN_FORMAT (bpp, type, a, r, g, b) with the type ARGB 2.
@@ -41,7 +44,19 @@ mod imp {
     /// of two buffers and the screen are 17) makes every operation of a band
     /// make an image again and drop another, which costs a band thousands of ticks
     /// and fragments the arena.
+    /// The table is `kept::Kept`: the lookup of a surface the caller numbers is one
+    /// comparison when the slot it was last found in still holds it.
     pub const KEPT: usize = 32;
+    /// The hints: 0 is the target of the operations, 1 to HINTS - 1 the sources by
+    /// the numbers their caller gives them (`NO_HINT` is none).
+    pub const HINTS: usize = 32;
+    pub const DST_HINT: usize = 0;
+    pub const NO_HINT: usize = usize::MAX;
+
+    /// The hint of a source the caller numbers `n`: none when `n` is out of range.
+    const fn src_hint(n: usize) -> usize {
+        if n < HINTS - 1 { n + 1 } else { NO_HINT }
+    }
 
     unsafe extern "C" {
         fn pixman_image_create_bits(
@@ -113,23 +128,38 @@ mod imp {
     /// memory an image wraps is only read or written in a call, so a surface
     /// whose memory is gone is harmless until the service names it again.
     pub struct Images {
-        kept: [Option<(Key, Image)>; KEPT],
-        next: usize,
+        kept: Kept<Key, Image, KEPT, HINTS>,
+        made: u32,
     }
 
     impl Images {
         pub const fn new() -> Images {
             Images {
-                kept: [const { None }; KEPT],
-                next: 0,
+                kept: Kept::new(),
+                made: 0,
             }
         }
 
-        /// The image of `key`, made when it is not kept. None when pixman
-        /// refuses (no memory in its arena).
-        fn image(&mut self, key: Key) -> Option<*mut c_void> {
-            if let Some((_, image)) = self.kept.iter().flatten().find(|(k, _)| *k == key) {
-                return Some(image.0);
+        /// The images made so far (a use of a surface the table does not
+        /// keep makes one, which costs a few thousand ticks for eight).
+        pub fn made(&self) -> u32 {
+            self.made
+        }
+
+        /// The entries of the table compared in all (0 without the feature
+        /// `scan-count`).
+        pub fn scanned(&self) -> u32 {
+            self.kept.scanned()
+        }
+
+        /// The image of `key`, made when it is not kept. `hint` is the number of
+        /// the surface in the caller's own naming (`DST_HINT`, or `SRC_HINT` and
+        /// the caller's number): the table remembers the slot each was found in,
+        /// and a lookup is one comparison when the slot still holds the key. None
+        /// when pixman refuses (no memory in its arena).
+        fn image(&mut self, key: Key, hint: usize) -> Option<*mut c_void> {
+            if let Some(slot) = self.kept.find(&key, hint) {
+                return self.kept.value(slot).map(|image| image.0);
             }
             // SAFETY: pixman reads the arguments; the bits are not owned by
             // the image, which is dropped (with the table) before the
@@ -146,9 +176,8 @@ mod imp {
             if image.is_null() {
                 return None;
             }
-            let at = self.next;
-            self.next = (self.next + 1) % KEPT;
-            self.kept[at] = Some((key, Image(image)));
+            self.made = self.made.wrapping_add(1);
+            self.kept.insert(key, Image(image), hint);
             Some(image)
         }
     }
@@ -194,6 +223,7 @@ mod imp {
         src: (&[u8], Format, u32, u32, u32),
         at: (u32, u32, u32, u32),
         size: (u32, u32),
+        hint: usize,
     ) -> bool {
         let (dbytes, dformat, dstride, dwidth, dheight) = dst;
         let (sbytes, sformat, sstride, swidth, sheight) = src;
@@ -215,22 +245,28 @@ mod imp {
         {
             return false;
         }
-        let Some(d) = images.image(Key {
-            bytes: dbytes.as_mut_ptr() as usize,
-            format: dformat,
-            stride: dstride,
-            width: dwidth,
-            height: dheight,
-        }) else {
+        let Some(d) = images.image(
+            Key {
+                bytes: dbytes.as_mut_ptr() as usize,
+                format: dformat,
+                stride: dstride,
+                width: dwidth,
+                height: dheight,
+            },
+            DST_HINT,
+        ) else {
             return false;
         };
-        let Some(s) = images.image(Key {
-            bytes: sbytes.as_ptr() as usize,
-            format: sformat,
-            stride: sstride,
-            width: swidth,
-            height: sheight,
-        }) else {
+        let Some(s) = images.image(
+            Key {
+                bytes: sbytes.as_ptr() as usize,
+                format: sformat,
+                stride: sstride,
+                width: swidth,
+                height: sheight,
+            },
+            src_hint(hint),
+        ) else {
             return false;
         };
         // SAFETY: both images wrap memory that the checks above show holds
@@ -253,6 +289,35 @@ mod imp {
             );
         }
         true
+    }
+
+    /// The image of a source surface is made (when the table does not keep
+    /// it), so that the first operation that reads it, in a band, does not
+    /// pay for it. False when the surface is not what its bytes hold or
+    /// pixman refuses.
+    pub fn prepare(images: &mut Images, src: (&[u8], Format, u32, u32, u32), hint: usize) -> bool {
+        let (sbytes, sformat, sstride, swidth, sheight) = src;
+        if !shaped(
+            sbytes.as_ptr() as usize,
+            sbytes.len(),
+            sstride,
+            swidth,
+            sheight,
+        ) {
+            return false;
+        }
+        images
+            .image(
+                Key {
+                    bytes: sbytes.as_ptr() as usize,
+                    format: sformat,
+                    stride: sstride,
+                    width: swidth,
+                    height: sheight,
+                },
+                src_hint(hint),
+            )
+            .is_some()
     }
 
     /// The rectangle takes `value`; false (and nothing is drawn) when the
@@ -288,7 +353,7 @@ mod imp {
 }
 
 #[cfg(target_os = "none")]
-pub use imp::{Images, KEPT};
+pub use imp::{HINTS, Images, KEPT, NO_HINT};
 
 /// A surface to draw on.
 #[cfg(target_os = "none")]
@@ -309,6 +374,10 @@ pub struct Source<'a> {
     pub stride: u32,
     pub width: u32,
     pub height: u32,
+    /// The surface's number in the caller's own naming, from 0 to `HINTS` - 2 (or
+    /// `NO_HINT`): the table of images remembers where it found the image of the
+    /// surface, and a later lookup is one comparison.
+    pub hint: usize,
 }
 
 /// The `w` by `h` points at (`sx`, `sy`) of `src` replace those at
@@ -333,6 +402,19 @@ pub fn composite(
         (src.bytes, src.format, src.stride, src.width, src.height),
         (sx, sy, dx, dy),
         (w, h),
+        src.hint,
+    )
+}
+
+/// The image of `src` is made now when the table does not keep it (see
+/// `Images::image`): the cost of a surface's first use goes where the
+/// caller puts it. False when the surface is not what its bytes hold.
+#[cfg(target_os = "none")]
+pub fn prepare(images: &mut Images, src: Source<'_>) -> bool {
+    imp::prepare(
+        images,
+        (src.bytes, src.format, src.stride, src.width, src.height),
+        src.hint,
     )
 }
 

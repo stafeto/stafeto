@@ -51,14 +51,14 @@ use init::overrun::Overruns;
 use init::quota::{self, Start};
 use init::restart::{BREAK_AFTER, Failures, Verdict, WINDOW_NS};
 use init::shutdown::{self, Decision, Expiry, Mask, Stop};
-use init::silent::{BudgetLook, Look, Moment, ThreadLook};
+use init::silent::{BudgetLook, ChannelLook, CpuSleep, Diag, Look, Moment, ThreadLook};
 use init::table::{self, MAX_RECORDS, Record, Restart};
 use init::waits::{self, Gate, Release, Standing, Step};
 use init::watch::{Action, Watched};
 use init::work::{Job, Jobs, WORKER_IDLE, worker_level};
 use proto_init::{
     Adoption, BUDGET_ASK, BUDGET_RELEASE, BUDGET_SHARES, BudgetAsk, BudgetRelease, BudgetSharesAsk,
-    BudgetSharesHead, Connect, FULL_SHARE, LIST_PAGE, ListReply, ListRequest, Method,
+    BudgetSharesHead, Connect, FULL_SHARE, LIST_PAGE, ListReply, ListRequest, Method, PROBE_BIT,
     Record as Listed, RegisterReply, SHUTDOWN_RESET, START_NAMES, STOP_NOTICE, ShutdownAsk, State,
     Stats, VERSION, Work,
 };
@@ -209,6 +209,9 @@ impl Held {
         }
     }
 }
+
+/// The CPUs whose sleep the line of a silent service tells.
+const DIAG_CPUS: usize = 8;
 
 /// What the main thread keeps for a record of the table: its state, its
 /// instance, what is left of the instance that ended until the worker
@@ -826,6 +829,17 @@ impl Init {
     /// and one notify, which blocks nobody. False when the copy could not be
     /// made.
     fn notify_stop(&self, place: usize) -> bool {
+        self.notify_label(place, 1)
+    }
+
+    /// The nudge of a suspect service (proto_init::PROBE_BIT), through the same copy of its
+    /// channel as the stop notice. The service answers with a line of its heartbeat; it
+    /// ends nothing. False when the copy could not be made.
+    fn nudge(&self, place: usize) -> bool {
+        self.notify_label(place, PROBE_BIT)
+    }
+
+    fn notify_label(&self, place: usize, bits: u64) -> bool {
         let record = &table::table()[place];
         let Some(channel) = self.entries[place]
             .held
@@ -836,7 +850,7 @@ impl Init {
         };
         match sys::handle_label(channel, Rights::NOTIFY, STOP_NOTICE, record.priority) {
             Ok(copy) => {
-                let _ = sys::notify(&copy, 1);
+                let _ = sys::notify(&copy, bits);
                 true
             }
             Err(_) => false,
@@ -1424,16 +1438,16 @@ impl Init {
             late_us: late.0 / 1000,
             late_count: late.1,
         };
-        self.print_look(place, "silent service", Some(moment));
+        self.print_look(place, "silent service", Some(moment), true);
         let driver = table::table().iter().position(|r| r.log);
         if let Some(driver) = driver.filter(|&d| d != place) {
-            self.print_look(driver, "console driver", None);
+            self.print_look(driver, "console driver", None, false);
         }
     }
 
     /// The line of what the kernel says of the thread of the instance of `place` that runs, and of
     /// the record's budgets.
-    fn print_look(&self, place: usize, role: &str, moment: Option<Moment>) {
+    fn print_look(&self, place: usize, role: &str, moment: Option<Moment>, diag: bool) {
         let record = &table::table()[place];
         let thread = self.entries[place]
             .held
@@ -1473,6 +1487,48 @@ impl Init {
                 count += 1;
             }
         }
+        let mut cpus = [CpuSleep {
+            since_us: 0,
+            idle_us: 0,
+        }; DIAG_CPUS];
+        let mut up = 0;
+        let mut init_cpu = None;
+        if diag {
+            let us = |ticks| time::ticks_to_ns(ticks) / 1000;
+            while up < DIAG_CPUS {
+                let Ok(info) = sys::cpu_info(up as u64) else {
+                    break;
+                };
+                init_cpu = Some(info.current);
+                cpus[up] = CpuSleep {
+                    since_us: us(info.since),
+                    idle_us: us(info.idle),
+                };
+                up += 1;
+            }
+        }
+        let diag = diag.then(|| {
+            let (refused, last) = self.entries[place]
+                .watch
+                .as_ref()
+                .map_or((0, None), |w| w.beats_refused());
+            let channel = self.entries[place]
+                .held
+                .running()
+                .and_then(|instance| instance.channel.as_ref())
+                .and_then(|channel| sys::channel_info(channel).ok())
+                .map(|c| ChannelLook {
+                    queued: c.queued,
+                    receivers: c.receivers,
+                });
+            Diag {
+                refused,
+                last_beat_us: last.map(|ns| ns / 1000),
+                channel,
+                init_cpu,
+                cpus: &cpus[..up],
+            }
+        });
         let look = Look {
             name: record.name,
             role,
@@ -1480,6 +1536,7 @@ impl Init {
             moment,
             thread,
             budgets: &looks[..count],
+            diag,
         };
         println!("{look}");
     }
@@ -1714,9 +1771,16 @@ impl Init {
                 self.launch(place);
             }
             State::Starting | State::Running => {
-                match entry.watch.as_mut().map(|w| w.expired(now)) {
-                    Some(Action::Suspect { deadline }) => self.set_deadline(place, deadline),
-                    Some(Action::Silent) => self.silent(place, now),
+                match entry.watch.as_mut().map(|w| w.expired_first(now)) {
+                    Some((Action::Suspect { deadline }, first)) => {
+                        self.set_deadline(place, deadline);
+                        // The first miss: a nudge, so that the line of a silence that follows
+                        // has the answer of the service's heartbeat before it.
+                        if first {
+                            self.nudge(place);
+                        }
+                    }
+                    Some((Action::Silent, _)) => self.silent(place, now),
                     _ => {}
                 }
             }
@@ -2086,6 +2150,9 @@ impl Init {
         let entry = &mut self.entries[place];
         let registered = !table::table()[place].is_client() && entry.state == State::Running;
         if !registered {
+            if let Some(w) = entry.watch.as_mut() {
+                w.refuse();
+            }
             return refuse(Error::BadState);
         }
         if let Some(at) = entry.watch.as_mut().map(|w| w.beat(now())) {
