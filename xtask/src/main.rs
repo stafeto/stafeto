@@ -4810,7 +4810,9 @@ fn posix_cancel_input_probe(vz: bool) -> Result<(), String> {
         )?;
         run.send("v")?;
         run.expect("posix-cancel-input-probe: ok", DIALOG_STEP)?;
-        run.expect(ENDED, DIALOG_STEP)
+        // Init's end line goes straight to the console and the probe's last lines
+        // through the terminal service, so the two come in no fixed order.
+        run.expect_seen(ENDED, DIALOG_STEP)
     })();
     run.stop();
     if vz {
@@ -4859,7 +4861,9 @@ fn posix_input_probe(vz: bool) -> Result<(), String> {
         )?;
         run.send("xyz")?;
         run.expect("posix-input-probe: ok", DIALOG_STEP)?;
-        run.expect(ENDED, DIALOG_STEP)
+        // Init's end line goes straight to the console and the probe's last lines
+        // through the terminal service, so the two come in no fixed order.
+        run.expect_seen(ENDED, DIALOG_STEP)
     })();
     run.stop();
     if vz {
@@ -5170,7 +5174,9 @@ fn posix_interrupt_on(vz: bool, machine: Option<&qemu::Machine>) -> Result<(), S
         run.expect("posix-interrupt-probe: retry waiting", BOOT_TIMEOUT)?;
         run.send("q")?;
         run.expect("posix-interrupt-probe: ok", DIALOG_STEP)?;
-        run.expect(ENDED, DIALOG_STEP)
+        // Init's end line goes straight to the console and the probe's last lines
+        // through the terminal service, so the two come in no fixed order.
+        run.expect_seen(ENDED, DIALOG_STEP)
     })();
     run.stop();
     if vz {
@@ -6584,9 +6590,7 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
             30
         }),
     );
-    let mut outcome = run.stop();
-    // A line of the audit of ramfs or of the services' timing may land inside a long line.
-    outcome.lines = rejoin_split_lines(&outcome.lines);
+    let outcome = run.stop();
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     if ended? != "init: posix-procs ended: exit code 0, not restarted" {
         return Err("the PID lifetime probe failed".into());
@@ -8292,8 +8296,6 @@ fn check_audit_rounds(lines: &[String]) -> Result<(), String> {
 /// volley of 112 completed renames and the held-job case that repeats a
 /// refused Start after releasing capacity. The lines go to the report output.
 fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
-    // A line of a service may land inside a long line of the probe (`rejoin_split_lines`).
-    let lines = rejoin_split_lines(lines);
     let shown: Vec<&String> = lines
         .iter()
         .filter(|line| line.starts_with("posix-procs: names "))
@@ -8425,64 +8427,11 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
 }
 
 /// Published concurrent snapshots must preserve the part's memory reserve.
-/// The console takes a line of more than 64 bytes in several writes, and a
-/// line that another CPU writes meanwhile may land inside it: a line of the
-/// services' timing (`service wait:`, `service table:`, `service heartbeat:` and the like,
-/// lib/rt) or the audit
-/// line of ramfs (`ramfs: audit round`). Such a line goes back where it
-/// came from, and the rest of the split line, the next line, joins its
-/// start.
-fn rejoin_split_lines(lines: &[String]) -> Vec<String> {
-    // The exact starts of the intruders: a text such as "in the service ok" is no intruder.
-    const INTRUDERS: [&str; 8] = [
-        "service step: ",
-        "service table: ",
-        "service heartbeat: ",
-        "service wait: ",
-        "service wait cut: ",
-        "service gap: ",
-        "service preempt: ",
-        "ramfs: audit round ",
-    ];
-    // The lines of the probes that are long enough to be split: those of posix-procs and the
-    // lines of its close and lifetime tests.
-    const SPLIT_STARTS: [&str; 5] = [
-        "posix-procs: ",
-        "RAM close ",
-        "POSIX close ",
-        "RAM native ",
-        "RAM lifetime ",
-    ];
-    let mut out = Vec::with_capacity(lines.len());
-    let mut i = 0;
-    while i < lines.len() {
-        let line = &lines[i];
-        let cut = INTRUDERS
-            .iter()
-            .filter_map(|tag| line.find(tag))
-            .min()
-            .filter(|&at| at > 0 && SPLIT_STARTS.iter().any(|start| line.starts_with(start)));
-        match (cut, lines.get(i + 1)) {
-            (Some(at), Some(rest)) => {
-                out.push(line[at..].to_owned());
-                out.push(format!("{}{rest}", &line[..at]));
-                i += 2;
-            }
-            _ => {
-                out.push(line.clone());
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
 fn check_process_memory_reserve(lines: &[String]) -> Result<(), String> {
     let mut snapshots = 0;
     let mut names_workload = false;
     let mut names_capacity = false;
-    let lines = rejoin_split_lines(lines);
-    for line in &lines {
+    for line in lines {
         let capacity = line.starts_with("posix-procs: names quota:")
             || line.starts_with("posix-procs: names capacity memory:");
         names_workload |= line.starts_with("posix-procs: names workload memory:");
@@ -10519,7 +10468,9 @@ fn tty_probe(vz: bool) -> Result<(), String> {
         run.expect_bytes(b"\nbare-lf\n", DIALOG_STEP)?;
         run.expect("tty-probe: wrote", DIALOG_STEP)?;
         run.expect("tty-probe: ok", DIALOG_STEP)?;
-        run.expect(ENDED_TTY, DIALOG_STEP)?;
+        // Init's end line goes straight to the console and the probe's last lines
+        // through the terminal service, so the two come in no fixed order.
+        run.expect_seen(ENDED_TTY, DIALOG_STEP)?;
         // The debug completion can precede bytes already accepted by UART.
         run.expect_seen(
             "tty-probe line 199 abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
@@ -17182,7 +17133,7 @@ mod tests {
         .map(|l| (*l).to_owned())
         .collect();
         assert_eq!(
-            rejoin_split_lines(&lines),
+            qemu::rejoin_lines(&lines),
             [
                 "service wait: 10 kind 64 29846 ticks of 31452",
                 "posix-procs: names quota: process 1, quota 552 pages, used 513 pages, remaining 39",
@@ -17202,7 +17153,7 @@ mod tests {
         let table = "service table: 1 kind 28 9834 ticks detail 0 preempts 0";
         let split: Vec<String> = [format!("{head}{table}"), tail.to_owned()].into();
         assert_eq!(
-            rejoin_split_lines(&split),
+            qemu::rejoin_lines(&split),
             [table.to_owned(), whole.to_owned()]
         );
         // The same with a line of the heartbeat.
@@ -17210,7 +17161,7 @@ mod tests {
             "service heartbeat: a stale expiry, armed again (period 250000000 ns, priority 50)";
         let split: Vec<String> = [format!("{head}{note}"), tail.to_owned()].into();
         assert_eq!(
-            rejoin_split_lines(&split),
+            qemu::rejoin_lines(&split),
             [note.to_owned(), whole.to_owned()]
         );
         // The names check reads the log with the line split.
@@ -17219,6 +17170,7 @@ mod tests {
         );
         let at = log.iter().position(|l| l == whole).unwrap();
         log.splice(at..=at, [format!("{head}{table}"), tail.to_owned()]);
+        let log = qemu::rejoin_lines(&log);
         assert!(names_lines(&log).is_ok(), "{:?}", names_lines(&log));
     }
 
@@ -17234,7 +17186,7 @@ mod tests {
         .map(|l| (*l).to_owned())
         .collect();
         assert_eq!(
-            rejoin_split_lines(&lines),
+            qemu::rejoin_lines(&lines),
             [
                 "ramfs: audit round 67",
                 "posix-procs: names quota: process 8, quota 576 pages, used 294 pages, remaining 282 pages, refused stack 1159168 bytes, eighth ordinary stack 65536 bytes",
@@ -17254,7 +17206,7 @@ mod tests {
         .map(|l| (*l).to_owned())
         .collect();
         assert_eq!(
-            rejoin_split_lines(&lines),
+            qemu::rejoin_lines(&lines),
             [
                 "ramfs: audit round 39",
                 "RAM close event: exact replay, stale body, physical I/O and 32-reference birth cleanup ok, ticks=12",
