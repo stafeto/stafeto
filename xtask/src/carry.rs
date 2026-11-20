@@ -18,6 +18,11 @@
 //!   package whose key is revoked is built again.
 //! * A package with a new recipe takes `release` one above the entry of the
 //!   same version, or 1 for a new version or a new name.
+//! * The recipe is the fast path. When it differs and the version is the same,
+//!   the package is still carried if what it installs equals what the file of
+//!   the index installs: the manifest lines (without `SOURCE`) and the `meta`
+//!   fields (without `recipe`, `commit`, `release` and `size`). Otherwise it is
+//!   built, and the plan names the first path or field that differs.
 
 use pkgfmt::index::Index;
 use pkgfmt::sig::{Block, Kind};
@@ -357,6 +362,120 @@ pub struct Wanted<'a> {
     pub name: &'a str,
     pub version: &'a str,
     pub recipe: &'a str,
+    /// What the package would install; `None` when the package may not be
+    /// carried by content (a variant for an image: `replace`, `remove`).
+    pub content: Option<&'a Installed>,
+}
+
+/// The `meta` fields that stay out of the comparison of content: they change
+/// with every build (`recipe`, `commit`, `release`) or hold the length of
+/// `SOURCE` (`size`).
+pub const META_VOLATILE: [&str; 4] = ["recipe", "commit", "release", "size"];
+
+/// What a package installs: the lines of its `manifest` (without the line of
+/// `SOURCE`) and its `meta` fields (without `META_VOLATILE`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Installed {
+    /// `(path, line)` sorted by path.
+    pub manifest: Vec<(String, String)>,
+    /// `(key, value)` in the order of the file.
+    pub meta: Vec<(&'static str, String)>,
+}
+
+/// One line of a manifest, as `pkgfmt::manifest::line` writes it (without the
+/// newline).
+fn manifest_text(e: &pkgfmt::manifest::ManifestEntry<'_>) -> String {
+    let digest = match &e.sha256 {
+        None => "-".to_string(),
+        Some(d) => {
+            let mut buf = [0u8; 64];
+            sha::hex(d, &mut buf).to_string()
+        }
+    };
+    format!(
+        "{digest} {} {:06o} {} {}",
+        e.size,
+        e.mode,
+        if e.elf { "elf" } else { "-" },
+        e.path
+    )
+}
+
+impl Installed {
+    /// `meta` and the manifest lines `(path, line)`; the line of `SOURCE` is dropped.
+    pub fn new(meta: &pkgfmt::meta::Meta<'_>, lines: Vec<(String, String)>) -> Installed {
+        let source = format!("/usr/share/licenses/{}/SOURCE", meta.name);
+        let mut manifest: Vec<(String, String)> = lines
+            .into_iter()
+            .filter(|(path, _)| *path != source)
+            .collect();
+        manifest.sort();
+        let fields: [(&'static str, &str); 16] = [
+            ("name", meta.name),
+            ("version", meta.version),
+            ("release", meta.release),
+            ("arch", meta.arch),
+            ("series", meta.series),
+            ("license", meta.license),
+            ("depends", meta.depends),
+            ("provides", meta.provides),
+            ("needs", meta.needs),
+            ("summary", meta.summary),
+            ("url", meta.url),
+            ("sha256", meta.sha256),
+            ("recipe", meta.recipe),
+            ("commit", meta.commit),
+            ("relibc", meta.relibc),
+            ("size", ""),
+        ];
+        let meta = fields
+            .into_iter()
+            .filter(|(k, _)| !META_VOLATILE.contains(k))
+            .map(|(k, v)| (k, v.to_string()))
+            .collect();
+        Installed { manifest, meta }
+    }
+
+    /// What the file of a package installs.
+    pub fn of_file(file: &PackageFile<'_>) -> Installed {
+        let lines = file
+            .manifest
+            .entries()
+            .map(|e| (e.path.to_string(), manifest_text(&e)))
+            .collect();
+        Installed::new(&file.meta, lines)
+    }
+
+    /// The first difference from `old`: a path of the manifest (in the order
+    /// of the paths) or else a field of `meta`; `None` when the content is equal.
+    pub fn first_difference(&self, old: &Installed) -> Option<String> {
+        let mut new_it = self.manifest.iter().peekable();
+        let mut old_it = old.manifest.iter().peekable();
+        loop {
+            match (new_it.peek(), old_it.peek()) {
+                (None, None) => break,
+                (Some((p, _)), None) => return Some(format!("{p} (added)")),
+                (None, Some((p, _))) => return Some(format!("{p} (removed)")),
+                (Some((np, nl)), Some((op, ol))) => match np.cmp(op) {
+                    std::cmp::Ordering::Less => return Some(format!("{np} (added)")),
+                    std::cmp::Ordering::Greater => return Some(format!("{op} (removed)")),
+                    std::cmp::Ordering::Equal => {
+                        if nl != ol {
+                            return Some(np.to_string());
+                        }
+                        new_it.next();
+                        old_it.next();
+                    }
+                },
+            }
+        }
+        for ((key, new), (_, old)) in self.meta.iter().zip(&old.meta) {
+            if new != old {
+                return Some(format!("meta {key}"));
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -368,10 +487,14 @@ pub enum Fate {
         address: String,
         /// The address of its source archive there, if it has one.
         source: Option<String>,
+        /// The recipe differs and the content is equal.
+        same_content: bool,
     },
     Built {
         release: String,
         why: &'static str,
+        /// The first path or field that differs, when the content was compared.
+        diff: Option<String>,
     },
 }
 
@@ -390,6 +513,45 @@ pub struct Plan {
     pub leaving: Vec<String>,
 }
 
+/// The file of an entry of the index with its size and SHA-256 checked.
+fn anchor_bytes(old: &PrevEntry, fetch: Fetch<'_>) -> Result<Vec<u8>, String> {
+    let bytes = fetch(&old.fetch)?
+        .ok_or_else(|| format!("{}: the file of {} is missing", old.fetch, old.name))?;
+    if bytes.len() as u64 != old.size {
+        return Err(format!(
+            "{}: {} bytes, the index says {}",
+            old.fetch,
+            bytes.len(),
+            old.size
+        ));
+    }
+    let mut hex = [0u8; 64];
+    if sha::hex(&sha::sha256(&bytes), &mut hex) != old.sha256 {
+        return Err(format!("{}: the SHA-256 differs from the index", old.fetch));
+    }
+    Ok(bytes)
+}
+
+/// The `meta` of the file says what the entry of the index says.
+fn check_anchor(
+    file: &PackageFile<'_>,
+    old: &PrevEntry,
+    w: &Wanted<'_>,
+    at: &str,
+) -> Result<(), String> {
+    let m = &file.meta;
+    if m.name != w.name
+        || m.version != w.version
+        || m.release != old.release
+        || m.recipe != old.recipe
+    {
+        return Err(format!(
+            "{at}: the meta of the file differs from the entry of the index"
+        ));
+    }
+    Ok(())
+}
+
 /// Decides for each wanted package. With no previous index every package is
 /// new.
 pub fn plan(
@@ -406,6 +568,7 @@ pub fn plan(
                 Fate::Built {
                     release: "1".into(),
                     why: "new",
+                    diff: None,
                 },
             );
         }
@@ -423,6 +586,7 @@ pub fn plan(
                 Fate::Built {
                     release: "1".into(),
                     why: "new",
+                    diff: None,
                 },
             );
             continue;
@@ -436,53 +600,49 @@ pub fn plan(
                 "1".to_string()
             }
         };
-        if old.recipe != w.recipe || !same_version {
+        let recipe_same = old.recipe == w.recipe;
+        // The recipe is the fast path. A new version is built without a
+        // look at the file; so is a new recipe of a package that may not be
+        // carried by content.
+        let content = if recipe_same { None } else { w.content };
+        if !same_version || (!recipe_same && content.is_none()) {
             fates.insert(
                 w.name.to_string(),
                 Fate::Built {
                     release: next_release(),
                     why: "recipe changed",
+                    diff: None,
                 },
             );
             continue;
         }
-        let bytes = fetch(&old.fetch)?
-            .ok_or_else(|| format!("{}: the file of {} is missing", old.fetch, w.name))?;
-        if bytes.len() as u64 != old.size {
-            return Err(format!(
-                "{}: {} bytes, the index says {}",
-                old.fetch,
-                bytes.len(),
-                old.size
-            ));
-        }
-        let mut hex = [0u8; 64];
-        if sha::hex(&sha::sha256(&bytes), &mut hex) != old.sha256 {
-            return Err(format!("{}: the SHA-256 differs from the index", old.fetch));
-        }
+        let bytes = anchor_bytes(old, fetch)?;
         let file = PackageFile::parse(&bytes).map_err(|e| format!("{}: {e}", old.fetch))?;
-        let m = &file.meta;
-        if m.name != w.name
-            || m.version != w.version
-            || m.release != old.release
-            || m.recipe != w.recipe
-        {
-            return Err(format!(
-                "{}: the meta of the file differs from the entry of the index",
-                old.fetch
-            ));
-        }
+        check_anchor(&file, old, w, &old.fetch)?;
         match file.verify(&trust, &prev.revocations) {
             Ok(_) => {
-                fates.insert(
-                    w.name.to_string(),
-                    Fate::Carried {
-                        release: old.release.clone(),
-                        bytes,
-                        address: old.file.clone(),
-                        source: old.source.clone(),
-                    },
-                );
+                let diff = content.and_then(|c| c.first_difference(&Installed::of_file(&file)));
+                if let Some(diff) = diff {
+                    fates.insert(
+                        w.name.to_string(),
+                        Fate::Built {
+                            release: next_release(),
+                            why: "content changed",
+                            diff: Some(diff),
+                        },
+                    );
+                } else {
+                    fates.insert(
+                        w.name.to_string(),
+                        Fate::Carried {
+                            release: old.release.clone(),
+                            bytes,
+                            address: old.file.clone(),
+                            source: old.source.clone(),
+                            same_content: !recipe_same,
+                        },
+                    );
+                }
             }
             Err(Error::Revoked) => {
                 fates.insert(
@@ -490,6 +650,7 @@ pub fn plan(
                     Fate::Built {
                         release: next_release(),
                         why: "key revoked",
+                        diff: None,
                     },
                 );
             }
@@ -540,14 +701,25 @@ pub fn describe(plan: &Plan, previous: Option<&Previous>, series: &str) -> Vec<S
     for (name, fate) in &plan.fates {
         lines.push(match fate {
             Fate::Carried {
-                release, address, ..
+                release,
+                address,
+                same_content,
+                ..
             } => {
                 let from = address
                     .rsplit_once('/')
                     .map_or(address.as_str(), |(d, _)| d);
-                format!("carried {name} -{release} from {from}")
+                let label = if *same_content {
+                    "carried, same content"
+                } else {
+                    "carried"
+                };
+                format!("{label} {name} -{release} from {from}")
             }
-            Fate::Built { release, why } => format!("built {name} -{release} ({why})"),
+            Fate::Built { release, why, diff } => match diff {
+                Some(d) => format!("built {name} -{release} ({why}: first difference {d})"),
+                None => format!("built {name} -{release} ({why})"),
+            },
         });
     }
     for name in &plan.leaving {
@@ -606,10 +778,14 @@ pub fn packages_only_refusals(
         lines.push("no package is built: there is nothing to update".to_string());
     }
     for (name, fate) in &built {
-        let Fate::Built { why, .. } = fate else {
+        let Fate::Built { why, diff, .. } = fate else {
             continue;
         };
-        if *why == "new" {
+        let why = match diff {
+            Some(d) => format!("{why}: first difference {d}"),
+            None => why.to_string(),
+        };
+        if why == "new" {
             lines.push(format!(
                 "{name} is new in the series: a package is added by a release of the system"
             ));
@@ -699,6 +875,52 @@ pub(crate) mod tests {
         key: &str,
         root_seed: &[u8; 32],
     ) -> Vec<u8> {
+        package_files(
+            name,
+            version,
+            release,
+            recipe,
+            seed,
+            key,
+            root_seed,
+            &Shape::default(),
+        )
+    }
+
+    /// What a test package holds beyond the directories of its licenses.
+    pub(crate) struct Shape<'a> {
+        pub files: Vec<(&'a str, &'a [u8])>,
+        pub source: Option<&'a [u8]>,
+        pub license: &'a str,
+        pub depends: &'a str,
+        pub relibc: &'a str,
+        pub commit: &'a str,
+    }
+
+    impl Default for Shape<'_> {
+        fn default() -> Self {
+            Shape {
+                files: Vec::new(),
+                source: None,
+                license: "MIT",
+                depends: "-",
+                relibc: "-",
+                commit: "cccccccccccccccccccccccccccccccccccccccc",
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn package_files(
+        name: &str,
+        version: &str,
+        release: &str,
+        recipe: &str,
+        seed: &[u8; 32],
+        key: &str,
+        root_seed: &[u8; 32],
+        shape: &Shape<'_>,
+    ) -> Vec<u8> {
         let cert = Certificate::issue(
             root_seed,
             n("t-root"),
@@ -711,11 +933,13 @@ pub(crate) mod tests {
         let dir_name = format!("/usr/share/licenses/{name}");
         let dirs = [
             "/usr",
+            "/usr/bin",
             "/usr/share",
             "/usr/share/licenses",
             dir_name.as_str(),
         ];
-        let items: Vec<Item<'_>> = dirs
+        let source_path = format!("{dir_name}/SOURCE");
+        let mut items: Vec<Item<'_>> = dirs
             .iter()
             .map(|path| Item {
                 path,
@@ -723,22 +947,36 @@ pub(crate) mod tests {
                 content: Content::Directory,
             })
             .collect();
+        for (path, bytes) in &shape.files {
+            items.push(Item {
+                path,
+                mode: 0o100644,
+                content: Content::Data(bytes),
+            });
+        }
+        if let Some(bytes) = shape.source {
+            items.push(Item {
+                path: &source_path,
+                mode: 0o100644,
+                content: Content::Data(bytes),
+            });
+        }
         let meta = Meta {
             name,
             version,
             release,
             arch: "aarch64",
             series: "0.2",
-            license: "MIT",
-            depends: "-",
+            license: shape.license,
+            depends: shape.depends,
             provides: "-",
             needs: "-",
             summary: "A demonstration",
             url: "https://example.org/demo.tar.gz",
             sha256: &"ab".repeat(32),
             recipe,
-            commit: &"c".repeat(40),
-            relibc: "-",
+            commit: shape.commit,
+            relibc: shape.relibc,
             size: 0,
         };
         sign(
@@ -758,12 +996,33 @@ pub(crate) mod tests {
         rows: &[(&str, &str, &str, &str, &str)],
         revoked_keys: &[(&str, u64)],
     ) -> PathBuf {
+        let made: Vec<(&str, &str, &str, &str, Vec<u8>)> = rows
+            .iter()
+            .map(|(name, version, release, recipe, key)| {
+                (
+                    *name,
+                    *version,
+                    *release,
+                    *recipe,
+                    package(name, version, release, recipe, key),
+                )
+            })
+            .collect();
+        repository_of(tag, &made, revoked_keys)
+    }
+
+    /// The same with the files given.
+    fn repository_of(
+        tag: &str,
+        rows: &[(&str, &str, &str, &str, Vec<u8>)],
+        revoked_keys: &[(&str, u64)],
+    ) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("stafeto-carry-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut files = Vec::new();
-        for (name, version, release, recipe, key) in rows {
-            let bytes = package(name, version, release, recipe, key);
+        for (name, version, release, recipe, bytes) in rows {
+            let bytes = bytes.clone();
             let file = format!("{name}-{version}-{release}.stpkg");
             std::fs::write(dir.join(&file), &bytes).unwrap();
             files.push((
@@ -855,6 +1114,7 @@ pub(crate) mod tests {
                 name,
                 version,
                 recipe,
+                content: None,
             })
             .collect()
     }
@@ -903,14 +1163,16 @@ pub(crate) mod tests {
             plan.fates["beta"],
             Fate::Built {
                 release: "2".into(),
-                why: "recipe changed"
+                why: "recipe changed",
+                diff: None
             }
         );
         assert_eq!(
             plan.fates["fresh"],
             Fate::Built {
                 release: "1".into(),
-                why: "new"
+                why: "new",
+                diff: None
             }
         );
         assert_eq!(plan.leaving, ["gone"]);
@@ -945,7 +1207,8 @@ pub(crate) mod tests {
             p.fates["alpha"],
             Fate::Built {
                 release: "1".into(),
-                why: "recipe changed"
+                why: "recipe changed",
+                diff: None
             }
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -967,7 +1230,8 @@ pub(crate) mod tests {
             p.fates["alpha"],
             Fate::Built {
                 release: "1".into(),
-                why: "new"
+                why: "new",
+                diff: None
             }
         );
         assert!(
@@ -1048,7 +1312,8 @@ pub(crate) mod tests {
             p.fates["alpha"],
             Fate::Built {
                 release: "3".into(),
-                why: "key revoked"
+                why: "key revoked",
+                diff: None
             }
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1248,9 +1513,10 @@ pub(crate) mod tests {
                 .iter()
                 .map(|(n, f)| {
                     let f = match f {
-                        Fate::Built { release, why } => Fate::Built {
+                        Fate::Built { release, why, diff } => Fate::Built {
                             release: release.clone(),
                             why,
+                            diff: diff.clone(),
                         },
                         Fate::Carried { .. } => unreachable!(),
                     };
@@ -1284,6 +1550,7 @@ pub(crate) mod tests {
         Fate::Built {
             release: "2".into(),
             why,
+            diff: None,
         }
     }
 
@@ -1418,5 +1685,440 @@ pub(crate) mod tests {
         // The synthetic package has no programs: no relibc, nothing to compare.
         assert!(carried_relibc(&plan).unwrap().is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- carrying by content ----
+
+    fn pk(name: &str, version: &str, release: &str, recipe: &str, shape: &Shape<'_>) -> Vec<u8> {
+        package_files(
+            name,
+            version,
+            release,
+            recipe,
+            &RELEASE,
+            "t-release",
+            &ROOT,
+            shape,
+        )
+    }
+
+    /// The anchor repository holds `alpha-1.0-3` made from `old`; the tree
+    /// wants `version` with `new_recipe` and what `new` installs.
+    fn scenario(
+        tag: &str,
+        old: &Shape<'_>,
+        new: &Shape<'_>,
+        version: &str,
+        key_revoked: bool,
+    ) -> (Plan, Previous, PathBuf, Vec<u8>) {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let anchor = pk("alpha", "1.0", "3", &a, old);
+        let dir = repository_of(
+            tag,
+            &[("alpha", "1.0", "3", &a, anchor.clone())],
+            if key_revoked {
+                &[("t-release", 0)]
+            } else {
+                &[]
+            },
+        );
+        let policy = Policy {
+            anchored: key_revoked,
+            ..Policy::default()
+        };
+        let prev = load(&base(&dir), "0.2", &fetch, &[root()], &policy)
+            .unwrap()
+            .unwrap();
+        // The candidate: the version of the tree, another recipe and release.
+        let candidate = pk("alpha", version, "9", &b, new);
+        let file = PackageFile::parse(&candidate).unwrap();
+        let content = Installed::of_file(&file);
+        let want = [Wanted {
+            name: "alpha",
+            version,
+            recipe: &b,
+            content: Some(&content),
+        }];
+        let plan = plan(Some(&prev), &want, &fetch, &[root()]).unwrap();
+        (plan, prev, dir, anchor)
+    }
+
+    fn data_shape<'a>(byte: &'a [u8], source: &'a [u8]) -> Shape<'a> {
+        Shape {
+            files: vec![
+                ("/usr/bin/alpha", byte),
+                ("/usr/share/licenses/alpha/COPYING", b"mit"),
+            ],
+            source: Some(source),
+            ..Shape::default()
+        }
+    }
+
+    #[test]
+    fn a_new_recipe_with_the_same_content_is_carried_with_the_file_of_the_anchor() {
+        // Another SOURCE text (commit, release, recipe in it) and another commit.
+        let old = data_shape(b"\x7fELF one", b"source of release 3");
+        let new = Shape {
+            commit: "dddddddddddddddddddddddddddddddddddddddd",
+            ..data_shape(b"\x7fELF one", b"source of the new commit")
+        };
+        let (plan, prev, dir, anchor) = scenario("same-content", &old, &new, "1.0", false);
+        match &plan.fates["alpha"] {
+            Fate::Carried {
+                release,
+                bytes,
+                address,
+                same_content,
+                ..
+            } => {
+                assert_eq!(release, "3");
+                assert_eq!(bytes, &anchor);
+                assert_eq!(address, "alpha-1.0-3.stpkg");
+                assert!(same_content);
+            }
+            other => panic!("{other:?}"),
+        }
+        let lines = describe(&plan, Some(&prev), "0.2");
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with("carried, same content alpha -3 from "),
+            "{lines:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_recipe_is_the_first_path_and_needs_no_content() {
+        // The same recipe carries even when the candidate differs in everything.
+        let a = "a".repeat(64);
+        let anchor = pk("alpha", "1.0", "3", &a, &data_shape(b"one", b"s"));
+        let dir = repository_of("recipe-first", &[("alpha", "1.0", "3", &a, anchor)], &[]);
+        let prev = load(&base(&dir), "0.2", &fetch, &[root()], &Policy::default())
+            .unwrap()
+            .unwrap();
+        let other = Installed {
+            manifest: vec![("/x".into(), "line".into())],
+            meta: Vec::new(),
+        };
+        let want = [Wanted {
+            name: "alpha",
+            version: "1.0",
+            recipe: &a,
+            content: Some(&other),
+        }];
+        let p = plan(Some(&prev), &want, &fetch, &[root()]).unwrap();
+        assert!(matches!(
+            p.fates["alpha"],
+            Fate::Carried {
+                same_content: false,
+                ..
+            }
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn one_byte_of_a_program_builds_the_package_again_and_names_the_path() {
+        let old = data_shape(b"\x7fELF one", b"s");
+        let new = data_shape(b"\x7fELF two", b"s");
+        let (plan, prev, dir, _) = scenario("byte", &old, &new, "1.0", false);
+        assert_eq!(
+            plan.fates["alpha"],
+            Fate::Built {
+                release: "4".into(),
+                why: "content changed",
+                diff: Some("/usr/bin/alpha".into())
+            }
+        );
+        let lines = describe(&plan, Some(&prev), "0.2");
+        assert_eq!(
+            lines,
+            ["built alpha -4 (content changed: first difference /usr/bin/alpha)"]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_added_or_a_removed_file_builds_the_package_again() {
+        let old = data_shape(b"one", b"s");
+        let mut more = data_shape(b"one", b"s");
+        more.files.push(("/usr/bin/zeta", b"z"));
+        let (plan, _, dir, _) = scenario("added", &old, &more, "1.0", false);
+        assert!(matches!(
+            &plan.fates["alpha"],
+            Fate::Built { diff: Some(d), .. } if d == "/usr/bin/zeta (added)"
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let mut fewer = data_shape(b"one", b"s");
+        fewer.files.remove(1);
+        let (plan, _, dir, _) = scenario("removed", &old, &fewer, "1.0", false);
+        assert!(matches!(
+            &plan.fates["alpha"],
+            Fate::Built { diff: Some(d), .. }
+                if d == "/usr/share/licenses/alpha/COPYING (removed)"
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn another_depends_or_license_or_relibc_builds_the_package_again() {
+        let old = data_shape(b"one", b"s");
+        let depends = Shape {
+            depends: "beta",
+            ..data_shape(b"one", b"s")
+        };
+        let license = Shape {
+            license: "GPL-2.0-only",
+            ..data_shape(b"one", b"s")
+        };
+        let relibc = Shape {
+            relibc: "pin-aaaaaaaa",
+            ..data_shape(b"one", b"s")
+        };
+        for (tag, new, field) in [
+            ("depends", depends, "meta depends"),
+            ("license", license, "meta license"),
+            ("relibc", relibc, "meta relibc"),
+        ] {
+            let (plan, _, dir, _) = scenario(tag, &old, &new, "1.0", false);
+            assert!(
+                matches!(&plan.fates["alpha"], Fate::Built { release, diff: Some(d), .. }
+                    if release == "4" && d == field),
+                "{tag}: {:?}",
+                plan.fates["alpha"]
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn another_version_is_built_without_a_comparison() {
+        let shape = data_shape(b"one", b"s");
+        let (plan, _, dir, _) = scenario("version-content", &shape, &shape, "1.1", false);
+        assert_eq!(
+            plan.fates["alpha"],
+            Fate::Built {
+                release: "1".into(),
+                why: "recipe changed",
+                diff: None
+            }
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_package_without_content_is_not_carried_by_content() {
+        // A variant for an image: the tree gives no content.
+        let a = "a".repeat(64);
+        let anchor = pk("alpha", "1.0", "3", &a, &data_shape(b"one", b"s"));
+        let dir = repository_of("variant", &[("alpha", "1.0", "3", &a, anchor)], &[]);
+        let prev = load(&base(&dir), "0.2", &fetch, &[root()], &Policy::default())
+            .unwrap()
+            .unwrap();
+        let b = "b".repeat(64);
+        let p = plan(
+            Some(&prev),
+            &wanted(&[("alpha", "1.0", &b)]),
+            &fetch,
+            &[root()],
+        )
+        .unwrap();
+        assert_eq!(
+            p.fates["alpha"],
+            Fate::Built {
+                release: "4".into(),
+                why: "recipe changed",
+                diff: None
+            }
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_revoked_key_builds_the_package_again_even_when_the_content_is_equal() {
+        let shape = data_shape(b"one", b"s");
+        let (plan, _, dir, _) = scenario("revoked-content", &shape, &shape, "1.0", true);
+        assert_eq!(
+            plan.fates["alpha"],
+            Fate::Built {
+                release: "4".into(),
+                why: "key revoked",
+                diff: None
+            }
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_file_of_the_anchor_stops_the_comparison() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let shape = data_shape(b"one", b"s");
+        let anchor = pk("alpha", "1.0", "3", &a, &shape);
+        let dir = repository_of("damaged-content", &[("alpha", "1.0", "3", &a, anchor)], &[]);
+        let prev = load(&base(&dir), "0.2", &fetch, &[root()], &Policy::default())
+            .unwrap()
+            .unwrap();
+        let path = dir.join("alpha-1.0-3.stpkg");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes.len() / 2;
+        bytes[at] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        let candidate = pk("alpha", "1.0", "9", &b, &shape);
+        let content = Installed::of_file(&PackageFile::parse(&candidate).unwrap());
+        let want = [Wanted {
+            name: "alpha",
+            version: "1.0",
+            recipe: &b,
+            content: Some(&content),
+        }];
+        let err = plan(Some(&prev), &want, &fetch, &[root()]).unwrap_err();
+        assert!(err.contains("SHA-256"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_volatile_field_of_meta_counts_and_every_other_field_does() {
+        let shape = data_shape(b"one", b"s");
+        let bytes = pk("alpha", "1.0", "3", &"a".repeat(64), &shape);
+        let file = PackageFile::parse(&bytes).unwrap();
+        let old = Installed::of_file(&file);
+        let hash: &'static str = Box::leak("e".repeat(64).into_boxed_str());
+        let m = &file.meta;
+        let make = |f: &dyn Fn(&mut pkgfmt::meta::Meta<'_>)| {
+            let mut meta = pkgfmt::meta::Meta { ..*m };
+            f(&mut meta);
+            let lines = file
+                .manifest
+                .entries()
+                .map(|e| (e.path.to_string(), manifest_text(&e)))
+                .collect();
+            Installed::new(&meta, lines)
+        };
+        // The four volatile fields.
+        assert_eq!(make(&|x| x.recipe = hash).first_difference(&old), None);
+        assert_eq!(
+            make(&|x| x.commit = &hash[..40]).first_difference(&old),
+            None
+        );
+        assert_eq!(make(&|x| x.release = "77").first_difference(&old), None);
+        assert_eq!(make(&|x| x.size = 123_456).first_difference(&old), None);
+        // Every other field.
+        type Change<'c> = &'c dyn Fn(&mut pkgfmt::meta::Meta<'_>);
+        let cases: [(&str, Change<'_>); 12] = [
+            ("name", &|x| x.name = "other"),
+            ("version", &|x| x.version = "2.0"),
+            ("arch", &|x| x.arch = "x86_64"),
+            ("series", &|x| x.series = "0.9"),
+            ("license", &|x| x.license = "BSD-2-Clause"),
+            ("depends", &|x| x.depends = "beta"),
+            ("provides", &|x| x.provides = "beta"),
+            ("needs", &|x| x.needs = "beta"),
+            ("summary", &|x| x.summary = "Another"),
+            ("url", &|x| x.url = "https://example.org/other.tar.gz"),
+            ("sha256", &|x| x.sha256 = hash),
+            ("relibc", &|x| x.relibc = "pin-12345678"),
+        ];
+        for (key, change) in cases {
+            if key == "name" {
+                // The name also moves the path of SOURCE, which comes first.
+                assert!(make(change).first_difference(&old).is_some());
+                continue;
+            }
+            assert_eq!(
+                make(change).first_difference(&old),
+                Some(format!("meta {key}")),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_line_of_source_never_counts() {
+        let a = pk(
+            "alpha",
+            "1.0",
+            "3",
+            &"a".repeat(64),
+            &data_shape(b"one", b"x"),
+        );
+        let b = pk(
+            "alpha",
+            "1.0",
+            "3",
+            &"a".repeat(64),
+            &data_shape(b"one", b"much longer text"),
+        );
+        let (ca, cb) = (
+            Installed::of_file(&PackageFile::parse(&a).unwrap()),
+            Installed::of_file(&PackageFile::parse(&b).unwrap()),
+        );
+        assert_eq!(ca, cb);
+        assert!(ca.manifest.iter().all(|(p, _)| !p.ends_with("/SOURCE")));
+    }
+
+    #[test]
+    fn a_base_package_with_the_same_content_is_no_refusal_and_one_with_other_bytes_is() {
+        let carried = |same_content| Fate::Carried {
+            release: "1".into(),
+            bytes: Vec::new(),
+            address: "busybox.stpkg".into(),
+            source: None,
+            same_content,
+        };
+        let previous = Previous {
+            serial: 2,
+            entries: vec![entry("busybox", "1.37"), entry("nginx", "1.30.6")],
+            revocations: Vec::new(),
+        };
+        let rows = [("busybox", "1.37", "r"), ("nginx", "1.30.7", "r")];
+        let want = wanted(&rows);
+        let nginx = Fate::Built {
+            release: "2".into(),
+            why: "recipe changed",
+            diff: None,
+        };
+        let plan = Plan {
+            fates: [
+                ("busybox".to_string(), carried(true)),
+                ("nginx".to_string(), nginx),
+            ]
+            .into_iter()
+            .collect(),
+            leaving: Vec::new(),
+        };
+        let lines = packages_only_refusals(
+            &plan,
+            &previous,
+            &want,
+            &|n| n == "busybox",
+            "pin-aaaaaaaa",
+            &BTreeMap::new(),
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+        let plan = Plan {
+            fates: [(
+                "busybox".to_string(),
+                Fate::Built {
+                    release: "2".into(),
+                    why: "content changed",
+                    diff: Some("/bin/busybox".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            leaving: Vec::new(),
+        };
+        let lines = packages_only_refusals(
+            &plan,
+            &previous,
+            &want,
+            &|n| n == "busybox",
+            "pin-aaaaaaaa",
+            &BTreeMap::new(),
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("first difference /bin/busybox"));
     }
 }

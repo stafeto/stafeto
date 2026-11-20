@@ -500,7 +500,14 @@ link programs (for a package with programs) and `build-depends <name>
   index and the entries of `keys/revoked` of the tree; the list next to the
   index may not be older than the tree's, an index that has expired is
   refused, and so is one older than the serial in
-  `packages/published-serial.txt`, lines `<series> <serial>`). A package of a new
+  `packages/published-serial.txt`, lines `<series> <serial>`). A package of
+  the same version whose recipe differs is carried all the same when what it
+  installs equals what the file of the entry installs: the same `manifest`
+  lines except the one of `SOURCE`, and the same `meta` fields except
+  `recipe`, `commit`, `release` and `size` (a package built for one image
+  with `replace` or `remove` is never compared). The plan prints `carried,
+  same content` for it, and `built (content changed: first difference <path
+  or meta field>)` for a package that differs. A package of a new
   recipe takes `release` one above the entry of the same version, or 1 for a
   new version or a new name; the `release` field of a description is a base
   the plan replaces. No index (answer 404, no `INDEX` file) means every

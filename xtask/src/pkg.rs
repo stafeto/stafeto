@@ -341,6 +341,69 @@ pub fn parts(
     Ok(out)
 }
 
+/// What the package `p` installs, as `carry::Installed` (its manifest lines
+/// without `SOURCE`, its `meta` fields without the volatile ones), from the
+/// parts of the build: the same bytes `build` would write.
+fn content_of(p: &Package, all: &[Package], pin: &str) -> Result<carry::Installed, String> {
+    let parts = parts(p, all, None)?;
+    let data: BTreeMap<&str, &[u8]> = parts
+        .iter()
+        .filter_map(|part| match &part.body {
+            Body::Data { bytes, .. } => Some((part.path.as_str(), bytes.as_slice())),
+            _ => None,
+        })
+        .collect();
+    let mut lines = Vec::new();
+    for part in &parts {
+        let bytes = match &part.body {
+            Body::Directory => None,
+            Body::Data { bytes, .. } => Some(bytes.as_slice()),
+            Body::Same(path) => Some(
+                *data
+                    .get(path.as_str())
+                    .ok_or_else(|| format!("{}: {path} holds no data", p.name))?,
+            ),
+        };
+        lines.push((
+            part.path.clone(),
+            pkgfmt::manifest::line(bytes, part.mode, &part.path)
+                .trim_end_matches('\n')
+                .to_string(),
+        ));
+    }
+    let has_elf = p.files.iter().any(|(_, f)| f.starts_with("elf:"));
+    let relibc = if has_elf {
+        format!("pin-{}", &pin[..8])
+    } else {
+        "-".to_string()
+    };
+    let series = series();
+    let (depends, provides, needs) = (
+        list_or_dash(&p.depends),
+        list_or_dash(&p.provides),
+        list_or_dash(&p.needs),
+    );
+    let meta = Meta {
+        name: &p.name,
+        version: &p.version,
+        release: "",
+        arch: "aarch64",
+        series: &series,
+        license: &p.license,
+        depends: &depends,
+        provides: &provides,
+        needs: &needs,
+        summary: &p.summary,
+        url: &p.url,
+        sha256: &p.sha256,
+        recipe: "",
+        commit: "",
+        relibc: &relibc,
+        size: 0,
+    };
+    Ok(carry::Installed::new(&meta, lines))
+}
+
 fn placeholder() -> notices::Build<'static> {
     notices::Build {
         commit: "",
@@ -779,12 +842,25 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
         let roots = carry::roots_for(base, &tree)?;
         let policy = carry::Policy::of_tree(&tree, base, &series())?;
         let previous = carry::load(base, &series(), &carry::fetch, &roots, &policy)?;
+        // What each package installs, for the carrying by content; a variant
+        // for an image (`replace`, `remove`) is never carried that way.
+        let pin = crate::script_value("tools/build-relibc.py", "COMMIT")?;
+        let variant = !opts.replace.is_empty() || !opts.remove.is_empty();
+        let contents: BTreeMap<String, carry::Installed> = if variant {
+            BTreeMap::new()
+        } else {
+            selected
+                .iter()
+                .map(|p| Ok((p.name.clone(), content_of(p, &all, &pin)?)))
+                .collect::<Result<_, String>>()?
+        };
         let wanted: Vec<carry::Wanted<'_>> = selected
             .iter()
             .map(|p| carry::Wanted {
                 name: &p.name,
                 version: &p.version,
                 recipe: &recipes[&p.name].0,
+                content: contents.get(&p.name),
             })
             .collect();
         let mut plan = carry::plan(previous.as_ref(), &wanted, &carry::fetch, &roots)?;
