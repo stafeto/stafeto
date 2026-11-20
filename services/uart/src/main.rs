@@ -7,8 +7,12 @@
 //! `irq` of its level-triggered line in the reply to its REGISTER. It sets
 //! the PL011 up, serves its interrupts and WRITE and READ of proto_uart
 //! (CRASH too with the feature `crash`), and shows the kernel log: at its
-//! start and on a timer of its own (every uart::log::IDLE_NS, every DRAIN_NS
-//! while it holds text or the kernel says records are left). What it decides
+//! start, on the kernel's notification that a record landed (the binding of
+//! the log's line, abi::LOG_LINE, at most once in uart::log::DRAIN_NS) and on a
+//! timer of its own (every DRAIN_NS while it holds text or the kernel says
+//! records are left, every SAFETY_NS otherwise, which also finds a record the
+//! notification missed and says so). A kernel that refuses the binding, and
+//! a 16550 that polls, leave the timer alone: every uart::log::IDLE_NS. What it decides
 //! comes from the library (uart::irq, output, writes, input, log); here are the calls and
 //! the registers, which it reaches through rt::mmio alone [G34]. The
 //! program ends with a code of its own when its start fails; init
@@ -56,6 +60,9 @@ const PAGE: u64 = 4096;
 const TIMER_LABEL: u64 = 1;
 /// A separate one-shot timer resumes paced transmit portions.
 const TX_TIMER_LABEL: u64 = 2;
+/// The label of the copy of the driver's channel the binding of the log's
+/// line posts through.
+const LOG_LABEL: u64 = 3;
 /// How long the driver waits for the transmitter to go idle before it
 /// sets the PL011 up: the kernel wrote to the port until the window came.
 const IDLE_NS: u64 = 10_000_000;
@@ -260,6 +267,17 @@ fn main(_: u64) -> u64 {
     let Ok(tx_timer) = sys::timer_create(&tx_view, level) else {
         return NOT_REGISTERED;
     };
+    // The kernel's notification of a record, for a driver that does not poll
+    // its port: any refusal leaves the log to the timer, every IDLE_NS, and
+    // the driver tells why (`log_wake`).
+    let (log_irq, log_view, log_refused) = if poll {
+        (None, None, None)
+    } else {
+        match bind_log(&channel, &log, level) {
+            Ok((irq, view)) => (Some(irq), Some(view), None),
+            Err(e) => (None, None, Some(e)),
+        }
+    };
     let mut uart = Uart {
         channel: Handle::borrowed(channel.raw()),
         level,
@@ -277,13 +295,25 @@ fn main(_: u64) -> u64 {
         deadline: 0,
         left: 0,
         peak: uart::log::Peak::new(),
+        log_irq,
+        _log_view: log_view,
+        pace: uart::log::Pace::new(),
+        missed: uart::log::Missed::new(),
+        safety: false,
         irqs: Irq::new(),
         stop_by: None,
         state,
     };
     uart.set_up();
     uart.take_log();
-    uart.arm();
+    uart.pace_took();
+    uart.settle();
+    if let Some(e) = log_refused {
+        uart.say(format_args!(
+            "uart: the kernel log wake is not available ({e:?}), reading the log every {} ms\n",
+            uart::log::IDLE_NS / 1_000_000
+        ));
+    }
     let base = args
         .and_then(|a| a.own.get(..8))
         .and_then(|b| b.try_into().ok())
@@ -332,6 +362,19 @@ fn main(_: u64) -> u64 {
     STOPPED
 }
 
+/// The binding of the log's line (spec 9, 11): a copy of the driver's channel
+/// with NOTIFY and LOG_LABEL, and the binding through it at the driver's
+/// level, born masked and unarmed (`Uart::settle` acknowledges it).
+fn bind_log(
+    channel: &Handle<Channel>,
+    log: &Handle<Resource>,
+    level: u8,
+) -> Result<(Handle<Interrupt>, Handle<Channel>), Error> {
+    let view = sys::handle_label(channel, abi::Rights::NOTIFY, LOG_LABEL, level)?;
+    let irq = sys::irq_bind_log(log, &view, level)?;
+    Ok((irq, view))
+}
+
 /// The driver: the registers, the binding of the line, `log`, the timer
 /// of the reads of the log, the copy of IMSC and the state.
 struct Uart {
@@ -360,6 +403,17 @@ struct Uart {
     left: u64,
     /// The largest backlog of the rings the driver saw (uart::log::Peak).
     peak: uart::log::Peak,
+    /// The binding of the log's line, with the copy of the channel it posts
+    /// through; None when the kernel refused it or the port polls.
+    log_irq: Option<Handle<Interrupt>>,
+    _log_view: Option<Handle<Channel>>,
+    /// When the log was taken last, which spaces the takes (uart::log::Pace).
+    pace: uart::log::Pace,
+    /// The ticks of the safety timer that found records (uart::log::Missed).
+    missed: uart::log::Missed,
+    /// The timer's deadline is a safety tick: the driver acknowledged the
+    /// binding and waits for the kernel.
+    safety: bool,
     irqs: Irq,
     /// Init asked the driver to stop: the time by which it exits whether
     /// or not the log reached the port (`stop`).
@@ -607,11 +661,61 @@ impl Uart {
     fn arm(&mut self) {
         let now = time::ticks_to_ns(time::now());
         let room = self.state.output.log_room();
-        let ns = uart::log::period_ns(self.left, room);
+        let ns = if self.log_irq.is_some() {
+            let drained = self.drained();
+            self.safety = drained;
+            uart::log::period_bound_ns(drained)
+        } else {
+            uart::log::period_ns(self.left, room)
+        };
         let ns = if self.poll { ns.min(POLL_NS) } else { ns };
         self.deadline = next_release(self.t0, ns, now);
         // The driver's own timer: timer_set has no error to give.
         let _ = sys::timer_set(&self.timer, self.deadline);
+    }
+
+    /// Whether everything the kernel gave is out and no record waits
+    /// (uart::log::drained).
+    fn drained(&self) -> bool {
+        let State {
+            output,
+            sources,
+            lines,
+            ..
+        } = &*self.state;
+        uart::log::drained(
+            self.left > 0 || sources.more(),
+            output.log_done(),
+            lines.any_open(),
+            self.stop_by.is_some(),
+        )
+    }
+
+    /// The log was taken now: the notification waits at least DRAIN_NS
+    /// from here (uart::log::Pace).
+    fn pace_took(&mut self) {
+        self.pace.took(time::ticks_to_ns(time::now()));
+    }
+
+    /// The end of a step that took the log: with the binding of the log's
+    /// line and nothing held, the driver acknowledges it, which arms the
+    /// kernel's notification of the next record (the kernel looks at the
+    /// rings once more, so a record that came meanwhile posts at once), and
+    /// the timer is the safety tick; otherwise the timer is the drain's.
+    /// A binding that cannot be acknowledged is dropped, and the driver
+    /// reads the log on its timer from then on.
+    fn settle(&mut self) {
+        if self.drained()
+            && let Some(irq) = &self.log_irq
+            && sys::irq_ack(irq).is_err()
+        {
+            self.log_irq = None;
+            self.say_log(format_args!(
+                "uart: the kernel log wake went away, reading the log every {} ms\n",
+                uart::log::IDLE_NS / 1_000_000
+            ));
+        }
+        self.arm();
     }
 
     /// Says the largest backlog of the kernel's rings the driver saw, once
@@ -1012,10 +1116,12 @@ impl Service<HELD> for Uart {
         self.clones.gone(label);
     }
 
-    /// The interrupt of the line, and the timer of the reads of the log:
-    /// a stale expiry, before its deadline, changes nothing.
+    /// The interrupt of the line, the kernel's notification of a record, and
+    /// the timer of the reads of the log: a stale expiry, before its
+    /// deadline, changes nothing.
     fn notification(&mut self, n: Notice) {
         match (n.source, n.label) {
+            (Source::Interrupt, LOG_LABEL) => self.log_notified(),
             (Source::Interrupt, _) => {
                 #[cfg(feature = "steps")]
                 rt::service::step_detail(1);
@@ -1032,20 +1138,8 @@ impl Service<HELD> for Uart {
                 if self.poll {
                     self.interrupt();
                 }
-                let (batches, records) = self.take_log();
-                #[cfg(feature = "steps")]
-                if records > 0 {
-                    rt::service::step_detail(100 + records as u64);
-                } else if batches == 0 {
-                    rt::service::step_detail(3);
-                } else {
-                    rt::service::step_own();
-                }
-                #[cfg(not(feature = "steps"))]
-                let _ = (batches, records);
-                self.say_peak(false);
-                self.arm();
-                self.exit_if_drained();
+                let safety = self.safety;
+                self.log_step(safety);
             }
             _ => {}
         }
@@ -1066,6 +1160,58 @@ impl Service<HELD> for Uart {
 }
 
 impl Uart {
+    /// The kernel says a record landed, and the binding stays masked until
+    /// `settle` acknowledges it: the log is taken now when the last take is
+    /// DRAIN_NS behind, and at the time that makes it so otherwise, so that
+    /// the work of the driver in a period stays STEP_BATCHES whatever the
+    /// rate of the records (uart::log::Pace).
+    fn log_notified(&mut self) {
+        let now = time::ticks_to_ns(time::now());
+        match self.pace.notified(now) {
+            uart::log::Due::Now => self.log_step(false),
+            uart::log::Due::At(at) => {
+                #[cfg(feature = "steps")]
+                rt::service::step_detail(4);
+                self.safety = false;
+                self.deadline = at;
+                // The driver's own timer: timer_set has no error to give.
+                let _ = sys::timer_set(&self.timer, at);
+            }
+        }
+    }
+
+    /// A step of the log: the batches the period allows, then the rule for
+    /// what follows. `safety` says the tick was the safety timer's: records
+    /// it finds are a notification the kernel did not post, unless the
+    /// binding is masked (the post is on its way): the driver says so once
+    /// (uart::log::Missed), and xtask fails the run for the line.
+    fn log_step(&mut self, safety: bool) {
+        let (batches, records) = self.take_log();
+        self.pace_took();
+        #[cfg(feature = "steps")]
+        if records > 0 {
+            rt::service::step_detail(100 + records as u64);
+        } else if batches == 0 {
+            rt::service::step_detail(3);
+        } else {
+            rt::service::step_own();
+        }
+        #[cfg(not(feature = "steps"))]
+        let _ = batches;
+        if safety && records > 0 {
+            let masked = self
+                .log_irq
+                .as_ref()
+                .and_then(|irq| sys::irq_info(irq).ok())
+                .map(|info| info.masked);
+            if let Some(n) = self.missed.tick(records, masked) {
+                self.say_log(format_args!("uart: log wake missed {n} records\n"));
+            }
+        }
+        self.say_peak(false);
+        self.settle();
+        self.exit_if_drained();
+    }
     /// After a tick, once init asked for the stop: the process ends when
     /// the last take of the log found nothing and every byte went out, or
     /// when the time is up.

@@ -1083,6 +1083,32 @@ pub fn irq_bind_on(
     Ok(returned(&x))
 }
 
+/// irq_bind of abi::LOG_LINE through `log`, a system resource with KSTATS, by
+/// a caller with a device window (spec 9, 11): the kernel posts bit 0 into a
+/// slot of `priority` of `view` (a handle of a channel with NOTIFY, whose
+/// label the notification carries) when a record lands in the kernel log
+/// that the driver has not taken. The binding is born masked and unarmed: the
+/// first `irq_ack` arms it, once the driver has taken what the rings hold
+/// (the kernel looks at the rings again then), and each notification masks it
+/// until the next `irq_ack`. One binding in the system (BAD_STATE); a kernel
+/// without the line answers INVALID_ARGS.
+pub fn irq_bind_log(
+    log: &Handle<Resource>,
+    view: &Handle<Channel>,
+    priority: u8,
+) -> Result<Handle<Interrupt>, Error> {
+    let args = [
+        log.raw().0,
+        abi::LOG_LINE,
+        view.raw().0,
+        priority.into(),
+        0,
+        0,
+    ];
+    let x = call::<{ Call::IrqBind.number() }>(&args)?;
+    Ok(returned(&x))
+}
+
 /// irq_ack: the line an interrupt masked opens again, once the driver
 /// served the device, cleared its source and read a register back (spec
 /// 9, 13.5). PEER_CLOSED once the binding's channel closed.

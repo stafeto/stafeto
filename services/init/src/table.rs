@@ -2078,6 +2078,26 @@ mod tests {
         }
     }
 
+    /// The console's driver binds the kernel's log line at its start, one binding in the system
+    /// for the first holder of KSTATS with a device window that asks (spec 9): in every table
+    /// the record with `log` starts before the record with `trace`, the other holder.
+    #[test]
+    fn the_driver_that_binds_the_log_line_starts_before_the_other_holders_of_kstats() {
+        let mut seen = 0;
+        for table in all_tables() {
+            let log = table.iter().position(|r| r.log);
+            let trace = table.iter().position(|r| r.trace);
+            if let (Some(log), Some(trace)) = (log, trace) {
+                seen += 1;
+                assert!(
+                    log < trace,
+                    "a record with `trace` starts before the driver"
+                );
+            }
+        }
+        assert!(seen > 0, "no table has both");
+    }
+
     /// Every record of every table whose program takes a budget at its start (the console drivers
     /// `uart` and `virtio-console`, whose record is the one with `log`, and every record with a
     /// budget `serve`) has the budget `rt::budget::SERVE` the program takes, with a `free` level
