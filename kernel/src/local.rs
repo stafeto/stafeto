@@ -53,6 +53,8 @@ pub struct Local {
     /// The time this CPU has slept and spent in the kernel, which other CPUs
     /// read (object_info CPU).
     pub time: CpuTime,
+    /// What this CPU keeps for object_info THREAD_PLACE, on a line of its own.
+    pub place: Place,
     /// The items of the cleanup queue for the firings of the levels of
     /// timers, level 1 first (timer). Zeros until `init`: an `Item` is not
     /// all zeros, and a `Local` of zeros lives in .bss, outside the image file.
@@ -87,6 +89,7 @@ impl Local {
             takes: core::sync::atomic::AtomicU16::new(0),
             entry: UnsafeCell::new((0, 0)),
             time: CpuTime::new(),
+            place: Place::new(),
             firings: [const { UnsafeCell::new(MaybeUninit::zeroed()) }; LEVELS],
             #[cfg(feature = "stamps")]
             stamps: crate::stamps::Stamps::new(),
@@ -135,6 +138,11 @@ impl CpuTime {
         );
     }
 
+    /// Whether the CPU is in its idle loop (the bit ASLEEP is set before the window of the poll).
+    pub fn asleep(&self) -> bool {
+        self.idle.load(core::sync::atomic::Ordering::Acquire) & ASLEEP != 0
+    }
+
     /// The CPU woke at `now`.
     pub fn woke(&self, now: u64) {
         use core::sync::atomic::Ordering::Relaxed;
@@ -172,6 +180,75 @@ impl CpuTime {
             idle,
             self.system.load(Relaxed),
         ]
+    }
+}
+
+/// What a CPU writes for object_info THREAD_PLACE and other CPUs read with no lock: the level of
+/// the last thread it let go to EL0, the counter when that stint (or the idle loop) began, and the
+/// counter at the last `cmd::drain`. The owner writes each word with one `Relaxed` store; a reader
+/// gets them roughly in step with the thread's own state, which it reads under `OBJ`. On a line
+/// of its own (64 bytes, the alignment of `Local`), so that a reader on another CPU takes no line
+/// with the owner's hot fields.
+#[repr(align(64))]
+pub struct Place {
+    running_level: core::sync::atomic::AtomicU8,
+    /// The idle loop began since the last stint began: the next `runs` starts a stint even for
+    /// the thread that ran before the sleep.
+    fresh: core::sync::atomic::AtomicBool,
+    stint_at: core::sync::atomic::AtomicU64,
+    drained_at: core::sync::atomic::AtomicU64,
+}
+
+impl Place {
+    const fn new() -> Place {
+        Place {
+            running_level: core::sync::atomic::AtomicU8::new(0),
+            fresh: core::sync::atomic::AtomicBool::new(false),
+            stint_at: core::sync::atomic::AtomicU64::new(0),
+            drained_at: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Every pass of `thread::run`: `level` is the effective level of the thread that goes to
+    /// EL0 at the counter `now`; `switched` when it is not the thread that ran last.
+    #[inline(always)]
+    pub fn runs(&self, level: u8, now: u64, switched: bool) {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.running_level.store(level, Relaxed);
+        if switched || self.fresh.load(Relaxed) {
+            self.stint_at.store(now, Relaxed);
+            self.fresh.store(false, Relaxed);
+        }
+    }
+
+    /// The CPU begins its idle loop at the counter `now`.
+    pub fn idles(&self, now: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.running_level.store(0, Relaxed);
+        self.stint_at.store(now, Relaxed);
+        self.fresh.store(true, Relaxed);
+    }
+
+    /// `cmd::drain` begins at the counter `now`.
+    #[inline(always)]
+    pub fn drains(&self, now: u64) {
+        self.drained_at
+            .store(now, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The level, the ticks since the last drain and the ticks since the stint began, at the
+    /// counter `now` gives (read after the words, so that none is later than it).
+    pub fn read(&self, now: impl FnOnce() -> u64) -> (u8, u64, u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let level = self.running_level.load(Relaxed);
+        let drained = self.drained_at.load(Relaxed);
+        let stint = self.stint_at.load(Relaxed);
+        let now = now();
+        (
+            level,
+            now.saturating_sub(drained),
+            now.saturating_sub(stint),
+        )
     }
 }
 

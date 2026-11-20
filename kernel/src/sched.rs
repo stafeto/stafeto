@@ -254,6 +254,22 @@ pub fn cpu_time(index: usize) -> Option<(usize, [u64; 3])> {
     (index < cpus).then(|| (cpus, arch::cpu::block(index).local.time.read(timer::now)))
 }
 
+/// What CPU `index`, which is up, keeps for object_info THREAD_PLACE: the level of the last
+/// thread it let go to EL0 (0 while it idles), the ticks since its last drain of commands and since
+/// its stint began, and the bits of abi::PLACE_*: idle, polling, bell. Takes no lock: the words are
+/// the owner's, read with one load each.
+pub fn cpu_place(index: usize) -> (u8, u64, u64, u64) {
+    let local = &arch::cpu::block(index).local;
+    let (level, drained, stint) = local.place.read(timer::now);
+    let idle = if local.time.asleep() {
+        abi::PLACE_IDLE
+    } else {
+        0
+    };
+    let bits = idle | crate::idle::place_bits(index);
+    (level, drained, stint, bits)
+}
+
 /// A stopped thread becomes ready: the tail of its level with a new
 /// quantum. The kernel takes a reference to it, which `exit` drops.
 /// BAD_STATE for a thread that started before. thread::start comes here,
@@ -1070,6 +1086,7 @@ fn sleep() {
     let slept = timer::now();
     #[cfg(feature = "measure")]
     crate::obj::stretch_ends(slept);
+    local().place.idles(slept);
     local().time.sleeps(slept);
     crate::qsbr::idle();
     // The window of the poll (idle.rs); a bell ends it like an SGI would.

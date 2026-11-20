@@ -1552,7 +1552,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 274;
+const INIT_TESTS: u32 = 276;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -13364,6 +13364,10 @@ const SMP_FIRST_LINE: &str = "smp: 4 CPUs, threads ran together on every CPU";
 const IDLE_PAIRS_BEGIN: &str = "smp idle bell  pairs begin";
 const IDLE_PAIRS_DONE: &str = "smp idle bell  pairs done";
 const IDLE_IRQ_DONE: &str = "smp idle bell  interrupt rounds done";
+/// The test of the place of a thread with a break, which runs before the pairs.
+const PLACE_BREAK_TEST: &str = "smp_thread_place_shows_a_wake_up_a_break_lost";
+/// The line of the rounds of the place test on a sound kernel (tests/init/src/smp.rs).
+const PLACE_ROUNDS_LINE: &str = "smp place: 1000 rounds, ";
 const IDLE_IRQ_LINE: &str = "idle poll  an interrupt was pending at the end of the window";
 /// The windows of the rounds of the test of the interrupt that may end with an interrupt pending in the
 /// kernel that reads ISR_EL1 every turn: it arrives in the last turn.
@@ -13387,11 +13391,12 @@ fn smp_idle_bell() -> Result<(), String> {
         Variant::IdleNoDrain,
         Variant::IdleNoIrq,
     );
-    for (variant, what) in [
-        (bell, "the bell as one step with the look at POLLING"),
-        (drain, "the drain of the queues after a bell"),
+    for (variant, what, number) in [
+        (bell, "the bell as one step with the look at POLLING", 2),
+        (drain, "the drain of the queues after a bell", 1),
     ] {
         let o = idle_probe_runs(variant)?;
+        place_shows_the_break(&o, what, number)?;
         // A lost wake-up leaves a call for good: the run hangs until the cut,
         // the kernel does not stop, the tests of the stage began, and the
         // pairs did not end. A panic or an exit of init is another failure.
@@ -13419,6 +13424,31 @@ fn smp_idle_bell() -> Result<(), String> {
     println!(
         "smp idle bell: the kernel without the look at ISR_EL1 is caught: {late} windows of the pairs and the rounds ended with an interrupt pending"
     );
+    Ok(())
+}
+
+/// The test of the place of a thread (tests/init/src/smp.rs, `thread_place_shows_a_lost_wake_up`)
+/// runs before the pairs in the kernel with a break: it passed, and its line says the wake-up of
+/// break `number` was lost and shown by object_info THREAD_PLACE.
+fn place_shows_the_break(o: &qemu::Outcome, what: &str, number: u32) -> Result<(), String> {
+    let r = qemu::parse_report(&o.lines);
+    if !r.passed.iter().any(|n| n == PLACE_BREAK_TEST) {
+        return Err(format!(
+            "the test of the place of a thread did not pass in the kernel without {what}: failed {:?}",
+            r.failed
+        ));
+    }
+    let say = format!("of the break {number}: state ");
+    let Some(line) = o
+        .lines
+        .iter()
+        .find(|l| l.starts_with("smp place: attempt ") && l.contains(&say))
+    else {
+        return Err(format!(
+            "THREAD_PLACE showed no lost wake-up in the kernel without {what}"
+        ));
+    };
+    println!("smp idle bell: the kernel without {what} is shown by THREAD_PLACE: {line}");
     Ok(())
 }
 
@@ -13660,6 +13690,11 @@ fn init_tests_in(
         for line in SMP_PROBE_LINES {
             qemu::expect_line(&o, line)?;
         }
+        // The rounds of the place test: a number of the lines of a run is no line to expect whole.
+        let Some(place) = o.lines.iter().find(|l| l.starts_with(PLACE_ROUNDS_LINE)) else {
+            return Err("the test init printed no line of the rounds of THREAD_PLACE".into());
+        };
+        println!("{place}");
         whole_lines_of_every_cpu(&o.lines, cpus)?;
         let waited = qemu::number_after(&o.lines, "smp: suspend waited ");
         let late = qemu::number_after(

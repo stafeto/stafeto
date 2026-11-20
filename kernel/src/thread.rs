@@ -1194,6 +1194,43 @@ pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64, u64, u64) {
     })
 }
 
+/// object_info THREAD_PLACE of `thread`, which the caller holds (spec 11): where it stands and
+/// what its CPU does. The state, the command flags and the queue count are one read under `OBJ`
+/// (the flags and the state change only there, but for the owner's `take_batch`, which is what
+/// makes the state 5); the words of the CPU are read after the section, with no lock, and agree
+/// with the state only roughly. O(MAX_CPUS), for the count of the queues.
+pub fn place(thread: NonNull<Thread>) -> abi::ThreadPlace {
+    let (state, cmds, cpu) = sched::locked(|_| {
+        // SAFETY: the caller holds a reference to the thread; only its fields are read.
+        let t = unsafe { thread.as_ref() };
+        let cmds = crate::cmd::flags_of(thread);
+        let state = match t.sched.state() {
+            State::Stopped => abi::PlaceState::Stopped,
+            State::Ready => abi::PlaceState::Ready,
+            State::Running => abi::PlaceState::Running,
+            // The wait ended on another CPU and the command to this one is on its way (4), or
+            // its CPU took the flags and has not finished serving them (5): see `info`.
+            State::Waiting if t.waits.is_some() => abi::PlaceState::Waiting,
+            State::Waiting if cmds != 0 => abi::PlaceState::WakeStanding,
+            State::Waiting => abi::PlaceState::WakeTaken,
+            State::Dead => abi::PlaceState::Ended,
+            State::Parked => abi::PlaceState::Parked,
+        };
+        (state, cmds, cpu_of(thread))
+    });
+    let (level, drained, stint, bits) = sched::cpu_place(cpu);
+    abi::ThreadPlace {
+        cpu: cpu as u64,
+        state: Some(state),
+        cmds: u64::from(cmds),
+        level: u64::from(level),
+        cpu_flags: bits,
+        drained_ticks: drained,
+        stint_ticks: stint,
+        queued: crate::cmd::queued_to(cpu),
+    }
+}
+
 /// The portion of a thread nobody refers to (cleanup): its buffer goes with
 /// the handles of a request it made, released at `level`, the budget it took
 /// before it started goes, its number goes
@@ -1312,6 +1349,11 @@ pub fn run(next: NonNull<Thread>) -> ! {
         let now = crate::arch::timer::now_unordered();
         #[cfg(feature = "measure")]
         crate::obj::stretch_ends(now);
+        // For object_info THREAD_PLACE: the level at EL0 on every pass, the stint's start at a
+        // change of thread or after the idle loop.
+        crate::local::local()
+            .place
+            .runs(thread.priority(), now, prev != Some(next));
         user_resumes(thread, now);
         user::enter(next.as_ptr().cast())
     }

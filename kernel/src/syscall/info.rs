@@ -43,6 +43,9 @@ const SELF_RIGHTS: Rights = abi::OWNER_RIGHTS;
 /// ACCESS_DENIED for a copy of another channel, WRONG_TYPE for a channel
 /// handle without a label (the lookup of x2 comes first).
 ///
+/// THREAD_PLACE takes a thread's handle and in x2 the system resource with KSTATS, and returns
+/// abi::ThreadPlace in x1-x8 (tasks/2026-11-20-thread-place-kernel-decision.md).
+///
 /// SELF_THREAD requires x0 zero and x2 a subset of MANAGE | DUPLICATE |
 /// TRANSFER, the rights the creator of a thread gets from thread_create,
 /// and returns a new owned handle of those rights to the actual caller. Its
@@ -70,6 +73,7 @@ pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
         abi::INFO_IRQ => irq_info(thread, a),
         abi::INFO_MSI_DEVICE => msi_info(thread, a),
         abi::INFO_BUDGET => budget_info(thread, a),
+        abi::INFO_THREAD_PLACE => thread_place(thread, a),
         abi::INFO_LABEL => label_info(thread, a),
         abi::INFO_LOG => log_info(thread, a),
         abi::INFO_CPU => cpu_info(thread, a),
@@ -178,6 +182,15 @@ fn thread_state(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let (info, ran, kernel, preempts) = thread::info(t);
     let [a1, a2, a3, a4] = info.to_words();
     Ok(Values::new(&[a1, a2, a3, a4, ran, kernel, preempts]))
+}
+
+/// THREAD_PLACE: x2 is the system resource with KSTATS (looked up first, as for LABEL), x0 a thread
+/// handle with any rights. Diagnostic (abi::INFO_THREAD_PLACE): the words of x4-x7 are the CPU's
+/// own and read with no lock, so they agree with x2 only roughly.
+fn thread_place(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    lookup(thread, a[2], Rights::KSTATS, Object::resource)?;
+    let t = lookup(thread, a[0], Rights::NONE, Object::thread)?;
+    Ok(Values::new(&thread::place(t).to_words()))
 }
 
 /// CHANNEL: x2 reserved; a channel's counts.
@@ -357,6 +370,25 @@ pub(super) fn debug_write(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
         }
         b"idle-probe unwatch" => {
             crate::idle::watch(false);
+            return Ok(Values::new(&[a[1]]));
+        }
+        b"idle-probe arm-place" => {
+            crate::idle::arm_place();
+            return Ok(Values::new(&[a[1]]));
+        }
+        b"idle-probe disarm" => {
+            crate::idle::disarm();
+            return Ok(Values::new(&[a[1]]));
+        }
+        // The break this kernel has (0 none, 1 drain, 2 bell), in x1.
+        b"idle-probe which" => {
+            return Ok(Values::new(&[crate::idle::which_break() as u64]));
+        }
+        // A command-less ask to CPU 1 to enter the kernel: how the test of the place of a thread
+        // recovers the CPU a break left deaf.
+        b"idle-probe kick" => {
+            crate::cmd::kick(1);
+            crate::cmd::flush_posted();
             return Ok(Values::new(&[a[1]]));
         }
         _ => {}
