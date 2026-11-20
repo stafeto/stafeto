@@ -73,11 +73,35 @@ pub struct Look<'a> {
 }
 
 /// What a CPU counts of its time, in microseconds (`object_info` CPU).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CpuSleep {
     /// The time since the CPU started, and the time it slept in `wfi`.
     pub since_us: u64,
     pub idle_us: u64,
+}
+
+/// The CPUs whose sleep the line of a silent service tells.
+pub const DIAG_CPUS: usize = 8;
+
+/// What init noted at the first miss of a service, when it sent the nudge: its own clock and what
+/// each CPU counted then. The line of the silence tells the sleep of each CPU since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Nudged {
+    pub at_us: u64,
+    pub up: usize,
+    pub cpus: [CpuSleep; DIAG_CPUS],
+}
+
+impl Nudged {
+    /// The sleep of CPU `n` and the time it ran since the nudge, given what it counts now. None
+    /// for a CPU not noted at the nudge.
+    pub fn window(&self, n: usize, now: CpuSleep) -> Option<CpuSleep> {
+        let then = *self.cpus[..self.up].get(n)?;
+        Some(CpuSleep {
+            since_us: now.since_us.saturating_sub(then.since_us),
+            idle_us: now.idle_us.saturating_sub(then.idle_us),
+        })
+    }
 }
 
 /// The state of the service's channel (`object_info` CHANNEL): requests queued and receivers
@@ -99,6 +123,8 @@ pub struct Diag<'a> {
     /// The CPU init runs on, and what each CPU of the machine counts, in the order of its number.
     pub init_cpu: Option<u64>,
     pub cpus: &'a [CpuSleep],
+    /// What init noted when it sent the nudge, None when none went.
+    pub nudged: Option<Nudged>,
 }
 
 /// Microseconds as `S.mmm ms`.
@@ -112,7 +138,7 @@ impl fmt::Display for Ms {
 
 impl fmt::Display for Diag<'_> {
     /// `; heartbeats refused R, last accepted at T ms|never; channel queued Q, receivers V|unknown;
-    /// init on cpu C; cpu 0 slept I of S ms; cpu 1 ...`
+    /// init on cpu C; nudged at T ms; cpu 0 slept I of S ms, W of U ms since the nudge; cpu 1 ...`
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "; heartbeats refused {}, last accepted ", self.refused)?;
         match self.last_beat_us {
@@ -131,8 +157,19 @@ impl fmt::Display for Diag<'_> {
             Some(cpu) => write!(f, "; init on cpu {cpu}")?,
             None => f.write_str("; init on cpu ?")?,
         }
+        if let Some(n) = &self.nudged {
+            write!(f, "; nudged at {}", Ms(n.at_us))?;
+        }
         for (n, c) in self.cpus.iter().enumerate() {
             write!(f, "; cpu {n} slept {} of {}", Ms(c.idle_us), Ms(c.since_us))?;
+            if let Some(w) = self.nudged.and_then(|nudged| nudged.window(n, *c)) {
+                write!(
+                    f,
+                    ", {} of {} since the nudge",
+                    Ms(w.idle_us),
+                    Ms(w.since_us)
+                )?;
+            }
         }
         Ok(())
     }
@@ -405,6 +442,7 @@ mod tests {
                 }),
                 init_cpu: Some(1),
                 cpus: &cpus,
+                nudged: None,
             }),
         };
         let line = look.to_string();
@@ -425,6 +463,7 @@ mod tests {
             channel: None,
             init_cpu: None,
             cpus: &[],
+            nudged: None,
         };
         assert_eq!(
             diag.to_string(),
@@ -441,5 +480,49 @@ mod tests {
             diag: None,
         };
         assert!(!driver.to_string().contains("heartbeats"));
+    }
+
+    /// The planted fault of the window: CPU 1 slept 200 ms of the 250 ms between the nudge and the
+    /// silence, CPU 0 slept none of it, and a CPU that came up after the nudge has no window.
+    #[test]
+    fn the_line_tells_the_sleep_of_each_cpu_since_the_nudge() {
+        let at = |since_us, idle_us| CpuSleep { since_us, idle_us };
+        let mut then = [at(0, 0); DIAG_CPUS];
+        then[0] = at(2_000_000, 88_000);
+        then[1] = at(1_950_000, 190_000);
+        let nudged = Nudged {
+            at_us: 2_133_940,
+            up: 2,
+            cpus: then,
+        };
+        let now = [
+            at(2_250_100, 88_107),
+            at(2_200_300, 390_926),
+            at(2_337_623, 643_436),
+        ];
+        assert_eq!(nudged.window(0, now[0]), Some(at(250_100, 107)));
+        assert_eq!(nudged.window(1, now[1]), Some(at(250_300, 200_926)));
+        assert_eq!(nudged.window(2, now[2]), None);
+        assert_eq!(
+            nudged.window(0, at(1, 1)),
+            Some(at(0, 0)),
+            "a counter that reads lower saturates at 0"
+        );
+        let diag = Diag {
+            refused: 0,
+            last_beat_us: None,
+            channel: None,
+            init_cpu: Some(0),
+            cpus: &now,
+            nudged: Some(nudged),
+        };
+        assert_eq!(
+            diag.to_string(),
+            "; heartbeats refused 0, last accepted never; channel unknown; init on cpu 0; \
+             nudged at 2133.940 ms; \
+             cpu 0 slept 88.107 ms of 2250.100 ms, 0.107 ms of 250.100 ms since the nudge; \
+             cpu 1 slept 390.926 ms of 2200.300 ms, 200.926 ms of 250.300 ms since the nudge; \
+             cpu 2 slept 643.436 ms of 2337.623 ms"
+        );
     }
 }
