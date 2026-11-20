@@ -9720,9 +9720,14 @@ struct Holder {
 }
 
 /// Ticks the server's budget (100 us for each 1 ms) and the client's
-/// (1 ms for each 10 ms) hold, and a stretch the tests spin.
+/// (1 s for each 10 s) hold, and a stretch the tests spin. The server's runs
+/// out on purpose within a stretch of the tests. The client's must not run
+/// out on the way to the request: a host that stops the CPU of the test for
+/// more than its budget (a loaded runner stops it for milliseconds) would
+/// demote the client before its send, and the server would take the request
+/// at `low` with nothing of the client's level.
 const SERVER_C: u64 = 6_250;
-const CLIENT_C: u64 = 62_500;
+const CLIENT_C: u64 = 62_500_000;
 const SPIN: u64 = 3_125;
 
 /// Spins for `ticks` of the counter.
