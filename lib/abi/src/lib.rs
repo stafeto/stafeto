@@ -1120,6 +1120,13 @@ pub const CHANNEL_WAIT: u64 = 1;
 /// reserved.
 pub const TRIGGER_EDGE: u64 = 1;
 
+/// The line of `irq_bind` that names the kernel log, in the place of a line of the
+/// GIC (spec 9, 11): its binding is a source of notifications of one bit, posted when a
+/// record lands in a ring of the log the console's driver has not taken (`irq_ack` arms
+/// it). Outside the INTIDs, so that no line of the GIC has this number. The caller holds
+/// KSTATS in x0 and a device window; one binding in the system.
+pub const LOG_LINE: u64 = 0x8000_0000;
+
 /// The most events a device of `msi_create` has (spec 9, 11): ENA gives a
 /// function up to 33 vectors.
 pub const MAX_MSI_EVENTS: u64 = 64;
