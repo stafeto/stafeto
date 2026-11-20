@@ -765,6 +765,28 @@ pub fn flush_copy() {
     }
 }
 
+/// `flush_copy` for the way out of the kernel (`sched::resume`), which goes
+/// on to the decision: it also posts the log's wake when a record the call
+/// wrote asked for one (`log::take_wake`), since the decision that follows
+/// weighs the notification. A call that runs a thread at once (`run_from`)
+/// does not, for the thread it chose would run with a better one ready.
+#[inline(always)]
+pub fn flush_copy_exit() {
+    if crate::local::local().deferred.load(Ordering::Relaxed) != 0 {
+        flush_deferred_exit();
+    }
+}
+
+#[inline(never)]
+fn flush_deferred_exit() {
+    flush_copy_now();
+    if crate::log::take_wake() {
+        crate::irq::deliver_log();
+        flush_copy_now();
+    }
+    crate::cmd::flush();
+}
+
 /// Whether a copy waits on this CPU (the kernel tests tell a copy made by
 /// the call itself from one made at the end of `dispatch`).
 #[cfg(feature = "ktest")]
@@ -1356,6 +1378,15 @@ pub fn run(next: NonNull<Thread>) -> ! {
             .place
             .runs(thread.priority(), now, prev != Some(next));
         user_resumes(thread, now);
+        // No record may be written after the check of the log's wake at the
+        // start of the turn: the thread would run with the post undone, and
+        // on a CPU that never enters the kernel again the driver would wait
+        // for good. The test builds stop on one.
+        #[cfg(feature = "ktest")]
+        assert!(
+            !crate::log::wake_due(),
+            "a record of the log was written on the way to EL0"
+        );
         user::enter(next.as_ptr().cast())
     }
 }

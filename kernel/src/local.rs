@@ -24,6 +24,11 @@ pub const COPY: u32 = 1;
 /// The outbox holds commands (`Local::deferred`).
 pub const OUTBOX: u32 = 2;
 
+/// A record landed in the log while the console's driver waited for one, and
+/// the post into its binding has not been made (`Local::deferred`,
+/// `log::take_wake`): the way out of the kernel makes it.
+pub const LOG_WAKE: u32 = 4;
+
 /// The data of one CPU, in its block (cpu::CpuBlock).
 #[repr(C, align(64))]
 pub struct Local {
@@ -46,7 +51,7 @@ pub struct Local {
     /// The commands for other CPUs that sections posted (cmd.rs).
     pub outbox: Own<crate::cmd::Outbox>,
     /// What the end of a call has still to do (`thread::flush_copy`): the
-    /// bits `COPY` and `OUTBOX`, one load for both.
+    /// bits `COPY`, `OUTBOX` and `LOG_WAKE`, one load for all.
     pub deferred: core::sync::atomic::AtomicU32,
     /// The start of the open entry interval and the longest one (sched).
     pub entry: UnsafeCell<(u64, u64)>,

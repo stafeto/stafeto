@@ -83,12 +83,20 @@ pub fn init(boot: &Boot) {
     *ASIDS.lock() = Some(AsidAllocator::new(bits));
 }
 
-/// The probe kernel names a generation that is a power of two from 2 on,
-/// once each (xtask smp-asid).
+/// The newest generation a slow switch saw, which the probe kernel names at
+/// the start of the next turn of the way out of the kernel (`say_generation`):
+/// a line of the log written on the way to EL0 would come after the check
+/// of the log's wake (`log::take_wake`) and wait for the next entry.
 #[cfg(feature = "asid-probe")]
-fn probe_says_generations() {
+static GENERATION_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// The probe kernel names a generation that is a power of two from 2 on,
+/// once each (xtask smp-asid), at the start of a turn of the way out of the
+/// kernel, before the check of the log's wake.
+#[cfg(feature = "asid-probe")]
+pub fn say_generation() {
     static SAID: AtomicU64 = AtomicU64::new(0);
-    let g = CPUS.generation();
+    let g = GENERATION_SEEN.load(Ordering::Relaxed);
     if g >= 2 && g.is_power_of_two() && SAID.fetch_max(g, Ordering::Relaxed) < g {
         kprintln!("smp asid  generation {g} of narrow ASIDs began");
     }
@@ -441,7 +449,7 @@ impl AddressSpace {
         let _section = crate::obj::lock();
         with_asids(|a| tlb::switch_slow(a, &CPUS, cpu, &self.tag, root, empty, &mut Cpu, zero_map));
         #[cfg(feature = "asid-probe")]
-        probe_says_generations();
+        GENERATION_SEEN.fetch_max(CPUS.generation(), Ordering::Relaxed);
     }
 
     /// Takes TTBR0 of this CPU off the tables and keeps the ASID: the

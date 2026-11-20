@@ -249,9 +249,25 @@ fn add(what: usize, flag: u8) {
         .fetch_or(crate::local::OUTBOX, Ordering::Relaxed);
 }
 
-/// `flush` when the outbox holds commands.
+/// `flush` when the outbox holds commands, after the post of the log's wake
+/// when a record asked for one (`log::take_wake`): the turns of the way out
+/// of the kernel that handle an interrupt or run a portion end with it, as
+/// does the sleep, so that a record they wrote does not wait for the next
+/// entry of the kernel.
 #[inline(always)]
 pub fn flush_posted() {
+    if local().deferred.load(Ordering::Relaxed) & (crate::local::OUTBOX | crate::local::LOG_WAKE)
+        != 0
+    {
+        flush_posted_slow();
+    }
+}
+
+#[inline(never)]
+fn flush_posted_slow() {
+    if crate::log::take_wake() {
+        crate::irq::deliver_log();
+    }
     if local().deferred.load(Ordering::Relaxed) & crate::local::OUTBOX != 0 {
         flush();
     }

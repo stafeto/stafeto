@@ -932,7 +932,7 @@ pub fn resume() -> ! {
     // The copy of a message and the commands of the call go out here: every
     // exit of the kernel passes this point, a call that never returns
     // (thread_exit, process_exit, the end of a process by a fault) included.
-    crate::thread::flush_copy();
+    crate::thread::flush_copy_exit();
     arch::on_empty_stack(exit_loop)
 }
 
@@ -967,6 +967,14 @@ extern "C" fn exit_loop() -> ! {
             // which polls again first.
             crate::cmd::flush_posted();
             continue;
+        }
+        // The probe kernel's line about a new generation of ASIDs is written
+        // here and posted at once, so that no record is written after the
+        // posts of the turn (thread::run checks it in the test builds).
+        #[cfg(feature = "asid-probe")]
+        {
+            crate::mm::aspace::say_generation();
+            crate::cmd::flush_posted();
         }
         match decide(now) {
             Some(Decision::Run(t)) => {
@@ -1078,6 +1086,16 @@ fn decide(now: u64) -> Option<Decision<Thread>> {
     Some(decision)
 }
 
+/// `gic::wait`, but for a CPU whose log's post is due: that one returns at
+/// once with nothing acknowledged (`log::wake_due`), and `sleep` posts.
+fn wait_unless_wake() -> Option<kcore::gic::Ack> {
+    if crate::log::wake_due() {
+        None
+    } else {
+        gic::wait()
+    }
+}
+
 /// Nothing to do: sleeps in `wfi` with interrupts masked until one is
 /// pending, and handles it; the time asleep counts for KSTATS.
 fn sleep() {
@@ -1092,12 +1110,15 @@ fn sleep() {
     // The window of the poll (idle.rs); a bell ends it like an SGI would.
     let window = crate::idle::window(local().sched.lock().poll.window());
     let began = timer::now();
+    // A record written since the last post (the poll of the idle window
+    // writes one in the probe build) leaves the wait out: the post goes out
+    // below, after the wake-up, as every wake-up's work does.
     let (ack, bell, hit) = if window == 0 {
-        (gic::wait(), false, false)
+        (wait_unless_wake(), false, false)
     } else {
         let polled = crate::idle::poll(window);
         let ack = if polled.quiet {
-            gic::wait()
+            wait_unless_wake()
         } else if arch::irq_pending() {
             gic::acknowledge()
         } else {
@@ -1136,6 +1157,8 @@ fn sleep() {
         }
         crate::cmd::flush_posted();
     }
+    // The post of the log's wake a record asked for (`log::take_wake`).
+    crate::cmd::flush_posted();
     local().sched.lock().waking = false;
 }
 

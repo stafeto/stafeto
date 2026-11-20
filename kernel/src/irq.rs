@@ -23,6 +23,15 @@
 //! on. The last reference queues the binding (spec 7.7), whose portion
 //! gives the channel's slot and reference back and lets the payer's shell
 //! go.
+//!
+//! One binding is no line of the GIC: the log's (`bind_log`, the line
+//! abi::LOG_LINE), which the console's driver makes with KSTATS and a device
+//! window. It is born masked and unarmed; irq_ack opens it, which arms the
+//! log's wake (`log::arm`), and a record that lands while it is armed makes the
+//! way out of the kernel post bit 0 into its slot and mask it again
+//! (`deliver_log`), so that any number of records give one notification
+//! until the next irq_ack. Its last handle clears `LOG_BINDING` and the
+//! arming. No branch of the GIC touches it (`Irq::log`).
 
 use crate::arch::its::Position;
 use crate::arch::{gic, its};
@@ -73,8 +82,11 @@ pub struct Irq {
     event: Option<Event>,
     /// The line is edge-triggered; otherwise level-triggered.
     edge: bool,
-    /// An interrupt masked the line, and no irq_ack opened it since.
+    /// An interrupt masked the line, and no irq_ack opened it since; for the
+    /// binding of the log, no irq_ack since the post (or since it was made).
     masked: bool,
+    /// The binding of the log's line (`bind_log`): no line of the GIC.
+    log: bool,
     /// The process whose pool of bindings holds it, and whose shell it
     /// holds.
     payer: NonNull<Process>,
@@ -115,6 +127,7 @@ impl Irq {
             event,
             edge,
             masked: false,
+            log: false,
             payer,
             level: 0,
             wait: Wait::new(),
@@ -158,6 +171,10 @@ static LPI_LIMIT: core::sync::atomic::AtomicU32 =
 pub fn set_lpi_limit(limit: u32) {
     LPI_LIMIT.store(limit, Ordering::Relaxed);
 }
+
+/// The binding of the log's line, or null: written under `OBJ` (`bind_log`,
+/// the last handle in `release_handle`), read under it (`deliver_log`).
+static LOG_BINDING: AtomicPtr<Irq> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Bindings whose places have not gone back.
 static LIVE: Live = Live::new();
@@ -209,6 +226,37 @@ pub fn bind(
     gic::set_trigger(line, edge);
     gic::set_route(line, cpu as usize);
     gic::unmask(line);
+    Ok(b)
+}
+
+/// Whether the log's line has a binding (spec 9): irq_bind of it fails with
+/// BAD_STATE. Under `OBJ`.
+pub fn log_is_bound() -> bool {
+    !LOG_BINDING.load(Ordering::Acquire).is_null()
+}
+
+/// The binding of the log's line, `bind` for abi::LOG_LINE as irq_bind
+/// checked it: no binding of it yet. Like `bind` but for the GIC, which it
+/// leaves alone: the binding is born masked and unarmed, and the first
+/// irq_ack arms it. Under `OBJ`.
+pub fn bind_log(
+    payer: NonNull<Process>,
+    c: NonNull<Channel>,
+    label: u64,
+    priority: u8,
+    cpu: u32,
+) -> Result<NonNull<Irq>, Error> {
+    channel::reserve_source(c)?;
+    let mut irq = Irq::new(c, payer, abi::LOG_LINE as u32, cpu, None, false);
+    irq.log = true;
+    irq.masked = true;
+    let b = process::paid_alloc(payer, irq).inspect_err(|_| channel::remove_source(c))?;
+    // SAFETY: the binding was just made, and nothing else refers to it.
+    unsafe { (*b.as_ptr()).source.attach(Owner::Irq(b), priority, label) };
+    process::retain_shell(payer);
+    LIVE.made();
+    crate::log::disarm();
+    LOG_BINDING.store(b.as_ptr(), Ordering::Release);
     Ok(b)
 }
 
@@ -350,7 +398,12 @@ pub unsafe fn release_handle(b: NonNull<Irq>, cause: u8) {
         let p = b.as_ptr();
         (*p).handles -= 1;
         if (*p).handles == 0 {
-            if (*p).event.is_some() {
+            if (*p).log {
+                // The log's line has no line in the GIC: no post finds the
+                // binding, and no record posts any more.
+                LOG_BINDING.store(core::ptr::null_mut(), Ordering::Release);
+                crate::log::disarm();
+            } else if (*p).event.is_some() {
                 // An LPI has no mask in the GIC: no interrupt finds the
                 // binding, and its enable byte goes; DISCARD follows in the
                 // portion that takes the binding apart.
@@ -370,8 +423,12 @@ pub unsafe fn release_handle(b: NonNull<Irq>, cause: u8) {
 /// once the channel closed, and the line stays masked for good; for an event
 /// the count its mapping is at goes to `mapping`; otherwise
 /// a line an interrupt masked opens again, and a line that is open stays
-/// so. O(1).
-pub fn ack(b: NonNull<Irq>, mapping: &mut Option<u64>) -> Result<(), Error> {
+/// so. The binding of the log opens on the same rule, and only on the
+/// transition from masked to open does it arm the log's wake and set
+/// `recheck`, which asks the caller to look at the rings once its section
+/// ended (`log::recheck`); an open one does nothing, so that two irq_ack
+/// after one record give one notification. O(1).
+pub fn ack(b: NonNull<Irq>, mapping: &mut Option<u64>, recheck: &mut bool) -> Result<(), Error> {
     let p = b.as_ptr();
     // SAFETY: the caller's handle holds the binding, which holds its
     // channel; only the fields are touched.
@@ -387,7 +444,12 @@ pub fn ack(b: NonNull<Irq>, mapping: &mut Option<u64>) -> Result<(), Error> {
         }
         if (*p).masked {
             (*p).masked = false;
-            gic::unmask((*p).line);
+            if (*p).log {
+                crate::log::arm();
+                *recheck = true;
+            } else {
+                gic::unmask((*p).line);
+            }
         }
     }
     Ok(())
@@ -450,6 +512,34 @@ pub fn deliver(line: u32) -> bool {
         crate::stamps::origin(0);
     }
     true
+}
+
+/// The post of the log's wake (`log::take_wake`, taken by the way out of the
+/// kernel at the start of a turn and before the sleep): when the log's
+/// binding lives and is open, it masks it and posts bit 0 into its slot at
+/// the slot's priority, the level of whatever the post lets go (spec 7.7);
+/// a closed channel takes nothing, and the binding stays masked. One take
+/// of `OBJ`, O(1), the same hold as `deliver`. A flag that outlived the
+/// binding, or one an irq_ack already served, posts nothing.
+pub fn deliver_log() {
+    crate::obj::serving(crate::obj::ENTRY_INTERRUPT);
+    let _section = crate::obj::lock();
+    let Some(b) = NonNull::new(LOG_BINDING.load(Ordering::Acquire)) else {
+        return;
+    };
+    // SAFETY: LOG_BINDING names the binding still, under OBJ, so a handle to
+    // it is left with its reference, and none goes during the post.
+    unsafe {
+        let p = b.as_ptr();
+        if (*p).masked {
+            return;
+        }
+        (*p).masked = true;
+        let priority = (*p).source.priority();
+        crate::stamps::origin(abi::WAKE_IRQ);
+        let _ = Source::post(source(b), IRQ_BITS, priority);
+        crate::stamps::origin(0);
+    }
 }
 
 /// An interrupt of the LPI `lpi`, acknowledged at the GIC, before its EOI

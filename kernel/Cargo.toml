@@ -150,6 +150,8 @@ break-budget-overrun-silent = ["kcore/break-budget-overrun-silent"]
 break-budget-unbind-keeps = ["kcore/break-budget-unbind-keeps"]
 break-notice-holder-keeps = []
 break-log-seen = ["kcore/break-log-seen"]
+# The look at the rings in `irq_ack` of the log's binding is left out (kernel/src/log.rs, `recheck`): the kernel test `log_wake` must catch it.
+break-log-wake = []
 break-notice-payer-none = []
 break-relift-notice = []
 break-relift-reply = []
