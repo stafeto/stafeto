@@ -7450,6 +7450,12 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// reads of the scheduler's decision and the upcall state under the
 /// scheduler lock moved the null call from 263 to 267 instructions (the
 /// compiler's layout of the path; no single change owns them).
+/// `NULL_MAX` 271 -> 275 (object_info THREAD_PLACE): every pass of `thread::run` writes the level
+/// of the thread that goes to EL0 into the line of its CPU that other CPUs read (the decision of
+/// tasks/2026-11-20-thread-place-kernel-decision.md, M3: the level must be right whatever
+/// changed it, so the store is on every pass, not on a switch); 275 measured, 4 over, a load of
+/// the thread's level, the store, and the test of a switch with the store of the stint start.
+/// The change is of the path, so the reviewer of the kernel decides whether it stays.
 ///
 /// Rules for a guard that fires (the paths are deterministic under -icount,
 /// so a firing is no noise and a repeat does not clear it):
@@ -7470,7 +7476,7 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 ///    room the guard keeps (4, and 16 for S5; it does not fail), and
 ///    the next commit lowers the constant, so that a shorter path does not
 ///    turn into room for later growth.
-const NULL_MAX: u64 = 271;
+const NULL_MAX: u64 = 275;
 /// The longest hold of the lock OBJ (kernel/src/obj.rs) in instructions
 /// under -icount, over every kernel test and EL0 test of both images: the
 /// term of each other CPU's wait for it (B_N = B + (N-1) * OBJ_HOLD_MAX +

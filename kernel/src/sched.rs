@@ -1116,6 +1116,7 @@ fn sleep() {
     #[cfg(feature = "measure")]
     crate::obj::stretch_begins(woke);
     local().time.woke(woke);
+    local().place.woke(woke);
     {
         let mut g = local().sched.lock();
         g.idle += woke.saturating_sub(slept);

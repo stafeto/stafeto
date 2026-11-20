@@ -192,9 +192,6 @@ impl CpuTime {
 #[repr(align(64))]
 pub struct Place {
     running_level: core::sync::atomic::AtomicU8,
-    /// The idle loop began since the last stint began: the next `runs` starts a stint even for
-    /// the thread that ran before the sleep.
-    fresh: core::sync::atomic::AtomicBool,
     stint_at: core::sync::atomic::AtomicU64,
     drained_at: core::sync::atomic::AtomicU64,
 }
@@ -203,30 +200,36 @@ impl Place {
     const fn new() -> Place {
         Place {
             running_level: core::sync::atomic::AtomicU8::new(0),
-            fresh: core::sync::atomic::AtomicBool::new(false),
             stint_at: core::sync::atomic::AtomicU64::new(0),
             drained_at: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Every pass of `thread::run`: `level` is the effective level of the thread that goes to
-    /// EL0 at the counter `now`; `switched` when it is not the thread that ran last.
+    /// EL0 at the counter `now`; `switched` when it is not the thread that ran last (the stint
+    /// of a thread that goes on after the idle loop began at the wake, `woke`).
     #[inline(always)]
     pub fn runs(&self, level: u8, now: u64, switched: bool) {
         use core::sync::atomic::Ordering::Relaxed;
         self.running_level.store(level, Relaxed);
-        if switched || self.fresh.load(Relaxed) {
+        if switched {
             self.stint_at.store(now, Relaxed);
-            self.fresh.store(false, Relaxed);
         }
     }
 
-    /// The CPU begins its idle loop at the counter `now`.
+    /// The CPU begins its idle loop at the counter `now`: no level, and the stint of the idle
+    /// loop begins.
     pub fn idles(&self, now: u64) {
         use core::sync::atomic::Ordering::Relaxed;
         self.running_level.store(0, Relaxed);
         self.stint_at.store(now, Relaxed);
-        self.fresh.store(true, Relaxed);
+    }
+
+    /// The CPU leaves the idle loop at the counter `now`: the stint of the thread that goes on
+    /// begins here.
+    pub fn woke(&self, now: u64) {
+        self.stint_at
+            .store(now, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// `cmd::drain` begins at the counter `now`.
