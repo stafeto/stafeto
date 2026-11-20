@@ -63,8 +63,8 @@ pub(super) fn device_window_create(thread: NonNull<Thread>, a: &Args) -> Result<
 /// room in the caller's table (LIMIT_REACHED), a slot of the channel
 /// (LIMIT_REACHED, spec 6.5), a page of the caller's pool of bindings and
 /// a block of its table (NO_MEMORY). A binding whose handle did not go in
-/// goes again, and its line with it. The line abi::LOG_LINE binds the log
-/// instead (`irq_bind_log`), before any check of a line.
+/// goes again, and its line with it. The line abi::LOG_LINE takes the branch
+/// of the log (`irq_bind_log`), before any check of a line.
 #[inline(never)]
 pub(super) fn irq_bind(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let cpu = cpu_arg(a[5], arch::cpu::MAX_CPUS)?;
