@@ -2594,29 +2594,48 @@ fn place_rounds(a: &Handle<Thread>, c: &Handle<Channel>, ready: bool) -> Outcome
         wait_for(|| mark(1) > u64::from(PLACE_ROUNDS)),
         "the receiver did not take the notification under the spinner",
     )?;
-    MARKS[2].store(0, Relaxed);
-    MARKS[3].store(0, Relaxed);
-    place_until(a, WAIT_NS, |p| {
-        p.state == Some(Waiting) && p.cpu_flags & abi::PLACE_IDLE != 0
-    })
-    .ok_or("the thread did not wait with its CPU idle")?;
-    pause(40_000_000);
-    sys::notify(c, 2).map_err(|_| "notify failed")?;
-    let running = place_until(a, WAIT_NS, |p| p.state == Some(Running) && mark(3) == 1);
-    MARKS[2].store(1, Relaxed);
-    let look = running.ok_or("the thread did not run after the sleep of its CPU")?;
-    check(
-        time::ticks_to_ns(look.stint_ticks) < 20_000_000,
-        "the stint after a sleep holds the sleep",
-    )?;
-    check(
-        look.level == u64::from(TEST_PRIORITY + 1),
-        "the level of the running thread is not its own",
-    )?;
+    // A stall of the host can hold a virtual CPU while the thread runs, and the stint is wall
+    // time: a kernel that counts the sleep in the stint fails every attempt.
+    let mut stints = [0u64; 5];
+    let mut small = None;
+    for stint in &mut stints {
+        MARKS[2].store(0, Relaxed);
+        MARKS[3].store(0, Relaxed);
+        let before = mark(1);
+        place_until(a, WAIT_NS, |p| {
+            p.state == Some(Waiting) && p.cpu_flags & abi::PLACE_IDLE != 0
+        })
+        .ok_or("the thread did not wait with its CPU idle")?;
+        pause(40_000_000);
+        sys::notify(c, 2).map_err(|_| "notify failed")?;
+        // The thread says it spins; the reading comes after that.
+        let spins = wait_for(|| mark(3) == 1);
+        let running = place_of(a);
+        MARKS[2].store(1, Relaxed);
+        check(spins, "the thread did not run after the sleep of its CPU")?;
+        let look = running?;
+        check(
+            look.state == Some(Running),
+            "a thread that spins at EL0 is not running",
+        )?;
+        check(
+            wait_for(|| mark(1) > before),
+            "the thread did not return from its spin",
+        )?;
+        *stint = time::ticks_to_ns(look.stint_ticks) / 1000;
+        check(
+            look.level == u64::from(TEST_PRIORITY + 1),
+            "the level of the running thread is not its own",
+        )?;
+        if *stint < 20_000 {
+            small = Some(*stint);
+            break;
+        }
+    }
     println!(
-        "smp place: the stint after a sleep of 40 ms read {} us",
-        time::ticks_to_ns(look.stint_ticks) / 1000
+        "smp place: the stint of the thread that woke after a sleep of 40 ms read {small:?} us (attempts {stints:?})"
     );
+    check(small.is_some(), "the stint after a sleep holds the sleep")?;
     Ok(())
 }
 
@@ -2665,6 +2684,10 @@ fn thread_place_shows_a_lost_wake_up() -> Outcome {
     // A kernel without the probe takes the text for a line of the log and answers its length.
     let which = sys::debug_write(&resource(), b"idle-probe which").unwrap_or(0);
     if !(1..=2).contains(&which) {
+        if which > 2 {
+            // The kernel logged the text with no end of line.
+            println!();
+        }
         return Ok(());
     }
     reset_marks();
