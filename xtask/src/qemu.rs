@@ -1096,6 +1096,11 @@ impl Run {
         if let Some(refused) = refused_budget(&lines) {
             panic!("{refused}");
         }
+        // Every run of every image: the console's driver found records its safety tick
+        // should not have, so the kernel's notification of a record was missed (spec 9).
+        if let Some(missed) = missed_log_wake(&lines) {
+            panic!("{missed}");
+        }
         // The console volume of the step tables, as a number the log shows.
         if let Some(warning) = table_volume_warning(&lines) {
             println!("{warning}");
@@ -1125,6 +1130,18 @@ fn table_volume_warning(lines: &[String]) -> Option<String> {
             "warning: the run printed {tables} lines of service table, more than {TABLE_LINES_WARN}: the console volume may slow the services"
         )
     })
+}
+
+/// The first line of a run in which the console's driver says a record of the kernel log came with
+/// no notification (`uart: log wake missed N records`, services/uart), as the message that fails
+/// the run. The word is taken as far as `log wake mis`, since another line may cut the text.
+fn missed_log_wake(lines: &[String]) -> Option<String> {
+    lines
+        .iter()
+        .find(|l| l.contains("log wake mis"))
+        .map(|line| {
+            format!("the kernel did not wake the console's driver for a record of its log: {line}")
+        })
 }
 
 /// The first line of a run in which a program says its budget was refused (`<program>: the budget
@@ -2717,6 +2734,26 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         .unwrap();
         run.expect("attached\n", Duration::from_secs(5)).unwrap();
         run.stop();
+    }
+
+    /// Every run of every image: the driver's line about a missed wake of the log fails the run.
+    #[test]
+    fn a_missed_log_wake_fails_every_run() {
+        let lines = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            missed_log_wake(&lines(&[
+                "uart: the kernel log wake is not available (InvalidArgs)"
+            ])),
+            None
+        );
+        assert_eq!(missed_log_wake(&[]), None);
+        let m = missed_log_wake(&lines(&[
+            "init: services started",
+            "uart: log wake missed 3 records",
+        ]))
+        .unwrap();
+        assert!(m.contains("uart: log wake missed 3 records"), "{m}");
+        assert!(missed_log_wake(&lines(&["uart: log wake missinit: x"])).is_some());
     }
 
     /// Every run of every image: a program that says its budget was refused fails the run when it
