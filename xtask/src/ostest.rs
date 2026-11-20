@@ -704,8 +704,7 @@ fn plan_suite(suite: Option<&str>) -> Result<(Vec<Job>, Plan), String> {
         crate::relibc()?;
         crate::busybox_build()?;
     }
-    let mut compile = Command::new("python3");
-    compile.arg(crate::root().join("tools/build-os-test.py"));
+    let mut compile = crate::build_script(crate::root().join("tools/build-os-test.py"));
     if let Some(suite) = suite {
         compile.args(["--suite", suite]);
     }
@@ -1484,9 +1483,9 @@ pub fn run_one(name: &str) -> Result<(), String> {
         crate::relibc()?;
         crate::busybox_build()?;
     }
-    crate::run_cmd(
-        std::process::Command::new("python3").arg(crate::root().join("tools/build-os-test.py")),
-    )?;
+    crate::run_cmd(&mut crate::build_script(
+        crate::root().join("tools/build-os-test.py"),
+    ))?;
     let work = target_dir().join("os-test");
     let elfs = work.join("elfs");
     std::fs::create_dir_all(&elfs).map_err(|e| format!("{}: {e}", elfs.display()))?;
