@@ -1638,6 +1638,8 @@ impl<'a> Beat<'a> {
             sent: self.tally.sent,
             send_errors: self.tally.send_errors,
             last_send_error: self.tally.last_send_error,
+            period: self.wire.period,
+            priority: self.wire.priority,
         }
     }
 }
@@ -1657,6 +1659,10 @@ struct Probe {
     sent: u32,
     send_errors: u32,
     last_send_error: Option<Error>,
+    /// The period of the heartbeat and the level of the service, which name it as they name it on
+    /// the other lines of the heartbeat.
+    period: u64,
+    priority: u8,
 }
 
 impl Probe {
@@ -1681,7 +1687,7 @@ impl core::fmt::Display for Ms {
 
 impl core::fmt::Display for Probe {
     /// `service heartbeat probe: cpu C, now N ms, deadline D ms, armed at A ms (Ok|E),
-    /// expiries F, sent S, send errors X (last E|none)`
+    /// expiries F, sent S, send errors X (last E|none) (period P ns, priority L)`
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("service heartbeat probe: cpu ")?;
         match self.cpu {
@@ -1705,9 +1711,14 @@ impl core::fmt::Display for Probe {
             self.expiries, self.sent, self.send_errors
         )?;
         match self.last_send_error {
-            Some(e) => write!(f, "{e:?})"),
-            None => f.write_str("none)"),
+            Some(e) => write!(f, "{e:?})")?,
+            None => f.write_str("none)")?,
         }
+        write!(
+            f,
+            " (period {} ns, priority {})",
+            self.period, self.priority
+        )
     }
 }
 
@@ -2385,6 +2396,8 @@ mod beat_tests {
             sent: 4,
             send_errors: 0,
             last_send_error: None,
+            period: 250_000_000,
+            priority: 36,
         }
     }
 
@@ -2453,7 +2466,8 @@ mod beat_tests {
         assert_eq!(
             probe().to_string(),
             "service heartbeat probe: cpu 1, now 1666.399 ms, deadline 1250.000 ms, \
-             armed at 1000.000 ms (Ok), expiries 5, sent 4, send errors 0 (last none)"
+             armed at 1000.000 ms (Ok), expiries 5, sent 4, send errors 0 (last none) \
+             (period 250000000 ns, priority 36)"
         );
         let faulty = Probe {
             cpu: None,
@@ -2465,7 +2479,8 @@ mod beat_tests {
         assert_eq!(
             faulty.to_string(),
             "service heartbeat probe: cpu ?, now 1666.399 ms, deadline 1250.000 ms, \
-             armed at 1000.000 ms (BadState), expiries 5, sent 4, send errors 2 (last PeerClosed)"
+             armed at 1000.000 ms (BadState), expiries 5, sent 4, send errors 2 (last PeerClosed) \
+             (period 250000000 ns, priority 36)"
         );
         assert_eq!(Ms(7_000_999).to_string(), "7.000 ms");
     }

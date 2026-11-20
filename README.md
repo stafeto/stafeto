@@ -35,7 +35,7 @@ The details of each part and the known limits are in [docs/status.md](docs/statu
 
 ## Where it is going
 
-The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) and subproject 2 (POSIX and services) are done; the network and the packages arrived in 0.3.0 and AWS EC2 Graviton in 0.4.0 and scheduler time budgets in 0.5.0; 0.5.1 adds the try-out image for AWS (SSH, nginx, the package manager and a data volume for the host key).
+The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) and subproject 2 (POSIX and services) are done; the network and the packages arrived in 0.3.0 and AWS EC2 Graviton in 0.4.0 and scheduler time budgets in 0.5.0; 0.5.1 adds the try-out image for AWS (SSH, nginx, the package manager and a data volume for the host key), and 0.5.2 brings nginx 1.30.7 with nine security fixes and a new image.
 
 **Next, in this order**
 

@@ -466,7 +466,19 @@ int main(int argc, char **argv)
 	}
 	if (!strcmp(mode, "saturate"))
 		pin(0xe);
-	REQUIRE(stafeto_fast_attach(&claim) == 0);
+	if (!strcmp(mode, "hold-block")) {
+		/* The eight programs that ran just before have detached, but the service
+		 * frees their numbers and ring mappings step by step: an attach in that
+		 * time is refused with EBUSY. Ask again for up to 30 s. */
+		int tries = 0;
+		int rc;
+
+		while ((rc = stafeto_fast_attach(&claim)) != 0 && errno == EBUSY && ++tries < 300)
+			pause_ms(100);
+		REQUIRE(rc == 0);
+	} else {
+		REQUIRE(stafeto_fast_attach(&claim) == 0);
+	}
 	REQUIRE(claim.kind == STAFETO_FAST_PORT);
 	c = &claim.config;
 	block_first = (uint16_t)claim.snapshot[4];

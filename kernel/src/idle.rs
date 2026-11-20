@@ -31,6 +31,20 @@ struct Word(AtomicU32);
 
 static IDLE: [Word; MAX_CPUS] = [const { Word(AtomicU32::new(0)) }; MAX_CPUS];
 
+/// The bits of the word of CPU `cpu` as object_info THREAD_PLACE gives them (abi::PLACE_POLLING
+/// and abi::PLACE_BELL), read with no lock.
+pub fn place_bits(cpu: usize) -> u64 {
+    let word = IDLE[cpu].0.load(Ordering::Relaxed);
+    let mut bits = 0;
+    if word & POLLING != 0 {
+        bits |= abi::PLACE_POLLING;
+    }
+    if word & BELL != 0 {
+        bits |= abi::PLACE_BELL;
+    }
+    bits
+}
+
 /// Whether the machine polls: set once by CPU 0 before the others start.
 static POLL_ON: AtomicBool = AtomicBool::new(false);
 
@@ -45,6 +59,33 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 pub fn arm() {
     ARMED.store(true, Ordering::Relaxed);
     WATCH.store(true, Ordering::Relaxed);
+}
+
+/// The test of the place of a thread ends its break (debug_write "idle-probe disarm"): what it
+/// held is sound again, and the test of the pairs arms it anew.
+#[cfg(feature = "idle-probe")]
+pub fn disarm() {
+    ARMED.store(false, Ordering::Relaxed);
+}
+
+/// The test of the place of a thread arms the break alone, with no watch of the window
+/// (debug_write "idle-probe arm-place").
+#[cfg(feature = "idle-probe")]
+pub fn arm_place() {
+    ARMED.store(true, Ordering::Relaxed);
+}
+
+/// The break this kernel has, as the test of the place of a thread asks (debug_write
+/// "idle-probe which"): 0 none, 1 `break-idle-drain`, 2 `break-idle-bell`.
+#[cfg(feature = "idle-probe")]
+pub fn which_break() -> usize {
+    if cfg!(feature = "break-idle-drain") {
+        1
+    } else if cfg!(feature = "break-idle-bell") {
+        2
+    } else {
+        0
+    }
 }
 
 /// The probe kernels print their line about an interrupt pending at the end
