@@ -36,6 +36,7 @@ use abi::{INIT_STACK_TOP, INLINE_MAX, MESSAGE_MAX, Rights, START_CHANNEL, Source
 use bootimg::Part;
 use bootimg::elf::{self, Load};
 use core::mem::MaybeUninit;
+use loader_image::data_slot;
 use proto_loader::{
     self as pl, AREA_MAX, BLOCK_MAX, Block, BlockError, Fork, LOADER_BASE, MAP_ENTRIES, MapEntry,
     Method, PROGRAM_ROOM, REGIONS_MAX, Region, SLOTS, START_AREA, Slot, TRANSFER_SIZE,
@@ -654,6 +655,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                     if !cfg!(feature = "break-no-heal-fork") {
                                         heal_entropy(session, own, &mut given, &mut roots)?;
                                     }
+                                    forget_dead_data(&mut given);
                                     tell_ready(session, 0)
                                 } else {
                                     Ok(())
@@ -791,7 +793,9 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                 } else if cfg!(feature = "break-no-heal-fork") {
                                     Ok(())
                                 } else {
-                                    heal_entropy(session, own, &mut given, &mut roots)
+                                    let healed = heal_entropy(session, own, &mut given, &mut roots);
+                                    forget_dead_data(&mut given);
+                                    healed
                                 }
                             {
                                 reply(token, code);
@@ -1089,10 +1093,11 @@ fn loader_root(session: &Handle<Channel>, root: u32) -> Result<Option<Handle<Cha
 
 /// The slots whose sessions a set-ID program takes only from their service,
 /// each with the root the process service keeps for it.
-const VERIFIED: [(Slot, u32); 3] = [
+const VERIFIED: [(Slot, u32); 4] = [
     (Slot::Pipes, proto_process::ROOT_PIPES),
     (Slot::Net, proto_process::ROOT_NET),
     (Slot::Entropy, proto_process::ROOT_ENTROPY),
+    (Slot::Data, proto_process::ROOT_DATA),
 ];
 
 /// The roots of `VERIFIED`, in its order.
@@ -1110,12 +1115,28 @@ fn roots_before_ready(
     roots: &mut Roots,
 ) -> Result<(), u32> {
     heal_entropy(session, own, given, roots)?;
+    forget_dead_data(given);
     for (root, &(slot, which)) in roots.iter_mut().zip(&VERIFIED) {
         if given[slot as usize].is_some() && root.is_none() {
             *root = loader_root(session, which)?;
         }
     }
     Ok(())
+}
+
+/// A session of the data file service that died with its instance is let go: the slot stays
+/// empty, and the child takes a session when it uses `/data` (the descriptions of the dead one
+/// are dead targets in its layer). Nothing cures it: a session the loader made would carry no
+/// identity of the child's own, and the child's layer asks the root of the service for one that
+/// does.
+fn forget_dead_data(given: &mut [Option<Handle<Channel>>; SLOTS]) {
+    let slot = Slot::Data as usize;
+    if given[slot]
+        .as_ref()
+        .is_some_and(|session| !is_open(session))
+    {
+        given[slot] = None;
+    }
 }
 
 /// Whether `session` is open: its service's instance has not ended.
@@ -1197,6 +1218,7 @@ fn verify_header(slot: Slot) -> [u8; 8] {
     match slot {
         Slot::Net => proto_net::Method::VerifySession.header().bytes(),
         Slot::Entropy => proto_entropy::Method::VerifySession.header().bytes(),
+        Slot::Data => proto_data::Method::VerifySession.header().bytes(),
         _ => proto_pipe::Method::VerifySession.header().bytes(),
     }
 }
@@ -1220,6 +1242,30 @@ fn verify_slot(
         return Err(pl::IO);
     }
     reply.handles.take::<Channel>(0).map_err(code)
+}
+
+/// A set-ID program's session in the slot Data: the offered one goes to the root of the data file
+/// service, which answers with the session itself when it is a live session of the service and
+/// with BAD_HANDLE and no handle for any other channel (a forged one, or one that died). The slot
+/// is then left empty and the program takes a session of its own from the root when it uses
+/// `/data`. A start with no root (an image without the service) leaves the slot empty too: the
+/// offered channel is closed unsent. Any other answer refuses the start.
+fn verify_data(
+    root: Option<&Handle<Channel>>,
+    offered: Handle<Channel>,
+) -> Result<Option<Handle<Channel>>, u32> {
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let request = verify_header(Slot::Data);
+    let mut reply = sys::send_handles(root, &request, [offered.erase()])
+        .map_err(|refused| code(refused.error))?;
+    let mut buffer = [0; MESSAGE_MAX];
+    match data_slot::verdict(Reader::new(reply.bytes(&mut buffer)).u32().ok()) {
+        data_slot::Verdict::Keep => reply.handles.take::<Channel>(0).map(Some).map_err(code),
+        data_slot::Verdict::Empty => Ok(None),
+        data_slot::Verdict::Refuse => Err(pl::IO),
+    }
 }
 
 /// Verify before a parent can commit SetId. True tty descriptions and
@@ -2329,12 +2375,19 @@ fn finish(
     let c = taken.credentials;
     // A set-ID program starts in the secure mode (AT_SECURE).
     let secure = c.uid != c.euid || c.gid != c.egid;
-    // A set-ID program takes its Pipes, Net and Entropy sessions from their
+    // A set-ID program takes its Pipes, Net, Entropy and Data sessions from their
     // services alone: a forged one is replaced, and a start a service cannot
     // verify is refused. Any other program keeps what its parent gave.
     if secure {
         for (root, &(slot, _)) in roots.iter().zip(&VERIFIED) {
             if let Some(offered) = given[slot as usize].take() {
+                if slot == Slot::Data {
+                    match verify_data(root.as_ref(), offered) {
+                        Ok(session) => given[slot as usize] = session,
+                        Err(_) => return GAVE_UP,
+                    }
+                    continue;
+                }
                 match verify_slot(slot, root.as_ref(), offered) {
                     Ok(session) => given[slot as usize] = Some(session),
                     Err(_) => return GAVE_UP,

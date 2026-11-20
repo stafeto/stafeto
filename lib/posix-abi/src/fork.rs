@@ -169,8 +169,8 @@ struct Work {
 }
 
 /// The values of the sessions a fork gives the child's loader (Handles),
-/// by proto_loader::Slot: Files, Clock, Driver, Pipes, Terminal, Entropy, Display, Net and
-/// Packages; 0 for none.
+/// by proto_loader::Slot: Files, Clock, Driver, Pipes, Terminal, Entropy, Display, Net, Packages
+/// and Data; 0 for none.
 #[derive(Clone, Copy, Default)]
 pub struct Sessions {
     pub files: u64,
@@ -182,6 +182,7 @@ pub struct Sessions {
     pub display: u64,
     pub net: u64,
     pub packages: u64,
+    pub data: u64,
 }
 
 impl Sessions {
@@ -200,6 +201,7 @@ impl Sessions {
             (Slot::Display, self.display),
             (Slot::Net, self.net),
             (Slot::Packages, self.packages),
+            (Slot::Data, self.data),
         ] {
             if raw != 0 {
                 mask |= slot.bit();
@@ -224,6 +226,7 @@ impl Sessions {
             self.display,
             self.net,
             self.packages,
+            self.data,
         ] {
             if raw != 0 {
                 drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
@@ -291,6 +294,7 @@ fn give(c: &Handle<Channel>, sessions: Sessions) -> Result<(), i32> {
         (Slot::Display, session(sessions.display)),
         (Slot::Net, session(sessions.net)),
         (Slot::Packages, session(sessions.packages)),
+        (Slot::Data, session(sessions.data)),
     ];
     match crate::process::give_sessions(c, given) {
         0 => Ok(()),
@@ -838,6 +842,11 @@ fn sessions() -> Result<Sessions, i32> {
         if let Some(clone) = crate::packages::clone_session() {
             out.packages = clone.into_raw().0;
         }
+        // The child's descriptions of the data volume and its current directory there: a clone of
+        // the session holds them, and the child binds it before its first path call.
+        if let Some(clone) = crate::data::clone_for_fork()? {
+            out.data = clone.into_raw().0;
+        }
         Ok(())
     })();
     match made {
@@ -1004,6 +1013,9 @@ fn child() -> Result<(), &'static str> {
         // The child's session with the package service is the clone the
         // parent made.
         crate::packages::after_fork(handle(raw(Slot::Packages)));
+        // The child's session with the data file service is the clone the parent made when it
+        // held descriptions of `/data`; none otherwise.
+        crate::data::after_fork(handle(raw(Slot::Data)));
         // The instances of epoll are the parent's, whose set the parent's
         // session holds: the child's calls on them are EBADF.
         crate::epoll::after_fork();

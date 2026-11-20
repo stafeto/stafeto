@@ -193,13 +193,14 @@ pub const PACKAGE_SERVICE: &str = "pkgd";
 pub const TERMINAL_SERVICE: &str = "tty";
 /// The services that send their root to the process service with Register
 /// (proto_process::ROOT_MARKS), each with the mark init gives its notary
-/// session and no other entry: the terminal, channel, network and entropy
+/// session and no other entry: the terminal, channel, network, entropy and data
 /// services.
 pub const ROOT_SERVICES: &[(&str, u64)] = &[
     (TERMINAL_SERVICE, proto_process::TERMINAL),
     (PIPE_SERVICE, proto_process::PIPE),
     (NET_SERVICE, proto_process::NET),
     (ENTROPY_SERVICE, proto_process::ENTROPY),
+    (DATA_SERVICE, proto_process::DATAFS),
 ];
 
 /// The label mark of the notary session of the voucher `name`: NOTARY, with
@@ -1586,6 +1587,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-pty") as usize
     + cfg!(feature = "table-posix-steps") as usize
     + cfg!(feature = "table-os-test") as usize
+    + cfg!(feature = "table-os-test-data") as usize
     + cfg!(feature = "table-posix-abi-vz") as usize
     + cfg!(feature = "table-busybox-dialog-vz") as usize
     + cfg!(feature = "table-rtbench-vz") as usize
@@ -1633,6 +1635,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-random-net") as usize
     + cfg!(feature = "table-posix-random-net2") as usize
     + cfg!(feature = "table-posix-display") as usize
+    + cfg!(feature = "table-data-posix") as usize
     + cfg!(feature = "table-posix-window") as usize
     + cfg!(feature = "table-display") as usize
     + cfg!(feature = "table-fstack-probe") as usize
@@ -1690,6 +1693,7 @@ const _: () = assert!(
     feature = "table-posix-pty",
     feature = "table-posix-steps",
     feature = "table-os-test",
+    feature = "table-os-test-data",
     feature = "table-posix-abi-vz",
     feature = "table-busybox-dialog-vz",
     feature = "table-rtbench-vz",
@@ -1737,6 +1741,7 @@ const _: () = assert!(
     feature = "table-posix-random-net",
     feature = "table-posix-random-net2",
     feature = "table-posix-display",
+    feature = "table-data-posix",
     feature = "table-posix-window",
     feature = "table-display",
     feature = "table-fstack-probe",
@@ -1791,6 +1796,8 @@ pub const TABLE: &[Record] = ramfs::POSIX_STEPS_TABLE;
 pub const TABLE: &[Record] = ramfs::RELIBC_THREADS_TABLE;
 #[cfg(feature = "table-os-test")]
 pub const TABLE: &[Record] = ramfs::OS_TEST_TABLE;
+#[cfg(feature = "table-os-test-data")]
+pub const TABLE: &[Record] = ramfs::OS_TEST_DATA_TABLE;
 #[cfg(feature = "table-busybox")]
 pub const TABLE: &[Record] = ramfs::BUSYBOX_TABLE;
 #[cfg(feature = "table-busybox-dialog")]
@@ -1938,6 +1945,8 @@ pub const TABLE: &[Record] = net::POSIX_RANDOM_NET_TABLE;
 pub const TABLE: &[Record] = net::POSIX_RANDOM_NET2_TABLE;
 #[cfg(feature = "table-posix-display")]
 pub const TABLE: &[Record] = ramfs::POSIX_DISPLAY_TABLE;
+#[cfg(feature = "table-data-posix")]
+pub const TABLE: &[Record] = ramfs::DATA_POSIX_TABLE;
 #[cfg(feature = "table-posix-window")]
 pub const TABLE: &[Record] = window::TABLE;
 #[cfg(feature = "table-display")]
@@ -2037,6 +2046,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     net::POSIX_RANDOM_NET_TABLE,
     net::POSIX_RANDOM_NET2_TABLE,
     ramfs::POSIX_DISPLAY_TABLE,
+    ramfs::DATA_POSIX_TABLE,
     ramfs::DISPLAY_TABLE,
     ramfs::LOADER_CHANNELS_TABLE,
     ramfs::POSIX_POLL_TABLE,
@@ -3722,6 +3732,7 @@ mod tests {
             ramfs::POSIX_RANDOM_TABLE,
             ramfs::POSIX_RANDOM_RESTART_TABLE,
             ramfs::POSIX_DISPLAY_TABLE,
+            ramfs::DATA_POSIX_TABLE,
             ramfs::DISPLAY_TABLE,
             ramfs::LOADER_CHANNELS_TABLE,
             ramfs::POSIX_POLL_TABLE,
@@ -4223,6 +4234,7 @@ mod tests {
             ramfs::POSIX_RANDOM_TABLE,
             ramfs::POSIX_RANDOM_RESTART_TABLE,
             ramfs::POSIX_DISPLAY_TABLE,
+            ramfs::DATA_POSIX_TABLE,
             lvgl::TABLE,
             window::TABLE,
             ramfs::DISPLAY_TABLE,
@@ -4242,6 +4254,7 @@ mod tests {
                     "rtbench-posix",
                     "posix-random",
                     "posix-display",
+                    "posix-data",
                     "posix-window",
                     "display-run",
                     "posix-pty",
@@ -4548,15 +4561,41 @@ mod tests {
         }
     }
 
-    /// The data file service is a voucher with the plain notary session: no mark of a root, no
-    /// right to say a file is set-ID, and it is not a POSIX process, so `connects` has no `posix`
-    /// (a record that connects to it is one, and gets no notary session).
+    /// The data file service is a voucher whose notary session carries the mark of its root (it
+    /// registers the root the process service hands to every process with TakeRoot) and no other:
+    /// no right to say a file is set-ID, and it is not a POSIX process, so `connects` has no
+    /// `posix` (a record that connects to it is one, and gets no notary session). No other
+    /// service of any table gets the mark.
     #[test]
     fn the_data_file_service_is_a_plain_voucher() {
         assert!(VOUCHERS.contains(&DATA_SERVICE));
-        assert_eq!(notary_mark(DATA_SERVICE), proto_process::NOTARY);
+        assert_eq!(
+            notary_mark(DATA_SERVICE),
+            proto_process::NOTARY | proto_process::DATAFS
+        );
+        assert_eq!(
+            proto_process::root_of(notary_mark(DATA_SERVICE)),
+            Some(proto_process::ROOT_DATA)
+        );
         assert!(!SET_ID_VOUCHERS.contains(&DATA_SERVICE));
-        assert!(!ROOT_SERVICES.iter().any(|(name, _)| *name == DATA_SERVICE));
+        // The mark goes to the data service alone, whatever else a table holds.
+        for name in [
+            "clock",
+            RAM_SERVICE,
+            TERMINAL_SERVICE,
+            PIPE_SERVICE,
+            NET_SERVICE,
+        ] {
+            assert_eq!(notary_mark(name) & proto_process::DATAFS, 0, "{name}");
+        }
+        assert_eq!(
+            ROOT_SERVICES
+                .iter()
+                .filter(|(_, mark)| *mark == proto_process::DATAFS)
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            [DATA_SERVICE]
+        );
         for table in data_tables() {
             for r in table.iter().filter(|r| r.name == DATA_SERVICE) {
                 assert!(!r.is_posix() && !r.is_client());

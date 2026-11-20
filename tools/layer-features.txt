@@ -1,1 +1,1 @@
-shared,procfs,trace
+shared,procfs,data,trace

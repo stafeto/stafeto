@@ -116,6 +116,8 @@ struct Tables {
     /// The handles of the passes (sockets of the network service in messages),
     /// by slot, and the slots of the sends that wait, by operation.
     passes: [Option<Handle<Channel>>; PASSES_MAX],
+    /// The kind of the service of each pass (`proto_pipe::sock::KIND_NET`, `KIND_DATA`), by slot.
+    pass_kinds: [u8; PASSES_MAX],
     carried: Carries<OPERATIONS>,
 }
 struct Bss(UnsafeCell<core::mem::MaybeUninit<Tables>>);
@@ -138,6 +140,7 @@ impl Tables {
             rt::bss::fill_none(addr_of_mut!((*tables).sessions));
             rt::bss::fill_none(addr_of_mut!((*tables).births));
             rt::bss::fill_none(addr_of_mut!((*tables).passes));
+            addr_of_mut!((*tables).pass_kinds).write([0; PASSES_MAX]);
             Pipes::initialize_at(addr_of_mut!((*tables).pipes));
             LongOps::initialize_at(addr_of_mut!((*tables).ops));
             pipe::watches::Pool::initialize_at(addr_of_mut!((*tables).watches));
@@ -204,6 +207,7 @@ fn main(_: u64) -> u64 {
         named: &mut tables.named,
         io: &mut tables.io,
         passes: &mut tables.passes,
+        pass_kinds: &mut tables.pass_kinds,
         carried: &mut tables.carried,
         pending_carry: None,
         step,
@@ -277,6 +281,7 @@ struct PipeService {
     named: &'static mut Admissions<Handle<Channel>>,
     io: &'static mut [IoCapture; OPERATIONS],
     passes: &'static mut [Option<Handle<Channel>>; PASSES_MAX],
+    pass_kinds: &'static mut [u8; PASSES_MAX],
     carried: &'static mut Carries<OPERATIONS>,
     /// The slots of the send that is about to wait: `wait` files them under
     /// the operation it makes.
@@ -1631,6 +1636,13 @@ impl PipeService {
         for (k, handle) in handles.iter_mut().enumerate().take(listed) {
             self.passes[usize::from(slots[k])] = handle.take();
         }
+        // The kind of each pass, as the sender stated it for the description that lists it.
+        for (i, &id) in fds[..send.nfds].iter().enumerate() {
+            if id >= PASS {
+                let slot = usize::from(slots[(id - PASS) as usize]);
+                self.pass_kinds[slot] = proto_pipe::sock::kind_of(send.kinds, i) as u8;
+            }
+        }
         carry::translate(&mut fds[..send.nfds], &slots[..listed]).map_err(|_| bad())?;
         Ok((
             fds,
@@ -1700,9 +1712,15 @@ impl PipeService {
                 // The passes of the message go to the receiver as handles of
                 // the reply, listed in the order of the message as `PASS + k`.
                 let mut fds = got.fds;
+                let mut kinds = 0;
                 let mut handles = Outgoing::new();
-                for id in fds[..got.nfds].iter_mut().filter(|id| **id >= PASS) {
+                for (i, id) in fds[..got.nfds].iter_mut().enumerate() {
+                    if *id < PASS {
+                        continue;
+                    }
                     let slot = (*id - PASS) as usize;
+                    kinds = proto_pipe::sock::with_kind(kinds, i, u32::from(self.pass_kinds[slot]));
+                    self.pass_kinds[slot] = 0;
                     let handle = self.passes[slot].take();
                     self.pipes.pass_free(slot);
                     *id = PASS + PASSES_PER_MESSAGE as u32;
@@ -1718,6 +1736,7 @@ impl PipeService {
                     flags: got.flags,
                     fds,
                     nfds: got.nfds,
+                    kinds,
                     from: got.from,
                     bytes: &out[..got.n],
                 };

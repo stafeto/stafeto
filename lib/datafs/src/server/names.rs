@@ -186,6 +186,115 @@ impl Server {
         }
     }
 
+    /// The pairs and the directories of the volume are counted (one fetch of each pair, about two
+    /// reads for each): the exact count replaces the estimate and the count of directories, a
+    /// refusal that was waiting for a removal is forgotten, and the line of the count is left for
+    /// the worker to tell (`take_pairs_report`). At the mount, at each refresh walk and before the
+    /// first refusal.
+    pub fn recount<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> Res<(u64, u64)> {
+        let (pairs, dirs) = volume(fs.metadata_pairs())?;
+        // A count that disagrees with the directories the service followed catches a change it did
+        // not see (a rollback that failed, an orphan of a cut commit): the worker says so in a line.
+        let mismatch = self
+            .pairs
+            .dirs
+            .filter(|tracked| *tracked != dirs)
+            .map(|tracked| (tracked, dirs));
+        self.pairs = Pairs {
+            known: Some(pairs),
+            since: 0,
+            dirs: Some(dirs),
+            refused: false,
+            dirs_refused: false,
+            report: Some((pairs, dirs)),
+            mismatch,
+        };
+        Ok((pairs, dirs))
+    }
+
+    /// The tracked and the counted directories when the last recount found them different, once.
+    pub fn take_dirs_mismatch(&mut self) -> Option<(u64, u64)> {
+        self.pairs.mismatch.take()
+    }
+
+    /// The count the last `recount` made, once: the worker tells it in a line.
+    pub fn take_pairs_report(&mut self) -> Option<(u64, u64)> {
+        self.pairs.report.take()
+    }
+
+    /// MKDIR is about to make a directory: NO_SPACE when the volume has `DIRS_MAX` directories or
+    /// more. The count is exact (followed by every MKDIR and RMDIR since the last count), so the
+    /// refusal needs no recount.
+    pub(super) fn room_for_dir<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> Res<()> {
+        let dirs = match self.pairs.dirs {
+            Some(dirs) => dirs,
+            None => self.recount(fs)?.1,
+        };
+        if dirs < self.dirs_max {
+            return Ok(());
+        }
+        // The tracked count can be over the volume's (a rollback that could not remove the name, an
+        // orphan the next write repairs): a refusal is made on an exact count, as the pairs' is, and
+        // after a confirmed refusal the service does not count again until a removal.
+        if self.pairs.dirs_refused {
+            return Err(p::code(p::NO_SPACE));
+        }
+        let (_, dirs) = self.recount(fs)?;
+        if dirs >= self.dirs_max {
+            self.pairs.dirs_refused = true;
+            Err(p::code(p::NO_SPACE))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A commit that may make a pair is about to be done (MKDIR, the creation of a file, a RENAME
+    /// into another directory, at the cap a RENAME to a longer name): NO_SPACE when the volume has
+    /// `PAIRS_MAX` pairs or more. The estimate (the last count plus what the commits since may have
+    /// added) is kept below the cap with no read. When it reaches the cap, or there is no count yet,
+    /// the pairs are counted and the exact count decides: a refusal is never made on the estimate.
+    /// After a refusal on an exact count the service does not count again until a removal, so a
+    /// refused loop costs one count. A removal, which is never refused, is what makes room.
+    pub(super) fn room_for_pair<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> Res<()> {
+        if let Some(known) = self.pairs.known
+            && known + self.pairs.since < self.pairs_max
+        {
+            return Ok(());
+        }
+        if self.pairs.refused {
+            return Err(p::code(p::NO_SPACE));
+        }
+        let (pairs, _) = self.recount(fs)?;
+        if pairs >= self.pairs_max {
+            self.pairs.refused = true;
+            Err(p::code(p::NO_SPACE))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Commits that may add pairs: `n` more to the estimate.
+    pub(super) fn pairs_added(&mut self, n: u64) {
+        self.pairs.since += n;
+    }
+
+    /// A directory was made (+1) or removed (-1); a removal also lets the service count again.
+    pub(super) fn dirs_changed(&mut self, delta: i64) {
+        if let Some(d) = self.pairs.dirs.as_mut() {
+            *d = d.saturating_add_signed(delta);
+        }
+        if delta < 0 {
+            self.pairs.refused = false;
+            self.pairs.dirs_refused = false;
+        }
+    }
+
+    /// A name was removed: a refusal that waited for a removal may be tried again.
+    pub(super) fn removed(&mut self) {
+        self.pairs.refused = false;
+        self.pairs.dirs_refused = false;
+    }
+
     /// The reserve (rule 14): a caller other than user 0 gets NO_SPACE with fewer than
     /// `RESERVE_BLOCKS` free blocks, for a create, a rename and a change of attributes: each may
     /// split or compact a pair of metadata blocks, which takes blocks the superuser needs to remove
@@ -283,13 +392,29 @@ impl Server {
             return Err(p::code(p::EXISTS));
         }
         self.room_in_dir(fs, parent)?;
+        self.room_for_dir(fs)?;
+        self.room_for_pair(fs)?;
         self.reserve_allows(fs, caller)?;
         let record = self.new_record(fs, caller, &parent_attr, Kind::Directory, mode)?;
         volume(fs.mkdir(path))?;
+        self.pairs_added(2);
+        self.dirs_changed(1);
         // The record is written in the same job as the name; a cut between the two commits leaves
-        // an entry with no record, which reads as the closed default.
-        if let Err(e) = fs.setattr(path, ATTR_TYPE, &record.to_bytes()) {
-            let _ = fs.remove(path);
+        // an entry with no record, which reads as the closed default. When the record cannot be
+        // written the name goes again, and so does the directory from the count (a removal that
+        // failed leaves it in the count until the next recount, which tells the difference).
+        #[cfg(test)]
+        let written = if self.fail_record {
+            Err(Error::Io)
+        } else {
+            fs.setattr(path, ATTR_TYPE, &record.to_bytes())
+        };
+        #[cfg(not(test))]
+        let written = fs.setattr(path, ATTR_TYPE, &record.to_bytes());
+        if let Err(e) = written {
+            if fs.remove(path).is_ok() {
+                self.dirs_changed(-1);
+            }
             return Err(status_of(e));
         }
         self.count_add(parent, 1);
@@ -343,6 +468,10 @@ impl Server {
             }
         }
         self.count_add(parent, -1);
+        if info.kind == Kind::Directory {
+            self.dirs_changed(-1);
+        }
+        self.removed();
         self.touch(fs, parent, parent_record);
         Ok(())
     }
@@ -406,6 +535,14 @@ impl Server {
         if from_parent != to_parent && target_entry.is_none() {
             self.room_in_dir(fs, to_parent)?;
         }
+        // A name in another directory, or a longer name in the same one, may split a pair: refused
+        // at the cap of pairs, on an exact count. A name that does not grow in its own directory
+        // makes no pair and is never refused.
+        let adds_pair = target_entry.is_none()
+            && (from_parent != to_parent || split(to).1.len() > split(from).1.len());
+        if adds_pair {
+            self.room_for_pair(fs)?;
+        }
         if source.kind == Kind::Directory {
             if self.dir_in_use(from) || self.dir_in_use(to) {
                 return Err(p::code(p::BUSY));
@@ -449,6 +586,16 @@ impl Server {
                 }
             }
             moved?;
+        }
+        if adds_pair {
+            self.pairs_added(1);
+        }
+        // A directory the rename replaced is gone, and the removal of a name lets the count run again.
+        if target_entry.is_some() {
+            if replaced.is_some_and(|r| r.kind == Kind::Directory) {
+                self.dirs_changed(-1);
+            }
+            self.removed();
         }
         if from_parent != to_parent {
             self.count_add(from_parent, -1);

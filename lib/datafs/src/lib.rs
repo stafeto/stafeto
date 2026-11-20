@@ -24,6 +24,7 @@ pub mod gpt;
 pub mod idle;
 #[cfg(any(test, feature = "model"))]
 pub mod mem;
+pub mod roots;
 pub mod server;
 pub mod stop;
 #[cfg(test)]

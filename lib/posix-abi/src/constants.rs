@@ -63,6 +63,13 @@ pub const O_CLOEXEC: i32 = 524288;
 /// The legacy device-only Open profile.
 pub const O_CHANGES: i32 = 1048576;
 pub const O_CLOFORK: i32 = 16777216;
+/// O_DSYNC and O_SYNC of the platform as one bit of the layer: the data volume makes every write
+/// durable, the RAM file service never sees it.
+pub const O_SYNC: i32 = 1 << 25;
+/// O_SEARCH and O_PATH of the platform as one bit of the layer: a directory is opened to be
+/// searched alone (the data volume keeps no access bits on the description); the RAM file service
+/// never sees it.
+pub const O_SEARCH: i32 = 1 << 26;
 pub const SEEK_SET: i32 = 0;
 pub const SEEK_CUR: i32 = 1;
 pub const SEEK_END: i32 = 2;

@@ -67,7 +67,7 @@
 use core::ops::Range;
 use proto_wire::{Header, Reader, Status};
 
-pub const VERSION: u16 = 6;
+pub const VERSION: u16 = 7;
 
 /// The region of the loader: 16 MiB under the top of a process's lower
 /// half (spec 2, 3.2), which no program's segment may take.
@@ -151,6 +151,13 @@ pub enum Names {
         description: u32,
         stream: bool,
     },
+    /// The open description of this number of the data file service in the session the child gets
+    /// in the slot Data, which holds it; `directory` tells a directory from a file. The loader takes
+    /// the kind only with a session in the slot Data.
+    Data {
+        handle: u32,
+        directory: bool,
+    },
     /// The terminal of this number of the terminal service, which the
     /// child's session in the slot Terminal serves (5f); the loader takes
     /// the kind only with that session.
@@ -196,6 +203,7 @@ impl Descriptor {
                 description,
                 stream,
             } => (10, description, u64::from(stream), 0),
+            Names::Data { handle, directory } => (11, handle, u64::from(directory), 0),
             Names::Terminal(n) => (5, n, 0, 0),
             Names::Random(n) => (6, n, 0, 0),
             Names::PendingTerminal(n) => (7, n, 0, 0),
@@ -226,12 +234,12 @@ impl Descriptor {
         let fd = word(0);
         let ram_generation = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
         let pipe_generation = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
-        if word(1) == 10 && ram_generation > 1 {
+        if matches!(word(1), 10 | 11) && ram_generation > 1 {
             return None;
         }
         if word(1) != 8
             && word(1) != 9
-            && !(word(1) == 10 && ram_generation <= 1)
+            && !(matches!(word(1), 10 | 11) && ram_generation <= 1)
             && (ram_generation != 0 || pipe_generation != 0)
         {
             return None;
@@ -248,6 +256,10 @@ impl Descriptor {
             (10, n) => Names::Net {
                 description: n,
                 stream: ram_generation == 1,
+            },
+            (11, n) => Names::Data {
+                handle: n,
+                directory: ram_generation == 1,
             },
             (5, n) => Names::Terminal(n),
             (6, n) => Names::Random(n),
@@ -467,14 +479,21 @@ pub enum Slot {
     /// it; a set-ID program starts without it. Empty in an image without the
     /// package service.
     Packages = 13,
+    /// The process's session with the data file service, a `Data` session (`proto_data`): fork and
+    /// spawn give the child a CLONE of it when it holds descriptions of `/data` or a current
+    /// directory there, exec moves it; a set-ID program keeps a genuine one with the descriptions it
+    /// holds (the loader asks the root of the service, `ROOT_DATA`, which returns a live session as it
+    /// is and nothing for any other channel). Empty in an image without the data file service and in
+    /// a process that never used `/data`.
+    Data = 14,
 }
 
 /// The handles a start area names.
-pub const SLOTS: usize = 14;
+pub const SLOTS: usize = 15;
 
 impl Slot {
     /// The sessions Handles brings, in their order.
-    pub const GIVEN: [Slot; 9] = [
+    pub const GIVEN: [Slot; 10] = [
         Slot::Files,
         Slot::Clock,
         Slot::Driver,
@@ -484,6 +503,7 @@ impl Slot {
         Slot::Display,
         Slot::Net,
         Slot::Packages,
+        Slot::Data,
     ];
 
     /// The bit of this slot in Fork's required session mask.
@@ -503,7 +523,7 @@ impl Slot {
     };
 
     /// The slot of a handle Handles brings: Files, Clock, Driver, Pipes or
-    /// Terminal, Entropy, Display, Net or Packages.
+    /// Terminal, Entropy, Display, Net, Packages or Data.
     pub const fn given(n: u32) -> Option<Slot> {
         match n {
             4 => Some(Slot::Files),
@@ -515,6 +535,7 @@ impl Slot {
             11 => Some(Slot::Display),
             12 => Some(Slot::Net),
             13 => Some(Slot::Packages),
+            14 => Some(Slot::Data),
             _ => None,
         }
     }
@@ -604,6 +625,7 @@ impl<'a> Block<'a> {
                 ) | (Slot::Entropy, Names::Random(_))
                     | (Slot::Pipes, Names::Pipe(_) | Names::Fifo { .. })
                     | (Slot::Net, Names::Net { .. })
+                    | (Slot::Data, Names::Data { .. })
                     | (
                         Slot::Terminal,
                         Names::Terminal(_) | Names::PendingTerminal(_)
@@ -925,7 +947,7 @@ pub struct Start {
 }
 
 pub const START_MAGIC: [u8; 8] = *b"STAFSTRT";
-pub const START_VERSION: u32 = 9;
+pub const START_VERSION: u32 = 10;
 pub const SECURE: u32 = 1;
 /// The program is dynamic: the loader filled the auxiliary vector (`auxv`)
 /// and the libc.so is in the space, so the start takes the vector as it is
@@ -938,7 +960,7 @@ pub const RANDOM: u32 = 4;
 pub const AUXV_PAIRS: usize = 9;
 /// The bytes of the header.
 pub const START_SIZE: usize = core::mem::size_of::<Start>();
-const _: () = assert!(START_SIZE == 224);
+const _: () = assert!(START_SIZE == 232);
 /// Where `Start.random` lies in the area, and its address in the program.
 pub const RANDOM_OFFSET: usize = core::mem::offset_of!(Start, random);
 pub const RANDOM_AT: u64 = START_AREA + RANDOM_OFFSET as u64;
@@ -1733,7 +1755,8 @@ mod tests {
             Ok([Some(Slot::Packages), None, None, None])
         );
         for (slots, count) in [
-            (&[14][..], 1),
+            (&[15][..], 1),
+            (&[14, 14][..], 2),
             (&[13, 13][..], 2),
             (&[12, 12][..], 2),
             (&[11, 11][..], 2),
@@ -1830,7 +1853,7 @@ mod tests {
             let read = Block::read(&out[..len]).unwrap();
             let at = START_AREA;
             let mut area = vec![0xAA; area_len(&read)];
-            let handles = [1, 2, 3, 4, 5, 6, 0, 8, 9, 10, 11, 12, 13, 14];
+            let handles = [1, 2, 3, 4, 5, 6, 0, 8, 9, 10, 11, 12, 13, 14, 15];
             write_area(&mut area, at, &read, SECURE, handles, &[]).unwrap();
             assert!(write_area(&mut vec![0; area.len() - 1], at, &read, 0, handles, &[]).is_err());
             let start = Start::read(&area).unwrap();
@@ -1866,6 +1889,60 @@ mod tests {
                 assert_eq!(word(start.auxv + 8 * i), 0);
             }
             assert_eq!(start.stack % 16, 0);
+        }
+    }
+
+    /// A descriptor of the data file service rides in the block and back, a file and a directory,
+    /// and needs the slot Data and no other; a forged `directory` word is refused.
+    #[test]
+    fn a_data_descriptor_goes_there_and_back_and_needs_the_slot_data() {
+        for (handle, directory) in [(0x0101_0007, false), (9, true)] {
+            let d = Descriptor {
+                fd: 12,
+                names: Names::Data { handle, directory },
+            };
+            assert_eq!(Descriptor::read(&d.bytes()), Some(d));
+        }
+        let mut forged = Descriptor {
+            fd: 3,
+            names: Names::Data {
+                handle: 5,
+                directory: false,
+            },
+        }
+        .bytes();
+        forged[12] = 2;
+        assert_eq!(Descriptor::read(&forged), None);
+        // The word of the kind is 11 and no earlier kind changed.
+        assert_eq!(u32::from_le_bytes(forged[4..8].try_into().unwrap()), 11);
+        let list = [Descriptor {
+            fd: 12,
+            names: Names::Data {
+                handle: 5,
+                directory: false,
+            },
+        }];
+        let mut out = vec![0; BLOCK_MAX];
+        let len = Block::write_with(
+            &mut out,
+            b"/bin/ls",
+            b"/",
+            0,
+            [&b"ls"[..]].into_iter(),
+            [].into_iter(),
+            &list,
+        )
+        .unwrap();
+        let read = Block::read(&out[..len]).unwrap();
+        assert!(read.needs(Slot::Data));
+        for other in [
+            Slot::Files,
+            Slot::Pipes,
+            Slot::Terminal,
+            Slot::Net,
+            Slot::Entropy,
+        ] {
+            assert!(!read.needs(other), "{other:?}");
         }
     }
 
@@ -2149,11 +2226,14 @@ mod tests {
         assert_ne!(Slot::GIVEN_MASK & (1 << 13), 0);
         assert_eq!(Slot::given(12), Some(Slot::Net));
         assert_eq!(Slot::given(13), Some(Slot::Packages));
-        assert_eq!(Slot::given(14), None);
-        assert_eq!(Slot::GIVEN[Slot::GIVEN.len() - 1], Slot::Packages);
-        assert_eq!((Slot::Packages as usize) + 1, SLOTS);
-        assert_eq!(START_VERSION, 9);
-        for (n, ok) in [(13, true), (14, false)] {
+        assert_eq!(Slot::given(14), Some(Slot::Data));
+        assert_eq!(Slot::given(15), None);
+        assert_ne!(Slot::GIVEN_MASK & (1 << 14), 0);
+        assert_eq!(Slot::GIVEN[Slot::GIVEN.len() - 1], Slot::Data);
+        assert_eq!((Slot::Data as usize) + 1, SLOTS);
+        assert_eq!(SLOTS, 15);
+        assert_eq!((VERSION, START_VERSION), (7, 10));
+        for (n, ok) in [(14, true), (15, false)] {
             let mut w = Writer::new();
             w.u32(n).unwrap();
             assert_eq!(
@@ -2282,7 +2362,7 @@ mod tests {
     /// libc.so, the stack and the area; the dynamic flag is its own bit.
     #[test]
     fn the_start_constants_of_a_dynamic_program() {
-        assert_eq!((START_VERSION, MAP_ENTRIES, AUXV_PAIRS), (9, 8, 9));
+        assert_eq!((START_VERSION, MAP_ENTRIES, AUXV_PAIRS), (10, 8, 9));
         assert_eq!(SECURE & DYNAMIC, 0);
         assert_eq!(DYNAMIC, 2);
         let mut out = vec![0; BLOCK_MAX];
@@ -2539,7 +2619,7 @@ mod tests {
                 image: false,
             })
             .collect();
-        let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11, 12, 13, 14];
+        let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         let mut out = vec![0xAA; TRANSFER_SIZE];
         write_transfer(&mut out, handles, &map).unwrap();
         let t = Transfer::read(&out).unwrap();

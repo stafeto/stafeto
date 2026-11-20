@@ -105,3 +105,6 @@ mod tests {
         }
     }
 }
+
+#[path = "data_slot.rs"]
+pub mod data_slot;

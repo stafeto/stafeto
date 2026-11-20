@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "datafsd"
-version = "0.5.1"
+version = "0.6.0-pre.0"
 dependencies = [
  "abi",
  "datafs",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "datakey"
-version = "0.5.1"
+version = "0.6.0-pre.0"
 dependencies = [
  "abi",
  "posix-fs",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.5.1"
+version = "0.6.0-pre.0"
 dependencies = [
  "abi",
  "bootimg",
@@ -593,6 +593,7 @@ dependencies = [
  "dynlink",
  "posix-random",
  "proto-clock",
+ "proto-data",
  "proto-entropy",
  "proto-fs",
  "proto-loader",
@@ -612,7 +613,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lvgl-demo"
-version = "0.5.1"
+version = "0.6.0-pre.0"
 dependencies = [
  "posix-abi",
  "posix-crt",
@@ -759,7 +760,7 @@ version = "0.1.0"
 
 [[package]]
 name = "pkg"
-version = "0.5.1"
+version = "0.6.0-pre.0"
 dependencies = [
  "libc-ffi",
  "pkgd",
@@ -784,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "pkgd"
-version = "0.5.1"
+version = "0.6.0-pre.0"
 dependencies = [
  "abi",
  "bootimg",
@@ -831,6 +832,7 @@ dependencies = [
  "process-client",
  "proto-clock",
  "proto-comp",
+ "proto-data",
  "proto-entropy",
  "proto-fs",
  "proto-gpu",
@@ -925,6 +927,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-data-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "posix-display-probe"
 version = "0.1.0"
 dependencies = [
@@ -948,9 +957,11 @@ dependencies = [
 name = "posix-fs"
 version = "0.1.0"
 dependencies = [
+ "abi",
  "entries",
  "posix-fd",
  "posix-path",
+ "proto-data",
  "proto-fs",
  "proto-net",
  "proto-pipe",
@@ -1005,7 +1016,7 @@ version = "0.1.0"
 
 [[package]]
 name = "posix-platform"
-version = "0.5.1"
+version = "0.6.0-pre.0"
 dependencies = [
  "dynlink",
  "posix-abi",
@@ -1242,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "power"
-version = "0.5.1"
+version = "0.6.0-pre.0"
 dependencies = [
  "abi",
  "proto-init",
@@ -1974,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.5.1"
+version = "0.6.0-pre.0"
 dependencies = [
  "abi",
  "bootimg",

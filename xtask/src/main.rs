@@ -55,6 +55,7 @@ mod comp_probe;
 mod cpus_dialog;
 mod cyrillic;
 mod data_image;
+mod data_posix;
 mod data_probe;
 mod disasm;
 mod display_probe;
@@ -2278,11 +2279,18 @@ commands:
             --one NAME, one test in a boot of its own, with its log;
             a FAIL verdict from --one returns a nonzero exit status
             --full-basic runs the complete pinned basic corpus in bounded batches
-  open-posix [--full | --only PREFIX] [--jobs N] run the Open POSIX Test Suite (LTP 20260930)
+  data-save a file saved the way sed -i saves it (temporary file, mode, fsync, rename) under /data and
+            read back after a second boot on the same disk (the Open POSIX runner's image with the data
+            file service); replaces the plan's vi scenario
+  open-posix [--data] [--full | --only PREFIX] [--jobs N] run the Open POSIX Test Suite (LTP 20260930)
             on relibc in bounded batches, N boots at a time; without --full only
             the tests of tests/open-posix/pass.txt, which must all pass; --only
             runs the tests whose names start with PREFIX and shows their logs; the
-            table goes to target/measure/open-posix.tsv
+            table goes to target/measure/open-posix.tsv; --data runs the file-related
+            tests (fsync, aio_*, lio_listio, mmap, munmap) with their scratch files on
+            the data volume (data file service, TMPDIR /data/tmp): the tests of
+            tests/open-posix/data-pass.txt must pass, those of data-expected-not-pass.txt
+            do not by design, any other failure is a defect
   os-test-headers compile and link the pinned include corpus and check namespace
   posix-tty run the C probe of the terminal: termios, isatty, ttyname and the
             names of terminals through the terminal service, with typed input
@@ -2308,6 +2316,7 @@ commands:
             under HVF, with --plain on QEMU's emulation without -icount
   data-probe the data file service in QEMU: a table with store and data, littlefs formatted, a series of synced file operations, the same tree after a new start of QEMU
   data-crash [N] kill the data file service's machine in 12 places of its series of writes (or after sector N) and start it again on the same disk: every synced step is there and no file is torn
+  data-probe fill the measurements of the data file service on a volume of 1 GiB with small and large files made offline (the layout of an older release): the boot that converts it, then the boot that reports the mount time, the first call, the listing of 1,000 entries, RMDIR, the longest WRITE, the removals and the refresh walk, the longest job of each method and the CPU of the worker in a walk
   store-probe [steps] run the package service in QEMU: a store written on the host is
             attached from the disk, the packages that fail their checks are skipped,
             a disk of zeros is formatted, the full scenario of installations, refusals,
@@ -2494,6 +2503,7 @@ commands:
   posix-random-net-two the same with two stack instances of the network service on two CPUs: a socket homed on the second instance survives
   posix-random-net-two-steps the same under -icount, the steps of both instances
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
+  data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
   posix-window run the C probe of the window library (<stafeto/window.h>) in QEMU: a window with two buffers, the bits that free them, events, fork, a signal and close, the frames compared with QEMU's screenshot
   display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
@@ -2504,9 +2514,9 @@ commands:
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
   posix-ipc-steps measure the steps of those calls under -icount, against term B
   nvme-breaks the deliberate breaks of lib/nvme fail its host tests
-  data-image <path> [--size 2G] the data volume of the image of EC2 made offline: a sparse file with the table and an empty file system, made by the code of the first boot of datafs
+  data-image <path> [--size 2G] [--fill] the data volume of the image of EC2 made offline: a sparse file with the table and an empty file system, made by the code of the first boot of datafs
   datafs-breaks the deliberate breaks of lib/datafs fail its host tests
-  nvme-persist [breaks|lba4096|mdts1|steps|key [nodisk|wrongdisk [breaks]|foreign|image [grown]]|blk-probe|shutdown|stop-handlers [breaks]] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught; key: the host key service on the NVMe data volume, the same key fingerprint on two boots of one volume; key nodisk: no data controller, the shell comes up and the key is new on each boot; key foreign: the serial the record wants over a file shaped like a fresh volume of EC2 (the first and last 4 KiB zero, bytes between), datafs says where the first non-zero byte is, prints no byte of the disk and leaves it alone, the key is new on each boot; key image [grown]: the data image of the AMI (`data-image`) as the data disk, mounted on the first boot with no formatting, the key saved and restored (grown: the file 1 GiB longer, the backup of the table moves to the end first); key wrongdisk [blank]: a controller with another serial number is left alone and its file keeps its SHA-256 (breaks: the check of the identity always passes and the case must fail); blk-probe: the probe of the disk service over NVMe with a restart of the service; shutdown: init stops the system (SHUTDOWN) with the NVMe controller stopped and the machine off; stop-handlers [breaks]: the same with two POSIX programs and a file on /data, the stop handlers of the process service and datafs, and the file read back whole on the next boot
+  nvme-persist [breaks|lba4096|mdts1|steps|upgrade|key [nodisk|wrongdisk [breaks]|foreign|image [grown]]|blk-probe|shutdown|stop-handlers [breaks]] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught; upgrade: a data volume made as the 0.5.1 image leaves it (no attribute on any entry, the key under /ssh) converted at the first mount of this tree, the modes root 0755, /ssh 0700, key 0600 and the key fingerprint the same on two boots; key: the host key service on the NVMe data volume, the same key fingerprint on two boots of one volume; key nodisk: no data controller, the shell comes up and the key is new on each boot; key foreign: the serial the record wants over a file shaped like a fresh volume of EC2 (the first and last 4 KiB zero, bytes between), datafs says where the first non-zero byte is, prints no byte of the disk and leaves it alone, the key is new on each boot; key image [grown]: the data image of the AMI (`data-image`) as the data disk, mounted on the first boot with no formatting, the key saved and restored (grown: the file 1 GiB longer, the backup of the table moves to the end first); key wrongdisk [blank]: a controller with another serial number is left alone and its file keeps its SHA-256 (breaks: the check of the identity always passes and the case must fail); blk-probe: the probe of the disk service over NVMe with a restart of the service; shutdown: init stops the system (SHUTDOWN) with the NVMe controller stopped and the machine off; stop-handlers [breaks]: the same with two POSIX programs and a file on /data, the stop handlers of the process service and datafs, and the file read back whole on the next boot
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
   random-breaks run the probe of getentropy in C with a loader that gives AT_RANDOM as zeros: the probe must fail
@@ -2650,15 +2660,27 @@ fn main() {
             rest => jobs::parse_jobs("os-test", rest).and_then(ostest::run_in_budget),
         },
         Some("os-test-headers") => os_test_headers(&args[1..]),
+        Some("data-save") => openposix::data_save(),
         Some("open-posix") => {
-            let (select, rest) = match &args[1..] {
+            // `--data` first: the file-related tests with their scratch files on the data volume.
+            let (data, args) = match &args[1..] {
+                [flag, rest @ ..] if flag == "--data" => (true, rest),
+                rest => (false, rest),
+            };
+            let (select, rest) = match args {
                 [flag, rest @ ..] if flag == "--full" => (openposix::Select::Full, rest),
                 [flag, prefix, rest @ ..] if flag == "--only" => {
                     (openposix::Select::Prefix(prefix.clone()), rest)
                 }
                 rest => (openposix::Select::Pinned, rest),
             };
-            jobs::parse_jobs("open-posix", rest).and_then(|jobs| openposix::run(select, jobs))
+            jobs::parse_jobs("open-posix", rest).and_then(|jobs| {
+                if data {
+                    openposix::run_data(select, jobs)
+                } else {
+                    openposix::run(select, jobs)
+                }
+            })
         }
         Some("posix-map") => match args.get(1).map(String::as_str) {
             None => posix_map_probe(),
@@ -2902,6 +2924,7 @@ fn main() {
         Some("posix-random-net-two") => entropy::random_net_two(false),
         Some("posix-random-net-two-steps") => entropy::random_net_two(true),
         Some("posix-display") => posix_display::probe(&qemu::VIRT),
+        Some("data-posix") => data_posix::command(&args[1..], &qemu::VIRT),
         Some("posix-window") => posix_window::probe(&qemu::VIRT),
         Some("display-probe") => display_probe::probe(&qemu::VIRT),
         Some("help") | None => {
@@ -11086,6 +11109,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
                 "grown".to_string(),
             ])
         }),
+        job("nvme-persist upgrade", || {
+            store_probe::nvme_persist(&["upgrade".to_string()])
+        }),
         job("nvme-persist blk-probe", || {
             store_probe::nvme_persist(&["blk-probe".to_string()])
         }),
@@ -11127,6 +11153,12 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             entropy::random_net_two(true)
         }),
         job("posix-display", || posix_display::probe(&qemu::VIRT)),
+        job("data-posix", || {
+            data_posix::probe(data_posix::Mode::Read, &qemu::VIRT)
+        }),
+        job("data-posix write", || {
+            data_posix::probe(data_posix::Mode::Write, &qemu::VIRT)
+        }),
         // The window library of C programs against QEMU's screenshots.
         job("posix-window", || posix_window::probe(&qemu::VIRT)),
         // The screen and the keys of libc.so against QEMU's screenshots and
@@ -14812,6 +14844,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "posix-display-probe",
         "--package",
+        "posix-data-probe",
+        "--package",
         "posix-window-probe",
         "--package",
         "pkg-slot-probe",
@@ -17521,6 +17555,7 @@ mod entropy_in_images_tests {
             ),
             ("pkg_slot::PROGRAMS", &crate::pkg_slot::PROGRAMS),
             ("posix_display::PROGRAMS", &crate::posix_display::PROGRAMS),
+            ("data_posix::PROGRAMS", &crate::data_posix::PROGRAMS),
             ("posix_window::PROGRAMS", &crate::posix_window::PROGRAMS),
             ("store_probe::PROGRAMS", &crate::store_probe::PROGRAMS),
             // The images whose lists are built at run time, EC2's among them.

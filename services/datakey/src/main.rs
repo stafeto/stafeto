@@ -228,6 +228,62 @@ impl Data {
         Ok(true)
     }
 
+    /// The modes of the root, of `/ssh` and of the key file as the volume says them, in one line
+    /// (the probe of an upgrade reads it): `datakey: modes / 0755 /ssh 0700 key 0600`.
+    #[cfg(feature = "modes")]
+    fn modes(&self) {
+        let mode = |path: &[u8]| {
+            self.call(|w| p::path_call(Method::Stat, path, w))
+                .ok()
+                .and_then(|r| p::Stat::from_bytes(&r.bytes[4..r.len]).ok())
+                .map(|s| s.mode)
+        };
+        match (mode(b"/"), mode(DATA_DIR), mode(DATA_KEY)) {
+            (Some(root), Some(dir), Some(key)) => {
+                rt::println!("datakey: modes / {root:04o} /ssh {dir:04o} key {key:04o}")
+            }
+            other => rt::println!("datakey: modes could not be read: {other:?}"),
+        }
+    }
+
+    /// The key rewritten where it stands: the bytes at its start and at its middle read and written
+    /// back, synced, and read again (`datakey: key rewritten in place and read back`). On a volume
+    /// the 0.5.1 service made the key is an inline file, and a write at its start or in its middle
+    /// is lost in littlefs 2.11.3 unless the mount work moved the file out: the probe of an upgrade
+    /// needs this to work. The bytes are the same, so the fingerprint does not change.
+    #[cfg(feature = "modes")]
+    fn rewrite_in_place(&self) {
+        let rewrite = || -> Result<bool, Status> {
+            let handle = self.open(DATA_KEY, p::READ | p::WRITE)?;
+            let mut same = true;
+            for offset in [0u64, 16] {
+                let read = self.call(|w| p::pread(handle, 8, offset, w))?;
+                let n = (read.word(0) as usize).min(8);
+                let mut bytes = [0u8; 8];
+                bytes[..n].copy_from_slice(&read.bytes[8..8 + n]);
+                let wrote = self
+                    .call(|w| p::pwrite(handle, offset, &bytes[..n], w))?
+                    .word(0) as usize;
+                let again = self.call(|w| p::pread(handle, 8, offset, w))?;
+                same &= wrote == n
+                    && again.word(0) as usize == n
+                    && again.bytes[8..8 + n] == bytes[..n];
+            }
+            self.call(|w| p::handle_call(Method::Fsync, handle, w))?;
+            self.close(handle)?;
+            Ok(same)
+        };
+        match rewrite() {
+            Ok(true) => rt::println!("datakey: key rewritten in place and read back"),
+            Ok(false) => {
+                rt::println!("datakey: the key read back differs after a rewrite in place")
+            }
+            Err(status) => {
+                rt::println!("datakey: rewrite in place failed: status {}", status.code())
+            }
+        }
+    }
+
     /// The key written as `.tmp`, synced, and renamed to its name.
     fn save(&self, key: &Key) -> Result<(), Status> {
         match self.call(|w| p::mkdir(DATA_DIR, 0o700, w)) {
@@ -297,6 +353,11 @@ fn main(_: u64) -> u64 {
                         "datakey: /etc/dropbear has a key already, the key of /data is not restored"
                     ),
                     Err(error) => rt::println!("datakey: the key could not be placed: {error:?}"),
+                }
+                #[cfg(feature = "modes")]
+                {
+                    data.modes();
+                    data.rewrite_in_place();
                 }
                 Found::Restored
             }

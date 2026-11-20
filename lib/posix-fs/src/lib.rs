@@ -12,6 +12,7 @@ extern crate std;
 pub mod change;
 pub mod closing;
 pub mod control;
+pub mod data;
 pub mod drain;
 pub mod fifo;
 pub mod open;
@@ -300,6 +301,17 @@ pub enum Target {
     /// the layer's table: no service holds it, and the last close of it
     /// drops its interest set in the network service.
     Epoll(u32),
+    /// A file or a directory of the data file service by its description (`proto_data`), held in
+    /// the process's session with that service; read only until the writing paths exist.
+    Data(DataTarget),
+}
+
+/// An open description of the data file service: its handle in the process's session and whether
+/// it is a directory (the kind of a description does not change in its life).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DataTarget {
+    pub handle: u32,
+    pub directory: bool,
 }
 
 /// A socket of the network service: its description in the process's session
@@ -384,6 +396,25 @@ fn release_net(id: u32) {
         // SAFETY: only `set_net_release` stores a value, a `fn(u32)`.
         let hook: fn(u32) = unsafe { core::mem::transmute::<usize, fn(u32)>(hook) };
         hook(id);
+    }
+}
+
+/// The function that closes a `Target::Data` description in the data file service when its last
+/// descriptor closes (0 until `set_data_release`).
+static DATA_RELEASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Names the function that closes the description `handle` of a `Target::Data`: the session with
+/// the service lives in the ABI layer (`posix_abi::data`); the transport holds no handle of it.
+pub fn set_data_release(release: fn(u32)) {
+    DATA_RELEASE.store(release as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn release_data(handle: u32) {
+    let hook = DATA_RELEASE.load(core::sync::atomic::Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `set_data_release` stores a value, a `fn(u32)`.
+        let hook: fn(u32) = unsafe { core::mem::transmute::<usize, fn(u32)>(hook) };
+        hook(handle);
     }
 }
 
@@ -646,6 +677,10 @@ impl Transport {
             }
             Some(Target::Epoll(id)) => {
                 release_epoll(id);
+                Ok(())
+            }
+            Some(Target::Data(data)) => {
+                release_data(data.handle);
                 Ok(())
             }
             _ => Ok(()),

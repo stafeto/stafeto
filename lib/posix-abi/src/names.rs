@@ -176,6 +176,9 @@ pub fn unlinkat(dirfd: c_int, path: &[u8], flags: c_int) -> Result<(), c_int> {
     if flags & !AT_REMOVEDIR != 0 {
         return Err(EINVAL);
     }
+    if let Some(vol) = crate::data::route(dirfd, path)? {
+        return crate::data::unlink(&vol, flags & AT_REMOVEDIR != 0);
+    }
     let placed = place(dirfd, path)?;
     let remove_directory = flags & AT_REMOVEDIR != 0;
     check_virtual(
@@ -199,6 +202,9 @@ pub fn unlinkat(dirfd: c_int, path: &[u8], flags: c_int) -> Result<(), c_int> {
 
 /// mkdir: the mode with the creation mask of the process.
 pub fn mkdirat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
+    if let Some(vol) = crate::data::route(dirfd, path)? {
+        return crate::data::mkdir(&vol, mode, umask);
+    }
     let placed = place(dirfd, path)?;
     // A name of the terminal exists even with a slash after it.
     check_virtual(Named::Mkdir, &placed, None, false)?;
@@ -209,6 +215,10 @@ pub fn mkdirat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c
 
 /// Create a FIFO inode; its ring is allocated only by a later open.
 pub fn mkfifoat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
+    // The volume keeps files and directories alone.
+    if crate::data::route(dirfd, path)?.is_some() {
+        return Err(EPERM);
+    }
     let placed = place(dirfd, path)?;
     check_virtual(Named::Mkdir, &placed, None, false)?;
     let mut create = request(ChangeOp::Mkfifo, &placed);
@@ -219,6 +229,9 @@ pub fn mkfifoat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), 
 /// Create the node of kind socket that a bound socket of the pipe service
 /// names; EEXIST for a name in use.
 pub fn mksockat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
+    if crate::data::route(dirfd, path)?.is_some() {
+        return Err(EPERM);
+    }
     let placed = place(dirfd, path)?;
     check_virtual(Named::Mkdir, &placed, None, false)?;
     let mut create = request(ChangeOp::Mksock, &placed);
@@ -231,8 +244,11 @@ pub fn faccessat(dirfd: c_int, path: &[u8], mode: c_int, flags: c_int) -> Result
     if flags & !AT_EACCESS != 0 || !(0..=7).contains(&mode) {
         return Err(EINVAL);
     }
-    let placed = place(dirfd, path)?;
     let effective = flags & AT_EACCESS != 0;
+    if let Some(vol) = crate::data::route(dirfd, path)? {
+        return crate::data::access(&vol, mode, effective);
+    }
+    let placed = place(dirfd, path)?;
     let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
     if let Some((kind, number)) = virtual_leaf(transport, &placed, true)? {
         // A name the terminal service keeps: the answer is its metadata.
@@ -270,6 +286,10 @@ pub fn faccessat(dirfd: c_int, path: &[u8], mode: c_int, flags: c_int) -> Result
 
 /// rename: `renameat2` without flags.
 pub fn renameat(old_dirfd: c_int, old: &[u8], new_dirfd: c_int, new: &[u8]) -> Result<(), c_int> {
+    // Both names on the volume, or neither (EXDEV across the mount).
+    if let Some((from, to)) = crate::data::pair(old_dirfd, old, new_dirfd, new)? {
+        return crate::data::rename(&from, &to);
+    }
     let first = place(old_dirfd, old)?;
     let second = place(new_dirfd, new)?;
     check_virtual(Named::Rename, &first, Some(&second), true)?;
@@ -290,6 +310,9 @@ pub fn linkat(
     if flags & !AT_SYMLINK_FOLLOW != 0 {
         return Err(EINVAL);
     }
+    if let Some((from, _)) = crate::data::pair(old_dirfd, old, new_dirfd, new)? {
+        return crate::data::link(&from);
+    }
     let first = place(old_dirfd, old)?;
     let second = place(new_dirfd, new)?;
     check_virtual(Named::Link, &first, Some(&second), true)?;
@@ -308,6 +331,10 @@ pub fn symlinkat(target: &[u8], new_dirfd: c_int, linkpath: &[u8]) -> Result<(),
     if target.len() > MAX_PATH {
         return Err(ENAMETOOLONG);
     }
+    // The volume has no symbolic links.
+    if crate::data::route(new_dirfd, linkpath)?.is_some() {
+        return Err(EPERM);
+    }
     let placed = place(new_dirfd, linkpath)?;
     check_virtual(Named::Symlink, &placed, None, false)?;
     let mut symlink = request(ChangeOp::Symlink, &placed);
@@ -320,6 +347,10 @@ pub fn symlinkat(target: &[u8], new_dirfd: c_int, linkpath: &[u8]) -> Result<(),
 pub fn readlinkat(dirfd: c_int, path: &[u8], out: &mut [u8]) -> Result<usize, c_int> {
     if out.is_empty() {
         return Err(EINVAL);
+    }
+    // The volume has no links: a path that exists is no link.
+    if let Some(vol) = crate::data::route(dirfd, path)? {
+        return crate::data::stat(&vol).and(Err(EINVAL));
     }
     let placed = place(dirfd, path)?;
     // A name of the terminal exists and is no link.
@@ -386,6 +417,14 @@ fn metadata(
     at_flags: c_int,
     args: [u64; 4],
 ) -> Result<(), c_int> {
+    if at_flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
+    if (!path.is_empty() || at_flags & AT_EMPTY_PATH != 0)
+        && crate::data::change(op, dirfd, path, args)?
+    {
+        return Ok(());
+    }
     let (placed, itself) = metadata_target(dirfd, path, at_flags)?;
     if !itself {
         check_virtual(named, &placed, None, true)?;
@@ -492,6 +531,9 @@ pub fn fstatat(
         {
             return crate::procfs::stat(path.bytes());
         }
+        if let Some(vol) = crate::data::route(dirfd, path)? {
+            return crate::data::stat(&vol);
+        }
         let placed = place(dirfd, path)?;
         let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
         if let Some((kind, number)) = transport
@@ -532,6 +574,9 @@ pub fn fstatat(
 /// directory: the service resolves the links, `.` and `..`, and checks that
 /// the caller may search it. The path of a name of the terminal is ENOTDIR.
 pub fn directory_path(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
+    if let Some(vol) = crate::data::route(AT_FDCWD, path)? {
+        return crate::data::directory(&vol, out);
+    }
     let placed = place(AT_FDCWD, path)?;
     let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
     if virtual_leaf(transport, &placed, false)?.is_some() {
@@ -549,6 +594,9 @@ pub fn directory_path(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize
 /// the right to search the directory. The service names it by its path from
 /// the root, without links, `.` and `..`.
 pub fn descriptor_path(target: Target, out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
+    if let Target::Data(data) = target {
+        return crate::data::descriptor_path(data, out);
+    }
     let base = match target {
         target if target.ram_target().is_some() => {
             let target = target.ram_target().ok_or(ENOTDIR)?;
@@ -590,7 +638,8 @@ pub fn fchdir(fd: c_int) -> Result<(), c_int> {
     crate::shared::held(fd, |_, target| {
         let mut canonical = [0; MAX_PATH + 1];
         let length = descriptor_path(target, &mut canonical)?;
-        crate::shared::with_files(|files| files.set_cwd(&canonical[..length]).map_err(error))
+        crate::shared::with_files(|files| files.set_cwd(&canonical[..length]).map_err(error))?;
+        crate::data::sync_cwd(&canonical[..length])
     })
 }
 
@@ -600,6 +649,9 @@ pub fn fchdir(fd: c_int) -> Result<(), c_int> {
 /// ENOTDIR for a part that is no directory, ELOOP, EACCES. A name of the
 /// terminal service is its directory's path and its name.
 pub fn realpath(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
+    if let Some(vol) = crate::data::route(AT_FDCWD, path)? {
+        return crate::data::realpath(&vol, out);
+    }
     let placed = place(AT_FDCWD, path)?;
     let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
     // A slash after a name of the terminal makes ENOTDIR.
@@ -679,6 +731,10 @@ pub fn statvfs(path: &[u8]) -> Result<Statvfs, c_int> {
             return crate::procfs::stat(path.bytes()).map(|_| NO_FILESYSTEM);
         }
     }
+    if let Some(vol) = crate::data::route(AT_FDCWD, path)? {
+        crate::data::stat(&vol)?;
+        return crate::data::statvfs();
+    }
     let placed = place(AT_FDCWD, path)?;
     let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
     if virtual_leaf(transport, &placed, true)?.is_some() {
@@ -699,6 +755,7 @@ pub fn fstatvfs(fd: c_int) -> Result<Statvfs, c_int> {
                 generation: target.generation(),
             }
         }
+        Target::Data(_) => return crate::data::statvfs(),
         _ => return Ok(NO_FILESYSTEM),
     };
     let placed = Placed {

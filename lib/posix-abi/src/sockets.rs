@@ -19,9 +19,9 @@ use crate::shared;
 use core::cell::RefCell;
 use posix_fs::{Target, Transport};
 use proto_pipe::sock::{
-    ADDR_INET, ADDR_NONE, ADDR_UNIX, Addr, DGRAM, DONTWAIT, FDS_MAX, INET, NAME_MAX, OOB,
-    OPT_ACCEPTCONN, OPT_ATMARK, OPT_BROADCAST, OPT_DOMAIN, OPT_ERROR, OPT_KEEPALIVE, OPT_PASSES,
-    OPT_RCVBUF, OPT_REUSEADDR, OPT_SNDBUF, OPT_TYPE, OUT_CTRUNC, OUT_TRUNC, PASS,
+    ADDR_INET, ADDR_NONE, ADDR_UNIX, Addr, DGRAM, DONTWAIT, FDS_MAX, INET, KIND_DATA, KIND_NET,
+    NAME_MAX, OOB, OPT_ACCEPTCONN, OPT_ATMARK, OPT_BROADCAST, OPT_DOMAIN, OPT_ERROR, OPT_KEEPALIVE,
+    OPT_PASSES, OPT_RCVBUF, OPT_REUSEADDR, OPT_SNDBUF, OPT_TYPE, OUT_CTRUNC, OUT_TRUNC, PASS,
     PASSES_PER_MESSAGE, PEEK, Received, Recv, SEND_MAX, SOCK_END, STREAM, Send, UNIX,
 };
 use proto_pipe::{Endpoint, Method};
@@ -793,6 +793,7 @@ fn handles_have_room() -> bool {
 fn rights(
     control: &[u8],
     ids: &mut [u32; FDS_MAX],
+    kinds: &mut u32,
     carried: &RefCell<Carried>,
 ) -> Result<usize, i32> {
     let mut at = 0;
@@ -828,6 +829,20 @@ fn rights(
                     let pass = crate::net::export(fd as i32)?;
                     c.out.push(pass.erase()).map_err(|_| EIO)?;
                     ids[count] = PASS + k as u32;
+                    *kinds = proto_pipe::sock::with_kind(*kinds, count, KIND_NET);
+                }
+                // A description of the data file service goes as a pass of that service (EXPORT),
+                // stated as such in the kind word.
+                Target::Data(data) => {
+                    let mut c = carried.borrow_mut();
+                    let k = c.out.len();
+                    if k == PASSES_PER_MESSAGE {
+                        return Err(ETOOMANYREFS);
+                    }
+                    let pass = crate::data::export(data.handle)?;
+                    c.out.push(pass.erase()).map_err(|_| EIO)?;
+                    ids[count] = PASS + k as u32;
+                    *kinds = proto_pipe::sock::with_kind(*kinds, count, KIND_DATA);
                 }
                 _ => return Err(EOPNOTSUPP),
             }
@@ -843,11 +858,12 @@ fn send_once(
     pipes: &Handle<Channel>,
     end: u32,
     flags: u32,
-    ids: &[u32],
+    rights: (&[u32], u32),
     to: &Addr,
     bytes: &[u8],
     carried: &RefCell<Carried>,
 ) -> Result<usize, i32> {
+    let (ids, kinds) = rights;
     let e = endpoint(end);
     let mut fds = [0; FDS_MAX];
     fds[..ids.len()].copy_from_slice(ids);
@@ -857,6 +873,7 @@ fn send_once(
         flags,
         fds,
         nfds: ids.len(),
+        kinds,
         to: *to,
         bytes,
     };
@@ -913,7 +930,8 @@ pub fn send(
             _ => Addr::NONE,
         };
         let mut ids = [0; FDS_MAX];
-        let nfds = rights(control, &mut ids, &carried)?;
+        let mut kinds = 0;
+        let nfds = rights(control, &mut ids, &mut kinds, &carried)?;
         let pipes = pipes_of(transport)?;
         let ty = option(transport, end, OPT_TYPE, false, 0)?;
         if ty == DGRAM {
@@ -926,7 +944,7 @@ pub fn send(
                 &pipes,
                 end,
                 wire,
-                &ids[..nfds],
+                (&ids[..nfds], kinds),
                 &to,
                 &piece[..size],
                 &carried,
@@ -937,7 +955,16 @@ pub fn send(
         loop {
             let n = gather(iov, done, &mut piece);
             let with = if done == 0 { &ids[..nfds] } else { &[][..] };
-            match send_once(&pipes, end, wire, with, &to, &piece[..n], &carried) {
+            let kinds_now = if done == 0 { kinds } else { 0 };
+            match send_once(
+                &pipes,
+                end,
+                wire,
+                (with, kinds_now),
+                &to,
+                &piece[..n],
+                &carried,
+            ) {
                 // A short count goes on: the next call waits for room, or says
                 // EAGAIN (a non-blocking socket), which ends the send with
                 // the bytes that went.
@@ -1098,6 +1125,7 @@ pub fn recv(
                 message.control_len = install(
                     transport,
                     &got.fds[..got.nfds],
+                    got.kinds,
                     &mut carried.borrow_mut().back,
                     flags & MSG_CMSG_CLOEXEC != 0,
                     control,
@@ -1123,6 +1151,7 @@ pub fn recv(
 fn install(
     transport: Transport,
     ids: &[u32],
+    kinds: u32,
     passes: &mut Incoming,
     cloexec: bool,
     control: &mut [u8],
@@ -1133,15 +1162,25 @@ fn install(
     }
     let mut made = [0i32; FDS_MAX];
     let mut count = 0;
-    for &id in ids {
+    for (i, &id) in ids.iter().enumerate() {
         if id >= PASS {
-            // A pass: the session with the network service adopts it. The
-            // handle closes when it cannot (no session, a refusal).
+            // A pass: the session with the service of its kind adopts it. The handle closes when
+            // it cannot (no session, a refusal), and a pass of a kind this layer does not serve
+            // closes without reaching any service (EBADF).
             let kept = if cloexec { SOCK_CLOEXEC } else { 0 };
-            let adopted = passes
+            let kind = proto_pipe::sock::kind_of(kinds, i);
+            let pass = passes
                 .take::<Channel>((id - PASS) as usize)
-                .map_err(|_| EIO)
-                .and_then(|pass| crate::net::adopt(pass, kept));
+                .map_err(|_| EIO);
+            let adopted = match (pass, kind) {
+                (Ok(pass), KIND_NET) => crate::net::adopt(pass, kept),
+                (Ok(pass), KIND_DATA) => crate::data::adopt(pass, cloexec),
+                (Ok(pass), _) => {
+                    drop(pass);
+                    return Err(EBADF);
+                }
+                (Err(errno), _) => Err(errno),
+            };
             match adopted {
                 Ok(fd) => {
                     made[count] = fd;

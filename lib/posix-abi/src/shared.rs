@@ -304,6 +304,9 @@ pub(crate) fn descriptor_information(
     if let Target::Proc(id) = target {
         return crate::procfs::description_stat(id);
     }
+    if let Target::Data(data) = target {
+        return crate::data::fstat(data.handle);
+    }
     transport
         .descriptor_information(target)
         .map_err(crate::error)
@@ -476,6 +479,18 @@ fn net_reply(description: u32, count: u32, out: &mut Writer) -> Result<(), i32> 
     Reply::Bytes(&bytes[..n]).write(out).map_err(|_| EIO)
 }
 
+/// The reply of a read of a file of the data file service, its bytes once they came.
+#[inline(never)]
+fn data_reply(data: posix_fs::DataTarget, count: u32, out: &mut Writer) -> Result<(), i32> {
+    if data.directory {
+        return Err(EISDIR);
+    }
+    let mut bytes = [0; posix_fs::MAX_READ];
+    let extent = (count as usize).min(bytes.len());
+    let n = crate::data::read(data.handle, &mut bytes[..extent])?;
+    Reply::Bytes(&bytes[..n]).write(out).map_err(|_| EIO)
+}
+
 /// A read of `fd`: what it names held, outside the lock; the read of a
 /// pipe or of the terminal waits here. Each kind has its own frame: the
 /// reads of files stay as deep as they were (threads with small stacks
@@ -497,6 +512,7 @@ fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
         }
         Target::Tty(number) => terminal_reply(transport, number, count, &mut *out),
         Target::Net(net) => net_reply(net.description, count, &mut *out),
+        Target::Data(data) => data_reply(data, count, &mut *out),
         Target::Random(_) => random_reply(count, &mut *out),
         // An epoll descriptor has nothing to read.
         Target::Epoll(_) => Err(EINVAL),
@@ -690,6 +706,8 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
                 Target::Pipe(end) => crate::pipes::write(transport, end, bytes).map(|n| n as u64),
                 Target::Net(net) => crate::net::write(net.description, bytes).map(|n| n as u64),
                 Target::Epoll(_) => Err(EINVAL),
+                // A description of the data volume: all the bytes, in messages of the service.
+                Target::Data(data) => crate::data::write(data.handle, bytes).map(|n| n as u64),
                 Target::Fifo(target) => {
                     crate::pipes::write_endpoint(transport, target.endpoint(), bytes)
                         .map(|n| n as u64)
@@ -713,6 +731,15 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
             }
             if let Target::Epoll(_) = target {
                 return Err(ESPIPE);
+            }
+            if let Target::Data(data) = target {
+                let whence = match origin {
+                    posix_fs::SeekFrom::Start => 0,
+                    posix_fs::SeekFrom::Current => 1,
+                    posix_fs::SeekFrom::End => 2,
+                    _ => return Err(EINVAL),
+                };
+                return crate::data::seek(data, offset, whence);
             }
             transport
                 .lseek(target, offset, origin)
@@ -772,6 +799,8 @@ fn perform(request: Request<'_>, out: &mut Writer) -> Result<(), i32> {
             let mut canonical = [0; crate::names::MAX_PATH + 1];
             let length = crate::names::directory_path(path, &mut canonical)?;
             process_state(|files| files.set_cwd(&canonical[..length]).map_err(crate::error))?;
+            // The current directory under /data holds a description of the service.
+            crate::data::sync_cwd(&canonical[..length])?;
             write(Reply::Unit, out)
         }
         Cwd => {

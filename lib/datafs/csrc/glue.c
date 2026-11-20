@@ -129,6 +129,14 @@ void datafs_setup(struct datafs *d, uint32_t blocks)
     // A virtual disk wears no block out: no relocation by erase count.
     d->cfg.block_cycles = -1;
     d->cfg.cache_size = BLOCK;
+    // No data inside a pair of metadata: a file of any size has a block of its own. A file of up to
+    // 500 bytes or so lived in the pair of its directory, which made a directory of 1,024 small
+    // files 513 pairs and a removal in it walk the list of pairs. A volume of an older release (or
+    // of a build with inline data on) that has such a file reads it as before, but a write at its
+    // start or in its middle is lost with LFS_ERR_CORRUPT: only an append, O_TRUNC or a truncation
+    // moves it out safely. The mount work therefore moves every inline file out (`datafs_outline`)
+    // before the first request and marks the volume (the format mark 4).
+    d->cfg.inline_max = (lfs_size_t)-1;
     // One bit for each block, a multiple of 8 bytes, at least 8 and at most LOOKAHEAD_MAX.
     uint32_t window = ((blocks + 63u) / 64u) * 8u;
     if (window < 8u) {
@@ -247,6 +255,61 @@ int64_t datafs_used(struct datafs *d, void *ctx)
     return lfs_fs_size(&d->lfs);
 }
 
+// The metadata pairs of the volume (the pairs of the directories, the pairs that large directories
+// split into, and the superblock's) and its directories, in out[0] and out[1]: 0, or a negative
+// error. One fetch of each pair.
+int datafs_pairs(struct datafs *d, void *ctx, uint32_t *out)
+{
+    d->ctx = ctx;
+    lfs_size_t pairs = 0, dirs = 0;
+    int err = lfs_fs_pairs(&d->lfs, &pairs, &dirs);
+    if (err == 0) {
+        out[0] = pairs;
+        out[1] = dirs;
+    }
+    return err;
+}
+
+// Whether the file at `path` is inline (its bytes are in the pair of its directory) and not empty,
+// and with `dry` zero it is moved out to blocks of its own: 1 for such a file, 0 for any other, or a
+// negative error. A write at the start or in the middle of an inline file fails at close with
+// LFS_ERR_CORRUPT when inline data is off (littlefs 2.11.3 copies only the bytes before the write
+// when it moves the file out), so a volume made with inline data on is made safe first: open the
+// file for writing, seek to its end and write no byte, which moves the whole file out in one commit
+// (the old file or the moved one is there after a cut). A file already in a block is not touched.
+int datafs_outline(struct datafs *d, void *ctx, const char *path, int dry)
+{
+    d->ctx = ctx;
+    int slot = -1;
+    for (int i = 0; i < DATAFS_FILES; i++) {
+        if (!d->file_used[i]) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        return LFS_ERR_NOMEM;
+    }
+    int err = lfs_file_opencfg(&d->lfs, &d->file[slot], path, dry ? LFS_O_RDONLY : LFS_O_RDWR,
+                               &d->file_cfg[slot]);
+    if (err < 0) {
+        return err;
+    }
+    int result = 0;
+    if ((d->file[slot].flags & LFS_F_INLINE) && lfs_file_size(&d->lfs, &d->file[slot]) > 0) {
+        result = 1;
+        if (!dry) {
+            lfs_soff_t at = lfs_file_seek(&d->lfs, &d->file[slot], 0, LFS_SEEK_END);
+            lfs_ssize_t wrote = at < 0 ? at : lfs_file_write(&d->lfs, &d->file[slot], "", 0);
+            if (wrote < 0) {
+                result = (int)wrote;
+            }
+        }
+    }
+    int closed = lfs_file_close(&d->lfs, &d->file[slot]);
+    return result >= 0 && closed < 0 ? closed : result;
+}
+
 // A file: the slot, or a negative error (LFS_ERR_NOMEM when every slot is open).
 int datafs_open(struct datafs *d, void *ctx, const char *path, int flags)
 {
@@ -299,6 +362,16 @@ int datafs_open_attr(struct datafs *d, void *ctx, const char *path, int flags, u
 static int file_ok(struct datafs *d, int slot)
 {
     return slot >= 0 && slot < DATAFS_FILES && d->file_used[slot];
+}
+
+// Whether the open file in `slot` is inline and not empty (see `datafs_outline`).
+int datafs_file_inline(struct datafs *d, void *ctx, int slot)
+{
+    d->ctx = ctx;
+    if (!file_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    return (d->file[slot].flags & LFS_F_INLINE) && lfs_file_size(&d->lfs, &d->file[slot]) > 0;
 }
 
 int datafs_close(struct datafs *d, void *ctx, int slot)
@@ -475,6 +548,13 @@ int datafs_seek_dir(struct datafs *d, void *ctx, int slot, uint32_t off)
         return LFS_ERR_BADF;
     }
     return lfs_dir_seek(&d->lfs, &d->dir[slot], off);
+}
+
+// Tests: the inline limit of the configuration, for the next mount (0 is littlefs's default, which
+// keeps a small file in its directory's pair: the layout of the volumes an older release made).
+void datafs_set_inline(struct datafs *d, uint32_t max)
+{
+    d->cfg.inline_max = max;
 }
 
 int datafs_rewinddir(struct datafs *d, void *ctx, int slot)

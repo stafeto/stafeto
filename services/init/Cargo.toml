@@ -100,6 +100,8 @@ table-posix-pty = []
 # steps mode, xtask process-steps).
 table-posix-steps = []
 table-os-test = []
+# The Open POSIX tests with their scratch files on the data volume (xtask open-posix --data).
+table-os-test-data = []
 table-busybox = []
 table-busybox-dialog = []
 # The games image: the dialog with the quota of Doom (xtask doom-headless).
@@ -258,6 +260,8 @@ table-posix-random-net = []
 table-posix-random-net2 = []
 # The C probe of the display service's place in a process (xtask posix-display).
 table-posix-display = []
+# The probe of the reading paths of /data in the POSIX layer (xtask data-posix).
+table-data-posix = []
 # The C probe of the window library (xtask posix-window).
 table-posix-window = []
 # The C probe of the screen and the keys on libc.so (xtask display-probe).

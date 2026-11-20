@@ -37,7 +37,7 @@ use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 mod mount;
 mod names;
 
-pub use mount::{CONVERT_MAX, Mounted, Recovered, bump_epoch, ensure_orphans, recover_orphans};
+pub use mount::{Mounted, Recovered, StartWork, Step, bump_epoch, ensure_orphans, recover_orphans};
 use names::{denied, entry_of, split, stat_record};
 
 /// The sessions of the table: the loop of the service holds as many.
@@ -58,6 +58,10 @@ pub const ROOT_CLONES: usize = p::ROOT_CLONES;
 pub const ROOT_DESCRIPTIONS: usize = p::ROOT_DESCRIPTIONS;
 /// The entries of one directory at most (the service keeps the minimum of the protocol).
 pub const DIR_ENTRIES_MAX: usize = p::DIR_ENTRIES_MAX;
+/// The metadata pairs at which a creation stops, and the directories at which MKDIR stops (see
+/// `proto_data::PAIRS_MAX`).
+pub const PAIRS_MAX: u64 = p::PAIRS_MAX;
+pub const DIRS_MAX: u64 = p::DIRS_MAX;
 /// The passes alive at once.
 pub const PASSES: usize = 16;
 /// The directories whose count of entries the server remembers.
@@ -99,8 +103,13 @@ struct Description {
     used: bool,
     generation: u8,
     kind: Kind,
-    /// A file: the index of its `Node`. A directory: its slot in the volume.
+    /// A file: the index of its `Node`. A directory: its slot in the volume, or, for one opened
+    /// only for search (`searched`), the description's own number, whose path is `searches`.
     object: u8,
+    /// A directory opened with no access bits (for `chdir`, `fchdir` and `O_SEARCH`): it holds
+    /// its path and no place of the volume, so that the current directories of many processes
+    /// never take the places a listing needs.
+    searched: bool,
     read: bool,
     write: bool,
     append: bool,
@@ -117,6 +126,7 @@ impl Description {
         generation: 0,
         kind: Kind::File,
         object: 0,
+        searched: false,
         read: false,
         write: false,
         append: false,
@@ -210,6 +220,35 @@ struct Pending {
     len: usize,
 }
 
+/// What the server knows of the metadata pairs and the directories of the volume: the count of the
+/// last walk of the list, the most that the commits since have added to the pairs (each MKDIR 2: its
+/// own pair and a split of its parent's; each creation, each RENAME into another directory and each
+/// RENAME to a longer name 1), the directories (exact: counted with the pairs, then 1 for each MKDIR
+/// and RMDIR), whether a refusal was made on an exact count and no removal has come since, and the
+/// count the worker has not yet told in its line.
+#[derive(Clone, Copy)]
+struct Pairs {
+    known: Option<u64>,
+    since: u64,
+    dirs: Option<u64>,
+    refused: bool,
+    dirs_refused: bool,
+    report: Option<(u64, u64)>,
+    mismatch: Option<(u64, u64)>,
+}
+
+impl Pairs {
+    const NONE: Pairs = Pairs {
+        known: None,
+        since: 0,
+        dirs: None,
+        refused: false,
+        dirs_refused: false,
+        report: None,
+        mismatch: None,
+    };
+}
+
 /// The table a walk of a path fills (`Fs::path_attrs`): the root and each entry of the longest path
 /// the protocol accepts (`MAX_PATH` bytes is at most `ceil(MAX_PATH / 2)` components of one letter
 /// and a slash), with the bytes of the attribute of each. About 16 KiB, in the server's static, never
@@ -239,6 +278,14 @@ pub struct Server {
     walk: PathWalk,
     counts: [Counted; COUNT_CACHE],
     counts_hand: usize,
+    /// The count of the metadata pairs of the volume: what the last walk of the list found
+    /// (None before the first MKDIR after the mount) and the pairs the commits since may have added.
+    pairs: Pairs,
+    /// The conversion job of the mount work, while it has steps to do (`convert_step`).
+    conversion: Option<mount::Conversion>,
+    /// The caps (`PAIRS_MAX` and `DIRS_MAX`; the tests lower them).
+    pairs_max: u64,
+    dirs_max: u64,
     /// The present moment in nanoseconds, which the service sets before each job (the clock page).
     now: i64,
     /// The next file number to hand out and the end of the block reserved in the counter.
@@ -248,6 +295,8 @@ pub struct Server {
     refused: bool,
     nodes: [Node; FILES],
     dirs: [PathBuf; DIRS],
+    /// The paths of the directories opened for search only, by the number of the description.
+    searches: [PathBuf; DESCRIPTIONS],
     sessions: [Session; SESSIONS],
     passes: [Pass; PASSES],
     generation: u8,
@@ -258,6 +307,9 @@ pub struct Server {
     pub(crate) fail_reopen: bool,
     #[cfg(test)]
     pub(crate) fail_second: bool,
+    /// Tests: the write of the record of a new directory fails.
+    #[cfg(test)]
+    pub(crate) fail_record: bool,
     /// Tests: every session starts as a native client's (user 0), as before permissions; the
     /// permission tests turn it off.
     #[cfg(test)]
@@ -436,12 +488,17 @@ impl Server {
                 entries: 0,
             }; COUNT_CACHE],
             counts_hand: 0,
+            pairs: Pairs::NONE,
+            conversion: None,
+            pairs_max: PAIRS_MAX,
+            dirs_max: DIRS_MAX,
             now: 0,
             ino_next: 0,
             ino_end: 0,
             refused: false,
             nodes: [Node::EMPTY; FILES],
             dirs: [PathBuf::EMPTY; DIRS],
+            searches: [PathBuf::EMPTY; DESCRIPTIONS],
             sessions: [Session::EMPTY; SESSIONS],
             passes: [Pass {
                 used: false,
@@ -461,6 +518,8 @@ impl Server {
             fail_reopen: false,
             #[cfg(test)]
             fail_second: false,
+            #[cfg(test)]
+            fail_record: false,
             #[cfg(test)]
             default_service: true,
         }
@@ -660,6 +719,8 @@ impl Server {
         self.descriptions[di].used = false;
         match d.kind {
             Kind::File => self.node_unref(fs, usize::from(d.object)),
+            // A directory opened for search holds no place of the volume.
+            Kind::Directory if d.searched => Ok(()),
             Kind::Directory => fs.closedir(Dir(d.object)),
         }
     }
@@ -717,10 +778,8 @@ impl Server {
         self.nodes
             .iter()
             .any(|n| n.used && !n.orphan && within(n.path.get(), path))
-            || self.descriptions.iter().any(|d| {
-                d.used
-                    && d.kind == Kind::Directory
-                    && within(self.dirs[usize::from(d.object)].get(), path)
+            || self.descriptions.iter().enumerate().any(|(di, d)| {
+                d.used && d.kind == Kind::Directory && within(self.dir_path(di).get(), path)
             })
     }
 
@@ -790,6 +849,19 @@ impl Server {
         (u64::from(self.epoch) << 32) | u64::from(self.orphan_seq)
     }
 
+    /// Makes the hidden directory of the orphans when the volume has none and counts it among the
+    /// directories (the count of the mount was made before it existed).
+    pub fn make_orphans<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> Result<(), Error> {
+        match fs.mkdir(ORPHANS) {
+            Ok(()) => {
+                self.dirs_changed(1);
+                Ok(())
+            }
+            Err(Error::Exists) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The open file `ni` leaves the tree and stays readable and writable for its descriptions. With
     /// `home`, a rename is replacing it there: the mark lets a mount put it back.
     fn orphan<D: Device>(&mut self, fs: &mut Fs<'_, D>, ni: usize, home: Option<&[u8]>) -> Res<()> {
@@ -800,7 +872,8 @@ impl Server {
             // The directory is made at the mount; a volume that lost it gets it again here.
             Err(Status::Unknown(p::NO_ENTRY)) => {
                 match fs.mkdir(ORPHANS) {
-                    Ok(()) | Err(Error::Exists) => {}
+                    Ok(()) => self.dirs_changed(1),
+                    Err(Error::Exists) => {}
                     Err(e) => return Err(status_of(e)),
                 }
                 self.move_node(fs, ni, &path[..len], mark)
@@ -1046,7 +1119,7 @@ impl Server {
                         stat_record(Kind::File, size as u32, &attr, nlink).write(w)
                     }
                     Kind::Directory => {
-                        let dir_path = self.dirs[usize::from(d.object)];
+                        let dir_path = self.dir_path(di);
                         let entry = entry_of(fs, dir_path.get(), Kind::Directory)?;
                         stat_record(Kind::Directory, 0, &entry.attr, 1).write(w)
                     }
@@ -1081,6 +1154,10 @@ impl Server {
                 let d = self.descriptions[di];
                 if d.kind != Kind::Directory {
                     return Err(p::code(p::NOT_DIRECTORY));
+                }
+                // A directory opened for search has no listing to start again.
+                if d.searched {
+                    return Err(bad_handle());
                 }
                 self.pending[usize::from(d.object)] = None;
                 volume(fs.rewinddir(Dir(d.object)))
@@ -1332,8 +1409,19 @@ impl Server {
         let d = self.descriptions[di];
         Ok(match d.kind {
             Kind::File => self.nodes[usize::from(d.object)].path,
-            Kind::Directory => self.dirs[usize::from(d.object)],
+            Kind::Directory => self.dir_path(di),
         })
+    }
+
+    /// The path of the directory description `di`: from its place of the volume, or the path a
+    /// description opened for search keeps.
+    fn dir_path(&self, di: usize) -> PathBuf {
+        let d = &self.descriptions[di];
+        if d.searched {
+            self.searches[usize::from(d.object)]
+        } else {
+            self.dirs[usize::from(d.object)]
+        }
     }
 
     /// The size of a shared file, with what the descriptions wrote and has not been synced.
@@ -1564,15 +1652,22 @@ impl Server {
                 if !perm::permits(id, &entry.attr.perm(Kind::Directory), wanted) {
                     return Err(p::code(p::ACCESS));
                 }
-                let slot = match fs.opendir(path) {
-                    Ok(dir) => dir.0,
-                    Err(Error::NoMemory) => return Err(p::code(p::TABLE_FULL)),
-                    Err(e) => return Err(status_of(e)),
-                };
-                self.dirs[usize::from(slot)].set(path);
-                self.pending[usize::from(slot)] = None;
-                description.object = slot;
-                description.read = flags & p::READ != 0;
+                if flags & p::READ == 0 {
+                    // For search only: the path and no place of the volume.
+                    self.searches[di].set(path);
+                    description.searched = true;
+                    description.object = di as u8;
+                } else {
+                    let slot = match fs.opendir(path) {
+                        Ok(dir) => dir.0,
+                        Err(Error::NoMemory) => return Err(p::code(p::TABLE_FULL)),
+                        Err(e) => return Err(status_of(e)),
+                    };
+                    self.dirs[usize::from(slot)].set(path);
+                    self.pending[usize::from(slot)] = None;
+                    description.object = slot;
+                    description.read = true;
+                }
             }
             Kind::File => {
                 description.read = flags & p::READ != 0;
@@ -1620,6 +1715,7 @@ impl Server {
                     let parent_attr = parent_record.attr.perm(Kind::Directory);
                     perm::place_allowed(id, &parent_attr, None).map_err(denied)?;
                     self.room_in_dir(fs, parent)?;
+                    self.room_for_pair(fs)?;
                     self.reserve_allows(fs, caller)?;
                     created = Some((
                         parent_record,
@@ -1653,6 +1749,7 @@ impl Server {
                         if let Some((parent_record, _)) = &created {
                             let (parent, _) = split(path);
                             self.count_add(parent, 1);
+                            self.pairs_added(1);
                             self.touch(fs, parent, *parent_record);
                         }
                         let mut node = Node {
@@ -1665,6 +1762,21 @@ impl Server {
                         (ni, true)
                     }
                 };
+                // A file may be inline (its bytes inside the pair of its directory) whatever the
+                // format mark says: a volume of an older build, an entry the conversion job has not
+                // reached or never reaches (a job that was abandoned), a volume that was marked and
+                // then written by an older build. littlefs 2.11.3 loses a write at the start or in
+                // the middle of such a file with inline data off. A file about to be written or
+                // truncated is moved out first (seek to the end, write no byte: one commit) through
+                // the node's file, which every description of the path shares. The flag is in
+                // memory after the open: a file that is not inline costs no read.
+                if existing.is_some() && flags & (p::WRITE | p::TRUNCATE) != 0 {
+                    let file = File(self.nodes[ni].slot);
+                    if volume(fs.file_inline(file))? {
+                        volume(fs.seek(file, 0, Whence::End))?;
+                        volume(fs.write(file, &[]))?;
+                    }
+                }
                 if flags & p::TRUNCATE != 0 {
                     let file = File(self.nodes[ni].slot);
                     self.nodes[ni].at = None;
@@ -1747,6 +1859,31 @@ impl Server {
         }
     }
 
+    /// The root the session of `label` counts under (a tree of processes, or a client of init
+    /// alone), None for a label that is no session. The worker publishes it for the request
+    /// thread, which counts the jobs in flight by root.
+    pub fn root_of(&self, label: u64) -> Option<Root> {
+        self.sessions
+            .iter()
+            .find(|s| s.used && s.label == label)
+            .map(|s| s.root)
+    }
+
+    /// The session of `label` passed VERIFY_SESSION, which only a loader sends, for the session a
+    /// parent gave a set-ID program: the binding of the parent's identity ends, and the program's
+    /// layer binds the session to its own (BIND). The descriptions it holds stay, with their
+    /// rights, and are read without a binding; a session of a native client keeps its profile.
+    pub fn unbind(&mut self, label: u64) {
+        if let Some(s) = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.used && s.label == label)
+            && matches!(s.binding, Binding::Bound(_))
+        {
+            s.binding = Binding::Unbound;
+        }
+    }
+
     /// Whether `label` is a live session of the service (VERIFY_SESSION).
     pub fn is_live(&self, label: u64) -> bool {
         self.sessions.iter().any(|s| s.used && s.label == label)
@@ -1762,3 +1899,37 @@ impl Server {
 pub const REQUEST_MAX: usize = abi::MESSAGE_MAX;
 
 const _: () = assert!(HEADER_LEN == 8);
+
+#[cfg(test)]
+impl Server {
+    /// Tests: the caps of the pairs and of the directories, lowered so that a small volume reaches
+    /// them.
+    pub(crate) fn set_pairs_max(&mut self, n: u64) {
+        self.pairs_max = n;
+    }
+
+    pub(crate) fn set_dirs_max(&mut self, n: u64) {
+        self.dirs_max = n;
+    }
+
+    /// Tests: count the pairs and the directories now, as the mount does.
+    pub(crate) fn recount_for_test(&mut self, fs: &mut Fs<'_, crate::mem::MemDevice>) {
+        self.recount(fs).unwrap();
+    }
+
+    /// Tests: the tracked count of the directories set to `n`, as a change the service did not see
+    /// would leave it.
+    pub(crate) fn set_dirs_tracked(&mut self, n: u64) {
+        self.pairs.dirs = Some(n);
+    }
+
+    /// Tests: the server's count of the directories, None before the first count.
+    pub(crate) fn dirs_known(&self) -> Option<u64> {
+        self.pairs.dirs
+    }
+
+    /// Tests: the server's upper bound of the pairs, None before the first count.
+    pub(crate) fn pairs_bound(&self) -> Option<u64> {
+        self.pairs.known.map(|k| k + self.pairs.since)
+    }
+}

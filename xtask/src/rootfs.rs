@@ -278,7 +278,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 75] = [
+const SYSTEM_PATHS: [&str; 76] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -286,6 +286,7 @@ const SYSTEM_PATHS: [&str; 75] = [
     "/libexec/ramfs",
     "/dev",
     "/proc",
+    "/data",
     "/sys",
     "/sys/devices",
     "/sys/devices/system",
@@ -621,6 +622,13 @@ fn dialog(image: &str) -> Vec<RootFile> {
 /// the games image.
 fn shell_files(image: &str) -> Result<Vec<RootFile>, String> {
     let mut files = library();
+    // The mount point of the data volume, for an image whose table has the data file service: the
+    // layer sends the paths there to the service by their text and the directory shows `/data` in
+    // `ls /`. An image with no service has no `/data` (a path there answers EIO after a second,
+    // so `du /` and `find /` would meet it).
+    if has_data_service(image) {
+        files.push(dir("/data"));
+    }
     files.extend([
         dir("/bin"),
         dir("/libexec"),
@@ -696,6 +704,11 @@ pub struct LayerPackage {
     /// The paths of the package that the image's package file leaves out (the probes of BusyBox
     /// in the image of EC2): the image holds a variant of the package file.
     pub removed: Vec<&'static str>,
+}
+
+/// The shell images whose init table has the data file service: the images of the try-out.
+pub fn has_data_service(name: &str) -> bool {
+    is_aws_image(name)
 }
 
 /// The images of the try-out on EC2 and on QEMU.
@@ -921,6 +934,17 @@ pub fn check_owners(
             if !files.iter().any(|f| f.path == path) {
                 wrong.push(format!("{path} of {} is not in the image", p.name));
             }
+        }
+    }
+    // The data volume is mounted at /data (the layer sends the paths there to the data file
+    // service): a file of the image below it would be hidden, and so is the target of a
+    // link that named a place there (a link names a file of its own directory, below).
+    for f in files {
+        if f.path.starts_with("/data/") {
+            wrong.push(format!(
+                "{} is below /data, which the data volume covers",
+                f.path
+            ));
         }
     }
     // A link names a file of its own directory that the image has and that
@@ -1262,6 +1286,28 @@ pub fn os_test_with_fixtures(
 /// of its own file with its time limit in milliseconds (`limits`, one for
 /// each test).
 pub fn open_posix(tests: &[(String, Vec<u8>)], limits: &[u64]) -> Vec<RootFile> {
+    open_posix_with(tests, limits, None, "")
+}
+
+/// The files of a boot of the Open POSIX tests with their scratch files on the data volume: the
+/// list starts with the directory `tmp` names, made on the volume, and the variable `TMPDIR` the
+/// suite's tests read.
+pub fn open_posix_data(tests: &[(String, Vec<u8>)], limits: &[u64], tmp: &str) -> Vec<RootFile> {
+    open_posix_with(tests, limits, Some(tmp), "")
+}
+
+/// The files of a boot of the save scenario (`cargo xtask data-save`): the runner with no test and
+/// the lines of `script`, which make or read back a file of the volume.
+pub fn data_save(script: &str) -> Vec<RootFile> {
+    open_posix_with(&[], &[], Some("/data/tmp"), script)
+}
+
+fn open_posix_with(
+    tests: &[(String, Vec<u8>)],
+    limits: &[u64],
+    tmp: Option<&str>,
+    script: &str,
+) -> Vec<RootFile> {
     /// Tests that print a usage line without an argument: the number of
     /// threads the suite's README gives them.
     const ARGUMENTS: [(&str, &str); 2] = [
@@ -1279,6 +1325,10 @@ pub fn open_posix(tests: &[(String, Vec<u8>)], limits: &[u64]) -> Vec<RootFile> 
     files.push(of("/bin/sleep", 0o755, ROOT, Source::Elf("busybox-probe")));
     files.push(of("/bin/ls", 0o755, ROOT, Source::Elf("busybox-probe")));
     let mut list = String::new();
+    if let Some(tmp) = tmp {
+        list.push_str(&format!("mkdir {tmp}\nenv TMPDIR {tmp}\n"));
+    }
+    list.push_str(script);
     let mut limit = None;
     for ((name, _), ms) in tests.iter().zip(limits) {
         if limit != Some(*ms) {
@@ -2441,6 +2491,35 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        "boot-data-posix.img"
+        | "boot-data-posix-write.img"
+        | "boot-data-posix-cap.img"
+        | "boot-data-posix-full.img"
+        | "boot-data-posix-crash.img"
+        | "boot-data-posix-verify.img"
+        | "boot-data-posix-restart.img"
+        | "boot-data-posix-throughput.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/posix-data", 0o755, ROOT, "posix-data"),
+                // Owned by another user, set-ID: a spawn of it runs with a real ID that differs from
+                // the effective one, and the loader passes the data session of its caller only if it
+                // is the genuine one.
+                of(
+                    "/bin/posix-data-suid",
+                    0o4755,
+                    (1000, 100),
+                    Source::Variant {
+                        program: "posix-data",
+                        tag: "setid",
+                        extra: 4096,
+                    },
+                ),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
         "boot-posix-window.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -2811,6 +2890,38 @@ mod tests {
             .push(("/bin/again".into(), "link:cat".into()));
         let error = check_owners(image, &chained, &owned).unwrap_err();
         assert!(error.contains("/bin/again links to /bin/cat"), "{error}");
+    }
+
+    /// The data volume covers /data: a file of the image there would never be reached.
+    /// Only an image whose table has the data file service keeps the mount point: in the others a
+    /// path under /data answers EIO, so `du /` and `find /` would stop at the directory.
+    #[test]
+    fn only_an_image_with_the_data_service_has_the_mount_point() {
+        let has = |image: &str| files_of(image).iter().any(|f| f.path == "/data");
+        assert!(!has("boot-ash-dialog.img"));
+        assert!(!has("boot-full.img"));
+        assert!(has("boot-aws.img") && has("boot-aws-qemu.img"));
+        assert!(has_data_service("boot-aws.img") && !has_data_service("boot-ash-dialog.img"));
+    }
+
+    #[test]
+    fn no_file_of_the_image_is_under_the_data_volume() {
+        let image = "boot-ash-dialog.img";
+        let packages = crate::packages::of_image(image).unwrap();
+        // The image has none now; `/bin/data` and `/database` are other names.
+        check_owners(image, &files_of(image), &packages).unwrap();
+        let mut covered = files_of(image);
+        covered.push(of("/data/keep", 0o644, ROOT, Source::Bytes("keep", b"x")));
+        let mut owned = packages.clone();
+        owned[0].files.push(("/data/keep".into(), "keep".into()));
+        let error = check_owners(image, &covered, &owned).unwrap_err();
+        assert!(error.contains("/data/keep is below /data"), "{error}");
+        let mut near = files_of(image);
+        near.push(of("/database", 0o644, ROOT, Source::Bytes("near", b"x")));
+        let mut owned = packages.clone();
+        owned[0].files.push(("/database".into(), "near".into()));
+        let error = check_owners(image, &near, &owned).err().unwrap_or_default();
+        assert!(!error.contains("below /data"), "{error}");
     }
 
     #[test]
@@ -3347,6 +3458,14 @@ mod tests {
             "boot-posix-random-limit.img",
             "boot-posix-random-rejoin-steps.img",
             "boot-posix-display.img",
+            "boot-data-posix.img",
+            "boot-data-posix-write.img",
+            "boot-data-posix-cap.img",
+            "boot-data-posix-full.img",
+            "boot-data-posix-crash.img",
+            "boot-data-posix-verify.img",
+            "boot-data-posix-restart.img",
+            "boot-data-posix-throughput.img",
             "boot-posix-window.img",
             "boot-pkg-slot.img",
             "boot-display.img",

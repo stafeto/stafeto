@@ -93,7 +93,11 @@ pub use named::WatchSet;
 ///
 /// Version 3: VerifySession, which the loader sends to the service's root
 /// (`ROOT`) for the Pipes session of a set-ID program.
-pub const VERSION: u16 = 3;
+///
+/// Version 4: a word of the kinds of the descriptions of a message (`sock::KIND_NET`,
+/// `sock::KIND_DATA`) in SOCK_SEND, SOCK_SEND_TAKE and in the reply of SOCK_RECV, after the count
+/// of descriptions, so that a pass is of the data file service as well as of the network service.
+pub const VERSION: u16 = 4;
 
 /// The pipes of the service.
 pub const PIPES: usize = 64;

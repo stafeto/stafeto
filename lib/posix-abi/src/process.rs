@@ -1159,6 +1159,10 @@ impl Shadow {
                     },
                     posix_fs::Target::Tty(n) => Names::Terminal(n),
                     posix_fs::Target::Random(n) => Names::Random(n.fd()),
+                    posix_fs::Target::Data(n) => Names::Data {
+                        handle: n.handle,
+                        directory: n.directory,
+                    },
                     // An epoll descriptor never reaches the new image: its set
                     // goes with ABANDON, and its number is free there.
                     posix_fs::Target::Epoll(_) => continue,
@@ -1254,6 +1258,23 @@ impl Shadow {
             }
         }
         Ok((ends, found))
+    }
+
+    /// A clone of the session with the data file service that holds the descriptions the child's
+    /// descriptors name, none when it has none (the child takes a session at its first use of
+    /// `/data`). The current directory is the child's to open again.
+    fn clone_data(&self) -> Result<Option<Handle<Channel>>, i32> {
+        let (list, count) = self.descriptors()?;
+        crate::data::clone_for_child(
+            list[..count].iter().filter_map(|d| match d.names {
+                proto_loader::Names::Data { handle, .. } => Some(posix_fs::data::Held {
+                    handle,
+                    clofork: false,
+                }),
+                _ => None,
+            }),
+            false,
+        )
     }
 
     /// The descriptions of sockets the child's session shares, each once.
@@ -1535,6 +1556,10 @@ pub fn spawn_search<'s, 'a>(
     if file.is_empty() {
         return Err(ENOENT);
     }
+    // A program is never run from the data volume: EACCES before any request to the loader.
+    if search.is_none() && crate::data::route(crate::names::AT_FDCWD, file)?.is_some() {
+        return Err(crate::constants::EACCES);
+    }
     let pgroup = attributes.pgroup;
     if pgroup > i32::MAX as u32 || attributes.flags & !proto_process::SPAWN_FLAGS != 0 {
         return Err(EINVAL);
@@ -1772,6 +1797,11 @@ fn exec_selected<'s>(
     use crate::constants::ENOENT;
     if matches!(source, ExecSource::Path(path) if path.is_empty()) {
         return Err(ENOENT);
+    }
+    if let ExecSource::Path(path) = source
+        && crate::data::route(crate::names::AT_FDCWD, path)?.is_some()
+    {
+        return Err(crate::constants::EACCES);
     }
     // The claimed network device stays with this image (spec 6, 3.9).
     if crate::fast::claimed() {
@@ -2161,6 +2191,9 @@ fn move_files(c: &Handle<Channel>) -> bool {
             (Slot::Display, moved(crate::display::session())),
             (Slot::Net, moved(crate::net::session_passive())),
             (Slot::Packages, moved(crate::packages::session())),
+            // The session with the data file service goes on with the descriptions of the
+            // descriptors that stay: its binding lapses, and the new image binds it again.
+            (Slot::Data, moved(crate::data::session_for_exec())),
         ],
     ) == 0
 }
@@ -2270,6 +2303,7 @@ fn commit(
     let entropy = crate::fork::entropy_clone();
     let display = crate::display::clone_session();
     let packages = crate::packages::clone_session();
+    let data = shadow.clone_data()?;
     let (nets, count) = shadow.shared_nets()?;
     // The child carries 64 descriptors at most: one portion.
     let net = crate::net::clone_kept(|out| {
@@ -2286,6 +2320,7 @@ fn commit(
         (Slot::Display, display),
         (Slot::Net, net),
         (Slot::Packages, packages),
+        (Slot::Data, data),
     ];
     if give_sessions(c, sessions) != 0 {
         return Err(EIO);

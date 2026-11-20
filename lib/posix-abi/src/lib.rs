@@ -37,6 +37,11 @@ pub use lock_wait::{Probe as WaitProbe, probe_hook as probe_wait_hook};
 pub fn record_locks_none() -> bool {
     shared::with_files(|files| Ok(files.knows_no_record_lock())).unwrap_or(false)
 }
+#[cfg(feature = "data")]
+pub mod data;
+#[cfg(not(feature = "data"))]
+#[path = "data_off.rs"]
+pub mod data;
 pub mod display;
 pub mod epoll;
 pub mod fast;
@@ -88,7 +93,11 @@ pub unsafe fn file_lock(fd: c_int, command: c_int, pointer: *mut u8) -> Result<c
     let point = waiting.then(threads::cancel::Point::begin);
     let result = (|| {
         let fd = u32::try_from(fd).map_err(|_| constants::EBADF)?;
-        shared::with_fd(fd, |files| files.target(fd).map(|_| ()).map_err(error))?;
+        let target = shared::with_fd(fd, |files| files.target(fd).map_err(error))?;
+        // The data volume keeps no record locks: ENOLCK (XSH fcntl()).
+        if matches!(target, posix_fs::Target::Data(_)) {
+            return Err(constants::ENOLCK);
+        }
         // SAFETY: the calling platform supplies flock fields for this invocation.
         let input = unsafe { lock_fields::Input::read(command, pointer) }?;
         if waiting && input.kind != proto_fs::LockKind::Unlock {
@@ -275,7 +284,12 @@ fn open_policy_inner(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result
     if let Some(path) = procfs::absolute(name).filter(procfs::Absolute::is_under) {
         return procfs::open(path.bytes(), flags);
     }
-    open_image(name, flags, mode, umask)
+    // The files under /data are the data file service's (data).
+    if let Some(vol) = data::route(names::AT_FDCWD, name)? {
+        return data::open(&vol, flags, mode, umask);
+    }
+    // The RAM file service takes every write as done at its return: the bit is the volume's.
+    open_image(name, flags & !(O_SYNC | O_SEARCH), mode, umask)
 }
 
 /// Opens a path of the image's file service.
@@ -328,6 +342,11 @@ pub fn openat_policy(
     if let Some(path) = procfs::relative(dirfd, name) {
         return procfs::open(path.bytes(), flags);
     }
+    // A name against a directory of /data (data).
+    if let Some(vol) = data::route(dirfd, name)? {
+        return data::open(&vol, flags, mode, umask);
+    }
+    let flags = flags & !(O_SYNC | O_SEARCH);
     let point = threads::cancel::Point::begin();
     let result = (|| {
         if name.is_empty() {

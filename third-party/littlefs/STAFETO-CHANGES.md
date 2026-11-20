@@ -10,7 +10,7 @@ the copy is modified, so that the notice is not read as saying it is the release
 
 ## What was added
 
-Three functions that only read. They add no field to any structure of the release, and change
+Four functions that only read. They add no field to any structure of the release, and change
 nothing on the disk: a volume written by the release reads with the change and the other way
 round. One function of the release, `lfs_dir_find`, is split to carry the third (below): its body
 becomes `lfs_dir_find_` with one more argument, and `lfs_dir_find` calls it with that argument
@@ -42,8 +42,16 @@ NULL, so every caller of the release behaves as before.
   repeats from the root.
 - A private helper, `lfs_dir_getattr_`, which they use: the tail of `lfs_getattr_` over a pair
   and an id.
+- `lfs_fs_pairs(lfs, &pairs, &dirs)` in `lfs.h` and `lfs.c`: the number of metadata pairs, the length of
+  the threaded list of pairs that `lfs_fs_traverse_` walks (the superblock's pair first), and the
+  number of directories, by one `lfs_dir_fetch` for each pair with the cycle check of the
+  traversal. A pair whose tail is a hard tail (`dir.split`) continues its directory with the
+  next pair; any other tail is a soft tail and the next pair begins a directory; the first pair is
+  the root. About two reads for each pair, where `lfs_fs_pred` (which a removal of a directory uses
+  to find the pair before the one it removes) walks the same list from its head. The data service
+  caps the pairs and the directories of a volume with it.
 
-Each of the three has the public wrapper with `LFS_LOCK` and `LFS_TRACE` and the private function with a
+Each of the four has the public wrapper with `LFS_LOCK` and `LFS_TRACE` and the private function with a
 trailing underscore, as the functions around them do. The attribute buffer is read as
 `lfs_getattr` reads it (padded with zeros, truncated to `size` and to `LFS_ATTR_MAX`).
 
@@ -69,6 +77,10 @@ the attribute of every ancestor, and a lookup of each prefix from the root costs
 depth: 60,301 reads for the 201 prefixes of a path of depth 200, against 602 for the walk (8 and 26
 reads at depth 2 and 8, against 10 and 109).
 
+## A known defect of the release that the service works around
+
+With `inline_max = -1` (no inlined files) littlefs 2.11.3, with or without this change, loses a write at the start or in the middle of an existing inline file (a file that an earlier configuration kept inside the pair of its directory): moving the file out (`lfs_file_outline`, `lfs_file_relocate`) copies only the bytes before the write position, flushing the rest then fails, and the close answers `LFS_ERR_CORRUPT`; the write is lost and the old bytes stay. Appending, `O_TRUNC` and truncating down work. The service moves every inline file out before a write can meet this: open for writing, seek to the end and write no byte (one commit, the whole file moves), by the conversion job after the mount and, for a file the job has not reached, at the first open of the path for writing or truncation. The test that reproduces the defect is `without_the_move_out_a_write_in_the_middle_of_an_old_inline_file_is_lost` in `lib/datafs/src/tests_perm.rs`: it fails when a release stops losing the write, and then the move-out can go. The release's own message about it is not sent yet.
+
 ## Against which release
 
 littlefs v2.11.3 (`LFS_VERSION` 0x0002000b, disk format 2.1). Checksums of the files of the
@@ -82,8 +94,8 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 0cb4ff1daf5fdc1359c6a6ee3116092f08fc100c9d58b1b77ab17bfd801f856d  LICENSE.md
 6dd74dfc58ac93589f8e002bb73c0830a59206912cfe8c951c07eb2bd5fccad0  SPEC.md
 2a8b3459d74b9fa8bdd947738522c46331739405b1fc3d70f057f636a1dea768  DESIGN.md
-7fa02871d2147b6230183694e8b9efc1cfd797808cba687aa4e91e19debab557  lfs.c (with the change)
-9c13b195643ccfd5025961fa3fb6029bbb9be0f6ffce9488ec9be958d33163b6  lfs.h (with the change)
+990fd7fc88fc4e9cff64e9fc0c946b51a658ff58c652a52bb673fbf890906bf5  lfs.c (with the change)
+89c6aa3d49725ac6cc50f98b366cdd4b6df17d423649b18fa4a84c9ee97fffc7  lfs.h (with the change)
 ```
 
 `tools/check-littlefs.py` (run by `cargo xtask ci` as "littlefs sources") fails when a file of the
@@ -102,6 +114,15 @@ change, or when `stafeto-changes.patch` applied backwards to them does not give 
    places that call `lfs_path_walk_visit` are right after the empty-path check (the root) and
    right after the loop that matches the name (the entry just found, while `dir` is still the
    pair that holds it). The rest of the body must equal the release's.
+   `lfs_fs_pairs` relies on three things of the release: the threaded list of metadata pairs
+   starts at the superblock's pair `{0, 1}` and each pair's `tail` names the next (the list
+   `lfs_fs_traverse_` walks); `lfs_tortoise_detectcycles` is the cycle check of that walk; and
+   `lfs_dir_fetch` of a pair gives the `tail` of the directory it holds, the same shape as in
+   `lfs_fs_pred`; the count of directories relies on `dir.split` being true exactly when the
+   pair's tail is a hard tail (a continuation of the same directory) and false for a soft tail.
+   Check that the new release's `lfs_fs_traverse_` still begins its walk with
+   `dir.tail = {0, 1}`, runs the cycle check before each fetch and goes on to `dir.tail`, and keep
+   the function in step with it.
 2. Apply `stafeto-changes.patch` with `patch -p1` from the root of the repository (or by hand if
    the context moved) to the new `lfs.c` and `lfs.h`.
 3. Rebuild the patch (`diff -u` of the new release against the files here) as
@@ -111,4 +132,4 @@ change, or when `stafeto-changes.patch` applied backwards to them does not give 
 4. Run `cargo test -p datafs`: `tests_entry_attr.rs` compares the attribute of every entry of
    a directory with `lfs_getattr` by path, across several metadata pairs.
 5. When a release has the same functions, delete the change: remove the patch, this file, the use
-   of the three functions in `lib/datafs/csrc/glue.c` and `lib/datafs/src/fs.rs`, and the check.
+   of the four functions in `lib/datafs/csrc/glue.c` and `lib/datafs/src/fs.rs`, and the check.

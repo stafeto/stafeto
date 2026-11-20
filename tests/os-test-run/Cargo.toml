@@ -15,3 +15,7 @@ bench = false
 
 [dependencies]
 posix-crt = { path = "../../lib/posix-crt", features = ["uart-input"] }
+
+[features]
+# The paths under /data go to the data file service (xtask open-posix --data).
+data = ["posix-crt/data"]

@@ -1,0 +1,20 @@
+[package]
+name = "posix-data-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The C probe of the reading paths of /data in the POSIX layer: open, read, stat, readdir, chdir, fork, spawn and exec over the data file service"
+build = "build.rs"
+
+[[bin]]
+name = "posix-data-probe"
+test = false
+bench = false
+
+[dependencies]
+# The layer with the data file service at /data (the features `data` and `trace` of
+# tools/layer-features.txt: libc.so has them, and a static program has them when it asks; `trace`
+# makes the layer print the step and the status behind each EIO).
+posix-crt = { path = "../../lib/posix-crt", features = ["data", "trace"] }
