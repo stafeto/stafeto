@@ -145,6 +145,7 @@ mod store_probe;
 mod stubs;
 mod symbolize;
 mod untag;
+mod vi_dialog;
 mod vz;
 mod wcet;
 mod window;
@@ -2259,6 +2260,7 @@ commands:
             the spread of loops over the CPUs, taskset, htop
   ncdu-dialog  check ncdu in an ash dialog in QEMU: directory sizes, hard links counted once, quit
   nano-dialog  check GNU nano in an ash dialog in QEMU: typing, arrow keys, save, exit
+  vi-dialog  check BusyBox vi on the data volume in an ash dialog in QEMU: type, :wq, cat, reboot of the same disk, cat
   doom-headless [MACHINE]  check Doom in the games image (boot-doom.img): from ash, without a
             screen, it plays the demo of Freedoom (-timedemo demo1 -nodraw) and ash prompts again
   doom-probe [MACHINE]  the goal: from ash, `doom -iwad /games/freedoom1.wad` shows the title screen (QEMU's
@@ -2815,6 +2817,7 @@ fn main() {
         Some("init-reserve") => init_reserve::check(),
         Some("netd-quota") => netd_quota::check(),
         Some("nano-dialog") => nano_dialog::nano_dialog(),
+        Some("vi-dialog") => vi_dialog::vi_dialog(),
         Some("htop-dialog") => htop_dialog::htop_dialog(),
         Some("cpus-dialog") => args
             .get(1)
@@ -11187,6 +11190,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("data-posix write", || {
             data_posix::probe(data_posix::Mode::Write, &qemu::VIRT)
         }),
+        job("vi-dialog", vi_dialog::vi_dialog),
         // The window library of C programs against QEMU's screenshots.
         job("posix-window", || posix_window::probe(&qemu::VIRT)),
         // The screen and the keys of libc.so against QEMU's screenshots and

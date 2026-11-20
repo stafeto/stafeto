@@ -104,6 +104,8 @@ table-os-test = []
 table-os-test-data = []
 table-busybox = []
 table-busybox-dialog = []
+# The dialog of the shell with the data volume (xtask vi-dialog).
+table-busybox-dialog-data = []
 # The games image: the dialog with the quota of Doom (xtask doom-headless).
 table-doom = []
 # The games image of the measures (xtask doom-measure, boot-doom-steps.img): the same table with the

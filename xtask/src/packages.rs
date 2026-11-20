@@ -644,6 +644,7 @@ pub fn check() -> Result<(), String> {
     let packages = load()?;
     for image in [
         "boot-ash-dialog.img",
+        "boot-vi-dialog.img",
         "boot-doom.img",
         "boot-lvgl.img",
         "boot-net.img",
@@ -821,7 +822,7 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
             .collect()),
         "boot-full.img" => load(),
         other if without_name(other).is_some() => without(load()?, without_name(other).unwrap()),
-        "boot-ash-dialog.img" => of(&[Group::Base, Group::Addon]),
+        "boot-ash-dialog.img" | "boot-vi-dialog.img" => of(&[Group::Base, Group::Addon]),
         // The try-out on EC2 (and its image on QEMU): the base packages, the network ones
         // (nginx, OpenSSL, curl, Dropbear) and the F-Stack ones (`nginx-fast`, a consumer of the
         // switch, which `of` leaves out for the images with no second device).

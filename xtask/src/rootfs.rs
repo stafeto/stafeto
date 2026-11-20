@@ -708,7 +708,7 @@ pub struct LayerPackage {
 
 /// The shell images whose init table has the data file service: the images of the try-out.
 pub fn has_data_service(name: &str) -> bool {
-    is_aws_image(name)
+    is_aws_image(name) || name == crate::vi_dialog::IMAGE
 }
 
 /// The images of the try-out on EC2 and on QEMU.
@@ -1964,6 +1964,7 @@ pub const IMAGES: &[&str] = &[
     "boot-net-probe-two.img",
     "boot-net-steps-two.img",
     "boot-ash-dialog.img",
+    "boot-vi-dialog.img",
     "boot-doom.img",
     "boot-doom-steps.img",
     "boot-lvgl.img",
@@ -2095,6 +2096,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files
         }
         "boot-ash-dialog.img"
+        | "boot-vi-dialog.img"
         | "boot-doom.img"
         | "boot-doom-steps.img"
         | "boot-lvgl.img"
@@ -3235,6 +3237,7 @@ mod tests {
             let list: &[crate::ImageProgram] = match image {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
                 "boot-ash-dialog.img" => shell,
+                "boot-vi-dialog.img" => crate::vi_dialog::programs(),
                 "boot-doom.img" => crate::doom::programs(),
                 "boot-doom-steps.img" => crate::doom::steps_programs(),
                 "boot-lvgl.img" => crate::lvgl_image::programs(),
@@ -3434,6 +3437,7 @@ mod tests {
     fn the_images_of_posix_programs_have_the_device_nodes() {
         for name in [
             "boot-ash-dialog.img",
+            "boot-vi-dialog.img",
             "boot-doom.img",
             "boot-doom-steps.img",
             "boot-lvgl.img",

@@ -103,6 +103,7 @@ files = [
   "/bin/uniq = link:busybox",
   "/bin/uudecode = link:busybox",
   "/bin/uuencode = link:busybox",
+  "/bin/vi = link:busybox",
   "/bin/wc = link:busybox",
   "/bin/wget = link:busybox",
   "/bin/xargs = link:busybox",

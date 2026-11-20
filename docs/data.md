@@ -27,6 +27,7 @@ This is what a POSIX program gets from the data volume: the directory `/data`, w
 - **`mmap`.** A private mapping of a file reads the file at the call; a shared mapping is ENODEV. A program is never run from the volume: `exec` of a path under `/data` is EACCES, and `access(X_OK)` of a regular file there too.
 - **Locks and passes.** Record locks (`fcntl` F_SETLK and the others) are ENOLCK. A description of `/data` goes through a Unix socket with SCM_RIGHTS and keeps its rights.
 - **Directories.** `readdir` lists `.` and `..` first, in batches; `d_ino` is the number `stat` gives, also for `..` of the root of the volume. `telldir` and `seekdir` count entries, so after a removal in the directory between them `seekdir` resumes later by the number removed before the position. `O_SEARCH` and `O_PATH` open a directory for search only.
+- **Times.** `atime` is set when a file is made and by `utimensat`; a read never updates it (the volume behaves as mounted with `noatime`). A write sets `mtime` and `ctime`, a name added to or removed from a directory sets those of the directory.
 - **Truncation.** `open` for reading with O_TRUNC is two opens, one for writing that truncates and closes and the reading one after it, so another process can write between them.
 
 ## Limits
@@ -59,6 +60,10 @@ In an image that has the service, a missing volume or a service marked broken le
 
 A descriptor opened before the restart answers EIO to every call but `close`, which succeeds. The first call by path takes a session with the new instance; a call that meets the end of the old session goes on at once with the new one. The current directory is opened again from its string. Names made before the restart are there, files written and not synced are as the last sync left them.
 
+## An editor on the volume
+
+BusyBox `vi` of the shell image edits files under `/data`. It writes a file in place (`open` with `O_WRONLY | O_CREAT`, `write`, `ftruncate`, `close`), which the volume serves like any other write: the bytes are durable at the close of the last description. `cargo xtask vi-dialog` types lines into a new file, saves with `:wq`, reads it back with `cat`, edits it again and reads it after a second boot of the same disk.
+
 ## Where to look next
 
-`docs/posix-coverage.md` lists each departure, `tests/open-posix/data-pass.txt` and `data-expected-not-pass.txt` list the Open POSIX tests that pass on the volume and those that do not by design, and `cargo xtask data-posix`, `open-posix --data` and `data-save` are the probes.
+`docs/posix-coverage.md` lists each departure, `tests/open-posix/data-pass.txt` and `data-expected-not-pass.txt` list the Open POSIX tests that pass on the volume and those that do not by design, and `cargo xtask data-posix`, `open-posix --data`, `data-save` and `vi-dialog` are the probes.
