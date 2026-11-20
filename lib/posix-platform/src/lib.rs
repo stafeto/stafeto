@@ -222,7 +222,8 @@ const O_PATH_FLAG: c_int = 0o10000000;
 
 /// Translates relibc Open flags into the process-local request interface.
 fn open_flags(flags: c_int) -> Result<c_int, c_int> {
-    let flags = if flags & O_PATH_FLAG != 0 {
+    let search = flags & O_PATH_FLAG != 0;
+    let flags = if search {
         flags & !O_PATH_FLAG & !O_ACCMODE
     } else {
         flags
@@ -259,6 +260,13 @@ fn open_flags(flags: c_int) -> Result<c_int, c_int> {
         if flags & native != 0 {
             mapped |= local;
         }
+    }
+    if search {
+        mapped |= posix_abi::constants::O_SEARCH;
+    }
+    // Either flag of durability is the layer's one: the data volume keeps it in the description.
+    if flags & O_SYNC_FLAGS != 0 {
+        mapped |= posix_abi::constants::O_SYNC;
     }
     Ok(mapped)
 }

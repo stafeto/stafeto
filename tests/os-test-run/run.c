@@ -7,7 +7,12 @@
  * "./name" with that as argv[0] (the tests that exec themselves and those
  * of basic/ name their program so). The list is the file /os-test/list, a
  * line a test: its name, its directory and its path from there, apart by
- * spaces; a line `limit MS` sets the time a test may take from then on.
+ * spaces; a line `limit MS` sets the time a test may take from then on, a
+ * line `env NAME VALUE` sets a variable the tests inherit, and a line
+ * `mkdir PATH` makes a directory (the data volume's scratch place), a line
+ * `save-write PATH` saves a file the way `sed -i` does (a temporary file in
+ * the directory, the mode of the original, fsync, rename over it) and a
+ * line `save-verify PATH` reads the saved file back (two boots on one disk).
  *
  * A test's output goes to the console as it writes it; the runner marks
  * each test on both sides, without a newline before the second mark, so
@@ -37,7 +42,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -115,6 +122,46 @@ static void report_group(const char *name, int left) {
 }
 
 /* Runs the test `name` of the file `rel` in the directory `dir`. */
+/* The save of `sed -i`: the new text goes into a temporary file of the same
+ * directory, which takes the mode of the original and is renamed over it. */
+static void save_write(const char *path) {
+    char temp[600];
+    snprintf(temp, sizeof temp, "%s.tmp", path);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0640);
+    if (fd < 0 || write(fd, "old\n", 4) != 4 || fsync(fd) != 0 || close(fd) != 0) {
+        printf("os-test-run: save-write: the original failed: %s\n", strerror(errno));
+        return;
+    }
+    struct stat st;
+    int tmp = open(temp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (tmp < 0 || stat(path, &st) != 0 || write(tmp, "new\n", 4) != 4 ||
+        fchmod(tmp, st.st_mode & 07777) != 0 || fsync(tmp) != 0 || close(tmp) != 0 ||
+        rename(temp, path) != 0) {
+        printf("os-test-run: save-write: the temporary file failed: %s\n", strerror(errno));
+        return;
+    }
+    printf("os-test-run: data-save written\n");
+}
+
+static void save_verify(const char *path) {
+    char temp[600], text[16];
+    snprintf(temp, sizeof temp, "%s.tmp", path);
+    struct stat st;
+    int fd = open(path, O_RDONLY);
+    ssize_t n = fd < 0 ? -1 : read(fd, text, sizeof text);
+    if (fd >= 0) close(fd);
+    if (n != 4 || memcmp(text, "new\n", 4) != 0) {
+        printf("os-test-run: save-verify: the file is not the saved one (read %zd): %s\n", n,
+               strerror(errno));
+    } else if (stat(path, &st) != 0 || (st.st_mode & 07777) != 0640 || st.st_size != 4) {
+        printf("os-test-run: save-verify: mode or size differ\n");
+    } else if (stat(temp, &st) == 0 || errno != ENOENT) {
+        printf("os-test-run: save-verify: the temporary file is still there\n");
+    } else {
+        printf("os-test-run: data-save verified\n");
+    }
+}
+
 static void run_one(const char *name, const char *dir, const char *rel, const char *arg) {
     printf("@@os-test begin %s\n", name);
     fflush(stdout);
@@ -197,6 +244,23 @@ int main(int argc, char **argv) {
         if (name && strcmp(name, "limit") == 0) {
             char *ms = strtok(NULL, " \n");
             if (ms) limit_ms = atoll(ms);
+            continue;
+        }
+        if (name && strcmp(name, "env") == 0) {
+            char *var = strtok(NULL, " \n");
+            char *value = strtok(NULL, " \n");
+            if (var && value) setenv(var, value, 1);
+            continue;
+        }
+        if (name && (strcmp(name, "save-write") == 0 || strcmp(name, "save-verify") == 0)) {
+            char *path = strtok(NULL, " \n");
+            if (path) (name[5] == 'w' ? save_write : save_verify)(path);
+            continue;
+        }
+        if (name && strcmp(name, "mkdir") == 0) {
+            char *path = strtok(NULL, " \n");
+            if (path && mkdir(path, 0777) != 0 && errno != EEXIST)
+                printf("os-test-run: mkdir %s failed: %s\n", path, strerror(errno));
             continue;
         }
         char *dir = strtok(NULL, " \n");

@@ -22,6 +22,12 @@ use super::*;
 use std::path::{Path, PathBuf};
 
 const DATAFS_STACK_SIZE: u32 = 32 * 1024;
+/// The stack of the probe. Its calls are nested: `verify` holds a reply of 1 KiB (`MESSAGE_MAX`) and
+/// the checks of the version 3 series add `stat_of`, `Client::call` with its own reply and request
+/// and the copies the `Result`s make, each of a kilobyte or more; 16 KiB (`CHILD_STACK_SIZE`) was
+/// overrun by a write fault below the stack in the verifying boot. 32 KiB leaves the room of the
+/// deepest chain (about 8 frames of 2 KiB) twice over.
+const DATA_PROBE_STACK_SIZE: u32 = 32 * 1024;
 const DISK_BYTES: u64 = 64 << 20;
 const STEPS: u32 = 12;
 /// The files of the tree after the 12 steps: f2 to f4, f6 to f8 and f10 to f12.
@@ -41,16 +47,20 @@ const DATAFS_TAG: &str = "17";
 /// The kinds of the loop that the probe's two runs use: the methods of proto_data that the series
 /// and the check send (the worker thread does the disk's work, so these steps are the queue's), the notices
 /// with the heartbeat (64) and the notification the service marks as its own (65, the worker's DONE).
-const STEP_KINDS: [(usize, &str); 11] = [
+const STEP_KINDS: [(usize, &str); 15] = [
     (1, "Open"),
     (2, "Close"),
     (3, "Read"),
     (4, "Write"),
     (6, "Fsync"),
+    (8, "Stat"),
     (10, "Mkdir"),
     (11, "Unlink"),
     (13, "Rename"),
     (14, "Readdir"),
+    (19, "Clone"),
+    (25, "Bind"),
+    (26, "Chmod"),
     (64, "the notices and the heartbeat"),
     (65, "the service's own step"),
 ];
@@ -94,7 +104,7 @@ const fn programs(crash: bool) -> [ImageProgram; 5] {
         ("uart", "uart", UART_STACK_SIZE, &[]),
         ("virtio-blk", "virtio-blk", blk_probe::BLK_STACK_SIZE, &[]),
         ("datafsd", "datafsd", DATAFS_STACK_SIZE, datafs),
-        ("data-probe", "data-probe", CHILD_STACK_SIZE, &[]),
+        ("data-probe", "data-probe", DATA_PROBE_STACK_SIZE, &[]),
     ]
 }
 pub const PROGRAMS: [ImageProgram; 5] = programs(false);
@@ -135,6 +145,20 @@ fn image(
         ("STAFETO_DATA_PROBE_MIN", min.as_str()),
         ("STAFETO_DATA_PROBE_WAIT_S", wait.as_str()),
         ("STAFETO_DATAFS_CRASH_AT", point.as_str()),
+        // The version 3 series runs in the two boots of `probe` and not in the crash runs, whose
+        // count of the sectors it would move.
+        (
+            "STAFETO_DATA_PROBE_V3",
+            if crash_at.is_none()
+                && !name.contains("crash")
+                && !name.contains("fill")
+                && !name.contains("settle")
+            {
+                "1"
+            } else {
+                "0"
+            },
+        ),
     ];
     let programs: &'static [ImageProgram] = if crash_at.is_some() {
         &PROGRAMS_CRASH
@@ -160,8 +184,83 @@ fn machine(built: &Built, image: &Path, disk: &Path, icount: bool) -> Command {
 
 /// A run until the probe ends well.
 fn run_to_end(built: &Built, cmd: Command, what: &str) -> Result<Vec<String>, String> {
-    let output = run_until(cmd, BOOT_TIMEOUT * 6, Some(ENDS), &built.kernel.elf)
-        .map_err(|e| format!("data-probe ({what}): {e}"))?;
+    run_to_end_within(built, cmd, what, BOOT_TIMEOUT * 6)
+}
+
+/// The boot ends on the line of the service that holds `marker` (the machine is stopped there), with
+/// a limit of its own and the time the boot took told.
+fn run_to_line(
+    built: &Built,
+    cmd: Command,
+    what: &str,
+    limit: std::time::Duration,
+    marker: &str,
+) -> Result<Vec<String>, String> {
+    let started = std::time::Instant::now();
+    let output = run_until(cmd, limit, Some(marker), &built.kernel.elf).map_err(|e| {
+        format!(
+            "data-probe ({what}): {e} (after {} s)",
+            started.elapsed().as_secs()
+        )
+    })?;
+    if !output.stopped_on_marker {
+        return Err(format!(
+            "data-probe ({what}): the line {marker:?} did not come in {} s",
+            limit.as_secs()
+        ));
+    }
+    println!(
+        "data-probe fill: the {what} took {} s of {} s allowed",
+        started.elapsed().as_secs(),
+        limit.as_secs()
+    );
+    Ok(output.lines)
+}
+
+/// READY must come at once, whatever the volume holds: the mount work reads the mark and counts the
+/// pairs (about two reads for each, 5,000 at the cap of 2,048), at most this long. The job comes
+/// after it.
+const READY_MS_MAX: u64 = 15_000;
+
+/// The times of the converting boot: READY (`datafs: ready after N ms`, at most `READY_MS_MAX`) and
+/// the job (`datafs: conversion ended after N ms, ...`).
+fn conversion_times(lines: &[String]) -> Result<(u64, u64), String> {
+    let number = |prefix: &str| {
+        qemu::number_after(lines, prefix).ok_or_else(|| format!("no number after {prefix:?}"))
+    };
+    let ready = number("datafs: ready after ")?;
+    let job = number("datafs: conversion ended after ")?;
+    if ready > READY_MS_MAX {
+        return Err(format!(
+            "READY came after {ready} ms, over {READY_MS_MAX} ms: the conversion held it, or the count of pairs did"
+        ));
+    }
+    Ok((ready, job))
+}
+
+/// The same with a limit of its own, and the time the boot took told: the boots of `fill` last
+/// minutes (the conversion of a full volume holds READY for as long as it takes), and the whole
+/// command has the 60 minutes of the probe workflow.
+fn run_to_end_within(
+    built: &Built,
+    cmd: Command,
+    what: &str,
+    limit: std::time::Duration,
+) -> Result<Vec<String>, String> {
+    let started = std::time::Instant::now();
+    let output = run_until(cmd, limit, Some(ENDS), &built.kernel.elf).map_err(|e| {
+        format!(
+            "data-probe ({what}): {e} (after {} s)",
+            started.elapsed().as_secs()
+        )
+    })?;
+    if limit > BOOT_TIMEOUT * 6 {
+        println!(
+            "data-probe fill: the {what} took {} s of {} s allowed",
+            started.elapsed().as_secs(),
+            limit.as_secs()
+        );
+    }
     if let Some(failed) = output
         .lines
         .iter()
@@ -307,6 +406,10 @@ pub fn probe() -> Result<(), String> {
         .map(|j| format!("data-probe: synced {j}"))
         .collect();
     wanted.push("data-probe: written".into());
+    // The version 3 series: the record of a native client's files, and the refusals of a session
+    // with no mark and no BIND (NOT_BOUND) and of a BIND with a copy that is no identity session.
+    wanted.push("data-probe: v3 stat 0644 0:0 ino ok".into());
+    wanted.push("data-probe: unbound session refused ok".into());
     wanted.push("data-probe: finished".into());
     need(&lines, &wanted, "writing")?;
     if datafs_line(&lines, "partition table written, data volume formatted").is_none() {
@@ -327,9 +430,10 @@ pub fn probe() -> Result<(), String> {
     )?;
     need(
         &lines,
-        &[format!(
-            "data-probe: verify ok progress={STEPS} files={FILES}"
-        )],
+        &[
+            format!("data-probe: verify ok progress={STEPS} files={FILES}"),
+            "data-probe: chmod survives a remount ok".to_string(),
+        ],
         "verifying",
     )?;
     if datafs_line(&lines, "data volume mounted").is_none() {
@@ -438,15 +542,564 @@ pub fn crash(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The lines of the service and of the probe that a measurement run reports, in the order they came.
+fn report(lines: &[String], what: &str) {
+    const WANTED: [&str; 14] = [
+        "datafs: pairs ",
+        "datafs: conversion ended",
+        "datafs: the volume has no mark 4",
+        "datafs: walk own work",
+        "datafs: ready after",
+        "datafs: first walk",
+        "datafs: refresh walk",
+        "datafs: walk cpu",
+        "datafs: job ",
+        "entries got attributes",
+        "datafs: data volume mounted",
+        "data-probe: fill",
+        "datafs: the budget of the worker",
+        "datafs: serve ran",
+    ];
+    println!("data-probe fill ({what}):");
+    for l in lines {
+        let start = l.find("datafs: ").or_else(|| l.find("data-probe: fill"));
+        if let Some(at) = start.filter(|_| WANTED.iter().any(|w| l.contains(w))) {
+            println!("  {}", &l[at..]);
+        }
+    }
+}
+
+/// `cargo xtask data-probe fill`: the measurements of the plan's step on a volume of 1 GiB with
+/// small and large files (`data_image::make_filled`, the layout an older release leaves, no
+/// attribute anywhere). The first boot converts the volume (the lines `entries got attributes` and
+/// `ready after`) and walks it in the quiet; the second boot, on the converted volume, reports the
+/// mount time, the first call, the listing of 1,000 entries, RMDIR, the longest WRITE, the removal of
+/// large files with the refresh walk after it, the longest job of each method (the service is built
+/// with `steps`) and the CPU the worker took in each walk. QEMU runs with real time (no `-icount`):
+/// the figures are those of the host's disk and CPU, for the table of the limit of the volume (the
+/// reads a second and the time of a walk).
+pub fn fill() -> Result<(), String> {
+    let built = Built {
+        kernel: build(Variant::Normal)?,
+    };
+    // One CPU first: no budget `work`, no cross-CPU hand-off, the device rate to put in the table of
+    // the limit of the volume; then two, where the worker has its budget on CPU 1 and the line `walk
+    // cpu` tells its share, and where each read costs two crossings between the CPUs.
+    let one = qemu::on_cpus(1, || fill_on(&built, 1))?;
+    let two = qemu::on_cpus(2, || fill_on(&built, 2))?;
+    println!(
+        "data-probe fill: the first walk read {} blocks a second on one CPU and {} on two (the cost of the hand-off between the CPUs of the worker and the disk service is {}%)",
+        one.rate,
+        two.rate,
+        (one.rate.saturating_sub(two.rate) * 100)
+            .checked_div(one.rate)
+            .unwrap_or(0)
+    );
+    Ok(())
+}
+
+/// What a run on `cpus` CPUs found.
+struct Filled {
+    /// The reads a second of the first walk.
+    rate: u64,
+}
+
+/// The two boots of `fill` on a machine of `cpus` CPUs, on a volume of their own: the lines, and the
+/// check of every figure against its bound.
+fn fill_on(built: &Built, cpus: usize) -> Result<Filled, String> {
+    let disk = Disk::new(&format!("fill{cpus}"));
+    let started = std::time::Instant::now();
+    super::data_image::make_filled(
+        &disk.0,
+        super::data_image::FILL_DISK,
+        super::data_image::FILL_1G,
+    )?;
+    println!(
+        "data-probe fill ({cpus} CPUs): the disk of 2 GiB with a data partition of 1,023 MiB made in {} s",
+        started.elapsed().as_secs()
+    );
+    // The first boot converts the volume. READY comes at once (the mount work reads the mark and
+    // counts the pairs); the conversion is a job of the worker after READY, one entry a step, and
+    // its own line says how long it took (`datafs: conversion ended after N ms`, 142 s as part of
+    // READY for 3,258 entries in the first run). The probe sleeps and the host stops the machine on
+    // that line. The walk the job's commits need fills the window, so the first walk of this boot
+    // is `made at mount`, with no rate: the second boot finds nothing to convert and walks in the
+    // quiet, after READY, and its line has the reads and the time, which give the device rate.
+    let convert = image(
+        "boot-data-probe-convert.img",
+        None,
+        "settle",
+        0,
+        CONVERT_LIMIT.as_secs() as u32,
+    )?;
+    let converted = run_to_line(
+        built,
+        machine(built, &convert, &disk.0, false),
+        "converting boot",
+        CONVERT_LIMIT,
+        "datafs: conversion ended",
+    )?;
+    need_ready(&converted, "converting boot")?;
+    let (ready_ms, job_ms) = conversion_times(&converted)?;
+    println!(
+        "data-probe fill ({cpus} CPUs): READY after {ready_ms} ms, the conversion job ended after {job_ms} ms (after READY, one entry a step)"
+    );
+    // What the job cost for each entry: a commit is some writes and a flush (a sync of the disk file
+    // on the host), which is what a read of 27 blocks an entry does not show.
+    let job_line: Vec<String> = converted
+        .iter()
+        .filter(|l| l.contains("datafs: conversion ended"))
+        .cloned()
+        .collect();
+    let one = |prefix: &str| qemu::number_after(&job_line, prefix);
+    if let (Some(entries), Some(reads), Some(writes), Some(flushes)) = (
+        one("ms, "),
+        one("the job read "),
+        one("blocks, made "),
+        one("writes and "),
+    ) && entries > 0
+    {
+        println!(
+            "data-probe fill ({cpus} CPUs): the job took {} us, read {:.1} blocks, made {:.1} writes and {:.1} flushes for each of {entries} entries",
+            job_ms * 1000 / entries,
+            reads as f64 / entries as f64,
+            writes as f64 / entries as f64,
+            flushes as f64 / entries as f64
+        );
+    }
+    report(
+        &converted,
+        &format!("{cpus} CPUs, the boot that converts the volume"),
+    );
+    let settle = image(
+        "boot-data-probe-settle.img",
+        None,
+        "settle",
+        0,
+        SETTLE_WAIT_S,
+    )?;
+    let settled = run_to_end_within(
+        built,
+        machine(built, &settle, &disk.0, false),
+        "quiet boot",
+        QUIET_LIMIT,
+    )?;
+    need_ready(&settled, "quiet boot")?;
+    report(
+        &settled,
+        &format!("{cpus} CPUs, the boot that walks in the quiet"),
+    );
+    let measure = image("boot-data-probe-fill.img", None, "fill", 0, 0)?;
+    let measured = run_to_end_within(
+        built,
+        machine(built, &measure, &disk.0, false),
+        "measuring boot",
+        MEASURE_LIMIT,
+    )?;
+    need_ready(&measured, "measuring boot")?;
+    need(
+        &measured,
+        &["data-probe: fill done".to_string()],
+        "measuring boot",
+    )?;
+    report(&measured, &format!("{cpus} CPUs, the boot that measures"));
+    let checked = fill_checks(&settled, &measured, cpus)?;
+    for line in &checked.lines {
+        println!("data-probe fill ({cpus} CPUs): {line}");
+    }
+    Ok(Filled { rate: checked.rate })
+}
+
+/// The seconds the converting boot sleeps: the conversion of 3,260 entries, the quiet of 2 s and the
+/// first walk of 1 GiB at 78 % (at most 60 s by the limit 4.3) fit with room over.
+const SETTLE_WAIT_S: u32 = 120;
+
+/// The limits of the three boots of `fill` (the whole command has 60 minutes, and the boots of one
+/// machine took about 12 minutes together in the first run): the conversion holds READY for the
+/// conversion of every entry and the move-out of every inline file (about 110 reads an entry), the
+/// quiet boot sleeps `SETTLE_WAIT_S` s after a walk of up to 60 s, and the measuring boot walks the
+/// volume itself, waits 65 s and removes files.
+const CONVERT_LIMIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+const QUIET_LIMIT: std::time::Duration = std::time::Duration::from_secs(8 * 60);
+const MEASURE_LIMIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// The figures of a pair of boots and the bounds they were checked against.
+struct Checked {
+    /// The reads a second of the first walk.
+    rate: u64,
+    /// One line for each figure: the figure, its bound and the source of the bound.
+    lines: Vec<String>,
+}
+
+/// The reads a call needs by table 4.2 of the plan as amended by the review of step 5: RMDIR of the
+/// oldest directory costs 3.2 reads for each pair of the volume (the pairs are read from the line
+/// `datafs: pairs N of 2048, directories M of 1024`), a `rm -rf` of D directories 1.6 reads for each
+/// pair for each directory (measured 1.53 on the host at 1,010 directories in 2,148 pairs), the
+/// listing of 1,000 entries, and a write (the 393 reads of the creation and write of 1 MiB, rounded
+/// up).
+const READDIR_READS: u64 = 197;
+/// The caps of the volume (`proto_data::PAIRS_MAX` and `DIRS_MAX`).
+const PAIRS_CAP: u64 = 2048;
+const DIRS_CAP: u64 = 1024;
+const WRITE_READS: u64 = 400;
+/// The first walk of a full volume takes at most this long (limit 4.3).
+const WALK_MS_LIMIT: u64 = 60_000;
+/// A measured time may be this much over the time its reads take at the measured rate (3 over 2).
+const MARGIN_NUM: u64 = 3;
+const MARGIN_DEN: u64 = 2;
+/// The overruns of `work` a period of its budget (10 ms) may have in a walk before the share the
+/// line `walk cpu` tells is too low to trust.
+const OVERRUNS_PER_PERIOD: u64 = 4;
+/// The blocks the probe gives back with its 24 removals of 16 MiB, and the part of them the refresh
+/// walk must show in the free count.
+const GIVEN_BACK_BLOCKS: u64 = 24 * (16 << 20) / 4096;
+
+/// Checks every figure of the two boots against its bound: the first walk (a time, from the line of
+/// the converting boot), the device rate it gives, and the bounds of table 4.2 and the limit 4.3 for
+/// the calls of the measuring boot at that rate with a margin of 1.5. On two CPUs also the share the
+/// worker took in a walk and the overruns of its budget.
+fn fill_checks(settled: &[String], measured: &[String], cpus: usize) -> Result<Checked, String> {
+    let walk = first_walk(settled, "converting boot")?.ok_or("no line of the first walk")?;
+    let walk = walk.strip_prefix("datafs: ").unwrap_or(&walk);
+    let (blocks, reads, ms) = parse_walk(walk)
+        .ok_or_else(|| format!("the first walk is not one that ran to its end: {walk:?}"))?;
+    let rate = (reads * 1000)
+        .checked_div(ms)
+        .unwrap_or(reads * 1000)
+        .max(1);
+    let mut lines = vec![format!(
+        "first walk {blocks} blocks used, {reads} reads in {ms} ms: {rate} reads a second"
+    )];
+    if ms > WALK_MS_LIMIT {
+        return Err(format!(
+            "the first walk took {ms} ms, over the 60 s of the limit 4.3 (limit of the volume)"
+        ));
+    }
+    lines.push(format!(
+        "first walk {ms} ms <= {WALK_MS_LIMIT} ms (limit 4.3, a full volume): ok"
+    ));
+    // The time of `reads` reads at the measured rate with the margin, in microseconds.
+    let allowed = |reads: u64| reads * 1_000_000 * MARGIN_NUM / MARGIN_DEN / rate;
+    let number = |prefix: &str| {
+        qemu::number_after(measured, prefix)
+            .ok_or_else(|| format!("no number after {prefix:?} in the measuring boot"))
+    };
+    // The pairs and the directories of the volume, from the count at the mount of the measuring boot.
+    let counts: Vec<(u64, u64)> = measured
+        .iter()
+        .filter_map(|l| {
+            let one = [l.clone()];
+            l.contains("datafs: pairs ")
+                .then(|| {
+                    Some((
+                        qemu::number_after(&one, "datafs: pairs ")?,
+                        qemu::number_after(&one, ", directories ")?,
+                    ))
+                })
+                .flatten()
+        })
+        .collect();
+    let &(pairs, dirs) = counts
+        .first()
+        .ok_or("no line `datafs: pairs N of 2048, directories M of 1024` in the measuring boot")?;
+    if pairs == 0 || pairs > PAIRS_CAP || dirs > DIRS_CAP {
+        return Err(format!(
+            "the volume has {pairs} pairs and {dirs} directories, over the caps of {PAIRS_CAP} and {DIRS_CAP}"
+        ));
+    }
+    lines.push(format!(
+        "the volume has {pairs} pairs of {PAIRS_CAP} and {dirs} directories of {DIRS_CAP}: ok"
+    ));
+    // The first call after the mount comes before the walk in the quiet starts and walks the volume
+    // itself: it takes the time of the first walk (the same reads) with a margin of 1.5 and a second.
+    let first_call = number("data-probe: fill first call ")?;
+    let bound = ms * 1000 * MARGIN_NUM / MARGIN_DEN + 1_000_000;
+    if first_call > bound {
+        return Err(format!(
+            "the first call took {first_call} us, over {bound} us (the first walk took {ms} ms, margin 1.5 and 1 s)"
+        ));
+    }
+    lines.push(format!(
+        "first call {first_call} us <= {bound} us (a first walk of {ms} ms, margin 1.5): ok"
+    ));
+    let rmdir = number("data-probe: fill rmdir ")?;
+    let rmdir_reads = pairs * 32 / 10;
+    let bound = allowed(rmdir_reads);
+    if rmdir > bound {
+        return Err(format!(
+            "RMDIR of the oldest directory took {rmdir} us, over {bound} us (3.2 x {pairs} pairs = {rmdir_reads} reads of table 4.2 at {rate} a second, margin 1.5)"
+        ));
+    }
+    lines.push(format!(
+        "RMDIR {rmdir} us <= {bound} us (3.2 reads for each of {pairs} pairs, table 4.2): ok"
+    ));
+    let tree = number("data-probe: fill rm -rf 199 directories ")?;
+    let tree_reads = 199 * pairs * 16 / 10;
+    let bound = allowed(tree_reads);
+    if tree > bound {
+        return Err(format!(
+            "rm -rf of 199 directories took {tree} us, over {bound} us (1.6 x 199 x {pairs} = {tree_reads} reads at {rate} a second, margin 1.5)"
+        ));
+    }
+    lines.push(format!(
+        "rm -rf of 199 directories {tree} us <= {bound} us (1.6 reads for each pair for each directory): ok"
+    ));
+    let calls = number("data-probe: fill readdir 1002 entries in ")?;
+    let total = number(&format!("{calls} calls, total "))?;
+    let bound = allowed(READDIR_READS) + 2_000 * calls;
+    if total > bound {
+        return Err(format!(
+            "the listing of 1,002 entries took {total} us in {calls} calls, over {bound} us ({READDIR_READS} reads of table 4.2 at {rate} a second, margin 1.5, 2 ms a call)"
+        ));
+    }
+    lines.push(format!(
+        "READDIR of 1,002 entries {total} us in {calls} calls <= {bound} us ({READDIR_READS} reads, table 4.2, and 2 ms a call): ok"
+    ));
+    let write = number("longest call ")?;
+    let bound = allowed(WRITE_READS) + 50_000;
+    if write > bound {
+        return Err(format!(
+            "the longest WRITE took {write} us, over {bound} us ({WRITE_READS} reads of table 4.2 at {rate} a second, margin 1.5, 50 ms)"
+        ));
+    }
+    lines.push(format!(
+        "longest WRITE {write} us <= {bound} us ({WRITE_READS} reads, table 4.2, and 50 ms): ok"
+    ));
+    // The refresh walk: the free count caught up with the removals.
+    let free = measured
+        .iter()
+        .find_map(|l| {
+            l.split_once("data-probe: fill free blocks ")
+                .map(|(_, t)| t.to_owned())
+        })
+        .ok_or("no line of the free blocks")?;
+    let words: Vec<u64> = free.split(' ').filter_map(|w| w.parse().ok()).collect();
+    let &[_, low, after] = words.get(..3).unwrap_or_default() else {
+        return Err(format!("the line of the free blocks is not read: {free:?}"));
+    };
+    if after < low + GIVEN_BACK_BLOCKS * 9 / 10 {
+        return Err(format!(
+            "after the removals the free count went from {low} to {after}, short of 90% of the {GIVEN_BACK_BLOCKS} blocks given back: no refresh walk (limit 4.3, the refresh rule)"
+        ));
+    }
+    if !measured.iter().any(|l| l.contains("datafs: refresh walk ")) {
+        return Err(
+            "the free count caught up but the service printed no line of a refresh walk".into(),
+        );
+    }
+    lines.push(format!(
+        "free blocks {low} -> {after} after the removals (at least 90% of {GIVEN_BACK_BLOCKS} given back) with a refresh walk: ok"
+    ));
+    // The share of the walk that was the worker's own work, on any number of CPUs: the time of the
+    // walk less the time in the disk reads. On a table of one CPU the worker has no budget; when
+    // this share is over 30% there, the review's rule puts its thread at level 1 (below every
+    // program). No bound: the figure is for that decision.
+    let own = settled
+        .iter()
+        .find(|l| l.contains("datafs: walk own work "))
+        .ok_or("no line `walk own work` (the service is built with `steps`)")?;
+    let one = [own.to_string()];
+    let (work, wall) = (
+        qemu::number_after(&one, "walk own work ").unwrap_or(0),
+        qemu::number_after(&one, " us of ").unwrap_or(1).max(1),
+    );
+    lines.push(format!(
+        "the walk's own work {work} us of {wall} us ({}%){}",
+        work * 100 / wall,
+        if work * 100 > wall * 30 {
+            ": over 30%, so on a table of one CPU the worker goes to level 1 (the rule of the review of step 5)"
+        } else {
+            ": at most 30%, the budget of 30% would not bind it"
+        }
+    ));
+    // The budget of the worker: on two CPUs it is there and tells its share; on one it is not.
+    let cpu_lines: Vec<&String> = measured
+        .iter()
+        .chain(settled)
+        .filter(|l| l.contains("datafs: walk cpu "))
+        .collect();
+    if cpus >= 2 {
+        if cpu_lines.is_empty() {
+            return Err("two CPUs and no line `walk cpu`: the worker has no budget".into());
+        }
+        for l in cpu_lines {
+            let one = [l.to_string()];
+            let cpu = qemu::number_after(&one, "walk cpu ").unwrap_or(0);
+            let wall = qemu::number_after(&one, " us of ").unwrap_or(1).max(1);
+            let overruns = qemu::number_after(&one, ", ").unwrap_or(0);
+            let periods = wall / 10_000 + 1;
+            if overruns > OVERRUNS_PER_PERIOD * periods {
+                return Err(format!(
+                    "a walk had {overruns} overruns of `work` in {periods} periods, over {OVERRUNS_PER_PERIOD} a period: the share it tells is too low to trust: {l}"
+                ));
+            }
+            if cpu * 100 > wall * 35 {
+                return Err(format!(
+                    "the worker took {cpu} us of {wall} us in a walk, over the 30% of its budget (and 5% of slack): {l}"
+                ));
+            }
+            lines.push(format!(
+                "walk cpu {cpu} us of {wall} us ({}%), {overruns} overruns in {periods} periods (at most {OVERRUNS_PER_PERIOD} a period): ok",
+                cpu * 100 / wall
+            ));
+        }
+    } else if !cpu_lines.is_empty() {
+        return Err(
+            "one CPU and a line `walk cpu`: a budget on CPU 1 was given to a machine without it"
+                .into(),
+        );
+    } else {
+        lines.push("one CPU: no budget `work`, no line `walk cpu`: ok (the share of the worker on one CPU is read from the time of its walk against the reads it did)".into());
+    }
+    Ok(Checked { rate, lines })
+}
+
+/// The service said it was ready, after how long.
+fn need_ready(lines: &[String], what: &str) -> Result<(), String> {
+    if lines.iter().any(|l| l.contains("datafs: ready after ")) {
+        Ok(())
+    } else {
+        Err(format!(
+            "data-probe fill ({what}): no line `datafs: ready after`"
+        ))
+    }
+}
+
 pub fn command(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         None => probe(),
+        Some("fill") if args.len() == 1 => fill(),
         Some(other) => Err(format!("data-probe: unknown argument {other}")),
     }
 }
 
+/// The names the probe program builds, the file itself (plain code without an allocator).
+#[cfg(test)]
+#[path = "../../tests/data-probe/src/names.rs"]
+mod probe_names;
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_names_of_the_removals_are_the_names_the_fill_volume_made() {
+        use super::probe_names::{big_name, decimal, rm_name};
+        // The fill makes /rm/e0 to /rm/e199 and /big/b0 to /big/b31, in decimal.
+        for n in 0..200u32 {
+            let mut name = [0u8; 16];
+            let len = rm_name(n, &mut name);
+            assert_eq!(&name[..len], format!("/rm/e{n}").as_bytes(), "{n}");
+        }
+        for n in 0..32u32 {
+            let mut name = [0u8; 16];
+            let len = big_name(n, &mut name);
+            assert_eq!(&name[..len], format!("/big/b{n}").as_bytes(), "{n}");
+        }
+        for n in [0u32, 9, 10, 99, 100, 199, 999, 1000, 9999] {
+            let mut digits = [0u8; 4];
+            let d = decimal(n, &mut digits);
+            assert_eq!(&digits[..d], n.to_string().as_bytes(), "{n}");
+        }
+    }
+
+    fn lines(text: &[&str]) -> Vec<String> {
+        text.iter().map(|l| (*l).to_owned()).collect()
+    }
+
+    /// The lines of a pair of boots that pass: a walk of 150,000 reads in 15 s (10,000 reads a second).
+    fn fixture(cpus: usize) -> (Vec<String>, Vec<String>) {
+        let settled = lines(&[
+            "datafs: first walk 200000 blocks used, 150000 reads, 15000 ms",
+            "datafs: walk own work 3000000 us of 15000000 us, 12000000 us in disk reads",
+            "datafs: ready after 900 ms, 700 reads",
+        ]);
+        let mut measured = lines(&[
+            "data-probe: fill first call 15000000 us, 261888 blocks, 60000 free",
+            "data-probe: fill readdir 1002 entries in 3 calls, total 30000 us, longest 20000 us",
+            "data-probe: fill rmdir 150000 us",
+            "data-probe: fill rm -rf 199 directories 15000000 us",
+            "datafs: pairs 400 of 2048, directories 230 of 1024",
+            "data-probe: fill write 8388608 bytes in 9000 calls, total 900000 us, longest call 90000 us",
+            "data-probe: fill free blocks 60000 before the removals, 60040 right after, 158000 after 4 s of quiet",
+            "datafs: refresh walk 100000 blocks used, about 98304 given back, 100000 reads, 10000 ms",
+        ]);
+        if cpus >= 2 {
+            measured.push("datafs: walk cpu 800000 us of 10000000 us, 3 overruns".into());
+        }
+        (settled, measured)
+    }
+
+    #[test]
+    fn the_fill_figures_are_checked_against_the_bounds_of_the_plan() {
+        for cpus in [1, 2] {
+            let (settled, measured) = fixture(cpus);
+            let checked = super::fill_checks(&settled, &measured, cpus).unwrap();
+            assert_eq!(checked.rate, 10_000);
+            assert!(checked.lines.len() >= 5);
+        }
+        let slow = |from: &str, to: &str, cpus: usize| {
+            let (settled, measured) = fixture(cpus);
+            let measured: Vec<String> = measured.iter().map(|l| l.replace(from, to)).collect();
+            super::fill_checks(&settled, &measured, cpus)
+        };
+        // The first call over 1.5 times the first walk (15 s) and a second.
+        assert!(slow("first call 15000000 us", "first call 23500000 us", 2).is_ok());
+        assert!(slow("first call 15000000 us", "first call 23500001 us", 2).is_err());
+        // RMDIR over 1.5 times 3.2 x 400 pairs = 1,280 reads at 10,000 a second (192 ms).
+        assert!(slow("rmdir 150000 us", "rmdir 192001 us", 2).is_err());
+        assert!(slow("rmdir 150000 us", "rmdir 192000 us", 2).is_ok());
+        // rm -rf of 199 directories: 1.5 times 1.6 x 199 x 400 = 127,360 reads (19.104 s).
+        assert!(slow("directories 15000000 us", "directories 19104001 us", 2).is_err());
+        assert!(slow("directories 15000000 us", "directories 19104000 us", 2).is_ok());
+        // Pairs over the cap, or no line of the count.
+        assert!(slow("pairs 400 of", "pairs 2049 of", 2).is_err());
+        // The listing over 1.5 times 197 reads and 2 ms for each of 3 calls.
+        assert!(slow("total 30000 us", "total 35550 us", 2).is_ok());
+        assert!(slow("total 30000 us", "total 35551 us", 2).is_err());
+        // The longest write over 1.5 times 400 reads and 50 ms.
+        assert!(slow("longest call 90000 us", "longest call 111000 us", 2).is_err());
+        // A free count that did not catch up: no refresh.
+        assert!(slow("158000 after", "60100 after", 2).is_err());
+        // Overruns of `work` over 4 a period make the share untrustworthy; a share over the budget fails.
+        assert!(slow("3 overruns", "4005 overruns", 2).is_err());
+        assert!(slow("800000 us of", "4000000 us of", 2).is_err());
+        // Two CPUs need the line of the share; one CPU must not have it.
+        let (settled, mut measured) = fixture(2);
+        measured.pop();
+        assert!(super::fill_checks(&settled, &measured, 2).is_err());
+        let (settled, measured) = fixture(2);
+        assert!(super::fill_checks(&settled, &measured, 1).is_err());
+        // A first walk over 60 s.
+        let (mut settled, measured) = fixture(1);
+        settled[0] = "datafs: first walk 200000 blocks used, 150000 reads, 60001 ms".into();
+        assert!(super::fill_checks(&settled, &measured, 1).is_err());
+    }
+
+    #[test]
+    fn ready_must_come_at_once_and_the_conversion_job_has_its_own_line() {
+        let ok = lines(&[
+            "datafs: ready after 700 ms, 900 reads",
+            "datafs: conversion ended after 142361 ms, 3258 entries got attributes, 0 inline files moved out",
+        ]);
+        assert_eq!(super::conversion_times(&ok), Ok((700, 142_361)));
+        let slow = lines(&[
+            "datafs: ready after 15001 ms, 900 reads",
+            "datafs: conversion ended after 5 ms, 3 entries got attributes, 0 inline files moved out",
+        ]);
+        assert!(super::conversion_times(&slow).is_err());
+        assert!(super::conversion_times(&ok[..1]).is_err());
+    }
+
+    #[test]
+    fn the_probe_has_the_stack_its_nested_calls_need() {
+        // The verifying boot overran 16 KiB: the stack is not lowered again without a measurement.
+        const { assert!(super::DATA_PROBE_STACK_SIZE >= 32 * 1024) };
+        assert!(
+            super::PROGRAMS
+                .iter()
+                .any(|p| p.0 == "data-probe" && p.2 == super::DATA_PROBE_STACK_SIZE)
+        );
+    }
+
     #[test]
     fn a_walk_line_is_read_only_in_the_form_of_a_walk_that_ran_to_its_end() {
         use super::parse_walk;

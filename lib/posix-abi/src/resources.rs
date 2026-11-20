@@ -183,6 +183,9 @@ pub fn truncate_path(path: &[u8], length: i64, umask: u32) -> Result<(), i32> {
         let length = u64::try_from(length).map_err(|_| EINVAL)?;
         let fd = crate::open_policy(path, O_WRONLY | O_NOCTTY | O_CLOEXEC | O_CLOFORK, 0, umask)?;
         let result = crate::shared::held(fd as u32, |_, target| {
+            if let posix_fs::Target::Data(data) = target {
+                return crate::data::truncate(data.handle, length);
+            }
             let posix_fs::Target::Ram(target) = target else {
                 return Err(EINVAL);
             };

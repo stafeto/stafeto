@@ -1205,6 +1205,7 @@ pub fn nvme_persist(args: &[String]) -> Result<(), String> {
             };
             return nvme_persist_key(case, breaks);
         }
+        Some("upgrade") if args.len() == 1 => return nvme_persist_key(KeyCase::Upgrade, false),
         Some("blk-probe") if args.len() == 1 => return nvme_blk_probe(),
         Some("shutdown") if args.len() == 1 => return nvme_shutdown(),
         Some("stop-handlers") if args.len() == 1 => return nvme_stop_handlers(false),
@@ -1502,6 +1503,9 @@ enum KeyCase {
     /// The same image with the file 1 GiB longer, as an enlarged volume is: the backup copy of the
     /// table is moved to the new end and the volume mounts.
     ImageGrown,
+    /// A volume as the 0.5.1 image left it (`data_image::make_v051`: the table, `/ssh` and the key
+    /// file, no attribute on any entry) under the image of this tree: the first mount converts it.
+    Upgrade,
 }
 
 /// The size of the file that stands for an ESP in the case `WrongDisk`.
@@ -1565,8 +1569,17 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
         (KeyCase::Foreign, _) => "-foreign",
         (KeyCase::Image, _) => "-image",
         (KeyCase::ImageGrown, _) => "-image-grown",
+        (KeyCase::Upgrade, _) => "-upgrade",
     };
     let mut list = PROGRAMS_KEY.to_vec();
+    if case == KeyCase::Upgrade {
+        // The service of the host key tells the modes it finds after the conversion.
+        for program in &mut list {
+            if program.0 == "datakey" {
+                program.3 = &["modes"];
+            }
+        }
+    }
     if breaks {
         for program in &mut list {
             if program.0 == "nvme-blk" {
@@ -1595,12 +1608,18 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
     efi::make_disk(&loader, &artifacts, &esp)?;
     let file = Disk::new(&format!("nvme-key{tag}"));
     let shape = match case {
-        KeyCase::Normal | KeyCase::Foreign | KeyCase::Image | KeyCase::ImageGrown => Shape::Plain,
+        KeyCase::Normal
+        | KeyCase::Foreign
+        | KeyCase::Image
+        | KeyCase::ImageGrown
+        | KeyCase::Upgrade => Shape::Plain,
         KeyCase::NoDisk => Shape::Absent,
         KeyCase::WrongDisk | KeyCase::WrongBlank => Shape::Wrong,
     };
     if case == KeyCase::Foreign {
         write_ec2_noise(&file.0)?;
+    } else if case == KeyCase::Upgrade {
+        data_image::make_v051(&file.0, DISK_BYTES, &UPGRADE_KEY)?;
     } else if case == KeyCase::Image || case == KeyCase::ImageGrown {
         data_image::make(&file.0, DISK_BYTES)?;
         if case == KeyCase::ImageGrown {
@@ -1634,6 +1653,9 @@ fn nvme_persist_key(case: KeyCase, breaks: bool) -> Result<(), String> {
     }
     if case == KeyCase::Image || case == KeyCase::ImageGrown {
         return nvme_key_image(case, &run);
+    }
+    if case == KeyCase::Upgrade {
+        return nvme_upgrade(&run);
     }
     if case != KeyCase::Normal {
         return nvme_key_without_volume(case, breaks, &file.0, &run);
@@ -1851,6 +1873,126 @@ fn nvme_key_image(
         } else {
             ""
         }
+    );
+    Ok(())
+}
+
+/// The bytes of the key on the volume the 0.5.1 image left (test bytes, no key of any server): 120
+/// bytes, as long as a dropbear Ed25519 key file.
+const UPGRADE_KEY: [u8; 120] = {
+    let mut key = [0u8; 120];
+    let mut i = 0;
+    while i < key.len() {
+        key[i] = (i as u8).wrapping_mul(37).wrapping_add(11);
+        i += 1;
+    }
+    key
+};
+
+/// The 64-bit FNV-1a of `bytes`, the fingerprint the probe that stands in for the boot script
+/// prints.
+fn fnv_of(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// `nvme-persist upgrade`: a data volume made the way the 0.5.1 image left it (a table, `/ssh` and
+/// the key file the boot script's key became, with no attribute on any entry) boots under the image
+/// of this tree, twice. The first boot converts it at the mount: the line `datafs: N entries got
+/// attributes` (the root, `/ssh`, the key file and the hidden directory at least, three), and the
+/// service of the host key, a native client, finds the entries as the closed defaults say: the root
+/// 0755, `/ssh` 0700, the key 0600. The key is put into `/etc/dropbear` and its fingerprint is that
+/// of the bytes the host wrote. The second boot converts nothing, reports the same modes and the
+/// same fingerprint.
+fn nvme_upgrade(run: &dyn Fn() -> Result<Vec<String>, String>) -> Result<(), String> {
+    let name = "nvme-persist upgrade";
+    let (first, second) = (run()?, run()?);
+    let wanted = format!("{:016x}", fnv_of(&UPGRADE_KEY));
+    for (lines, boot) in [(&first, "first"), (&second, "second")] {
+        no_restart_loop(lines, name)?;
+        no_foreign_report(lines, &format!("{name}, {boot} boot"))?;
+        if said(lines, "datafs: data volume formatted")
+            || said(lines, "datafs: partition table written")
+            || said(lines, "the volume's format is newer")
+        {
+            return Err(format!(
+                "{name}, {boot} boot: datafs formatted or refused the volume: {:?}",
+                lines
+                    .iter()
+                    .filter(|l| l.contains("datafs: "))
+                    .collect::<Vec<_>>()
+            ));
+        }
+        if !said(lines, "datakey: host key restored from /data") {
+            return Err(format!(
+                "{name}, {boot} boot: the key of the volume was not restored: {:?}",
+                lines
+                    .iter()
+                    .filter(|l| l.contains("datakey"))
+                    .collect::<Vec<_>>()
+            ));
+        }
+        if !said(lines, "datakey: modes / 0755 /ssh 0700 key 0600") {
+            return Err(format!(
+                "{name}, {boot} boot: the modes are not the defaults of the old volume (root 0755, /ssh 0700, key 0600): {:?}",
+                lines
+                    .iter()
+                    .filter(|l| l.contains("datakey: modes"))
+                    .collect::<Vec<_>>()
+            ));
+        }
+        // The key is an inline file the 0.5.1 service made: the mount work moved it out, so that a
+        // write at its start and in its middle is kept (littlefs 2.11.3 loses it otherwise).
+        if !said(lines, "datakey: key rewritten in place and read back") {
+            return Err(format!(
+                "{name}, {boot} boot: the key was not rewritten in place and read back: {:?}",
+                lines
+                    .iter()
+                    .filter(|l| l.contains("datakey: "))
+                    .collect::<Vec<_>>()
+            ));
+        }
+        let fingerprint = key_fingerprint(lines)?;
+        if fingerprint != wanted {
+            return Err(format!(
+                "{name}, {boot} boot: the fingerprint is {fingerprint}, the bytes the host wrote make {wanted}"
+            ));
+        }
+    }
+    let converted = first
+        .iter()
+        .find_map(|l| {
+            let at = l.find(" entries got attributes")?;
+            l[..at].rsplit(' ').next()?.parse::<u64>().ok()
+        })
+        .ok_or_else(|| {
+            format!(
+                "{name}: the first boot did not convert the volume: {:?}",
+                first
+                    .iter()
+                    .filter(|l| l.contains("datafs: "))
+                    .collect::<Vec<_>>()
+            )
+        })?;
+    if converted < 3 {
+        return Err(format!(
+            "{name}: the first boot gave records to {converted} entries, 3 at least (the root, /ssh, the key)"
+        ));
+    }
+    if said(&second, " entries got attributes") {
+        return Err(format!(
+            "{name}: the second boot converted again: {:?}",
+            second
+                .iter()
+                .filter(|l| l.contains("datafs: "))
+                .collect::<Vec<_>>()
+        ));
+    }
+    println!("nvme-persist: upgrade root 0755 ssh 0700 key 0600 ok");
+    println!("nvme-persist: host key fingerprint kept ok");
+    println!(
+        "{name}: a volume made as the 0.5.1 image leaves it was converted at the first mount ({converted} entries), mounted again with nothing to convert, and its key came back with the fingerprint FNV:{wanted} on both boots: ok"
     );
     Ok(())
 }

@@ -33,7 +33,7 @@ use posix_process_service::queue::Queue;
 use posix_process_service::queued::{Queued, Waiting};
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
 use posix_process_service::rejoin::{self, Outcome, Refusal, Rejoin};
-use posix_process_service::roots::{Registration, Roots, registration};
+use posix_process_service::roots::{Registration, Roots, TAKEN_RIGHTS, registration};
 use posix_process_service::shares::{self, Got, Shares};
 use posix_process_service::signals::{self, Info, PageStart, Posted};
 use posix_process_service::stopping::{Act, Stop};
@@ -4420,6 +4420,31 @@ impl Processes {
         }
     }
 
+    /// TakeRoot, through the session of any record: a copy of the root of the data file service
+    /// with `roots::TAKEN_RIGHTS` (`roots::Roots::taken`): the process sends the root SESSION and
+    /// VERIFY_SESSION and cannot copy it (TRANSFER is the right every handle of a reply needs). One
+    /// duplicate of a handle the service holds, so no call to the data service and no wait.
+    fn take_root(&self, r: &mut Request<'_>) -> Answer {
+        let Ok(LoaderRoot { root }) = LoaderRoot::read(r.body()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let root = match self.loader_roots.taken(root) {
+            Ok(root) => root,
+            Err(code) => return refuse(code),
+        };
+        let copy = match sys::handle_duplicate(root, TAKEN_RIGHTS) {
+            Ok(copy) => copy,
+            Err(e) => return kernel(e),
+        };
+        if r.reply().u32(0).is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        Answer::Reply([copy.erase()].into())
+    }
+
     /// The reply of a loader's request for a root: a copy of `root` that
     /// sends and transfers, UNREGISTERED when its service sent none.
     fn loader_root_reply(&self, root: Option<&Handle<Channel>>, r: &mut Request<'_>) -> Answer {
@@ -4976,6 +5001,9 @@ impl Service<0> for Processes {
         }
         if method == Method::Share as u16 {
             return self.share(index, r);
+        }
+        if method == Method::TakeRoot as u16 {
+            return self.take_root(r);
         }
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);

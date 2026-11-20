@@ -5379,6 +5379,48 @@ static lfs_ssize_t lfs_fs_size_(lfs_t *lfs) {
     return size;
 }
 
+// the number of metadata pairs of the filesystem and the number of directories: the
+// length of the threaded list of pairs that lfs_fs_traverse_ walks, the
+// superblock's pair first, and the pairs that begin a directory. A pair whose
+// tail is a hard tail (dir.split) continues its directory with the next pair,
+// any other tail (a soft tail) starts the next directory, and the first pair
+// is the root. Each pair is fetched once, no entry is looked at, so the cost is
+// about the fetch of two blocks for each pair.
+static int lfs_fs_pairs_(lfs_t *lfs, lfs_size_t *pairs, lfs_size_t *dirs) {
+    lfs_mdir_t dir = {.tail = {0, 1}};
+    struct lfs_tortoise_t tortoise = {
+        .pair = {LFS_BLOCK_NULL, LFS_BLOCK_NULL},
+        .i = 1,
+        .period = 1,
+    };
+    lfs_size_t npairs = 0;
+    lfs_size_t ndirs = 0;
+    bool continues = false;
+    while (!lfs_pair_isnull(dir.tail)) {
+        int err = lfs_tortoise_detectcycles(&dir, &tortoise);
+        if (err < 0) {
+            return LFS_ERR_CORRUPT;
+        }
+
+        // the pair we are about to fetch begins a directory unless the one
+        // before it said, with a hard tail, that its directory goes on
+        if (!continues) {
+            ndirs += 1;
+        }
+
+        err = lfs_dir_fetch(lfs, &dir, dir.tail);
+        if (err) {
+            return err;
+        }
+        continues = dir.split;
+        npairs += 1;
+    }
+
+    *pairs = npairs;
+    *dirs = ndirs;
+    return 0;
+}
+
 // explicit garbage collection
 #ifndef LFS_READONLY
 static int lfs_fs_gc_(lfs_t *lfs) {
@@ -6697,6 +6739,20 @@ lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
     LFS_TRACE("lfs_fs_size -> %"PRId32, res);
     LFS_UNLOCK(lfs->cfg);
     return res;
+}
+
+int lfs_fs_pairs(lfs_t *lfs, lfs_size_t *pairs, lfs_size_t *dirs) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_fs_pairs(%p, %p, %p)", (void*)lfs, (void*)pairs, (void*)dirs);
+
+    err = lfs_fs_pairs_(lfs, pairs, dirs);
+
+    LFS_TRACE("lfs_fs_pairs -> %d", err);
+    LFS_UNLOCK(lfs->cfg);
+    return err;
 }
 
 int lfs_fs_traverse(lfs_t *lfs, int (*cb)(void *, lfs_block_t), void *data) {

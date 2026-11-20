@@ -2143,12 +2143,20 @@ impl Probe<'_> {
         let send = |fds: &[u32], handle: Handle<Channel>| -> Result<u32, &'static str> {
             let mut list = [0u32; proto_pipe::sock::FDS_MAX];
             list[..fds.len()].copy_from_slice(fds);
+            // Every pass of this check is a socket of the network service.
+            let mut kinds = 0;
+            for (i, fd) in fds.iter().enumerate() {
+                if *fd >= PASS {
+                    kinds = proto_pipe::sock::with_kind(kinds, i, proto_pipe::sock::KIND_NET);
+                }
+            }
             let message = Send {
                 key: None,
                 end,
                 flags: 0,
                 fds: list,
                 nfds: fds.len(),
+                kinds,
                 to: Addr::NONE,
                 bytes: b"m",
             };

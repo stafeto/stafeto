@@ -16,3 +16,7 @@ bench = false
 [dependencies]
 # The Open POSIX tests read /proc/<pid>/stat, which the layer makes.
 posix-crt = { path = "../../lib/posix-crt", features = ["procfs"] }
+
+[features]
+# The paths under /data go to the data file service (xtask open-posix --data).
+data = ["posix-crt/data"]

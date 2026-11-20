@@ -27,6 +27,10 @@ unsafe extern "C" {
     fn datafs_mount(d: *mut c_void, ctx: *mut c_void) -> c_int;
     fn datafs_unmount(d: *mut c_void, ctx: *mut c_void) -> c_int;
     fn datafs_used(d: *mut c_void, ctx: *mut c_void) -> i64;
+    fn datafs_pairs(d: *mut c_void, ctx: *mut c_void, out: *mut u32) -> c_int;
+    fn datafs_outline(d: *mut c_void, ctx: *mut c_void, path: *const c_char, dry: c_int) -> c_int;
+    fn datafs_set_inline(d: *mut c_void, max: u32);
+    fn datafs_file_inline(d: *mut c_void, ctx: *mut c_void, slot: c_int) -> c_int;
     fn datafs_open(d: *mut c_void, ctx: *mut c_void, path: *const c_char, flags: c_int) -> c_int;
     fn datafs_close(d: *mut c_void, ctx: *mut c_void, slot: c_int) -> c_int;
     fn datafs_read(d: *mut c_void, ctx: *mut c_void, slot: c_int, buf: *mut u8, size: u32) -> i64;
@@ -486,6 +490,32 @@ impl<'a, D: Device> Fs<'a, D> {
         check64(self.call(|d, ctx| unsafe { datafs_used(d, ctx) }))
     }
 
+    /// The metadata pairs of the volume and its directories (the pairs are the list `lfs_fs_pred` walks to find the pair before the one a
+    /// removal takes out): about two reads for each pair.
+    pub fn metadata_pairs(&mut self) -> Res<(u64, u64)> {
+        let mut out = [0u32; 2];
+        // SAFETY: as above; `out` holds the two words.
+        check(self.call(|d, ctx| unsafe { datafs_pairs(d, ctx, out.as_mut_ptr()) }))?;
+        Ok((u64::from(out[0]), u64::from(out[1])))
+    }
+
+    /// Whether the file at `path` is inline and not empty (`dry`), or, with `dry` false, moves such
+    /// a file out to blocks of its own in one commit; true for such a file, false for any other (a
+    /// file in a block, an empty file, a directory is an error).
+    pub fn outline(&mut self, path: &[u8], dry: bool) -> Res<bool> {
+        let path = CPath::new(path)?;
+        // SAFETY: as above; the path is a C string that lives through the call.
+        let r = self.call(|d, ctx| unsafe { datafs_outline(d, ctx, path.ptr(), c_int::from(dry)) });
+        check(r).map(|n| n == 1)
+    }
+
+    /// Whether the open file is inline (its bytes inside the pair of its directory) and not empty.
+    pub fn file_inline(&mut self, file: File) -> Res<bool> {
+        // SAFETY: as above.
+        check(self.call(|d, ctx| unsafe { datafs_file_inline(d, ctx, c_int::from(file.0)) }))
+            .map(|n| n == 1)
+    }
+
     /// Walks the file system once and fills the allocator's window from it: every block the tree
     /// refers to is marked, the others are free. The walk only reads. The estimate of freed blocks
     /// starts again from 0. Make it where no operation is half done (between jobs).
@@ -756,6 +786,16 @@ pub const fn file_blocks(bytes: u64) -> u64 {
         0
     } else {
         blocks_of(bytes)
+    }
+}
+
+impl<D: Device> Fs<'_, D> {
+    /// The inline limit of the configuration for the next mount: 0 for littlefs's default (small
+    /// files inside the pair of their directory, the layout an older release made, which the makers
+    /// of test volumes write), `u32::MAX` for none (the service's setting).
+    pub fn set_inline_max(&mut self, max: u32) {
+        // SAFETY: sets a word of the configuration of the state.
+        unsafe { datafs_set_inline(self.state.0.as_mut_ptr().cast(), max) };
     }
 }
 
