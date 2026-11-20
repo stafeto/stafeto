@@ -50,6 +50,9 @@ pub struct Options {
     pub remote: Option<String>,
     /// Packages whose recipe is changed on purpose (the carrying probe of `pkg-identity`).
     pub perturb: Vec<String>,
+    /// Packages that get one more file on purpose, so that what they install
+    /// changes (the same probe; with `perturb` the content differs too).
+    pub perturb_content: Vec<String>,
     /// The build is a packages-only update (`pkg::Options::packages_only`).
     pub packages_only: bool,
 }
@@ -74,6 +77,7 @@ impl Default for Options {
             serial_after: None,
             remote: None,
             perturb: Vec::new(),
+            perturb_content: Vec::new(),
             packages_only: false,
         }
     }
@@ -698,6 +702,7 @@ pub fn run(o: &Options) -> Result<PathBuf, String> {
         cert: o.cert.clone(),
         previous: o.previous.clone(),
         perturb: o.perturb.clone(),
+        perturb_content: o.perturb_content.clone(),
         packages_only: o.packages_only,
         ..pkg::Options::default()
     })?;

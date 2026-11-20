@@ -500,7 +500,14 @@ link programs (for a package with programs) and `build-depends <name>
   index and the entries of `keys/revoked` of the tree; the list next to the
   index may not be older than the tree's, an index that has expired is
   refused, and so is one older than the serial in
-  `packages/published-serial.txt`, lines `<series> <serial>`). A package of a new
+  `packages/published-serial.txt`, lines `<series> <serial>`). A package of
+  the same version whose recipe differs is carried all the same when what it
+  installs equals what the file of the entry installs: the same `manifest`
+  lines except the one of `SOURCE`, and the same `meta` fields except
+  `recipe`, `commit`, `release` and `size` (a package built for one image
+  with `replace` or `remove` is never compared). The plan prints `carried,
+  same content` for it, and `built (content changed: first difference <path
+  or meta field>)` for a package that differs. A package of a new
   recipe takes `release` one above the entry of the same version, or 1 for a
   new version or a new name; the `release` field of a description is a base
   the plan replaces. No index (answer 404, no `INDEX` file) means every
@@ -593,6 +600,23 @@ link programs (for a package with programs) and `build-depends <name>
   with their sources. `cargo xtask pkg-ci` runs `pkg-build`, `repo`, `abi --check`,
   `pkg-identity` and `dist-licenses` in a row;
   it is the job `pkg` of the CI.
+
+### Reproducible builds
+
+Carrying by content (above) works when the same inputs give the same
+installed bytes. xtask starts every `tools/build-*.py` with
+`SOURCE_DATE_EPOCH=1767225600` (2026-01-01, a fixed number, since the time of
+a commit would change the bytes with every commit) and `PYTHONHASHSEED=0`;
+the environment of xtask itself and so the times of images and package tables
+are unchanged. BusyBox and OpenSSL write the time of the build into the
+program, and now write that fixed time. `cargo xtask pkg-repro` checks the
+rest: it moves `target/` away, builds every package from an empty `target/`
+into one directory, moves that `target/` away, builds again into another
+directory, and prints per package `same` or `DIFFERS` with the first path (or
+`meta <field>`) that differs and how many more do. It exits with an error if
+any package differs. It runs on a runner: `gh workflow run probe.yml --ref
+<branch> -f command=pkg-repro -f timeout=60` (it refuses outside GitHub
+Actions without `--force`).
 
 ## Add a package
 

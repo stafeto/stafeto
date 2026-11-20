@@ -466,11 +466,7 @@ pub fn reference() -> Result<Report, String> {
     let program = root.join("target/lvgl-host/lvgl-ref");
     // The script builds what is missing or stale and places the font for the
     // reference (a few seconds when all is built).
-    run_cmd(
-        Command::new("python3")
-            .arg(root.join("tools/build-lvgl.py"))
-            .arg("--host"),
-    )?;
+    run_cmd(crate::build_script(root.join("tools/build-lvgl.py")).arg("--host"))?;
     // The font lies under a relative path as long as the guest's, so that the
     // pool's largest use is the guest's (tools/build-lvgl.py, REFERENCE_FONT).
     let out = Command::new(&program)

@@ -121,6 +121,7 @@ mod pci_walk;
 mod pkg;
 mod pkg_probe;
 mod pkg_probes;
+mod pkg_repro;
 mod pkg_sign;
 mod pkg_slot;
 mod pkg_states;
@@ -2247,6 +2248,7 @@ commands:
   image-repack IMAGE --packages D  put the package files of D into a boot image of the same layout
   abi       the fingerprint of the ABI of the packages against packages/abi.txt (`--check`, `--update`,
             `--freeze`, `--explain`; `--release` wants a frozen series; docs/packages.md)
+  pkg-repro build every package twice from scratch and compare what they install (a runner: probe.yml)
   pkg-ci    pkg-build, repo, abi, pkg-identity and dist-licenses in a row (the job `pkg` of CI)
   init-reserve  build the programs of the base table that restart and check that the largest
             need of a restart, DMA objects included, fits INIT_RESERVE_PAGES
@@ -2802,6 +2804,7 @@ fn main() {
         Some("packages") => packages_command(args.get(1).map(String::as_str)),
         Some("keys") => keys::command(&args[1..]),
         Some("pkg-build") => pkg::command(&args[1..]),
+        Some("pkg-repro") => pkg_repro::command(&args[1..]),
         Some("repo") => repo::command(&args[1..]),
         Some("pkg-identity") => pkg_probes::identity(),
         Some("dist-licenses") => pkg_probes::dist_licenses(),
@@ -3003,6 +3006,28 @@ fn once<K: PartialEq, T: Clone>(
 fn cargo() -> Command {
     let mut c = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     c.current_dir(root());
+    c
+}
+
+/// The time the build scripts of programs (`tools/build-*.py`) see as
+/// `SOURCE_DATE_EPOCH`: 2026-01-01 00:00:00 UTC. A fixed number keeps the
+/// bytes of a program the same from one build to the next (BusyBox and
+/// OpenSSL write the time of the build into the program); the time of a
+/// commit would change them with every commit. The environment of xtask
+/// itself stays as it is, so the times of the files of an image and of the
+/// table of a package do not move.
+const PROGRAM_EPOCH: &str = "1767225600";
+
+/// `python3 <script>` for a build script of programs, with the environment
+/// that makes the build repeatable: `SOURCE_DATE_EPOCH=PROGRAM_EPOCH` (also
+/// when the caller has set another) and `PYTHONHASHSEED=0` (the order in which
+/// a script walks a set). Every `tools/build-*.py` that xtask starts goes
+/// through here; the scripts they start inherit it.
+fn build_script(script: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut c = Command::new("python3");
+    c.arg(script)
+        .env("SOURCE_DATE_EPOCH", PROGRAM_EPOCH)
+        .env("PYTHONHASHSEED", "0");
     c
 }
 
@@ -4734,7 +4759,7 @@ fn stock_thread_probe(vz: bool) -> Result<(), String> {
 
 fn native_scope_probe(vz: bool) -> Result<(), String> {
     relibc()?;
-    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    run_cmd(&mut build_script(root().join("tools/build-busybox.py")))?;
     let (name, programs): (&str, &[ImageProgram]) = if vz {
         (
             "boot-posix-native-scopes-vz.img",
@@ -5305,11 +5330,7 @@ fn libc_so() -> Result<(), String> {
     once(&LIBC_SO_BUILT, (), || {
         relibc()?;
         for subcommand in ["build", "probes"] {
-            run_cmd(
-                Command::new("python3")
-                    .arg(root().join("tools/build-libc-so.py"))
-                    .arg(subcommand),
-            )?;
+            run_cmd(build_script(root().join("tools/build-libc-so.py")).arg(subcommand))?;
         }
         Ok(())
     })
@@ -5357,8 +5378,7 @@ fn dynamic_programs(names: &[&str]) -> Result<(), String> {
     once(&DYNAMIC_BUILT, names.join(" "), || {
         libc_so()?;
         run_cmd(
-            Command::new("python3")
-                .arg(root().join("tools/build-libc-so.py"))
+            build_script(root().join("tools/build-libc-so.py"))
                 .arg("programs")
                 .args(names),
         )
@@ -5389,7 +5409,7 @@ fn package_script(package: &packages::Package) -> Result<(), String> {
         }
     }
     once(&PACKAGE_SCRIPTS_BUILT, package.build.clone(), || {
-        run_cmd(Command::new("python3").arg(root().join(&package.build)))
+        run_cmd(&mut build_script(root().join(&package.build)))
     })
 }
 
@@ -5426,7 +5446,7 @@ fn bash_build() -> Result<(), String> {
 }
 
 fn build_relibc() -> Result<(), String> {
-    run_cmd(Command::new("python3").arg(root().join("tools/build-relibc.py")))?;
+    run_cmd(&mut build_script(root().join("tools/build-relibc.py")))?;
     // The notices follow each build of relibc, each change of the crates
     // the workspace links (Cargo.lock) and of the script that writes them.
     let modified = |path: PathBuf| std::fs::metadata(path).and_then(|m| m.modified()).ok();
@@ -6365,7 +6385,7 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
 
 fn posix_lock_ring_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
-    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    run_cmd(&mut build_script(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
         "boot-posix-lock-ring.img",
@@ -6530,7 +6550,7 @@ fn fragment_release_report(lines: &[String]) -> Result<(), String> {
 
 fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<(), String> {
     relibc()?;
-    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    run_cmd(&mut build_script(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let programs = match probe {
         LifetimeProbe::Full => &POSIX_LIFETIMES_PROGRAMS,
@@ -7002,7 +7022,7 @@ fn posix_sync_probe() -> Result<(), String> {
 
 fn posix_spawn_churn_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
-    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    run_cmd(&mut build_script(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
         "boot-posix-spawn-churn.img",
@@ -7035,7 +7055,7 @@ fn posix_spawn_churn_probe(machine: &qemu::Machine) -> Result<(), String> {
 /// fork working again once the threads ended.
 fn posix_shares_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
-    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    run_cmd(&mut build_script(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
         "boot-posix-shares.img",
@@ -7090,7 +7110,7 @@ fn process_repeat_each(
 fn posix_procs_repeat(machine: &qemu::Machine, count: usize) -> Result<(), String> {
     relibc()?;
     // BusyBox is /bin/ls of the image's files (5c).
-    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    run_cmd(&mut build_script(root().join("tools/build-busybox.py")))?;
     // STAFETO_READY_GAP: the kernel waits inside every removal of a thread
     // from a ready queue, which widens the window of a CPU that reads the
     // link of a thread of another CPU (#438).
@@ -10671,7 +10691,7 @@ fn ash_shell_exit() -> Result<(), String> {
 
 fn os_test_headers(args: &[String]) -> Result<(), String> {
     relibc()?;
-    run_cmd(Command::new("python3").arg(root().join("tools/build-os-test.py")))?;
+    run_cmd(&mut build_script(root().join("tools/build-os-test.py")))?;
     let work = target_dir().join("os-test-headers");
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let object = work.join("empty-main.o");
@@ -14956,6 +14976,58 @@ fn ci_lints() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// A build script of programs sees a fixed `SOURCE_DATE_EPOCH` (also
+    /// over a value the caller has set) and `PYTHONHASHSEED=0`; the
+    /// environment of xtask is not touched.
+    #[test]
+    fn a_build_script_gets_the_fixed_epoch_and_hash_seed() {
+        let cmd = super::build_script("tools/build-x.py");
+        let envs: std::collections::BTreeMap<_, _> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(envs["SOURCE_DATE_EPOCH"].as_deref(), Some("1767225600"));
+        assert_eq!(envs["PYTHONHASHSEED"].as_deref(), Some("0"));
+        assert_eq!(cmd.get_program(), "python3");
+        // 2026-01-01 00:00:00 UTC.
+        assert_eq!(
+            super::PROGRAM_EPOCH.parse::<u64>().unwrap(),
+            56 * 365 * 86_400 + 14 * 86_400
+        );
+    }
+
+    /// No source file of xtask starts a `tools/build-*.py` (or the script of
+    /// a package) without `build_script`: the environment would be missing.
+    #[test]
+    fn every_build_script_is_started_through_build_script() {
+        let needle = format!("Command::new(\"{}\")", "python3");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (at, _) in text.match_indices(&needle) {
+                seen += 1;
+                let rest = &text[at..];
+                let statement = &rest[..rest.find(';').unwrap_or(rest.len())];
+                assert!(
+                    !statement.contains("tools/build-") && !statement.contains("package.build"),
+                    "{}: a build script is started without build_script: {statement}",
+                    path.display()
+                );
+            }
+        }
+        assert!(seen > 5, "the scan found {seen} starts of python3");
+    }
+
     /// The table of the static package programs and PACKAGE_PROGRAMS agree: a
     /// program without the feature `dynamic` is in the table, with a stack,
     /// and the table names no other.

@@ -577,7 +577,9 @@ fn run_inner(
     let begun = Instant::now();
     crate::relibc()?;
     crate::busybox_build()?;
-    crate::run_cmd(Command::new("python3").arg(crate::root().join("tools/build-open-posix.py")))?;
+    crate::run_cmd(&mut crate::build_script(
+        crate::root().join("tools/build-open-posix.py"),
+    ))?;
     let work = target_dir().join("open-posix");
     ostest::use_licence(LICENCE, work.join("source/COPYING"));
     let passing = if data { DATA_PASSING } else { PASSING };
@@ -947,7 +949,9 @@ mod tests {
 pub fn data_save() -> Result<(), String> {
     crate::relibc()?;
     crate::busybox_build()?;
-    crate::run_cmd(Command::new("python3").arg(crate::root().join("tools/build-open-posix.py")))?;
+    crate::run_cmd(&mut crate::build_script(
+        crate::root().join("tools/build-open-posix.py"),
+    ))?;
     let work = target_dir().join("open-posix");
     ostest::use_licence(LICENCE, work.join("source/COPYING"));
     let kernel = build(Variant::Normal)?;

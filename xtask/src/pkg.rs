@@ -341,6 +341,89 @@ pub fn parts(
     Ok(out)
 }
 
+/// What the package `p` installs, as `carry::Installed` (its manifest lines
+/// without `SOURCE`, its `meta` fields without the volatile ones), from the
+/// parts of the build: the same bytes `build` would write.
+fn content_of(
+    p: &Package,
+    all: &[Package],
+    pin: &str,
+    perturb: bool,
+) -> Result<carry::Installed, String> {
+    let mut parts = parts(p, all, None)?;
+    if perturb {
+        parts.push(perturbation(p));
+    }
+    let data: BTreeMap<&str, &[u8]> = parts
+        .iter()
+        .filter_map(|part| match &part.body {
+            Body::Data { bytes, .. } => Some((part.path.as_str(), bytes.as_slice())),
+            _ => None,
+        })
+        .collect();
+    let mut lines = Vec::new();
+    for part in &parts {
+        let bytes = match &part.body {
+            Body::Directory => None,
+            Body::Data { bytes, .. } => Some(bytes.as_slice()),
+            Body::Same(path) => Some(
+                *data
+                    .get(path.as_str())
+                    .ok_or_else(|| format!("{}: {path} holds no data", p.name))?,
+            ),
+        };
+        lines.push((
+            part.path.clone(),
+            pkgfmt::manifest::line(bytes, part.mode, &part.path)
+                .trim_end_matches('\n')
+                .to_string(),
+        ));
+    }
+    let has_elf = p.files.iter().any(|(_, f)| f.starts_with("elf:"));
+    let relibc = if has_elf {
+        format!("pin-{}", &pin[..8])
+    } else {
+        "-".to_string()
+    };
+    let series = series();
+    let (depends, provides, needs) = (
+        list_or_dash(&p.depends),
+        list_or_dash(&p.provides),
+        list_or_dash(&p.needs),
+    );
+    let meta = Meta {
+        name: &p.name,
+        version: &p.version,
+        release: "",
+        arch: "aarch64",
+        series: &series,
+        license: &p.license,
+        depends: &depends,
+        provides: &provides,
+        needs: &needs,
+        summary: &p.summary,
+        url: &p.url,
+        sha256: &p.sha256,
+        recipe: "",
+        commit: "",
+        relibc: &relibc,
+        size: 0,
+    };
+    Ok(carry::Installed::new(&meta, lines))
+}
+
+/// The file a content perturbation adds (`Options::perturb_content`).
+fn perturbation(p: &Package) -> Part {
+    Part {
+        path: format!("{}/PERTURB", notices::directory(&p.name)),
+        mode: REGULAR | 0o644,
+        body: Body::Data {
+            bytes: b"perturbed\n".to_vec(),
+            elf: false,
+        },
+    }
+}
+
 fn placeholder() -> notices::Build<'static> {
     notices::Build {
         commit: "",
@@ -588,6 +671,9 @@ pub struct Options {
     /// Packages whose recipe gets one more line, so that their recipe changes
     /// (the probe of carrying makes a change this way).
     pub perturb: Vec<String>,
+    /// Packages that get one more file (`<licenses>/<name>/PERTURB`), so that
+    /// the bytes they install change (the probe of carrying by content).
+    pub perturb_content: Vec<String>,
     /// Paths of the selected packages that the package file leaves out: the file is a variant
     /// for one image (`image_files`).
     pub remove: Vec<String>,
@@ -649,6 +735,7 @@ pub fn image_files(
             replace: Vec::new(),
             previous: None,
             perturb: Vec::new(),
+            perturb_content: Vec::new(),
             remove: Vec::new(),
             packages_only: false,
         })?;
@@ -676,6 +763,7 @@ pub fn image_files(
                     .collect(),
                 previous: None,
                 perturb: Vec::new(),
+                perturb_content: Vec::new(),
                 remove: l.removed.iter().map(|p| (*p).to_string()).collect(),
                 packages_only: false,
             })?;
@@ -774,17 +862,33 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
     }
     // The packages of a published index that did not change are carried; the
     // releases of the plan go to the descriptions.
-    let mut carried: BTreeMap<String, (Vec<u8>, String, Option<String>)> = BTreeMap::new();
+    let mut carried: BTreeMap<String, (Vec<u8>, String, Option<String>, String)> = BTreeMap::new();
     if let Some(base) = &opts.previous {
         let roots = carry::roots_for(base, &tree)?;
         let policy = carry::Policy::of_tree(&tree, base, &series())?;
         let previous = carry::load(base, &series(), &carry::fetch, &roots, &policy)?;
+        // What each package installs, for the carrying by content; a variant
+        // for an image (`replace`, `remove`) is never carried that way.
+        let pin = crate::script_value("tools/build-relibc.py", "COMMIT")?;
+        let variant = !opts.replace.is_empty() || !opts.remove.is_empty();
+        let contents: BTreeMap<String, carry::Installed> = if variant {
+            BTreeMap::new()
+        } else {
+            selected
+                .iter()
+                .map(|p| {
+                    let perturb = opts.perturb_content.contains(&p.name);
+                    Ok((p.name.clone(), content_of(p, &all, &pin, perturb)?))
+                })
+                .collect::<Result<_, String>>()?
+        };
         let wanted: Vec<carry::Wanted<'_>> = selected
             .iter()
             .map(|p| carry::Wanted {
                 name: &p.name,
                 version: &p.version,
                 recipe: &recipes[&p.name].0,
+                content: contents.get(&p.name),
             })
             .collect();
         let mut plan = carry::plan(previous.as_ref(), &wanted, &carry::fetch, &roots)?;
@@ -838,10 +942,11 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
                 bytes,
                 address,
                 source,
+                recipe,
                 ..
             } = fate
             {
-                carried.insert(name, (bytes, address, source));
+                carried.insert(name, (bytes, address, source, recipe));
             }
         }
     }
@@ -865,7 +970,10 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
     let mut built = Vec::new();
     for p in selected {
         let recipe = recipes[&p.name].0.clone();
-        if let Some((bytes, address, source)) = carried.remove(&p.name) {
+        if let Some((bytes, address, source, kept)) = carried.remove(&p.name) {
+            // The entry of the index says the recipe of the file, which is
+            // the anchor's when the package was carried by content.
+            let recipe = kept;
             let file = PackageFile::parse(&bytes).map_err(|e| format!("{}: {e}", p.name))?;
             let path = out_dir.join(file_name(p));
             let temp = path.with_extension("stpkg.part");
@@ -907,6 +1015,9 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
             ..build
         };
         let mut all_parts = parts(p, &all, Some(&build))?;
+        if opts.perturb_content.contains(&p.name) {
+            all_parts.push(perturbation(p));
+        }
         for (path, bytes) in &opts.replace {
             let part = all_parts
                 .iter_mut()
@@ -1040,6 +1151,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         replace: Vec::new(),
         previous: None,
         perturb: Vec::new(),
+        perturb_content: Vec::new(),
         remove: Vec::new(),
         packages_only: false,
     };

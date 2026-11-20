@@ -480,11 +480,7 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     // script's message naming the archive and its SHA-256, and the host
     // tests that need the reference fail with it.
     steps.push(step("build", LVGL_HOST, &[RELIBC, GAMES], || {
-        super::run_cmd(
-            Command::new("python3")
-                .arg(super::root().join("tools/build-lvgl.py"))
-                .arg("--host"),
-        )
+        super::run_cmd(super::build_script(super::root().join("tools/build-lvgl.py")).arg("--host"))
     }));
     steps.push(step(
         "build",
@@ -511,15 +507,16 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     }));
     steps.push(step("build", OS_TEST_OBJECTS, &[RELIBC, BASE], || {
         for extra in [None, Some("--full-basic")] {
-            let mut cmd = Command::new("python3");
-            cmd.arg(super::root().join("tools/build-os-test.py"));
+            let mut cmd = super::build_script(super::root().join("tools/build-os-test.py"));
             cmd.args(extra);
             super::run_cmd(&mut cmd)?;
         }
         Ok(())
     }));
     steps.push(step("build", OPEN_POSIX_OBJECTS, &[RELIBC, BASE], || {
-        super::run_cmd(Command::new("python3").arg(super::root().join("tools/build-open-posix.py")))
+        super::run_cmd(&mut super::build_script(
+            super::root().join("tools/build-open-posix.py"),
+        ))
     }));
 
     // The checks that read the repository and run on the host.

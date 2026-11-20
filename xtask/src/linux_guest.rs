@@ -979,8 +979,7 @@ pub fn build_guest() -> Result<PathBuf, String> {
     }
     write_overlay(&overlay, mime)?;
     run_cmd(
-        Command::new("python3")
-            .arg(root().join("tools/build-linux-guest.py"))
+        crate::build_script(root().join("tools/build-linux-guest.py"))
             .arg("--overlay")
             .arg(&overlay)
             .arg("--out")

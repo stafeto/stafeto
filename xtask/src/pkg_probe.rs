@@ -210,6 +210,7 @@ pub(crate) fn make_repository(dir: &Path, names: &[&str], serial: u64) -> Result
         replace: Vec::new(),
         previous: None,
         perturb: Vec::new(),
+        perturb_content: Vec::new(),
         remove: Vec::new(),
         packages_only: false,
     })?;
