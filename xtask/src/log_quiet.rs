@@ -14,7 +14,7 @@
 //! 1. In the window of 10 s from the first tick the driver woke at most
 //!    `WAKEUPS_MAX` times (the 10 safety ticks and a reserve) and its budget ran
 //!    out never under -icount; under TCG, whose clock is the host's, no more often than the
-//!    heartbeat of the driver comes (the step of the heartbeat itself runs the budget out there).
+//!    heartbeat and the safety tick come, none for the kernel's notifications or the drain.
 //!    The boot's own overruns lie before the window.
 //! 2. The driver says no `log wake missed` line (every run of xtask fails on one).
 //! 3. Under -icount the longest latency of a line is below `LATENCY_MAX_US`, the
@@ -64,6 +64,10 @@ pub struct Said {
     pub longest_us: u64,
     pub p99_us: u64,
     pub lines: u64,
+    /// The overruns of the window by the reason of the wake-up they came in: the heartbeat to
+    /// init, the kernel's notification of a record, the safety tick, a tick of the drain, the
+    /// rest.
+    pub reasons: [u64; 5],
 }
 
 /// The numbers of `line` after `head`, at the places of `shape` (`None` for a number).
@@ -96,6 +100,22 @@ pub fn parse(lines: &[String]) -> (Option<Said>, bool) {
         ) {
             (said.wakeups, said.overruns, said.window_ms) = (n[0], n[1], n[2]);
             window = true;
+        } else if let Some(n) = numbers(
+            l,
+            "uart: quiet reasons beat ",
+            &[
+                None,
+                Some("log"),
+                None,
+                Some("safe"),
+                None,
+                Some("drain"),
+                None,
+                Some("other"),
+                None,
+            ],
+        ) {
+            said.reasons = [n[0], n[1], n[2], n[3], n[4]];
         } else if let Some(n) = numbers(
             l,
             "uart: quiet latency max ",
@@ -137,17 +157,23 @@ pub fn verdict(said: Option<Said>, latency: bool, icount: bool) -> Result<Report
             said.wakeups, said.window_ms
         ));
     }
-    // Under -icount none. Under TCG the clock is the host's, and the driver's step for its
-    // heartbeat (a request to init each 250 ms, which init's table sets) runs out the budget
-    // of 150 us in about every one of them: the heartbeats of the window are what is allowed.
+    // Under -icount none at all. Under TCG the clock is the host's: the step of the driver's
+    // heartbeat (a request to init each 250 ms, which init's table sets, no work of the log) and
+    // its safety tick (about 110 us under -icount, close to the budget of 150 us) run the budget
+    // out about once each, and the overruns of the other wake-ups, the kernel's notifications
+    // and the drain, never. The driver counts each overrun by the reason of the wake-up before
+    // the count that showed it (the kernel counts it up to a period of 10 ms after the step),
+    // so a heartbeat and a safety tick within one period are counted together: the sum of the
+    // two is what the probe bounds, by the heartbeats and the ticks of the window.
+    let [beat, log, safe, drain, other] = said.reasons;
     let allowed = if icount {
         0
     } else {
-        said.window_ms / HEARTBEAT_MS + 2
+        said.window_ms / HEARTBEAT_MS + said.window_ms / 1000 + 4
     };
-    if said.overruns > allowed {
+    if log + drain + other != 0 || beat + safe > allowed || (icount && said.overruns != 0) {
         return Err(format!(
-            "the budget of the driver ran out {} times in the window of 10 s, at most {allowed} expected",
+            "the budget of the driver ran out in the window of 10 s: {} times in all, by the heartbeat {beat} and the safety tick {safe} (at most {allowed} together), by the kernel's notification {log}, the drain {drain}, the rest {other} (none expected)",
             said.overruns
         ));
     }
@@ -184,23 +210,44 @@ fn probe(icount: bool) -> Result<Report, String> {
     verdict(said, latency, icount)
 }
 
-/// The kernel test of the log's arming and the kernel built to break it
+/// The kernel tests of the log's wake and the kernels built to break them
 /// (`cargo xtask log-wake-break`, part of `budget-breaks`): with the rings left out of the
-/// `irq_ack` of the log's binding, a record that waits for the first `irq_ack` is never posted,
-/// and the test must report the failure.
+/// `irq_ack` of the log's binding, a record that waits for the first `irq_ack` is never
+/// posted, and the writer on CPU 1 that races the arming loses a wake; with the post made in
+/// the call that claimed it, the call takes `OBJ` twice. Each must fail its tests.
 pub fn breaks() -> Result<(), String> {
-    const TEST: &str = "log_wake_posts_once_for_each_arming";
-    let a = build(Variant::LogWakeBreakTest)?;
-    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
-    cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, Duration::from_secs(300), None)?;
-    let report = qemu::parse_report(&o.lines);
-    if !report.failed.iter().any(|(name, _)| name == TEST) {
-        return Err(format!(
-            "the kernel with no look at the rings passed {TEST}"
-        ));
+    for (variant, tests, what) in [
+        (
+            Variant::LogWakeBreakTest,
+            &["log_wake_posts_once_for_each_arming"][..],
+            "an irq_ack that looks at no ring",
+        ),
+        (
+            Variant::LogWakeBreakEl0,
+            &["log_wake_a_writer_on_another_cpu_loses_no_wake"][..],
+            "an irq_ack that looks at no ring, against a writer on CPU 1",
+        ),
+        (
+            Variant::LogPostInCallBreakTest,
+            &["log_wake_post_is_a_turn_of_its_own"][..],
+            "a post made in the call that claimed it",
+        ),
+    ] {
+        let a = build(variant)?;
+        // The writer test needs a second CPU.
+        let o = qemu::on_cpus(2, || {
+            let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+            cmd.args(qemu::HEADLESS);
+            qemu::run_until(cmd, Duration::from_secs(300), None)
+        })?;
+        let report = qemu::parse_report(&o.lines);
+        for test in tests {
+            if !report.failed.iter().any(|(name, _)| name == test) {
+                return Err(format!("the kernel with {what} passed {test}"));
+            }
+            println!("log-wake-break: a kernel with {what} fails {test}");
+        }
     }
-    println!("log-wake-break: a kernel whose irq_ack looks at no ring fails {TEST}");
     Ok(())
 }
 
@@ -214,7 +261,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let r = probe(icount).map_err(|e| format!("log-quiet: {e}"))?;
     let mode = if icount { "icount" } else { "tcg" };
     println!(
-        "log-quiet {mode}: {} wake-ups and {} overruns of the budget in {} ms (at most {WAKEUPS_MAX}; no overruns under icount, under tcg no more than the heartbeats, one in 250 ms); latency of a line after its write: max {} us, p99 {} us over {} lines",
+        "log-quiet {mode}: {} wake-ups and {} overruns of the budget in {} ms (at most {WAKEUPS_MAX}; no overruns under icount, under tcg only the heartbeats and the safety ticks, at most one each); latency of a line after its write: max {} us, p99 {} us over {} lines",
         r.wakeups, r.overruns, r.window_ms, r.longest_us, r.p99_us, r.lines
     );
     Ok(())
@@ -227,6 +274,7 @@ mod tests {
     fn run(w: u64, o: u64, ms: u64, max: u64, n: u64) -> Vec<String> {
         vec![
             "uart: pl011 at 0x9000000, line 33".to_owned(),
+            format!("uart: quiet reasons beat {o} log 0 safe 0 drain 0 other 0"),
             format!("uart: quiet window wakeups {w} overruns {o} ms {ms}"),
             format!(
                 "uart: quiet latency max {max} us p99 {} us lines {n}",
@@ -256,9 +304,25 @@ mod tests {
     #[test]
     fn an_overrun_in_the_window_fails_it() {
         let e = judged(&run(10, 1, 10_000, 90, 100), true).unwrap_err();
-        assert!(e.contains("ran out 1 times"), "{e}");
+        assert!(e.contains("1 times in all"), "{e}");
         let e = judged(&run(10, u64::MAX, 10_000, 90, 100), true).unwrap_err();
         assert!(e.contains("could not read"), "{e}");
+    }
+
+    #[test]
+    fn under_tcg_only_the_heartbeats_may_overrun() {
+        // 40 overruns of the heartbeat pass under TCG and fail under icount.
+        let beat = run(10, 40, 10_000, 90, 100);
+        assert!(judged(&run(10, 50, 10_000, 90, 100), false).is_ok());
+        assert!(judged(&beat, false).is_ok());
+        assert!(judged(&beat, true).is_err());
+        // One of the log's own fails under TCG too, whatever the heartbeats are.
+        let mut log = run(10, 40, 10_000, 90, 100);
+        log[1] = "uart: quiet reasons beat 39 log 1 safe 0 drain 0 other 0".to_owned();
+        let e = judged(&log, false).unwrap_err();
+        assert!(e.contains("notification 1"), "{e}");
+        // More than the heartbeats that came also fails.
+        assert!(judged(&run(10, 70, 10_000, 90, 100), false).is_err());
     }
 
     #[test]

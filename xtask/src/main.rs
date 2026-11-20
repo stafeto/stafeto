@@ -1830,10 +1830,16 @@ enum Variant {
     /// (`break-log-wake`): the kernel test of the arming must catch it
     /// (`cargo xtask log-wake-break`, and `budget-breaks`).
     LogWakeBreakTest,
+    /// The post made in the call that claimed the arming (`break-log-post-in-call`): the
+    /// kernel test of the takes of `OBJ` must catch it.
+    LogPostInCallBreakTest,
+    /// `LogWakeBreakTest` with the tests at EL0, where the writer on another CPU races the
+    /// arming.
+    LogWakeBreakEl0,
 }
 
 impl Variant {
-    const ALL: [Variant; 78] = [
+    const ALL: [Variant; 80] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1911,6 +1917,8 @@ impl Variant {
         Variant::LiftAgainReply,
         Variant::LogSeenBreak,
         Variant::LogWakeBreakTest,
+        Variant::LogPostInCallBreakTest,
+        Variant::LogWakeBreakEl0,
         Variant::LiftAgainReplyTest,
     ];
 
@@ -2000,6 +2008,8 @@ impl Variant {
             Variant::LiftAgainReply => Some("break-relift-reply"),
             Variant::LogSeenBreak => Some("break-log-seen"),
             Variant::LogWakeBreakTest => Some("ktest,break-log-wake"),
+            Variant::LogPostInCallBreakTest => Some("ktest,break-log-post-in-call"),
+            Variant::LogWakeBreakEl0 => Some("ktest,el0-half,break-log-wake"),
         }
     }
 
@@ -2102,6 +2112,8 @@ impl Variant {
             Variant::LiftAgainReply => "stafeto-relift-reply",
             Variant::LogSeenBreak => "stafeto-log-seen-break",
             Variant::LogWakeBreakTest => "stafeto-ktest-log-wake-break",
+            Variant::LogPostInCallBreakTest => "stafeto-ktest-log-post-in-call-break",
+            Variant::LogWakeBreakEl0 => "stafeto-ktest-el0-log-wake-break",
         }
     }
 }
