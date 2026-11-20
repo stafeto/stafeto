@@ -431,7 +431,8 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
     service: &mut S,
     config: Config<'_>,
 ) -> Error {
-    let mut table: [Option<Session<S::Data, K>>; N] = core::array::from_fn(|_| None);
+    // Built in place: `from_fn` builds the array apart and copies it, which doubles the frame.
+    let mut table: [Option<Session<S::Data, K>>; N] = [const { None }; N];
     run_in(channel, service, config, &mut table)
 }
 
@@ -1593,6 +1594,7 @@ impl<'a> Beat<'a> {
         self.say(note);
     }
 
+    #[inline(never)]
     fn say(&self, note: Note) {
         let (period, priority) = (self.wire.period, self.wire.priority);
         match note {
@@ -1611,8 +1613,18 @@ impl<'a> Beat<'a> {
 
     /// Init's nudge of a suspect service (`proto_init::PROBE_BIT`): the line
     /// of what this heartbeat knows. No sign of life goes for it.
+    ///
+    /// A heartbeat whose first expiry is not yet due says nothing (`Probe::news`): init's watchdog
+    /// counts a start from the start of the process, so a service that takes its time between
+    /// REGISTER and its loop is a first miss for init in a normal boot. Out of line, so that
+    /// the frame of the formatting stays out of the loop's own: a service on a small stack
+    /// (pkgd's 32 KiB) has no room for it.
+    #[inline(never)]
     fn probe(&self) {
-        crate::println!("{}", self.probe_line());
+        let line = self.probe_line();
+        if line.news() {
+            crate::println!("{line}");
+        }
     }
 
     fn probe_line(&self) -> Probe {
@@ -1645,6 +1657,17 @@ struct Probe {
     sent: u32,
     send_errors: u32,
     last_send_error: Option<Error>,
+}
+
+impl Probe {
+    /// Whether the line tells anything: a heartbeat that has not had its first expiry and whose
+    /// deadline is still ahead has nothing to tell yet, and its armed timer is no fault.
+    fn news(&self) -> bool {
+        self.expiries != 0
+            || self.now >= self.deadline
+            || self.last_arm.is_err()
+            || self.send_errors != 0
+    }
 }
 
 /// Nanoseconds as `S.mmm ms`.
@@ -2363,6 +2386,66 @@ mod beat_tests {
             send_errors: 0,
             last_send_error: None,
         }
+    }
+
+    /// The line seen in the log of ci #528: a service that registered early and began its loop at
+    /// 935 ms, nudged at 1045 ms by init's watchdog (armed at its start, one second long), with its
+    /// first expiry due at 1185 ms. Nothing is wrong there, and nothing is printed.
+    #[test]
+    fn a_nudge_in_the_window_before_the_first_expiry_prints_nothing() {
+        let early = Probe {
+            now: 1_045_328_000,
+            deadline: 1_185_204_000,
+            armed_at: 935_215_000,
+            expiries: 0,
+            sent: 0,
+            ..probe()
+        };
+        assert!(!early.news());
+        // The planted faults: the deadline is past with no expiry taken (the timer did not fire),
+        // an arming failed, a send failed, or expiries came and the service is still suspect.
+        let late = Probe {
+            now: 1_300_000_000,
+            ..early
+        };
+        assert!(late.news());
+        let unarmed = Probe {
+            last_arm: Err(Error::BadState),
+            ..early
+        };
+        assert!(unarmed.news());
+        let refused_send = Probe {
+            send_errors: 1,
+            last_send_error: Some(Error::PeerClosed),
+            ..early
+        };
+        assert!(refused_send.news());
+        assert!(
+            Probe {
+                expiries: 1,
+                ..early
+            }
+            .news()
+        );
+        assert!(probe().news());
+    }
+
+    /// The counts of the line of a service that beat: each due expiry is counted, each send that
+    /// returned is counted as sent, a stale one only as an expiry. (`beats 17 1` of the log is the
+    /// step counter of another service, which the probe line does not read.)
+    #[test]
+    fn the_counts_follow_the_expiries_and_the_sends() {
+        let (mut w, mut t) = (Fake::new(true), Tally::default());
+        assert_eq!(
+            (t.expiries, t.sent),
+            (0, 0),
+            "before the first expiry both are 0"
+        );
+        let _ = expiry(&mut w, &mut t);
+        let _ = expiry(&mut w, &mut t);
+        w.reached = false;
+        let _ = expiry(&mut w, &mut t);
+        assert_eq!((t.expiries, t.sent, t.send_errors), (3, 2, 0));
     }
 
     #[test]

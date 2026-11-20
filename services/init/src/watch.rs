@@ -305,4 +305,26 @@ mod tests {
         assert_eq!(w.expired_first(50), (Action::Stale, false));
         assert!(w.expired_first(210).1, "a new first miss is nudged again");
     }
+
+    /// A service that registered at its start and began its loop late: the watchdog armed at its
+    /// start finds it suspect at start + deadline, before its first beat is due. That is a first
+    /// miss (the service is nudged and says nothing yet), and a beat at start + deadline + a
+    /// period still saves it.
+    #[test]
+    fn a_first_beat_that_comes_in_the_window_after_the_first_miss_saves_the_service() {
+        let mut w = WATCH.arm(45);
+        assert_eq!(w.expired_first(40), (Action::Stale, false));
+        assert_eq!(
+            w.expired_first(145),
+            (Action::Suspect { deadline: 165 }, true)
+        );
+        assert!(w.suspect());
+        assert_eq!(w.beat(150), 250);
+        assert!(!w.suspect());
+        assert_eq!(w.beats_refused(), (0, Some(150)));
+        assert_eq!(
+            w.expired_first(250),
+            (Action::Suspect { deadline: 270 }, true)
+        );
+    }
 }
