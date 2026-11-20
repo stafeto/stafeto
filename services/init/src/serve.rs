@@ -422,7 +422,19 @@ impl Init {
             jobs: Jobs::new(),
             adoption: None,
             started: 0,
-            overruns: counts(),
+            overruns: {
+                let overruns = counts();
+                if let Some((place, record)) =
+                    table::table().iter().enumerate().find(|(_, r)| r.log)
+                {
+                    let mut periods = [0; table::START_DATA_MAX];
+                    for (t, b) in periods.iter_mut().zip(record.budgets) {
+                        *t = b.t_ns;
+                    }
+                    overruns.set_console(place, &periods);
+                }
+                overruns
+            },
             stopping: None,
             pool: None,
         }
