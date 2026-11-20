@@ -768,6 +768,8 @@ pub struct Run {
     /// line that has not ended starts.
     lines: Vec<String>,
     line_start: usize,
+    /// Puts back the lines that another writer cut into (`Rejoin`): `lines` holds the result.
+    rejoin: Rejoin,
     echo: Box<dyn FnMut(&str)>,
 }
 
@@ -835,6 +837,7 @@ impl Run {
             untag: crate::untag::Untag::default(),
             lines: Vec::new(),
             line_start: 0,
+            rejoin: Rejoin::default(),
             echo,
         })
     }
@@ -848,7 +851,7 @@ impl Run {
             let raw = &bytes[self.line_start..self.line_start + len];
             let line = String::from_utf8_lossy(raw.strip_suffix(b"\r").unwrap_or(raw));
             (self.echo)(&line);
-            self.lines.push(line.into_owned());
+            self.rejoin.push(line.into_owned(), &mut self.lines);
             self.line_start += len + 1;
         }
     }
@@ -863,9 +866,10 @@ impl Run {
             let raw = &bytes[self.line_start..];
             let line = String::from_utf8_lossy(raw.strip_suffix(b"\r").unwrap_or(raw));
             (self.echo)(&line);
-            self.lines.push(line.into_owned());
+            self.rejoin.push(line.into_owned(), &mut self.lines);
             self.line_start = bytes.len();
         }
+        self.rejoin.finish(&mut self.lines);
     }
 
     /// Waits for the next piece of output until `deadline`.
@@ -1072,7 +1076,9 @@ impl Run {
             self.take(&piece);
         }
         self.end_line();
-        let mut lines = self.transcript.lines();
+        // The lines as `take` kept them: the lines that a service or init printed inside another
+        // line are back out of it (`Rejoin`), the line they cut whole.
+        let mut lines = std::mem::take(&mut self.lines);
         if let End::Marker(at) = end {
             lines.truncate(at + 1);
         }
@@ -1726,8 +1732,185 @@ pub fn unglued(lines: &[String], marker: &str) -> Vec<String> {
     out
 }
 
+/// The starts of the lines that a service or init prints on its own while another program's
+/// long line goes out in several writes from another CPU: the timing lines of lib/rt
+/// (`service step:`, `service table:`, `service heartbeat:`, `service wait:`, `service wait cut:`,
+/// `service gap:`, `service preempt:`, `service beats:`), the lines of the compositor's bands
+/// (`service band`), the audit and profile lines of ramfs, and the lines of init.
+const INTRUDERS: [&str; 12] = [
+    "service step: ",
+    "service table: ",
+    "service heartbeat: ",
+    "service wait: ",
+    "service wait cut: ",
+    "service gap: ",
+    "service preempt: ",
+    "service beats: ",
+    "service band",
+    "ramfs: audit round ",
+    "ramfs: prof ",
+    "init: ",
+];
+
+/// Where the first intruder starts inside `line` (after at least one byte of another text), if
+/// a line of a service or init has cut into it. The rule: an `INTRUDERS` start that is not at
+/// the start of the line and does not follow one of ``-"'`(<:/`` (a name such as `posix-init: `,
+/// a quotation); `init: ` after a space too (`uart init: ` is a text of a program). A text that
+/// holds such a start in the middle and no other writer cut into it cannot be told from a cut
+/// line, so no program prints one.
+fn intruder_at(line: &str) -> Option<usize> {
+    INTRUDERS
+        .iter()
+        .flat_map(|tag| {
+            line.match_indices(tag).filter_map(move |(at, _)| {
+                let before = line[..at].chars().next_back()?;
+                let quoted = "-\"'`(<:/".contains(before) || (*tag == "init: " && before == ' ');
+                (!quoted).then_some(at)
+            })
+        })
+        .min()
+}
+
+/// Puts back the lines that another writer cut into, as the lines of a run come in one by one:
+/// a line that holds an intruder (`intruder_at`) gives the intruder out whole at once, and the
+/// start of the line waits for the next line, which holds the rest of it; the two join, and the
+/// result is looked at again, for a second intruder. At the end of the run (`finish`) a start
+/// that no rest came to goes out as it is, after its intruder.
+#[derive(Default)]
+struct Rejoin {
+    head: Option<String>,
+}
+
+impl Rejoin {
+    fn push(&mut self, line: String, out: &mut Vec<String>) {
+        let mut line = match self.head.take() {
+            Some(head) => head + &line,
+            None => line,
+        };
+        if let Some(at) = intruder_at(&line) {
+            out.push(line[at..].to_owned());
+            line.truncate(at);
+            self.head = Some(line);
+        } else {
+            out.push(line);
+        }
+    }
+
+    fn finish(&mut self, out: &mut Vec<String>) {
+        out.extend(self.head.take());
+    }
+}
+
+/// `lines` with the lines of services and init that cut into another line taken out and the
+/// cut line whole (`Rejoin`): what every run's output goes through.
+#[cfg(test)]
+pub fn rejoin_lines(lines: &[String]) -> Vec<String> {
+    let (mut rejoin, mut out) = (Rejoin::default(), Vec::with_capacity(lines.len()));
+    for line in lines {
+        rejoin.push(line.clone(), &mut out);
+    }
+    rejoin.finish(&mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    fn owned(v: &[&str]) -> Vec<String> {
+        v.iter().map(|l| (*l).to_owned()).collect()
+    }
+
+    /// A client line cut by each kind of intruder is whole again, the intruder out of it.
+    #[test]
+    fn a_line_cut_by_each_kind_of_intruder_is_rejoined() {
+        for intruder in [
+            "service step: 5 kind 64 100 ticks detail 0",
+            "service table: 1 kind 28 9834 ticks detail 0 preempts 0",
+            "service heartbeat: send failed with Busy (period 250000000 ns, priority 50)",
+            "service wait: 10 kind 64 29846 ticks of 31452",
+            "service wait cut: 10 kind 64 2 ticks of 31452",
+            "service gap: 10 kind 64 3 ticks of 31452",
+            "service preempt: 10 kind 64 4 ticks of 31452",
+            "service beats: 10 12",
+            "service band floor: 17 layers 2 n 3",
+            "ramfs: audit round 67",
+            "ramfs: prof 3 calls 9 reads 1 snaps 2 budget_ran_us 5 budget_overruns 0",
+            "init: uart budget serve: at least 3 overruns, at least 9 in all",
+        ] {
+            let got = rejoin_lines(&owned(&[
+                &format!("probe: a long line that goes out in pieces, bro{intruder}"),
+                "ken in the middle, ok",
+                "probe: next",
+            ]));
+            assert_eq!(
+                got,
+                [
+                    intruder,
+                    "probe: a long line that goes out in pieces, broken in the middle, ok",
+                    "probe: next"
+                ],
+                "{intruder}"
+            );
+        }
+    }
+
+    /// Two intruders in one client line, and an intruder with another inside it.
+    #[test]
+    fn two_intruders_in_one_line_are_both_taken_out() {
+        let got = rejoin_lines(&owned(&[
+            "probe: one long line bservice step: 1 kind 2 3 ticks detail 0",
+            "roken twice, hinit: uart ended",
+            "ere",
+        ]));
+        assert_eq!(
+            got,
+            [
+                "service step: 1 kind 2 3 ticks detail 0",
+                "init: uart ended",
+                "probe: one long line broken twice, here"
+            ]
+        );
+        let got = rejoin_lines(&owned(&[
+            "probe: head service wait: 1 kind 2 3 ticks of 4 init: x ended",
+            "tail",
+        ]));
+        assert_eq!(
+            got,
+            [
+                "service wait: 1 kind 2 3 ticks of 4 init: x ended",
+                "probe: head tail"
+            ]
+        );
+    }
+
+    /// An intruder in the last line of a run: its rest never came, the intruder goes out
+    /// whole and the start stays as it is.
+    #[test]
+    fn an_intruder_at_the_very_end_of_a_run_is_taken_out() {
+        let got = rejoin_lines(&owned(&[
+            "probe: a lineservice step: 1 kind 2 3 ticks detail 0",
+        ]));
+        assert_eq!(
+            got,
+            ["service step: 1 kind 2 3 ticks detail 0", "probe: a line"]
+        );
+    }
+
+    /// A real line is never mangled: an intruder start at the start of a line, in a name, in
+    /// a quotation, or after a space for `init: `, and a plain log, stay as they are.
+    #[test]
+    fn a_real_line_with_an_intruder_start_is_left_alone() {
+        let real = owned(&[
+            "service table: 1 kind 28 9834 ticks detail 0 preempts 0",
+            "init: tty ended: exit code 0",
+            "posix-init: ok",
+            "the line `service step: 5 kind 1 2 ticks detail 0` is quoted",
+            "uart init: fine",
+            "says \"init: x\" and (service wait: y) and a/ramfs: audit round z",
+            "no intruder here",
+        ]);
+        assert_eq!(rejoin_lines(&real), real);
+    }
+
     use super::*;
     use std::os::unix::process::ExitStatusExt;
 
@@ -2498,6 +2681,28 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         let o = run.stop();
         assert_eq!(*echoed.borrow(), ["one", "two", "prompt> "]);
         assert_eq!(o.lines, ["one", "two", "prompt> "]);
+    }
+
+    /// A run's lines come rejoined from `Run::lines` and the outcome, and `expect_seen` finds
+    /// the end line of init that came before the last line of the probe as well as after it.
+    #[test]
+    fn a_run_gives_rejoined_lines_and_expect_seen_is_order_free() {
+        let script = sh(
+            "printf 'probe: a long linservice step: 1 kind 2 3 ticks detail 0\\ne that was cut\\n'; \
+             printf 'init: probe ended: exit code 0\\nprobe: ok\\n'",
+        );
+        let mut run = Run::start_with(script, Input::Null, Box::new(|_| {})).unwrap();
+        run.expect("probe: ok", Duration::from_secs(5)).unwrap();
+        run.expect_seen("init: probe ended: exit code 0", Duration::from_secs(5))
+            .unwrap();
+        run.expect_seen("probe: a long line that was cut", Duration::from_secs(5))
+            .unwrap();
+        let o = run.stop();
+        assert_eq!(o.lines[0], "service step: 1 kind 2 3 ticks detail 0");
+        assert!(
+            o.lines
+                .contains(&"probe: a long line that was cut".to_owned())
+        );
     }
 
     /// Every run of every image with layers: the line of ramfs that says a
