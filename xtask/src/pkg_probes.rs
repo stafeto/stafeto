@@ -52,6 +52,7 @@ fn options(names: Vec<String>, out: Option<PathBuf>) -> pkg::Options {
         replace: Vec::new(),
         previous: None,
         perturb: Vec::new(),
+        perturb_content: Vec::new(),
         remove: Vec::new(),
         packages_only: false,
     }
@@ -114,8 +115,11 @@ fn sha_of(path: &Path) -> Result<String, String> {
 /// Step 8 of `pkg-identity`: `built` is the repository of step 1 (development key).
 ///
 /// A published repository is made from `built` by signing its packages with a first probe key.
-/// A build that carries from it with one recipe changed (`--perturb freedoom`) keeps the files
-/// of the others byte for byte at their addresses and gives the changed one the next release.
+/// A build that carries from it keeps the files of the others byte for byte at their addresses.
+/// Two packages are changed on purpose: one with its recipe and its content (`freedoom`: the
+/// recipe line and one more file), which is built again and gets the next release; one with its
+/// recipe alone (`nano`: the bytes it installs are the same), which is carried by content with
+/// its release, its file and the recipe of the anchor.
 /// Signing with a second probe key changes only the last page of the new package and leaves the
 /// carried ones. An image built from the files of the run takes the signed files over its own
 /// and keeps every other file.
@@ -157,7 +161,7 @@ fn carry_over(built: &Path) -> Result<(), String> {
     )?;
     let old_text = std::fs::read_to_string(published.join("INDEX")).map_err(|e| e.to_string())?;
     let old_index = pkgfmt::index::Index::parse(&old_text).map_err(|e| e.to_string())?;
-    let old: BTreeMap<String, (String, String, String)> = old_index
+    let old: BTreeMap<String, (String, String, String, String)> = old_index
         .entries()
         .map(|e| {
             (
@@ -166,24 +170,27 @@ fn carry_over(built: &Path) -> Result<(), String> {
                     e.version.to_string(),
                     e.file.to_string(),
                     e.sha256.to_string(),
+                    e.recipe.to_string(),
                 ),
             )
         })
         .collect();
     // The build that carries, with the recipe of one package changed.
     let changed = "freedoom";
+    let recipe_only = "nano";
     repo::run(&repo::Options {
         sources: false,
         dir: Some(next.clone()),
         previous: Some(published.display().to_string()),
-        perturb: vec![changed.to_string()],
+        perturb: vec![changed.to_string(), recipe_only.to_string()],
+        perturb_content: vec![changed.to_string()],
         ..repo::Options::default()
     })?;
     let text = std::fs::read_to_string(next.join("INDEX")).map_err(|e| e.to_string())?;
     let index = pkgfmt::index::Index::parse(&text).map_err(|e| e.to_string())?;
     let mut carried = 0;
     for e in index.entries() {
-        let (version, file, sha) = old
+        let (version, file, sha, recipe) = old
             .get(e.name)
             .ok_or_else(|| format!("pkg-identity: {} is not in the published index", e.name))?;
         if e.name == changed {
@@ -210,12 +217,19 @@ fn carry_over(built: &Path) -> Result<(), String> {
                     e.name
                 ));
             }
+            // A package carried by content keeps the recipe of the anchor, so
+            // that the next build compares its content again.
+            if e.name == recipe_only && e.recipe != *recipe {
+                return Err(format!(
+                    "pkg-identity: {recipe_only} changed only its recipe and should be carried by content with the recipe {recipe}: {e:?}"
+                ));
+            }
             carried += 1;
         }
     }
     repo::check(&next, &[dev.root])?;
     println!(
-        "pkg-identity: carried from the published index: {carried} packages with the same bytes and address, {changed} one release up"
+        "pkg-identity: carried from the published index: {carried} packages with the same bytes and address ({recipe_only} with only its recipe changed, by content), {changed} (recipe and content changed) one release up"
     );
     // The second probe key signs again what the development key signed.
     copy_files(&next, &signed, |n| {

@@ -1733,8 +1733,10 @@ pub(crate) mod tests {
         let a = "a".repeat(64);
         let b = "b".repeat(64);
         let anchor = pk("alpha", "1.0", "3", &a, old);
+        // A directory of its own: the tests run in parallel, and the tags of
+        // the older tests (`relibc`, `plan`) must not meet these.
         let dir = repository_of(
-            tag,
+            &format!("scenario-{tag}"),
             &[("alpha", "1.0", "3", &a, anchor.clone())],
             if key_revoked {
                 &[("t-release", 0)]

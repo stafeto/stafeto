@@ -344,8 +344,16 @@ pub fn parts(
 /// What the package `p` installs, as `carry::Installed` (its manifest lines
 /// without `SOURCE`, its `meta` fields without the volatile ones), from the
 /// parts of the build: the same bytes `build` would write.
-fn content_of(p: &Package, all: &[Package], pin: &str) -> Result<carry::Installed, String> {
-    let parts = parts(p, all, None)?;
+fn content_of(
+    p: &Package,
+    all: &[Package],
+    pin: &str,
+    perturb: bool,
+) -> Result<carry::Installed, String> {
+    let mut parts = parts(p, all, None)?;
+    if perturb {
+        parts.push(perturbation(p));
+    }
     let data: BTreeMap<&str, &[u8]> = parts
         .iter()
         .filter_map(|part| match &part.body {
@@ -402,6 +410,18 @@ fn content_of(p: &Package, all: &[Package], pin: &str) -> Result<carry::Installe
         size: 0,
     };
     Ok(carry::Installed::new(&meta, lines))
+}
+
+/// The file a content perturbation adds (`Options::perturb_content`).
+fn perturbation(p: &Package) -> Part {
+    Part {
+        path: format!("{}/PERTURB", notices::directory(&p.name)),
+        mode: REGULAR | 0o644,
+        body: Body::Data {
+            bytes: b"perturbed\n".to_vec(),
+            elf: false,
+        },
+    }
 }
 
 fn placeholder() -> notices::Build<'static> {
@@ -651,6 +671,9 @@ pub struct Options {
     /// Packages whose recipe gets one more line, so that their recipe changes
     /// (the probe of carrying makes a change this way).
     pub perturb: Vec<String>,
+    /// Packages that get one more file (`<licenses>/<name>/PERTURB`), so that
+    /// the bytes they install change (the probe of carrying by content).
+    pub perturb_content: Vec<String>,
     /// Paths of the selected packages that the package file leaves out: the file is a variant
     /// for one image (`image_files`).
     pub remove: Vec<String>,
@@ -712,6 +735,7 @@ pub fn image_files(
             replace: Vec::new(),
             previous: None,
             perturb: Vec::new(),
+            perturb_content: Vec::new(),
             remove: Vec::new(),
             packages_only: false,
         })?;
@@ -739,6 +763,7 @@ pub fn image_files(
                     .collect(),
                 previous: None,
                 perturb: Vec::new(),
+                perturb_content: Vec::new(),
                 remove: l.removed.iter().map(|p| (*p).to_string()).collect(),
                 packages_only: false,
             })?;
@@ -851,7 +876,10 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
         } else {
             selected
                 .iter()
-                .map(|p| Ok((p.name.clone(), content_of(p, &all, &pin)?)))
+                .map(|p| {
+                    let perturb = opts.perturb_content.contains(&p.name);
+                    Ok((p.name.clone(), content_of(p, &all, &pin, perturb)?))
+                })
                 .collect::<Result<_, String>>()?
         };
         let wanted: Vec<carry::Wanted<'_>> = selected
@@ -983,6 +1011,9 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
             ..build
         };
         let mut all_parts = parts(p, &all, Some(&build))?;
+        if opts.perturb_content.contains(&p.name) {
+            all_parts.push(perturbation(p));
+        }
         for (path, bytes) in &opts.replace {
             let part = all_parts
                 .iter_mut()
@@ -1116,6 +1147,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         replace: Vec::new(),
         previous: None,
         perturb: Vec::new(),
+        perturb_content: Vec::new(),
         remove: Vec::new(),
         packages_only: false,
     };
