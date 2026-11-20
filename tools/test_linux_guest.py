@@ -150,7 +150,7 @@ class LockTests(unittest.TestCase):
     def test_the_shipped_lock_pins_nginx_and_openssl_of_stafeto(self):
         lock = guest.parse_lock((HERE / "linux-guest" / "alpine.lock").read_text())
         versions = {p["name"]: p["version"] for p in lock["package"]}
-        self.assertEqual(versions["nginx"], "1.30.6-r0")
+        self.assertEqual(versions["nginx"], "1.30.7-r0")
         self.assertEqual(versions["libssl3"], "3.5.9-r0")
         self.assertEqual(versions["libcrypto3"], "3.5.9-r0")
         self.assertIn("linux-virt", versions)
