@@ -1170,6 +1170,18 @@ pub fn run_until(
     run_until_staged(cmd, timeout, stop_marker, None)
 }
 
+/// How long a run that stops on init's end line (`init: <program> ended: ...`) goes on reading
+/// after it: init writes that line straight to the console, and the last lines of a probe that
+/// prints through the terminal service (`posix-pty: ok`) come in no fixed order with it, either
+/// side of it (the race stafeto#538 settled for five probes).
+pub const END_GRACE: Duration = Duration::from_millis(500);
+
+/// Whether `marker` is init's line for the end of a program, `init: <program> ended` and what
+/// follows: the stop marker of a probe whose own last lines may come after it.
+pub fn is_init_end_marker(marker: &str) -> bool {
+    marker.starts_with("init: ") && marker.contains(" ended")
+}
+
 /// A limit on one stage of a run: once a line contains `after`, a line that
 /// contains `until` must come within `within` of the clock of the host, or
 /// the run is cut as timed out. The probes that a broken service leaves
@@ -1197,7 +1209,15 @@ pub fn run_until_staged(
         if let Some(marker) = stop_marker
             && let Some(at) = run.lines[checked..].iter().position(|l| l.contains(marker))
         {
-            return Ok(run.end(End::Marker(checked + at)));
+            let mut last = checked + at;
+            if is_init_end_marker(marker) {
+                // The lines that follow within END_GRACE belong to the probe, whichever
+                // order they came in; the run keeps them all.
+                let until = Instant::now() + END_GRACE;
+                while let Wait::Came = run.wait(until) {}
+                last = run.lines.len().saturating_sub(1).max(last);
+            }
+            return Ok(run.end(End::Marker(last)));
         }
         if let Some(stage) = stage {
             for line in &run.lines[checked..] {
@@ -1238,7 +1258,11 @@ fn tail(lines: &[String]) -> &[String] {
 /// (run_until): the machine still ran, so the run has no exit status. No
 /// line has KERNEL PANIC.
 pub fn expect_stopped_on(o: &Outcome, line: &str) -> Result<(), String> {
-    if !o.stopped_on_marker || o.lines.last().is_none_or(|l| l != line) {
+    // The line that stopped the run is the last, or, for init's end line
+    // (`is_init_end_marker`), one of the last: the probe's own lines may follow it.
+    let stopped = o.lines.last().is_some_and(|l| l == line)
+        || (is_init_end_marker(line) && o.lines.iter().any(|l| l == line));
+    if !o.stopped_on_marker || !stopped {
         return Err(format!(
             "QEMU was not stopped on {line:?}; last lines: {:?}",
             tail(&o.lines)
@@ -2432,6 +2456,41 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             warning.contains("601 lines") && warning.contains("600"),
             "{warning}"
         );
+    }
+
+    /// Init's end line and the probe's last line come in either order: a run that stops on the
+    /// end line keeps the lines that follow it within END_GRACE and still counts as stopped on
+    /// it, and a line later than that is not waited for.
+    #[test]
+    fn a_run_stopped_on_init_ending_keeps_the_probe_lines_that_follow() {
+        assert!(is_init_end_marker("init: posix-pty ended: "));
+        assert!(is_init_end_marker("init: tty-probe ended"));
+        assert!(!is_init_end_marker("KERNEL PANIC: x"));
+        assert!(!is_init_end_marker("posix-pty: ok"));
+        let ended = "init: posix-pty ended: exit code 0, not restarted";
+        let o = run_until(
+            sh(&format!(
+                "echo booting; echo '{ended}'; sleep 0.2; echo 'posix-pty: ok'; sleep 3; echo 'too late'; exec sleep 10"
+            )),
+            Duration::from_secs(20),
+            Some("init: posix-pty ended: "),
+        )
+        .unwrap();
+        assert!(o.stopped_on_marker && !o.timed_out);
+        assert!(expect_marker(&o, "posix-pty: ok").is_ok());
+        assert!(expect_stopped_on(&o, ended).is_ok());
+        assert!(!o.lines.iter().any(|l| l == "too late"));
+        // The other order: the probe's line first.
+        let o = run_until(
+            sh(&format!(
+                "echo 'posix-pty: ok'; echo '{ended}'; exec sleep 10"
+            )),
+            Duration::from_secs(20),
+            Some("init: posix-pty ended: "),
+        )
+        .unwrap();
+        assert!(expect_marker(&o, "posix-pty: ok").is_ok());
+        assert!(expect_stopped_on(&o, ended).is_ok());
     }
 
     #[test]
