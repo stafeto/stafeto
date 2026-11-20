@@ -46,8 +46,6 @@ pub const WAKEUPS_MAX: u64 = 12;
 pub const LATENCY_MAX_US: u64 = 5_000;
 /// The period of the driver's heartbeat in init's table (services/init/src/table/normal.rs).
 const HEARTBEAT_MS: u64 = 250;
-/// The window of the count, in milliseconds from the first tick.
-const WINDOW_MS: u64 = 10_000;
 /// The lines the driver writes (uart::probe::LINES): the run ends with the
 /// line that says it took them all.
 const LINES: u64 = 100;
