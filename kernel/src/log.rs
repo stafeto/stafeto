@@ -21,8 +21,8 @@
 //! the log's line (`irq_bind` of abi::LOG_LINE, `irq.rs`) and its `irq_ack`
 //! arms `LOG_ARMED`. A record that lands while it is armed claims the arming
 //! (`wake_if_armed`) and sets the flag of its CPU, and the way out of the
-//! kernel posts the notification (`take_wake`, `thread::flush_copy_exit`,
-//! `cmd::flush_posted`, `sched::sleep`): a record
+//! kernel posts the notification: the claimant sends its CPU the SGI `SGI_LOG`,
+//! and the turn of that interrupt (`smp::handle`) posts (`take_wake`): a record
 //! takes no `OBJ`, no queue lock and posts nothing. The two sides keep the
 //! order of a Dekker pair: the writer writes the ring, fences and reads
 //! `LOG_ARMED`; `irq_ack` writes `LOG_ARMED`, fences and reads the rings
@@ -91,11 +91,24 @@ fn wake_if_armed() {
     }
 }
 
-/// Takes the arming, once: the claimant sets the flag of its CPU.
+/// Takes the arming, once: the claimant sets the flag of its CPU and sends this CPU the
+/// SGI whose turn makes the post (`take_wake`, `smp::handle`). The write of the GIC's
+/// register takes no lock, so this is safe in an interrupt and inside a section of `OBJ`;
+/// the post itself waits for the poll of the next turn of the way out of the kernel and
+/// takes `OBJ` there once, a turn of its own, whatever the claimant was doing: no
+/// stretch of the kernel gets a second take of `OBJ` for a record, and a thread that
+/// goes to EL0 meanwhile comes back at once, since the SGI is pending.
 #[inline(never)]
 fn claim_arming() {
     if LOG_ARMED.swap(false, SeqCst) {
-        local().deferred.fetch_or(crate::local::LOG_WAKE, Relaxed);
+        local().log_wake.store(true, Relaxed);
+        crate::arch::gic::send_sgi(crate::arch::cpu::this().index(), kcore::gic::SGI_LOG);
+        // The negative build: the post in the stretch of the claimant, a second take of `OBJ`
+        // for a call that took it (not inside a section, where the lock would not nest).
+        #[cfg(feature = "break-log-post-in-call")]
+        if !crate::obj::held() && take_wake() {
+            crate::irq::deliver_log();
+        }
     }
 }
 
@@ -162,18 +175,18 @@ pub fn pass_all() {
     }
 }
 
-/// Whether a post waits on this CPU, which the way out of the kernel makes
-/// (`take_wake`).
+/// Whether a post waits on this CPU (the kernel tests).
+#[cfg(feature = "ktest")]
 #[inline(always)]
 pub fn wake_due() -> bool {
-    local().deferred.load(Relaxed) & crate::local::LOG_WAKE != 0
+    local().log_wake.load(Relaxed)
 }
 
 /// Clears the flag of this CPU; true when it stood, and the caller posts
 /// (`irq::deliver_log`).
 #[inline(always)]
 pub fn take_wake() -> bool {
-    local().deferred.fetch_and(!crate::local::LOG_WAKE, Relaxed) & crate::local::LOG_WAKE != 0
+    local().log_wake.swap(false, Relaxed)
 }
 
 /// The bytes of a debug_write, up to abi::LOG_TEXT, as one record of

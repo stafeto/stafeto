@@ -666,6 +666,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::log_wake_ack_posts_at_once_for_a_record_of_another_cpu,
     ),
     (
+        "log_wake_post_is_a_turn_of_its_own",
+        calls::log_wake_post_is_a_turn_of_its_own,
+    ),
+    (
         "log_wake_ends_with_the_last_handle",
         calls::log_wake_ends_with_the_last_handle,
     ),

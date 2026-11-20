@@ -22,7 +22,7 @@ use kcore::gic::{
     GICC_PMR, GICD_CTLR, GICD_CTLR_RWP, GICD_CTLR_V3, GICD_ICACTIVER, GICD_ICENABLER, GICD_ICPENDR,
     GICD_IGROUPR, GICD_IPRIORITYR, GICD_IROUTER, GICD_ISENABLER, GICD_ITARGETSR, GICD_SGIR,
     GICD_TYPER, GICR_CTLR, GICR_CTLR_RWP, GICR_TYPER, GICR_WAKER, ICC_SRE_SRE, PRIORITY_MASK,
-    SGI_CMD, SGI_FRAME, SGI_GO, SGI_LOCK, SGI_PING, SGI_PONG, WAKER_CHILDREN_ASLEEP,
+    SGI_CMD, SGI_FRAME, SGI_GO, SGI_LOCK, SGI_LOG, SGI_PING, SGI_PONG, WAKER_CHILDREN_ASLEEP,
     WAKER_PROCESSOR_SLEEP,
 };
 use kcore::layout::LINEAR_BASE;
@@ -302,7 +302,7 @@ pub fn init_secondary(redistributor_ready: impl FnOnce(Option<&BootInfo>, usize)
 
 /// Lets this CPU's SGIs of the kernel through (banked per CPU).
 pub fn enable_ipi() {
-    for intid in [SGI_PING, SGI_PONG, SGI_GO, SGI_LOCK, SGI_CMD] {
+    for intid in [SGI_PING, SGI_PONG, SGI_GO, SGI_LOCK, SGI_CMD, SGI_LOG] {
         set_priority(intid, DEFAULT_PRIORITY);
         unmask(intid);
     }

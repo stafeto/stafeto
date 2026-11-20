@@ -514,12 +514,13 @@ pub fn deliver(line: u32) -> bool {
     true
 }
 
-/// The post of the log's wake (`log::take_wake`, taken by the way out of the
-/// kernel at the start of a turn and before the sleep): when the log's
+/// The post of the log's wake (`log::take_wake`, made in the turn of the SGI `SGI_LOG`
+/// that the record's claimant sent its CPU, `smp::handle`): when the log's
 /// binding lives and is open, it masks it and posts bit 0 into its slot at
 /// the slot's priority, the level of whatever the post lets go (spec 7.7);
 /// a closed channel takes nothing, and the binding stays masked. One take
-/// of `OBJ`, O(1), the same hold as `deliver`. A flag that outlived the
+/// of `OBJ`, O(1), the same hold as `deliver`, in a turn of its own that no call
+/// shares. A flag that outlived the
 /// binding, or one an irq_ack already served, posts nothing.
 pub fn deliver_log() {
     crate::obj::serving(crate::obj::ENTRY_INTERRUPT);

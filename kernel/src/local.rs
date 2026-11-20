@@ -24,11 +24,6 @@ pub const COPY: u32 = 1;
 /// The outbox holds commands (`Local::deferred`).
 pub const OUTBOX: u32 = 2;
 
-/// A record landed in the log while the console's driver waited for one, and
-/// the post into its binding has not been made (`Local::deferred`,
-/// `log::take_wake`): the way out of the kernel makes it.
-pub const LOG_WAKE: u32 = 4;
-
 /// The data of one CPU, in its block (cpu::CpuBlock).
 #[repr(C, align(64))]
 pub struct Local {
@@ -53,6 +48,10 @@ pub struct Local {
     /// What the end of a call has still to do (`thread::flush_copy`): the
     /// bits `COPY`, `OUTBOX` and `LOG_WAKE`, one load for all.
     pub deferred: core::sync::atomic::AtomicU32,
+    /// A record claimed the arming of the console driver's wake on this CPU, and the post
+    /// into its binding is not made: the SGI the claimant sent itself (`SGI_LOG`) makes
+    /// it in a turn of its own (`log::take_wake`, spec 9).
+    pub log_wake: core::sync::atomic::AtomicBool,
     /// The start of the open entry interval and the longest one (sched).
     pub entry: UnsafeCell<(u64, u64)>,
     /// The time this CPU has slept and spent in the kernel, which other CPUs
@@ -90,6 +89,7 @@ impl Local {
             copy: Own::new(crate::thread::PendingCopy::new()),
             outbox: Own::new(crate::cmd::Outbox::new()),
             deferred: core::sync::atomic::AtomicU32::new(0),
+            log_wake: core::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "ktest")]
             takes: core::sync::atomic::AtomicU16::new(0),
             entry: UnsafeCell::new((0, 0)),

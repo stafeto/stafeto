@@ -152,6 +152,9 @@ break-notice-holder-keeps = []
 break-log-seen = ["kcore/break-log-seen"]
 # The look at the rings in `irq_ack` of the log's binding is left out (kernel/src/log.rs, `recheck`): the kernel test `log_wake` must catch it.
 break-log-wake = []
+# The post of the log's wake is made in the call that claimed the arming, as the first
+# build had it, not in the turn of the SGI: the kernel test of the takes of `OBJ` must catch it.
+break-log-post-in-call = []
 break-notice-payer-none = []
 break-relift-notice = []
 break-relift-reply = []

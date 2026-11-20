@@ -33,6 +33,8 @@
 .equ CALL_THREAD_EXIT, 17               // abi::Call::ThreadExit
 .equ CALL_THREAD_SET_PRIORITY, 18       // abi::Call::ThreadSetPriority
 .equ CALL_YIELD, 19                     // abi::Call::Yield
+.equ CALL_DEBUG_WRITE, 28             // abi::Call::DebugWrite
+.equ SVC_LOG_RACE, 0xFF0B               // ktest::el0::SVC_LOG_RACE
 .equ CALL_OBJECT_INFO, 27               // abi::Call::ObjectInfo
 .equ CALL_UPCALL_CONTROL, 32            // abi::Call::ThreadUpcallControl
 .equ UPCALL_ENABLE, 1                   // abi::UpcallControl::Enable
@@ -218,6 +220,34 @@ el0_take_loop:
     mov     x2, #1
     str     x2, [x4]
     svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
+// The writer of the test of the log's wake: x0 the word it watches, x1 a resource with
+// DEBUG. While the word is 1 it clears it and writes one record, "w\n", with debug_write;
+// at 2 it ends with thread_exit. The test sets the word just before the irq_ack that
+// arms the binding, so that the record races the arming.
+.global el0_log_writer
+el0_log_writer:
+    mov     x4, x0
+    mov     x6, x1
+1:  ldr     x2, [x4]
+    cbz     x2, 1b
+    cmp     x2, #2
+    b.eq    2f
+    str     xzr, [x4]
+    mov     x0, x6
+    mov     x1, #2
+    mov     x2, #0x0a77
+    svc     #CALL_DEBUG_WRITE
+    b       1b
+2:  svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
+// The listener's thread of the same test: its irq_ack and the notifications are made by the
+// kernel in svc #SVC_LOG_RACE, on this CPU.
+.global el0_log_judge
+el0_log_judge:
+    svc     #SVC_LOG_RACE
     svc     #SVC_DONE
 
 // Counts the takes of OBJ of this CPU (svc #SVC_TAKES_ALONE), sets the word

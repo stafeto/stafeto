@@ -5915,7 +5915,7 @@ fn with_log_binding(
         crate::log::pass_all();
         // The post a failed test left on this CPU goes, so that no other
         // test meets it.
-        crate::cmd::flush_posted();
+        let _ = log_posts();
         result
     })?;
     check(
@@ -5939,10 +5939,22 @@ fn log_notice_once(c: &Caller, h: Handle) -> Result<(), &'static str> {
     c.fails(Call::Receive.number(), &[h.0, NO_WAIT], Error::WouldBlock)
 }
 
-/// The way out of the kernel's post of the log's wake, as `resume` makes it
-/// at the end of a call.
-fn log_posts() {
-    crate::cmd::flush_posted();
+/// The turn of the SGI that a record, or the irq_ack that found records, sent its CPU
+/// (`SGI_LOG`): taken and handled as the way out of the kernel does, which posts. Nothing
+/// happens when no claim was made, and no interrupt may then be pending.
+fn log_posts() -> Result<(), &'static str> {
+    if !crate::log::wake_due() {
+        return nothing_pending("an interrupt was pending with no claim of the log's wake");
+    }
+    let ack = (0..1000)
+        .find_map(|_| gic::acknowledge())
+        .ok_or("the SGI of the log's post did not arrive")?;
+    if ack.intid() != kcore::gic::SGI_LOG {
+        gic::end(ack);
+        return Err("an interrupt other than the SGI of the log's post arrived");
+    }
+    crate::interrupt::handle(ack);
+    Ok(())
 }
 
 /// irq_bind of abi::LOG_LINE (spec 9, 11): KSTATS in x0 and a device window
@@ -5988,7 +6000,7 @@ pub fn log_wake_binds_with_its_rights_and_is_born_masked(_: &Boot) -> Result<(),
             crate::log::pass_all();
             crate::log::text(b"log wake test\n");
             check(!crate::log::wake_due(), "a record woke an unarmed binding")?;
-            log_posts();
+            log_posts()?;
             c.fails(Call::Receive.number(), &[h.0, NO_WAIT], Error::WouldBlock)
         })();
         let _ = process::close_handle(c.process, first, CAUSE);
@@ -6013,7 +6025,7 @@ pub fn log_wake_binds_with_its_rights_and_is_born_masked(_: &Boot) -> Result<(),
 pub fn log_wake_posts_once_for_each_arming(_: &Boot) -> Result<(), &'static str> {
     let ack = Call::IrqAck.number();
     with_log_binding(|c, h, b| {
-        // A record waits: irq_ack posts at once, with its way out.
+        // A record waits: irq_ack posts at once, with the turn of its SGI.
         crate::log::text(b"waits for the first irq_ack\n");
         check(!crate::log::wake_due(), "an unarmed record woke")?;
         c.succeeds(ack, &[b.0], &[])?;
@@ -6021,7 +6033,7 @@ pub fn log_wake_posts_once_for_each_arming(_: &Boot) -> Result<(), &'static str>
             crate::log::wake_due(),
             "irq_ack with a record in a ring did not ask for a post",
         )?;
-        log_posts();
+        log_posts()?;
         check(
             irq_info_of(c, b)?.masked && !crate::log::is_armed(),
             "the post left the binding open or armed",
@@ -6030,7 +6042,7 @@ pub fn log_wake_posts_once_for_each_arming(_: &Boot) -> Result<(), &'static str>
         // The rings are empty: irq_ack arms and posts nothing.
         crate::log::pass_all();
         c.succeeds(ack, &[b.0], &[])?;
-        log_posts();
+        log_posts()?;
         c.fails(Call::Receive.number(), &[h.0, NO_WAIT], Error::WouldBlock)?;
         check(
             crate::log::is_armed() && !irq_info_of(c, b)?.masked,
@@ -6043,7 +6055,7 @@ pub fn log_wake_posts_once_for_each_arming(_: &Boot) -> Result<(), &'static str>
             "an armed record did not ask for a post",
         )?;
         crate::log::text(b"second\n");
-        log_posts();
+        log_posts()?;
         check(!crate::log::wake_due(), "the post left its flag")?;
         log_notice_once(c, h)?;
         crate::log::text(b"third, before the irq_ack\n");
@@ -6051,7 +6063,7 @@ pub fn log_wake_posts_once_for_each_arming(_: &Boot) -> Result<(), &'static str>
             !crate::log::wake_due(),
             "a record after the post asked for one",
         )?;
-        log_posts();
+        log_posts()?;
         c.fails(Call::Receive.number(), &[h.0, NO_WAIT], Error::WouldBlock)?;
         // Two irq_ack after one record give one notification: the second
         // finds the binding open and does nothing.
@@ -6059,14 +6071,14 @@ pub fn log_wake_posts_once_for_each_arming(_: &Boot) -> Result<(), &'static str>
         c.succeeds(ack, &[b.0], &[])?;
         crate::log::text(b"one record\n");
         c.succeeds(ack, &[b.0], &[])?;
-        log_posts();
+        log_posts()?;
         log_notice_once(c, h)?;
         // A record of the `trace` feature goes past `record` and wakes
         // nobody: the ring's own `push` is that path.
         crate::log::pass_all();
         c.succeeds(ack, &[b.0], &[])?;
         c.succeeds(ack, &[b.0], &[])?;
-        log_posts();
+        log_posts()?;
         c.fails(Call::Receive.number(), &[h.0, NO_WAIT], Error::WouldBlock)
     })
 }
@@ -6091,10 +6103,110 @@ pub fn log_wake_ack_posts_at_once_for_a_record_of_another_cpu(
             true,
         );
         c.succeeds(Call::IrqAck.number(), &[b.0], &[])?;
-        log_posts();
+        log_posts()?;
         let result = log_notice_once(c, h);
         crate::log::pass_all();
         result
+    })
+}
+
+/// The post of the log's wake is a turn of its own, one take of `OBJ` that no call or
+/// section shares (review of the build, P1, P2): `irq_ack` that finds records waiting takes
+/// `OBJ` once, in its own section, and the post comes with the turn of the SGI that the claim
+/// sent; a record written inside a section of `OBJ` takes nothing more. The stretch of
+/// the call or section has one take, whatever the binding does. The kernel built with
+/// `break-log-post-in-call` posts in the call, and the first part fails.
+pub fn log_wake_post_is_a_turn_of_its_own(_: &Boot) -> Result<(), &'static str> {
+    use crate::obj;
+    with_log_binding(|c, h, b| {
+        crate::log::text(b"waits for the irq_ack\n");
+        let before = obj::takes();
+        c.succeeds(Call::IrqAck.number(), &[b.0], &[])?;
+        check(
+            obj::takes().wrapping_sub(before) == 1,
+            "an irq_ack that found records took OBJ more than once before its turn ended",
+        )?;
+        check(
+            crate::log::wake_due() || !irq_info_of(c, b)?.masked,
+            "irq_ack found records and claimed no post",
+        )?;
+        if crate::log::wake_due() {
+            log_posts()?;
+            check(
+                obj::takes().wrapping_sub(before) == 2,
+                "the post was not one take of OBJ in a turn of its own",
+            )?;
+        }
+        log_notice_once(c, h)?;
+        // A record written inside a section while the binding is armed.
+        crate::log::pass_all();
+        c.succeeds(Call::IrqAck.number(), &[b.0], &[])?;
+        check(crate::log::is_armed(), "the binding is not armed")?;
+        let before = obj::takes();
+        {
+            let _section = obj::lock();
+            crate::log::text(b"a record inside a section\n");
+        }
+        check(
+            obj::takes().wrapping_sub(before) == 1 && crate::log::wake_due(),
+            "a record inside a section took OBJ again, or claimed no post",
+        )?;
+        log_posts()?;
+        log_notice_once(c, h)
+    })
+}
+
+/// The listener of the race test (el0.rs `log_race`), on this CPU: `rounds` armings in a row
+/// against a writer on another CPU that writes exactly one record each time the word `go`
+/// is 1 (it clears it first). Each round sets `go` and, after a delay that grows round by
+/// round, arms with `irq_ack`, so the record lands before the arming, during it and after
+/// it. Each must give exactly one notification: none within the limit is a lost wake, and a
+/// second one is a doubled post. The SGI of a claim made on this CPU is handled here, as the
+/// way out of the kernel would; the other CPU handles its own.
+pub fn log_race_listener(
+    go: &core::sync::atomic::AtomicU64,
+    rounds: u32,
+) -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering::SeqCst;
+    let pump = || {
+        while crate::log::wake_due() {
+            if let Some(ack) = gic::acknowledge() {
+                crate::interrupt::handle(ack);
+            }
+        }
+    };
+    with_log_binding(|c, h, b| {
+        let receive = Call::Receive.number();
+        for round in 0..rounds {
+            crate::log::pass_all();
+            pump();
+            go.store(1, SeqCst);
+            for _ in 0..(round % 40) * 6 {
+                core::hint::spin_loop();
+            }
+            c.succeeds(Call::IrqAck.number(), &[b.0], &[])?;
+            let limit = timer::now() + timer::frequency() / 5;
+            loop {
+                pump();
+                let got = c.call(receive, &[h.0, NO_WAIT]);
+                if got[0] == 0 {
+                    break;
+                }
+                if got[0] != Error::WouldBlock.code() {
+                    return Err("receive of the log's notification failed");
+                }
+                if timer::now() > limit {
+                    return Err("a record after an arming gave no notification");
+                }
+            }
+            // No second notification for the one record, whichever CPU posted.
+            let until = timer::now() + timer::frequency() / 20_000;
+            while timer::now() < until {
+                pump();
+            }
+            c.fails(receive, &[h.0, NO_WAIT], Error::WouldBlock)?;
+        }
+        Ok(())
     })
 }
 
@@ -6110,7 +6222,7 @@ pub fn log_wake_ends_with_the_last_handle(_: &Boot) -> Result<(), &'static str> 
         c.close(b)?;
         check(!crate::log::is_armed(), "the last handle left the arming")?;
         // The flag outlived the binding: the post finds nobody.
-        log_posts();
+        log_posts()?;
         c.fails(Call::Receive.number(), &[h.0, NO_WAIT], Error::WouldBlock)?;
         crate::log::text(b"after the close\n");
         check(
