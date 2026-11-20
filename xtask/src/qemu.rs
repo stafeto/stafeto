@@ -1170,16 +1170,69 @@ pub fn run_until(
     run_until_staged(cmd, timeout, stop_marker, None)
 }
 
-/// How long a run that stops on init's end line (`init: <program> ended: ...`) goes on reading
-/// after it: init writes that line straight to the console, and the last lines of a probe that
-/// prints through the terminal service (`posix-pty: ok`) come in no fixed order with it, either
-/// side of it (the race stafeto#538 settled for five probes).
-pub const END_GRACE: Duration = Duration::from_millis(500);
-
 /// Whether `marker` is init's line for the end of a program, `init: <program> ended` and what
-/// follows: the stop marker of a probe whose own last lines may come after it.
+/// follows: init writes it straight to the console, and the last line of a probe that prints
+/// through the terminal service comes in no fixed order with it, either side of it (the race
+/// stafeto#538 settled for five probes).
 pub fn is_init_end_marker(marker: &str) -> bool {
     marker.starts_with("init: ") && marker.contains(" ended")
+}
+
+/// `run_until` for a probe with two lines that end it in no fixed order, init's end line
+/// (`init: <program> ended: ...`) and the probe's own last line, which goes through the terminal
+/// service: stops once every one of `markers` has come, and keeps the lines up to the last of
+/// them. The first of `markers` is init's end line: what the services print in measures
+/// (`service step:` and the like) after it is left out, as it is when a run stops on it: init is
+/// stopping them then, and a step of the shutdown is no measure of the probe.
+pub fn run_until_all(cmd: Command, timeout: Duration, markers: &[&str]) -> Result<Outcome, String> {
+    let mut run = Run::start(cmd, Input::Null)?;
+    let deadline = Instant::now() + timeout;
+    let mut seen: Vec<Option<usize>> = vec![None; markers.len()];
+    let mut checked = 0;
+    loop {
+        for (i, line) in run.lines.iter().enumerate().skip(checked) {
+            for (k, marker) in markers.iter().enumerate() {
+                if seen[k].is_none() && line.contains(marker) {
+                    seen[k] = Some(i);
+                }
+            }
+        }
+        checked = run.lines.len();
+        if seen.iter().all(Option::is_some) {
+            // The first marker is init's end line, which main's runs stopped on.
+            let first = seen[0].unwrap_or(0);
+            let last = seen.iter().flatten().max().copied().unwrap_or(0);
+            let mut outcome = run.end(End::Marker(last));
+            drop_measures_after(&mut outcome.lines, first);
+            return Ok(outcome);
+        }
+        match run.wait(deadline) {
+            Wait::Came => {}
+            Wait::Deadline => return Ok(run.end(End::TimedOut)),
+            Wait::Ended if run.line_start < run.transcript.bytes.len() => run.end_line(),
+            Wait::Ended => break,
+        }
+    }
+    loop {
+        if let Some(status) = run.child.try_wait().map_err(|e| e.to_string())? {
+            return Ok(run.end(End::Exited(status)));
+        }
+        if Instant::now() >= deadline {
+            return Ok(run.end(End::TimedOut));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Leaves out of `lines` the lines the services print for their measures (`service step:`,
+/// `service table:`, `service wait:`, `service gap:`, `service preempt:`, `service heartbeat:`)
+/// that stand after place `first`, the place of init's end line.
+fn drop_measures_after(lines: &mut Vec<String>, first: usize) {
+    let mut at = 0;
+    lines.retain(|l| {
+        at += 1;
+        at - 1 <= first || !l.starts_with("service ")
+    });
 }
 
 /// A limit on one stage of a run: once a line contains `after`, a line that
@@ -1209,15 +1262,7 @@ pub fn run_until_staged(
         if let Some(marker) = stop_marker
             && let Some(at) = run.lines[checked..].iter().position(|l| l.contains(marker))
         {
-            let mut last = checked + at;
-            if is_init_end_marker(marker) {
-                // The lines that follow within END_GRACE belong to the probe, whichever
-                // order they came in; the run keeps them all.
-                let until = Instant::now() + END_GRACE;
-                while let Wait::Came = run.wait(until) {}
-                last = run.lines.len().saturating_sub(1).max(last);
-            }
-            return Ok(run.end(End::Marker(last)));
+            return Ok(run.end(End::Marker(checked + at)));
         }
         if let Some(stage) = stage {
             for line in &run.lines[checked..] {
@@ -2458,39 +2503,59 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         );
     }
 
-    /// Init's end line and the probe's last line come in either order: a run that stops on the
-    /// end line keeps the lines that follow it within END_GRACE and still counts as stopped on
-    /// it, and a line later than that is not waited for.
+    /// Init's end line and the probe's last line come in either order: the run stops on the
+    /// later of the two and keeps both, leaves out the measures of the services that come
+    /// after the first, and waits for neither a third thing nor a line past them.
     #[test]
-    fn a_run_stopped_on_init_ending_keeps_the_probe_lines_that_follow() {
+    fn a_run_waits_for_init_ending_and_the_probes_last_line_in_either_order() {
         assert!(is_init_end_marker("init: posix-pty ended: "));
         assert!(is_init_end_marker("init: tty-probe ended"));
         assert!(!is_init_end_marker("KERNEL PANIC: x"));
         assert!(!is_init_end_marker("posix-pty: ok"));
         let ended = "init: posix-pty ended: exit code 0, not restarted";
-        let o = run_until(
+        let markers = ["init: posix-pty ended: ", "posix-pty: ok"];
+        let o = run_until_all(
             sh(&format!(
-                "echo booting; echo '{ended}'; sleep 0.2; echo 'posix-pty: ok'; sleep 3; echo 'too late'; exec sleep 10"
+                "echo booting; echo 'service step: 1 kind 64 5 ticks'; echo '{ended}'; echo 'service step: 1 kind 64 99999 ticks detail 0 preempts 26'; echo 'ramfs: audit round 1'; sleep 0.2; echo 'posix-pty: ok'; echo 'too late'; exec sleep 10"
             )),
             Duration::from_secs(20),
-            Some("init: posix-pty ended: "),
+            &markers,
         )
         .unwrap();
         assert!(o.stopped_on_marker && !o.timed_out);
         assert!(expect_marker(&o, "posix-pty: ok").is_ok());
         assert!(expect_stopped_on(&o, ended).is_ok());
+        assert!(
+            o.lines
+                .iter()
+                .any(|l| l == "service step: 1 kind 64 5 ticks")
+        );
+        assert!(
+            !o.lines.iter().any(|l| l.contains("99999")),
+            "{:?}",
+            o.lines
+        );
+        assert!(o.lines.iter().any(|l| l == "ramfs: audit round 1"));
         assert!(!o.lines.iter().any(|l| l == "too late"));
         // The other order: the probe's line first.
-        let o = run_until(
+        let o = run_until_all(
             sh(&format!(
                 "echo 'posix-pty: ok'; echo '{ended}'; exec sleep 10"
             )),
             Duration::from_secs(20),
-            Some("init: posix-pty ended: "),
+            &markers,
         )
         .unwrap();
         assert!(expect_marker(&o, "posix-pty: ok").is_ok());
         assert!(expect_stopped_on(&o, ended).is_ok());
+        // A run in which one never comes times out.
+        let o = run_until_all(
+            sh("echo 'posix-pty: ok'; exec sleep 10"),
+            Duration::from_secs(1),
+            &markers,
+        )
+        .unwrap();
+        assert!(o.timed_out && !o.stopped_on_marker);
     }
 
     #[test]

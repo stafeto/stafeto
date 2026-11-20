@@ -3086,6 +3086,19 @@ fn run_until(
     Ok(outcome)
 }
 
+/// `run_until` for a probe that ends with init's end line and its own last line in no fixed
+/// order (`qemu::run_until_all`): stops once all of `markers` have come.
+fn run_until_all(
+    cmd: Command,
+    timeout: Duration,
+    markers: &[&str],
+    elf: &Path,
+) -> Result<qemu::Outcome, String> {
+    let outcome = qemu::run_until_all(cmd, timeout, markers)?;
+    symbolize::backtrace(&outcome.lines, elf);
+    Ok(outcome)
+}
+
 fn stdout_of(cmd: &mut Command) -> Result<String, String> {
     let out = cmd.output().map_err(|e| format!("{cmd:?}: {e}"))?;
     String::from_utf8(out.stdout).map_err(|e| e.to_string())
@@ -4913,7 +4926,14 @@ fn posix_tty_control_steps() -> Result<(), String> {
     )?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
-    let outcome = qemu::run_until(cmd, Duration::from_secs(180), Some("init: posix-tty ended"))?;
+    let outcome = qemu::run_until_all(
+        cmd,
+        Duration::from_secs(180),
+        &[
+            "init: posix-tty ended",
+            "posix-tty: quiet controls sixteen clients ok",
+        ],
+    )?;
     let dir = target_dir().join("measure");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     std::fs::write(
@@ -5635,10 +5655,10 @@ fn posix_poll_probe() -> Result<(), String> {
     let image = build_boot_image("boot-posix-poll.img", &PROGRAMS, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
-    let output = run_until(
+    let output = run_until_all(
         cmd,
         BOOT_TIMEOUT,
-        Some("init: posix-poll ended: "),
+        &["init: posix-poll ended: ", "posix-poll: ok"],
         &kernel.elf,
     )?;
     qemu::expect_marker(&output, "posix-poll: poll and select of 64 descriptions ok")?;
@@ -5724,10 +5744,10 @@ fn posix_sock_run(steps: bool) -> Result<Vec<String>, String> {
     let image = build_boot_image("boot-posix-sock.img", programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
-    let output = run_until(
+    let output = run_until_all(
         cmd,
         BOOT_TIMEOUT,
-        Some("init: posix-sock ended: "),
+        &["init: posix-sock ended: ", "posix-sock: ok"],
         &kernel.elf,
     )?;
     qemu::expect_marker(&output, "posix-sock: ok")?;
@@ -5857,10 +5877,10 @@ fn posix_ipc_run(steps: bool) -> Result<Vec<String>, String> {
     let image = build_boot_image("boot-posix-ipc.img", programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
-    let output = run_until(
+    let output = run_until_all(
         cmd,
         BOOT_TIMEOUT,
-        Some("init: posix-ipc ended: "),
+        &["init: posix-ipc ended: ", "posix-ipc: ok"],
         &kernel.elf,
     )?;
     qemu::expect_marker(&output, "posix-ipc: ok")?;
@@ -5917,10 +5937,10 @@ fn posix_pty_probe_in(steps: bool) -> Result<(), String> {
     )?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
-    let output = run_until(
+    let output = run_until_all(
         cmd,
         BOOT_TIMEOUT,
-        Some("init: posix-pty ended: "),
+        &["init: posix-pty ended: ", "posix-pty: ok"],
         &kernel.elf,
     )?;
     qemu::expect_marker(&output, "posix-pty: ok")?;
@@ -10549,10 +10569,10 @@ fn tty_steps() -> Result<(), String> {
     let image = build_boot_image("boot-tty-steps.img", &TTY_STEPS_PROGRAMS, BOOT_PROFILE)?;
     let (mut cmd, kernel) = probe_command(&image, false)?;
     cmd.args(qemu::ICOUNT);
-    let output = run_until(
+    let output = run_until_all(
         cmd,
         BOOT_TIMEOUT,
-        Some("init: tty-probe ended"),
+        &["init: tty-probe ended", "tty-probe: ok"],
         &kernel.elf,
     )?;
     let dir = target_dir().join("measure");
