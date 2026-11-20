@@ -604,11 +604,14 @@ mod tests {
         assert!(e.contains("series 0.6") && e.contains("series 0.5"), "{e}");
         assert!(parse_update(Some("v0.05-pkgs.1"), false, "0.5").is_err());
         assert_eq!(
-            parse_update(Some("v0.5-pkgs.1"), false, &crate::pkg::series())
+            parse_update(Some("v0.5-pkgs.1"), false, "0.5")
                 .unwrap()
                 .series,
-            crate::pkg::series()
+            "0.5"
         );
+        let own = crate::pkg::series();
+        let tag = format!("v{own}-pkgs.1");
+        assert_eq!(parse_update(Some(&tag), false, &own).unwrap().series, own);
     }
 
     #[test]
