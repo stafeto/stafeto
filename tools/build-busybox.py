@@ -157,6 +157,11 @@ UTILITIES = tuple(name.upper() for name in (
     # The CPUs: nproc counts the mask of sched_getaffinity, taskset reads and
     # sets it (-p, -c and a command to run under a mask).
     "nproc taskset feature_taskset_fancy feature_taskset_cpulist "
+    # The screen editor: colon commands, yank and marks, search, the dot command, the read-only
+    # mode and the settings, the signals of the terminal. No terminal query (the reply of a
+    # terminal is waited for), no undo.
+    "vi feature_vi_colon feature_vi_yankmark feature_vi_search feature_vi_dot_cmd "
+    "feature_vi_readonly feature_vi_setopts feature_vi_set feature_vi_use_signals "
     "").split()) + OWN_CONFIGS
 
 
@@ -361,6 +366,8 @@ def build(utilities: bool) -> None:
             config.write_text(text.replace(f"# CONFIG_{name} is not set", f"CONFIG_{name}=y"))
         elif f"CONFIG_{name}=y" not in text:
             raise SystemExit(f"BusyBox has no CONFIG_{name}")
+    if "VI" in names:
+        replace(config, "CONFIG_FEATURE_VI_MAX_LEN=0", "CONFIG_FEATURE_VI_MAX_LEN=4096")
     if "HTTPD" in names:
         # httpd serves plain files: the allnoconfig leaves every feature of it
         # off, and its default port 0 is out of the range the build asks

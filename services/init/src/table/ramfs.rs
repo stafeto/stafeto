@@ -316,6 +316,29 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::entropy::ENTROPY,
 ];
 
+/// The dialog of the shell with the data volume (`xtask vi-dialog`): the table of the dialog, the
+/// disk service of the volume and the data file service before the launcher, which waits for the
+/// service to say READY (a blank volume is formatted first) before it starts the shell.
+pub const BUSYBOX_DIALOG_DATA_TABLE: &[Record] = &[
+    BUSYBOX_DIALOG_TABLE[0],
+    BUSYBOX_DIALOG_TABLE[1],
+    BUSYBOX_DIALOG_TABLE[2],
+    BUSYBOX_DIALOG_TABLE[3],
+    BUSYBOX_DIALOG_TABLE[4],
+    super::pkg::BLK_DATADISK,
+    super::pkg::DATAFS_CLOCKED,
+    Record {
+        waits: &[super::Wait {
+            service: "datafs",
+            deadline_ms: 60_000,
+        }],
+        ..BUSYBOX_DIALOG_TABLE[5]
+    },
+    BUSYBOX_DIALOG_TABLE[6],
+    BUSYBOX_DIALOG_TABLE[7],
+    BUSYBOX_DIALOG_TABLE[8],
+];
+
 /// The page of the PL031 of QEMU `virt` (rtc::PL031_BASE): the clock
 /// service reads the time of the host there when it starts.
 const RTC: Window = Window {
