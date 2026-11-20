@@ -16784,7 +16784,7 @@ mod tests {
         );
         assert_eq!(
             guard_lower_hint("NULL_MAX", 17, NULL_SLACK, NULL_MAX, NULL_KEEP),
-            Some("lower NULL_MAX to 258".to_owned())
+            Some(format!("lower NULL_MAX to {}", NULL_MAX - 13))
         );
         assert_eq!(
             guard_lower_hint(
