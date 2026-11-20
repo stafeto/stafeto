@@ -17,6 +17,7 @@ pub mod input;
 pub mod irq;
 pub mod log;
 pub mod output;
+pub mod probe;
 pub mod regs;
 pub mod view16550;
 pub mod writes;

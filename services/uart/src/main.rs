@@ -104,6 +104,9 @@ struct State {
     /// The lines of the kernel log that go in pieces, until they are whole.
     lines: console_line::Lines,
     read: [u8; RX_RING],
+    /// The latency of the lines the quiet probe writes (feature `quiet-probe`).
+    #[cfg(feature = "quiet-probe")]
+    latency: uart::probe::Latency,
 }
 
 struct Cell(UnsafeCell<MaybeUninit<State>>);
@@ -141,6 +144,8 @@ fn state() -> Option<&'static mut State> {
         sources: uart::log::Sources::new(),
         lines: console_line::Lines::new(),
         read: [0; RX_RING],
+        #[cfg(feature = "quiet-probe")]
+        latency: uart::probe::Latency::new(),
     }))
 }
 
@@ -300,6 +305,14 @@ fn main(_: u64) -> u64 {
         pace: uart::log::Pace::new(),
         missed: uart::log::Missed::new(),
         safety: false,
+        #[cfg(feature = "quiet-probe")]
+        probe: Probe {
+            budget: None,
+            wakeups: 0,
+            ticks: 0,
+            first: (0, 0, 0),
+            said_latency: false,
+        },
         irqs: Irq::new(),
         stop_by: None,
         state,
@@ -343,7 +356,11 @@ fn main(_: u64) -> u64 {
     // runs under its budget" is not printed then. xtask fails the run for the refusal line in
     // any probe (`Run::end`, `refused_budget`), and the probes that require the boot line fail
     // for its absence.
-    let _ = rt::budget::bind("uart", "serve", budget, &s.thread);
+    let _bound = rt::budget::bind("uart", "serve", budget, &s.thread);
+    #[cfg(feature = "quiet-probe")]
+    {
+        uart.probe.budget = _bound.ok().flatten();
+    }
     // The tag of the driver's lines of steps (`service table: 18 kind K ...`): kind 65 is the tick
     // of the log that found no record (the idle tick), kind 64 is the other notices, and the
     // detail of kind 64 tells which: 1 the interrupt of the line, 2 the transmit wake-up, 3 a
@@ -360,6 +377,17 @@ fn main(_: u64) -> u64 {
     let _ = rt::service::run::<Uart, SESSIONS, HELD>(&channel, &mut uart, config);
     uart.say_peak(true);
     STOPPED
+}
+
+/// What the quiet probe counts (feature `quiet-probe`).
+#[cfg(feature = "quiet-probe")]
+struct Probe {
+    budget: Option<Handle<rt::handle::Budget>>,
+    wakeups: u64,
+    ticks: u32,
+    /// The wake-ups, the overruns and the time (ms) at the first safety tick.
+    first: (u64, u64, u64),
+    said_latency: bool,
 }
 
 /// The binding of the log's line (spec 9, 11): a copy of the driver's channel
@@ -414,6 +442,11 @@ struct Uart {
     /// The timer's deadline is a safety tick: the driver acknowledged the
     /// binding and waits for the kernel.
     safety: bool,
+    /// The quiet probe (feature `quiet-probe`): the notices the driver
+    /// served, the safety ticks, the budget it reads the overruns of, and the
+    /// latency of the lines it writes.
+    #[cfg(feature = "quiet-probe")]
+    probe: Probe,
     irqs: Irq,
     /// Init asked the driver to stop: the time by which it exits whether
     /// or not the log reached the port (`stop`).
@@ -616,6 +649,8 @@ impl Uart {
                 records,
                 sources,
                 lines,
+                #[cfg(feature = "quiet-probe")]
+                latency,
                 ..
             } = &mut *self.state;
             if !output.accepts_log() || !uart::log::take_more(taken, output.log_room()) {
@@ -643,6 +678,18 @@ impl Uart {
                 let _ = output.put_log(bytes);
             });
             taken += 1;
+            #[cfg(feature = "quiet-probe")]
+            {
+                let now = time::ticks_to_ns(time::now());
+                for bytes in records.iter().take((batch.count as usize).min(LOG_BATCH)) {
+                    if let Ok(r) = uart::log::record(bytes)
+                        && uart::probe::is_line(r.text)
+                    {
+                        let written = time::ticks_to_ns(r.time);
+                        latency.taken(now.saturating_sub(written) / 1_000);
+                    }
+                }
+            }
             if self.left == 0 {
                 break;
             }
@@ -1120,6 +1167,10 @@ impl Service<HELD> for Uart {
     /// the timer of the reads of the log: a stale expiry, before its
     /// deadline, changes nothing.
     fn notification(&mut self, n: Notice) {
+        #[cfg(feature = "quiet-probe")]
+        {
+            self.probe.wakeups += 1;
+        }
         match (n.source, n.label) {
             (Source::Interrupt, LOG_LABEL) => self.log_notified(),
             (Source::Interrupt, _) => {
@@ -1142,6 +1193,19 @@ impl Service<HELD> for Uart {
                 self.log_step(safety);
             }
             _ => {}
+        }
+    }
+
+    /// The quiet probe's lines for the latency: one at each heartbeat once the
+    /// quiet window is over, which no other wake-up of the driver is near.
+    #[cfg(feature = "quiet-probe")]
+    fn maintenance(&mut self, _: &mut [Option<Session<(), HELD>>], notice: Notice) {
+        if notice.source == Source::Timer
+            && notice.label == 0
+            && self.state.latency.writes(self.probe.ticks)
+        {
+            let n = self.state.latency.written();
+            let _ = rt::console::write_fmt(format_args!("uart: latency probe line {n}\n"));
         }
     }
 
@@ -1198,6 +1262,39 @@ impl Uart {
         }
         #[cfg(not(feature = "steps"))]
         let _ = batches;
+        // The probe says nothing before the window is over, so that no line of its own
+        // (the console's transmit interrupts and the drain that follow) is counted in it.
+        #[cfg(feature = "quiet-probe")]
+        if safety {
+            self.probe.ticks += 1;
+            let overruns = self
+                .probe
+                .budget
+                .as_ref()
+                .and_then(|b| sys::budget_info(b).ok())
+                .map_or(u64::MAX, |info| info.overruns);
+            let at = time::ticks_to_ns(time::now()) / 1_000_000;
+            let now = (self.probe.wakeups, overruns, at);
+            if self.probe.ticks == 1 {
+                self.probe.first = now;
+            } else if self.probe.ticks == 11 {
+                let (w, o, t) = self.probe.first;
+                self.say_log(format_args!(
+                    "uart: quiet window wakeups {} overruns {} ms {}\n",
+                    now.0 - w,
+                    now.1.wrapping_sub(o),
+                    now.2 - t
+                ));
+            }
+            if self.state.latency.lines() >= uart::probe::LINES && !self.probe.said_latency {
+                self.probe.said_latency = true;
+                let (longest, p99) = self.state.latency.longest_and_p99();
+                self.say_log(format_args!(
+                    "uart: quiet latency max {longest} us p99 {p99} us lines {}\n",
+                    uart::probe::LINES
+                ));
+            }
+        }
         if safety && records > 0 {
             let masked = self
                 .log_irq

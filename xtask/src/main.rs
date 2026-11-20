@@ -86,6 +86,7 @@ mod kernel_size;
 mod keys;
 mod layer_probe;
 mod linux_guest;
+mod log_quiet;
 mod lvgl;
 mod lvgl_image;
 #[cfg(test)]
@@ -2537,6 +2538,7 @@ commands:
             level with a budget leaves a lower level its share; the boost of a request stays and a
             notification's goes with the budget)
   budget-journal the probe of the overruns in init's journal under -icount: one line in each 10 s for a budget that overruns in every period, none for one that does not
+  log-quiet [icount|tcg] the quiet probe of the kernel log's wake: an idle system for 10 s wakes the console driver at most 12 times with no overrun of its budget, and the latency of a line after its write is printed
   budget-breaks the deliberate breaks of the time budgets fail the probe, the kernel tests and the host tests
   budget-break-unbound the share probe of the network service fails on the image with no budget bound
   its-breaks the deliberate breaks of the ITS command counter and the portions of teardown fail their host tests
@@ -2616,6 +2618,7 @@ fn main() {
         Some("budget-breaks") => budget_hog::breaks(),
         Some("budget-break-unbound") => budget_hog::unbound_break(),
         Some("budget-journal") => budget_journal::run(&args[1..]),
+        Some("log-quiet") => log_quiet::run(&args[1..]),
         Some("rtbench") => match &args[1..] {
             [flag, minutes, placing @ ..] if flag == "--minutes" => minutes
                 .parse::<u64>()
