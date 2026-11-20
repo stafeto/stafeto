@@ -508,6 +508,11 @@ pub enum Fate {
         source: Option<String>,
         /// The recipe differs and the content is equal.
         same_content: bool,
+        /// The recipe of the entry, which is also the one in the `meta` of the
+        /// file: a carried package keeps it (even when the recipe of the tree
+        /// differs), so that the next build compares the content again and
+        /// the `meta` of the file still says what the index says.
+        recipe: String,
     },
     Built {
         release: String,
@@ -659,6 +664,7 @@ pub fn plan(
                             address: old.file.clone(),
                             source: old.source.clone(),
                             same_content: !recipe_same,
+                            recipe: old.recipe.clone(),
                         },
                     );
                 }
@@ -1791,9 +1797,16 @@ pub(crate) mod tests {
                 bytes,
                 address,
                 same_content,
+                recipe,
                 ..
             } => {
                 assert_eq!(release, "3");
+                // Rule 3: the entry of the next index keeps the recipe of the
+                // anchor, which the file says in its meta.
+                assert_eq!(recipe, &"a".repeat(64));
+                assert_ne!(recipe, &"b".repeat(64));
+                let file = PackageFile::parse(bytes).unwrap();
+                assert_eq!(file.meta.recipe, recipe.as_str());
                 assert_eq!(bytes, &anchor);
                 assert_eq!(address, "alpha-1.0-3.stpkg");
                 assert!(same_content);
@@ -2087,6 +2100,7 @@ pub(crate) mod tests {
             address: "busybox.stpkg".into(),
             source: None,
             same_content,
+            recipe: "r".into(),
         };
         let previous = Previous {
             serial: 2,

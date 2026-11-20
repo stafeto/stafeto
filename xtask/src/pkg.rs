@@ -862,7 +862,7 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
     }
     // The packages of a published index that did not change are carried; the
     // releases of the plan go to the descriptions.
-    let mut carried: BTreeMap<String, (Vec<u8>, String, Option<String>)> = BTreeMap::new();
+    let mut carried: BTreeMap<String, (Vec<u8>, String, Option<String>, String)> = BTreeMap::new();
     if let Some(base) = &opts.previous {
         let roots = carry::roots_for(base, &tree)?;
         let policy = carry::Policy::of_tree(&tree, base, &series())?;
@@ -942,10 +942,11 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
                 bytes,
                 address,
                 source,
+                recipe,
                 ..
             } = fate
             {
-                carried.insert(name, (bytes, address, source));
+                carried.insert(name, (bytes, address, source, recipe));
             }
         }
     }
@@ -969,7 +970,10 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
     let mut built = Vec::new();
     for p in selected {
         let recipe = recipes[&p.name].0.clone();
-        if let Some((bytes, address, source)) = carried.remove(&p.name) {
+        if let Some((bytes, address, source, kept)) = carried.remove(&p.name) {
+            // The entry of the index says the recipe of the file, which is
+            // the anchor's when the package was carried by content.
+            let recipe = kept;
             let file = PackageFile::parse(&bytes).map_err(|e| format!("{}: {e}", p.name))?;
             let path = out_dir.join(file_name(p));
             let temp = path.with_extension("stpkg.part");
