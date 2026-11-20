@@ -4993,7 +4993,9 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
         run.expect("posix-tty: three signals in a row ok", DIALOG_STEP)?;
         run.expect("posix-tty: sessions ok", DIALOG_STEP)?;
         run.expect("posix-tty: ok", DIALOG_STEP)?;
-        run.expect(ENDED, DIALOG_STEP)
+        // Init writes its line straight to the console while the probe's last lines travel
+        // through the terminal service, so the line can come before "posix-tty: ok".
+        run.expect_seen(ENDED, DIALOG_STEP)
     })();
     let output = run.stop();
     if vz {
