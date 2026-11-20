@@ -601,6 +601,23 @@ link programs (for a package with programs) and `build-depends <name>
   `pkg-identity` and `dist-licenses` in a row;
   it is the job `pkg` of the CI.
 
+### Reproducible builds
+
+Carrying by content (above) works when the same inputs give the same
+installed bytes. xtask starts every `tools/build-*.py` with
+`SOURCE_DATE_EPOCH=1767225600` (2026-01-01, a fixed number, since the time of
+a commit would change the bytes with every commit) and `PYTHONHASHSEED=0`;
+the environment of xtask itself and so the times of images and package tables
+are unchanged. BusyBox and OpenSSL write the time of the build into the
+program, and now write that fixed time. `cargo xtask pkg-repro` checks the
+rest: it moves `target/` away, builds every package from an empty `target/`
+into one directory, moves that `target/` away, builds again into another
+directory, and prints per package `same` or `DIFFERS` with the first path (or
+`meta <field>`) that differs and how many more do. It exits with an error if
+any package differs. It runs on a runner: `gh workflow run probe.yml --ref
+<branch> -f command=pkg-repro -f timeout=60` (it refuses outside GitHub
+Actions without `--force`).
+
 ## Add a package
 
 1. Write the build script in `tools/`, with the version, URL and SHA-256 taken

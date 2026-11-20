@@ -449,19 +449,38 @@ impl Installed {
     /// The first difference from `old`: a path of the manifest (in the order
     /// of the paths) or else a field of `meta`; `None` when the content is equal.
     pub fn first_difference(&self, old: &Installed) -> Option<String> {
+        self.differences(old).into_iter().next()
+    }
+
+    /// Every difference from `old`: the paths of the manifest in the order of
+    /// the paths, then the fields of `meta` (`meta <key>`).
+    pub fn differences(&self, old: &Installed) -> Vec<String> {
+        let mut found = Vec::new();
         let mut new_it = self.manifest.iter().peekable();
         let mut old_it = old.manifest.iter().peekable();
         loop {
             match (new_it.peek(), old_it.peek()) {
                 (None, None) => break,
-                (Some((p, _)), None) => return Some(format!("{p} (added)")),
-                (None, Some((p, _))) => return Some(format!("{p} (removed)")),
+                (Some((p, _)), None) => {
+                    found.push(format!("{p} (added)"));
+                    new_it.next();
+                }
+                (None, Some((p, _))) => {
+                    found.push(format!("{p} (removed)"));
+                    old_it.next();
+                }
                 (Some((np, nl)), Some((op, ol))) => match np.cmp(op) {
-                    std::cmp::Ordering::Less => return Some(format!("{np} (added)")),
-                    std::cmp::Ordering::Greater => return Some(format!("{op} (removed)")),
+                    std::cmp::Ordering::Less => {
+                        found.push(format!("{np} (added)"));
+                        new_it.next();
+                    }
+                    std::cmp::Ordering::Greater => {
+                        found.push(format!("{op} (removed)"));
+                        old_it.next();
+                    }
                     std::cmp::Ordering::Equal => {
                         if nl != ol {
-                            return Some(np.to_string());
+                            found.push(np.to_string());
                         }
                         new_it.next();
                         old_it.next();
@@ -471,10 +490,10 @@ impl Installed {
         }
         for ((key, new), (_, old)) in self.meta.iter().zip(&old.meta) {
             if new != old {
-                return Some(format!("meta {key}"));
+                found.push(format!("meta {key}"));
             }
         }
-        None
+        found
     }
 }
 

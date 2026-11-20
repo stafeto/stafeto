@@ -121,6 +121,7 @@ mod pci_walk;
 mod pkg;
 mod pkg_probe;
 mod pkg_probes;
+mod pkg_repro;
 mod pkg_sign;
 mod pkg_slot;
 mod pkg_states;
@@ -2247,6 +2248,7 @@ commands:
   image-repack IMAGE --packages D  put the package files of D into a boot image of the same layout
   abi       the fingerprint of the ABI of the packages against packages/abi.txt (`--check`, `--update`,
             `--freeze`, `--explain`; `--release` wants a frozen series; docs/packages.md)
+  pkg-repro build every package twice from scratch and compare what they install (a runner: probe.yml)
   pkg-ci    pkg-build, repo, abi, pkg-identity and dist-licenses in a row (the job `pkg` of CI)
   init-reserve  build the programs of the base table that restart and check that the largest
             need of a restart, DMA objects included, fits INIT_RESERVE_PAGES
@@ -2802,6 +2804,7 @@ fn main() {
         Some("packages") => packages_command(args.get(1).map(String::as_str)),
         Some("keys") => keys::command(&args[1..]),
         Some("pkg-build") => pkg::command(&args[1..]),
+        Some("pkg-repro") => pkg_repro::command(&args[1..]),
         Some("repo") => repo::command(&args[1..]),
         Some("pkg-identity") => pkg_probes::identity(),
         Some("dist-licenses") => pkg_probes::dist_licenses(),
