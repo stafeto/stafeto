@@ -19,6 +19,14 @@
 //! stopped, once its window has passed. The totals run across the instances
 //! of a record: a restart makes new budgets under the same labels.
 //!
+//! The lines of the journal go through the console driver, so each one costs
+//! the driver's own budget a few overruns, and a line about that budget would
+//! cause the next one, window after window, in an idle system. A window of the
+//! console record's budgets (`set_console`) is therefore written only when its
+//! overruns exceed `CONSOLE_SHARE_PERCENT` of the periods the window holds; a
+//! smaller window closes without a line, and its overruns stay in the sum the
+//! next written line tells (the totals count every overrun).
+//!
 //! The kernel counts an overrun for each exhausted piece of the budget. The
 //! queue of a budget holds up to `abi::SS_REPL_MAX` pieces, and each block of
 //! its thread splits the capacity, so a service that blocks often can exhaust
@@ -71,6 +79,14 @@ pub fn reports(name: &str) -> bool {
     cfg!(feature = "table-frame") || name != crate::table::NET_SERVICE
 }
 
+/// The share of the periods of a window, in percent, that the overruns of a
+/// console budget have to exceed for the window to be written. The share of
+/// the periods in which a budget ran out is the figure that compares services
+/// (see above), and a line's own echo is a few overruns. With a period of
+/// 10 ms and a window of 10 s this is 50 overruns. Not measured on real
+/// hardware.
+pub const CONSOLE_SHARE_PERCENT: u64 = 5;
+
 /// A line of the journal that is due: the budget `index` of the record at
 /// `place`, the overruns since the last line and the total.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +100,10 @@ pub struct Line {
 #[derive(Clone, Copy)]
 struct Slot {
     total: u64,
+    /// The overruns that no written line has told.
     unwritten: u64,
+    /// The overruns of the window that is open.
+    window: u64,
     /// When the last line was due, in nanoseconds on init's clock.
     last: Option<u64>,
 }
@@ -92,6 +111,9 @@ struct Slot {
 /// The counts of the overruns of every budget of the table.
 pub struct Overruns {
     slots: [Slot; SLOTS],
+    /// The place of the console record and the overruns a window of each of
+    /// its budgets has to exceed to be written.
+    console: Option<(usize, [u64; START_DATA_MAX])>,
 }
 
 impl Overruns {
@@ -100,9 +122,22 @@ impl Overruns {
             slots: [Slot {
                 total: 0,
                 unwritten: 0,
+                window: 0,
                 last: None,
             }; SLOTS],
+            console: None,
         }
+    }
+
+    /// Names the record at `place` as the console driver, whose budgets have
+    /// the periods `periods_ns`: the windows of them get the threshold of
+    /// `CONSOLE_SHARE_PERCENT` of their periods.
+    pub fn set_console(&mut self, place: usize, periods_ns: &[u64]) {
+        let mut floor = [0; START_DATA_MAX];
+        for (f, &t) in floor.iter_mut().zip(periods_ns) {
+            *f = (WINDOW_NS / t.max(1)) * CONSOLE_SHARE_PERCENT / 100;
+        }
+        self.console = Some((place, floor));
     }
 
     /// A notification of the place `label` of count `count` at time `now`:
@@ -120,6 +155,7 @@ impl Overruns {
         let count = u64::from(count).max(1);
         slot.total = slot.total.saturating_add(count);
         slot.unwritten = slot.unwritten.saturating_add(count);
+        slot.window = slot.window.saturating_add(count);
         let due = slot
             .last
             .is_none_or(|last| now.saturating_sub(last) >= WINDOW_NS);
@@ -127,7 +163,23 @@ impl Overruns {
         if !due && cfg!(not(feature = "break-overrun-log-each")) {
             return None;
         }
+        self.write(place, index, now)
+    }
+
+    /// The window of the budget `index` of the record at `place` is over: its
+    /// line, or None for a window of a console budget below the threshold.
+    fn write(&mut self, place: usize, index: usize, now: u64) -> Option<Line> {
+        let floor = match self.console {
+            Some((p, floor)) if p == place => floor[index],
+            _ => 0,
+        };
+        let slot = &mut self.slots[place * START_DATA_MAX + index];
+        let window = core::mem::take(&mut slot.window);
         slot.last = Some(now);
+        // The break (a line for every notification) writes whatever the size.
+        if window <= floor && cfg!(not(feature = "break-overrun-log-each")) {
+            return None;
+        }
         let since = core::mem::take(&mut slot.unwritten);
         Some(Line {
             place,
@@ -146,17 +198,10 @@ impl Overruns {
         let open = slot
             .last
             .is_some_and(|last| now.saturating_sub(last) < WINDOW_NS);
-        if slot.unwritten == 0 || open {
+        if slot.window == 0 || open {
             return None;
         }
-        slot.last = Some(now);
-        let since = core::mem::take(&mut slot.unwritten);
-        Some(Line {
-            place,
-            index,
-            since,
-            total: slot.total,
-        })
+        self.write(place, index, now)
     }
 
     /// The overruns counted for the budget `index` of the record at `place`.
@@ -308,5 +353,68 @@ mod tests {
             cfg!(feature = "table-frame")
         );
         assert!(reports("ramfs"));
+    }
+
+    const T10MS: u64 = 10_000_000;
+
+    /// The console record at place 0 with one budget of period 10 ms: a window
+    /// of 10 s holds 1000 periods, and 5 % of them are 50.
+    fn console() -> (Overruns, u64) {
+        let mut o = Overruns::new();
+        o.set_console(0, &[T10MS]);
+        (o, label(0, 0))
+    }
+
+    #[test]
+    fn a_console_window_at_the_threshold_is_silent_and_one_over_it_is_written() {
+        let (mut o, id) = console();
+        assert_eq!(o.note(id, 50, 0), None, "50 of 1000 periods");
+        let l = o.note(id, 51, 10 * S).expect("51 of 1000 periods");
+        assert_eq!((l.since, l.total), (101, 101));
+        // The threshold is the share of the budget's own period.
+        let mut o = Overruns::new();
+        o.set_console(0, &[T10MS * 5]);
+        assert_eq!(o.note(id, 10, 0), None, "10 of 200 periods");
+        assert!(o.note(id, 11, 10 * S).is_some());
+    }
+
+    #[test]
+    fn the_silent_windows_are_in_the_sum_of_the_next_line() {
+        let (mut o, id) = console();
+        for w in 0..5 {
+            assert_eq!(o.note(id, 40, w * 10 * S), None);
+        }
+        let l = o.note(id, 60, 50 * S).unwrap();
+        assert_eq!((l.since, l.total), (260, 260));
+        // After a written line the count starts again, the total goes on.
+        assert_eq!(o.note(id, 1, 60 * S), None);
+        let l = o.note(id, 70, 70 * S).unwrap();
+        assert_eq!((l.since, l.total), (71, 331));
+        assert_eq!(o.total(0, 0), 331);
+    }
+
+    #[test]
+    fn the_tail_of_a_console_budget_below_the_threshold_is_not_flushed() {
+        let (mut o, id) = console();
+        assert!(o.note(id, 100, 0).is_some());
+        assert_eq!(o.note(id, 3, 4 * S), None);
+        assert_eq!(o.flush(0, 0, 20 * S), None, "3 of 1000 periods");
+        let l = o.note(id, 100, 30 * S).unwrap();
+        assert_eq!((l.since, l.total), (103, 203));
+    }
+
+    #[test]
+    fn the_other_budgets_keep_the_rule_whatever_the_console_does() {
+        let (mut o, _) = console();
+        let other = label(1, 0);
+        assert!(
+            o.note(other, 1, 0).is_some(),
+            "one overrun, written at once"
+        );
+        assert!(o.note(other, 1, 10 * S).is_some());
+        // A second budget of the console record, with no period given, has
+        // no threshold either way: a window of 1 is silent only when it is
+        // at or under 0 periods' share, so it is written.
+        assert!(o.note(label(0, 1), 1, 0).is_some());
     }
 }
