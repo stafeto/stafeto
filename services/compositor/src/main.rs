@@ -426,6 +426,8 @@ fn now_ns() -> u64 {
 }
 
 fn main(_: u64) -> u64 {
+    #[cfg(feature = "steps")]
+    px::stack::paint();
     let Ok(mut s) = rt::startup() else {
         return NO_START_DATA;
     };
@@ -509,14 +511,17 @@ fn main(_: u64) -> u64 {
         service.open_screen_waiting(level);
     }
     // The prices of the bands measured on shapes of their own, in the screen's
-    // buffer, before the first request (the run under -icount, `steps` alone).
-    #[cfg(feature = "steps")]
+    // buffer, before the first request (the probes that read the lines, feature
+    // `calibrate`: it takes a second of the CPU at the service's level, in which
+    // the services below it, the process service among them, do not start).
+    #[cfg(feature = "calibrate")]
     if service.screen.is_some() {
         // SAFETY: the buffer is this service's mapping of the screen's object,
         // read and write, SCREEN_BYTES of its 256 pages; nothing else holds it.
         let fb = unsafe { slice::from_raw_parts_mut(FB_AT as *mut u8, SCREEN_BYTES as usize) };
         service.raster.calibrate(fb);
         service.raster.calibrate_layers(fb);
+        service.raster.calibrate_lookup(fb);
     }
     // The periods start when the screen is open (and measured).
     service.pacer = Pacer::new(now_ns(), period, cap);
@@ -1389,7 +1394,11 @@ impl Compositor {
         };
         self.job = Some(Job {
             damage,
-            at: Band { row, col: 0 },
+            at: Band {
+                row,
+                col: 0,
+                pass: 0,
+            },
         });
         #[cfg(feature = "irq-trace")]
         px::cost::trace::mark_first_of_frame();
