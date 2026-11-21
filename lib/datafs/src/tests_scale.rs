@@ -2207,3 +2207,92 @@ fn the_mount_work_of_a_volume_that_exists_leaves_the_window_empty() {
     fs.walk().unwrap();
     assert!(now(&mut fs).since(at).reads > 0);
 }
+
+// ---------------------------------------------------------------------------------------------
+// The repair of the orphans after a cut, on volumes with many directories and many pairs.
+// ---------------------------------------------------------------------------------------------
+
+/// A volume of `dirs` directories and about `pairs` metadata pairs (the rest of the pairs are made
+/// by files of 500 bytes in one directory). Returns the settled device and the exact counts.
+fn many_pairs(dirs: usize, pairs: usize) -> (MemDevice, u64, u64) {
+    // /z is made first and /w after it, so the list runs root, /w, the pairs of its files, /z, the
+    // directories of /z: the parent of every directory is as far from the head as the files put it.
+    let mut fs = fresh(65536, Win::Whole);
+    let mut meter = Meter::new(&mut fs);
+    fs.mkdir(b"/z").unwrap();
+    fs.mkdir(b"/w").unwrap();
+    for i in 0..dirs.saturating_sub(4) {
+        fs.mkdir(format!("/z/d{i}").as_bytes()).unwrap();
+    }
+    let mut n = 0;
+    loop {
+        if n % 32 == 0 && fs.metadata_pairs().unwrap().0 >= pairs as u64 {
+            break;
+        }
+        let sub = n / 900;
+        if n % 900 == 0 {
+            fs.mkdir(format!("/w/s{sub}").as_bytes()).unwrap();
+        }
+        put(&mut fs, &mut meter, &format!("/w/s{sub}/f{n}"), 500).unwrap();
+        n += 1;
+    }
+    let (p, d) = fs.metadata_pairs().unwrap();
+    (settle(fs), p, d)
+}
+
+#[test]
+#[ignore = "slow: volumes with thousands of pairs; run by name, see the module text"]
+fn scale_orphan_mount() {
+    std::println!("\n## Mount after a cut inside MKDIR, RMDIR and RENAME over a directory\n");
+    std::println!(
+        "| dirs | pairs | op | clean mount reads | cheapest | dearest | dearest s at 10,000/s | dearest s at 3,000/s |"
+    );
+    std::println!("|---:|---:|---|---:|---:|---:|---:|---:|");
+    type Op = fn(&mut Vol);
+    let ops: [(&str, Op); 3] = [
+        ("mkdir", |fs| {
+            let _ = fs.mkdir(b"/z/newdir");
+        }),
+        ("rmdir", |fs| {
+            let _ = fs.remove(b"/z/d1");
+        }),
+        ("rename over a directory", |fs| {
+            let _ = fs.rename(b"/z/d2", b"/z/d3");
+        }),
+    ];
+    let scales: Vec<(usize, usize)> = std::env::var("ORPHAN_SCALES")
+        .unwrap_or_else(|_| "128:256,256:512,512:1024,1024:2048".into())
+        .split(',')
+        .map(|s| {
+            let (d, p) = s.split_once(':').unwrap();
+            (d.parse().unwrap(), p.parse().unwrap())
+        })
+        .collect();
+    for (dirs, pairs) in scales {
+        let (device, p, d) = many_pairs(dirs, pairs);
+        let (clean, _) = service_mount(device.clone(), Win::Whole);
+        for (name, op) in ops {
+            let mut fs = mounted(&device, Win::Whole);
+            let before = fs.device().written;
+            op(&mut fs);
+            let sectors = fs.device().written - before;
+            let (mut low, mut high) = (u64::MAX, 0u64);
+            for cut in 0..=sectors {
+                let mut fs = mounted(&device, Win::Whole);
+                fs.device().cut_after(Some(cut));
+                op(&mut fs);
+                let mut dev = fs.into_device();
+                dev.power_cycle(Survive::Random(cut + 5));
+                let (c, _) = service_mount(dev, Win::Whole);
+                low = low.min(c.reads);
+                high = high.max(c.reads);
+            }
+            std::println!(
+                "| {d} | {p} | {name} | {} | {low} | {high} | {:.1} | {:.1} |",
+                clean.reads,
+                high as f64 / 10_000.0,
+                high as f64 / 3_000.0
+            );
+        }
+    }
+}
