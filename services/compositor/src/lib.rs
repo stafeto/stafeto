@@ -151,6 +151,11 @@ pub struct Price {
     pub point_measured: u32,
     pub point: u32,
     pub point_estimate: bool,
+    /// What a call of this kind pays when pixman's cache of resolved paths has
+    /// lost its key (`LOOKUP_MISS_MEASURED`): measured for the kind, ticks, and
+    /// with the margin.
+    pub miss_measured: u32,
+    pub miss: u32,
 }
 
 /// The margin over a measure, in percent.
@@ -168,6 +173,7 @@ const fn price(
     row_estimate: bool,
     point_measured: u32,
     point_estimate: bool,
+    miss_measured: u32,
 ) -> Price {
     Price {
         kind,
@@ -179,26 +185,213 @@ const fn price(
         point_measured,
         point: with_margin(point_measured),
         point_estimate,
+        miss_measured,
+        miss: with_margin(miss_measured),
     }
 }
 
-/// The prices: black, copy, over, each the upper fit of the model over the
-/// greatest ticks of 26 shapes of operations, the widths 1 to 152 and 640
+/// The prices: black, copy, over and the kinds of the elements' operations, each
+/// the upper fit of the model over the greatest ticks of 26 shapes of operations, the widths 1 to 152 and 640
 /// (`compositor::fit`, `px::calibration`),
 /// measured under -icount, the same in `comp-probe` and in `focus-probe`
-/// (the run is deterministic). Every entry is a measure.
-pub const PRICES: [Price; 11] = [
-    price("black", 209, 2_400, false, 38, false),
-    price("copy", 780, 5_480, false, 138, false),
-    price("over", 785, 18_981, false, 427, false),
-    price("scale-nearest-copy", 5711, 19_973, false, 2900, false),
-    price("scale-nearest-over", 5651, 27_984, false, 2875, false),
-    price("scale-bilinear-copy", 5741, 19_976, false, 8299, false),
-    price("scale-bilinear-over", 5664, 27_956, false, 9475, false),
-    price("rotate90", 2861, 94, false, 646, false),
-    price("alpha", 4942, 35_650, false, 969, false),
-    price("mask", 1170, 260, false, 4695, false),
-    price("mask-alpha", 3246, 4_785, false, 4820, false),
+/// (the run is deterministic). Every entry is a measure. The rows from
+/// `fast-nearest-copy` on are the fast class (`elements::Class::FastNearestCopy`):
+/// a scale by a fraction with no turn and no reflection, whose paths pixman
+/// has apart from its general path; their miss is the one of the general kinds
+/// until the calibration (`px::calibration`, `calibrate_lookup`) tells each kind's own.
+pub const PRICES: [Price; 24] = [
+    price("black", 209, 2_400, false, 38, false, LOOKUP_MISS_MEASURED),
+    price("copy", 780, 5_480, false, 138, false, LOOKUP_MISS_MEASURED),
+    price("over", 785, 18_981, false, 427, false, LOOKUP_MISS_MEASURED),
+    price(
+        "scale-nearest-copy",
+        5_711,
+        19_973,
+        false,
+        2_900,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "scale-nearest-over",
+        5_651,
+        27_984,
+        false,
+        2_875,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "scale-bilinear-copy",
+        5_741,
+        19_976,
+        false,
+        8_299,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "scale-bilinear-over",
+        5_664,
+        27_956,
+        false,
+        9_475,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "rotate90",
+        2_861,
+        94,
+        false,
+        646,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "alpha",
+        4_942,
+        35_650,
+        false,
+        969,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "mask",
+        1_170,
+        260,
+        false,
+        4_695,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "mask-alpha",
+        3_246,
+        4_785,
+        false,
+        4_820,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "fast-nearest-copy",
+        2_673,
+        2_012,
+        false,
+        600,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "fast-nearest-over",
+        2_673,
+        19_412,
+        false,
+        1_012,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "fast-bilinear-copy",
+        2_681,
+        7_626,
+        false,
+        1_374,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "fast-bilinear-over",
+        2_674,
+        16_570,
+        false,
+        2_142,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "fast-nearest-alpha",
+        6_105,
+        40_994,
+        false,
+        3_268,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "fast-bilinear-alpha",
+        6_717,
+        32_799,
+        false,
+        7_007,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "fast-nearest-mask",
+        6_037,
+        50_312,
+        false,
+        3_737,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "fast-bilinear-mask",
+        2_898,
+        13_726,
+        false,
+        3_999,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "fast-bilinear-mask-alpha",
+        4_438,
+        18_521,
+        false,
+        4_120,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "fast-nearest-alpha-opaque",
+        6_049,
+        30_205,
+        false,
+        3_370,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "fast-bilinear-alpha-opaque",
+        6_055,
+        30_205,
+        false,
+        8_770,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "fast-nearest-mask-opaque",
+        6_106,
+        38_768,
+        false,
+        3_837,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "fast-bilinear-mask-opaque",
+        6_120,
+        38_740,
+        false,
+        9_237,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
 ];
 /// What every layer costs a band beyond its operation (ticks, for each window
 /// the band lays and for the pointer's picture), and what every band costs beyond
@@ -2144,11 +2337,15 @@ impl Scene {
             if !touches(r) {
                 continue;
             }
-            let (first, second) = elements::classes(e);
+            let argb = self
+                .place_of(e.source)
+                .and_then(|p| self.window(p))
+                .is_some_and(|w| w.format == Format::Argb);
+            let (first, second) = elements::classes(e, argb);
             let (a, b) = (PRICES[first.row()], second.map(|c| PRICES[c.row()]));
             // The alpha or the mask is part of the one call of pixman the stretch
             // makes: it adds its rows and points, and no second call.
-            let calls = a.call + LAYER + LOOKUP_MISS;
+            let calls = a.call + LAYER + a.miss;
             let at = match open {
                 Some(g) if plan.cost[g].calls + calls <= GROUP_CALLS => g,
                 _ => {
@@ -2162,7 +2359,7 @@ impl Scene {
             plan.elements += 1;
             plan.members[at] |= 1 << k;
             let c = &mut plan.cost[at];
-            c.add(a, LAYER + LOOKUP_MISS, area);
+            c.add(a, LAYER + a.miss, area);
             if let Some(b) = b {
                 c.add(b, 0, area);
                 c.calls -= b.call;
@@ -2172,7 +2369,7 @@ impl Scene {
         if let Some(c) = cursor.filter(|&c| touches(c)) {
             // Under a scene the picture's path may miss the cache too.
             plan.pointer = plan.groups as u8;
-            plan.cost[plan.groups] = GroupCost::of(OVER, LAYER + LOOKUP_MISS, intersect(c, damage));
+            plan.cost[plan.groups] = GroupCost::of(OVER, LAYER + OVER.miss, intersect(c, damage));
             plan.groups += 1;
         }
         plan

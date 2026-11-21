@@ -1012,7 +1012,10 @@ pub mod calibration {
         (640, 8, 2),
         (640, 13, 2),
     ];
-    const REPEAT: u32 = 3;
+    /// The timed operations after the warm-up of a plain kind: one, the run under
+    /// -icount being deterministic (the calibration is bounded by the display
+    /// driver's watchdog, which the service's start must keep under).
+    const REPEAT: u32 = 1;
 
     /// What a kind of the elements' operations draws: nearest or bilinear, the
     /// source turned a quarter, reflected and stretched (the general path of
@@ -1025,6 +1028,7 @@ pub mod calibration {
         transform: Transform,
         over: bool,
         mix: Mix,
+        source: Src,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1035,6 +1039,19 @@ pub mod calibration {
         General,
         /// A quarter turn with no stretch: pixman's own path for it.
         Quarter,
+        /// Stretched by a fraction, no turn and no reflection: the class of the
+        /// fast paths (`compositor::elements::Class::FastNearestCopy` and the
+        /// rest).
+        Scale,
+    }
+
+    /// The source's format: both in turn (the kinds that were measured so), or the
+    /// one named.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Src {
+        Both,
+        Argb,
+        Opaque,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1049,13 +1066,14 @@ pub mod calibration {
     /// (`compositor::PRICES` after the black, the copy and the laying over):
     /// each is measured on the shapes of the plain ones narrower than 160
     /// points (a dear band is a part of a line), at two offsets of the target.
-    pub(super) const RECIPES: [Recipe; 8] = [
+    pub(super) const RECIPES: [Recipe; 21] = [
         Recipe {
             name: "scale-nearest-copy",
             bilinear: false,
             transform: Transform::General,
             over: false,
             mix: Mix::None,
+            source: Src::Both,
         },
         Recipe {
             name: "scale-nearest-over",
@@ -1063,6 +1081,7 @@ pub mod calibration {
             transform: Transform::General,
             over: true,
             mix: Mix::None,
+            source: Src::Both,
         },
         Recipe {
             name: "scale-bilinear-copy",
@@ -1070,6 +1089,7 @@ pub mod calibration {
             transform: Transform::General,
             over: false,
             mix: Mix::None,
+            source: Src::Both,
         },
         Recipe {
             name: "scale-bilinear-over",
@@ -1077,6 +1097,7 @@ pub mod calibration {
             transform: Transform::General,
             over: true,
             mix: Mix::None,
+            source: Src::Both,
         },
         Recipe {
             name: "rotate90",
@@ -1084,6 +1105,7 @@ pub mod calibration {
             transform: Transform::Quarter,
             over: false,
             mix: Mix::None,
+            source: Src::Both,
         },
         Recipe {
             name: "alpha",
@@ -1091,6 +1113,7 @@ pub mod calibration {
             transform: Transform::Plain,
             over: true,
             mix: Mix::Alpha,
+            source: Src::Both,
         },
         Recipe {
             name: "mask",
@@ -1098,6 +1121,7 @@ pub mod calibration {
             transform: Transform::Plain,
             over: true,
             mix: Mix::Mask,
+            source: Src::Both,
         },
         Recipe {
             name: "mask-alpha",
@@ -1105,6 +1129,111 @@ pub mod calibration {
             transform: Transform::Plain,
             over: true,
             mix: Mix::Both,
+            source: Src::Both,
+        },
+        Recipe {
+            name: "fast-nearest-copy",
+            bilinear: false,
+            transform: Transform::Scale,
+            over: false,
+            mix: Mix::None,
+            source: Src::Opaque,
+        },
+        Recipe {
+            name: "fast-nearest-over",
+            bilinear: false,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::None,
+            source: Src::Argb,
+        },
+        Recipe {
+            name: "fast-bilinear-copy",
+            bilinear: true,
+            transform: Transform::Scale,
+            over: false,
+            mix: Mix::None,
+            source: Src::Opaque,
+        },
+        Recipe {
+            name: "fast-bilinear-over",
+            bilinear: true,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::None,
+            source: Src::Argb,
+        },
+        Recipe {
+            name: "fast-nearest-alpha",
+            bilinear: false,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Alpha,
+            source: Src::Argb,
+        },
+        Recipe {
+            name: "fast-bilinear-alpha",
+            bilinear: true,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Alpha,
+            source: Src::Argb,
+        },
+        Recipe {
+            name: "fast-nearest-mask",
+            bilinear: false,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Mask,
+            source: Src::Argb,
+        },
+        Recipe {
+            name: "fast-bilinear-mask",
+            bilinear: true,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Mask,
+            source: Src::Argb,
+        },
+        Recipe {
+            name: "fast-bilinear-mask-alpha",
+            bilinear: true,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Both,
+            source: Src::Argb,
+        },
+        Recipe {
+            name: "fast-nearest-alpha-opaque",
+            bilinear: false,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Alpha,
+            source: Src::Opaque,
+        },
+        Recipe {
+            name: "fast-bilinear-alpha-opaque",
+            bilinear: true,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Alpha,
+            source: Src::Opaque,
+        },
+        Recipe {
+            name: "fast-nearest-mask-opaque",
+            bilinear: false,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Mask,
+            source: Src::Opaque,
+        },
+        Recipe {
+            name: "fast-bilinear-mask-opaque",
+            bilinear: true,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Mask,
+            source: Src::Opaque,
         },
     ];
 
@@ -1153,9 +1282,14 @@ pub mod calibration {
                 width: NARROW,
                 height: NARROW_HEIGHT,
             };
-            // The formats alternate with the offset for the kinds that mix: the
-            // source with its alpha at 0, without at 1 (both are drawn).
-            let argb = r.over && (r.mix == Mix::None || sx == 0);
+            // The formats alternate with the offset for the kinds that mix and name
+            // no format: the source with its alpha at 0, without at 1 (both are
+            // drawn).
+            let argb = match r.source {
+                Src::Argb => true,
+                Src::Opaque => false,
+                Src::Both => r.over && (r.mix == Mix::None || sx == 0),
+            };
             let from = Source {
                 bytes: src,
                 format: if argb { Px::Argb8888 } else { Px::Xrgb8888 },
@@ -1198,10 +1332,10 @@ pub mod calibration {
                 dy: 0,
                 dw: w as i32,
                 dh: h as i32,
-                orient: if r.transform == Transform::General {
-                    1 | proto_comp::MIRROR
-                } else {
-                    1
+                orient: match r.transform {
+                    Transform::General => 1 | proto_comp::MIRROR,
+                    Transform::Scale => 0,
+                    _ => 1,
                 },
                 filter: u32::from(r.bilinear),
                 transparency: 0,
@@ -1311,8 +1445,21 @@ pub mod calibration {
         // the kinds that mix are drawn from both formats of the source (the
         // second number). The rest is the general path of pixman, which does
         // not mind the alignment.
+        // The kinds of the fast class are measured once after the warm-up (the run is
+        // deterministic), from the source they name, at two offsets of the target
+        // when their path is NEON (the source has an alpha, or no mix) and at one
+        // when it is pixman's general path (an opaque source that mixes).
         let (dxs, sxs, repeat) = match recipe {
             None => (4, 4, REPEAT),
+            Some(r) if r.transform == Transform::Scale => (
+                if r.mix != Mix::None && r.source == Src::Opaque {
+                    1
+                } else {
+                    2
+                },
+                1,
+                1,
+            ),
             Some(r) => (
                 if r.transform == Transform::General {
                     1
@@ -1320,7 +1467,7 @@ pub mod calibration {
                     2
                 },
                 if r.mix == Mix::None { 1 } else { 2 },
-                2,
+                1,
             ),
         };
         // The calls first, then the rows, then the points: each class takes off
@@ -1444,7 +1591,7 @@ pub mod calibration {
     /// before the first request is bounded: the watchdog of init kills a service
     /// silent for about 1.3 s, and the three kinds take the first half of that.
     const LAYER_ROW: u32 = 96;
-    const LAYER_REPEAT: u32 = 2;
+    const LAYER_REPEAT: u32 = 1;
     const _: () = assert!(LAYER_TARGET_BYTES <= BYTES);
 
     /// The pixel operations of a band of the calibration: pixman's, on a
@@ -1671,6 +1818,8 @@ pub mod calibration {
         /// Tells a line `service lookup: 17 KIND inside I least L greatest G` for
         /// each and `service lookup: 17 greatest G`.
         pub fn calibrate_lookup(&mut self, fb: &mut [u8]) {
+            /// The runs of a kind: one, the run under -icount being deterministic.
+            const LOOKUP_TURNS: u32 = 1;
             let Ok(thread) = rt::sys::self_thread() else {
                 return;
             };
@@ -1681,7 +1830,7 @@ pub mod calibration {
                 for inside in [false, true] {
                     let shape = (1, 1);
                     let (mut least, mut worst) = (u64::MAX, 0u64);
-                    for turn in 0..3 {
+                    for turn in 0..LOOKUP_TURNS {
                         let images = &mut self.images;
                         // Warm: the call again and again.
                         operate(images, 3, Some(r), fb, shape, (0, 0, inside));
@@ -1690,12 +1839,11 @@ pub mod calibration {
                         }) else {
                             continue;
                         };
-                        // Evicted: nine calls of other keys (the other kinds and
-                        // the plain copy and laying over), then the call.
-                        for (j, other) in RECIPES.iter().enumerate() {
-                            if j != k {
-                                operate(images, 3, Some(other), fb, shape, (0, 0, false));
-                            }
+                        // Evicted: nine calls of other keys (the kinds that follow it),
+                        // then the plain copy and laying over, then the call.
+                        for i in 1..=9 {
+                            let other = &RECIPES[(k + i) % RECIPES.len()];
+                            operate(images, 3, Some(other), fb, shape, (0, 0, false));
                         }
                         operate(images, 1, None, fb, shape, (0, 0, false));
                         operate(images, 2, None, fb, shape, (0, 0, false));

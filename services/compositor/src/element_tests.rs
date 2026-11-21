@@ -632,13 +632,16 @@ fn an_element_is_charged_by_its_geometry_and_its_mixing() {
     let with = |f: fn(&mut Element)| {
         let mut e = plain;
         f(&mut e);
-        elements::classes(&e)
+        elements::classes(&e, true)
     };
     use elements::Class::*;
-    assert_eq!(elements::classes(&plain), (Copy, None));
+    assert_eq!(elements::classes(&plain, true), (Copy, None));
     assert_eq!(with(|e| e.transparency = TRANSPARENCY_SOURCE), (Over, None));
     assert_eq!(with(|e| e.dx = -30), (Copy, None));
-    assert_eq!(with(|e| e.dw = 128), (ScaleNearestCopy, None));
+    // A scale by a fraction (no turn, no reflection) is the class of the fast paths.
+    assert_eq!(with(|e| e.dw = 128), (FastNearestCopy, None));
+    assert_eq!(with(|e| e.dh = 100), (FastNearestCopy, None));
+    assert_eq!(with(|e| e.sx = 0x8000), (FastNearestCopy, None));
     assert_eq!(with(|e| e.orient = MIRROR), (ScaleNearestCopy, None));
     assert_eq!(with(|e| e.orient = 2), (ScaleNearestCopy, None));
     assert_eq!(
@@ -646,14 +649,14 @@ fn an_element_is_charged_by_its_geometry_and_its_mixing() {
             e.dw = 128;
             e.filter = BILINEAR
         }),
-        (ScaleBilinearCopy, None)
+        (FastBilinearCopy, None)
     );
     assert_eq!(
         with(|e| {
             e.dw = 128;
             e.transparency = TRANSPARENCY_SOURCE
         }),
-        (ScaleNearestOver, None)
+        (FastNearestOver, None)
     );
     assert_eq!(
         with(|e| {
@@ -661,7 +664,7 @@ fn an_element_is_charged_by_its_geometry_and_its_mixing() {
             e.transparency = TRANSPARENCY_SOURCE;
             e.filter = BILINEAR
         }),
-        (ScaleBilinearOver, None)
+        (FastBilinearOver, None)
     );
     // A quarter turn of the same size: its own path in pixman.
     assert_eq!(
@@ -691,9 +694,69 @@ fn an_element_is_charged_by_its_geometry_and_its_mixing() {
         with(|e| e.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA),
         (MaskAlpha, None)
     );
-    // A stretched one pays for the stretch and for the extra.
+    // A scaled one with a mix is one operation of its own.
     assert_eq!(
         with(|e| {
+            e.dw = 128;
+            e.transparency = TRANSPARENCY_MASK;
+        }),
+        (FastNearestMaskOpaque, None)
+    );
+    assert_eq!(
+        with(|e| {
+            e.dw = 128;
+            e.transparency = TRANSPARENCY_MASK | TRANSPARENCY_SOURCE;
+        }),
+        (FastNearestMask, None)
+    );
+    // The same from a window with no alpha channel: the source is opaque.
+    let xrgb = |t: u32| {
+        let mut e = plain;
+        e.dw = 128;
+        e.transparency = t;
+        elements::classes(&e, false)
+    };
+    assert_eq!(
+        xrgb(TRANSPARENCY_MASK | TRANSPARENCY_SOURCE),
+        (FastNearestMaskOpaque, None)
+    );
+    assert_eq!(
+        with(|e| {
+            e.dw = 128;
+            e.filter = BILINEAR;
+            e.transparency = TRANSPARENCY_ALPHA | TRANSPARENCY_SOURCE;
+        }),
+        (FastBilinearAlpha, None)
+    );
+    assert_eq!(
+        with(|e| {
+            e.dw = 128;
+            e.filter = BILINEAR;
+            e.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA | TRANSPARENCY_SOURCE;
+        }),
+        (FastBilinearMaskAlpha, None)
+    );
+    // The others with both are priced as the general class: a layer of the fast
+    // one would not fit a step with the miss of the lookup.
+    assert_eq!(
+        with(|e| {
+            e.dw = 128;
+            e.filter = BILINEAR;
+            e.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA;
+        }),
+        (ScaleBilinearOver, Some(MaskAlpha))
+    );
+    assert_eq!(
+        with(|e| {
+            e.dw = 128;
+            e.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA | TRANSPARENCY_SOURCE;
+        }),
+        (ScaleNearestOver, Some(MaskAlpha))
+    );
+    // A turned or reflected one pays for the stretch and for the extra.
+    assert_eq!(
+        with(|e| {
+            e.orient = 2;
             e.dw = 128;
             e.transparency = TRANSPARENCY_MASK;
         }),
@@ -708,6 +771,53 @@ fn an_element_is_charged_by_its_geometry_and_its_mixing() {
             e.transparency = TRANSPARENCY_ALPHA;
         }),
         (ScaleBilinearOver, Some(Alpha))
+    );
+}
+
+#[test]
+fn the_fast_class_is_the_diagonal_matrix_with_positive_steps_that_the_element_makes() {
+    // Every orientation and reflection, a stretch up and down on each axis, and
+    // the source's corner at a fraction: the class is the fast one exactly when
+    // `elements::matrix` is a diagonal with positive steps, and no turn or
+    // reflection is.
+    let rig = Rig::new(&[(ARGB, 64, 40)]);
+    let sizes = [
+        (64, 40),
+        (128, 80),
+        (30, 17),
+        (64, 80),
+        (7, 40),
+        (40, 64),
+        (1, 1),
+    ];
+    let (mut fast, mut general) = (0, 0);
+    for orient in 0..8 {
+        for &(dw, dh) in &sizes {
+            for corner in [0, 0x8000] {
+                let mut e = rig.whole(0, [3, 4, dw, dh]);
+                e.orient = orient;
+                e.sx = corner;
+                if elements::is_plain(&e) {
+                    continue;
+                }
+                let m = elements::matrix(&e);
+                let diagonal = m[1] == 0 && m[3] == 0 && m[0] > 0 && m[4] > 0;
+                let (class, _) = elements::classes(&e, true);
+                let is_fast = class.row() >= elements::Class::FastNearestCopy.row();
+                assert_eq!(is_fast, diagonal, "orient {orient} to {dw} by {dh}: {m:?}");
+                if diagonal {
+                    // No turn and no reflection: the orientation is 0.
+                    assert_eq!(orient, 0, "{m:?}");
+                    fast += 1;
+                } else {
+                    general += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        fast >= 10 && general >= 40,
+        "{fast} fast, {general} general"
     );
 }
 
@@ -933,7 +1043,7 @@ fn a_group_draws_in_bands_over_the_rectangle_of_its_elements_only() {
     let mut rig = Rig::new(&[
         (XRGB, 640, 400),
         (XRGB, 200, 100),
-        (XRGB, 160, 100),
+        (ARGB, 160, 100),
         (A8, 320, 200),
     ]);
     let mut full = rig.whole(0, [0, 0, 640, 400]);
@@ -943,7 +1053,7 @@ fn a_group_draws_in_bands_over_the_rectangle_of_its_elements_only() {
     turn.orient = 2;
     let mut dear = rig.whole(2, [300, 150, 320, 200]);
     dear.filter = BILINEAR;
-    dear.transparency = TRANSPARENCY_MASK;
+    dear.transparency = TRANSPARENCY_MASK | TRANSPARENCY_SOURCE;
     dear.mask = rig.id(3);
     let els = [full, turn, dear];
     rig.scene
@@ -968,7 +1078,7 @@ fn a_group_draws_in_bands_over_the_rectangle_of_its_elements_only() {
         let (w, h) = plan.band(g);
         (320usize.div_ceil(w as usize)) * (200usize.div_ceil(h as usize))
     });
-    assert!(steps < 40_000, "{steps} steps, {each:?}");
+    assert!(steps < 6_000, "{steps} steps, {each:?}");
 }
 
 #[test]
@@ -1030,53 +1140,35 @@ impl Raster for StepCost {
         over: bool,
         _: usize,
     ) {
+        let p = if over { OVER } else { OPAQUE };
         self.layers += 1;
-        self.calls += LOOKUP_MISS;
-        self.add(if over { OVER } else { OPAQUE }, area);
+        self.calls += p.miss;
+        self.add(p, area);
     }
 
     fn element(&mut self, _: &mut [u8], d: &Draw<'_>) {
         // The classes by what the raster is told (a turn of a quarter is read as
         // a general transform, which errs high).
-        use elements::Class::*;
         let t = d.transparency;
         let area = (d.area.w, d.area.h);
+        let (first, extra) = elements::class_of(elements::Shape4 {
+            scale: d.matrix.map(|m| elements::is_scale(&m)),
+            quarter: false,
+            bilinear: d.filter == BILINEAR,
+            over: t & TRANSPARENCY_SOURCE != 0,
+            argb: d.src.format == Format::Argb,
+            mask: t & TRANSPARENCY_MASK != 0,
+            alpha: t & TRANSPARENCY_ALPHA != 0,
+        });
+        let p = PRICES[first.row()];
         self.layers += 1;
-        self.calls += LOOKUP_MISS;
-        let extra = match (t & TRANSPARENCY_MASK != 0, t & TRANSPARENCY_ALPHA != 0) {
-            (true, true) => Some(MaskAlpha),
-            (true, false) => Some(Mask),
-            (false, true) => Some(Alpha),
-            _ => None,
-        };
-        let geometry = match (
-            d.matrix.is_some(),
-            d.filter == BILINEAR,
-            t & TRANSPARENCY_SOURCE != 0,
-        ) {
-            (false, ..) => None,
-            (true, false, false) => Some(ScaleNearestCopy),
-            (true, false, true) => Some(ScaleNearestOver),
-            (true, true, false) => Some(ScaleBilinearCopy),
-            (true, true, true) => Some(ScaleBilinearOver),
-        };
-        // A transformed element with a mix pays for the stretch as a laying over.
-        let first = match (geometry, extra) {
-            (Some(ScaleNearestCopy), Some(_)) => Some(ScaleNearestOver),
-            (Some(ScaleBilinearCopy), Some(_)) => Some(ScaleBilinearOver),
-            (g, _) => g,
-        };
-        match (first, extra) {
-            (None, Some(x)) => self.add(PRICES[x.row()], area),
-            (Some(f), x) => {
-                self.add(PRICES[f.row()], area);
-                if let Some(x) = x {
-                    // The alpha or the mask is in the one call: rows and points.
-                    self.add(PRICES[x.row()], area);
-                    self.calls -= PRICES[x.row()].call;
-                }
-            }
-            (None, None) => self.add(if t != 0 { OVER } else { OPAQUE }, area),
+        self.calls += p.miss;
+        self.add(p, area);
+        if let Some(x) = extra {
+            // The alpha or the mask is in the one call: rows and points.
+            let x = PRICES[x.row()];
+            self.add(x, area);
+            self.calls -= x.call;
         }
     }
 }
