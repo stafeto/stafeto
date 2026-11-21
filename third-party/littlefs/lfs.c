@@ -5089,8 +5089,9 @@ static lfs_stag_t lfs_fs_parent(lfs_t *lfs, const lfs_block_t pair[2],
 // table: a pair named by no entry has no parent (LFS_ERR_NOENT), and for a
 // pair that is named the one pair the table names is fetched with the same
 // match lfs_fs_parent makes. Whatever the table does not settle (two different
-// holders for one block, a table that is full, a fetch that finds no match) is
-// answered by lfs_fs_parent, so the answer is the one the walk gives. The table
+// holders for one block, a key that did not fit, a fetch that finds no match
+// or fails) is answered by lfs_fs_parent, so the answer is the one the walk
+// gives; a pair that cannot be read while the table is built ends the table. The table
 // lives for one call of lfs_fs_deorphan and is built again after each commit
 // of the repair, so a failed write leaves nothing behind.
 struct lfs_orphan_cell {
@@ -5104,6 +5105,7 @@ struct lfs_orphan_table {
     lfs_size_t used;
     bool built;
     bool ok;
+    bool full;
 };
 
 static void lfs_orphan_put(struct lfs_orphan_table *t,
@@ -5116,7 +5118,9 @@ static void lfs_orphan_put(struct lfs_orphan_table *t,
         struct lfs_orphan_cell *c = &t->cells[i];
         if (c->key == LFS_BLOCK_NULL) {
             if ((t->used+1) * 4 > t->n * 3) {
-                t->ok = false;
+                // full: a key that is in the table is still found, a key
+                // that is not is answered by the walk
+                t->full = true;
                 return;
             }
             c->key = key;
@@ -5137,7 +5141,7 @@ static void lfs_orphan_put(struct lfs_orphan_table *t,
         }
         i = (i+1) % t->n;
     }
-    t->ok = false;
+    t->full = true;
 }
 
 static const struct lfs_orphan_cell *lfs_orphan_get(
@@ -5188,6 +5192,7 @@ static int lfs_orphan_build(lfs_t *lfs, struct lfs_orphan_table *t) {
     }
     t->used = 0;
     t->ok = true;
+    t->full = false;
     t->built = true;
 
     lfs_mdir_t dir = {.tail = {0, 1}};
@@ -5197,9 +5202,12 @@ static int lfs_orphan_build(lfs_t *lfs, struct lfs_orphan_table *t) {
         .period = 1,
     };
     while (!lfs_pair_isnull(dir.tail)) {
+        // a pair that cannot be read ends the table: the walk of the release
+        // meets the same pair, after it has repaired the heads before it
         int err = lfs_tortoise_detectcycles(&dir, &tortoise);
         if (err < 0) {
-            return err;
+            t->ok = false;
+            return 0;
         }
 
         struct lfs_orphan_collect collect = {
@@ -5210,7 +5218,8 @@ static int lfs_orphan_build(lfs_t *lfs, struct lfs_orphan_table *t) {
                 NULL,
                 lfs_orphan_collect, &collect);
         if (tag < 0 && tag != LFS_ERR_NOENT) {
-            return tag;
+            t->ok = false;
+            return 0;
         }
     }
 
@@ -5236,6 +5245,10 @@ static lfs_stag_t lfs_fs_parent_table(lfs_t *lfs,
 
     const struct lfs_orphan_cell *a = lfs_orphan_get(t, pair[0]);
     const struct lfs_orphan_cell *b = lfs_orphan_get(t, pair[1]);
+    if (t->full && (!a || !b)) {
+        // a key that did not fit is not in the table: no answer from it
+        return lfs_fs_parent(lfs, pair, parent);
+    }
     if (!a && !b) {
         return LFS_ERR_NOENT;
     }
@@ -5252,7 +5265,7 @@ static lfs_stag_t lfs_fs_parent_table(lfs_t *lfs,
             NULL,
             lfs_fs_parent_match, &(struct lfs_fs_parent_match){
                 lfs, {pair[0], pair[1]}});
-    if (tag && tag != LFS_ERR_NOENT) {
+    if (tag > 0) {
         return tag;
     }
     return lfs_fs_parent(lfs, pair, parent);
