@@ -97,17 +97,23 @@ reads at 135 directories and 256 pairs, 1,443,988 at 539 and 1,024, 6,003,785 at
   for a parent is then answered from the table: no entry names the pair (the answer of the walk,
   `LFS_ERR_NOENT`), or the one holder the table names is fetched with the very match `lfs_fs_parent`
   uses, which gives the tag and the parent. A key that has two holders (a move a power loss left
-  half done has the entry under both names), a fetch that finds no match (the entry was deleted later
-  in the log of its pair) and a table that is full are answered by `lfs_fs_parent` itself, so every
-  answer is the one the release gives. The table is three quarters full at most, 12 bytes a cell.
+  half done has the entry under both names, and so has a directory moved since its old parent's log
+  was compacted: the replaced entry is still in the log), a fetch that finds no match or fails (the entry was deleted later
+  in the log of its pair) and a key that did not fit in a full table are answered by `lfs_fs_parent`
+  itself, so every answer is the one the release gives; a key that is in a full table is still
+  answered from it. A pair that cannot be read while the table is built ends the table (every ask is then
+  the walk of the release, which meets the same pair after it has repaired the heads before it).
+  The table is three quarters full at most, 12 bytes a cell; a cell holds one block that a
+  directory entry names, and the entries of the whole log of a pair count, the replaced ones too.
 - The table is scratch for one call of `lfs_fs_deorphan`, built again after each commit of the repair
   and not kept. A write that fails ends the call with its error and leaves nothing behind; the next
   mount starts with no table. The repair that runs with no power loss (`lfs_fs_deorphan(lfs, false)`,
   after a relocation) does not use the table.
 - Nothing changes on the disk: the repair makes the same commits, in the same order, with or without the table
   (the test below compares the disks byte for byte).
-- The data service gives the table 48 KiB (4,096 cells, 1,536 directories), `ORPHAN_CELLS` in
-  `lib/datafs/csrc/glue.c`. A volume with more directories than that is repaired with the walk.
+- The data service gives the table 48 KiB (4,096 cells, 3,072 blocks: the 1,024 directories of
+  the plan with their replaced entries), `ORPHAN_CELLS` in `lib/datafs/csrc/glue.c`. The keys of a
+  volume with more are repaired with the walk.
 - Measured (`scale_orphan_table`): the dearest mount after a cut is 26,159 reads at 540 directories
   and 1,024 pairs and 53,996 at 1,077 and 2,048 (5.4 s at 10,000 reads a second, against 600 s). Tests:
   `the_table_of_the_repair_of_orphans_leaves_the_disk_of_the_walk` (a cut at every sector of MKDIR, RMDIR and
@@ -131,8 +137,8 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 0cb4ff1daf5fdc1359c6a6ee3116092f08fc100c9d58b1b77ab17bfd801f856d  LICENSE.md
 6dd74dfc58ac93589f8e002bb73c0830a59206912cfe8c951c07eb2bd5fccad0  SPEC.md
 2a8b3459d74b9fa8bdd947738522c46331739405b1fc3d70f057f636a1dea768  DESIGN.md
-4eb79f059f224cf2ea53ef31f6b4c899bae1c2f8d69a51003815e507bde1ab67  lfs.c (with the change)
-5ed746718dd5be8435d070861a344a945b463d7f9f515ffc93477ad2e02f1f63  lfs.h (with the change)
+75ee60e4b8123438a1ee144ff397f6b7e5918c527b60a852085ad3e90ad35135  lfs.c (with the change)
+bc1e84ff52c58d32d8bf2973bdaaac935598545caa692f561340e6f445ca507a  lfs.h (with the change)
 ```
 
 `tools/check-littlefs.py` (run by `cargo xtask ci` as "littlefs sources") fails when a file of the

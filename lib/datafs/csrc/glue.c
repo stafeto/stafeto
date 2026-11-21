@@ -19,10 +19,12 @@
 // dozens of times inside one call of the service on a volume half full.
 #define LOOKAHEAD_MAX (128u * 1024u)
 
-// The table of the repair of orphans after a power loss (lfs_config.orphan_buffer): two cells of 12
-// bytes for each directory the volume may hold (1,024 at most, `proto_data::DIRS_MAX`), the table at
-// most three quarters full: 4,096 cells, 48 KiB, room for 1,536 directories. A volume with more leaves littlefs the
-// walk of the release.
+// The table of the repair of orphans after a power loss (lfs_config.orphan_buffer): a cell of 12
+// bytes holds one block that a directory entry names. A directory has two blocks and its entry is
+// in the log of its parent's pair, where the entries that a later commit replaced count too, so
+// the cells are 4 times the 1,024 directories of the plan (`proto_data::DIRS_MAX`) and the table
+// is used up to three quarters: 4,096 cells, 48 KiB, 3,072 blocks. A volume with more blocks than
+// that is repaired for the keys that did not fit with the walk of the release.
 #define ORPHAN_CELLS 4096u
 
 #ifndef DATAFS_FILES
@@ -180,6 +182,16 @@ void datafs_set_orphan_table(struct datafs *d, int on)
 {
     d->cfg.orphan_buffer = on ? d->orphans : NULL;
     d->cfg.orphan_size = on ? sizeof(d->orphans) : 0;
+}
+
+// The same with a table of `cells` cells (at most ORPHAN_CELLS), for the tests of a full table.
+void datafs_set_orphan_cells(struct datafs *d, uint32_t cells)
+{
+    if (cells > ORPHAN_CELLS) {
+        cells = ORPHAN_CELLS;
+    }
+    d->cfg.orphan_buffer = cells ? d->orphans : NULL;
+    d->cfg.orphan_size = cells * 12u;
 }
 
 // The size of the window the volume was set up with, in blocks.

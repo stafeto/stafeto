@@ -30,8 +30,8 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 With the change (`lfs.c` and `lfs.h` as they stand in this directory):
 
 ```
-4eb79f059f224cf2ea53ef31f6b4c899bae1c2f8d69a51003815e507bde1ab67  lfs.c
-5ed746718dd5be8435d070861a344a945b463d7f9f515ffc93477ad2e02f1f63  lfs.h
+75ee60e4b8123438a1ee144ff397f6b7e5918c527b60a852085ad3e90ad35135  lfs.c
+bc1e84ff52c58d32d8bf2973bdaaac935598545caa692f561340e6f445ca507a  lfs.h
 ```
 
 `SPEC.md` and `DESIGN.md` describe the on-disk format and the design, for the reader of

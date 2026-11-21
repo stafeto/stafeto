@@ -1,5 +1,5 @@
 diff --git a/third-party/littlefs/lfs.c b/third-party/littlefs/lfs.c
-index c83c7e0..976c0db 100644
+index c83c7e0..e1196bb 100644
 --- a/third-party/littlefs/lfs.c
 +++ b/third-party/littlefs/lfs.c
 @@ -1481,8 +1481,78 @@ static int lfs_dir_find_match(void *data,
@@ -230,7 +230,7 @@ index c83c7e0..976c0db 100644
  #ifndef LFS_READONLY
  static int lfs_remove_(lfs_t *lfs, const char *path) {
      // deorphan if we haven't yet, needed at most once after poweron
-@@ -4894,6 +5078,187 @@ static lfs_stag_t lfs_fs_parent(lfs_t *lfs, const lfs_block_t pair[2],
+@@ -4894,6 +5078,200 @@ static lfs_stag_t lfs_fs_parent(lfs_t *lfs, const lfs_block_t pair[2],
  }
  #endif
  
@@ -245,8 +245,9 @@ index c83c7e0..976c0db 100644
 +// table: a pair named by no entry has no parent (LFS_ERR_NOENT), and for a
 +// pair that is named the one pair the table names is fetched with the same
 +// match lfs_fs_parent makes. Whatever the table does not settle (two different
-+// holders for one block, a table that is full, a fetch that finds no match) is
-+// answered by lfs_fs_parent, so the answer is the one the walk gives. The table
++// holders for one block, a key that did not fit, a fetch that finds no match
++// or fails) is answered by lfs_fs_parent, so the answer is the one the walk
++// gives; a pair that cannot be read while the table is built ends the table. The table
 +// lives for one call of lfs_fs_deorphan and is built again after each commit
 +// of the repair, so a failed write leaves nothing behind.
 +struct lfs_orphan_cell {
@@ -260,6 +261,7 @@ index c83c7e0..976c0db 100644
 +    lfs_size_t used;
 +    bool built;
 +    bool ok;
++    bool full;
 +};
 +
 +static void lfs_orphan_put(struct lfs_orphan_table *t,
@@ -272,7 +274,9 @@ index c83c7e0..976c0db 100644
 +        struct lfs_orphan_cell *c = &t->cells[i];
 +        if (c->key == LFS_BLOCK_NULL) {
 +            if ((t->used+1) * 4 > t->n * 3) {
-+                t->ok = false;
++                // full: a key that is in the table is still found, a key
++                // that is not is answered by the walk
++                t->full = true;
 +                return;
 +            }
 +            c->key = key;
@@ -293,7 +297,7 @@ index c83c7e0..976c0db 100644
 +        }
 +        i = (i+1) % t->n;
 +    }
-+    t->ok = false;
++    t->full = true;
 +}
 +
 +static const struct lfs_orphan_cell *lfs_orphan_get(
@@ -344,6 +348,7 @@ index c83c7e0..976c0db 100644
 +    }
 +    t->used = 0;
 +    t->ok = true;
++    t->full = false;
 +    t->built = true;
 +
 +    lfs_mdir_t dir = {.tail = {0, 1}};
@@ -353,9 +358,12 @@ index c83c7e0..976c0db 100644
 +        .period = 1,
 +    };
 +    while (!lfs_pair_isnull(dir.tail)) {
++        // a pair that cannot be read ends the table: the walk of the release
++        // meets the same pair, after it has repaired the heads before it
 +        int err = lfs_tortoise_detectcycles(&dir, &tortoise);
 +        if (err < 0) {
-+            return err;
++            t->ok = false;
++            return 0;
 +        }
 +
 +        struct lfs_orphan_collect collect = {
@@ -366,7 +374,8 @@ index c83c7e0..976c0db 100644
 +                NULL,
 +                lfs_orphan_collect, &collect);
 +        if (tag < 0 && tag != LFS_ERR_NOENT) {
-+            return tag;
++            t->ok = false;
++            return 0;
 +        }
 +    }
 +
@@ -392,6 +401,10 @@ index c83c7e0..976c0db 100644
 +
 +    const struct lfs_orphan_cell *a = lfs_orphan_get(t, pair[0]);
 +    const struct lfs_orphan_cell *b = lfs_orphan_get(t, pair[1]);
++    if (t->full && (!a || !b)) {
++        // a key that did not fit is not in the table: no answer from it
++        return lfs_fs_parent(lfs, pair, parent);
++    }
 +    if (!a && !b) {
 +        return LFS_ERR_NOENT;
 +    }
@@ -408,7 +421,7 @@ index c83c7e0..976c0db 100644
 +            NULL,
 +            lfs_fs_parent_match, &(struct lfs_fs_parent_match){
 +                lfs, {pair[0], pair[1]}});
-+    if (tag && tag != LFS_ERR_NOENT) {
++    if (tag > 0) {
 +        return tag;
 +    }
 +    return lfs_fs_parent(lfs, pair, parent);
@@ -418,7 +431,7 @@ index c83c7e0..976c0db 100644
  static void lfs_fs_prepsuperblock(lfs_t *lfs, bool needssuperblock) {
      lfs->gstate.tag = (lfs->gstate.tag & ~LFS_MKTAG(0, 0, 0x200))
              | (uint32_t)needssuperblock << 9;
-@@ -5010,6 +5375,13 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
+@@ -5010,6 +5388,13 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
      // references to full-orphans, effectively hiding them from the deorphan
      // search.
      //
@@ -432,7 +445,7 @@ index c83c7e0..976c0db 100644
      int pass = 0;
      while (pass < 2) {
          // Fix any orphans
-@@ -5028,7 +5400,8 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
+@@ -5028,7 +5413,8 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
              if (!pdir.split) {
                  // check if we have a parent
                  lfs_mdir_t parent;
@@ -442,7 +455,7 @@ index c83c7e0..976c0db 100644
                  if (tag < 0 && tag != LFS_ERR_NOENT) {
                      return tag;
                  }
-@@ -5071,6 +5444,7 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
+@@ -5071,6 +5457,7 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
                          if (state < 0) {
                              return state;
                          }
@@ -450,7 +463,7 @@ index c83c7e0..976c0db 100644
  
                          // did our commit create more orphans?
                          if (state == LFS_OK_ORPHANED) {
-@@ -5105,6 +5479,7 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
+@@ -5105,6 +5492,7 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
                      if (state < 0) {
                          return state;
                      }
@@ -458,7 +471,7 @@ index c83c7e0..976c0db 100644
  
                      // did our commit create more orphans?
                      if (state == LFS_OK_ORPHANED) {
-@@ -5195,6 +5570,48 @@ static lfs_ssize_t lfs_fs_size_(lfs_t *lfs) {
+@@ -5195,6 +5583,48 @@ static lfs_ssize_t lfs_fs_size_(lfs_t *lfs) {
      return size;
  }
  
@@ -507,7 +520,7 @@ index c83c7e0..976c0db 100644
  // explicit garbage collection
  #ifndef LFS_READONLY
  static int lfs_fs_gc_(lfs_t *lfs) {
-@@ -6096,6 +6513,42 @@ int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info) {
+@@ -6096,6 +6526,42 @@ int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info) {
      return err;
  }
  
@@ -550,7 +563,7 @@ index c83c7e0..976c0db 100644
  lfs_ssize_t lfs_getattr(lfs_t *lfs, const char *path,
          uint8_t type, void *buffer, lfs_size_t size) {
      int err = LFS_LOCK(lfs->cfg);
-@@ -6391,6 +6844,23 @@ int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
+@@ -6391,6 +6857,23 @@ int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
      return err;
  }
  
@@ -574,7 +587,7 @@ index c83c7e0..976c0db 100644
  int lfs_dir_seek(lfs_t *lfs, lfs_dir_t *dir, lfs_off_t off) {
      int err = LFS_LOCK(lfs->cfg);
      if (err) {
-@@ -6462,6 +6932,20 @@ lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
+@@ -6462,6 +6945,20 @@ lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
      return res;
  }
  
@@ -596,10 +609,10 @@ index c83c7e0..976c0db 100644
      int err = LFS_LOCK(lfs->cfg);
      if (err) {
 diff --git a/third-party/littlefs/lfs.h b/third-party/littlefs/lfs.h
-index 8fbd5b4..3bde4db 100644
+index 8fbd5b4..1502704 100644
 --- a/third-party/littlefs/lfs.h
 +++ b/third-party/littlefs/lfs.h
-@@ -291,6 +291,16 @@ struct lfs_config {
+@@ -291,6 +291,20 @@ struct lfs_config {
      // to the most recent minor version when zero.
      uint32_t disk_version;
  #endif
@@ -608,15 +621,19 @@ index 8fbd5b4..3bde4db 100644
 +    // aligned) for the repair of orphans after a power loss. With it
 +    // lfs_fs_deorphan finds the parent of every directory from one walk of the
 +    // list of metadata pairs, where the release walks the list for each
-+    // directory. Holds two cells of 12 bytes for each directory, with the table
-+    // at most three quarters full; a table that is too small (or NULL) leaves the
-+    // release's walk. The disk is the same with or without it.
++    // directory. A cell of 12 bytes holds one block that a directory entry
++    // names, with the pair that holds the entry; every entry of every log
++    // of a pair counts, the entries that a later commit replaced too, and
++    // each live directory has two blocks. At most three quarters of the cells
++    // are used; a key that does not fit, and any key with two holders, is
++    // answered by the walk of the release. NULL leaves the release's walk.
++    // The disk is the same with or without the table.
 +    void *orphan_buffer;
 +    lfs_size_t orphan_size;
  };
  
  // File info structure
-@@ -526,6 +536,45 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
+@@ -526,6 +540,45 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
  // Returns a negative error code on failure.
  int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info);
  
@@ -662,7 +679,7 @@ index 8fbd5b4..3bde4db 100644
  // Get a custom attribute
  //
  // Custom attributes are uniquely identified by an 8-bit type and limited
-@@ -686,6 +735,21 @@ int lfs_dir_close(lfs_t *lfs, lfs_dir_t *dir);
+@@ -686,6 +739,21 @@ int lfs_dir_close(lfs_t *lfs, lfs_dir_t *dir);
  // or a negative error code on failure.
  int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info);
  
@@ -684,7 +701,7 @@ index 8fbd5b4..3bde4db 100644
  // Change the position of the directory
  //
  // The new off must be a value previous returned from tell and specifies
-@@ -724,6 +788,15 @@ int lfs_fs_stat(lfs_t *lfs, struct lfs_fsinfo *fsinfo);
+@@ -724,6 +792,15 @@ int lfs_fs_stat(lfs_t *lfs, struct lfs_fsinfo *fsinfo);
  // Returns the number of allocated blocks, or a negative error code on failure.
  lfs_ssize_t lfs_fs_size(lfs_t *lfs);
  
