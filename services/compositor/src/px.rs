@@ -148,10 +148,21 @@ pub mod cost {
     static BAND_OPS: AtomicU64 = AtomicU64::new(0);
     static BAND_LAYERS: AtomicU32 = AtomicU32::new(0);
 
+    /// The bands of the frame in progress and the tick its first band began at, and
+    /// the frame that has just ended (told after its step, `tell`).
+    static FRAME_BANDS: AtomicU32 = AtomicU32::new(0);
+    static FRAME_FIRST: AtomicU64 = AtomicU64::new(0);
+    static ENDED_BANDS: AtomicU32 = AtomicU32::new(0);
+    static ENDED_TICKS: AtomicU64 = AtomicU64::new(0);
+    static ENDED_DUE: AtomicU32 = AtomicU32::new(0);
+
     /// A band begins: its operations are counted from zero.
     pub fn band_begin() {
         BAND_OPS.store(0, Ordering::Relaxed);
         BAND_LAYERS.store(0, Ordering::Relaxed);
+        if FRAME_BANDS.fetch_add(1, Ordering::Relaxed) == 0 {
+            FRAME_FIRST.store(rt::time::now(), Ordering::Relaxed);
+        }
     }
 
     /// The band ended: `compose` took `compose` ticks, the band's code in all
@@ -483,6 +494,15 @@ pub mod cost {
     pub fn frame_done() {
         FRAMES.fetch_add(1, Ordering::Relaxed);
         DUE.store(1, Ordering::Relaxed);
+        let bands = FRAME_BANDS.swap(0, Ordering::Relaxed);
+        if bands != 0 {
+            ENDED_BANDS.store(bands, Ordering::Relaxed);
+            ENDED_TICKS.store(
+                rt::time::now() - FRAME_FIRST.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            ENDED_DUE.store(1, Ordering::Relaxed);
+        }
     }
 
     /// Runs after each step of the loop (rt::service::step_after): at the
@@ -505,6 +525,15 @@ pub mod cost {
         #[cfg(feature = "irq-trace")]
         if trace::fold() {
             trace::tell();
+        }
+        // A frame made by bands: how many, and the time from its first band to its end.
+        if ENDED_DUE.swap(0, Ordering::Relaxed) != 0 {
+            rt::println!(
+                "service frame: 17 n {} bands {} us {}",
+                FRAMES.load(Ordering::Relaxed),
+                ENDED_BANDS.load(Ordering::Relaxed),
+                rt::time::ticks_to_ns(ENDED_TICKS.load(Ordering::Relaxed)) / 1_000
+            );
         }
         if DUE.swap(0, Ordering::Relaxed) == 0 {
             return;
