@@ -1140,7 +1140,7 @@ fn s5_7_1_the_cursor_row_carries_the_place_of_the_hot_spot() {
     assert_eq!(
         (row.x, row.y),
         (10 + 5, 20 + 7),
-        "the hot spot, not the corner"
+        "the place is the hot spot's, which the corner does not give"
     );
     assert_eq!((row.hot_x, row.hot_y), (5, 7));
     assert_eq!(row.source, SOURCE_CURSOR);
