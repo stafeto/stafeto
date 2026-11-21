@@ -2131,7 +2131,7 @@ impl Scene {
             let (first, second) = elements::classes(e);
             let (a, b) = (PRICES[first.row()], second.map(|c| PRICES[c.row()]));
             // The alpha or the mask is part of the one call of pixman the stretch
-            // makes: it adds its rows and points, not a second call.
+            // makes: it adds its rows and points, and no second call.
             let calls = a.call + LAYER + LOOKUP_MISS;
             at = plan.place(at, calls);
             plan.group[k] = at as u8;

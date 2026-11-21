@@ -590,8 +590,8 @@ pub mod stack {
         let bottom = top - PAINTED;
         let mut at = bottom;
         while at < high {
-            // SAFETY: the words are of this thread's stack below its frame, not in
-            // use now, and inside the stack (PAINTED is less than its size).
+            // SAFETY: the words are of this thread's stack below its frame, free
+            // of any use now, and inside the stack (PAINTED is less than its size).
             unsafe { core::ptr::write_volatile(at as *mut u64, PATTERN) };
             at += 8;
         }
