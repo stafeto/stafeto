@@ -110,7 +110,7 @@ const CHECKS: [(&str, usize); 14] = [
 ];
 
 /// The tag of the service's lines of steps (rt::service::report_steps).
-const GPU_TAG: &str = "12";
+pub const GPU_TAG: &str = "12";
 /// The kinds of the service's steps that must come: OPEN, FLUSH, CLOSE,
 /// CLONE, PIPELINES, SOURCE, LAYERS (the methods of proto_gpu), and its own steps:
 /// the interrupt and the portions of clearing (rt::service::step_own).
