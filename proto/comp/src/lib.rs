@@ -1968,7 +1968,8 @@ mod tests {
             read_commit(&commit_bytes(&SceneCommit::new(4, 0, &[]).unwrap())),
             Err(code(INVALID))
         );
-        let broken: [(&str, fn(&mut Element)); 14] = [
+        type Change = fn(&mut Element);
+        let broken: [(&str, Change); 14] = [
             ("a zero width", |e| e.sw = 0),
             ("a zero height", |e| e.sh = 0),
             ("a negative source place", |e| e.sx = -1),

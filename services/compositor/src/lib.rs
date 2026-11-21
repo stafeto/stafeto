@@ -5090,7 +5090,7 @@ mod tests {
             "the frame is in work"
         );
         draw(&s, d, &mut screen(), &solid(&[]));
-        assert_eq!(s.scene_bits().composed, false);
+        assert!(!s.scene_bits().composed);
         s.end(true);
         assert!(s.scene_bits().composed, "COMPOSED at the end of the frame");
         assert_eq!(s.scene_bits(), SceneBits::default());
