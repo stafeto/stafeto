@@ -501,6 +501,7 @@ pub mod cost {
     /// each class: C the call in ticks, R the row and P the point in hundredths of
     /// a tick.
     pub fn tell() {
+        super::stack::watch();
         #[cfg(feature = "irq-trace")]
         if trace::fold() {
             trace::tell();
@@ -551,6 +552,86 @@ pub mod cost {
                 s.ops_at_greatest.load(Ordering::Relaxed),
             );
         }
+    }
+}
+
+/// The deepest the stack of the service goes, for the run of the probes under
+/// -icount (feature `steps`): at the start the stack below the entry is painted
+/// with a pattern (`paint`), and each step after it looks at a few words
+/// (`watch`), from the lowest painted address up, for the lowest that no longer
+/// holds the pattern; a new lowest is told as `service stack: 17 depth D painted
+/// P` (bytes from the top of the stack, bytes painted). The words between the top
+/// and the painted part (the frame of `main` and 2 KiB below it, which the
+/// painting's own frames use) count as used, so the depth is at least that.
+#[cfg(feature = "steps")]
+pub mod stack {
+    use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    const PATTERN: u64 = 0xA5A5_A5A5_A5A5_A5A5;
+    /// The bytes painted, below the entry of the program: less than its stack, so
+    /// that the guard below it is not touched.
+    pub const PAINTED: usize = 112 * 1024;
+    const WORDS_A_STEP: usize = 128;
+
+    static TOP: AtomicUsize = AtomicUsize::new(0);
+    static BOTTOM: AtomicUsize = AtomicUsize::new(0);
+    static LOW: AtomicUsize = AtomicUsize::new(0);
+    static CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+    /// Paints the stack below the caller's frame.
+    pub fn paint() {
+        let sp: usize;
+        // SAFETY: reads the stack pointer.
+        unsafe { core::arch::asm!("mov {}, sp", out(reg) sp) };
+        // The stack is right under INIT_STACK_TOP; what is above this frame is
+        // in use (the frame of `main` holds the service).
+        let top = abi::INIT_STACK_TOP as usize;
+        let high = (sp & !15) - 2048;
+        let bottom = top - PAINTED;
+        let mut at = bottom;
+        while at < high {
+            // SAFETY: the words are of this thread's stack below its frame, not in
+            // use now, and inside the stack (PAINTED is less than its size).
+            unsafe { core::ptr::write_volatile(at as *mut u64, PATTERN) };
+            at += 8;
+        }
+        TOP.store(top, Relaxed);
+        BOTTOM.store(bottom, Relaxed);
+        LOW.store(high, Relaxed);
+        CURSOR.store(bottom, Relaxed);
+    }
+
+    /// Looks at a few more words for the lowest that was written.
+    pub fn watch() {
+        let top = TOP.load(Relaxed);
+        if top == 0 {
+            return;
+        }
+        let low = LOW.load(Relaxed);
+        let mut at = CURSOR.load(Relaxed);
+        let end = (at + WORDS_A_STEP * 8).min(low);
+        while at < end {
+            // SAFETY: a word of the painted stack.
+            if unsafe { core::ptr::read_volatile(at as *const u64) } != PATTERN {
+                LOW.store(at, Relaxed);
+                rt::println!(
+                    "service stack: 17 depth {} painted {}",
+                    top - at,
+                    top - BOTTOM.load(Relaxed)
+                );
+                CURSOR.store(BOTTOM.load(Relaxed), Relaxed);
+                return;
+            }
+            at += 8;
+        }
+        CURSOR.store(
+            if end >= low {
+                BOTTOM.load(Relaxed)
+            } else {
+                end
+            },
+            Relaxed,
+        );
     }
 }
 
@@ -1028,10 +1109,10 @@ pub mod calibration {
         recipe: Option<&Recipe>,
         fb: &mut [u8],
         shape: (u32, u32),
-        offsets: (u32, u32),
+        offsets: (u32, u32, bool),
     ) {
         let (w, h) = shape;
-        let (dx, sx) = offsets;
+        let (dx, sx, inside) = offsets;
         if let Some(r) = recipe {
             let (head, tail) = fb.split_at_mut(ELEMENTS_AT);
             let (src, mask) = tail.split_at_mut(ELEMENT_SRC_BYTES);
@@ -1064,15 +1145,22 @@ pub mod calibration {
             let element = proto_comp::Element {
                 source: 0,
                 mask: 0,
-                sx: 0,
-                sy: 0,
+                // Inside the source (the samples of the target are far from its
+                // edges) or at its edge: pixman's flags, and with them the key of
+                // its path, differ.
+                sx: if inside { 40 << 16 } else { 0 },
+                sy: if inside { 40 << 16 } else { 0 },
                 sw: if r.transform == Transform::Quarter {
                     (h as i32) << 16
+                } else if inside {
+                    80 << 16
                 } else {
                     (ELEMENT_SRC_SIDE as i32) << 16
                 },
                 sh: if r.transform == Transform::Quarter {
                     (w as i32) << 16
+                } else if inside {
+                    80 << 16
                 } else {
                     (ELEMENT_SRC_SIDE as i32) << 16
                 },
@@ -1231,7 +1319,7 @@ pub mod calibration {
                         for turn in 0..=repeat {
                             let images = &mut px.images;
                             let ticks = timed(thread, || {
-                                operate(images, which, recipe, fb, (w, h), (dx, sx));
+                                operate(images, which, recipe, fb, (w, h), (dx, sx, false));
                             });
                             if turn == 0 {
                                 continue;
@@ -1545,6 +1633,66 @@ pub mod calibration {
     }
 
     impl Pixman {
+        /// Measures what a call pays when pixman's cache of resolved paths has
+        /// lost its key: for each kind of the elements' operations, at both
+        /// variants of the flags (inside the source and at its edge), the call of
+        /// one point as it is after eight calls of other keys, less the same call
+        /// when it repeats (`compositor::LOOKUP_MISS_MEASURED` is the greatest).
+        /// Tells a line `service lookup: 17 KIND inside I least L greatest G` for
+        /// each and `service lookup: 17 greatest G`.
+        pub fn calibrate_lookup(&mut self, fb: &mut [u8]) {
+            let Ok(thread) = rt::sys::self_thread() else {
+                return;
+            };
+            fb[ELEMENTS_AT..ELEMENTS_AT + ELEMENT_SRC_BYTES].fill(0x40);
+            fb[ELEMENT_MASK_AT..ELEMENT_MASK_AT + ELEMENT_MASK_BYTES].fill(0x80);
+            let mut greatest = 0u64;
+            for (k, r) in RECIPES.iter().enumerate() {
+                for inside in [false, true] {
+                    let shape = (1, 1);
+                    let (mut least, mut worst) = (u64::MAX, 0u64);
+                    for turn in 0..3 {
+                        let images = &mut self.images;
+                        // Warm: the call again and again.
+                        operate(images, 3, Some(r), fb, shape, (0, 0, inside));
+                        let Some(warm) = timed(&thread, || {
+                            operate(images, 3, Some(r), fb, shape, (0, 0, inside));
+                        }) else {
+                            continue;
+                        };
+                        // Evicted: nine calls of other keys (the other kinds and
+                        // the plain copy and laying over), then the call.
+                        for (j, other) in RECIPES.iter().enumerate() {
+                            if j != k {
+                                operate(images, 3, Some(other), fb, shape, (0, 0, false));
+                            }
+                        }
+                        operate(images, 1, None, fb, shape, (0, 0, false));
+                        operate(images, 2, None, fb, shape, (0, 0, false));
+                        let Some(cold) = timed(&thread, || {
+                            operate(images, 3, Some(r), fb, shape, (0, 0, inside));
+                        }) else {
+                            continue;
+                        };
+                        let _ = turn;
+                        let miss = cold.saturating_sub(warm);
+                        least = least.min(miss);
+                        worst = worst.max(miss);
+                    }
+                    if worst > 0 {
+                        rt::println!(
+                            "service lookup: 17 {} inside {} least {least} greatest {worst}",
+                            r.name,
+                            u8::from(inside)
+                        );
+                        greatest = greatest.max(worst);
+                    }
+                }
+            }
+            rt::println!("service lookup: 17 greatest {greatest}");
+            fb[ELEMENTS_AT..ELEMENT_MASK_AT + ELEMENT_MASK_BYTES].fill(0);
+        }
+
         /// Measures the three kinds on the shapes of the classes and tells a
         /// line each (`service calibration: 17 KIND call L G N W H row L G N W H
         /// point L G N W H preempted K`: for each class the least and the

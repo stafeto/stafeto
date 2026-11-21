@@ -426,6 +426,8 @@ fn now_ns() -> u64 {
 }
 
 fn main(_: u64) -> u64 {
+    #[cfg(feature = "steps")]
+    px::stack::paint();
     let Ok(mut s) = rt::startup() else {
         return NO_START_DATA;
     };
@@ -517,6 +519,7 @@ fn main(_: u64) -> u64 {
         let fb = unsafe { slice::from_raw_parts_mut(FB_AT as *mut u8, SCREEN_BYTES as usize) };
         service.raster.calibrate(fb);
         service.raster.calibrate_layers(fb);
+        service.raster.calibrate_lookup(fb);
     }
     // The periods start when the screen is open (and measured).
     service.pacer = Pacer::new(now_ns(), period, cap);

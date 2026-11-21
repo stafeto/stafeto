@@ -230,6 +230,17 @@ pub const BAND_FIXED: u32 = with_margin(BAND_FIXED_MEASURED);
 /// work over `BAND_FIXED` and the term of its layers, for each element), with the
 /// margin.
 pub const ELEMENT_TERM_MEASURED: u32 = 106;
+/// What a call of an element pays when pixman's cache of resolved paths (8
+/// places) has lost its key: the greatest, over the kinds of the elements'
+/// operations at both variants of the flags (inside the source and at its edge), of
+/// the call of one point after eight calls of other keys less the same call
+/// repeated (the line `service lookup` of `px::calibration`, ticks), and the
+/// constant with the margin. An element with a transform has two keys, so a scene
+/// of 16 has up to 32 and the cache is lost on every band: under a scene every
+/// layer of an element pays it with its call (`Scene::passes`). The windows with no
+/// scene have three keys and the pointer's, all warm.
+pub const LOOKUP_MISS_MEASURED: u32 = 4_546;
+pub const LOOKUP_MISS: u32 = with_margin(LOOKUP_MISS_MEASURED);
 pub const ELEMENT_TERM: u32 = with_margin(ELEMENT_TERM_MEASURED);
 pub const FILL: Price = PRICES[0];
 pub const OPAQUE: Price = PRICES[1];
@@ -2119,14 +2130,17 @@ impl Scene {
             }
             let (first, second) = elements::classes(e);
             let (a, b) = (PRICES[first.row()], second.map(|c| PRICES[c.row()]));
-            let calls = a.call + LAYER + b.map_or(0, |b| b.call);
+            // The alpha or the mask is part of the one call of pixman the stretch
+            // makes: it adds its rows and points, not a second call.
+            let calls = a.call + LAYER + LOOKUP_MISS;
             at = plan.place(at, calls);
             plan.group[k] = at as u8;
             plan.elements += 1;
             plan.members[at] |= 1 << k;
-            plan.add_to(at, a, LAYER);
+            plan.add_to(at, a, LAYER + LOOKUP_MISS);
             if let Some(b) = b {
                 plan.add_to(at, b, 0);
+                plan.cost[at].0 -= b.call;
             }
         }
         if self
@@ -4331,6 +4345,7 @@ mod tests {
                 model(*p, w, h)
             );
         }
+        assert_eq!(LOOKUP_MISS, with_margin(LOOKUP_MISS_MEASURED));
         // The margin of nothing would leave a measure above the constant.
         assert!(with_margin(190) > 190);
     }

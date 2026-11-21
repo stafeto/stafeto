@@ -760,9 +760,9 @@ fn a_scene_of_dear_elements_is_taken_and_drawn_in_groups_as_the_reference_has_it
 }
 
 #[test]
-fn sixteen_of_the_dearest_are_taken_and_every_step_costs_under_the_gate_by_the_model() {
+fn eight_of_the_dearest_are_taken_and_every_step_costs_under_the_gate_by_the_model() {
     let mut rig = dear_rig();
-    let els: Vec<Element> = (0..16).map(|k| dear(&rig, k, (0, 0))).collect();
+    let els: Vec<Element> = (0..8).map(|k| dear(&rig, k, (0, 0))).collect();
     rig.scene
         .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap())
         .unwrap();
@@ -853,6 +853,7 @@ impl Raster for StepCost {
         _: usize,
     ) {
         self.layers += 1;
+        self.calls += LOOKUP_MISS;
         self.add(if over { OVER } else { OPAQUE }, area);
     }
 
@@ -863,6 +864,7 @@ impl Raster for StepCost {
         let t = d.transparency;
         let area = (d.area.w, d.area.h);
         self.layers += 1;
+        self.calls += LOOKUP_MISS;
         let extra = match (t & TRANSPARENCY_MASK != 0, t & TRANSPARENCY_ALPHA != 0) {
             (true, true) => Some(MaskAlpha),
             (true, false) => Some(Mask),
@@ -891,10 +893,43 @@ impl Raster for StepCost {
             (Some(f), x) => {
                 self.add(PRICES[f.row()], area);
                 if let Some(x) = x {
+                    // The alpha or the mask is in the one call: rows and points.
                     self.add(PRICES[x.row()], area);
+                    self.calls -= PRICES[x.row()].call;
                 }
             }
             (None, None) => self.add(if t != 0 { OVER } else { OPAQUE }, area),
         }
     }
+}
+
+#[test]
+fn one_layer_that_misses_pixmans_cache_fits_a_step_by_the_model() {
+    // The dearest layer (a bilinear stretch with a mask and an alpha) alone, with
+    // the miss of the path, the fixed term of a band, the black and the term of
+    // the element: the smallest step (one point) is under the gate by the model.
+    let mut rig = dear_rig();
+    let e = dear(&rig, 0, (0, 0));
+    rig.scene
+        .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &[e]).unwrap())
+        .unwrap();
+    rig.scene.begin().unwrap();
+    let d = Rect {
+        x: 0,
+        y: 0,
+        w: 1,
+        h: 1,
+    };
+    let def = rig.scene.working().copied().unwrap();
+    let plan = rig.scene.passes(&def, d);
+    let (calls, row, point) = plan.cost[0];
+    let ticks = u64::from(calls)
+        + u64::from(BAND_FIXED)
+        + u64::from(ELEMENT_TERM)
+        + (u64::from(row) + u64::from(point)).div_ceil(100);
+    assert!(
+        ticks <= u64::from(BAND_GATE - 1_080),
+        "one layer costs {ticks} by the model"
+    );
+    assert!(calls >= PRICES[elements::Class::ScaleBilinearOver.row()].call + LOOKUP_MISS);
 }

@@ -385,14 +385,23 @@ stretch with a mask and an alpha, leave a step of one point after the calls of i
 and the terms of the sixteen elements), which shows as `capped` and `late` in STATS; the
 cap of 47 bands a period stays.
 
-The calibration measures a call that repeats, which finds its path in pixman's cache of
-8 resolved paths. A call whose path is not in the cache scans the tables of every
-implementation and costs 4 000 to 6 500 ticks more; a scene makes more combinations of
-operation, formats and image flags (a transform, a filter, a mask, the position on the
-source) than the cache holds, and some combinations (a turn of 180 degrees at the edge
-of the source, bilinear) miss however the calls repeat. A step with such a call is longer
-than the model says: the longest steps of `comp-probe` under -icount are 18 100 ticks
-against the gate of 16 328.
+The calibration of the kinds measures calls that repeat, which find their path in pixman's
+cache of 8 resolved paths. A call whose path is not in the cache scans the tables of every
+implementation: 4 546 ticks more at the most (`LOOKUP_MISS_MEASURED`, the greatest over the
+kinds and over the two variants of the flags, inside the source and at its edge, of a call of
+one point after eight calls of other keys less the same call repeated; the line `service
+lookup` of the steps build). An element with a transform has two keys, so a scene of 16
+has up to 32 and the cache is lost on every band; under a scene every layer of an element
+pays `LOOKUP_MISS` (the measure with the margin, 5 228 ticks) with its call, in `Scene::passes`
+and so in `tile`, and the alpha or the mask of a stretched element adds its rows and points
+to the one call of the stretch. The windows with no scene have three keys and the pointer's,
+all warm, and are priced as before. A layer that misses is a step of its own, and the dearest
+fits one (a test holds it). The longest steps of `comp-probe` under -icount are 16 289
+ticks against the gate of 16 328.
+
+The steps build paints the stack of the service at its start and tells the deepest word
+written (`service stack`); the probe's scenes of every kind of element take it to 74 672
+bytes of the 131 072 of the stack.
 
 The images pixman wraps around the buffers are kept in a ring of 32 (`lib/pixman`,
 `kept.rs`), the oldest going when a new one comes, and each is made when its buffer is
