@@ -486,17 +486,28 @@ pub const TABLET: &[&str] = &["-device", "virtio-tablet-device,bus=virtio-mmio-b
 /// through `blkdebug` with that rules file, and writes after the first wait
 /// a second (THROTTLE).
 pub fn store(image: &Path, faults: Option<&Path>) -> Vec<String> {
+    store_cached(image, faults, "writeback")
+}
+
+/// The disk of a run whose file is temporary and whose data nobody keeps (the frame image's):
+/// `store` with `cache=unsafe`, so that a FLUSH of the guest never reaches the host's disk and
+/// the host's `fsync` cannot stall QEMU's loop in the middle of a frame.
+pub fn store_unsafe(image: &Path) -> Vec<String> {
+    store_cached(image, None, "unsafe")
+}
+
+fn store_cached(image: &Path, faults: Option<&Path>, cache: &str) -> Vec<String> {
     let image = option_path(image);
     let (drive, mut out) = match faults {
         None => (
             format!(
-                "if=none,id=store,format=raw,file={image},cache=writeback,werror=report,rerror=report"
+                "if=none,id=store,format=raw,file={image},cache={cache},werror=report,rerror=report"
             ),
             Vec::new(),
         ),
         Some(rules) => (
             format!(
-                "if=none,id=store,driver=throttle,throttle-group=slow,file.driver=raw,file.file.driver=blkdebug,file.file.config={},file.file.image.filename={image},cache=writeback,werror=report,rerror=report",
+                "if=none,id=store,driver=throttle,throttle-group=slow,file.driver=raw,file.file.driver=blkdebug,file.file.config={},file.file.image.filename={image},cache={cache},werror=report,rerror=report",
                 option_path(rules)
             ),
             vec!["-object".to_owned(), THROTTLE.to_owned()],
@@ -1901,6 +1912,17 @@ pub fn rejoin_lines(lines: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The general disk keeps the host's flush; the frame image's temporary disk drops it.
+    #[test]
+    fn only_the_frame_disk_swallows_the_flush() {
+        let path = std::path::Path::new("/tmp/d.img");
+        let general = super::store(path, None).join(" ");
+        assert!(general.contains("cache=writeback") && !general.contains("cache=unsafe"));
+        let frame = super::store_unsafe(path).join(" ");
+        assert!(frame.contains("cache=unsafe") && !frame.contains("cache=writeback"));
+        assert!(frame.contains("virtio-blk-pci,drive=store"));
+    }
+
     fn owned(v: &[&str]) -> Vec<String> {
         v.iter().map(|l| (*l).to_owned()).collect()
     }

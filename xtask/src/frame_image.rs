@@ -209,7 +209,8 @@ pub fn run_traced(steps: bool, trace: bool) -> Result<Vec<String>, String> {
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::GPU);
     cmd.args(qemu::net(&[]));
-    cmd.args(qemu::store(&disk, None));
+    // The file is temporary: the host's flush has nothing to keep and can only stall the run.
+    cmd.args(qemu::store_unsafe(&disk));
     if steps {
         // The clock follows the instructions, and sleeps with the host while
         // the guest waits for the disk (stafeto/stafeto#459).
