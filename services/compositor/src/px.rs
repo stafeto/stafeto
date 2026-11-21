@@ -1469,15 +1469,9 @@ pub mod calibration {
         // when it is pixman's general path (an opaque source that mixes).
         let (dxs, sxs, repeat) = match recipe {
             None => (4, 4, REPEAT),
-            Some(r) if r.transform == Transform::Scale => (
-                if r.mix != Mix::None && r.source == Src::Opaque {
-                    1
-                } else {
-                    2
-                },
-                2,
-                1,
-            ),
+            // One offset of the target for each of the two places in the source: the
+            // second place at the offset 1 when the path is NEON.
+            Some(r) if r.transform == Transform::Scale => (1, 2, 1),
             Some(r) => (
                 if r.transform == Transform::General {
                     1
@@ -1514,6 +1508,16 @@ pub mod calibration {
                         // made inside its source (the first of the two) and at its edge.
                         let inside =
                             recipe.is_some_and(|r| r.transform == Transform::Scale && sx == 0);
+                        // A scale of a NEON path is at the offset 1 of the target at its edge.
+                        let dx = match recipe {
+                            Some(r)
+                                if r.transform == Transform::Scale
+                                    && !(r.mix != Mix::None && r.source == Src::Opaque) =>
+                            {
+                                sx
+                            }
+                            _ => dx,
+                        };
                         for turn in 0..=repeat {
                             let images = &mut px.images;
                             // An operation a higher level preempted is made again.

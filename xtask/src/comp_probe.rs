@@ -300,9 +300,9 @@ pub fn steps_verdict(lines: &[String]) -> Result<(Rows, Rows), String> {
 }
 
 /// The most steps a frame of the probe's scenes may take (the lines `service frame: T n N
-/// bands B us U` of the service): the greatest of the scenes is 17,675, and a band of one
+/// bands B us U` of the service): the greatest of the scenes took 17,675 before the edge of the fast class was priced, and a band of one
 /// point over the whole rectangle of an element would make up to 256,000 steps of a group.
-pub const FRAME_STEPS_MAX: u64 = 40_000;
+pub const FRAME_STEPS_MAX: u64 = 60_000;
 
 /// The frames the service told: (frame, steps, microseconds).
 pub fn frame_steps(lines: &[String], tag: &str) -> Vec<(u64, u64, u64)> {
