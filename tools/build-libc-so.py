@@ -68,6 +68,14 @@ TOOLCHAIN = "nightly-2026-05-24"
 TRACE = bool(os.environ.get("STAFETO_TRACE"))
 # The names of `<stafeto/window.h>`, which libc.so never exports.
 WINDOW_NAMES = re.compile(r"stafeto_(window|screen)_")
+# The functions of OpenWF Display and Composition (`<WF/wfd.h>`, `<WF/wfc.h>`, the features
+# `wfd` and `wfc` of posix-crt), which libc.so never exports either.
+OPENWF_NAMES = re.compile(r"wf[cd][A-Z]")
+
+
+def leaked_names(defined) -> list:
+    """The names of `defined` that belong to a static library the programs link, sorted."""
+    return sorted(n for n in defined if WINDOW_NAMES.match(n) or OPENWF_NAMES.match(n))
 # The features of posix-crt that libc.so is built with, named once in tools/layer-features.txt:
 # `cargo xtask abi` reads the same file for the crates its fingerprint counts, and a host test of
 # xtask holds the file to posix-crt's features. `trace` is on only for the measurement build.
@@ -463,9 +471,9 @@ def export_names(sysroot: Path, plain: Elf) -> dict:
     defined = {n for n, is_def, bind, vis, _ in plain.dynsym() if is_def and n and bind in (1, 2)}
     # The windows of the composition service are a static library of the programs that use them
     # (the feature `window` of posix-crt): their names in libc.so would change the frozen series.
-    leaked = sorted(n for n in defined if WINDOW_NAMES.match(n))
+    leaked = leaked_names(defined)
     if leaked:
-        fail(f"libc.so defines names of the window library, which stays out of it: "
+        fail(f"libc.so defines names of the window or OpenWF libraries, which stay out of it: "
              f"{' '.join(leaked)}")
     words = set()
     for header in (sysroot / "include").rglob("*.h"):

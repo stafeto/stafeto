@@ -149,6 +149,7 @@ mod untag;
 mod vi_dialog;
 mod vz;
 mod wcet;
+mod wfd;
 mod window;
 mod workflows;
 
@@ -2531,6 +2532,7 @@ commands:
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
   data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
+  wfd-probe run the display demo on OpenWF Display (<WF/wfd.h>) in QEMU with the display driver alone: 100 frames bound to the primary pipeline in turn, each compared with the guest's CRC, the host's own and QEMU's screenshot, and the cursor moved 100 times (the device's trace); then the driver's steps under -icount
   posix-window run the C probe of the window library (<stafeto/window.h>) in QEMU: a window with two buffers, the bits that free them, events, fork, a signal and close, the frames compared with QEMU's screenshot
   display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
   layer-probe [steps] attach and detach layers of the RAM file service in QEMU; steps
@@ -2959,6 +2961,7 @@ fn main() {
         Some("posix-display") => posix_display::probe(&qemu::VIRT),
         Some("data-posix") => data_posix::command(&args[1..], &qemu::VIRT),
         Some("posix-window") => posix_window::probe(&qemu::VIRT),
+        Some("wfd-probe") => wfd::probe(&qemu::VIRT),
         Some("display-probe") => display_probe::probe(&qemu::VIRT),
         Some("help") | None => {
             println!("{USAGE}");
@@ -11191,6 +11194,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("vi-dialog", vi_dialog::vi_dialog),
         // The window library of C programs against QEMU's screenshots.
         job("posix-window", || posix_window::probe(&qemu::VIRT)),
+        // OpenWF Display over the driver alone: the frames against QEMU's
+        // screenshot, the scanout and cursor trace, the driver's steps.
+        job("wfd-probe", || wfd::probe(&qemu::VIRT)),
         // The screen and the keys of libc.so against QEMU's screenshots and
         // the keys of its monitor.
         job("display-probe", || display_probe::probe(&qemu::VIRT)),
@@ -11359,6 +11365,7 @@ fn host_tests() -> Result<(), String> {
         "tools/test_build_freetype.py",
         "tools/test_build_lvgl.py",
         "tools/test_lvgl_port.py",
+        "tools/test_build_libc_so.py",
         "tools/test_pkg_source.py",
         "tools/test_pkg_mirror.py",
         "tools/test_dist.py",
@@ -11472,6 +11479,8 @@ fn host_tests() -> Result<(), String> {
         "entropy",
         "--package",
         "proto-gpu",
+        "--package",
+        "wfd",
         "--package",
         "proto-comp",
         "--package",
@@ -14590,6 +14599,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "proto-gpu",
         "--package",
+        "wfd",
+        "--package",
         "proto-comp",
         "--package",
         "proto-input",
@@ -14915,6 +14926,8 @@ fn ci_lints() -> Result<(), String> {
         "posix-data-probe",
         "--package",
         "posix-window-probe",
+        "--package",
+        "wfd-demo",
         "--package",
         "pkg-slot-probe",
         "--package",
@@ -17678,6 +17691,8 @@ mod entropy_in_images_tests {
             ("posix_display::PROGRAMS", &crate::posix_display::PROGRAMS),
             ("data_posix::PROGRAMS", &crate::data_posix::PROGRAMS),
             ("posix_window::PROGRAMS", &crate::posix_window::PROGRAMS),
+            ("wfd::PROGRAMS", &crate::wfd::PROGRAMS),
+            ("wfd::STEPS_PROGRAMS", &crate::wfd::STEPS_PROGRAMS),
             ("store_probe::PROGRAMS", &crate::store_probe::PROGRAMS),
             // The images whose lists are built at run time, EC2's among them.
             ("main::shell_programs", shell_programs()),

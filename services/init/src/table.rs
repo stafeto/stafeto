@@ -1553,6 +1553,7 @@ pub mod ramfs;
 pub mod shutdown;
 pub mod test;
 pub mod vz;
+pub mod wfd;
 pub mod window;
 
 /// The table features of the build: one at most.
@@ -1638,6 +1639,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-display") as usize
     + cfg!(feature = "table-data-posix") as usize
     + cfg!(feature = "table-posix-window") as usize
+    + cfg!(feature = "table-wfd") as usize
+    + cfg!(feature = "table-wfd-steps") as usize
     + cfg!(feature = "table-display") as usize
     + cfg!(feature = "table-fstack-probe") as usize
     + cfg!(feature = "table-fstack-device") as usize
@@ -1745,6 +1748,8 @@ const _: () = assert!(
     feature = "table-posix-display",
     feature = "table-data-posix",
     feature = "table-posix-window",
+    feature = "table-wfd",
+    feature = "table-wfd-steps",
     feature = "table-display",
     feature = "table-fstack-probe",
     feature = "table-fstack-device",
@@ -1953,6 +1958,10 @@ pub const TABLE: &[Record] = ramfs::POSIX_DISPLAY_TABLE;
 pub const TABLE: &[Record] = ramfs::DATA_POSIX_TABLE;
 #[cfg(feature = "table-posix-window")]
 pub const TABLE: &[Record] = window::TABLE;
+#[cfg(feature = "table-wfd")]
+pub const TABLE: &[Record] = wfd::TABLE;
+#[cfg(feature = "table-wfd-steps")]
+pub const TABLE: &[Record] = wfd::STEPS_TABLE;
 #[cfg(feature = "table-display")]
 pub const TABLE: &[Record] = ramfs::DISPLAY_TABLE;
 #[cfg(feature = "table-fstack-probe")]
@@ -4261,6 +4270,8 @@ mod tests {
             ramfs::DATA_POSIX_TABLE,
             lvgl::TABLE,
             window::TABLE,
+            wfd::TABLE,
+            wfd::STEPS_TABLE,
             ramfs::DISPLAY_TABLE,
         ];
         for table in tables {
@@ -4280,6 +4291,7 @@ mod tests {
                     "posix-display",
                     "posix-data",
                     "posix-window",
+                    "wfd-demo",
                     "display-run",
                     "posix-pty",
                 ]

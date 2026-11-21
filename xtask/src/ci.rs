@@ -313,6 +313,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("data-posix write", 40),
     ("vi-dialog", 30),
     ("posix-window", 25),
+    ("wfd-probe", 40),
     ("display-probe", 25),
     ("lvgl-probe", 40),
     ("comp-late-probe", 25),

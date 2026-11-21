@@ -36,6 +36,10 @@ mod fast_c;
 // linked program (`<stafeto/window.h>`); libc.so leaves them out.
 #[cfg(feature = "window")]
 mod window_c;
+// The C functions of OpenWF Display (`<WF/wfd.h>`), for a statically linked
+// program; libc.so leaves them out.
+#[cfg(feature = "wfd")]
+mod wfd_c;
 
 // relibc's platform calls the layer through posix-platform's functions.
 extern crate posix_platform;

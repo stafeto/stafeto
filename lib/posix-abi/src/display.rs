@@ -122,6 +122,13 @@ pub fn unmap_buffer() -> Result<(), i32> {
     crate::allocation::heap(|state| state.unmap_display())
 }
 
+/// Whether the process has the screen of the first revision, open or being
+/// opened (`<stafeto/display.h>`): the driver has one owner, so the
+/// OpenWF Display device (`wfd`) leaves the screen alone then.
+pub fn screen_open() -> bool {
+    STATE.load(Ordering::Acquire) != CLOSED
+}
+
 /// The address and pages of the display piece, None without one.
 pub fn buffer() -> Option<(usize, usize)> {
     crate::allocation::regions(|map| map.display_piece())

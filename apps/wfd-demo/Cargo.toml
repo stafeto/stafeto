@@ -1,0 +1,18 @@
+[package]
+name = "wfd-demo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The display demo of stafeto: a C program on OpenWF Display 1.0 that binds the compositing target and the pool buffer to the primary pipeline in turn and moves a cursor picture on the cursor pipeline; with --probe it checks the API and prints the CRC of each frame"
+build = "build.rs"
+
+[[bin]]
+name = "wfd-demo"
+test = false
+bench = false
+
+[dependencies]
+posix-abi = { path = "../../lib/posix-abi" }
+posix-crt = { path = "../../lib/posix-crt", features = ["wfd"] }

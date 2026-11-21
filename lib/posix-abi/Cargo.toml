@@ -58,6 +58,11 @@ break-rejoin-race = []
 # (posix-crt's feature `window`); libc.so is built without it, so that its
 # exports and the series 0.5 of the ABI stay as they were.
 window = ["dep:comp-client", "dep:proto-comp"]
+# The OpenWF Display device over the display service for a C program (wfd.rs):
+# the state of the process's device, the sources of the driver as pieces of
+# the map and the calls that `<WF/wfd.h>` has. Statically linked programs
+# turn it on (posix-crt's feature `wfd`); libc.so is built without it.
+wfd = ["dep:wfd", "dep:proto-comp"]
 
 [dependencies]
 trace = { path = "../trace" }
@@ -95,3 +100,4 @@ proto-input = { path = "../../proto/input" }
 comp-client = { path = "../comp-client", optional = true }
 proto-comp = { path = "../../proto/comp", optional = true }
 proto-data = { path = "../../proto/data", optional = true }
+wfd = { path = "../wfd", optional = true }

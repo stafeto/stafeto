@@ -176,6 +176,11 @@ const KEPT: Rights = Rights::MAP_READ
     .union(Rights::DUPLICATE)
     .union(Rights::TRANSFER);
 
+/// The most pieces of the kind `Source` a process holds: the pool buffer and
+/// the cursor picture of the display driver (the target is a `Display` piece).
+/// `after_fork` keeps room for this many.
+pub(crate) const SOURCE_PIECES: usize = 2;
+
 /// Runs `f` on the heap and the map under the heap's lock.
 pub(crate) fn heap<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let _guard = HEAP_LOCK.lock();
@@ -380,12 +385,22 @@ pub unsafe fn after_fork(
     {
         *slot = piece;
     }
+    // The sources of the display driver the parent held (the pool and the
+    // cursor picture).
+    let mut sources = [(0usize, 0usize); SOURCE_PIECES];
+    for (slot, piece) in sources
+        .iter_mut()
+        .zip(state.map.kind_pieces(posix_map::Kind::Source))
+    {
+        *slot = piece;
+    }
     state.map.forget();
     for (address, pages) in [display, network, files]
         .into_iter()
         .flatten()
         .chain(cache.into_iter().filter(|piece| piece.1 != 0))
         .chain(windows.into_iter().filter(|piece| piece.1 != 0))
+        .chain(sources.into_iter().filter(|piece| piece.1 != 0))
     {
         state.space.set(address, pages, Page::Unbacked);
     }
@@ -748,6 +763,29 @@ impl State {
     pub(crate) fn unmap_windows(&mut self) -> Result<(), i32> {
         while self.map.kind_piece(posix_map::Kind::Window).is_some() {
             self.unmap_special(posix_map::Kind::Window)?;
+        }
+        Ok(())
+    }
+
+    /// A source of the display driver (`posix_map::Kind::Source`): `handle`
+    /// (`pages` pages, MAP_READ and MAP_WRITE) becomes a piece of its own, at
+    /// an address of the room; the address. ENOMEM past the room, the limits
+    /// or the table; the handle goes if the map refuses it.
+    #[cfg(feature = "wfd")]
+    pub(crate) fn map_source(
+        &mut self,
+        handle: Handle<Memory>,
+        pages: usize,
+    ) -> Result<usize, i32> {
+        self.map_special_more(handle, pages, posix_map::Kind::Source)
+    }
+
+    /// Every source of the display driver leaves the process and its objects
+    /// close; Ok when there are none.
+    #[cfg(feature = "wfd")]
+    pub(crate) fn unmap_sources(&mut self) -> Result<(), i32> {
+        while self.map.kind_piece(posix_map::Kind::Source).is_some() {
+            self.unmap_special(posix_map::Kind::Source)?;
         }
         Ok(())
     }

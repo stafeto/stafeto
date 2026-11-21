@@ -1,0 +1,121 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! The numbers of `<WF/wfd.h>` that the rules use, under the header's names
+//! without the prefix `WFD_`.
+
+pub const ERROR_NONE: i32 = 0;
+pub const ERROR_OUT_OF_MEMORY: i32 = 0x7510;
+pub const ERROR_ILLEGAL_ARGUMENT: i32 = 0x7511;
+pub const ERROR_NOT_SUPPORTED: i32 = 0x7512;
+pub const ERROR_BAD_ATTRIBUTE: i32 = 0x7513;
+pub const ERROR_IN_USE: i32 = 0x7514;
+pub const ERROR_BUSY: i32 = 0x7515;
+pub const ERROR_BAD_DEVICE: i32 = 0x7516;
+pub const ERROR_BAD_HANDLE: i32 = 0x7517;
+pub const ERROR_INCONSISTENCY: i32 = 0x7518;
+
+pub const VENDOR: i32 = 0x7500;
+pub const RENDERER: i32 = 0x7501;
+pub const VERSION: i32 = 0x7502;
+pub const EXTENSIONS: i32 = 0x7503;
+
+pub const DEVICE_FILTER_PORT_ID: i32 = 0x7530;
+pub const COMMIT_ENTIRE_DEVICE: i32 = 0x7550;
+pub const COMMIT_ENTIRE_PORT: i32 = 0x7551;
+pub const COMMIT_PIPELINE: i32 = 0x7552;
+pub const DEVICE_ID: i32 = 0x7560;
+
+pub const EVENT_INVALID: i32 = 0x7580;
+pub const EVENT_NONE: i32 = 0x7581;
+pub const EVENT_DESTROYED: i32 = 0x7582;
+pub const EVENT_PORT_ATTACH_DETACH: i32 = 0x7583;
+pub const EVENT_PORT_PROTECTION_FAILURE: i32 = 0x7584;
+pub const EVENT_PIPELINE_BIND_SOURCE_COMPLETE: i32 = 0x7585;
+pub const EVENT_PIPELINE_BIND_MASK_COMPLETE: i32 = 0x7586;
+
+pub const EVENT_PIPELINE_BIND_QUEUE_SIZE: i32 = 0x75C0;
+pub const EVENT_TYPE: i32 = 0x75C1;
+pub const EVENT_PORT_ATTACH_PORT_ID: i32 = 0x75C2;
+pub const EVENT_PORT_ATTACH_STATE: i32 = 0x75C3;
+pub const EVENT_PORT_PROTECTION_PORT_ID: i32 = 0x75C4;
+pub const EVENT_PIPELINE_BIND_PIPELINE_ID: i32 = 0x75C5;
+pub const EVENT_PIPELINE_BIND_SOURCE: i32 = 0x75C6;
+pub const EVENT_PIPELINE_BIND_MASK: i32 = 0x75C7;
+pub const EVENT_PIPELINE_BIND_QUEUE_OVERFLOW: i32 = 0x75C8;
+
+pub const PORT_MODE_WIDTH: i32 = 0x7600;
+pub const PORT_MODE_HEIGHT: i32 = 0x7601;
+pub const PORT_MODE_REFRESH_RATE: i32 = 0x7602;
+pub const PORT_MODE_FLIP_MIRROR_SUPPORT: i32 = 0x7603;
+pub const PORT_MODE_ROTATION_SUPPORT: i32 = 0x7604;
+pub const PORT_MODE_INTERLACED: i32 = 0x7605;
+
+pub const PORT_ID: i32 = 0x7620;
+pub const PORT_TYPE: i32 = 0x7621;
+pub const PORT_DETACHABLE: i32 = 0x7622;
+pub const PORT_ATTACHED: i32 = 0x7623;
+pub const PORT_NATIVE_RESOLUTION: i32 = 0x7624;
+pub const PORT_PHYSICAL_SIZE: i32 = 0x7625;
+pub const PORT_FILL_PORT_AREA: i32 = 0x7626;
+pub const PORT_BACKGROUND_COLOR: i32 = 0x7627;
+pub const PORT_FLIP: i32 = 0x7628;
+pub const PORT_MIRROR: i32 = 0x7629;
+pub const PORT_ROTATION: i32 = 0x762A;
+pub const PORT_POWER_MODE: i32 = 0x762B;
+pub const PORT_GAMMA_RANGE: i32 = 0x762C;
+pub const PORT_GAMMA: i32 = 0x762D;
+pub const PORT_PARTIAL_REFRESH_SUPPORT: i32 = 0x762E;
+pub const PORT_PARTIAL_REFRESH_MAXIMUM: i32 = 0x762F;
+pub const PORT_PARTIAL_REFRESH_ENABLE: i32 = 0x7630;
+pub const PORT_PARTIAL_REFRESH_RECTANGLE: i32 = 0x7631;
+pub const PORT_PIPELINE_ID_COUNT: i32 = 0x7632;
+pub const PORT_BINDABLE_PIPELINE_IDS: i32 = 0x7633;
+pub const PORT_PROTECTION_ENABLE: i32 = 0x7634;
+
+pub const PORT_TYPE_INTERNAL: i32 = 0x7660;
+pub const POWER_MODE_OFF: i32 = 0x7680;
+pub const POWER_MODE_SUSPEND: i32 = 0x7681;
+pub const POWER_MODE_LIMITED_USE: i32 = 0x7682;
+pub const POWER_MODE_ON: i32 = 0x7683;
+pub const PARTIAL_REFRESH_NONE: i32 = 0x7690;
+pub const PARTIAL_REFRESH_BOTH: i32 = 0x7693;
+pub const DISPLAY_DATA_FORMAT_NONE: i32 = 0x76A0;
+pub const ROTATION_SUPPORT_NONE: i32 = 0x76D0;
+
+pub const PIPELINE_ID: i32 = 0x7720;
+pub const PIPELINE_PORTID: i32 = 0x7721;
+pub const PIPELINE_LAYER: i32 = 0x7722;
+pub const PIPELINE_SHAREABLE: i32 = 0x7723;
+pub const PIPELINE_DIRECT_REFRESH: i32 = 0x7724;
+pub const PIPELINE_MAX_SOURCE_SIZE: i32 = 0x7725;
+pub const PIPELINE_SOURCE_RECTANGLE: i32 = 0x7726;
+pub const PIPELINE_FLIP: i32 = 0x7727;
+pub const PIPELINE_MIRROR: i32 = 0x7728;
+pub const PIPELINE_ROTATION_SUPPORT: i32 = 0x7729;
+pub const PIPELINE_ROTATION: i32 = 0x772A;
+pub const PIPELINE_SCALE_RANGE: i32 = 0x772B;
+pub const PIPELINE_SCALE_FILTER: i32 = 0x772C;
+pub const PIPELINE_DESTINATION_RECTANGLE: i32 = 0x772D;
+pub const PIPELINE_TRANSPARENCY_ENABLE: i32 = 0x772E;
+pub const PIPELINE_GLOBAL_ALPHA: i32 = 0x772F;
+
+pub const SCALE_FILTER_NONE: i32 = 0x7760;
+pub const SCALE_FILTER_FASTER: i32 = 0x7761;
+pub const SCALE_FILTER_BETTER: i32 = 0x7762;
+
+pub const TRANSPARENCY_NONE: u32 = 0;
+pub const TRANSPARENCY_SOURCE_COLOR: u32 = 1;
+pub const TRANSPARENCY_GLOBAL_ALPHA: u32 = 2;
+pub const TRANSPARENCY_SOURCE_ALPHA: u32 = 4;
+pub const TRANSPARENCY_MASK: u32 = 8;
+
+pub const TSC_FORMAT_UINT8_RGB_8_8_8_LINEAR: i32 = 0x7790;
+pub const TSC_FORMAT_UINT8_RGB_5_6_5_LINEAR: i32 = 0x7791;
+
+pub const TRANSITION_IMMEDIATE: i32 = 0x77E1;
+pub const TRANSITION_AT_VSYNC: i32 = 0x77E2;
+
+/// The largest integer or float value the API takes (`WFD_MAX_INT`).
+pub const MAX_INT: i32 = 1 << 24;
+pub const FOREVER: u64 = u64::MAX;
