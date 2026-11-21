@@ -149,6 +149,7 @@ mod untag;
 mod vi_dialog;
 mod vz;
 mod wcet;
+mod wfc;
 mod wfd;
 mod window;
 mod workflows;
@@ -2532,6 +2533,7 @@ commands:
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
   data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
+  wfc-probe run the scene demo on OpenWF Composition (<WF/wfc.h>) in QEMU with the compositor: two scenes of three elements (a stretch, turns, a flip, the three filters, a global alpha and a mask) over the windows of two producers, committed in turn 100 times and each composed on request, QEMU's screenshot compared with the CRC of the host's reference (tools/wfc-ref), then the scene changed 100 times on an active context with every screenshot one of the two; then the steps of the compositor and the driver under -icount
   wfd-probe run the display demo on OpenWF Display (<WF/wfd.h>) in QEMU with the display driver alone: 100 frames bound to the primary pipeline in turn, each compared with the guest's CRC, the host's own and QEMU's screenshot, and the cursor moved 100 times (the device's trace); then the driver's steps under -icount
   posix-window run the C probe of the window library (<stafeto/window.h>) in QEMU: a window with two buffers, the bits that free them, events, fork, a signal and close, the frames compared with QEMU's screenshot
   display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
@@ -2961,6 +2963,7 @@ fn main() {
         Some("posix-display") => posix_display::probe(&qemu::VIRT),
         Some("data-posix") => data_posix::command(&args[1..], &qemu::VIRT),
         Some("posix-window") => posix_window::probe(&qemu::VIRT),
+        Some("wfc-probe") => wfc::command(&args[1..], &qemu::VIRT),
         Some("wfd-probe") => wfd::probe(&qemu::VIRT),
         Some("display-probe") => display_probe::probe(&qemu::VIRT),
         Some("help") | None => {
@@ -11213,6 +11216,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // OpenWF Display over the driver alone: the frames against QEMU's
         // screenshot, the scanout and cursor trace, the driver's steps.
         job("wfd-probe", || wfd::probe(&qemu::VIRT)),
+        // OpenWF Composition over the compositor: two scenes of every kind of
+        // element against the host's frames and QEMU's screenshot, then the
+        // steps of the compositor and the driver.
+        job("wfc-probe", || wfc::probe(&qemu::VIRT, true)),
         // The screen and the keys of libc.so against QEMU's screenshots and
         // the keys of its monitor.
         job("display-probe", || display_probe::probe(&qemu::VIRT)),
@@ -14951,6 +14958,10 @@ fn ci_lints() -> Result<(), String> {
         "posix-window-probe",
         "--package",
         "wfd-demo",
+        "--package",
+        "wfc-demo",
+        "--package",
+        "wfc-producer",
         "--package",
         "pkg-slot-probe",
         "--package",

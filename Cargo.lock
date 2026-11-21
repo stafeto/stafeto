@@ -1986,6 +1986,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "wfc-demo"
+version = "0.6.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
+name = "wfc-producer"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
+name = "wfc-ref"
+version = "0.1.0"
+dependencies = [
+ "proto-comp",
+ "proto-wire",
+ "wfc",
+]
+
+[[package]]
 name = "wfd"
 version = "0.1.0"
 dependencies = [
@@ -2042,6 +2065,7 @@ dependencies = [
  "rtc",
  "uart",
  "virtio-pci",
+ "wfc-ref",
 ]
 
 [[package]]

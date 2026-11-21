@@ -1,0 +1,17 @@
+[package]
+name = "wfc-demo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The scene demo of stafeto: a C program on OpenWF Composition 1.0 that shows two scenes of three elements each (a stretch, turns, a flip, the three filters, a global alpha and a mask) over the windows of two producers; with --probe it checks the API and commits the scenes in turn"
+build = "build.rs"
+
+[[bin]]
+name = "wfc-demo"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt", features = ["wfc", "window"] }

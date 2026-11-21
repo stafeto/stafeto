@@ -2531,6 +2531,16 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        "boot-wfc.img" | "boot-wfc-steps.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/wfc-demo", 0o755, ROOT, "wfc-demo"),
+                file("/bin/wfc-producer", 0o755, ROOT, "wfc-producer"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
         "boot-wfd.img" | "boot-wfd-steps.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -3480,6 +3490,8 @@ mod tests {
             "boot-data-posix-restart.img",
             "boot-data-posix-throughput.img",
             "boot-posix-window.img",
+            "boot-wfc.img",
+            "boot-wfc-steps.img",
             "boot-wfd.img",
             "boot-wfd-steps.img",
             "boot-pkg-slot.img",
