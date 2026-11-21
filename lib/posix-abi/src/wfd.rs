@@ -60,6 +60,9 @@ static CHANNEL: AtomicU64 = AtomicU64::new(0);
 static TIMER: AtomicU64 = AtomicU64::new(0);
 /// OPEN's flags: the client cleans the cache before it shows.
 static FLAGS: AtomicU32 = AtomicU32::new(0);
+/// The device mapped the display piece itself (a first-revision screen of the
+/// process maps the same kind of piece, which the device never takes out).
+static MAPPED: AtomicBool = AtomicBool::new(false);
 /// A thread waits for events.
 static WAITING: AtomicBool = AtomicBool::new(false);
 
@@ -70,6 +73,8 @@ struct Lib(UnsafeCell<Option<Wfd>>);
 unsafe impl Sync for Lib {}
 static LIB: Lib = Lib(UnsafeCell::new(None));
 static LIB_LOCK: LayerLock = LayerLock::new();
+/// One thread at a time commits or destroys the device.
+static COMMIT_LOCK: LayerLock = LayerLock::new();
 /// One thread at a time makes a source of the driver.
 static STREAM_LOCK: LayerLock = LayerLock::new();
 
@@ -87,6 +92,10 @@ pub struct Stream {
     pub pixels: usize,
 }
 
+/// The streams of the driver: the target and the sources the map holds as pieces.
+const STREAM_COUNT: usize = 3;
+const _: () = assert!(STREAM_COUNT - 1 == crate::allocation::SOURCE_PIECES);
+
 const NO_STREAM: Stream = Stream {
     id: 0,
     width: 0,
@@ -97,11 +106,11 @@ const NO_STREAM: Stream = Stream {
     pixels: 0,
 };
 
-struct Streams(UnsafeCell<[Stream; 3]>);
+struct Streams(UnsafeCell<[Stream; STREAM_COUNT]>);
 // SAFETY: a descriptor is written once under STREAM_LOCK before its address
 // is given out, and read after that.
 unsafe impl Sync for Streams {}
-static STREAMS: Streams = Streams(UnsafeCell::new([NO_STREAM; 3]));
+static STREAMS: Streams = Streams(UnsafeCell::new([NO_STREAM; STREAM_COUNT]));
 
 fn level() -> u8 {
     (threads::own_block().base_level.load(Ordering::Relaxed) as u8).max(1)
@@ -180,9 +189,41 @@ fn open_errno(status: Status) -> i32 {
     }
 }
 
+/// Whether the process's `Display` session leads to the composition service,
+/// which answers DESCRIBE (the driver does not): the screen is the service's
+/// then and no device can take it.
+fn composition_present(session: &Handle<Channel>) -> bool {
+    let Ok(reply) = call(
+        session,
+        &proto_comp::Method::Describe.header().bytes(),
+        Outgoing::new(),
+    ) else {
+        return false;
+    };
+    let mut buffer = [0; MESSAGE_MAX];
+    proto_comp::Description::read(reply.bytes(&mut buffer)).is_ok()
+}
+
+/// Whether a device can be made: the process has a `Display` session and it
+/// leads to the driver (the composition service answers DESCRIBE and refuses).
+pub fn available() -> bool {
+    match crate::display::session() {
+        Some(session) => !composition_present(&Handle::<Channel>::borrowed(session)),
+        None => false,
+    }
+}
+
 /// `wfdCreateDevice`: the device's handle, or the errno it was not made for.
+/// A screen of the first revision that the process has open (EBUSY) and the
+/// composition service (ENODEV) refuse it before any OPEN.
 pub fn create() -> Result<u32, i32> {
     let session = crate::display::session().ok_or(ENODEV)?;
+    if crate::display::screen_open() {
+        return Err(EBUSY);
+    }
+    if composition_present(&Handle::<Channel>::borrowed(session)) {
+        return Err(ENODEV);
+    }
     if STATE
         .compare_exchange(CLOSED, OPENING, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -240,6 +281,7 @@ fn make(display: &Handle<Channel>) -> Result<u32, i32> {
     // The target is the display piece of the map.
     let bytes = u64::from(screen.stride) * u64::from(screen.height);
     let pixels = crate::display::map_buffer(memory, bytes.div_ceil(PAGE) as usize)?;
+    MAPPED.store(true, Ordering::Release);
     // SAFETY: no other thread knows the device yet (STATE is OPENING).
     unsafe {
         (*STREAMS.0.get())[0] = Stream {
@@ -433,6 +475,7 @@ fn block_until(until: u64, ready: impl Fn() -> bool) -> Result<(), Ended> {
 /// `wfdDeviceCommit`: the rules decide what to ask the driver, the driver is
 /// asked, the rules are told how it went.
 pub fn commit(dev: u32, kind: i32, handle: u32) {
+    let _commit = COMMIT_LOCK.lock();
     let Some(Some(plan)) = with(|w| w.commit(dev, kind, handle)) else {
         return;
     };
@@ -541,6 +584,7 @@ pub fn wake() {
 
 /// `wfdDestroyDevice`: the screen goes back and the device's resources go.
 pub fn destroy(dev: u32) {
+    let _commit = COMMIT_LOCK.lock();
     if device() != dev
         || STATE
             .compare_exchange(OPEN, OPENING, Ordering::AcqRel, Ordering::Acquire)
@@ -565,11 +609,13 @@ fn release() {
     }
     wake();
     let _ = crate::allocation::heap(|state| state.unmap_sources());
-    let _ = crate::display::unmap_buffer();
+    if MAPPED.swap(false, Ordering::AcqRel) {
+        let _ = crate::display::unmap_buffer();
+    }
     {
         let _make = STREAM_LOCK.lock();
         // SAFETY: written under STREAM_LOCK.
-        unsafe { *STREAMS.0.get() = [NO_STREAM; 3] };
+        unsafe { *STREAMS.0.get() = [NO_STREAM; STREAM_COUNT] };
     }
     for (cell, is_timer) in [(&OWNER, false), (&TIMER, true), (&CHANNEL, false)] {
         let raw = cell.swap(0, Ordering::AcqRel);
@@ -595,10 +641,11 @@ pub unsafe fn after_fork() {
         cell.store(0, Ordering::Release);
     }
     WAITING.store(false, Ordering::Release);
+    MAPPED.store(false, Ordering::Release);
     // SAFETY: the child's only thread.
     unsafe {
         *LIB.0.get() = None;
-        *STREAMS.0.get() = [NO_STREAM; 3];
+        *STREAMS.0.get() = [NO_STREAM; STREAM_COUNT];
     }
     STATE.store(CLOSED, Ordering::Release);
 }

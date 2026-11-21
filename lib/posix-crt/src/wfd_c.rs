@@ -145,6 +145,11 @@ pub unsafe extern "C" fn wfdEnumerateDevices(ids: *mut i32, count: i32, filter: 
     if !ids.is_null() && count <= 0 {
         return 0;
     }
+    // No device without a session with the driver; none either where the
+    // composition service owns the screen.
+    if !layer::available() {
+        return 0;
+    }
     Wfd::enumerate_devices(out, filter)
 }
 

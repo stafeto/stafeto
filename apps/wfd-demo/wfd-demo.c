@@ -37,6 +37,11 @@
 
 extern char **environ;
 
+/* The screen of the first revision, from src/main.rs. */
+int wd_screen_open(void **pixels);
+int wd_screen_flush(unsigned rows);
+int wd_screen_close(void);
+
 #define CHECK(cond)                                                                    \
     do {                                                                               \
         if (!(cond)) {                                                                 \
@@ -60,6 +65,7 @@ extern char **environ;
 
 static WFDDevice dev;
 static int quick;
+static int exec_done;
 
 static WFDErrorCode last_error(void) { return dev ? wfdGetError(dev) : WFD_ERROR_NONE; }
 
@@ -162,10 +168,28 @@ static int before_the_device(void) {
     return 0;
 }
 
+/* The screen of the first revision and the device keep out of each other's
+ * way: with the screen open no device is made (no OPEN goes to the driver),
+ * and the buffer of the screen is still there, written and shown. */
+static int with_the_first_revision(void) {
+    void *px = NULL;
+    CHECK(wd_screen_open(&px) == 0 && px != NULL);
+    CHECK(wfdCreateDevice(WFD_DEFAULT_DEVICE_ID, NULL) == WFD_INVALID_HANDLE);
+    uint32_t *points = px;
+    for (int i = 0; i < SCREEN_W * 8; i++) points[i] = 0x00FF00FFu;
+    CHECK(wd_screen_flush(8) == 0);
+    CHECK(wd_screen_close() == 0);
+    printf("wfd-demo: no device while the screen of the first revision is open, and its buffer is untouched\n");
+    return 0;
+}
+
 static int describe_device(void) {
     const char *list[4];
     dev = wfdCreateDevice(WFD_DEFAULT_DEVICE_ID, NULL);
     CHECK(dev != WFD_INVALID_HANDLE);
+    if (exec_done) {
+        printf("wfd-demo: exec gave the screen back to the driver, a new device is made\n");
+    }
     CHECK(wfdCreateDevice(WFD_DEFAULT_DEVICE_ID, NULL) == WFD_INVALID_HANDLE);
     CHECK(wfdGetError(dev) == WFD_ERROR_NONE);
     CHECK(wfdGetDeviceAttribi(dev, WFD_DEVICE_ID) == 1);
@@ -420,10 +444,25 @@ static int finish(void) {
     return 0;
 }
 
+/* A device is held across exec: the new image gets the screen back and
+ * makes a device of its own. The line after the exec says so. */
+static int exec_with_the_device(int is_quick) {
+    char *argv[] = {"wfd-demo", "run", "--probe", "--exec", NULL, NULL};
+    if (is_quick) argv[4] = "--quick";
+    dev = wfdCreateDevice(WFD_DEFAULT_DEVICE_ID, NULL);
+    CHECK(dev != WFD_INVALID_HANDLE);
+    fflush(stdout);
+    execv("/bin/wfd-demo", argv);
+    CHECK(0 && "exec returned");
+    return 20;
+}
+
 static int run_role(int probe) {
     crc_init();
-    if (probe) {
+    if (probe && !exec_done) {
         CHECK(before_the_device() == 0);
+        CHECK(with_the_first_revision() == 0);
+        return exec_with_the_device(quick);
     }
     CHECK(describe_device() == 0);
     CHECK(describe_port_and_pipelines() == 0);
@@ -459,6 +498,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--probe") == 0) probe = 1;
         else if (strcmp(argv[i], "--quick") == 0) quick = 1;
         else if (strcmp(argv[i], "run") == 0) run = 1;
+        else if (strcmp(argv[i], "--exec") == 0) exec_done = 1;
     }
     if (run) return run_role(probe);
     int status = first(probe, quick);

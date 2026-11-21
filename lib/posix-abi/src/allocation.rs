@@ -176,6 +176,11 @@ const KEPT: Rights = Rights::MAP_READ
     .union(Rights::DUPLICATE)
     .union(Rights::TRANSFER);
 
+/// The most pieces of the kind `Source` a process holds: the pool buffer and
+/// the cursor picture of the display driver (the target is a `Display` piece).
+/// `after_fork` keeps room for this many.
+pub(crate) const SOURCE_PIECES: usize = 2;
+
 /// Runs `f` on the heap and the map under the heap's lock.
 pub(crate) fn heap<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let _guard = HEAP_LOCK.lock();
@@ -382,7 +387,7 @@ pub unsafe fn after_fork(
     }
     // The sources of the display driver the parent held (the pool and the
     // cursor picture).
-    let mut sources = [(0usize, 0usize); 2];
+    let mut sources = [(0usize, 0usize); SOURCE_PIECES];
     for (slot, piece) in sources
         .iter_mut()
         .zip(state.map.kind_pieces(posix_map::Kind::Source))

@@ -62,7 +62,7 @@ window = ["dep:comp-client", "dep:proto-comp"]
 # the state of the process's device, the sources of the driver as pieces of
 # the map and the calls that `<WF/wfd.h>` has. Statically linked programs
 # turn it on (posix-crt's feature `wfd`); libc.so is built without it.
-wfd = ["dep:wfd"]
+wfd = ["dep:wfd", "dep:proto-comp"]
 
 [dependencies]
 trace = { path = "../trace" }

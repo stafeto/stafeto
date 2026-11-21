@@ -141,7 +141,9 @@ const ENDED: &str = concat!("init: wfd-demo ended: exit code 0,", " not restarte
 const ENDS: &str = "init: wfd-demo ended: ";
 
 /// The lines of the demo, each a check that passed.
-const LINES: [&str; 9] = [
+const LINES: [&str; 11] = [
+    "wfd-demo: no device while the screen of the first revision is open, and its buffer is untouched",
+    "wfd-demo: exec gave the screen back to the driver, a new device is made",
     "wfd-demo: the device is made once, described, and its calls are checked",
     "wfd-demo: the port has one mode of 640 by 400 at 60 hertz and its power is on",
     "wfd-demo: the pipelines are the primary one and the cursor, with their layers and limits",
