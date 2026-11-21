@@ -316,7 +316,14 @@ pub fn merge(
             break;
         }
         let from_volume = find(volume.group, g.name, group_line, |x| x.name);
-        let members = from_volume.map_or(g.members, |v| v.members);
+        // A volume that has a group file and no line for an image group brings it back with no
+        // members (a `wheel` an operator removed does not return with `user`); a volume with no
+        // group file gives the image's members.
+        let members = match from_volume {
+            Some(v) => v.members,
+            None if !volume.group.is_empty() => &[][..],
+            None => g.members,
+        };
         if write_group(&mut out.group, g.name, g.gid, members) {
             gids[group_count] = g.gid;
             group_count += 1;

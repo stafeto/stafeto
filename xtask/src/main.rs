@@ -11288,6 +11288,12 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The try-out image of EC2 on QEMU: its page on 80, 443 and 8080, a login, `pkg search`
         // and the image check. Also in the group `net`.
         job("net-try", || net_try::probe(&qemu::VIRT_2G)),
+        // The ordinary account: doas, the set-user-ID su and passwd, the account tools, the
+        // refusal of the console to an ordinary account.
+        job("users", || users::probe(&qemu::VIRT)),
+        // The same over a reboot: the image of the try-out twice over one data volume, the home,
+        // the accounts and the host key kept. Also in the group `net`.
+        job("users persist", net_try::accounts_persist),
         // TLS: curl and `openssl s_client` of the guest against two
         // `openssl s_server` of the host, the certificate checked both ways.
         job("net-tls", || {

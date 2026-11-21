@@ -1295,7 +1295,10 @@ const ACCOUNTS_FIRST: &str = "PATH=/bin; export PATH; echo kept > \"$HOME/note\"
 /// The commands of the second boot: what came back.
 const ACCOUNTS_SECOND: &str = "PATH=/bin; export PATH; cat \"$HOME/note\"; echo home=$HOME; \
      grep '^bob:' /etc/passwd; doas grep '^root:' /etc/shadow | cut -c1-8; doas grep '^bob:' /etc/shadow | cut -c1-8; \
-     ls -ldn /data/home/user /data/home/bob; id -un";
+     ls -ldn /data/home/user /data/home/bob; id -un; \
+     echo measure-meminfo; head -3 /proc/meminfo; \
+     echo measure-processes $(ls -d /proc/[0-9]* | wc -l); \
+     for p in /proc/[0-9]*; do read c < $p/cmdline; case $c in datakey*) echo measure-datakey ${p#/proc/}: $(cat $p/statm);; esac; done";
 
 /// A command of `user` over `ssh` (no `doas` around it).
 fn as_user(client: &Client, key: &Path, command: &str) -> Result<String, String> {
@@ -1382,6 +1385,18 @@ fn accounts_cases(rig: &Rig, volume: &Path) -> Result<(), String> {
     let after = second.fingerprint()?;
     if before != after {
         return Err(format!("the host key changed: {before} then {after}"));
+    }
+    // What the permanent datakey holds of the pool: the free memory and the number of processes
+    // with it running, and its own size (statm: pages), for the notes.
+    for line in second.extra.lines().skip_while(|l| *l != "measure-meminfo") {
+        println!("net-try accounts: {line}");
+    }
+    for line in second
+        .lines
+        .iter()
+        .filter(|l| l.contains("init: free pages "))
+    {
+        println!("net-try accounts: {line}");
     }
     println!(
         "net-try accounts: the second boot brought the note, the account bob, the hashes of root and bob and the home back, with the same host key"

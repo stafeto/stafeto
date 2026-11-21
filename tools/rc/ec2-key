@@ -43,12 +43,20 @@ while IFS=: read -r name _ id group _ dirname _; do
         break
     fi
 done <"$passwd"
+# The identifier is compared as a number: leading zeros come off first (`0000` is 0).
 case $uid in
-    '' | *[!0-9]* | [0-9] | [0-9][0-9] | [0-9][0-9][0-9])
-        say "no account $account with an identifier of 1000 or more, SSH stays off"
-        exit 1
-        ;;
+    '' | *[!0-9]*) uid=0 ;;
 esac
+while :; do
+    case $uid in
+        0?*) uid=${uid#0} ;;
+        *) break ;;
+    esac
+done
+if [ "${#uid}" -gt 9 ] || [ "$uid" -lt 1000 ]; then
+    say "no account $account with an identifier of 1000 or more, SSH stays off"
+    exit 1
+fi
 case $gid in
     '' | *[!0-9]*)
         say "the group of $account is not a number, SSH stays off"

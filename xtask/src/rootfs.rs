@@ -146,6 +146,9 @@ const fn of(path: &'static str, mode: u32, (uid, gid): (u32, u32), source: Sourc
 const ROOT: (u32, u32) = (0, 0);
 /// An owner other than root, for the checks of owners in listings.
 const USER: (u32, u32) = (1000, 100);
+/// The owner of the RAM service's file (set-user-ID to it): a number no account has and nobody
+/// logs in as, so that no member of the group of `user` is more than that by running it.
+const SERVICE_OWNER: (u32, u32) = (65533, 65533);
 
 /// The rules of `doas` (/etc/doas.conf): one line, with no `keepenv` and no `persist`.
 pub const DOAS_CONF: &[u8] = b"permit nopass :wheel\n";
@@ -651,7 +654,7 @@ fn shell_files(image: &str) -> Result<Vec<RootFile>, String> {
     files.extend([
         dir("/bin"),
         dir("/libexec"),
-        file("/libexec/ramfs", 0o4750, USER, "ramfs"),
+        file("/libexec/ramfs", 0o4750, SERVICE_OWNER, "ramfs"),
         // The three programs with the set-user-ID bit of root. They are system files and no
         // package's: the package file refuses a set-ID mode (a package may never bring one), and
         // the packages `busybox-suid` and `doas` only build the programs.
@@ -2942,6 +2945,19 @@ mod tests {
                 shell.iter().any(|f| f.path == path),
                 "the shell image has no {path}"
             );
+        }
+    }
+
+    /// No image ships a key of anyone's: no `authorized_keys` and no `.ssh` directory (the key of
+    /// an instance is written at boot by `ec2-key`).
+    #[test]
+    fn no_image_contains_an_authorized_keys_file_or_a_ssh_directory() {
+        for image in IMAGES {
+            for f in files_of(image) {
+                let bad = f.path.rsplit('/').next() == Some("authorized_keys")
+                    || f.path.split('/').any(|part| part == ".ssh");
+                assert!(!bad, "{image}: {}", f.path);
+            }
         }
     }
 

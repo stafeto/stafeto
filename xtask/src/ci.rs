@@ -133,7 +133,8 @@ struct Split {
 /// The probes with this start of their name run in the group `net`.
 const NET_PREFIX: &str = "net-";
 /// The probes of the group `net` that do not start with the prefix.
-const NET_NAMED: [&str; 17] = [
+const NET_NAMED: [&str; 18] = [
+    "users persist",
     "posix-net",
     "fstack-probe",
     "fast-probe",
@@ -282,6 +283,8 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("nvme-persist mdts1", 80),
     ("nvme-persist steps", 500),
     ("nvme-persist key", 100),
+    ("users", 20),
+    ("users persist", 150),
     ("nvme-persist key nodisk", 100),
     ("nvme-persist key wrongdisk", 80),
     ("nvme-persist key wrongdisk breaks", 80),
@@ -951,6 +954,7 @@ mod tests {
                 "net-wget",
                 "net-ec2-key",
                 "net-try",
+                "users persist",
                 "net-tls",
                 "posix-net",
                 "fstack-probe",

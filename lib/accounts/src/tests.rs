@@ -231,6 +231,18 @@ fn lines_that_are_not_well_formed_are_dropped_with_a_note() {
 }
 
 #[test]
+fn an_image_group_the_volume_lacks_comes_back_with_no_members_when_the_volume_has_groups() {
+    let volume = Files {
+        passwd: b"",
+        group: b"root:x:0:root\nuser:x:100:user\nnobody:x:65534:nobody\n",
+        shadow: b"",
+    };
+    let r = run(&volume, &Options::default());
+    assert!(r.group().contains("wheel:x:10:\n"));
+    assert!(r.group().contains("user:x:100:user\n"));
+}
+
+#[test]
 fn the_name_rule_holds() {
     assert!(valid_name(b"bob"));
     assert!(valid_name(b"_svc-1"));

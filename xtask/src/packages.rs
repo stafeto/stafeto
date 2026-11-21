@@ -70,6 +70,7 @@ pub const SERVICE_LIBRARIES: &[&str] = &["pixman"];
 
 /// The packages that only build a program the image holds as a file of the system (a set-user-ID
 /// file, which a package file may not be): they have a program and no file of their own.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const SYSTEM_PROGRAMS: &[&str] = &["busybox-suid", "doas"];
 
 /// A package: the content of its description.

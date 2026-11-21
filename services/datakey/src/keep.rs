@@ -163,9 +163,9 @@ fn create_ram(path: &[u8], mode: u32, bytes: &[u8]) -> Result<(), FsError> {
 /// Reads the three files of the file service into `into`: false when one could not be read
 /// (an absent file is empty).
 fn read_live(into: &mut Three) -> bool {
-    for i in 0..3 {
-        match read_ram(LIVE[i], &mut into.bytes[i]) {
-            Ok(n) => into.len[i] = n.unwrap_or(0),
+    for ((path, bytes), len) in LIVE.iter().zip(&mut into.bytes).zip(&mut into.len) {
+        match read_ram(path, bytes) {
+            Ok(n) => *len = n.unwrap_or(0),
             Err(_) => return false,
         }
     }
@@ -239,6 +239,18 @@ impl Data {
         Ok(Some(len))
     }
 
+    /// Whether `path` of the volume may be trusted with the accounts: absent (it is made here),
+    /// or owned by root with none of the bits of `mask` set. A volume is a disk that a host
+    /// could have written: a directory of another owner could hold files of its own making.
+    fn trusted(&self, path: &[u8], mask: u32) -> bool {
+        match self.call(|w| p::path_call(proto_data::Method::Stat, path, w)) {
+            Err(Status::Unknown(p::NO_ENTRY)) => true,
+            Err(_) => false,
+            Ok(reply) => p::Stat::from_bytes(&reply.bytes[4..reply.len])
+                .is_ok_and(|s| s.uid == 0 && s.mode & mask == 0),
+        }
+    }
+
     /// `path` of the volume made (mode `mode`). Ok(true): made now; Ok(false): it was there.
     fn make_dir(&self, path: &[u8], mode: u32) -> Result<bool, Status> {
         match self.call(|w| p::mkdir(path, mode, w)) {
@@ -279,6 +291,8 @@ pub struct Watch {
     armed: bool,
     /// The last look, for the next to compare with (the first look has nothing).
     looked: bool,
+    /// The line about an unreadable file was printed.
+    warned: bool,
 }
 
 /// Places the merged files in the file service as `*.new` and makes the home of `user` on the
@@ -292,28 +306,52 @@ pub fn start(data: Option<&Data>, volume: bool) -> Option<Watch> {
         rt::println!("datakey: no account files in the image, they are left alone");
         return None;
     }
+    // The volume's files are read, and kept up to date, only when /etc of the volume is root's
+    // and closed to the others, and the homes' directory is root's and not open for writing.
+    let etc_ok = matches!(data, Some(d) if volume && d.trusted(VOLUME_DIR, 0o077));
+    let homes_ok = matches!(data, Some(d) if volume && d.trusted(HOMES, 0o022));
+    if volume && !etc_ok {
+        rt::println!(
+            "datakey: /etc of the volume is not root's with mode 0700, its account files are not read or written"
+        );
+    }
+    if volume && !homes_ok {
+        rt::println!(
+            "datakey: /home of the volume is not root's or is open for writing, the home of user stays in memory"
+        );
+    }
     let mut kept = 0;
-    if let (Some(data), true) = (data, volume) {
-        for i in 0..3 {
-            match data.read_file(VOLUME[i], &mut w.volume.bytes[i]) {
+    if let (Some(data), true) = (data, etc_ok) {
+        for ((path, bytes), len) in VOLUME
+            .iter()
+            .zip(&mut w.volume.bytes)
+            .zip(&mut w.volume.len)
+        {
+            match data.read_file(path, bytes) {
                 Ok(n) => {
-                    w.volume.len[i] = n.unwrap_or(0);
+                    *len = n.unwrap_or(0);
                     kept += usize::from(n.is_some());
                 }
                 Err(status) => rt::println!(
                     "datakey: the volume's {} could not be read: status {}",
-                    core::str::from_utf8(VOLUME[i]).unwrap_or("?"),
+                    core::str::from_utf8(path).unwrap_or("?"),
                     status.code()
                 ),
             }
         }
     }
     let options = Options {
-        home: volume.then_some((USER, HOME_PATH)),
+        home: homes_ok.then_some((USER, HOME_PATH)),
     };
     let merged = &mut w.merged;
     *merged = Merged::new();
-    accounts::merge(&w.image.files(), &w.volume.files(), &options, merged, &mut report);
+    accounts::merge(
+        &w.image.files(),
+        &w.volume.files(),
+        &options,
+        merged,
+        &mut report,
+    );
     if merged.passwd.data().is_empty()
         || merged.passwd.full
         || merged.group.full
@@ -322,26 +360,44 @@ pub fn start(data: Option<&Data>, volume: bool) -> Option<Watch> {
         rt::println!("datakey: the merged account files do not fit, the image's are left alone");
         return None;
     }
-    let parts = [merged.passwd.data(), merged.group.data(), merged.shadow.data()];
+    let parts = [
+        merged.passwd.data(),
+        merged.group.data(),
+        merged.shadow.data(),
+    ];
     for i in 0..3 {
         if let Err(error) = create_ram(NEW[i], MODES[i], parts[i]) {
             rt::println!("datakey: the account files could not be placed: {error:?}");
+            // The file service has no removal for a service: the files made so far are emptied,
+            // and the boot script takes a copy of the image's file for each empty one.
+            for made in &NEW[..i] {
+                if let Ok(fd) = files().open(made, proto_fs::WRITE_ONLY | proto_fs::TRUNCATE) {
+                    let _ = files().close(fd);
+                }
+            }
             return None;
         }
     }
     if volume {
         rt::println!(
-            "datakey: accounts restored from /data ({kept} of 3 files there), home of user is /data/home/user"
+            "datakey: accounts restored from /data ({kept} of 3 files there), home of user is {}",
+            if homes_ok {
+                "/data/home/user"
+            } else {
+                "/home/user"
+            }
         );
-        if let Some(data) = data {
+        if let (Some(data), true) = (data, homes_ok) {
             make_home(data);
         }
     } else {
         rt::println!("datakey: no data volume, the accounts are the image's and live in memory");
     }
-    Some(Watch {
+    // Without a trusted /etc on the volume nothing is written there.
+    etc_ok.then_some(Watch {
         armed: false,
         looked: false,
+        warned: false,
     })
 }
 
@@ -357,7 +413,10 @@ fn make_home(data: &Data) {
         Ok(())
     })();
     if let Err(status) = made {
-        rt::println!("datakey: the home of user could not be made: status {}", status.code());
+        rt::println!(
+            "datakey: the home of user could not be made: status {}",
+            status.code()
+        );
     }
 }
 
@@ -368,8 +427,15 @@ impl Watch {
         let mut now = Three::new();
         if !read_live(&mut now) {
             self.looked = false;
+            if !self.warned {
+                self.warned = true;
+                rt::println!(
+                    "datakey: an account file could not be read or is above {N} bytes, the accounts are not saved until it can"
+                );
+            }
             return;
         }
+        self.warned = false;
         // A set that no look has seen twice is not written; one the first look sees is compared
         // with the next.
         let stable = self.looked && now.same(&w.live);
@@ -400,7 +466,10 @@ impl Watch {
                 rt::println!("datakey: accounts saved to /data");
             }
             Err(status) => {
-                rt::println!("datakey: the accounts could not be saved: status {}", status.code());
+                rt::println!(
+                    "datakey: the accounts could not be saved: status {}",
+                    status.code()
+                );
             }
         }
     }

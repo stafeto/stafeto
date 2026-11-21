@@ -860,6 +860,16 @@ mod tests {
                 "no account user with an identifier of 1000 or more",
             ),
             (
+                "zeros",
+                "user:x:0000:0:user:/root:/bin/ash\n",
+                "no account user with an identifier of 1000 or more",
+            ),
+            (
+                "long",
+                "user:x:99999999999999999999:0:user:/root:/bin/ash\n",
+                "no account user with an identifier of 1000 or more",
+            ),
+            (
                 "low",
                 "user:x:999:100:user:/home/user:/bin/ash\n",
                 "no account user with an identifier of 1000 or more",

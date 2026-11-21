@@ -11,7 +11,9 @@
 //!    /etc/busybox.conf; /etc/doas.conf is 0400 root with the one rule.
 //! 2. `doas`: `user` (a member of `wheel`) runs `id` as root, and as `nobody`; `nobody`
 //!    (not a member) is refused; no password is asked for.
-//! 3. `su` and `passwd`, the set-user-ID BusyBox: `user` runs `id` and an ordinary program
+//! 3. The console: mode 0600 root, refused to `user`, and the `ash-getty` name of the shell's
+//!    BusyBox as `user` ends with 126.
+//! 4. `su` and `passwd`, the set-user-ID BusyBox: `user` runs `id` and an ordinary program
 //!    after them with its own identifiers; `su root` by `user` without a password is refused;
 //!    `passwd` of another account is refused to `user`.
 
@@ -134,6 +136,35 @@ fn doas(run: &mut qemu::Run) -> Result<(), String> {
     )
 }
 
+/// The console is root's: a process of an ordinary account cannot open it, and the branch of
+/// the shell's BusyBox that takes the console for a session (the name `ash-getty`) ends for it
+/// with 126 (the open refused) and shows it nothing.
+fn console(run: &mut qemu::Run) -> Result<(), String> {
+    check(
+        run,
+        "console mode",
+        "ls -ln /dev/console",
+        &["crw-------", " 0        0 "],
+        &["No such file"],
+    )?;
+    check(
+        run,
+        "console refused to user",
+        "su user -c 'cat /dev/console < /dev/null 2>&1; echo rc=$?'",
+        &["Permission denied", "rc=1"],
+        &["rc=0"],
+    )?;
+    // The name ash-getty as `user` runs as `user` (BusyBox is not set-user-ID), and the console
+    // open it makes is refused: 126.
+    check(
+        run,
+        "ash-getty as user",
+        "su user -c 'cd /tmp; ln -s /bin/busybox ash-getty; PATH=/tmp ash-getty; echo rc=$?; /bin/id -u'",
+        &["rc=126", "1000"],
+        &["uid=0"],
+    )
+}
+
 /// Step 3: `su` and `passwd`.
 fn suid_busybox(run: &mut qemu::Run) -> Result<(), String> {
     check(
@@ -183,7 +214,7 @@ fn tools(run: &mut qemu::Run) -> Result<(), String> {
     check(
         run,
         "adduser",
-        "adduser -D -h /home/bob -s /bin/ash bob 2>&1; addgroup -S staff 2>&1; grep '^bob:' /etc/passwd; grep '^bob:' /etc/shadow | cut -c1-12; ls -ld /home/bob",
+        "adduser -D -h /home/bob -s /bin/ash bob 2>&1; addgroup staff 2>&1; grep '^bob:' /etc/passwd; grep '^bob:' /etc/shadow | cut -c1-12; ls -ld /home/bob",
         &["bob:x:100", "drwx"],
         &["adduser:", "addgroup:"],
     )?;
@@ -249,6 +280,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         privilege(&mut run)?;
         doas(&mut run)?;
         suid_busybox(&mut run)?;
+        console(&mut run)?;
         writable(&mut run)?;
         tools(&mut run)?;
         if started.elapsed() > RUN_WITHIN {
