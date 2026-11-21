@@ -753,7 +753,7 @@ fn a_scene_of_dear_elements_is_taken_and_drawn_in_groups_as_the_reference_has_it
             .filter(|&k| plan.group_of(k) == Some(g))
             .count();
         assert!(
-            n == 1 || plan.cost[g].0 <= GROUP_CALLS,
+            n == 1 || plan.cost[g].calls <= GROUP_CALLS,
             "group {g}: {n} elements"
         );
     }
@@ -811,6 +811,164 @@ fn sixteen_of_the_dearest_over_the_screen_make_steps_under_the_gate_by_the_model
     );
     // One step for each element, the black's apart, and the pointer's.
     assert_eq!(steps, 18, "{steps} steps, worst {worst}");
+}
+
+/// Walks the frame of the scene committed in `rig` over `d` as the service does,
+/// each step through a `StepCost` raster, and checks the key of the model: every
+/// layer a step draws is in the price of its group (the calls, the lines and the
+/// points the band's size was worked out from), so a step costs no more than
+/// BAND_TICKS by the model (the least band, one point, may). The bands of a group
+/// lie in its rectangle. Returns the steps, in all and of each group.
+fn walk_priced(rig: &Rig, d: Rect) -> (u32, Vec<u32>) {
+    let def = rig.scene.working().copied().unwrap();
+    let plan = rig.scene.passes(&def, d);
+    let mut each = vec![0u32; plan.groups];
+    let mut at = Band::default();
+    let mut fb = vec![0u8; (STRIDE * HEIGHT) as usize];
+    let mut steps = 0;
+    while at.row < d.y + d.h {
+        let g = at.pass as usize;
+        let r = plan.cost[g].rect;
+        let (w, h) = plan.band(g);
+        let mut model = StepCost {
+            elements: plan.elements,
+            ..StepCost::default()
+        };
+        let next = compose(&rig.scene, d, at, &mut fb, &rig.wins, &mut model);
+        let ticks = model.ticks() + u64::from(SCENE_STEP);
+        let limit = if (w, h) == (1, 1) {
+            u64::from(BAND_GATE - 1_080)
+        } else {
+            u64::from(BAND_TICKS)
+        };
+        assert!(
+            ticks <= limit,
+            "step {steps} of group {g} ({w} x {h}) costs {ticks} by the model, over {limit}"
+        );
+        assert!(
+            model.layers as usize
+                <= plan.members_of(g) + usize::from(plan.pointer_group() == Some(g)),
+            "step {steps} of group {g} draws {} layers",
+            model.layers
+        );
+        assert!(
+            at.row.max(r.y) >= r.y && at.row.max(r.y) < r.y + r.h,
+            "step {steps} of group {g} starts at row {} outside {r:?}",
+            at.row
+        );
+        each[g] += 1;
+        steps += 1;
+        at = next;
+    }
+    (steps, each)
+}
+
+#[test]
+fn every_layer_a_step_draws_is_in_the_price_of_its_step() {
+    let mut specs = vec![(XRGB, 64, 40), (ARGB, 40, 30), (XRGB, 160, 100)];
+    specs.extend(vec![(A8, 640, 400), (A8, 300, 200), (A8, 60, 40)]);
+    let mut rig = Rig::new(&specs);
+    let mut els = Vec::new();
+    // A transparent window over the screen, a turn, a bilinear stretch with a
+    // mask and an alpha, a mask alone, a nearest stretch laid over, a plain copy
+    // and a small bilinear one: wide and narrow, near and far apart.
+    let mut a = rig.whole(2, [0, 0, 640, 400]);
+    a.transparency = TRANSPARENCY_ALPHA;
+    a.alpha = 120;
+    els.push(a);
+    let mut r = rig.whole(0, [100, 50, 100, 64]);
+    r.orient = 1;
+    els.push(r);
+    let mut b = rig.whole(2, [300, 150, 300, 200]);
+    b.filter = BILINEAR;
+    b.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA;
+    b.mask = rig.id(4);
+    b.alpha = 200;
+    els.push(b);
+    let mut m = rig.whole(0, [20, 300, 60, 40]);
+    m.transparency = TRANSPARENCY_MASK;
+    m.mask = rig.id(5);
+    els.push(m);
+    let mut o = rig.whole(1, [400, 20, 120, 90]);
+    o.transparency = TRANSPARENCY_SOURCE;
+    els.push(o);
+    els.push(rig.whole(0, [500, 300, 64, 40]));
+    let mut t = rig.whole(1, [10, 10, 20, 15]);
+    t.filter = BILINEAR;
+    t.transparency = TRANSPARENCY_SOURCE;
+    els.push(t);
+    rig.scene.pointer_to(310, 160);
+    rig.scene
+        .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap())
+        .unwrap();
+    // One frame is taken; the walks are over damages of the test's own.
+    rig.scene.begin().expect("a frame");
+    for d in [
+        Rect::SCREEN,
+        Rect {
+            x: 90,
+            y: 40,
+            w: 300,
+            h: 140,
+        },
+        Rect {
+            x: 305,
+            y: 155,
+            w: 7,
+            h: 9,
+        },
+    ] {
+        let (steps, each) = walk_priced(&rig, d);
+        assert!(steps as usize >= each.len(), "{steps} steps over {d:?}");
+    }
+    rig.scene.end(true);
+}
+
+#[test]
+fn a_group_draws_in_bands_over_the_rectangle_of_its_elements_only() {
+    // The scene of the plan: a window over the screen with a global alpha, a turn,
+    // and a bilinear stretch with a mask over a part of the screen. The dear
+    // element's group walks 320 by 200, no more (the band of the dearest layer
+    // took the whole screen's width before: 298 000 steps).
+    let mut rig = Rig::new(&[
+        (XRGB, 640, 400),
+        (XRGB, 200, 100),
+        (XRGB, 160, 100),
+        (A8, 320, 200),
+    ]);
+    let mut full = rig.whole(0, [0, 0, 640, 400]);
+    full.transparency = TRANSPARENCY_ALPHA;
+    full.alpha = 128;
+    let mut turn = rig.whole(1, [100, 50, 200, 100]);
+    turn.orient = 2;
+    let mut dear = rig.whole(2, [300, 150, 320, 200]);
+    dear.filter = BILINEAR;
+    dear.transparency = TRANSPARENCY_MASK;
+    dear.mask = rig.id(3);
+    let els = [full, turn, dear];
+    rig.scene
+        .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap())
+        .unwrap();
+    let d = rig.scene.begin().expect("a frame");
+    let def = rig.scene.working().copied().unwrap();
+    let plan = rig.scene.passes(&def, d);
+    // The black, three elements (each dear enough to be alone), no pointer.
+    assert_eq!(plan.groups, 4);
+    assert!(plan.is_black(0));
+    let g = plan.group_of(2).unwrap();
+    assert_eq!(
+        (plan.cost[g].rect.w, plan.cost[g].rect.h),
+        (320, 200),
+        "{:?}",
+        plan.cost[g].rect
+    );
+    let (steps, each) = walk_priced(&rig, d);
+    rig.scene.end(true);
+    assert_eq!(each[g] as usize, {
+        let (w, h) = plan.band(g);
+        (320usize.div_ceil(w as usize)) * (200usize.div_ceil(h as usize))
+    });
+    assert!(steps < 40_000, "{steps} steps, {each:?}");
 }
 
 #[test]
