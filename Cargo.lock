@@ -7,6 +7,10 @@ name = "abi"
 version = "0.1.0"
 
 [[package]]
+name = "accounts"
+version = "0.1.0"
+
+[[package]]
 name = "ash-launcher"
 version = "0.1.0"
 dependencies = [
@@ -215,6 +219,7 @@ name = "datakey"
 version = "0.6.0"
 dependencies = [
  "abi",
+ "accounts",
  "posix-fs",
  "proto-data",
  "proto-fs",

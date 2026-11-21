@@ -17,6 +17,8 @@
 #![no_std]
 #![no_main]
 
+mod keep;
+
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use posix_fs::{DescriptorFlags, FsError, PosixFs, StartupFiles};
@@ -371,6 +373,13 @@ fn main(_: u64) -> u64 {
         _ => Found::NoVolume,
     };
     key.wipe();
+    // The account files, placed before READY: the launcher starts the boot script after it.
+    let volume = !matches!(found, Found::NoVolume);
+    let watch = if files_ok {
+        keep::start(data.as_ref(), volume)
+    } else {
+        None
+    };
     let Ok(channel) = sys::channel_create(1) else {
         return NOT_REGISTERED;
     };
@@ -380,14 +389,21 @@ fn main(_: u64) -> u64 {
     if let Err(why) = rt::service::ready(&s.parent) {
         rt::println!("datakey: READY refused: {why:?}");
     }
-    let (Found::NoKey, Some(data)) = (found, data) else {
+    // The service stays while a volume is there: it keeps the host key the boot script makes
+    // (a volume with none) and the account files.
+    let (true, Some(data)) = (volume, data) else {
         return 0;
     };
-    rt::println!("datakey: no host key on /data, waiting for the boot script's");
+    let host_key = matches!(found, Found::NoKey);
+    if host_key {
+        rt::println!("datakey: no host key on /data, waiting for the boot script's");
+    }
     let mut service = Waiting {
         data,
         last: Key::new(),
         looks: 0,
+        host_key,
+        watch,
     };
     let config = Config {
         issued: 0,
@@ -406,14 +422,32 @@ struct Waiting {
     /// The bytes the last look found, for the next look to compare with.
     last: Key,
     looks: u32,
+    /// The host key is still waited for.
+    host_key: bool,
+    /// The account files, once placed.
+    watch: Option<keep::Watch>,
 }
 
 impl Waiting {
+    /// One look a second: the host key while it is waited for, and the account files.
+    fn tick(&mut self) {
+        if self.host_key {
+            self.look();
+        }
+        if let Some(watch) = &mut self.watch {
+            watch.look(&self.data);
+        }
+        if !self.host_key && self.watch.is_none() {
+            sys::process_exit(0);
+        }
+    }
+
     fn look(&mut self) {
         self.looks += 1;
         if self.looks > LOOKS {
             rt::println!("datakey: no host key appeared in {LOOKS} s, nothing is kept");
-            sys::process_exit(0);
+            self.host_key = false;
+            return;
         }
         let mut now = Key::new();
         match read_ram(&mut now) {
@@ -432,7 +466,7 @@ impl Waiting {
                 rt::println!("datakey: host key saved to /data");
                 self.last.wipe();
                 now.wipe();
-                sys::process_exit(0);
+                self.host_key = false;
             }
             Err(status) => {
                 rt::println!(
@@ -456,7 +490,7 @@ impl Service<0> for Waiting {
 
     fn maintenance(&mut self, _: &mut [Option<Session<(), 0>>], notice: Notice) {
         if notice.source == abi::Source::Timer && notice.label == 0 {
-            self.look();
+            self.tick();
         }
     }
 }

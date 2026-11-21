@@ -1,0 +1,11 @@
+[package]
+name = "accounts"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The account files of stafeto (passwd, group, shadow): the merge of the image's files with those kept on the data volume, in no_std with no allocator"
+
+[lib]
+bench = false
