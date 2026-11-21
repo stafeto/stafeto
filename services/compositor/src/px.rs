@@ -886,7 +886,7 @@ fn draw(images: &mut Images, target: &mut Target<'_>, d: &Draw<'_>) -> bool {
 /// operation during which a thread of a higher level took the CPU off the
 /// service (the count of preemptions of the thread changed) is left out and
 /// counted: what is told is the thread's own work.
-#[cfg(feature = "steps")]
+#[cfg(feature = "calibrate")]
 pub mod calibration {
     use super::{Filter, Mask, Pixman, Px, Source, Target, composite, composite_element, fill};
 

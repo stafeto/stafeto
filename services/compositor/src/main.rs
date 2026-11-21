@@ -511,8 +511,10 @@ fn main(_: u64) -> u64 {
         service.open_screen_waiting(level);
     }
     // The prices of the bands measured on shapes of their own, in the screen's
-    // buffer, before the first request (the run under -icount, `steps` alone).
-    #[cfg(feature = "steps")]
+    // buffer, before the first request (the probes that read the lines, feature
+    // `calibrate`: it takes a second of the CPU at the service's level, in which
+    // the services below it, the process service among them, do not start).
+    #[cfg(feature = "calibrate")]
     if service.screen.is_some() {
         // SAFETY: the buffer is this service's mapping of the screen's object,
         // read and write, SCREEN_BYTES of its 256 pages; nothing else holds it.

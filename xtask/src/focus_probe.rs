@@ -86,7 +86,7 @@ pub const STEPS_PROGRAMS: [ImageProgram; 5] = [
         "compositor",
         "compositor",
         comp_probe::COMP_STACK_SIZE,
-        &["steps"],
+        &["calibrate"],
     ),
     ("focus-probe", "focus-probe", CHILD_STACK_SIZE, &["quick"]),
 ];

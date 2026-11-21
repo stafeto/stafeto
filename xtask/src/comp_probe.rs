@@ -68,7 +68,7 @@ pub const STEPS_PROGRAMS: [ImageProgram; 4] = [
         gpu_probe::GPU_STACK_SIZE,
         &["steps"],
     ),
-    ("compositor", "compositor", COMP_STACK_SIZE, &["steps"]),
+    ("compositor", "compositor", COMP_STACK_SIZE, &["calibrate"]),
     ("comp-probe", "comp-probe", PROBE_STACK_SIZE, &["quick"]),
 ];
 
