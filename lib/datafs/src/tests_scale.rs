@@ -131,9 +131,15 @@ impl Meter {
     }
 }
 
+std::thread_local! {
+    /// `block_cycles` of the volumes `attach` makes (the service's -1 is no wear levelling).
+    static BLOCK_CYCLES: core::cell::Cell<i32> = const { core::cell::Cell::new(-1) };
+}
+
 fn attach(device: MemDevice, win: Win) -> Vol {
     let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
     let mut fs = Fs::new(device, state).unwrap();
+    fs.set_block_cycles(BLOCK_CYCLES.with(|c| c.get()));
     if win == Win::Narrow {
         // The window the first release had; the service's own is one bit for every block.
         fs.set_lookahead(Box::leak(vec![0u8; 128].into_boxed_slice()));
@@ -2215,9 +2221,13 @@ fn the_mount_work_of_a_volume_that_exists_leaves_the_window_empty() {
 /// A volume of `dirs` directories and about `pairs` metadata pairs (the rest of the pairs are made
 /// by files of 500 bytes in one directory). Returns the settled device and the exact counts.
 fn many_pairs(dirs: usize, pairs: usize) -> (MemDevice, u64, u64) {
+    many_pairs_in(65536, dirs, pairs)
+}
+
+fn many_pairs_in(blocks: u64, dirs: usize, pairs: usize) -> (MemDevice, u64, u64) {
     // /z is made first and /w after it, so the list runs root, /w, the pairs of its files, /z, the
     // directories of /z: the parent of every directory is as far from the head as the files put it.
-    let mut fs = fresh(65536, Win::Whole);
+    let mut fs = fresh(blocks, Win::Whole);
     let mut meter = Meter::new(&mut fs);
     fs.mkdir(b"/z").unwrap();
     fs.mkdir(b"/w").unwrap();
@@ -2335,6 +2345,30 @@ fn orphan_ops() -> [(&'static str, OrphanOp); 3] {
     ]
 }
 
+/// 40 files made in `/z/d<K>`: its pair of metadata compacts several times, and with wear levelling
+/// it moves to a new block (a relocation the parent's entry learns of at the end of the commit).
+fn creates<const K: usize>(fs: &mut Vol) {
+    for i in 0..40 {
+        if let Ok(f) = fs.open(
+            format!("/z/d{K}/f{i}").as_bytes(),
+            Open::WRITE.with(Open::CREATE),
+        ) {
+            let _ = fs.close(f);
+        }
+    }
+}
+
+fn wear_ops() -> [(&'static str, OrphanOp); 6] {
+    [
+        ("creates in d4", creates::<4>),
+        ("creates in d5", creates::<5>),
+        ("creates in d6", creates::<6>),
+        ("creates in d7", creates::<7>),
+        ("creates in d8", creates::<8>),
+        ("creates in d9", creates::<9>),
+    ]
+}
+
 /// `device` with `k` directories of `/z` moved to `/y` (a made move leaves the replaced entry in
 /// the log of the old parent: two holders for each moved directory).
 fn with_moved(device: &MemDevice, k: usize) -> MemDevice {
@@ -2365,9 +2399,14 @@ fn survive_set(cut: u64, i: usize) -> Survive {
 /// disk after the mount is the same byte for byte with the table (of `cells` cells) and with the
 /// walk of the release. With `repair` the power is also cut at every sector of the repair itself.
 /// Returns the dearest mount with the table and with the walk.
-fn same_disk_after_every_cut(device: &MemDevice, cells: u32, repair: bool) -> (u64, u64) {
+fn same_disk_after_every_cut(
+    device: &MemDevice,
+    ops: &[(&str, OrphanOp)],
+    cells: u32,
+    repair: bool,
+) -> (u64, u64) {
     let (mut dear_table, mut dear_walk) = (0, 0);
-    for (name, op) in orphan_ops() {
+    for &(name, op) in ops {
         let mut fs = mounted(device, Win::Whole);
         let before = fs.device().written;
         op(&mut fs);
@@ -2411,25 +2450,63 @@ fn same_disk_after_every_cut(device: &MemDevice, cells: u32, repair: bool) -> (u
 }
 
 fn small_volume() -> MemDevice {
-    many_pairs(40, 80).0
+    many_pairs_in(8192, 40, 80).0
 }
 
 #[test]
 fn the_table_of_the_repair_of_orphans_leaves_the_disk_of_the_walk() {
-    let (table, walk) = same_disk_after_every_cut(&small_volume(), 4096, true);
+    let (table, walk) = same_disk_after_every_cut(&small_volume(), &orphan_ops(), 4096, true);
     assert!(table < walk, "the table {table} reads, the walk {walk}");
+}
+
+/// `device` with `n` files made in `/z/d4` first, wear levelling on: the pair of that directory has
+/// been compacted a different number of times when the operation starts.
+fn warmed(device: &MemDevice, n: usize, cycles: i32) -> MemDevice {
+    BLOCK_CYCLES.with(|c| c.set(cycles));
+    let mut fs = mounted(device, Win::Whole);
+    for i in 0..n {
+        let f = fs
+            .open(
+                format!("/z/d4/w{i}").as_bytes(),
+                Open::WRITE.with(Open::CREATE),
+            )
+            .unwrap();
+        fs.close(f).unwrap();
+    }
+    settle(fs)
+}
+
+#[test]
+fn with_wear_levelling_the_table_leaves_the_disk_of_the_walk() {
+    // A pair of metadata moves to a new block every few compactions: a cut leaves the entry of a
+    // directory naming the old pair of its blocks (a half-orphan), which shares one block with the
+    // pair the list has. After a compaction that only swaps the two blocks the entry names the
+    // other block than the list's first, so the warm-up counts of 0 to 19 files
+    // put the relocation at every phase.
+    let base = small_volume();
+    for cycles in [2, 3] {
+        for warm in 0..20 {
+            let device = warmed(&base, warm, cycles);
+            BLOCK_CYCLES.with(|c| c.set(cycles));
+            same_disk_after_every_cut(&device, &wear_ops()[..1], 4096, false);
+        }
+    }
+    BLOCK_CYCLES.with(|c| c.set(2));
+    same_disk_after_every_cut(&base, &wear_ops()[..1], 60, false);
+    same_disk_after_every_cut(&base, &wear_ops()[..1], 4096, true);
+    BLOCK_CYCLES.with(|c| c.set(-1));
 }
 
 #[test]
 fn a_full_table_and_moved_directories_leave_the_disk_of_the_walk() {
     // 8 and 60 cells: the table fills at once, keys that fit are answered from it, the rest by the walk.
     for cells in [8, 60] {
-        same_disk_after_every_cut(&small_volume(), cells, false);
+        same_disk_after_every_cut(&small_volume(), &orphan_ops(), cells, false);
     }
     // Directories moved before the cut: two holders for each.
     let moved = with_moved(&small_volume(), 12);
-    same_disk_after_every_cut(&moved, 4096, true);
-    same_disk_after_every_cut(&moved, 60, false);
+    same_disk_after_every_cut(&moved, &orphan_ops(), 4096, true);
+    same_disk_after_every_cut(&moved, &orphan_ops(), 60, false);
 }
 
 #[test]
@@ -2451,7 +2528,7 @@ fn scale_orphan_table() {
         } else {
             device
         };
-        let (table, walk) = same_disk_after_every_cut(&device, 4096, false);
+        let (table, walk) = same_disk_after_every_cut(&device, &orphan_ops(), 4096, false);
         std::println!(
             "| {dirs} | {pairs} | {moved} | {table} | {:.1} | {:.1} | {walk} |",
             table as f64 / 10_000.0,
