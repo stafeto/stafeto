@@ -15,7 +15,7 @@ pub const PATH_MAX: usize = 511;
 /// `volume::open` refuses it.
 pub const BLOCKS_MAX: u64 = 1 << 20;
 /// The bytes of memory a volume uses at most (`Storage`); the C structure is checked against it.
-pub const STORAGE_BYTES: usize = (56 + 68 + 128) * 1024;
+pub const STORAGE_BYTES: usize = (56 + 68 + 128 + 48) * 1024;
 
 unsafe extern "C" {
     fn datafs_state_size() -> usize;
@@ -108,6 +108,7 @@ unsafe extern "C" {
 #[cfg(test)]
 unsafe extern "C" {
     fn datafs_set_lookahead(d: *mut c_void, buffer: *mut u8, size: u32);
+    fn datafs_set_orphan_table(d: *mut c_void, on: i32);
     fn datafs_erases(d: *const c_void) -> u32;
     fn datafs_open_attr(
         d: *mut c_void,
@@ -822,6 +823,13 @@ impl<D: Device> Fs<'_, D> {
                 buffer.len() as u32,
             )
         };
+    }
+
+    /// The table of the repair of orphans on (the service's) or off (the walk of the release),
+    /// before the next mount: the tests compare the two.
+    pub fn set_orphan_table(&mut self, on: bool) {
+        // SAFETY: sets two fields of the configuration, which littlefs reads at the next mount.
+        unsafe { datafs_set_orphan_table(self.state.0.as_mut_ptr().cast(), i32::from(on)) };
     }
 
     /// The erases littlefs has asked for since the volume was set up.

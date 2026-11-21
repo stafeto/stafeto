@@ -859,11 +859,11 @@ mod tests {
         let held = pages_held(TABLE);
         // The segments of the programs are paid at the load besides the quotas, and the 96 MiB of
         // the image are the files; the zeroed statics are not in them. The data file service's
-        // statics: the memory of the volume (`datafs::Storage`, 252 KiB: the caches of 24 open
-        // files, the allocator's window of 128 KiB for a volume of 4 GiB), 49 pages more than the
-        // first release's 56 KiB, and the server's tables (about 65 KiB, with the 16 KiB table of
-        // a walk of a path), 21 pages.
-        const DATAFS_STATICS_PAGES: u64 = 49 + 21;
+        // statics: the memory of the volume (`datafs::Storage`, 300 KiB: the caches of 24 open
+        // files, the allocator's window of 128 KiB for a volume of 4 GiB, the 48 KiB table of the
+        // repair of orphans), 61 pages more than the first release's 56 KiB, and the server's
+        // tables (about 65 KiB, with the 16 KiB table of a walk of a path), 21 pages.
+        const DATAFS_STATICS_PAGES: u64 = 61 + 21;
         let need = held + IMAGE_PAGES + KERNEL_PAGES + INIT_FREE + DATAFS_STATICS_PAGES;
         assert!(
             need <= T4G_SMALL_PAGES,
