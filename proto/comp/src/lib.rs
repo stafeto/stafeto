@@ -196,6 +196,20 @@ pub const HAS_MANAGER: u32 = 1;
 /// into the frame.
 pub const CURSOR_PLANE: u32 = 2;
 
+/// The bytes of a line of `width` points of `format` at the least: 4 a point,
+/// or for FORMAT_A8 a byte a point rounded up to a multiple of 4 (the stride
+/// of an A8 window is any multiple of 4 from there). None past a `u32`.
+pub const fn line_bytes(format: u32, width: u32) -> Option<u32> {
+    if format == FORMAT_A8 {
+        match width.checked_add(3) {
+            Some(w) => Some(w & !3),
+            None => None,
+        }
+    } else {
+        width.checked_mul(4)
+    }
+}
+
 /// The bit the service sends a window's channel when its ring has events;
 /// bits 0 to 2 tell the buffer that is free.
 pub const EVENTS_BIT: u64 = 1 << 3;

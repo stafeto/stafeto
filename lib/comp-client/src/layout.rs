@@ -15,18 +15,9 @@ pub const XRGB8888: u32 = 1;
 pub const ARGB8888: u32 = 3;
 pub const A8: u32 = 4;
 
-/// The bytes of a line of `width` points of `format`: 4 a point, or for A8 a
-/// byte a point and the line rounded up to a multiple of 4. None past a
-/// `u32`.
+/// The bytes of a line of `width` points of `format` (`proto_comp::line_bytes`).
 pub const fn line_bytes(format: u32, width: u32) -> Option<u32> {
-    if format == A8 {
-        match width.checked_add(3) {
-            Some(w) => Some(w & !3),
-            None => None,
-        }
-    } else {
-        width.checked_mul(4)
-    }
+    proto_comp::line_bytes(format, width)
 }
 /// `STAFETO_WINDOW_BUFFERS_MAX`, `_RECTS_MAX` and `_EVENTS_MAX`.
 pub const BUFFERS_MAX: usize = 3;

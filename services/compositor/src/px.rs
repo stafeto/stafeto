@@ -26,10 +26,13 @@ pub struct Pixman {
 // window, the screen, the pointer's picture and the pool.
 const _: () = assert!(pixman::KEPT >= compositor::MAX_WINDOWS * proto_comp::BUFFERS + 3);
 
-const fn format(f: Format) -> Px {
+/// The pixman format of a window's points; None for a mask (FORMAT_A8), which
+/// no operation of a band reads yet.
+const fn format(f: Format) -> Option<Px> {
     match f {
-        Format::Xrgb => Px::Xrgb8888,
-        Format::Argb => Px::Argb8888,
+        Format::Xrgb => Some(Px::Xrgb8888),
+        Format::Argb => Some(Px::Argb8888),
+        Format::A8 => None,
     }
 }
 
@@ -594,9 +597,12 @@ impl Pixman {
     /// The image of a window's buffer is made now (a post), so that no band
     /// pays for the first use of a surface.
     pub fn prepare(&mut self, src: &[u8], stride: u32, f: Format, size: (u32, u32), image: usize) {
+        let Some(px) = format(f) else {
+            return;
+        };
         let source = Source {
             bytes: src,
-            format: format(f),
+            format: px,
             stride,
             width: size.0,
             height: size.1,
@@ -632,7 +638,7 @@ impl Pixman {
 }
 
 impl Raster for Pixman {
-    fn black(&mut self, fb: &mut [u8], r: Rect) {
+    fn fill(&mut self, fb: &mut [u8], r: Rect, rgb: u32) {
         let mut target = Target {
             bytes: fb,
             format: Px::Xrgb8888,
@@ -642,7 +648,7 @@ impl Raster for Pixman {
         };
         #[cfg(feature = "steps")]
         let began = rt::time::now();
-        if !fill(&mut target, r.x, r.y, r.w, r.h, 0) {
+        if !fill(&mut target, r.x, r.y, r.w, r.h, rgb) {
             self.refuse("a fill");
         }
         #[cfg(feature = "steps")]
@@ -667,6 +673,9 @@ impl Raster for Pixman {
         over: bool,
         image: usize,
     ) {
+        let Some(px) = format(f) else {
+            return;
+        };
         let mut target = Target {
             bytes: fb,
             format: Px::Xrgb8888,
@@ -676,7 +685,7 @@ impl Raster for Pixman {
         };
         let source = Source {
             bytes: src,
-            format: format(f),
+            format: px,
             stride,
             width: size.0,
             height: size.1,
@@ -998,7 +1007,7 @@ pub mod calibration {
     }
 
     impl compositor::Raster for Plain<'_> {
-        fn black(&mut self, _fb: &mut [u8], r: proto_comp::Rect) {
+        fn fill(&mut self, _fb: &mut [u8], r: proto_comp::Rect, rgb: u32) {
             let mut target = Target {
                 bytes: self.target,
                 format: Px::Xrgb8888,
@@ -1006,7 +1015,7 @@ pub mod calibration {
                 width: LAYER_TARGET_W,
                 height: LAYER_TARGET_H,
             };
-            fill(&mut target, r.x, r.y - self.y0, r.w, r.h, 0);
+            fill(&mut target, r.x, r.y - self.y0, r.w, r.h, rgb);
         }
 
         fn blit(
@@ -1031,7 +1040,7 @@ pub mod calibration {
             };
             let source = Source {
                 bytes: src,
-                format: super::format(f),
+                format: super::format(f).expect("a drawn format"),
                 stride,
                 width: size.0,
                 height: size.1,

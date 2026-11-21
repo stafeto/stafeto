@@ -38,12 +38,14 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod elements;
 pub mod fit;
 pub mod frame;
 
+use elements::{Def, Fault, Shape};
 use proto_comp::{
-    BUFFERS, BUTTON, CLOSE, CREATE, Event, FOCUS_IN, FOCUS_OUT, KEY, MAX_RECTS, MOVE, RING, Rect,
-    union,
+    BUFFERS, BUTTON, CLOSE, CREATE, Element, Event, FOCUS_IN, FOCUS_OUT, KEY, MAX_RECTS, MOVE,
+    RING, Rect, SceneCommit, union,
 };
 use proto_gpu::{HEIGHT, LayerRow, STRIDE, WIDTH};
 
@@ -420,6 +422,18 @@ pub enum Format {
     Xrgb,
     /// The colour premultiplied by the alpha in the top byte.
     Argb,
+    /// 8 bits an alpha, a byte a point: the mask of an element. Never shown.
+    A8,
+}
+
+impl Format {
+    /// The bytes of a line of `w` points at the least (`proto_comp::line_bytes`).
+    pub const fn line(self, w: u32) -> u64 {
+        match self {
+            Format::A8 => (w as u64 + 3) & !3,
+            _ => w as u64 * 4,
+        }
+    }
 }
 
 /// Why a call of the scene is refused.
@@ -431,6 +445,8 @@ pub enum Refusal {
     Invalid,
     /// The buffer is not free, or the window has its buffers.
     Busy,
+    /// The service has no operation that draws it (SCENE_COMMIT).
+    Unsupported,
     /// The call is not for this window (a POST before ATTACH, a FLUSH of a
     /// window that has buffers of its own, or the other way round).
     NotAllowed,
@@ -627,6 +643,70 @@ pub struct Scene {
     seq: u32,
     created: u32,
     frames: u32,
+    /// The scene of a scene session (proto_comp's SCENE_COMMIT): the last one
+    /// committed, which a taking makes the working one whole, and the working
+    /// one, which the bands of a frame read. Neither: the windows show as the
+    /// policy of the windows says.
+    pending: Option<Def>,
+    working: Option<Def>,
+    stage: Stage,
+}
+
+/// What the scene session's own state holds besides its two scenes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Stage {
+    /// The damage of changes that wait for the scene's frame while the scene
+    /// is not composed by itself.
+    held: Option<Rect>,
+    /// A SCENE_COMPOSE waits for the taking; the frame it made is in work.
+    compose_due: bool,
+    composing: bool,
+    /// The bits the scene's channel is to be told, asked for and ready.
+    ask_committed: bool,
+    ask_composed: bool,
+    committed_now: bool,
+    composed_now: bool,
+    /// A window no element shows posted something: a taking gives it back.
+    give_back: bool,
+    /// The scene session ended while a frame was in work: the taking that
+    /// follows goes back to the policy of the windows.
+    ending: bool,
+    /// What the last taking gave back: the buffer of each window, and the
+    /// windows of the first revision whose FLUSH is answered.
+    given: [Option<u8>; MAX_WINDOWS],
+    answered: u8,
+}
+
+impl Stage {
+    const NEW: Stage = Stage {
+        held: None,
+        compose_due: false,
+        composing: false,
+        ask_committed: false,
+        ask_composed: false,
+        committed_now: false,
+        composed_now: false,
+        give_back: false,
+        ending: false,
+        given: [None; MAX_WINDOWS],
+        answered: 0,
+    };
+}
+
+/// What a taking gave back of the windows no element shows (`Scene::given_back`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GivenBack {
+    /// The buffer of each window that is free again, by place.
+    pub freed: [Option<u8>; MAX_WINDOWS],
+    /// The windows of the first revision whose FLUSH has its answer, by place.
+    pub answered: u8,
+}
+
+/// The bits a scene session's channel is told by (`Scene::scene_bits`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SceneBits {
+    pub committed: bool,
+    pub composed: bool,
 }
 
 impl Default for Scene {
@@ -709,6 +789,9 @@ impl Scene {
             seq: 0,
             created: 0,
             frames: 0,
+            pending: None,
+            working: None,
+            stage: Stage::NEW,
         }
     }
 
@@ -905,7 +988,7 @@ impl Scene {
     /// Whether a window of the table is shown: it has something taken and
     /// is not hidden.
     fn shown(w: &Window) -> bool {
-        w.visible && w.current.is_some()
+        w.visible && w.current.is_some() && w.format != Format::A8
     }
 
     /// A window of context `ctx` at `rect`: its place, which is none of the
@@ -982,7 +1065,12 @@ impl Scene {
         if w.attached != 0 {
             return Err(Refusal::Busy);
         }
-        if count == 0 || count as usize > BUFFERS || u64::from(stride) < u64::from(w.rect.w) * 4 {
+        let line = w.format.line(w.rect.w);
+        if count == 0
+            || count as usize > BUFFERS
+            || u64::from(stride) < line
+            || (w.format == Format::A8 && !stride.is_multiple_of(4))
+        {
             return Err(Refusal::Invalid);
         }
         w.attached = count;
@@ -1018,6 +1106,78 @@ impl Scene {
         self.damage = Some(union(self.damage, r));
     }
 
+    /// Whether a scene session holds a scene (committed, or taken).
+    pub fn scene_on(&self) -> bool {
+        self.pending.is_some() || self.working.is_some()
+    }
+
+    /// Whether the scene the last commit left is composed by itself.
+    fn scene_active(&self) -> bool {
+        self.pending
+            .as_ref()
+            .or(self.working.as_ref())
+            .is_some_and(|d| d.active)
+    }
+
+    /// The change of window `i` at the rectangles `rects` of its own points
+    /// (none: all of it), as the screen sees it: without a scene the window's
+    /// place; with one the elements that use the window carry it. None when
+    /// the window changes nothing on the screen (no element uses it, or what
+    /// they show of it is off the screen).
+    fn window_damage(&self, i: usize, rects: &[Rect]) -> Option<Rect> {
+        let w = self.window(i)?;
+        if !self.scene_on() {
+            return Scene::changed(w.rect, rects).ok();
+        }
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            w: w.rect.w,
+            h: w.rect.h,
+        };
+        let mut sum = None;
+        let all = [whole];
+        let rects = if rects.is_empty() { &all[..] } else { rects };
+        // Both scenes: the taking that makes the pending one the working one
+        // may come before or after the window's buffer is taken.
+        for def in [self.working.as_ref(), self.pending.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            for r in rects {
+                if let Some(d) = elements::window_damage(def, i as u32, *r) {
+                    sum = Some(union(sum, d));
+                }
+            }
+        }
+        sum
+    }
+
+    /// The damage `d` of a window's change under a scene goes where the scene
+    /// says (`seen`: some element shows the window).
+    fn route_damage(&mut self, d: Rect, seen: bool) {
+        if !seen {
+            self.stage.give_back = true;
+        } else if self.scene_on() && !self.scene_active() {
+            self.stage.held = Some(union(self.stage.held, d));
+        } else {
+            self.add_damage(d);
+        }
+    }
+
+    /// The damage of a change of window `i` goes where the scene says: a frame
+    /// of the working scene's own at the next taking when the scene is composed
+    /// by itself (or there is none), the scene's stock for SCENE_COMPOSE when
+    /// it is not. A change no element shows asks for the taking that gives
+    /// the buffer back.
+    fn add_window_damage(&mut self, i: usize, rects: &[Rect]) {
+        match self.window_damage(i, rects) {
+            Some(d) => self.route_damage(d, true),
+            None if self.scene_on() => self.stage.give_back = true,
+            None => {}
+        }
+    }
+
     /// POST of buffer `buffer` of window `i` with the changed `rects`: the
     /// buffer a posted one it replaced ("the latest wins"), which is free
     /// at once.
@@ -1051,6 +1211,8 @@ impl Scene {
         if rects.len() > MAX_RECTS {
             return Err(Refusal::Invalid);
         }
+        // With a scene the change is what the elements carry to the screen.
+        let in_scene = self.scene_on().then(|| self.window_damage(i, rects));
         let w = self
             .windows
             .get_mut(i)
@@ -1066,6 +1228,13 @@ impl Scene {
             return Err(Refusal::Busy);
         }
         let mut damage = Scene::changed(w.rect, rects)?;
+        let mut seen = true;
+        if let Some(carried) = in_scene {
+            match carried {
+                Some(d) => damage = d,
+                None => seen = false,
+            }
+        }
         w.bufs[buffer as usize] = Buf::Posted;
         let replaced = w.posted.replace(buffer);
         if let Some(j) = replaced {
@@ -1086,13 +1255,19 @@ impl Scene {
         if let Some(h) = w.held.take() {
             damage = union(Some(damage), h);
         }
-        self.add_damage(damage);
+        if in_scene.is_some() {
+            self.route_damage(damage, seen);
+        } else {
+            self.add_damage(damage);
+        }
         Ok((replaced, due))
     }
 
-    /// Whether a change waits for a frame: damage the next frame will take.
+    /// Whether a change waits for a frame: damage the next frame will take, or
+    /// something of the scene a taking is for (a buffer to give back, a
+    /// SCENE_COMPOSE, the end of the scene).
     pub fn damaged(&self) -> bool {
-        self.damage.is_some()
+        self.damage.is_some() || self.stage.give_back || self.stage.compose_due || self.stage.ending
     }
 
     /// The start the windows a taking left are due at, the earliest.
@@ -1122,7 +1297,13 @@ impl Scene {
         }
         let damage = Scene::changed(w.rect, &[rect])?;
         w.posted = Some(0);
-        self.add_damage(damage);
+        if self.scene_on() {
+            // A window no element shows has nothing to wait for: the taking
+            // it asks for answers the FLUSH (`given_back`).
+            self.add_window_damage(i, &[rect]);
+        } else {
+            self.add_damage(damage);
+        }
         Ok(())
     }
 
@@ -1130,13 +1311,18 @@ impl Scene {
     /// the focus it had passes to the window on top, and the manager is
     /// told.
     pub fn destroy(&mut self, i: usize) -> Option<Window> {
+        let carried = self.scene_on().then(|| self.window_damage(i, &[]));
         let w = self.windows.get_mut(i)?.take()?;
         if w.legacy {
             self.release = true;
         }
         // A window of the first revision always has its line to say.
         if w.legacy || w.current.is_some() || w.posted.is_some() {
-            self.add_damage(w.rect);
+            match carried {
+                None => self.add_damage(w.rect),
+                Some(Some(d)) => self.route_damage(d, true),
+                Some(None) => {}
+            }
         }
         self.rings[i].clear();
         // The releases of what the window held are nobody's.
@@ -1362,6 +1548,13 @@ impl Scene {
             }
             self.add_damage(damage);
         }
+        // Under a scene the place of a window on the screen is the element's,
+        // with its scale and turn: the pointer is the scene's, in the screen's
+        // own coordinates, and no window's.
+        if self.scene_on() {
+            self.tell_manager(Event::at(MOVE, 0, 0, at.0, at.1));
+            return;
+        }
         // A window of the first revision takes no pointer: its ring holds the
         // keys, which a stream of moves would push out.
         if let Some(i) = self.held.or_else(|| self.hit(at.0, at.1))
@@ -1381,6 +1574,11 @@ impl Scene {
         let Some(at) = self.pointer else {
             return;
         };
+        if self.scene_on() {
+            let e = Event::at(BUTTON, code, i32::from(pressed), at.0, at.1);
+            self.tell_manager(e);
+            return;
+        }
         let target = if pressed {
             let hit = self.hit(at.0, at.1);
             if let Some(i) = hit {
@@ -1535,6 +1733,12 @@ impl Scene {
         if self.frame {
             return None;
         }
+        if core::mem::take(&mut self.stage.ending) {
+            self.pending = None;
+            self.working = None;
+            self.stage = Stage::NEW;
+            self.add_damage(SCREEN);
+        }
         // The start the windows this taking leaves are due at, whether or not
         // anything else is taken: with nothing to take the caller says `hold`.
         self.held_until = self
@@ -1551,7 +1755,10 @@ impl Scene {
                 self.damage = Some(union(self.damage, h));
             }
         }
-        let d = self.damage.take()?;
+        let compose_now = core::mem::take(&mut self.stage.compose_due);
+        let d = self.damage.take();
+        let frozen = self.take_scene(compose_now, d.is_some());
+        let d = d?;
         let x1 = (d.x + d.w).min(WIDTH);
         let y1 = (d.y + d.h).min(HEIGHT);
         if d.x >= x1 || d.y >= y1 {
@@ -1562,6 +1769,16 @@ impl Scene {
             let Some(w) = w else {
                 continue;
             };
+            // A scene that is composed on request keeps what its elements show
+            // until the SCENE_COMPOSE that makes the frame.
+            if frozen
+                && [self.working.as_ref(), self.pending.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|d| d.uses(i as u32))
+            {
+                continue;
+            }
             if w.posted.is_some() && !w.pace.due(k) {
                 // Not its start: the buffer stays posted, and the frame is
                 // owed it at its start (`held_until`).
@@ -1644,6 +1861,29 @@ impl Scene {
         if !self.direct || (self.pointer.is_some() && self.cursor.is_none()) {
             return Plan::Compose;
         }
+        if let Some(def) = &self.working {
+            // Under a scene the topmost element that shows something is the
+            // one that counts: it is a window of the first revision, opaque, the
+            // whole of it on the whole screen, with no turn, no reflection, no
+            // mask and no transparency.
+            let top =
+                def.elements().iter().rev().find_map(|e| {
+                    let w = self.window(usize::try_from(e.source).ok()?)?;
+                    (w.current.is_some() && elements::source_fits(e, w.rect.w, w.rect.h))
+                        .then_some((e, w, e.source as usize))
+                });
+            return match top {
+                Some((e, w, place))
+                    if w.legacy
+                        && w.format == Format::Xrgb
+                        && w.rect == SCREEN
+                        && fills_the_screen(e) =>
+                {
+                    Plan::Bypass(place)
+                }
+                _ => Plan::Compose,
+            };
+        }
         let Some(top) = self.top(None) else {
             return Plan::Compose;
         };
@@ -1669,6 +1909,11 @@ impl Scene {
             }
         }
         self.frame = false;
+        if core::mem::take(&mut self.stage.composing)
+            && core::mem::take(&mut self.stage.ask_composed)
+        {
+            self.stage.composed_now = true;
+        }
         if shown {
             self.frames += 1;
             match self.kind {
@@ -1721,27 +1966,43 @@ impl Scene {
                 && damage.y < r.y + r.h
         };
         let (mut opaque, mut over) = (0u32, 0u32);
-        for w in self.windows.iter().flatten() {
-            if Scene::shown(w) && touches(w.rect) {
-                if w.format == Format::Argb {
-                    over += 1;
-                } else {
-                    opaque += 1;
+        let covered;
+        if let Some(def) = &self.working {
+            // Under a scene: each element that shows something and touches the
+            // damage is a copy (no transparency) or a laying over.
+            let mut whole = false;
+            for e in def.elements() {
+                let Some(r) = self.element_place(e) else {
+                    continue;
+                };
+                if touches(r) {
+                    if e.transparency == 0 {
+                        opaque += 1;
+                    } else {
+                        over += 1;
+                    }
+                    whole |= e.transparency == 0 && covers_rect(r, damage);
                 }
             }
+            covered = whole;
+        } else {
+            for w in self.windows.iter().flatten() {
+                if Scene::shown(w) && touches(w.rect) {
+                    if w.format == Format::Argb {
+                        over += 1;
+                    } else {
+                        opaque += 1;
+                    }
+                }
+            }
+            covered = self.windows.iter().flatten().any(|w| {
+                Scene::shown(w) && w.format == Format::Xrgb && covers_rect(w.rect, damage)
+            });
         }
         over += u32::from(
             self.drawn_pointer()
                 .is_some_and(|p| touches(Scene::cursor_rect(p))),
         );
-        let covered = self.windows.iter().flatten().any(|w| {
-            Scene::shown(w)
-                && w.format == Format::Xrgb
-                && w.rect.x <= damage.x
-                && w.rect.y <= damage.y
-                && w.rect.x + w.rect.w >= damage.x + damage.w
-                && w.rect.y + w.rect.h >= damage.y + damage.h
-        });
         let fill = u32::from(!covered);
         // What the layers cost: the calls, a price for each line of each, a
         // price for each point of each (hundredths of a tick where it is a
@@ -1751,6 +2012,206 @@ impl Scene {
         let per_row = OPAQUE.row * opaque + OVER.row * over + FILL.row * fill;
         let per_point = OPAQUE.point * opaque + OVER.point * over + FILL.point * fill;
         band_size(calls, per_row, per_point, damage.w)
+    }
+}
+
+/// Whether `outer` holds every point of `inner`.
+fn covers_rect(outer: Rect, inner: Rect) -> bool {
+    outer.x <= inner.x
+        && outer.y <= inner.y
+        && outer.x + outer.w >= inner.x + inner.w
+        && outer.y + outer.h >= inner.y + inner.h
+}
+
+/// Whether an element shows the whole window of the first revision, one point
+/// for one, on the whole screen: no turn, no reflection, no mask, no
+/// transparency, the source rectangle the whole window (the rule of the direct
+/// frame under a scene).
+fn fills_the_screen(e: &Element) -> bool {
+    e.orient == 0
+        && e.transparency == 0
+        && e.sx == 0
+        && e.sy == 0
+        && i64::from(e.sw) == i64::from(WIDTH) << 16
+        && i64::from(e.sh) == i64::from(HEIGHT) << 16
+        && e.dx == 0
+        && e.dy == 0
+        && i64::from(e.dw) == i64::from(WIDTH)
+        && i64::from(e.dh) == i64::from(HEIGHT)
+}
+
+// ---------------------------------------------------------- the scene session
+
+impl Scene {
+    /// SCENE_COMMIT: the scene becomes the pending one. Refused INVALID for a
+    /// number the windows make wrong, UNSUPPORTED for an element no operation
+    /// of the service draws (`elements::check`). A scene that composes by
+    /// itself damages what changed from the scene before it (the pending one,
+    /// or the working one), and a taking makes it the working one whole; a
+    /// scene composed on request only keeps the damage for SCENE_COMPOSE, and
+    /// its COMMITTED, if asked, is told at once.
+    pub fn scene_commit(&mut self, commit: &SceneCommit) -> Result<(), Refusal> {
+        let def = Def::from_commit(commit);
+        let shape = |id: u32| {
+            self.window(id as usize).map(|w| Shape {
+                format: w.format,
+                w: w.rect.w,
+                h: w.rect.h,
+            })
+        };
+        elements::check(&def, shape).map_err(|f| match f {
+            Fault::Invalid => Refusal::Invalid,
+            Fault::Unsupported => Refusal::Unsupported,
+        })?;
+        let ask = commit.flags & proto_comp::ASK_COMMITTED != 0;
+        let damage = elements::scene_damage(self.pending.as_ref().or(self.working.as_ref()), &def);
+        if def.active {
+            self.stage.ask_committed |= ask;
+            match damage {
+                Some(d) => {
+                    self.add_damage(d);
+                    self.pending = Some(def);
+                }
+                // The same picture: nothing is to be drawn, so the scene is the
+                // working one now (the bands read the same elements) and is told.
+                None => {
+                    self.pending = None;
+                    self.working = Some(def);
+                    if core::mem::take(&mut self.stage.ask_committed) {
+                        self.stage.committed_now = true;
+                    }
+                }
+            }
+        } else {
+            if let Some(d) = damage {
+                self.stage.held = Some(union(self.stage.held, d));
+            }
+            self.pending = Some(def);
+            self.stage.committed_now |= ask;
+        }
+        Ok(())
+    }
+
+    /// SCENE_COMPOSE: the frame of a scene that is composed on request is to
+    /// be made at the next taking. UNSUPPORTED for a scene that composes by
+    /// itself, BUSY while the frame of an earlier request is not over. With no
+    /// scene committed the scene is the empty one (the background alone).
+    pub fn scene_compose(&mut self, ask: bool) -> Result<(), Refusal> {
+        if self.scene_active() {
+            return Err(Refusal::Unsupported);
+        }
+        if self.stage.compose_due || self.stage.composing {
+            return Err(Refusal::Busy);
+        }
+        if !self.scene_on() {
+            self.pending = Some(Def::EMPTY);
+            self.stage.held = Some(SCREEN);
+        }
+        self.stage.compose_due = true;
+        self.stage.ask_composed = ask;
+        if let Some(d) = self.stage.held.take() {
+            self.add_damage(d);
+        }
+        Ok(())
+    }
+
+    /// The scene session ended: the windows show as the policy of the windows
+    /// says from the next taking, the whole screen drawn again.
+    pub fn scene_end(&mut self) {
+        if !self.scene_on() {
+            return;
+        }
+        if self.frame {
+            self.stage.ending = true;
+        } else {
+            self.pending = None;
+            self.working = None;
+            self.stage = Stage::NEW;
+            self.add_damage(SCREEN);
+        }
+    }
+
+    /// The scene of the taking: the pending scene becomes the working one
+    /// whole when it composes by itself or SCENE_COMPOSE asked for this taking
+    /// (`compose_now`; `damaged` says the frame has something to show), and the
+    /// buffers of the windows no scene shows are given back at once (a window of
+    /// the first revision has its FLUSH answered). Whether the scene is held
+    /// still: composed on request, with no request for this taking.
+    fn take_scene(&mut self, compose_now: bool, damaged: bool) -> bool {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.active || compose_now)
+        {
+            self.working = self.pending.take();
+            if core::mem::take(&mut self.stage.ask_committed) {
+                self.stage.committed_now = true;
+            }
+        }
+        if compose_now {
+            if damaged {
+                self.stage.composing = true;
+            } else if core::mem::take(&mut self.stage.ask_composed) {
+                // Nothing changed: the frame is the one on the screen.
+                self.stage.composed_now = true;
+            }
+        }
+        if !self.scene_on() {
+            return false;
+        }
+        self.stage.give_back = false;
+        let (working, pending) = (self.working.as_ref(), self.pending.as_ref());
+        for (i, w) in self.windows.iter_mut().enumerate() {
+            let Some(w) = w else {
+                continue;
+            };
+            let id = i as u32;
+            if working.is_some_and(|d| d.uses(id)) || pending.is_some_and(|d| d.uses(id)) {
+                continue;
+            }
+            if w.legacy {
+                if w.posted.take().is_some() {
+                    self.stage.answered |= 1 << i;
+                }
+            } else if let Some(b) = w.posted.take() {
+                w.bufs[b as usize] = Buf::Free;
+                self.stage.given[i] = Some(b);
+            }
+        }
+        !self.working.as_ref().is_some_and(|d| d.active) && !compose_now
+    }
+
+    /// What the last taking gave back of the windows no element shows.
+    pub fn given_back(&mut self) -> GivenBack {
+        GivenBack {
+            freed: core::mem::take(&mut self.stage.given),
+            answered: core::mem::take(&mut self.stage.answered),
+        }
+    }
+
+    /// The bits the scene's channel is to be told: COMMITTED, COMPOSED.
+    pub fn scene_bits(&mut self) -> SceneBits {
+        SceneBits {
+            committed: core::mem::take(&mut self.stage.committed_now),
+            composed: core::mem::take(&mut self.stage.composed_now),
+        }
+    }
+
+    /// The working scene, which the bands of a frame read.
+    pub fn working(&self) -> Option<&Def> {
+        self.working.as_ref()
+    }
+
+    /// The place on the screen where element `e` of the working scene puts
+    /// something now: its target rectangle cut to the screen, when its window
+    /// has a buffer taken and holds the source rectangle; None otherwise (it
+    /// shows nothing).
+    pub fn element_place(&self, e: &Element) -> Option<Rect> {
+        let w = self.window(usize::try_from(e.source).ok()?)?;
+        if w.current.is_none() || !elements::source_fits(e, w.rect.w, w.rect.h) {
+            return None;
+        }
+        elements::target_bounds(e)
     }
 }
 
@@ -1816,8 +2277,13 @@ pub trait Source {
 /// The pixel operations of a band. The program's is pixman's.
 pub trait Raster {
     /// The rectangle of the screen's bytes `fb` (XRGB8888, STRIDE bytes a
-    /// line) becomes black.
-    fn black(&mut self, fb: &mut [u8], rect: Rect);
+    /// line) becomes the colour `rgb` (0x00RRGGBB).
+    fn fill(&mut self, fb: &mut [u8], rect: Rect, rgb: u32);
+
+    /// The rectangle becomes black.
+    fn black(&mut self, fb: &mut [u8], rect: Rect) {
+        self.fill(fb, rect, 0);
+    }
 
     /// The points of `src` (a surface of `size` points, `stride` bytes a
     /// line, in `format`) that start at (`from.0`, `from.1`) go to the
@@ -1870,6 +2336,75 @@ pub fn compose(
     compose_sized(scene, damage, at, size, fb, src, raster)
 }
 
+/// The band `band` of a frame of the working scene `def`: the topmost opaque
+/// element that covers the band whole is its base (copied, so the elements
+/// under it are not drawn), and the band that no element covers whole starts
+/// as the background; the elements above lie over it in their order. What an
+/// element draws is its source rectangle's points at the scale of one (the
+/// operations of a band so far: `elements::drawable_now`), cut to the band and
+/// the screen; an element whose window has nothing taken or does not hold the
+/// source rectangle (a window of the number went and another took its place)
+/// draws nothing.
+fn compose_elements(
+    scene: &Scene,
+    def: &Def,
+    band: Rect,
+    fb: &mut [u8],
+    src: &impl Source,
+    raster: &mut impl Raster,
+) {
+    let (x0, y0) = (i64::from(band.x), i64::from(band.y));
+    let (x1, y1) = (x0 + i64::from(band.w), y0 + i64::from(band.h));
+    let els = def.elements();
+    let places = |e: &Element| {
+        scene
+            .element_place(e)
+            .map(|_| scene.window(e.source as usize))
+    };
+    // The topmost element that copies and covers the band whole.
+    let base = els.iter().rposition(|e| {
+        e.transparency == 0
+            && places(e).is_some()
+            && i64::from(e.dx) <= x0
+            && i64::from(e.dy) <= y0
+            && i64::from(e.dx) + i64::from(e.dw) >= x1
+            && i64::from(e.dy) + i64::from(e.dh) >= y1
+    });
+    if base.is_none() {
+        raster.fill(fb, band, def.fill());
+    }
+    for e in &els[base.unwrap_or(0)..] {
+        let Some(Some(w)) = places(e) else {
+            continue;
+        };
+        let Some(b) = w.current else {
+            continue;
+        };
+        let (ex0, ey0) = (i64::from(e.dx), i64::from(e.dy));
+        let (ax0, ax1) = (x0.max(ex0), x1.min(ex0 + i64::from(e.dw)));
+        let (ay0, ay1) = (y0.max(ey0), y1.min(ey0 + i64::from(e.dh)));
+        if ax0 >= ax1 || ay0 >= ay1 {
+            continue;
+        }
+        let from = (
+            (i64::from(e.sx) >> 16) + (ax0 - ex0),
+            (i64::from(e.sy) >> 16) + (ay0 - ey0),
+        );
+        raster.blit(
+            fb,
+            src.pixels(e.source as usize, b),
+            w.stride,
+            w.format,
+            (w.rect.w, w.rect.h),
+            (from.0 as u32, from.1 as u32),
+            (ax0 as u32, ay0 as u32),
+            ((ax1 - ax0) as u32, (ay1 - ay0) as u32),
+            e.transparency == proto_comp::TRANSPARENCY_SOURCE,
+            image_of(e.source as usize, b),
+        );
+    }
+}
+
 /// `compose` for a band of `size` (columns and lines) that the caller names:
 /// the calibration measures the bands of its own shapes.
 pub fn compose_sized(
@@ -1892,53 +2427,63 @@ pub fn compose_sized(
             col: 0,
         };
     }
-    let (order, n) = scene.order();
-    let window = |k: u8| scene.window(k as usize).copied();
-    // The topmost opaque window over the whole band.
-    let base = order[..n].iter().rposition(|&k| {
-        window(k).is_some_and(|w| {
-            w.format == Format::Xrgb
-                && w.rect.x <= x0
-                && w.rect.x + w.rect.w >= x1
-                && w.rect.y <= y0
-                && w.rect.y + w.rect.h >= y1
-        })
-    });
-    if base.is_none() {
-        raster.black(
-            fb,
-            Rect {
-                x: x0,
-                y: y0,
-                w: x1 - x0,
-                h: y1 - y0,
-            },
-        );
-    }
-    for &k in &order[base.unwrap_or(0)..n] {
-        let Some(w) = window(k) else {
-            continue;
-        };
-        let Some(b) = w.current else {
-            continue;
-        };
-        let (wx0, wx1) = (x0.max(w.rect.x), x1.min(w.rect.x + w.rect.w));
-        let (wy0, wy1) = (y0.max(w.rect.y), y1.min(w.rect.y + w.rect.h));
-        if wx0 >= wx1 || wy0 >= wy1 {
-            continue;
+    let band = Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    };
+    if let Some(def) = scene.working() {
+        compose_elements(scene, def, band, fb, src, raster);
+    } else {
+        let (order, n) = scene.order();
+        let window = |k: u8| scene.window(k as usize).copied();
+        // The topmost opaque window over the whole band.
+        let base = order[..n].iter().rposition(|&k| {
+            window(k).is_some_and(|w| {
+                w.format == Format::Xrgb
+                    && w.rect.x <= x0
+                    && w.rect.x + w.rect.w >= x1
+                    && w.rect.y <= y0
+                    && w.rect.y + w.rect.h >= y1
+            })
+        });
+        if base.is_none() {
+            raster.black(
+                fb,
+                Rect {
+                    x: x0,
+                    y: y0,
+                    w: x1 - x0,
+                    h: y1 - y0,
+                },
+            );
         }
-        raster.blit(
-            fb,
-            src.pixels(k as usize, b),
-            w.stride,
-            w.format,
-            (w.rect.w, w.rect.h),
-            (wx0 - w.rect.x, wy0 - w.rect.y),
-            (wx0, wy0),
-            (wx1 - wx0, wy1 - wy0),
-            w.format == Format::Argb,
-            image_of(k as usize, b),
-        );
+        for &k in &order[base.unwrap_or(0)..n] {
+            let Some(w) = window(k) else {
+                continue;
+            };
+            let Some(b) = w.current else {
+                continue;
+            };
+            let (wx0, wx1) = (x0.max(w.rect.x), x1.min(w.rect.x + w.rect.w));
+            let (wy0, wy1) = (y0.max(w.rect.y), y1.min(w.rect.y + w.rect.h));
+            if wx0 >= wx1 || wy0 >= wy1 {
+                continue;
+            }
+            raster.blit(
+                fb,
+                src.pixels(k as usize, b),
+                w.stride,
+                w.format,
+                (w.rect.w, w.rect.h),
+                (wx0 - w.rect.x, wy0 - w.rect.y),
+                (wx0, wy0),
+                (wx1 - wx0, wy1 - wy0),
+                w.format == Format::Argb,
+                image_of(k as usize, b),
+            );
+        }
     }
     if let Some(p) = scene.drawn_pointer() {
         let c = Scene::cursor_rect(p);
@@ -1991,10 +2536,12 @@ mod tests {
     struct Plain;
 
     impl Raster for Plain {
-        fn black(&mut self, fb: &mut [u8], r: Rect) {
+        fn fill(&mut self, fb: &mut [u8], r: Rect, rgb: u32) {
             for y in r.y..r.y + r.h {
-                let at = (y * STRIDE + r.x * 4) as usize;
-                fb[at..at + (r.w * 4) as usize].fill(0);
+                for x in r.x..r.x + r.w {
+                    let at = (y * STRIDE + x * 4) as usize;
+                    fb[at..at + 4].copy_from_slice(&rgb.to_le_bytes());
+                }
             }
         }
 
@@ -2961,7 +3508,7 @@ mod tests {
     }
 
     impl Raster for Cost {
-        fn black(&mut self, _: &mut [u8], r: Rect) {
+        fn fill(&mut self, _: &mut [u8], r: Rect, _: u32) {
             self.calls += FILL.call;
             self.centi += FILL.row * r.h + FILL.point * r.w * r.h;
         }
@@ -3067,7 +3614,7 @@ mod tests {
     fn every_blit_names_its_surface_the_same_way_in_every_band() {
         struct Names(Vec<usize>);
         impl Raster for Names {
-            fn black(&mut self, _: &mut [u8], _: Rect) {}
+            fn fill(&mut self, _: &mut [u8], _: Rect, _: u32) {}
             fn blit(
                 &mut self,
                 _: &mut [u8],
