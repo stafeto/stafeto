@@ -11,6 +11,21 @@
 # The console, for the lines the scripts print.
 exec </dev/null >/dev/console 2>&1
 
+# The account files. The image's copies of /etc/passwd, /etc/group and /etc/shadow are immutable
+# files of the file service, so `adduser`, `passwd` and the rest could not write them. The service
+# `datakey` (an image with a data volume) has placed the merge of the image's files with those
+# kept on the volume as /etc/<file>.new; without it a copy of the image's file is made here. The
+# copies are moved over the image's and are ordinary files.
+(
+    umask 077
+    for f in passwd group shadow; do
+        if [ ! -f "/etc/$f.new" ]; then
+            cp -p "/etc/$f" "/etc/$f.new"
+        fi
+        mv -f "/etc/$f.new" "/etc/$f"
+    done
+)
+
 for name in ec2-key dropbear landing web fast; do
     if [ -f "/etc/rc.d/$name" ]; then
         ash "/etc/rc.d/$name"

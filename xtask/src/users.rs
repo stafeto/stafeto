@@ -159,21 +159,22 @@ fn suid_busybox(run: &mut qemu::Run) -> Result<(), String> {
     )
 }
 
-/// The account files of the image are immutable; a copy renamed over each is an ordinary file.
+/// The boot script has made the account files ordinary files (the image's are immutable).
 fn writable(run: &mut qemu::Run) -> Result<(), String> {
+    run.expect_seen("ec2-key: the key of the probe is placed", RUN_WITHIN)?;
     check(
         run,
-        "image files are immutable",
-        "( : >> /etc/passwd ) 2>&1; echo rc=$?",
-        &["Read-only file system", "rc=1"],
-        &[],
+        "account files are ordinary files",
+        "( : >> /etc/passwd ) 2>&1; echo rc=$?; ls -ln /etc/passwd /etc/group /etc/shadow; ls /etc/passwd.new 2>&1",
+        &["rc=0", "-rw-r--r--", "-rw-------", "No such file"],
+        &["Read-only"],
     )?;
     check(
         run,
-        "rename over an image file",
-        "cd /etc; for f in passwd group shadow; do cp -p $f $f.n && mv -f $f.n $f || echo FAILED $f; done; ( : >> passwd ) 2>&1; echo rc=$?; ls -ln passwd group shadow; cd /",
-        &["rc=0"],
-        &["FAILED", "Read-only"],
+        "home of user",
+        "ls -ldn /home/user /home/user/.ssh /home/user/.ssh/authorized_keys",
+        &["drwx------", " 1000     100 ", "-rw-------"],
+        &["No such file"],
     )
 }
 
@@ -207,10 +208,11 @@ fn tools(run: &mut qemu::Run) -> Result<(), String> {
 }
 
 pub fn command(args: &[String]) -> Result<(), String> {
-    if !args.is_empty() {
-        return Err("usage: cargo xtask users".to_owned());
+    match args {
+        [] => probe(&qemu::VIRT),
+        [mode] if mode == "persist" => crate::net_try::accounts_persist(),
+        _ => Err("usage: cargo xtask users [persist]".to_owned()),
     }
-    probe(&qemu::VIRT)
 }
 
 pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
