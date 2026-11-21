@@ -1380,10 +1380,11 @@ impl Wfc {
         if let Some(c) = &mut self.ctx {
             c.compose_pending = true;
         }
-        if wait && self.await_bit(svc, COMPOSED_BIT) {
-            if let Some(c) = &mut self.ctx {
-                c.compose_pending = false;
-            }
+        if wait
+            && self.await_bit(svc, COMPOSED_BIT)
+            && let Some(c) = &mut self.ctx
+        {
+            c.compose_pending = false;
         }
     }
 
