@@ -120,7 +120,7 @@ pub mod cost {
     /// each count of layers (1 to MAX_LAYERS - 1) how many bands, the least and
     /// the greatest ticks of `compose` less the operations in it (the work of
     /// `compose` around the calls: the stacking, the clip, the sources), and the
-    /// greatest step of the band's own code with the compose and the operations
+    /// greatest step of the band by the wall (preemptions of a higher level included) with the compose and the operations
     /// of that band.
     pub const MAX_LAYERS: usize = 10;
 
@@ -196,7 +196,7 @@ pub mod cost {
         /// last line of the conductor was lost so), so the lines of the bands are few.
         const TELL_FROM: u64 = 256;
 
-        /// The floor of a count of layers: the band whose own code took least (what a
+        /// The floor of a count of layers: the band whose step took least by the wall (what a
         /// band costs when nothing else happened in it), its `compose` and operations,
         /// and how many bands passed the gate of a band (a preempted band does too).
         struct Floor {

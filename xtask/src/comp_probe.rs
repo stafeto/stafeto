@@ -767,7 +767,7 @@ pub fn layer_term(costs: &[ShapeCost]) -> Option<LayerTerm> {
 /// The line `service band: T layers L n N outside least A greatest B total
 /// greatest G compose C ops O`: for the bands of L layers the service made, the
 /// least and the greatest ticks of `compose` less its operations (what the band
-/// spends around the calls), and, of the band whose own code took longest (G), the
+/// spends around the calls), and, of the band whose step took longest by the wall (G), the
 /// ticks of its `compose` and of its operations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BandSplit {
@@ -836,7 +836,7 @@ pub fn band_splits(lines: &[String], tag: &str) -> Vec<BandSplit> {
 }
 
 /// The line `service band floor: T layers L n N total least A compose C ops O
-/// above-gate G`: for the bands of L layers, the band whose own code took least (the
+/// above-gate G`: for the bands of L layers, the band whose step took least by the wall (the
 /// floor: what a band costs when nothing else happened in it), the ticks of its
 /// `compose` and of its operations, and how many bands passed the gate of a band
 /// (a preempted band does too).
@@ -959,7 +959,7 @@ pub fn band_report(lines: &[String], tag: &str) -> String {
 
 /// The bands the service made, by layers: what a band spends around its
 /// operations (`compose` less the calls, least and greatest, the greatest includes a
-/// preemption in the middle), and the band whose own code took longest: its ticks,
+/// preemption in the middle), and the band whose step took longest: its ticks by the wall (the counter of time from the start of the band to its end, so a higher level that ran in the middle is in them; the steps' own ticks, which the verdict judges, are in the lines of steps),
 /// of which the operations and what is around them, each by the layers it laid.
 pub fn band_split_text(splits: &[BandSplit]) -> String {
     if splits.is_empty() {
@@ -970,7 +970,7 @@ pub fn band_split_text(splits: &[BandSplit]) -> String {
         .map(|b| {
             let layers = b.layers.max(1);
             format!(
-                "{} layers ({} bands): around the operations {}..{} ticks, the model's {} ({}..{} a layer), longest band {} ticks of which the operations {} and around them {} ({} a layer)",
+                "{} layers ({} bands): around the operations {}..{} ticks, the model's {} ({}..{} a layer), longest band {} ticks by the wall, preemptions included, of which the operations {} and around them {} ({} a layer)",
                 b.layers,
                 b.n,
                 b.outside_least,
