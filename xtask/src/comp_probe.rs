@@ -89,7 +89,7 @@ const LEGACY_BACK: &str = "comp-probe: legacy back crc ";
 const ENDED: &str = "init: comp-probe ended: exit code 0, not restarted";
 const ENDED_C: &str = "init: comp-probe-c ended: exit code 0, not restarted";
 const ENDED_B: &str = "init: comp-probe-b ended: exit code 0, not restarted";
-const ENDED_S: &str = "init: comp-probe-s ended: exit code 0, not restarted";
+const ENDED_S: &str = concat!("init: comp-probe-s ended: exit code 0,", " not restarted");
 const B_ENDS: &str = "init: comp-probe-b ended: ";
 const S_ENDS: &str = "init: comp-probe-s ended: ";
 

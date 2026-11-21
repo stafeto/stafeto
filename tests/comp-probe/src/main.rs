@@ -944,7 +944,7 @@ impl Probe<'_> {
         );
         self.sleep(SNAPSHOT_NS);
         // A window of the first revision that no element shows: its FLUSH is
-        // answered at the taking, not left to wait for a frame that has none of it.
+        // answered at the taking and does not wait for a frame that has none of it.
         let open = proto_gpu::Method::Open.header().bytes();
         let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
         let (status, mut reply) = loop {

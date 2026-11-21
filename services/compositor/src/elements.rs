@@ -44,7 +44,7 @@ impl PartialEq for Def {
 impl Eq for Def {}
 
 impl Def {
-    /// The scene with no element, black, not composed by itself: what a
+    /// The scene with no element, black, composed only on request: what a
     /// context has before its first commit.
     pub const EMPTY: Def = Def {
         active: false,
@@ -59,7 +59,7 @@ impl Def {
         def
     }
 
-    /// The scene of `commit`, in place of what was here.
+    /// The scene of `commit`, replacing what was here.
     pub fn load(&mut self, commit: &SceneCommit) {
         self.active = commit.flags & proto_comp::ACTIVE != 0;
         self.bg = commit.bg;
