@@ -219,6 +219,9 @@ an earlier `compose(FALSE)` never counts for this frame and the call does not
 fail with BUSY (spec 8.3). After the service accepts, `wait(COMPOSED)`. With
 `wait` false the first BUSY is the result. `commit` uses the same loop with
 COMMITTED, so a wait that broke off with an error leaves no stale bit either.
+With `wait` false the bit is cleared before the send only when no earlier
+`compose` is pending, and cleared again after the service accepts one that
+was, because acceptance means the earlier frame is over and its bit is stale.
 `destroy_context` and `destroy_device` call `wait(COMPOSED)` while a compose
 the library sent has not been waited for (`compose_pending`).
 
@@ -287,7 +290,7 @@ source goes to (0,1) and (0,0) stays at (0,0); the wrong formula with
     library so the C layer has one place for them.
 11. **Zero-size elements** are left out of the record (the service refuses a zero source side).
 
-## 7. Tests (about 85), by clause
+## 7. Tests (152 in the first version, grouped by clause)
 
 Every test carries its clause in its name or its first comment.
 
