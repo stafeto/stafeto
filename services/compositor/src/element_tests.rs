@@ -98,8 +98,32 @@ impl Source for Wins {
     }
 }
 
-/// The raster of the tests: the screen's bytes are XRGB8888.
-struct Sampler;
+/// The work band of the raster of pixman (`pixman::WORK_W` by `pixman::WORK_H`).
+const WORK_W: u32 = 640;
+const WORK_H: u32 = 16;
+
+/// The raster of the tests: the screen's bytes are XRGB8888. It has the work band of
+/// the two steps of a mask and an alpha (a byte a point, 640 a line).
+struct Sampler {
+    work: Vec<u8>,
+    /// The element and the area of the product in the band; the work band is lost
+    /// (a product is refused) when `refuse`.
+    made: Option<(u32, Rect)>,
+    refuse: bool,
+}
+
+impl Sampler {
+    fn new() -> Sampler {
+        Sampler {
+            work: vec![0; (WORK_W * WORK_H) as usize],
+            made: None,
+            refuse: false,
+        }
+    }
+}
+
+// The work band holds a band of a frame.
+const _: () = assert!(WORK_W >= WIDTH && WORK_H >= BAND_ROWS);
 
 fn put(fb: &mut [u8], x: u32, y: u32, v: u32) {
     let at = (y * STRIDE + x * 4) as usize;
@@ -146,10 +170,41 @@ impl Raster for Sampler {
         }
     }
 
+    fn product_made(&self) -> Option<(u32, Rect)> {
+        self.made
+    }
+
+    fn product(
+        &mut self,
+        owner: (u32, Rect),
+        mask: &Surface<'_>,
+        at: (u32, u32),
+        alpha: u8,
+        size: (u32, u32),
+    ) -> bool {
+        if self.refuse {
+            self.made = None;
+            return false;
+        }
+        self.made = Some(owner);
+        for y in 0..size.1 {
+            for x in 0..size.0 {
+                let m = point(mask.bytes, mask.stride, Format::A8, at.0 + x, at.1 + y);
+                self.work[(y * WORK_W + x) as usize] = meaning::mul(m, u32::from(alpha)) as u8;
+            }
+        }
+        true
+    }
+
     fn element(&mut self, fb: &mut [u8], d: &Draw<'_>) {
         let e = Element {
             filter: d.filter,
-            transparency: d.transparency,
+            // The alpha is in the work band when there is one.
+            transparency: if d.work {
+                d.transparency & !TRANSPARENCY_ALPHA
+            } else {
+                d.transparency
+            },
             alpha: u32::from(d.alpha),
             ..Element::NONE
         };
@@ -171,6 +226,7 @@ impl Raster for Sampler {
                     None => fetch(d.from.0 + x, d.from.1 + y),
                 };
                 let m = match d.mask {
+                    _ if d.work => u32::from(self.work[(y * WORK_W + x) as usize]),
                     Some((m, at)) => point(m.bytes, m.stride, Format::A8, at.0 + x, at.1 + y),
                     None => 255,
                 };
@@ -258,8 +314,9 @@ impl Rig {
             col: 0,
             pass: 0,
         };
+        let mut sampler = Sampler::new();
         while at.row < d.y + d.h {
-            at = compose(&self.scene, d, at, &mut fb, &self.wins, &mut Sampler);
+            at = compose(&self.scene, d, at, &mut fb, &self.wins, &mut sampler);
         }
         self.scene.end(true);
         fb
@@ -632,13 +689,16 @@ fn an_element_is_charged_by_its_geometry_and_its_mixing() {
     let with = |f: fn(&mut Element)| {
         let mut e = plain;
         f(&mut e);
-        elements::classes(&e)
+        elements::classes(&e, true)
     };
     use elements::Class::*;
-    assert_eq!(elements::classes(&plain), (Copy, None));
+    assert_eq!(elements::classes(&plain, true), (Copy, None));
     assert_eq!(with(|e| e.transparency = TRANSPARENCY_SOURCE), (Over, None));
     assert_eq!(with(|e| e.dx = -30), (Copy, None));
-    assert_eq!(with(|e| e.dw = 128), (ScaleNearestCopy, None));
+    // A scale by a fraction (no turn, no reflection) is the class of the fast paths.
+    assert_eq!(with(|e| e.dw = 128), (FastNearestCopy, None));
+    assert_eq!(with(|e| e.dh = 100), (FastNearestCopy, None));
+    assert_eq!(with(|e| e.sx = 0x8000), (FastNearestCopy, None));
     assert_eq!(with(|e| e.orient = MIRROR), (ScaleNearestCopy, None));
     assert_eq!(with(|e| e.orient = 2), (ScaleNearestCopy, None));
     assert_eq!(
@@ -646,14 +706,14 @@ fn an_element_is_charged_by_its_geometry_and_its_mixing() {
             e.dw = 128;
             e.filter = BILINEAR
         }),
-        (ScaleBilinearCopy, None)
+        (FastBilinearCopy, None)
     );
     assert_eq!(
         with(|e| {
             e.dw = 128;
             e.transparency = TRANSPARENCY_SOURCE
         }),
-        (ScaleNearestOver, None)
+        (FastNearestOver, None)
     );
     assert_eq!(
         with(|e| {
@@ -661,7 +721,7 @@ fn an_element_is_charged_by_its_geometry_and_its_mixing() {
             e.transparency = TRANSPARENCY_SOURCE;
             e.filter = BILINEAR
         }),
-        (ScaleBilinearOver, None)
+        (FastBilinearOver, None)
     );
     // A quarter turn of the same size: its own path in pixman.
     assert_eq!(
@@ -691,9 +751,78 @@ fn an_element_is_charged_by_its_geometry_and_its_mixing() {
         with(|e| e.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA),
         (MaskAlpha, None)
     );
-    // A stretched one pays for the stretch and for the extra.
+    // A scaled one with a mix is one operation of its own.
     assert_eq!(
         with(|e| {
+            e.dw = 128;
+            e.transparency = TRANSPARENCY_MASK;
+        }),
+        (FastNearestMaskOpaque, None)
+    );
+    assert_eq!(
+        with(|e| {
+            e.dw = 128;
+            e.transparency = TRANSPARENCY_MASK | TRANSPARENCY_SOURCE;
+        }),
+        (FastNearestMask, None)
+    );
+    // The same from a window with no alpha channel: the source is opaque.
+    let xrgb = |t: u32| {
+        let mut e = plain;
+        e.dw = 128;
+        e.transparency = t;
+        elements::classes(&e, false)
+    };
+    // A laying over of an opaque source is a copy to pixman: its path and its key.
+    assert_eq!(xrgb(TRANSPARENCY_SOURCE), (FastNearestCopy, None));
+    let argb_over = {
+        let mut e = plain;
+        e.dw = 128;
+        e.transparency = TRANSPARENCY_SOURCE;
+        elements::classes(&e, true)
+    };
+    assert_eq!(argb_over, (FastNearestOver, None));
+    assert_eq!(
+        xrgb(TRANSPARENCY_MASK | TRANSPARENCY_SOURCE),
+        (FastNearestMaskOpaque, None)
+    );
+    assert_eq!(
+        with(|e| {
+            e.dw = 128;
+            e.filter = BILINEAR;
+            e.transparency = TRANSPARENCY_ALPHA | TRANSPARENCY_SOURCE;
+        }),
+        (FastBilinearAlpha, None)
+    );
+    assert_eq!(
+        with(|e| {
+            e.dw = 128;
+            e.filter = BILINEAR;
+            e.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA | TRANSPARENCY_SOURCE;
+        }),
+        (FastBilinearMaskAlpha, None)
+    );
+    // The others with both are priced as the general class: a layer of the fast
+    // one would not fit a step with the miss of the lookup.
+    assert_eq!(
+        with(|e| {
+            e.dw = 128;
+            e.filter = BILINEAR;
+            e.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA;
+        }),
+        (ScaleBilinearOver, Some(MaskAlpha))
+    );
+    assert_eq!(
+        with(|e| {
+            e.dw = 128;
+            e.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA | TRANSPARENCY_SOURCE;
+        }),
+        (ScaleNearestOver, Some(MaskAlpha))
+    );
+    // A turned or reflected one pays for the stretch and for the extra.
+    assert_eq!(
+        with(|e| {
+            e.orient = 2;
             e.dw = 128;
             e.transparency = TRANSPARENCY_MASK;
         }),
@@ -708,6 +837,53 @@ fn an_element_is_charged_by_its_geometry_and_its_mixing() {
             e.transparency = TRANSPARENCY_ALPHA;
         }),
         (ScaleBilinearOver, Some(Alpha))
+    );
+}
+
+#[test]
+fn the_fast_class_is_the_diagonal_matrix_with_positive_steps_that_the_element_makes() {
+    // Every orientation and reflection, a stretch up and down on each axis, and
+    // the source's corner at a fraction: the class is the fast one exactly when
+    // `elements::matrix` is a diagonal with positive steps, and no turn or
+    // reflection is.
+    let rig = Rig::new(&[(ARGB, 64, 40)]);
+    let sizes = [
+        (64, 40),
+        (128, 80),
+        (30, 17),
+        (64, 80),
+        (7, 40),
+        (40, 64),
+        (1, 1),
+    ];
+    let (mut fast, mut general) = (0, 0);
+    for orient in 0..8 {
+        for &(dw, dh) in &sizes {
+            for corner in [0, 0x8000] {
+                let mut e = rig.whole(0, [3, 4, dw, dh]);
+                e.orient = orient;
+                e.sx = corner;
+                if elements::is_plain(&e) {
+                    continue;
+                }
+                let m = elements::matrix(&e);
+                let diagonal = m[1] == 0 && m[3] == 0 && m[0] > 0 && m[4] > 0;
+                let (class, _) = elements::classes(&e, true);
+                let is_fast = class.row() >= elements::Class::FastNearestCopy.row();
+                assert_eq!(is_fast, diagonal, "orient {orient} to {dw} by {dh}: {m:?}");
+                if diagonal {
+                    // No turn and no reflection: the orientation is 0.
+                    assert_eq!(orient, 0, "{m:?}");
+                    fast += 1;
+                } else {
+                    general += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        fast >= 10 && general >= 40,
+        "{fast} fast, {general} general"
     );
 }
 
@@ -753,7 +929,7 @@ fn a_scene_of_dear_elements_is_taken_and_drawn_in_groups_as_the_reference_has_it
             .filter(|&k| plan.group_of(k) == Some(g))
             .count();
         assert!(
-            n == 1 || plan.cost[g].0 <= GROUP_CALLS,
+            n == 1 || plan.cost[g].calls <= GROUP_CALLS,
             "group {g}: {n} elements"
         );
     }
@@ -795,12 +971,15 @@ fn sixteen_of_the_dearest_over_the_screen_make_steps_under_the_gate_by_the_model
     let mut at = Band::default();
     let mut fb = vec![0u8; (STRIDE * HEIGHT) as usize];
     let (mut steps, mut worst) = (0, 0);
+    let mut made = None;
     while at.row < d.y + d.h {
         let mut model = StepCost {
             elements: els.len() as u32,
+            made,
             ..StepCost::default()
         };
         at = compose(&rig.scene, d, at, &mut fb, &rig.wins, &mut model);
+        made = model.made;
         worst = worst.max(model.ticks());
         steps += 1;
     }
@@ -809,8 +988,186 @@ fn sixteen_of_the_dearest_over_the_screen_make_steps_under_the_gate_by_the_model
         worst <= u64::from(BAND_GATE - 1_080),
         "a step costs {worst} by the model"
     );
-    // One step for each element, the black's apart, and the pointer's.
-    assert_eq!(steps, 18, "{steps} steps, worst {worst}");
+    // One step for each element, the black's apart, and the pointer's; the
+    // elements with a mask and an alpha that are stretched are two steps each
+    // (16 of them): 34.
+    assert_eq!(steps, 34, "{steps} steps, worst {worst}");
+}
+
+/// Walks the frame of the scene committed in `rig` over `d` as the service does,
+/// each step through a `StepCost` raster, and checks the key of the model: every
+/// layer a step draws is in the price of its group (the calls, the lines and the
+/// points the band's size was worked out from), so a step costs no more than
+/// BAND_TICKS by the model (the least band, one point, may). The bands of a group
+/// lie in its rectangle. Returns the steps, in all and of each group.
+fn walk_priced(rig: &Rig, d: Rect) -> (u32, Vec<u32>) {
+    let def = rig.scene.working().copied().unwrap();
+    let plan = rig.scene.passes(&def, d);
+    let mut each = vec![0u32; plan.groups];
+    let mut at = Band::default();
+    let mut fb = vec![0u8; (STRIDE * HEIGHT) as usize];
+    let mut steps = 0;
+    let mut first_step = 0;
+    let mut made = None;
+    while at.row < d.y + d.h {
+        let g = (at.pass & !PHASE) as usize;
+        let second = at.pass & PHASE != 0;
+        let r = plan.cost[g].rect;
+        let (w, h) = plan.band(g);
+        let mut model = StepCost {
+            elements: plan.elements,
+            made,
+            ..StepCost::default()
+        };
+        let next = compose(&rig.scene, d, at, &mut fb, &rig.wins, &mut model);
+        made = model.made;
+        let ticks = model.ticks() + u64::from(SCENE_STEP);
+        let limit = if (w, h) == (1, 1) {
+            u64::from(BAND_GATE - 1_080)
+        } else {
+            u64::from(BAND_TICKS)
+        };
+        assert!(
+            ticks <= limit,
+            "step {steps} of group {g} ({w} x {h}) costs {ticks} by the model, over {limit}"
+        );
+        assert!(
+            model.layers as usize
+                <= plan.members_of(g) + usize::from(plan.pointer_group() == Some(g)),
+            "step {steps} of group {g} draws {} layers",
+            model.layers
+        );
+        assert!(
+            at.row.max(r.y) >= r.y && at.row.max(r.y) < r.y + r.h,
+            "step {steps} of group {g} starts at row {} outside {r:?}",
+            at.row
+        );
+        // The first step of two is no dearer than the second: the band the second
+        // allows holds the first.
+        if plan.is_two_step(g) {
+            assert_eq!(plan.members_of(g), 1, "a group of two steps is one element");
+            if second {
+                assert!(
+                    ticks >= first_step,
+                    "step {steps} of group {g}: {ticks} < {first_step}"
+                );
+            } else {
+                first_step = ticks;
+            }
+        }
+        each[g] += 1;
+        steps += 1;
+        at = next;
+    }
+    (steps, each)
+}
+
+#[test]
+fn every_layer_a_step_draws_is_in_the_price_of_its_step() {
+    let mut specs = vec![(XRGB, 64, 40), (ARGB, 40, 30), (XRGB, 160, 100)];
+    specs.extend(vec![(A8, 640, 400), (A8, 300, 200), (A8, 60, 40)]);
+    let mut rig = Rig::new(&specs);
+    let mut els = Vec::new();
+    // A transparent window over the screen, a turn, a bilinear stretch with a
+    // mask and an alpha, a mask alone, a nearest stretch laid over, a plain copy
+    // and a small bilinear one: wide and narrow, near and far apart.
+    let mut a = rig.whole(2, [0, 0, 640, 400]);
+    a.transparency = TRANSPARENCY_ALPHA;
+    a.alpha = 120;
+    els.push(a);
+    let mut r = rig.whole(0, [100, 50, 100, 64]);
+    r.orient = 1;
+    els.push(r);
+    let mut b = rig.whole(2, [300, 150, 300, 200]);
+    b.filter = BILINEAR;
+    b.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA;
+    b.mask = rig.id(4);
+    b.alpha = 200;
+    els.push(b);
+    let mut m = rig.whole(0, [20, 300, 60, 40]);
+    m.transparency = TRANSPARENCY_MASK;
+    m.mask = rig.id(5);
+    els.push(m);
+    let mut o = rig.whole(1, [400, 20, 120, 90]);
+    o.transparency = TRANSPARENCY_SOURCE;
+    els.push(o);
+    els.push(rig.whole(0, [500, 300, 64, 40]));
+    let mut t = rig.whole(1, [10, 10, 20, 15]);
+    t.filter = BILINEAR;
+    t.transparency = TRANSPARENCY_SOURCE;
+    els.push(t);
+    rig.scene.pointer_to(310, 160);
+    rig.scene
+        .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap())
+        .unwrap();
+    // One frame is taken; the walks are over damages of the test's own.
+    rig.scene.begin().expect("a frame");
+    for d in [
+        Rect::SCREEN,
+        Rect {
+            x: 90,
+            y: 40,
+            w: 300,
+            h: 140,
+        },
+        Rect {
+            x: 305,
+            y: 155,
+            w: 7,
+            h: 9,
+        },
+    ] {
+        let (steps, each) = walk_priced(&rig, d);
+        assert!(steps as usize >= each.len(), "{steps} steps over {d:?}");
+    }
+    rig.scene.end(true);
+}
+
+#[test]
+fn a_group_draws_in_bands_over_the_rectangle_of_its_elements_only() {
+    // The scene of the plan: a window over the screen with a global alpha, a turn,
+    // and a bilinear stretch with a mask over a part of the screen. The dear
+    // element's group walks 320 by 200, no more (the band of the dearest layer
+    // took the whole screen's width before: 298 000 steps).
+    let mut rig = Rig::new(&[
+        (XRGB, 640, 400),
+        (XRGB, 200, 100),
+        (ARGB, 160, 100),
+        (A8, 320, 200),
+    ]);
+    let mut full = rig.whole(0, [0, 0, 640, 400]);
+    full.transparency = TRANSPARENCY_ALPHA;
+    full.alpha = 128;
+    let mut turn = rig.whole(1, [100, 50, 200, 100]);
+    turn.orient = 2;
+    let mut dear = rig.whole(2, [300, 150, 320, 200]);
+    dear.filter = BILINEAR;
+    dear.transparency = TRANSPARENCY_MASK | TRANSPARENCY_SOURCE;
+    dear.mask = rig.id(3);
+    let els = [full, turn, dear];
+    rig.scene
+        .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap())
+        .unwrap();
+    let d = rig.scene.begin().expect("a frame");
+    let def = rig.scene.working().copied().unwrap();
+    let plan = rig.scene.passes(&def, d);
+    // The black, three elements (each dear enough to be alone), no pointer.
+    assert_eq!(plan.groups, 4);
+    assert!(plan.is_black(0));
+    let g = plan.group_of(2).unwrap();
+    assert_eq!(
+        (plan.cost[g].rect.w, plan.cost[g].rect.h),
+        (320, 200),
+        "{:?}",
+        plan.cost[g].rect
+    );
+    let (steps, each) = walk_priced(&rig, d);
+    rig.scene.end(true);
+    assert_eq!(each[g] as usize, {
+        let (w, h) = plan.band(g);
+        (320usize.div_ceil(w as usize)) * (200usize.div_ceil(h as usize))
+    });
+    assert!(steps < 6_000, "{steps} steps, {each:?}");
 }
 
 #[test]
@@ -836,6 +1193,8 @@ struct StepCost {
     layers: u32,
     /// The elements of the scene that show something over the damage.
     elements: u32,
+    /// The element and the area of the last product.
+    made: Option<(u32, Rect)>,
 }
 
 impl StepCost {
@@ -872,53 +1231,169 @@ impl Raster for StepCost {
         over: bool,
         _: usize,
     ) {
+        let p = if over { OVER } else { OPAQUE };
         self.layers += 1;
-        self.calls += LOOKUP_MISS;
-        self.add(if over { OVER } else { OPAQUE }, area);
+        self.calls += p.miss;
+        self.add(p, area);
+    }
+
+    fn product(
+        &mut self,
+        owner: (u32, Rect),
+        _: &Surface<'_>,
+        _: (u32, u32),
+        _: u8,
+        size: (u32, u32),
+    ) -> bool {
+        self.made = Some(owner);
+        // The first step of an element of two steps: the product of a mask and an
+        // alpha over the band's area (the price of a mask with an alpha; its own call
+        // and its miss).
+        let p = PRICES[elements::Class::MaskAlpha.row()];
+        self.layers += 1;
+        self.calls += p.miss;
+        self.add(p, size);
+        true
+    }
+
+    fn product_made(&self) -> Option<(u32, Rect)> {
+        self.made
     }
 
     fn element(&mut self, _: &mut [u8], d: &Draw<'_>) {
         // The classes by what the raster is told (a turn of a quarter is read as
         // a general transform, which errs high).
-        use elements::Class::*;
         let t = d.transparency;
         let area = (d.area.w, d.area.h);
+        let (first, extra) = elements::class_of(elements::Shape4 {
+            scale: d.matrix.map(|m| elements::is_scale(&m)),
+            quarter: false,
+            bilinear: d.filter == BILINEAR,
+            over: t & TRANSPARENCY_SOURCE != 0,
+            argb: d.src.format == Format::Argb,
+            mask: t & TRANSPARENCY_MASK != 0,
+            alpha: t & TRANSPARENCY_ALPHA != 0,
+        });
+        // The second step of an element of two steps has the product made: the mask only.
+        let extra = if d.work {
+            Some(elements::Class::Mask)
+        } else {
+            extra
+        };
+        let p = PRICES[first.row()];
         self.layers += 1;
-        self.calls += LOOKUP_MISS;
-        let extra = match (t & TRANSPARENCY_MASK != 0, t & TRANSPARENCY_ALPHA != 0) {
-            (true, true) => Some(MaskAlpha),
-            (true, false) => Some(Mask),
-            (false, true) => Some(Alpha),
-            _ => None,
-        };
-        let geometry = match (
-            d.matrix.is_some(),
-            d.filter == BILINEAR,
-            t & TRANSPARENCY_SOURCE != 0,
-        ) {
-            (false, ..) => None,
-            (true, false, false) => Some(ScaleNearestCopy),
-            (true, false, true) => Some(ScaleNearestOver),
-            (true, true, false) => Some(ScaleBilinearCopy),
-            (true, true, true) => Some(ScaleBilinearOver),
-        };
-        // A transformed element with a mix pays for the stretch as a laying over.
-        let first = match (geometry, extra) {
-            (Some(ScaleNearestCopy), Some(_)) => Some(ScaleNearestOver),
-            (Some(ScaleBilinearCopy), Some(_)) => Some(ScaleBilinearOver),
-            (g, _) => g,
-        };
-        match (first, extra) {
-            (None, Some(x)) => self.add(PRICES[x.row()], area),
-            (Some(f), x) => {
-                self.add(PRICES[f.row()], area);
-                if let Some(x) = x {
-                    // The alpha or the mask is in the one call: rows and points.
-                    self.add(PRICES[x.row()], area);
-                    self.calls -= PRICES[x.row()].call;
-                }
-            }
-            (None, None) => self.add(if t != 0 { OVER } else { OPAQUE }, area),
+        self.calls += p.miss;
+        self.add(p, area);
+        if let Some(x) = extra {
+            // The alpha or the mask is in the one call: rows and points.
+            let x = PRICES[x.row()];
+            self.add(x, area);
+            self.calls -= x.call;
         }
     }
+}
+
+#[test]
+fn every_element_of_the_scene_is_a_term_of_a_step_whether_it_shows_or_not() {
+    let mut rig = Rig::new(&[(XRGB, 64, 40), (XRGB, 64, 40)]);
+    // One far from the damage, one under an opaque element that covers it.
+    let far = rig.whole(0, [500, 300, 64, 40]);
+    let under = rig.whole(0, [0, 0, 64, 40]);
+    let cover = rig.whole(1, [0, 0, 640, 400]);
+    let els = [far, under, cover];
+    rig.scene
+        .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap())
+        .unwrap();
+    rig.scene.begin().unwrap();
+    let def = rig.scene.working().copied().unwrap();
+    let d = Rect {
+        x: 0,
+        y: 0,
+        w: 100,
+        h: 100,
+    };
+    assert_eq!(rig.scene.passes(&def, d).elements, 3);
+    rig.scene.end(true);
+}
+
+/// A scene of two elements of two steps (a stretch with a mask and an alpha, by a
+/// turn of a half, so no fast path) side by side.
+fn two_of_two_steps() -> (Rig, Vec<Element>) {
+    let rig = Rig::new(&[(XRGB, 64, 40), (XRGB, 64, 40), (A8, 128, 80), (A8, 128, 80)]);
+    let mut a = rig.whole(0, [10, 10, 128, 80]);
+    a.orient = 2;
+    a.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA;
+    a.mask = rig.id(2);
+    a.alpha = 150;
+    let mut b = rig.whole(1, [200, 10, 128, 80]);
+    b.orient = 2;
+    b.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA;
+    b.mask = rig.id(3);
+    b.alpha = 90;
+    (rig, vec![a, b])
+}
+
+#[test]
+fn a_second_step_that_finds_the_product_of_another_element_goes_back_to_its_first() {
+    let (mut rig, els) = two_of_two_steps();
+    rig.scene
+        .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap())
+        .unwrap();
+    let d = rig.scene.begin().expect("a frame");
+    let def = rig.scene.working().copied().unwrap();
+    let plan = rig.scene.passes(&def, d);
+    let (ga, gb) = (plan.group_of(0).unwrap(), plan.group_of(1).unwrap());
+    assert!(plan.is_two_step(ga) && plan.is_two_step(gb) && ga != gb);
+    let mut fb = vec![0xEE; (STRIDE * HEIGHT) as usize];
+    let mut sampler = Sampler::new();
+    // The first step of the first element's first band.
+    let ra = plan.cost[ga].rect;
+    let at = Band {
+        row: ra.y,
+        col: ra.x - d.x,
+        pass: ga as u32,
+    };
+    let next = compose(&rig.scene, d, at, &mut fb, &rig.wins, &mut sampler);
+    assert_eq!(next.pass, ga as u32 | PHASE);
+    // The group numbers shift between the steps: the second step is asked of the
+    // other element's group, for the band the product was not made for.
+    let rb = plan.cost[gb].rect;
+    let wrong = Band {
+        row: rb.y,
+        col: rb.x - d.x,
+        pass: gb as u32 | PHASE,
+    };
+    let before = fb.clone();
+    let back = compose(&rig.scene, d, wrong, &mut fb, &rig.wins, &mut sampler);
+    assert_eq!(
+        back,
+        Band {
+            pass: gb as u32,
+            ..wrong
+        }
+    );
+    assert_eq!(fb, before, "nothing is drawn through another's product");
+    rig.scene.end(true);
+}
+
+#[test]
+fn a_product_that_is_refused_leaves_its_band_undrawn_and_the_frame_goes_on() {
+    let (mut rig, els) = two_of_two_steps();
+    rig.scene
+        .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap())
+        .unwrap();
+    let d = rig.scene.begin().expect("a frame");
+    let mut fb = vec![0xEE; (STRIDE * HEIGHT) as usize];
+    let mut sampler = Sampler::new();
+    sampler.refuse = true;
+    let mut at = Band::default();
+    let mut steps = 0;
+    while at.row < d.y + d.h {
+        at = compose(&rig.scene, d, at, &mut fb, &rig.wins, &mut sampler);
+        steps += 1;
+        assert!(steps < 10_000, "the frame does not end");
+    }
+    // The elements are not drawn: the point inside the first is the black's.
+    assert_eq!(get(&fb, 70, 50), BG & 0xFF_FFFF);
+    rig.scene.end(true);
 }
