@@ -11289,11 +11289,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // and the image check. Also in the group `net`.
         job("net-try", || net_try::probe(&qemu::VIRT_2G)),
         // The ordinary account: doas, the set-user-ID su and passwd, the account tools, the
-        // refusal of the console to an ordinary account.
+        // refusal of the console to an ordinary account. Its reboot cases (`users persist`) are
+        // run by the job `net-try`.
         job("users", || users::probe(&qemu::VIRT)),
-        // The same over a reboot: the image of the try-out twice over one data volume, the home,
-        // the accounts and the host key kept. Also in the group `net`.
-        job("users persist", net_try::accounts_persist),
         // TLS: curl and `openssl s_client` of the guest against two
         // `openssl s_server` of the host, the certificate checked both ways.
         job("net-tls", || {

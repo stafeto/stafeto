@@ -153,8 +153,14 @@ const SERVICE_OWNER: (u32, u32) = (65533, 65533);
 /// The rules of `doas` (/etc/doas.conf): one line, with no `keepenv` and no `persist`.
 pub const DOAS_CONF: &[u8] = b"permit nopass :wheel\n";
 
+/// The group file of the images that hold `doas`: the same and the group `wheel`, whose members
+/// the rule of /etc/doas.conf lets run any command as root. The probe images keep the file of
+/// three groups, which their tests count.
+const GROUP_WITH_WHEEL: &[u8] =
+    b"root:x:0:root\nwheel:x:10:user\nuser:x:100:user\nnobody:x:65534:nobody\n";
+
 /// Account databases are ordinary root-owned files in each shipped image.
-fn accounts() -> [RootFile; 5] {
+fn accounts() -> [RootFile; 4] {
     [
         dir("/etc"),
         of(
@@ -170,18 +176,7 @@ fn accounts() -> [RootFile; 5] {
             "/etc/group",
             0o644,
             ROOT,
-            Source::Bytes(
-                "group",
-                b"root:x:0:root\nwheel:x:10:user\nuser:x:100:user\nnobody:x:65534:nobody\n",
-            ),
-        ),
-        // The one rule of `doas`: the members of `wheel` run any command as root with no
-        // password (the key that opens the account is the proof). Readable by root alone.
-        of(
-            "/etc/doas.conf",
-            0o400,
-            ROOT,
-            Source::Bytes("doas.conf", DOAS_CONF),
+            Source::Bytes("group", b"root:x:0:root\nuser:x:100:user\nnobody:x:65534:nobody\n"),
         ),
         // Every account is locked: `!` in the password field matches no
         // hash, and the image carries no password of any owner.
@@ -661,6 +656,15 @@ fn shell_files(image: &str) -> Result<Vec<RootFile>, String> {
         file("/bin/su", 0o4755, ROOT, "busybox-suid"),
         file("/bin/passwd", 0o4755, ROOT, "busybox-suid"),
         file("/bin/doas", 0o4755, ROOT, "doas"),
+        // The one rule of `doas`: the members of `wheel` run any command as root with no
+        // password (the key that opens the account is the proof). Readable by root alone. It
+        // is a file of the images that hold `doas`: the probe images list /etc in full.
+        of(
+            "/etc/doas.conf",
+            0o400,
+            ROOT,
+            Source::Bytes("doas.conf", DOAS_CONF),
+        ),
         // The homes of the ordinary accounts: `adduser -h /home/<name>` makes one here (in memory).
         dir("/home"),
         dir("/dev"),
@@ -2661,6 +2665,12 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         _ => Vec::new(),
     };
     files.extend(accounts());
+    // An image that holds `doas` has the group `wheel` its rule names.
+    if files.iter().any(|f| f.path == "/bin/doas") {
+        for f in files.iter_mut().filter(|f| f.path == "/etc/group") {
+            f.source = Some(Source::Bytes("group", GROUP_WITH_WHEEL));
+        }
+    }
     if name == "boot-ssh-probe.img" {
         add_star(name, &mut files);
     }
@@ -2921,12 +2931,30 @@ mod tests {
             if let Some(busybox) = files.iter().find(|f| f.path == "/bin/busybox") {
                 assert_eq!(busybox.mode, 0o755, "{image}: /bin/busybox");
             }
-            let conf = files.iter().find(|f| f.path == "/etc/doas.conf").unwrap();
-            assert_eq!((conf.mode, conf.uid, conf.gid), (0o400, 0, 0), "{image}");
-            let Some(Source::Bytes(_, rules)) = conf.source else {
-                panic!("{image}: /etc/doas.conf is not bytes");
+            // `wheel` is in the group file of the images that hold `doas`, and in no other.
+            let group = files.iter().find(|f| f.path == "/etc/group").unwrap();
+            let Some(Source::Bytes(_, group)) = group.source else {
+                panic!("{image}: /etc/group is not bytes");
             };
-            assert_eq!(rules, b"permit nopass :wheel\n", "{image}");
+            assert_eq!(
+                group.windows(8).any(|w| w == b"wheel:x:"),
+                files.iter().any(|f| f.path == "/bin/doas"),
+                "{image}: group wheel and /bin/doas"
+            );
+            // The rule file is in the images that hold `doas`, and in no other.
+            let conf = files.iter().find(|f| f.path == "/etc/doas.conf");
+            assert_eq!(
+                conf.is_some(),
+                files.iter().any(|f| f.path == "/bin/doas"),
+                "{image}: /etc/doas.conf and /bin/doas"
+            );
+            if let Some(conf) = conf {
+                assert_eq!((conf.mode, conf.uid, conf.gid), (0o400, 0, 0), "{image}");
+                let Some(Source::Bytes(_, rules)) = conf.source else {
+                    panic!("{image}: /etc/doas.conf is not bytes");
+                };
+                assert_eq!(rules, b"permit nopass :wheel\n", "{image}");
+            }
             let shadow = files.iter().find(|f| f.path == "/etc/shadow").unwrap();
             let Some(Source::Bytes(_, bytes)) = shadow.source else {
                 panic!("{image}: /etc/shadow is not bytes");
@@ -3577,7 +3605,7 @@ mod tests {
         // the directories above them (it refuses a file without its
         // parent).
         let wanted = sources(&files);
-        assert_eq!(wanted.len(), 17);
+        assert_eq!(wanted.len(), 16);
         let bytes = table(&files, 3, 3 + wanted.len() as u32 + 1).unwrap();
         let read = Rootfs::parse(&bytes, 3 + wanted.len() as u32 + 1).unwrap();
         for path in [

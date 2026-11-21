@@ -1275,7 +1275,12 @@ static int terminal_spawn_parent(void) {
         if (test == 0) CHECK(error == ENXIO);
         else if (test == 5) CHECK(error == ENOTDIR);
         else if (test == 6) CHECK(error == EMFILE);
+        /* The console is root's (mode 0600): a caller that has dropped to nobody is refused the
+         * open of the file action, and nothing reaches the counterfeit endpoint. The spawn of a
+         * set-user-ID file by an unprivileged caller is the probe of posix-procs. */
+        else if (test == 7) CHECK(error == EACCES);
         else {
+            if (error != 0) say("posix-tty: spawn test %d failed with %d\n", test, error);
             CHECK(error == 0);
             int status;
             CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status));

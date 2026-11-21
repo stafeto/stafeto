@@ -422,6 +422,12 @@ fn steps(run: &mut qemu::Run, fake: &Fake) -> Result<(), String> {
         return Err(format!("the requests of the boot script: {log:?}"));
     }
     at("the boot script fetched the key, one token request and one request with it");
+    // The rest of the boot script's lines (the servers it finds nothing to start) come before the
+    // probe types: a line in the middle of a typed command breaks it.
+    run.expect_seen(
+        "fast: no nginx-fast in this image, 8080 stays off",
+        SCRIPT_WITHIN,
+    )?;
     run.expect("# ", DIALOG_STEP)?;
     run.send("S=ok")?;
     run.expect("# ", DIALOG_STEP)?;
@@ -438,7 +444,9 @@ fn steps(run: &mut qemu::Run, fake: &Fake) -> Result<(), String> {
     }
     let listing = capture(
         run,
-        "ls -ld /home/user/.ssh /home/user/.ssh/authorized_keys",
+        // Short: a typed line past the 80 columns of the console wraps, and its tail reads as the
+        // end marker.
+        "ls -ld /home/user/.ssh /home/user/.ssh/a*",
         "k2",
         DIALOG_STEP,
     )?;

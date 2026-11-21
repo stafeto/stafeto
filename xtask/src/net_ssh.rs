@@ -103,7 +103,7 @@ pub(crate) fn set_key(line: String) -> Result<(), String> {
 /// `key` as the authorized_keys of `user` (the home /etc/passwd names, which the service
 /// `datakey` has put on the data volume when there is one), as the metadata of an instance would
 /// give it.
-pub fn key_script_text(key: &str) -> String {
+pub fn key_script_text(key: &str, extra: &str) -> String {
     format!(
         "while IFS=: read -r n _ u g _ h _; do [ \"$n\" = user ] && break; done </etc/passwd\n\
          umask 077\n\
@@ -113,7 +113,7 @@ pub fn key_script_text(key: &str) -> String {
          echo '{key}' > \"$h/.ssh/authorized_keys\"\n\
          chown \"$u:$g\" \"$h/.ssh/authorized_keys\"\n\
          chmod 600 \"$h/.ssh/authorized_keys\"\n\
-         echo 'ec2-key: the key of the probe is placed'\n"
+         echo 'ec2-key: the key of the probe is placed'\n{extra}"
     )
 }
 
@@ -122,7 +122,7 @@ pub fn key_script() -> &'static [u8] {
     static SCRIPT: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
     SCRIPT.get_or_init(|| {
         let key = KEY.get().map_or(PLACEHOLDER_KEY, String::as_str);
-        Box::leak(key_script_text(key).into_bytes().into_boxed_slice())
+        Box::leak(key_script_text(key, "").into_bytes().into_boxed_slice())
     })
 }
 
