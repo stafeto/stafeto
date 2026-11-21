@@ -183,6 +183,8 @@ mod imp {
     pub struct Images {
         kept: Kept<Key, Image, KEPT, HINTS>,
         made: u32,
+        /// The image over the work band (`WORK`), made once and kept.
+        work: Option<Image>,
     }
 
     impl Images {
@@ -190,6 +192,7 @@ mod imp {
             Images {
                 kept: Kept::new(),
                 made: 0,
+                work: None,
             }
         }
 
@@ -203,6 +206,29 @@ mod imp {
         /// `scan-count`).
         pub fn scanned(&self) -> u32 {
             self.kept.scanned()
+        }
+
+        /// The image over the work band: A8, WORK_W by WORK_H points, made the
+        /// first time and kept. None when pixman refuses.
+        pub(crate) fn work_image(&mut self) -> Option<*mut c_void> {
+            if self.work.is_none() {
+                // SAFETY: the band is static memory of the program, WORK_W bytes
+                // a line, WORK_H lines, which outlives the image.
+                let image = unsafe {
+                    pixman_image_create_bits(
+                        A8,
+                        WORK_W as i32,
+                        WORK_H as i32,
+                        WORK.0.get().cast::<u32>(),
+                        WORK_W as i32,
+                    )
+                };
+                if image.is_null() {
+                    return None;
+                }
+                self.work = Some(Image(image));
+            }
+            self.work.as_ref().map(|i| i.0)
         }
 
         /// The image of `key`, made when it is not kept. `hint` is the number of
@@ -345,13 +371,14 @@ mod imp {
         true
     }
 
-    /// The work band of `Mask::Product`: an A8 surface of WORK_H lines of
-    /// WORK_W bytes, in the program's own memory (the service has one
-    /// thread, and the band is used inside one call).
+    /// The work band of `Mask::Product` and of `product`: an A8 surface of WORK_H
+    /// lines of WORK_W bytes, in the program's own memory (the service has one
+    /// thread; `Mask::Product` uses the band inside one call, `product` and
+    /// `Mask::Work` in two steps of a band, with nothing else made between them).
     struct Work(core::cell::UnsafeCell<[u32; (WORK_W * WORK_H / 4) as usize]>);
 
-    // SAFETY: the band is touched only inside `element`, by the one thread
-    // of the service.
+    // SAFETY: the band is touched only inside `element` and `product`, by the
+    // one thread of the service.
     unsafe impl Sync for Work {}
 
     static WORK: Work = Work(core::cell::UnsafeCell::new(
@@ -454,6 +481,13 @@ mod imp {
                 if owned.0.is_null() {
                     return false;
                 }
+            }
+            Mask::Work => {
+                let Some(m) = images.work_image() else {
+                    return false;
+                };
+                plane = m;
+                mask_at = (0, 0);
             }
             Mask::Plane { source, at } | Mask::Product { source, at, .. } => {
                 if source.format != Format::A8
@@ -576,6 +610,74 @@ mod imp {
         true
     }
 
+    /// The first step of a stretched element with a mask and an alpha: the mask
+    /// (`size` points from `at` of the A8 surface `mask`) times `alpha` goes to the
+    /// work band at its corner (pixman's SRC of a solid colour through the mask), for
+    /// `Mask::Work` to read. False, with nothing made, when the surface is not what
+    /// its bytes hold, the area is not inside it, the band is too small, or pixman
+    /// could not make an image.
+    pub fn product(
+        images: &mut Images,
+        mask: (&[u8], u32, u32, u32, usize),
+        at: (u32, u32),
+        alpha: u8,
+        size: (u32, u32),
+    ) -> bool {
+        let (bytes, stride, width, height, hint) = mask;
+        if size.0 > WORK_W
+            || size.1 > WORK_H
+            || !shaped(
+                bytes.as_ptr() as usize,
+                bytes.len(),
+                stride,
+                (width, height),
+                1,
+            )
+            || !inside(at.0, at.1, size.0, size.1, width, height)
+        {
+            return false;
+        }
+        let Some(m) = images.image(
+            Key {
+                bytes: bytes.as_ptr() as usize,
+                format: Format::A8,
+                stride,
+                width,
+                height,
+            },
+            src_hint(hint),
+        ) else {
+            return false;
+        };
+        let Some(work) = images.work_image() else {
+            return false;
+        };
+        let color = [0u16, 0, 0, u16::from(alpha) * 257];
+        // SAFETY: the colour is read in the call.
+        let solid = Made(unsafe { pixman_image_create_solid_fill(&color) });
+        if solid.0.is_null() {
+            return false;
+        }
+        // SAFETY: images made above; the rectangle is inside the band's.
+        unsafe {
+            pixman_image_composite32(
+                OP_SRC,
+                solid.0,
+                m,
+                work,
+                0,
+                0,
+                at.0 as i32,
+                at.1 as i32,
+                0,
+                0,
+                size.0 as i32,
+                size.1 as i32,
+            );
+        }
+        true
+    }
+
     /// The image of a source surface is made (when the table does not keep
     /// it), so that the first operation that reads it, in a band, does not
     /// pay for it. False when the surface is not what its bytes hold or
@@ -679,6 +781,9 @@ pub enum Mask<'a> {
         source: Source<'a>,
         at: (u32, u32),
     },
+    /// The work band as the first step (`product`) made it: the mask of an
+    /// element whose mask and alpha were multiplied before.
+    Work,
     /// The A8 surface times an alpha, made in the work band (at most `WORK_W`
     /// by `WORK_H` points).
     Product {
@@ -712,6 +817,37 @@ pub fn composite(
         (w, h),
         src.hint,
     )
+}
+
+/// The first step of a stretched element with a mask and an alpha (`Mask::Work` is
+/// the second): the A8 `mask`'s `size` points from `at` times `alpha` go to the
+/// work band. False, with nothing made, when the mask is not what its bytes hold,
+/// the area is not inside it, or the band is too small.
+#[cfg(target_os = "none")]
+pub fn product(
+    images: &mut Images,
+    mask: Source<'_>,
+    at: (u32, u32),
+    alpha: u8,
+    size: (u32, u32),
+) -> bool {
+    if mask.format != Format::A8 {
+        return false;
+    }
+    imp::product(
+        images,
+        (mask.bytes, mask.stride, mask.width, mask.height, mask.hint),
+        at,
+        alpha,
+        size,
+    )
+}
+
+/// The image over the work band (`product`, `Mask::Work`) is made now and kept,
+/// so that no band pays for it. False when pixman refuses.
+#[cfg(target_os = "none")]
+pub fn prepare_work(images: &mut Images) -> bool {
+    images.work_image().is_some()
 }
 
 /// The image of `src` is made now when the table does not keep it (see

@@ -62,6 +62,14 @@ pub const COMPOSITOR: Record = Record {
     ..comp::COMPOSITOR
 };
 
+/// The compositor of the image of the probe of focus, which calibrates the prices of
+/// its bands before its first request: a deadline of 4 s for its start
+/// (`comp::PROBE_COMPOSITOR`).
+const PROBE_COMPOSITOR: Record = Record {
+    kind: comp::PROBE_COMPOSITOR.kind,
+    ..COMPOSITOR
+};
+
 /// The first client (role `a`): a window of its own, opaque.
 const PROBE_A: Record = Record {
     name: "focus-a",
@@ -109,7 +117,7 @@ const PROBE_INPUT: Record = Record {
 pub const TABLE: &[Record] = &[
     comp::DISPLAY,
     POINTER,
-    COMPOSITOR,
+    PROBE_COMPOSITOR,
     PROBE_A,
     PROBE_B,
     PROBE_WM,

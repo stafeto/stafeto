@@ -2275,11 +2275,18 @@ impl Scene {
             let (first, second) = elements::classes(e, argb);
             let (a, b) = (PRICES[first.row()], second.map(|c| PRICES[c.row()]));
             // The alpha or the mask is part of the one call of pixman the stretch
-            // makes: it adds its rows and points, and no second call. The product
-            // of a mask and an alpha is made in a call of its own (its own key):
-            // that call and its miss are counted.
-            let product = b.filter(|_| second == Some(elements::Class::MaskAlpha));
-            let calls = a.call + LAYER + a.miss + product.map_or(0, |p| p.call + p.miss);
+            // makes: it adds its rows and points, and no second call. A stretch that
+            // is no scale, with a mask and an alpha, is two steps (the product of
+            // the mask and the alpha in the work band, then the stretch through
+            // it): the group is priced as the second, the dearer of the two, with
+            // the mask.
+            let two = second == Some(elements::Class::MaskAlpha);
+            let b = if two {
+                Some(PRICES[elements::Class::Mask.row()])
+            } else {
+                b
+            };
+            let calls = a.call + LAYER + a.miss;
             let at = match open {
                 Some(g) if plan.cost[g].calls + calls <= GROUP_CALLS => g,
                 _ => {
@@ -2291,13 +2298,12 @@ impl Scene {
             let area = intersect(r, damage);
             plan.group[k] = at as u8;
             plan.members[at] |= 1 << k;
+            plan.two_step[at] = two;
             let c = &mut plan.cost[at];
             c.add(a, LAYER + a.miss, area);
             if let Some(b) = b {
-                c.add(b, product.map_or(0, |p| p.miss), area);
-                if product.is_none() {
-                    c.calls -= b.call;
-                }
+                c.add(b, 0, area);
+                c.calls -= b.call;
             }
         }
         let cursor = self.drawn_pointer().map(Scene::cursor_rect);
@@ -2409,6 +2415,9 @@ pub struct Passes {
     pub elements: u32,
     /// The elements of each group, a bit each.
     members: [u16; MAX_ELEMENTS + 2],
+    /// The groups that are one element drawn in two steps for each band (the
+    /// product of its mask and alpha, then the element).
+    two_step: [bool; MAX_ELEMENTS + 2],
 }
 
 impl Passes {
@@ -2420,6 +2429,7 @@ impl Passes {
         cost: [GroupCost::EMPTY; MAX_ELEMENTS + 2],
         elements: 0,
         members: [0; MAX_ELEMENTS + 2],
+        two_step: [false; MAX_ELEMENTS + 2],
     };
 
     /// The size of a band of group `g` (columns and lines): by the calls of the
@@ -2439,6 +2449,11 @@ impl Passes {
     /// The group of the pointer's picture, if it is over the damage.
     pub fn pointer_group(&self) -> Option<usize> {
         Some(usize::from(self.pointer)).filter(|&g| g != usize::from(NO_GROUP))
+    }
+
+    /// Whether group `g` is drawn in two steps for each band (`PHASE`).
+    pub fn is_two_step(&self, g: usize) -> bool {
+        self.two_step[g]
     }
 
     /// The elements in group `g`.
@@ -2820,6 +2835,15 @@ pub trait Raster {
     /// An element's drawing: the points of `draw.src` carried to the screen by
     /// the transform, with the mask or the global alpha (`Draw`).
     fn element(&mut self, fb: &mut [u8], draw: &Draw<'_>);
+
+    /// The first step of an element that is stretched, turned or reflected, with a
+    /// mask and an alpha: the first `size` points of the area from `at` of the A8
+    /// `mask`, times `alpha`, go to the raster's work band; the second step is
+    /// `element` with `Draw::work`, which reads that band as its mask.
+    fn product(&mut self, mask: &Surface<'_>, at: (u32, u32), alpha: u8, size: (u32, u32)) {
+        let _ = (mask, at, alpha, size);
+        panic!("this raster has no work band");
+    }
 }
 
 /// A surface a band reads: a window's buffer (the points of a window of
@@ -2852,6 +2876,10 @@ pub struct Draw<'a> {
     pub transparency: u32,
     pub alpha: u8,
     pub mask: Option<(Surface<'a>, (u32, u32))>,
+    /// The mask is the work band that `Raster::product` made for this area (the
+    /// transparency has both the mask and the alpha bits, `mask` is none, and the
+    /// alpha is already in the band).
+    pub work: bool,
     pub area: Rect,
 }
 
@@ -2864,9 +2892,16 @@ pub struct Band {
     pub col: u32,
     /// The group of layers the next step draws on this place (`Plan`): 0 for the
     /// first step of a place, and for the frame of a scene of windows with no
-    /// elements, always.
+    /// elements, always. The bit `PHASE` says the next step is the second of an
+    /// element of two steps.
     pub pass: u32,
 }
+
+/// The bit of `Band::pass` that says the band is at the second step of its group
+/// (the group is one element that is stretched, turned or reflected, with a mask and
+/// an alpha: the first step makes the product of the mask and the alpha, the second
+/// draws).
+pub const PHASE: u32 = 1 << 31;
 
 /// One band of the frame, from `at` in `damage`: the lines
 /// `at.row..at.row + rows` (to the damage's end) of the columns from `at.col`
@@ -2887,7 +2922,9 @@ pub fn compose(
     // A band of a scene is the size its group allows; one of windows is the
     // size of the layers that touch the damage.
     let size = match passes.as_ref() {
-        Some(plan) if (at.pass as usize) < plan.groups => plan.band(at.pass as usize),
+        Some(plan) if ((at.pass & !PHASE) as usize) < plan.groups => {
+            plan.band((at.pass & !PHASE) as usize)
+        }
         _ => scene.tile_with(damage, passes.as_ref()),
     };
     compose_with(scene, damage, at, size, passes.as_ref(), fb, src, raster)
@@ -2905,13 +2942,16 @@ pub fn compose(
 /// the mask), cut to the band and the screen; an element whose window has
 /// nothing taken or does not hold the source rectangle (a window of the number
 /// went and another took its place), or whose mask is not there, draws nothing.
-/// The pointer's group draws no element (`compose_with` draws the picture).
+/// The pointer's group draws no element (`compose_with` draws the picture). A
+/// group of two steps (`Passes::is_two_step`) makes the product of the mask and
+/// the alpha at `phase` false and draws the element at `phase` true.
 #[allow(clippy::too_many_arguments)]
 fn compose_elements(
     scene: &Scene,
     def: &Def,
     passes: &Passes,
     pass: usize,
+    phase: bool,
     band: Rect,
     fb: &mut [u8],
     src: &impl Source,
@@ -3038,6 +3078,19 @@ fn compose_elements(
         } else {
             None
         };
+        // A group of one element with a mask and an alpha that is stretched, turned or
+        // reflected is two steps: the product of the mask and the alpha, then the
+        // element drawn through it.
+        let two = passes.is_two_step(pass);
+        if two {
+            let Some((m, at)) = &mask else {
+                continue;
+            };
+            if !phase {
+                raster.product(m, *at, e.alpha as u8, (area.w, area.h));
+                continue;
+            }
+        }
         raster.element(
             fb,
             &Draw {
@@ -3051,7 +3104,8 @@ fn compose_elements(
                 filter: e.filter,
                 transparency: e.transparency,
                 alpha: e.alpha as u8,
-                mask,
+                mask: if two { None } else { mask },
+                work: two,
                 area,
             },
         );
@@ -3087,6 +3141,7 @@ fn compose_with(
     raster: &mut impl Raster,
 ) -> Band {
     let (width, rows) = size;
+    let (group, phase) = ((at.pass & !PHASE) as usize, at.pass & PHASE != 0);
     let done = Band {
         row: damage.y + damage.h,
         col: 0,
@@ -3100,10 +3155,10 @@ fn compose_with(
     };
     let walk = match groups {
         Some((_, plan)) => {
-            if at.pass as usize >= plan.groups {
+            if group >= plan.groups {
                 return done;
             }
-            plan.cost[at.pass as usize].rect
+            plan.cost[group].rect
         }
         None => damage,
     };
@@ -3122,9 +3177,9 @@ fn compose_with(
     };
     let mut pointer_now = true;
     if let Some((def, passes)) = groups {
-        compose_elements(scene, def, passes, at.pass as usize, band, fb, src, raster);
+        compose_elements(scene, def, passes, group, phase, band, fb, src, raster);
         // The pointer's picture is the last group, drawn in the steps of it.
-        pointer_now = passes.pointer_group() == Some(at.pass as usize);
+        pointer_now = passes.pointer_group() == Some(group);
     } else {
         let (order, n) = scene.order();
         let window = |k: u8| scene.window(k as usize).copied();
@@ -3194,27 +3249,39 @@ fn compose_with(
             );
         }
     }
+    // The first step of an element of two steps is followed by its second, on the
+    // same band.
+    if let Some((_, plan)) = groups
+        && plan.is_two_step(group)
+        && !phase
+    {
+        return Band {
+            row: y0,
+            col: x0 - damage.x,
+            pass: at.pass | PHASE,
+        };
+    }
     if x1 < walk.x + walk.w {
         Band {
             row: y0,
             col: x1 - damage.x,
-            pass: at.pass,
+            pass: group as u32,
         }
     } else if y1 < walk.y + walk.h {
         Band {
             row: y1,
             col: walk.x - damage.x,
-            pass: at.pass,
+            pass: group as u32,
         }
     } else if let Some((_, plan)) = groups
-        && (at.pass as usize) + 1 < plan.groups
+        && group + 1 < plan.groups
     {
         // The next group, from the corner of its rectangle.
-        let next = plan.cost[at.pass as usize + 1].rect;
+        let next = plan.cost[group + 1].rect;
         Band {
             row: next.y,
             col: next.x - damage.x,
-            pass: at.pass + 1,
+            pass: group as u32 + 1,
         }
     } else {
         done

@@ -700,10 +700,10 @@ impl Pixman {
         );
         // The two images of the warm-up wrapped memory of this frame.
         drop(images);
-        Pixman {
-            images: Images::new(),
-            refused: 0,
-        }
+        let mut images = Images::new();
+        // The image over the work band of the steps of a mask and an alpha.
+        pixman::prepare_work(&mut images);
+        Pixman { images, refused: 0 }
     }
 
     /// The image of a window's buffer is made now (a post), so that no band
@@ -811,6 +811,18 @@ impl Raster for Pixman {
         );
     }
 
+    fn product(
+        &mut self,
+        mask: &compositor::Surface<'_>,
+        at: (u32, u32),
+        alpha: u8,
+        size: (u32, u32),
+    ) {
+        if !pixman::product(&mut self.images, plane(*mask), at, alpha, size) {
+            self.refuse("a product");
+        }
+    }
+
     fn element(&mut self, fb: &mut [u8], d: &Draw<'_>) {
         let mut target = Target {
             bytes: fb,
@@ -874,6 +886,8 @@ fn draw(images: &mut Images, target: &mut Target<'_>, d: &Draw<'_>) -> bool {
         t & TRANSPARENCY_MASK != 0,
         t & TRANSPARENCY_ALPHA != 0,
     ) {
+        // The product of the mask and the alpha was made in the work band.
+        _ if d.work => Mask::Work,
         (Some((m, at)), true, false) => Mask::Plane {
             source: plane(m),
             at,

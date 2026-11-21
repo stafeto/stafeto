@@ -98,8 +98,23 @@ impl Source for Wins {
     }
 }
 
-/// The raster of the tests: the screen's bytes are XRGB8888.
-struct Sampler;
+/// The work band of the raster of pixman (`pixman::WORK_W` by `pixman::WORK_H`).
+const WORK_W: u32 = 640;
+const WORK_H: u32 = 16;
+
+/// The raster of the tests: the screen's bytes are XRGB8888. It has the work band of
+/// the two steps of a mask and an alpha (a byte a point, 640 a line).
+struct Sampler {
+    work: Vec<u8>,
+}
+
+impl Sampler {
+    fn new() -> Sampler {
+        Sampler {
+            work: vec![0; (WORK_W * WORK_H) as usize],
+        }
+    }
+}
 
 fn put(fb: &mut [u8], x: u32, y: u32, v: u32) {
     let at = (y * STRIDE + x * 4) as usize;
@@ -146,10 +161,24 @@ impl Raster for Sampler {
         }
     }
 
+    fn product(&mut self, mask: &Surface<'_>, at: (u32, u32), alpha: u8, size: (u32, u32)) {
+        for y in 0..size.1 {
+            for x in 0..size.0 {
+                let m = point(mask.bytes, mask.stride, Format::A8, at.0 + x, at.1 + y);
+                self.work[(y * WORK_W + x) as usize] = meaning::mul(m, u32::from(alpha)) as u8;
+            }
+        }
+    }
+
     fn element(&mut self, fb: &mut [u8], d: &Draw<'_>) {
         let e = Element {
             filter: d.filter,
-            transparency: d.transparency,
+            // The alpha is in the work band when there is one.
+            transparency: if d.work {
+                d.transparency & !TRANSPARENCY_ALPHA
+            } else {
+                d.transparency
+            },
             alpha: u32::from(d.alpha),
             ..Element::NONE
         };
@@ -171,6 +200,7 @@ impl Raster for Sampler {
                     None => fetch(d.from.0 + x, d.from.1 + y),
                 };
                 let m = match d.mask {
+                    _ if d.work => u32::from(self.work[(y * WORK_W + x) as usize]),
                     Some((m, at)) => point(m.bytes, m.stride, Format::A8, at.0 + x, at.1 + y),
                     None => 255,
                 };
@@ -258,8 +288,9 @@ impl Rig {
             col: 0,
             pass: 0,
         };
+        let mut sampler = Sampler::new();
         while at.row < d.y + d.h {
-            at = compose(&self.scene, d, at, &mut fb, &self.wins, &mut Sampler);
+            at = compose(&self.scene, d, at, &mut fb, &self.wins, &mut sampler);
         }
         self.scene.end(true);
         fb
@@ -925,20 +956,14 @@ fn sixteen_of_the_dearest_over_the_screen_make_steps_under_the_gate_by_the_model
     }
     rig.scene.end(true);
     assert!(
-        worst <= u64::from(BAND_GATE - 1_080) + PRODUCT,
+        worst <= u64::from(BAND_GATE - 1_080),
         "a step costs {worst} by the model"
     );
-    // One step for each element, the black's apart, and the pointer's.
-    assert_eq!(steps, 18, "{steps} steps, worst {worst}");
+    // One step for each element, the black's apart, and the pointer's; the
+    // elements with a mask and an alpha that are stretched are two steps each
+    // (16 of them): 34.
+    assert_eq!(steps, 34, "{steps} steps, worst {worst}");
 }
-
-/// The call of the product of a mask and an alpha with its miss (ticks): a bilinear
-/// stretch with both, from an opaque source, pays it besides the stretch's own call,
-/// and by the model such a layer alone is a step over the gate less the 1 080 around
-/// it, whatever the band: the one-point step may pass the gate by this much in the
-/// model (the model errs high by the margins; a run of the probe is what shows it).
-const PRODUCT: u64 = (PRICES[elements::Class::MaskAlpha.row()].call
-    + PRICES[elements::Class::MaskAlpha.row()].miss) as u64;
 
 /// Walks the frame of the scene committed in `rig` over `d` as the service does,
 /// each step through a `StepCost` raster, and checks the key of the model: every
@@ -953,8 +978,10 @@ fn walk_priced(rig: &Rig, d: Rect) -> (u32, Vec<u32>) {
     let mut at = Band::default();
     let mut fb = vec![0u8; (STRIDE * HEIGHT) as usize];
     let mut steps = 0;
+    let mut first_step = 0;
     while at.row < d.y + d.h {
-        let g = at.pass as usize;
+        let g = (at.pass & !PHASE) as usize;
+        let second = at.pass & PHASE != 0;
         let r = plan.cost[g].rect;
         let (w, h) = plan.band(g);
         let mut model = StepCost {
@@ -964,7 +991,7 @@ fn walk_priced(rig: &Rig, d: Rect) -> (u32, Vec<u32>) {
         let next = compose(&rig.scene, d, at, &mut fb, &rig.wins, &mut model);
         let ticks = model.ticks() + u64::from(SCENE_STEP);
         let limit = if (w, h) == (1, 1) {
-            u64::from(BAND_GATE - 1_080) + PRODUCT
+            u64::from(BAND_GATE - 1_080)
         } else {
             u64::from(BAND_TICKS)
         };
@@ -983,6 +1010,19 @@ fn walk_priced(rig: &Rig, d: Rect) -> (u32, Vec<u32>) {
             "step {steps} of group {g} starts at row {} outside {r:?}",
             at.row
         );
+        // The first step of two is no dearer than the second: the band the second
+        // allows holds the first.
+        if plan.is_two_step(g) {
+            assert_eq!(plan.members_of(g), 1, "a group of two steps is one element");
+            if second {
+                assert!(
+                    ticks >= first_step,
+                    "step {steps} of group {g}: {ticks} < {first_step}"
+                );
+            } else {
+                first_step = ticks;
+            }
+        }
         each[g] += 1;
         steps += 1;
         at = next;
@@ -1163,6 +1203,16 @@ impl Raster for StepCost {
         self.add(p, area);
     }
 
+    fn product(&mut self, _: &Surface<'_>, _: (u32, u32), _: u8, size: (u32, u32)) {
+        // The first step of an element of two steps: the product of a mask and an
+        // alpha over the band's area (the price of a mask with an alpha; its own call
+        // and its miss).
+        let p = PRICES[elements::Class::MaskAlpha.row()];
+        self.layers += 1;
+        self.calls += p.miss;
+        self.add(p, size);
+    }
+
     fn element(&mut self, _: &mut [u8], d: &Draw<'_>) {
         // The classes by what the raster is told (a turn of a quarter is read as
         // a general transform, which errs high).
@@ -1177,6 +1227,12 @@ impl Raster for StepCost {
             mask: t & TRANSPARENCY_MASK != 0,
             alpha: t & TRANSPARENCY_ALPHA != 0,
         });
+        // The second step of an element of two steps has the product made: the mask only.
+        let extra = if d.work {
+            Some(elements::Class::Mask)
+        } else {
+            extra
+        };
         let p = PRICES[first.row()];
         self.layers += 1;
         self.calls += p.miss;
@@ -1185,12 +1241,7 @@ impl Raster for StepCost {
             // The alpha or the mask is in the one call: rows and points.
             let x = PRICES[x.row()];
             self.add(x, area);
-            if extra == Some(elements::Class::MaskAlpha) {
-                // The product of a mask and an alpha is a call of its own.
-                self.calls += x.miss;
-            } else {
-                self.calls -= x.call;
-            }
+            self.calls -= x.call;
         }
     }
 }
