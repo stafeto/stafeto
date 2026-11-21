@@ -1975,6 +1975,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wfc"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-comp",
+ "proto-wire",
+]
+
+[[package]]
 name = "wfd"
 version = "0.1.0"
 dependencies = [

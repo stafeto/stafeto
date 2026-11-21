@@ -1,0 +1,16 @@
+[package]
+name = "wfc"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The state and the rules of an OpenWF Composition 1.0 device over the scene session of the composition service of stafeto (proto_comp), as logic with no kernel call in it: handles, attributes, the scene order, commits, activation, composition"
+
+[lib]
+bench = false
+
+[dependencies]
+abi = { path = "../abi" }
+proto-comp = { path = "../../proto/comp" }
+proto-wire = { path = "../../proto/wire" }
