@@ -42,15 +42,20 @@ use crate::{
 
 /// The stack of the compositor: its loop's table of 96 sessions, the clones
 /// it gave, the rings of events of its windows, and the frames of pixman's
-/// general path, which keeps scanline buffers of 24 KiB on the stack.
-pub const COMP_STACK_SIZE: u32 = 64 * 1024;
+/// general path, which keeps scanline buffers of 24 KiB on the stack (a turned
+/// element in a scene runs it under the general path, and 64 KiB did not hold it).
+pub const COMP_STACK_SIZE: u32 = 128 * 1024;
+
+/// The stack of the probe: the scene holder keeps the scenes of its elements and
+/// the messages of its calls on it.
+pub const PROBE_STACK_SIZE: u32 = 2 * CHILD_STACK_SIZE;
 
 /// The probe's image: the driver, the compositor, the two clients.
 pub const PROGRAMS: [ImageProgram; 4] = [
     ("init", "init", INIT_STACK_SIZE, &["table-comp"]),
     ("virtio-gpu", "virtio-gpu", gpu_probe::GPU_STACK_SIZE, &[]),
     ("compositor", "compositor", COMP_STACK_SIZE, &[]),
-    ("comp-probe", "comp-probe", CHILD_STACK_SIZE, &[]),
+    ("comp-probe", "comp-probe", PROBE_STACK_SIZE, &[]),
 ];
 
 /// The image of the run under -icount: the driver and the compositor count
@@ -64,7 +69,7 @@ pub const STEPS_PROGRAMS: [ImageProgram; 4] = [
         &["steps"],
     ),
     ("compositor", "compositor", COMP_STACK_SIZE, &["steps"]),
-    ("comp-probe", "comp-probe", CHILD_STACK_SIZE, &["quick"]),
+    ("comp-probe", "comp-probe", PROBE_STACK_SIZE, &["quick"]),
 ];
 
 pub const DRIVER_LINE: &str = gpu_probe::SERVICE_LINE;
@@ -87,6 +92,13 @@ const SCENE_LEGACY: &str = "comp-probe: scene legacy crc ";
 const SCENE_STATIC: &str = "comp-probe: scene static crc ";
 const SCENE_COMPOSED: &str = "comp-probe: scene composed crc ";
 const LEGACY_BACK: &str = "comp-probe: legacy back crc ";
+/// The scenes of the elements, in the order the holder shows them.
+const ELEMENT_STRETCH: &str = "comp-probe: element stretch crc ";
+const ELEMENT_ORIENT: &str = "comp-probe: element orient crc ";
+const ELEMENT_BILINEAR: &str = "comp-probe: element bilinear crc ";
+const ELEMENT_ALPHA: &str = "comp-probe: element alpha crc ";
+const ELEMENT_MASK: &str = "comp-probe: element mask crc ";
+const ELEMENT_MASK_CUT: &str = "comp-probe: element maskcut crc ";
 const ENDED: &str = "init: comp-probe ended: exit code 0, not restarted";
 const ENDED_C: &str = "init: comp-probe-c ended: exit code 0, not restarted";
 const ENDED_B: &str = "init: comp-probe-b ended: exit code 0, not restarted";
@@ -96,7 +108,7 @@ const S_ENDS: &str = "init: comp-probe-s ended: ";
 
 /// The lines each client prints once per check that passed, and how many
 /// times a run has each.
-const CHECKS: [(&str, usize); 33] = [
+const CHECKS: [(&str, usize); 34] = [
     ("comp-probe: the screen is 640x400, no window yet", 1),
     (
         "comp-probe: windows outside the screen or of another format are refused",
@@ -173,6 +185,10 @@ const CHECKS: [(&str, usize); 33] = [
     ),
     (
         "comp-probe: a scene composed on request is made by SCENE_COMPOSE, COMPOSED comes",
+        1,
+    ),
+    (
+        "comp-probe: elements are drawn: a stretch, the turns and the reflection, the bilinear mean, a global alpha, a mask",
         1,
     ),
     ("comp-probe: the scene holder ends with its windows", 1),
@@ -1006,7 +1022,7 @@ pub fn fit_text(costs: &[ShapeCost]) -> String {
     let hundredths = |v: u64| format!("{}.{:02}", v / 100, v % 100);
     let mut fits = Vec::new();
     let mut parts = Vec::new();
-    for kind in ["black", "copy", "over"] {
+    for kind in compositor::PRICES.iter().map(|p| p.kind) {
         let Some((fit, slack)) = fit_of(costs, kind) else {
             parts.push(format!("{kind}: no fit (shapes missing)"));
             continue;
@@ -1177,7 +1193,18 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
     // The holder of a scene: the two windows of the first client through
     // their elements, the window of the first revision shown directly under a
     // scene, and a scene composed on request.
-    for prefix in [SCENE, SCENE_LEGACY, SCENE_STATIC, SCENE_COMPOSED] {
+    for prefix in [
+        SCENE,
+        SCENE_LEGACY,
+        SCENE_STATIC,
+        SCENE_COMPOSED,
+        ELEMENT_STRETCH,
+        ELEMENT_ORIENT,
+        ELEMENT_BILINEAR,
+        ELEMENT_ALPHA,
+        ELEMENT_MASK,
+        ELEMENT_MASK_CUT,
+    ] {
         compare(run, &mut monitor, prefix)?;
     }
     run.expect_line(ENDED_S, |l| l == ENDED_S, WITHIN)?;
@@ -1213,7 +1240,7 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
         qemu::parse_gpu_trace(&text).map_err(|e| format!("comp-probe on {}: {e}", machine.name))?;
     bypass_trace_verdict(&events).map_err(|e| format!("comp-probe on {}: {e}", machine.name))?;
     println!(
-        "comp-probe on {}: the screen matched the guest's frames for a window, a rectangle of it, two windows, the black screen after a process ended, a window of the first revision shown from the pool (the trace shows the scanout on resource 2, no band put together over three FLUSHes), a window over it (resource 1) and the pool again (resource 2), then the two windows through the elements of a scene, a window of the first revision shown directly under a scene and a scene composed on request",
+        "comp-probe on {}: the screen matched the guest's frames for a window, a rectangle of it, two windows, the black screen after a process ended, a window of the first revision shown from the pool (the trace shows the scanout on resource 2, no band put together over three FLUSHes), a window over it (resource 1) and the pool again (resource 2), then the two windows through the elements of a scene, a window of the first revision shown directly under a scene, a scene composed on request, and the scenes of the elements a stretch, the eight orientations, the bilinear mean, a global alpha and a mask, each the CRC the reference works out point by point",
         machine.name
     );
     if !machine.is_hvf() {
@@ -1281,7 +1308,7 @@ pub const LATE_PROGRAMS: [ImageProgram; 4] = [
         &["steps"],
     ),
     ("compositor", "compositor", COMP_STACK_SIZE, &["late-open"]),
-    ("comp-probe", "comp-probe", CHILD_STACK_SIZE, &["quick"]),
+    ("comp-probe", "comp-probe", PROBE_STACK_SIZE, &["quick"]),
 ];
 
 /// The details the compositor gives the steps of the opening from a request: a portion of the
