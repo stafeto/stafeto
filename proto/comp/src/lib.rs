@@ -210,6 +210,22 @@ pub const fn line_bytes(format: u32, width: u32) -> Option<u32> {
     }
 }
 
+/// The id of a window: its place in the service's table (3 bits) and the
+/// count of windows made at that place (`generation`, 1 to ID_GENERATION_MAX,
+/// above the place), so the id of a window that went is no window's again and
+/// is below 2^27, a positive `i32`. It is what WINDOW_CREATE answers, what LIST
+/// and the events CREATE and CLOSE carry and what MANAGE and an element name.
+pub const ID_GENERATION_MAX: u32 = (1 << 24) - 1;
+pub const fn window_id(place: u32, generation: u32) -> u32 {
+    generation << 3 | place
+}
+pub const fn id_place(id: u32) -> u32 {
+    id & 7
+}
+pub const fn id_generation(id: u32) -> u32 {
+    id >> 3
+}
+
 /// The bit the service sends a window's channel when its ring has events;
 /// bits 0 to 2 tell the buffer that is free.
 pub const EVENTS_BIT: u64 = 1 << 3;
@@ -513,7 +529,8 @@ pub const MOVE: u16 = 2;
 pub const BUTTON: u16 = 3;
 pub const FOCUS_IN: u16 = 4;
 pub const FOCUS_OUT: u16 = 5;
-/// The manager's: a window was made, a window went. `code` is its id.
+/// The manager's: a window was made, a window went. `code` is its place and
+/// `value` its id (`window_id`), which the manager gives back in MANAGE.
 pub const CREATE: u16 = 6;
 pub const CLOSE: u16 = 7;
 
@@ -2033,5 +2050,17 @@ mod tests {
         Header::read(&mut r).unwrap();
         assert_eq!(read_scene_compose(r), Err(code(INVALID)));
         assert_eq!(read_scene_compose(Reader::new(&[])), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn a_window_id_is_its_place_and_the_count_of_windows_made_there() {
+        let id = window_id(5, 77);
+        assert_eq!(id_place(id), 5);
+        assert_eq!(id_generation(id), 77);
+        assert_ne!(window_id(5, 78), id);
+        // The greatest id is a positive i32 and is not NO_WINDOW.
+        let top = window_id(7, ID_GENERATION_MAX);
+        assert!(top < 1 << 27 && top as i32 > 0);
+        assert_ne!(top, NO_WINDOW);
     }
 }

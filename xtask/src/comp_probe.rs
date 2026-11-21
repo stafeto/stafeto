@@ -84,6 +84,7 @@ const LEGACY_PARTIAL: &str = "comp-probe: legacy partial crc ";
 const ABOVE: &str = "comp-probe: above crc ";
 const SCENE: &str = "comp-probe: scene crc ";
 const SCENE_LEGACY: &str = "comp-probe: scene legacy crc ";
+const SCENE_STATIC: &str = "comp-probe: scene static crc ";
 const SCENE_COMPOSED: &str = "comp-probe: scene composed crc ";
 const LEGACY_BACK: &str = "comp-probe: legacy back crc ";
 const ENDED: &str = "init: comp-probe ended: exit code 0, not restarted";
@@ -1176,7 +1177,7 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
     // The holder of a scene: the two windows of the first client through
     // their elements, the window of the first revision shown directly under a
     // scene, and a scene composed on request.
-    for prefix in [SCENE, SCENE_LEGACY, SCENE_COMPOSED] {
+    for prefix in [SCENE, SCENE_LEGACY, SCENE_STATIC, SCENE_COMPOSED] {
         compare(run, &mut monitor, prefix)?;
     }
     run.expect_line(ENDED_S, |l| l == ENDED_S, WITHIN)?;

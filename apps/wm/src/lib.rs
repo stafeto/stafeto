@@ -81,7 +81,7 @@ impl Chords {
     /// part of a chord) ask nothing.
     pub fn event(&mut self, e: &Event) -> Option<Command> {
         match e.kind {
-            CREATE => Some(Command::Focus(u32::from(e.code))),
+            CREATE => Some(Command::Focus(e.value as u32)),
             KEY => self.key(e.code, e.value != 0),
             _ => None,
         }
@@ -169,7 +169,10 @@ mod tests {
     #[test]
     fn a_new_window_gets_the_focus() {
         let mut c = Chords::new();
-        assert_eq!(c.event(&Event::new(CREATE, 3, 0)), Some(Command::Focus(3)));
+        assert_eq!(
+            c.event(&Event::new(CREATE, 3, 0x2b)),
+            Some(Command::Focus(0x2b))
+        );
         assert_eq!(c.event(&Event::new(proto_comp::CLOSE, 3, 0)), None);
     }
 

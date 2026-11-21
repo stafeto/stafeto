@@ -455,6 +455,9 @@ pub enum Refusal {
 /// One window.
 #[derive(Clone, Copy, Debug)]
 pub struct Window {
+    /// The id the clients know the window by (`proto_comp::window_id`): its
+    /// place and the count of windows made there.
+    pub id: u32,
     pub label: u64,
     pub ctx: u64,
     pub rect: Rect,
@@ -651,6 +654,8 @@ pub struct Scene {
     /// and the one a commit is parsed into (no scene is copied: the places
     /// change their roles).
     defs: [Def; 3],
+    /// The windows made at each place so far (the generation of the id).
+    made: [u32; MAX_WINDOWS],
     slot_pending: Option<u8>,
     slot_working: Option<u8>,
     stage: Stage,
@@ -700,7 +705,8 @@ impl Stage {
 /// What a taking gave back of the windows no element shows (`Scene::given_back`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GivenBack {
-    /// The buffer of each window that is free again, by place.
+    /// The buffer of each window that is free again, by place: the one a
+    /// window no element shows had as its current one before it posted.
     pub freed: [Option<u8>; MAX_WINDOWS],
     /// The windows of the first revision whose FLUSH has its answer, by place.
     pub answered: u8,
@@ -794,6 +800,7 @@ impl Scene {
             created: 0,
             frames: 0,
             defs: [Def::EMPTY; 3],
+            made: [0; MAX_WINDOWS],
             slot_pending: None,
             slot_working: None,
             stage: Stage::NEW,
@@ -802,6 +809,14 @@ impl Scene {
 
     pub fn window(&self, i: usize) -> Option<&Window> {
         self.windows.get(i).and_then(Option::as_ref)
+    }
+
+    /// The place of the live window with id `id`: None for an id that names no
+    /// window, or the window of that place that went (the place holds another
+    /// window now, with another id).
+    pub fn place_of(&self, id: u32) -> Option<usize> {
+        let place = proto_comp::id_place(id) as usize;
+        self.window(place).filter(|w| w.id == id).map(|_| place)
     }
 
     /// The place of the window with `label`.
@@ -1028,7 +1043,15 @@ impl Scene {
             .ok_or(Refusal::Limit)?;
         self.seq = self.seq.wrapping_add(1);
         self.created += 1;
+        let generation = if self.made[place] >= proto_comp::ID_GENERATION_MAX {
+            1
+        } else {
+            self.made[place] + 1
+        };
+        self.made[place] = generation;
+        let id = proto_comp::window_id(place as u32, generation);
         self.windows[place] = Some(Window {
+            id,
             label,
             ctx,
             rect,
@@ -1048,7 +1071,7 @@ impl Scene {
             shown_once: false,
         });
         self.rings[place].clear();
-        self.tell_manager(Event::new(CREATE, place as u16, 0));
+        self.tell_manager(Event::new(CREATE, place as u16, id as i32));
         Ok(place)
     }
 
@@ -1159,7 +1182,7 @@ impl Scene {
         // may come before or after the window's buffer is taken.
         for def in [self.working(), self.pending_def()].into_iter().flatten() {
             for r in rects {
-                if let Some(d) = elements::window_damage(def, i as u32, *r) {
+                if let Some(d) = elements::window_damage(def, w.id, *r) {
                     sum = Some(union(sum, d));
                 }
             }
@@ -1348,7 +1371,7 @@ impl Scene {
         if self.held == Some(i) {
             self.held = None;
         }
-        self.tell_manager(Event::new(CLOSE, i as u16, 0));
+        self.tell_manager(Event::new(CLOSE, i as u16, w.id as i32));
         if self.focus == Some(i) {
             self.focus = None;
             if let Some(top) = self.top(None) {
@@ -1789,7 +1812,7 @@ impl Scene {
                 && [self.slot_working, self.slot_pending]
                     .into_iter()
                     .flatten()
-                    .any(|k| self.defs[usize::from(k)].uses(i as u32))
+                    .any(|k| self.defs[usize::from(k)].uses(w.id))
             {
                 continue;
             }
@@ -1813,7 +1836,8 @@ impl Scene {
                 }
             }
             w.in_frame = true;
-            if !core::mem::replace(&mut w.shown_once, true) {
+            // A mask gets neither the focus nor the top place.
+            if !core::mem::replace(&mut w.shown_once, true) && w.format != Format::A8 {
                 first |= 1 << i;
             }
         }
@@ -1880,12 +1904,12 @@ impl Scene {
             // one that counts: it is a window of the first revision, opaque, the
             // whole of it on the whole screen, with no turn, no reflection, no
             // mask and no transparency.
-            let top =
-                def.elements().iter().rev().find_map(|e| {
-                    let w = self.window(usize::try_from(e.source).ok()?)?;
-                    (w.current.is_some() && elements::source_fits(e, w.rect.w, w.rect.h))
-                        .then_some((e, w, e.source as usize))
-                });
+            let top = def.elements().iter().rev().find_map(|e| {
+                let place = self.place_of(e.source)?;
+                let w = self.window(place)?;
+                (w.current.is_some() && elements::source_fits(e, w.rect.w, w.rect.h))
+                    .then_some((e, w, place))
+            });
             return match top {
                 Some((e, w, place))
                     if w.legacy
@@ -2037,6 +2061,34 @@ fn covers_rect(outer: Rect, inner: Rect) -> bool {
         && outer.y + outer.h >= inner.y + inner.h
 }
 
+/// Who holds the subscription to the ring of the manager (MANAGE SUBSCRIBE).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holder {
+    Unsubscribed,
+    /// A session with MANAGER_MARK (`wm`).
+    Manager,
+    /// The scene session.
+    Scene,
+}
+
+/// Whether SCENE_COMMIT and SCENE_COMPOSE are taken: not while a manager that
+/// holds no scene has subscribed (input under a scene goes to the ring, which
+/// would then be the manager's).
+pub const fn scene_allowed(holder: Holder) -> bool {
+    !matches!(holder, Holder::Manager)
+}
+
+/// Whether the scene session's SUBSCRIBE is taken: not while a manager has.
+pub const fn subscribe_allowed(holder: Holder, caller_scene: bool) -> bool {
+    !(caller_scene && matches!(holder, Holder::Manager))
+}
+
+/// Whether a MANAGE of a session is taken: the scene session's always; a
+/// manager's not once the scene has subscribed or has committed a scene.
+pub const fn manage_allowed(holder: Holder, scene_committed: bool, caller_scene: bool) -> bool {
+    caller_scene || !(matches!(holder, Holder::Scene) || scene_committed)
+}
+
 /// Whether an element shows the whole window of the first revision, one point
 /// for one, on the whole screen: no turn, no reflection, no mask, no
 /// transparency, the source rectangle the whole window (the rule of the direct
@@ -2083,11 +2135,13 @@ impl Scene {
         let k = self.free_slot();
         let def = &self.defs[k];
         let shape = |id: u32| {
-            self.window(id as usize).map(|w| Shape {
-                format: w.format,
-                w: w.rect.w,
-                h: w.rect.h,
-            })
+            self.place_of(id)
+                .and_then(|p| self.window(p))
+                .map(|w| Shape {
+                    format: w.format,
+                    w: w.rect.w,
+                    h: w.rect.h,
+                })
         };
         elements::check(def, shape).map_err(|f| match f {
             Fault::Invalid => Refusal::Invalid,
@@ -2196,17 +2250,25 @@ impl Scene {
             let Some(w) = w else {
                 continue;
             };
-            let id = i as u32;
+            let id = w.id;
             if working.is_some_and(|d| d.uses(id)) || pending.is_some_and(|d| d.uses(id)) {
                 continue;
             }
+            // A window no element shows keeps the last buffer it posted as its
+            // current one, which an element added later shows from its first
+            // frame, and the buffer that was current is free at once (no band
+            // reads it). A window of the first revision has its FLUSH answered.
             if w.legacy {
                 if w.posted.take().is_some() {
+                    w.current = Some(0);
                     self.stage.answered |= 1 << i;
                 }
             } else if let Some(b) = w.posted.take() {
-                w.bufs[b as usize] = Buf::Free;
-                self.stage.given[i] = Some(b);
+                w.bufs[b as usize] = Buf::Taken;
+                if let Some(old) = w.current.replace(b) {
+                    w.bufs[old as usize] = Buf::Free;
+                    self.stage.given[i] = Some(old);
+                }
             }
         }
         !self.working().is_some_and(|d| d.active) && !compose_now
@@ -2238,7 +2300,7 @@ impl Scene {
     /// has a buffer taken and holds the source rectangle; None otherwise (it
     /// shows nothing).
     pub fn element_place(&self, e: &Element) -> Option<Rect> {
-        let w = self.window(usize::try_from(e.source).ok()?)?;
+        let w = self.window(self.place_of(e.source)?)?;
         if w.current.is_none() || !elements::source_fits(e, w.rect.w, w.rect.h) {
             return None;
         }
@@ -2388,9 +2450,8 @@ fn compose_elements(
     let (x1, y1) = (x0 + i64::from(band.w), y0 + i64::from(band.h));
     let els = def.elements();
     let places = |e: &Element| {
-        scene
-            .element_place(e)
-            .map(|_| scene.window(e.source as usize))
+        let place = scene.place_of(e.source)?;
+        scene.element_place(e).map(|_| (place, scene.window(place)))
     };
     // The topmost element that copies and covers the band whole.
     let base = els.iter().rposition(|e| {
@@ -2405,7 +2466,7 @@ fn compose_elements(
         raster.fill(fb, band, def.fill());
     }
     for e in &els[base.unwrap_or(0)..] {
-        let Some(Some(w)) = places(e) else {
+        let Some((place, Some(w))) = places(e) else {
             continue;
         };
         let Some(b) = w.current else {
@@ -2423,7 +2484,7 @@ fn compose_elements(
         );
         raster.blit(
             fb,
-            src.pixels(e.source as usize, b),
+            src.pixels(place, b),
             w.stride,
             w.format,
             (w.rect.w, w.rect.h),
@@ -2431,7 +2492,7 @@ fn compose_elements(
             (ax0 as u32, ay0 as u32),
             ((ax1 - ax0) as u32, (ay1 - ay0) as u32),
             e.transparency == proto_comp::TRANSPARENCY_SOURCE,
-            image_of(e.source as usize, b),
+            image_of(place, b),
         );
     }
 }
@@ -2551,6 +2612,11 @@ mod tests {
 
     fn rect(x: u32, y: u32, w: u32, h: u32) -> Rect {
         Rect { x, y, w, h }
+    }
+
+    /// The id of the first window made at `place`.
+    fn gen1(place: usize) -> i32 {
+        proto_comp::window_id(place as u32, 1) as i32
     }
 
     /// Buffers of fixed bytes, a byte value for each window and buffer.
@@ -3110,8 +3176,8 @@ mod tests {
             (&out[..n], lost),
             (
                 &[
-                    Event::new(CREATE, c as u16, 0),
-                    Event::new(CLOSE, c as u16, 0)
+                    Event::new(CREATE, c as u16, gen1(c)),
+                    Event::new(CLOSE, c as u16, gen1(c))
                 ][..],
                 false
             )
@@ -3389,8 +3455,8 @@ mod tests {
         assert_eq!(
             &out[..got],
             [
-                Event::new(CREATE, n as u16, 0),
-                Event::new(CREATE, l as u16, 0)
+                Event::new(CREATE, n as u16, gen1(n)),
+                Event::new(CREATE, l as u16, gen1(l))
             ]
         );
         // Nothing gave the window the focus yet: the first take of its
@@ -4619,7 +4685,7 @@ mod tests {
         assert!(events(&mut s, a).is_empty());
         let mut out = [Event::default(); 4];
         let (n, _) = s.take_manager_events(&mut out);
-        assert_eq!(&out[..n], [Event::new(CREATE, a as u16, 0)]);
+        assert_eq!(&out[..n], [Event::new(CREATE, a as u16, gen1(a))]);
         // The manager decides.
         s.focus_on(a).unwrap();
         assert_eq!(events(&mut s, a), [Event::new(FOCUS_IN, 0, 0)]);
@@ -4777,7 +4843,7 @@ mod tests {
     /// An element showing all of window `source` (`w` by `h` points) at (`x`, `y`).
     fn element(source: usize, x: i32, y: i32, w: i32, h: i32) -> Element {
         Element {
-            source: source as u32,
+            source: gen1(source) as u32,
             mask: NO_WINDOW,
             sx: 0,
             sy: 0,
@@ -4847,7 +4913,7 @@ mod tests {
             &[element(1, 200, 100, 100, 50)],
         ))
         .unwrap();
-        assert_eq!(s.working().unwrap().elements()[0].source, 0);
+        assert_eq!(s.working().unwrap().elements()[0].source, gen1(0) as u32);
         assert!(s.begin().is_none(), "no second frame in work");
         while at.row < d.y + d.h {
             at = compose(&s, d, at, &mut fb, &src, &mut Plain);
@@ -4860,11 +4926,10 @@ mod tests {
             "the second scene is not in this frame"
         );
         // The next taking makes the second scene the working one whole. The
-        // window it shows was given back at the first taking (no element showed
-        // it): its producer posts again.
-        s.post(1, 0, &[]).unwrap();
+        // window it shows posted before it was in a scene: its last buffer is
+        // its current one (nothing was lost).
         let d = s.begin().unwrap();
-        assert_eq!(s.working().unwrap().elements()[0].source, 1);
+        assert_eq!(s.working().unwrap().elements()[0].source, gen1(1) as u32);
         assert!(d.w > 0);
         draw(&s, d, &mut fb, &src);
         s.end(true);
@@ -4915,7 +4980,7 @@ mod tests {
         // A mask that is a window of the wrong format: INVALID.
         let mut e = element(0, 0, 0, 100, 50);
         e.transparency = proto_comp::TRANSPARENCY_MASK;
-        e.mask = 1;
+        e.mask = gen1(1) as u32;
         assert_eq!(
             s.scene_commit(&commit(ACTIVE, 0, &[e])),
             Err(Refusal::Invalid)
@@ -4923,51 +4988,198 @@ mod tests {
         // The scene the first commit left is the one taken.
         post_all(&mut s);
         s.begin().unwrap();
-        assert_eq!(s.working().unwrap().elements()[0].source, 0);
+        assert_eq!(s.working().unwrap().elements()[0].source, gen1(0) as u32);
         assert_eq!(s.working().unwrap().bg, 0xFF00_0000);
     }
 
     #[test]
-    fn a_window_no_element_shows_gets_its_buffer_back_at_the_taking() {
+    fn a_window_no_element_shows_keeps_its_last_buffer_and_frees_the_one_before() {
         let mut s = staged();
         s.scene_commit(&commit(ACTIVE, 0xFF00_0000, &[element(0, 0, 0, 100, 50)]))
             .unwrap();
         post_all(&mut s);
         let d = s.begin().unwrap();
+        // Windows 1 and 2 posted buffer 0 and no element shows them: it is
+        // their current buffer now, and no buffer is free again yet.
         let given = s.given_back();
-        // Windows 1 and 2 posted buffer 0 and no element shows them.
-        assert_eq!(given.freed[0], None);
-        assert_eq!(given.freed[1], Some(0));
-        assert_eq!(given.freed[2], Some(0));
-        assert_eq!(s.window(1).unwrap().bufs[0], Buf::Free);
-        assert!(s.window(1).unwrap().current.is_none());
+        assert_eq!(given.freed, [None; MAX_WINDOWS]);
+        assert_eq!(s.window(1).unwrap().current, Some(0));
+        assert_eq!(s.window(1).unwrap().bufs[0], Buf::Taken);
         assert_eq!(s.window(0).unwrap().bufs[0], Buf::Taken);
         assert_eq!(s.given_back(), GivenBack::default(), "told once");
         draw(&s, d, &mut screen(), &solid(&[]));
         s.end(true);
-        // A post of a window that shows nothing damages nothing, and still asks
-        // for the taking that gives the buffer back: no frame, a buffer free.
-        s.post(1, 0, &[]).unwrap();
+        // Its next buffer replaces it, and the one before is free at the taking,
+        // which has no frame to make: no damage, a buffer free.
+        s.post(1, 1, &[]).unwrap();
         assert!(s.damaged());
         assert!(s.begin().is_none());
         assert_eq!(s.given_back().freed[1], Some(0));
         assert!(!s.damaged());
         assert_eq!(s.window(1).unwrap().bufs[0], Buf::Free);
-        // The buffer can be posted again.
+        assert_eq!(s.window(1).unwrap().current, Some(1));
         s.post(1, 0, &[]).unwrap();
     }
 
     #[test]
-    fn a_buffer_given_back_is_free_for_the_windows_every_other_buffer_too() {
+    fn an_element_added_later_shows_the_picture_its_window_posted_before() {
+        let mut s = staged();
+        s.scene_commit(&commit(ACTIVE, 0xFF00_0000, &[element(0, 0, 0, 100, 50)]))
+            .unwrap();
+        post_all(&mut s);
+        let d = s.begin().unwrap();
+        draw(&s, d, &mut screen(), &solid(&[]));
+        s.end(true);
+        // Window 2 posted once, before any element showed it: a static picture.
+        s.scene_commit(&commit(
+            ACTIVE,
+            0xFF00_0000,
+            &[element(0, 0, 0, 100, 50), element(2, 300, 200, 100, 50)],
+        ))
+        .unwrap();
+        let d = s.begin().unwrap();
+        let mut fb = screen();
+        draw(&s, d, &mut fb, &solid(&[(0, 0x10), (2, 0x66)]));
+        s.end(true);
+        assert_eq!(at_point(&fb, 310, 210), 0x66, "the first frame has it");
+    }
+
+    #[test]
+    fn a_window_that_took_the_place_of_one_that_went_is_not_shown_by_the_old_element() {
+        let mut s = Scene::new();
+        s.set_manager(true);
+        let a = make(&mut s, 1, 1, rect(0, 0, 100, 50), 2);
+        let old = s.window(a).unwrap().id;
+        s.post(a, 0, &[]).unwrap();
+        let shown = Element {
+            source: old,
+            ..element(0, 300, 200, 100, 50)
+        };
+        s.scene_commit(&commit(ACTIVE, 0xFF00_0000, &[shown]))
+            .unwrap();
+        let d = s.begin().unwrap();
+        let mut fb = screen();
+        draw(&s, d, &mut fb, &solid(&[(0, 0x55)]));
+        s.end(true);
+        assert_eq!(at_point(&fb, 310, 210), 0x55);
+        // The window goes and a window of another client takes its place.
+        s.destroy(a);
+        let mut out = [Event::default(); 8];
+        let _ = s.take_manager_events(&mut out);
+        let b = make(&mut s, 2, 2, rect(0, 0, 100, 50), 2);
+        assert_eq!(b, a, "the same place");
+        let new = s.window(b).unwrap().id;
+        assert_ne!(new, old);
+        assert_eq!(proto_comp::id_place(new), proto_comp::id_place(old));
+        assert_eq!(s.place_of(old), None);
+        assert_eq!(s.place_of(new), Some(b));
+        let (n, _) = s.take_manager_events(&mut out);
+        assert_eq!(n, 1);
+        assert_eq!(out[0], Event::new(CREATE, b as u16, new as i32));
+        // The element of the working scene shows nothing of it ...
+        s.post(b, 0, &[]).unwrap();
+        let d = s.begin().unwrap();
+        let mut fb = screen();
+        draw(&s, d, &mut fb, &solid(&[(0, 0x77)]));
+        s.end(true);
+        assert_eq!(at_point(&fb, 310, 210), 0x00, "no foreign content");
+        // ... and a commit that still names the old id (it was sent before the
+        // holder read the CLOSE event) shows nothing either.
+        let late = Element {
+            alpha: 200,
+            ..shown
+        };
+        s.scene_commit(&commit(ACTIVE, 0xFF00_0000, &[late]))
+            .unwrap();
+        let d = s.begin().unwrap();
+        let mut fb = screen();
+        draw(&s, d, &mut fb, &solid(&[(0, 0x77)]));
+        s.end(true);
+        assert_eq!(at_point(&fb, 310, 210), 0x00);
+        // The commit that names the new id shows it.
+        let fresh = Element {
+            source: new,
+            ..late
+        };
+        s.scene_commit(&commit(ACTIVE, 0xFF00_0000, &[fresh]))
+            .unwrap();
+        let d = s.begin().unwrap();
+        let mut fb = screen();
+        draw(&s, d, &mut fb, &solid(&[(0, 0x77)]));
+        s.end(true);
+        assert_eq!(at_point(&fb, 310, 210), 0x77);
+    }
+
+    #[test]
+    fn the_generation_of_an_id_wraps_past_its_greatest_and_never_to_zero() {
+        let mut s = Scene::new();
+        s.made[0] = proto_comp::ID_GENERATION_MAX - 1;
+        let a = make(&mut s, 1, 1, rect(0, 0, 8, 8), 1);
+        assert_eq!(
+            proto_comp::id_generation(s.window(a).unwrap().id),
+            proto_comp::ID_GENERATION_MAX
+        );
+        assert!(s.window(a).unwrap().id < 1 << 27);
+        s.destroy(a);
+        let b = make(&mut s, 2, 1, rect(0, 0, 8, 8), 1);
+        assert_eq!(proto_comp::id_generation(s.window(b).unwrap().id), 1);
+    }
+
+    #[test]
+    fn a_mask_window_gets_no_focus_and_no_top_place() {
+        let mut s = Scene::new();
+        let a = make(&mut s, 1, 1, rect(0, 0, 8, 8), 1);
+        s.post(a, 0, &[]).unwrap();
+        s.begin().unwrap();
+        s.end(true);
+        assert_eq!(s.focus(), Some(a));
+        let m = s.create(2, 1, rect(0, 0, 8, 8), false, 0).unwrap();
+        s.set_format(m, Format::A8);
+        s.attach(m, 1, 8).unwrap();
+        s.post(m, 0, &[]).unwrap();
+        s.begin().unwrap();
+        s.end(true);
+        assert_eq!(s.focus(), Some(a), "the mask took no focus");
+    }
+
+    #[test]
+    fn the_scene_and_a_manager_exclude_each_other_in_both_orders() {
+        use Holder::{Manager, Scene as Holds, Unsubscribed};
+        // wm first: the scene is BUSY, in SUBSCRIBE, SCENE_COMMIT and SCENE_COMPOSE.
+        assert!(!scene_allowed(Manager));
+        assert!(!manage_allowed(Holds, false, false));
+        // Nobody, or the scene's own holder: allowed.
+        assert!(scene_allowed(Unsubscribed));
+        assert!(scene_allowed(Holds));
+        // A scene committed before anyone subscribed: the manager's MANAGE is
+        // NOT_ALLOWED from the commit on, the scene session's is not.
+        assert!(manage_allowed(Unsubscribed, false, false));
+        assert!(!manage_allowed(Unsubscribed, true, false));
+        assert!(manage_allowed(Unsubscribed, true, true));
+        assert!(manage_allowed(Holds, true, true));
+        // A manager that holds the subscription goes on while there is no scene.
+        assert!(manage_allowed(Manager, false, false));
+        // The scene session's own subscription is refused while the manager has.
+        assert!(!subscribe_allowed(Manager, true));
+        assert!(subscribe_allowed(Manager, false));
+        assert!(subscribe_allowed(Unsubscribed, true));
+    }
+
+    #[test]
+    fn the_latest_post_of_a_window_no_element_shows_wins_and_the_one_it_replaced_is_free() {
         let mut s = staged();
         s.scene_commit(&commit(ACTIVE, 0xFF00_0000, &[])).unwrap();
         s.post(2, 0, &[]).unwrap();
         s.post(2, 1, &[]).unwrap();
         // "The latest wins": the second POST replaced the first (free at once),
-        // and the taking gives the second back.
+        // and the second is the window's current one.
         assert!(s.begin().is_some());
-        assert_eq!(s.given_back().freed[2], Some(1));
-        assert_eq!(s.window(2).unwrap().bufs, [Buf::Free; 3]);
+        assert_eq!(s.given_back().freed[2], None);
+        assert_eq!(s.window(2).unwrap().current, Some(1));
+        assert_eq!(
+            s.window(2).unwrap().bufs,
+            [Buf::Free, Buf::Taken, Buf::Free]
+        );
     }
 
     #[test]
@@ -5028,8 +5240,6 @@ mod tests {
         // An element over it that shows something: composed.
         s.scene_commit(&commit(ACTIVE, 0, &[full, element(b, 10, 10, 100, 50)]))
             .unwrap();
-        // (the window b was given back while no element showed it: it posts again)
-        s.post(b, 0, &[]).unwrap();
         settle(&mut s);
         assert_eq!(s.plan(), Plan::Compose);
         // An element over it whose window shows nothing (none, or never taken):

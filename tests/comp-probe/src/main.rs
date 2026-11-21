@@ -301,6 +301,15 @@ const SECOND: Rect = Rect {
     h: 100,
 };
 
+/// The place of the window the scene holder paints and posts once, while no
+/// element shows it (a static picture).
+const THIRD: Rect = Rect {
+    x: 400,
+    y: 250,
+    w: 100,
+    h: 100,
+};
+
 /// Whether the point (x, y) of the window is in CHANGED.
 fn in_changed(x: u32, y: u32) -> bool {
     (CHANGED.x..CHANGED.x + CHANGED.w).contains(&x)
@@ -315,6 +324,7 @@ enum Layer {
         marked: bool,
     },
     Second,
+    Third,
 }
 
 fn layer_point(layer: Layer, x: u32, y: u32) -> u32 {
@@ -329,6 +339,7 @@ fn layer_point(layer: Layer, x: u32, y: u32) -> u32 {
             }
         }
         Layer::Second => second_pattern(x - SECOND.x, y - SECOND.y),
+        Layer::Third => second_pattern(x - THIRD.x, y - THIRD.y),
     }
 }
 
@@ -336,6 +347,7 @@ fn layer_rect(layer: Layer) -> Rect {
     match layer {
         Layer::First { .. } => FIRST,
         Layer::Second => SECOND,
+        Layer::Third => THIRD,
     }
 }
 
@@ -1037,6 +1049,25 @@ impl Probe<'_> {
             crc.point(p);
         }
         rt::println!("comp-probe: scene legacy crc {:08x}", !crc.0);
+        self.sleep(SNAPSHOT_NS);
+        // A window that posted once while no element showed it: a static
+        // picture. A scene that shows it later has it in its first frame.
+        let (c, c_id) = self.painted(&display, THIRD, second_pattern)?;
+        self.post(&c, 0, &[])
+            .map_err(say("POST of the static window"))?;
+        self.sleep(100_000_000);
+        self.settled(&display)?;
+        self.commit(
+            &display,
+            ACTIVE,
+            &[first, second, Self::element(c_id, THIRD)],
+        )
+        .map_err(say("SCENE_COMMIT with the static window"))?;
+        self.settled(&display)?;
+        rt::println!(
+            "comp-probe: scene static crc {:08x}",
+            expected_crc(&[Layer::First { marked: false }, Layer::Second, Layer::Third])
+        );
         self.sleep(SNAPSHOT_NS);
         // A scene composed on request: SCENE_COMPOSE is refused for an active
         // scene, and for the other it makes the frame, with COMPOSED at its end.

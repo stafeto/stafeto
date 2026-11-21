@@ -610,8 +610,13 @@ with the window it shows, the rectangle of the window it takes the points from
 (16.16 points), the rectangle of the screen it puts them in, the turn and
 reflection, the filter, the kind of transparency, a global alpha and a mask
 (`proto_comp::Element`, 56 bytes; up to 16 of them in a message of 916 bytes).
-The window is the `id` WINDOW_CREATE answers (a number no window has shows
-nothing; `NO_WINDOW`, 0xFFFFFFFF, names none, since window 0 is a window). A
+The window is the `id` WINDOW_CREATE answers: its place in the table (3 bits)
+and the count of windows made at that place (`proto_comp::window_id`), so the id
+of a window that went is no window's again. LIST, the events CREATE and CLOSE
+(the id is their `value`; `code` is the place) and MANAGE carry the same id. An
+element whose id names no live window shows nothing and holds no buffer, also
+when the holder commits with the id of a window that went before it read the
+CLOSE event; `NO_WINDOW`, 0xFFFFFFFF, names none. A
 mask is a window of the new format `FORMAT_A8` (a byte a point, a stride that is
 a multiple of 4), the size of the target rectangle; a window of that format is
 never shown by itself. `<stafeto/window.h>` has it as `STAFETO_WINDOW_A8`.
@@ -636,11 +641,12 @@ How a scene reaches the screen:
   rectangles carried through the element (turn, reflection and stretch, a point
   more on every side for the bilinear filter). The whole screen when the
   background changes or the scene is the first.
-- A window that no element shows gets its buffer back at the taking: the bit of
-  its number says the buffer is free, and a FLUSH of a window of the first
-  revision on it is answered at once, so a program of the first revision under a
-  scene does not wait for a frame that has none of it. A window the scene shows
-  later shows what its producer posts after that.
+- A window that no element shows keeps the last buffer it posted as its current
+  one at the taking, and the buffer that was current is free at once (the bit of
+  its number). An element added later shows that picture in its first frame
+  (a static background, a board, a mask). A FLUSH of a window of the first
+  revision on such a window is answered at once, so a program of the first
+  revision under a scene does not wait for a frame that has none of it.
 - The background is a colour: the first thing a band holds where no opaque
   element covers it whole (the same call as the black of a band, so the same
   price).
@@ -660,9 +666,13 @@ How a scene reaches the screen:
   FOCUS); the pointer's moves and buttons go to the scene's ring as events of the
   screen's coordinates and to no window. The pointer's picture is the cursor
   pipeline's, as it was.
-- While a scene session has subscribed (MANAGE SUBSCRIBE) a session with
-  `MANAGER_MARK` is NOT_ALLOWED in MANAGE, and the scene session's SUBSCRIBE is
-  BUSY while a manager holds the subscription. When the session ends the windows
+- While a manager (`MANAGER_MARK`) holds the subscription, the scene session's
+  SUBSCRIBE, SCENE_COMMIT and SCENE_COMPOSE are BUSY, so the pointer never goes
+  to the manager under a scene. From the scene's first commit, or its
+  subscription, a session with `MANAGER_MARK` is NOT_ALLOWED in MANAGE. A second
+  CONNECT of the holder (a second session with the mark) is BUSY in SCENE_COMMIT
+  and SCENE_COMPOSE while the first holds the scene. A window of FORMAT_A8 gets
+  neither the focus nor the top place. When the session ends the windows
   show as the policy of the windows says, from the next frame, the whole screen
   drawn again. The children of a process that holds a scene (a clone of its
   session) get an ordinary context; `exec` keeps the session.

@@ -794,7 +794,7 @@ impl Probe<'_> {
             if e.kind == CREATE {
                 // A window of the clients' size has the focus when it is made;
                 // the others (the many windows) have none.
-                self.focus_new(&display, e.code)?;
+                self.focus_new(&display, e.value as u32)?;
                 return Ok(false);
             }
             if e.kind != KEY {
@@ -826,22 +826,21 @@ impl Probe<'_> {
 
     /// FOCUS of window `id` when it is a window of the two clients (their
     /// size), found by LIST: the manager's policy of the probe.
-    fn focus_new(&self, display: &Handle<Channel>, id: u16) -> Result<(), &'static str> {
+    fn focus_new(&self, display: &Handle<Channel>, id: u32) -> Result<(), &'static str> {
         let mut w = Writer::new();
         proto_comp::write_manage(manage::LIST, 0, 0, 0, &mut w).map_err(say("MANAGE's bytes"))?;
         let reply = sys::send(display, w.as_bytes()).map_err(say("LIST"))?;
         let mut buffer = [0; MESSAGE_MAX];
         let mut mine = false;
         proto_comp::read_list(reply.bytes(&mut buffer), |r| {
-            mine |= r.id == u32::from(id) && r.w == A.w && r.h == A.h;
+            mine |= r.id == id && r.w == A.w && r.h == A.h;
         })
         .map_err(say("LIST's reply"))?;
         if !mine {
             return Ok(());
         }
         let mut w = Writer::new();
-        proto_comp::write_manage(manage::FOCUS, u32::from(id), 0, 0, &mut w)
-            .map_err(say("MANAGE's bytes"))?;
+        proto_comp::write_manage(manage::FOCUS, id, 0, 0, &mut w).map_err(say("MANAGE's bytes"))?;
         plain(display, w.as_bytes()).map_err(say("FOCUS"))
     }
 

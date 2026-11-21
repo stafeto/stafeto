@@ -2034,7 +2034,7 @@ impl Compositor {
         let wrote = r
             .reply()
             .u32(Status::Ok.code())
-            .and_then(|()| r.reply().u32(i as u32));
+            .and_then(|()| r.reply().u32(self.scene.window(i).map_or(0, |w| w.id)));
         if wrote.is_err() {
             self.destroy(i);
             return Answer::Status(Status::BadSize);
@@ -2213,7 +2213,7 @@ impl Compositor {
                 pace.settle(self.pacer.clock(), now);
             }
             if visible && let Some(pace) = self.scene.pace(i) {
-                records[count] = pace.record(i as u32);
+                records[count] = pace.record(self.scene.window(i).map_or(i as u32, |w| w.id));
                 count += 1;
             }
         }
@@ -2304,15 +2304,20 @@ impl Compositor {
         if (op == manage::SUBSCRIBE) != (r.handles.len() == 1) || r.handles.len() > 1 {
             return Answer::Status(Status::BadSize);
         }
-        let id = a as usize;
         let scene = is_scene(r.label());
-        // The scene's holder is the one manager while it has subscribed.
-        if !scene && self.manager_scene {
+        // The scene's holder is the one manager once it has subscribed or has
+        // committed a scene.
+        if !compositor::manage_allowed(self.holder(), self.scene_label != 0, scene) {
             return Answer::Status(proto_comp::code(proto_comp::NOT_ALLOWED));
         }
+        // The window of an id: the live window that has it (a window that went
+        // has no id any more, though its place may hold another window).
+        let id = self.scene.place_of(a).unwrap_or(usize::MAX);
         let result = match op {
             manage::SUBSCRIBE => {
-                if scene && self.manager.is_some() && self.manager_label != r.label() {
+                if !compositor::subscribe_allowed(self.holder(), scene)
+                    || (scene && self.manager.is_some() && self.manager_label != r.label())
+                {
                     return Answer::Status(proto_comp::code(proto_comp::BUSY));
                 }
                 let Ok(notify) = r.handles.take::<Channel>(0) else {
@@ -2353,7 +2358,7 @@ impl Compositor {
                 flags |= FOCUSED;
             }
             records[depth] = WindowRecord {
-                id: u32::from(k),
+                id: w.id,
                 x: w.rect.x,
                 y: w.rect.y,
                 w: w.rect.w,
@@ -2368,6 +2373,15 @@ impl Compositor {
         }
     }
 
+    /// Who holds the subscription to the manager's ring.
+    fn holder(&self) -> compositor::Holder {
+        match (self.manager.is_some(), self.manager_scene) {
+            (false, _) => compositor::Holder::Unsubscribed,
+            (true, false) => compositor::Holder::Manager,
+            (true, true) => compositor::Holder::Scene,
+        }
+    }
+
     /// SCENE_COMMIT: the scene of the session's windows (proto_comp).
     fn scene_commit(&mut self, r: &mut Request<'_>) -> Answer {
         // The scene is parsed into the place the scenes keep for it, with no
@@ -2379,7 +2393,9 @@ impl Compositor {
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        if self.scene_label != 0 && self.scene_label != r.label() {
+        if !compositor::scene_allowed(self.holder())
+            || (self.scene_label != 0 && self.scene_label != r.label())
+        {
             return Answer::Status(proto_comp::code(proto_comp::BUSY));
         }
         if let Err(refusal) = self
@@ -2402,7 +2418,9 @@ impl Compositor {
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        if self.scene_label != 0 && self.scene_label != r.label() {
+        if !compositor::scene_allowed(self.holder())
+            || (self.scene_label != 0 && self.scene_label != r.label())
+        {
             return Answer::Status(proto_comp::code(proto_comp::BUSY));
         }
         if let Err(refusal) = self
