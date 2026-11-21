@@ -11201,6 +11201,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // screenshot, the end of a process, a program of the first
         // revision, then the steps of the services under -icount.
         job("comp-probe", || comp_probe::probe(&qemu::VIRT)),
+        // The same service when the screen opens late, from a request: the
+        // frame buffer mapped in portions and the longest step of that work.
+        job("comp-late-probe", || comp_probe::late(&qemu::VIRT)),
         // Focus and composition of two clients: a window with an alpha over
         // another, a click and Super-Tab that switch them, the keys of the
         // window with the focus alone, a tablet's click, the window manager
