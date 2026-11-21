@@ -77,11 +77,14 @@ pub struct StreamInfo {
 pub trait Service {
     fn scene_commit(&mut self, commit: &SceneCommit) -> Result<(), Status>;
     fn scene_compose(&mut self, flags: u32) -> Result<(), Status>;
-    /// Blocks until the bit of the scene's channel is set.
+    /// Blocks until the bit of the scene's channel is set. It returns `Err`
+    /// (`PEER_CLOSED`) when the channel closes, so a wait never outlives the
+    /// service.
     fn wait(&mut self, bit: u64) -> Result<(), Status>;
     /// Forgets the bit, if it is set.
     fn clear(&mut self, bit: u64);
-    /// Blocks until the service may have moved on, at most one frame.
+    /// Blocks until the service may have moved on, at most one frame. Like
+    /// `wait` it returns `Err` (`PEER_CLOSED`) when the channel closes.
     fn pause(&mut self) -> Result<(), Status>;
     /// Takes the one screen: false when it is taken (by any device).
     fn claim_screen(&mut self) -> bool;
@@ -126,7 +129,7 @@ pub fn rect_to_fixed(r: [f32; 4]) -> [i32; 4] {
 /// context rotated by `ctx` quarter turns: the record's rotation, then
 /// whether it reflects about the vertical axis. See `CLAUSES.md` section 5.
 pub fn fold(rotation: u32, flip: bool, ctx: u32) -> (u32, bool) {
-    let sum = (rotation + ctx) % 4;
+    let sum = (rotation % 4 + ctx % 4) % 4;
     if flip {
         ((6 - sum) % 4, true)
     } else {
@@ -139,11 +142,12 @@ pub fn fold(rotation: u32, flip: bool, ctx: u32) -> (u32, bool) {
 /// target of `width` by `height`.
 pub fn fold_rect(r: [i32; 4], ctx: u32, width: i32, height: i32) -> [i32; 4] {
     let [x, y, w, h] = r;
+    let away = |total: i32, a: i32, b: i32| total.wrapping_sub(a).wrapping_sub(b);
     match ctx % 4 {
         0 => [x, y, w, h],
-        1 => [width - y - h, x, h, w],
-        2 => [width - x - w, height - y - h, w, h],
-        _ => [y, height - x - w, h, w],
+        1 => [away(width, y, h), x, h, w],
+        2 => [away(width, x, w), away(height, y, h), w, h],
+        _ => [y, away(height, x, w), h, w],
     }
 }
 
@@ -167,6 +171,8 @@ pub fn translate(status: Status) -> i32 {
     match status {
         Status::Kernel(Error::LimitReached | Error::NoMemory) => ERROR_OUT_OF_MEMORY,
         Status::Kernel(Error::PeerClosed | Error::BadHandle) => ERROR_BAD_DEVICE,
+        // A signal or a call that would block says nothing about the service.
+        Status::Kernel(Error::Interrupted | Error::WouldBlock) => ERROR_BUSY,
         Status::Kernel(_) => ERROR_BAD_DEVICE,
         Status::BadSize => ERROR_ILLEGAL_ARGUMENT,
         Status::BadVersion | Status::UnknownMethod => ERROR_BAD_DEVICE,
@@ -184,12 +190,46 @@ fn is_busy(s: Status) -> bool {
     s == Status::Unknown(proto_comp::BUSY)
 }
 
+/// A refusal that the call is made again after: a signal or a call that
+/// would block.
+fn transient(s: Status) -> bool {
+    matches!(
+        s,
+        Status::Kernel(abi::Error::Interrupted | abi::Error::WouldBlock)
+    )
+}
+
+/// The most times a request or a wait is made again after a transient refusal
+/// or (with `wait`) a BUSY answer: a frame each. A service that has not taken
+/// the request by then is not usable and the call stores BAD_DEVICE (BUSY
+/// when `wait` is false), `CLAUSES.md` 4.3.
+const MAX_TRIES: u32 = 16;
+
+/// What `attempt` found.
+#[derive(PartialEq)]
+enum Sent {
+    Accepted,
+    /// The service said BUSY and `wait` was false: BUSY is stored.
+    Busy,
+    Failed,
+}
+
 // ------------------------------------------------------------------- state
 
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 
-fn new_handle() -> u32 {
-    NEXT_HANDLE.fetch_add(1, Ordering::Relaxed)
+/// The next number of `counter`, or None at the largest (handles stop there
+/// and never wrap to 0, which is `WFC_INVALID_HANDLE`).
+fn next_from(counter: &AtomicU32) -> Option<u32> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            (n != u32::MAX).then(|| n + 1)
+        })
+        .ok()
+}
+
+fn new_handle() -> Option<u32> {
+    next_from(&NEXT_HANDLE)
 }
 
 #[derive(Clone, Copy)]
@@ -217,9 +257,9 @@ struct Elem {
 }
 
 impl Elem {
-    fn new() -> Elem {
+    fn new(handle: u32) -> Elem {
         Elem {
-            handle: new_handle(),
+            handle,
             dst: [0; 4],
             source: 0,
             src: [0.0; 4],
@@ -307,7 +347,7 @@ impl Wfc {
         }
         Some(Wfc {
             setup,
-            device: new_handle(),
+            device: new_handle()?,
             error: ERROR_NONE,
             lost: false,
             ctx: None,
@@ -473,11 +513,18 @@ impl Wfc {
             self.raise(ERROR_BAD_ATTRIBUTE);
             return 0;
         }
+        if self.lost {
+            self.raise(ERROR_BAD_DEVICE);
+            return 0;
+        }
+        let Some(handle) = new_handle() else {
+            self.raise(ERROR_OUT_OF_MEMORY);
+            return 0;
+        };
         if self.ctx.is_some() || !svc.claim_screen() {
             self.raise(ERROR_IN_USE);
             return 0;
         }
-        let handle = new_handle();
         self.ctx = Some(Ctx {
             handle,
             rotation: ROTATION_0,
@@ -509,19 +556,15 @@ impl Wfc {
         }
         let c = self.ctx.expect("checked");
         if !self.lost {
-            if c.compose_pending
-                && let Err(s) = svc.wait(COMPOSED_BIT)
-            {
-                self.fail(s);
+            if c.compose_pending {
+                self.await_bit(svc, COMPOSED_BIT);
             }
-            if c.active
-                && !self.lost
-                && let Err(s) = svc.scene_commit(&SceneCommit {
+            if c.active && !self.lost {
+                let off = SceneCommit {
                     flags: 0,
                     ..c.committed
-                })
-            {
-                self.fail(s);
+                };
+                self.attempt(svc, false, None, |s| s.scene_commit(&off));
             }
         }
         svc.release_screen();
@@ -664,7 +707,10 @@ impl Wfc {
             self.raise(ERROR_OUT_OF_MEMORY);
             return 0;
         };
-        let handle = new_handle();
+        let Some(handle) = new_handle() else {
+            self.raise(ERROR_OUT_OF_MEMORY);
+            return 0;
+        };
         *slot = Some(Img {
             handle,
             id: info.id,
@@ -788,7 +834,11 @@ impl Wfc {
             self.raise(ERROR_OUT_OF_MEMORY);
             return 0;
         };
-        let e = Elem::new();
+        let Some(handle) = new_handle() else {
+            self.raise(ERROR_OUT_OF_MEMORY);
+            return 0;
+        };
+        let e = Elem::new(handle);
         *slot = Some(e);
         e.handle
     }
@@ -1249,29 +1299,15 @@ impl Wfc {
         };
         let accepted = SceneCommit { ..record };
         record.flags = (if c.active { ACTIVE } else { 0 }) | if wait { ASK_COMMITTED } else { 0 };
-        loop {
-            if wait {
-                svc.clear(COMMITTED_BIT);
-            }
-            match svc.scene_commit(&record) {
-                Ok(()) => break,
-                Err(s) if wait && is_busy(s) => {
-                    if let Err(s) = svc.pause() {
-                        self.fail(s);
-                        return;
-                    }
-                }
-                Err(s) => {
-                    self.fail(s);
-                    return;
-                }
-            }
+        let clear = wait.then_some(COMMITTED_BIT);
+        if self.attempt(svc, wait, clear, |s| s.scene_commit(&record)) != Sent::Accepted {
+            return;
         }
         if let Some(c) = &mut self.ctx {
             c.committed = accepted;
         }
-        if wait && let Err(s) = svc.wait(COMMITTED_BIT) {
-            self.fail(s);
+        if wait {
+            self.await_bit(svc, COMMITTED_BIT);
         }
     }
 
@@ -1288,16 +1324,14 @@ impl Wfc {
             return;
         }
         let flags = if active { ACTIVE } else { 0 };
-        match svc.scene_commit(&SceneCommit {
+        let record = SceneCommit {
             flags,
             ..c.committed
-        }) {
-            Ok(()) => {
-                if let Some(c) = &mut self.ctx {
-                    c.active = active;
-                }
-            }
-            Err(s) => self.fail(s),
+        };
+        if self.attempt(svc, false, None, |s| s.scene_commit(&record)) == Sent::Accepted
+            && let Some(c) = &mut self.ctx
+        {
+            c.active = active;
         }
     }
 
@@ -1325,41 +1359,96 @@ impl Wfc {
             self.raise(ERROR_UNSUPPORTED);
             return;
         }
-        loop {
-            if wait || !c.compose_pending {
-                svc.clear(COMPOSED_BIT);
-            }
-            match svc.scene_compose(ASK_COMPOSED) {
-                Ok(()) => break,
-                Err(s) if wait && is_busy(s) => {
-                    if let Err(s) = svc.pause() {
-                        self.fail(s);
-                        return;
-                    }
+        // The bit is cleared before every send, so a bit of an earlier frame
+        // never counts for this one, and the one the service sets before its
+        // answer is never erased.
+        match self.attempt(svc, wait, Some(COMPOSED_BIT), |s| {
+            s.scene_compose(ASK_COMPOSED)
+        }) {
+            Sent::Accepted => {}
+            // The earlier frame is still being made: its bit will come.
+            Sent::Busy => return,
+            // The clearing may have erased the bit of an earlier frame that
+            // is over, so the context does not wait for it any more.
+            Sent::Failed => {
+                if let Some(c) = &mut self.ctx {
+                    c.compose_pending = false;
                 }
-                Err(s) => {
-                    self.fail(s);
-                    return;
-                }
+                return;
             }
-        }
-        if c.compose_pending && !wait {
-            // The earlier frame is over, so its bit is stale.
-            svc.clear(COMPOSED_BIT);
         }
         if let Some(c) = &mut self.ctx {
             c.compose_pending = true;
         }
-        if wait {
-            match svc.wait(COMPOSED_BIT) {
-                Ok(()) => {
-                    if let Some(c) = &mut self.ctx {
-                        c.compose_pending = false;
-                    }
-                }
-                Err(s) => self.fail(s),
+        if wait && self.await_bit(svc, COMPOSED_BIT) {
+            if let Some(c) = &mut self.ctx {
+                c.compose_pending = false;
             }
         }
+    }
+
+    /// Sends a request: `clear` is the bit forgotten before each send. A
+    /// transient refusal is sent again; with `wait` a BUSY answer is waited
+    /// out by `pause` and sent again (spec 5.4, 8.3: no BUSY with `wait`),
+    /// both at most `MAX_TRIES` times.
+    fn attempt<S: Service>(
+        &mut self,
+        svc: &mut S,
+        wait: bool,
+        clear: Option<u64>,
+        mut send: impl FnMut(&mut S) -> Result<(), Status>,
+    ) -> Sent {
+        for _ in 0..MAX_TRIES {
+            if let Some(bit) = clear {
+                svc.clear(bit);
+            }
+            match send(svc) {
+                Ok(()) => return Sent::Accepted,
+                Err(s) if transient(s) => {}
+                Err(s) if is_busy(s) && wait => {
+                    if !self.pause(svc) {
+                        return Sent::Failed;
+                    }
+                }
+                Err(s) => {
+                    self.fail(s);
+                    return if is_busy(s) { Sent::Busy } else { Sent::Failed };
+                }
+            }
+        }
+        self.raise(if wait { ERROR_BAD_DEVICE } else { ERROR_BUSY });
+        Sent::Failed
+    }
+
+    fn pause<S: Service>(&mut self, svc: &mut S) -> bool {
+        for _ in 0..MAX_TRIES {
+            match svc.pause() {
+                Ok(()) => return true,
+                Err(s) if transient(s) => {}
+                Err(s) => {
+                    self.fail(s);
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Waits for `bit`; a transient refusal waits again, at most `MAX_TRIES`
+    /// times (then BUSY is stored).
+    fn await_bit<S: Service>(&mut self, svc: &mut S, bit: u64) -> bool {
+        for _ in 0..MAX_TRIES {
+            match svc.wait(bit) {
+                Ok(()) => return true,
+                Err(s) if transient(s) => {}
+                Err(s) => {
+                    self.fail(s);
+                    return false;
+                }
+            }
+        }
+        self.raise(ERROR_BUSY);
+        false
     }
 
     /// `wfcFence` (9): ILLEGAL_ARGUMENT, there is no EGL display to pass.

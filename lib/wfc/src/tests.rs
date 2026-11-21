@@ -25,6 +25,10 @@ struct Fake {
     commit_refusals: Vec<Status>,
     compose_refusals: Vec<Status>,
     wait_refusal: Option<Status>,
+    wait_once: Vec<Status>,
+    bits: u64,
+    set_on_compose: bool,
+    strict_wait: bool,
     pause_refusal: Option<Status>,
     claimed: bool,
 }
@@ -39,6 +43,10 @@ impl Service for Fake {
     }
     fn scene_compose(&mut self, flags: u32) -> Result<(), Status> {
         self.log.push(Ev::Compose(flags));
+        if self.set_on_compose {
+            // The service sets the bit of the frame before its answer.
+            self.bits |= COMPOSED_BIT;
+        }
         match self.compose_refusals.is_empty() {
             true => Ok(()),
             false => Err(self.compose_refusals.remove(0)),
@@ -46,10 +54,15 @@ impl Service for Fake {
     }
     fn wait(&mut self, bit: u64) -> Result<(), Status> {
         self.log.push(Ev::Wait(bit));
+        if !self.wait_once.is_empty() {
+            return Err(self.wait_once.remove(0));
+        }
+        assert!(!self.strict_wait || self.bits & bit != 0, "wait would hang");
         self.wait_refusal.map_or(Ok(()), Err)
     }
     fn clear(&mut self, bit: u64) {
         self.log.push(Ev::Clear(bit));
+        self.bits &= !bit;
     }
     fn pause(&mut self) -> Result<(), Status> {
         self.log.push(Ev::Pause);
@@ -1306,17 +1319,39 @@ fn s7_1_3_zero_side_after_rounding_is_left_out() {
     assert_eq!(r.svc.last().count, 0);
 }
 
+/// Two floats near 50 whose sum in `f32` is exactly 100 and whose 16.16
+/// roundings (both up) add to one unit more than the window.
+fn edge_pair() -> (f32, f32) {
+    let ulp = 2f32.powi(-18);
+    (50.0 + 2.0 * ulp, 50.0 - 2.0 * ulp)
+}
+
 #[test]
 fn s7_1_3_source_rectangle_is_trimmed_at_the_window_edge() {
+    let (a, b) = edge_pair();
+    assert_eq!(a + b, 100.0);
+    assert!(to_fixed(a) + to_fixed(b) > 100 * 65536, "needs the trim");
     let mut r = rig();
     let e = r.shown(1);
-    // Fits in floats (sum 100.0 exactly), and rounds to more than 100 in 16.16
-    // when the offset rounds up and the size rounds up.
-    r.src_rect(e, [50.000_004, 0.0, 49.999_996, 100.0]);
+    r.src_rect(e, [a, 0.0, b, 100.0]);
     r.commit();
+    assert_eq!(r.err(), 0);
     let m = r.svc.last().elements[0];
-    assert!(m.sx + m.sw <= 100 * 65536);
-    assert!(m.sw > 49 * 65536);
+    assert_eq!(m.sx + m.sw, 100 * 65536);
+    assert_eq!(m.sw, 100 * 65536 - to_fixed(a));
+}
+
+#[test]
+fn s7_1_3_source_rectangle_is_trimmed_at_the_bottom_edge() {
+    let (a, b) = edge_pair();
+    let mut r = rig();
+    let e = r.shown(1);
+    r.src_rect(e, [0.0, a, 100.0, b]);
+    r.commit();
+    assert_eq!(r.err(), 0);
+    let m = r.svc.last().elements[0];
+    assert_eq!(m.sy + m.sh, 100 * 65536);
+    assert_eq!(m.sh, 100 * 65536 - to_fixed(a));
 }
 
 #[test]
@@ -1832,7 +1867,7 @@ fn s8_3_wait_failure_is_reported() {
 }
 
 #[test]
-fn s8_3_compose_after_a_failed_wait_clears_again() {
+fn s5_4_commit_after_a_failed_wait_clears_again() {
     let mut r = rig();
     r.svc.wait_refusal = Some(Status::Unknown(proto_comp::UNSUPPORTED));
     r.w.commit(r.dev, r.ctx, true, &mut r.svc);
@@ -2065,4 +2100,221 @@ fn p5_4_translate_table() {
         translate(Status::Kernel(Error::BadHandle)),
         ERROR_BAD_DEVICE
     );
+}
+
+// ------------------------------------------------------- the review's cases
+
+#[test]
+fn s8_3_two_unwaited_composes_then_destroy_does_not_hang() {
+    // The service sets COMPOSED before it answers; the library must not erase it.
+    let mut r = rig();
+    r.svc.set_on_compose = true;
+    r.svc.strict_wait = true;
+    r.w.compose(r.dev, r.ctx, false, &mut r.svc);
+    r.w.compose(r.dev, r.ctx, false, &mut r.svc);
+    assert_eq!(r.err(), 0);
+    r.w.destroy_context(r.dev, r.ctx, &mut r.svc);
+    assert_eq!(r.err(), 0);
+    assert!(r.w.ctx.is_none());
+}
+
+#[test]
+fn s8_3_destroy_device_after_unwaited_composes_does_not_hang() {
+    let mut r = rig();
+    r.svc.set_on_compose = true;
+    r.svc.strict_wait = true;
+    for _ in 0..3 {
+        r.w.compose(r.dev, r.ctx, false, &mut r.svc);
+    }
+    assert_eq!(r.w.destroy_device(r.dev, &mut r.svc), ERROR_NONE);
+}
+
+#[test]
+fn s8_3_clear_goes_before_every_send() {
+    let mut r = rig();
+    r.w.compose(r.dev, r.ctx, false, &mut r.svc);
+    r.w.compose(r.dev, r.ctx, false, &mut r.svc);
+    let log = &r.svc.log;
+    for (i, e) in log.iter().enumerate() {
+        if matches!(e, Ev::Compose(_)) {
+            assert_eq!(log[i - 1], Ev::Clear(COMPOSED_BIT));
+        }
+    }
+    assert!(!matches!(log.last(), Some(Ev::Clear(_))));
+}
+
+#[test]
+fn s8_3_failed_compose_wait_leaves_the_compose_pending() {
+    let mut r = rig();
+    r.svc
+        .wait_once
+        .push(Status::Unknown(proto_comp::UNSUPPORTED));
+    r.w.compose(r.dev, r.ctx, true, &mut r.svc);
+    assert_eq!(r.err(), ERROR_UNSUPPORTED);
+    assert!(r.w.ctx.unwrap().compose_pending);
+    r.svc.log.clear();
+    r.w.destroy_context(r.dev, r.ctx, &mut r.svc);
+    assert_eq!(r.svc.log, vec![Ev::Wait(COMPOSED_BIT)]);
+}
+
+#[test]
+fn s8_3_refused_compose_does_not_leave_a_wait_that_never_ends() {
+    let mut r = rig();
+    r.w.compose(r.dev, r.ctx, false, &mut r.svc);
+    r.svc
+        .compose_refusals
+        .push(Status::Unknown(proto_comp::UNSUPPORTED));
+    r.w.compose(r.dev, r.ctx, false, &mut r.svc);
+    assert_eq!(r.err(), ERROR_UNSUPPORTED);
+    assert!(!r.w.ctx.unwrap().compose_pending);
+}
+
+#[test]
+fn s8_3_busy_without_wait_keeps_the_earlier_compose_pending() {
+    let mut r = rig();
+    r.w.compose(r.dev, r.ctx, false, &mut r.svc);
+    r.svc.compose_refusals.push(BUSY);
+    r.w.compose(r.dev, r.ctx, false, &mut r.svc);
+    assert_eq!(r.err(), ERROR_BUSY);
+    assert!(r.w.ctx.unwrap().compose_pending);
+}
+
+#[test]
+fn s8_3_busy_that_never_ends_with_wait_is_bounded() {
+    let mut r = rig();
+    for _ in 0..100 {
+        r.svc.compose_refusals.push(BUSY);
+    }
+    r.w.compose(r.dev, r.ctx, true, &mut r.svc);
+    assert_eq!(r.err(), ERROR_BAD_DEVICE);
+    assert!(!r.w.is_lost());
+    let sends = r
+        .svc
+        .log
+        .iter()
+        .filter(|e| matches!(e, Ev::Compose(_)))
+        .count();
+    assert_eq!(sends, MAX_TRIES as usize);
+}
+
+#[test]
+fn s5_4_commit_busy_that_never_ends_with_wait_is_bounded() {
+    let mut r = rig();
+    for _ in 0..100 {
+        r.svc.commit_refusals.push(BUSY);
+    }
+    r.w.commit(r.dev, r.ctx, true, &mut r.svc);
+    assert_eq!(r.err(), ERROR_BAD_DEVICE);
+    assert_eq!(r.svc.commits().len(), MAX_TRIES as usize);
+}
+
+#[test]
+fn s5_4_commit_busy_without_wait_is_the_result() {
+    // The service answers BUSY on SCENE_COMMIT too (spec 5.4 allows it).
+    let mut r = rig();
+    r.svc.commit_refusals.push(BUSY);
+    r.commit();
+    assert_eq!(r.err(), ERROR_BUSY);
+    assert_eq!(r.svc.commits().len(), 1);
+}
+
+#[test]
+fn p5_4_interrupted_request_is_sent_again_and_the_device_stays() {
+    let mut r = rig();
+    r.svc
+        .commit_refusals
+        .push(Status::Kernel(Error::Interrupted));
+    r.svc
+        .commit_refusals
+        .push(Status::Kernel(Error::WouldBlock));
+    r.commit();
+    assert_eq!(r.err(), 0);
+    assert_eq!(r.svc.commits().len(), 3);
+    assert!(!r.w.is_lost());
+}
+
+#[test]
+fn p5_4_transient_that_never_ends_is_busy_not_lost() {
+    let mut r = rig();
+    for _ in 0..100 {
+        r.svc
+            .commit_refusals
+            .push(Status::Kernel(Error::WouldBlock));
+    }
+    r.commit();
+    assert_eq!(r.err(), ERROR_BUSY);
+    assert!(!r.w.is_lost());
+    assert_eq!(translate(Status::Kernel(Error::Interrupted)), ERROR_BUSY);
+}
+
+#[test]
+fn p5_4_interrupted_wait_waits_again() {
+    let mut r = rig();
+    r.svc.wait_once.push(Status::Kernel(Error::Interrupted));
+    r.w.commit(r.dev, r.ctx, true, &mut r.svc);
+    assert_eq!(r.err(), 0);
+    let waits = r
+        .svc
+        .log
+        .iter()
+        .filter(|e| matches!(e, Ev::Wait(_)))
+        .count();
+    assert_eq!(waits, 2);
+    assert!(!r.w.is_lost());
+}
+
+#[test]
+fn p5_4_interrupted_pause_is_not_a_loss() {
+    let mut r = rig();
+    r.svc.compose_refusals.push(BUSY);
+    r.svc.pause_refusal = Some(Status::Kernel(Error::Interrupted));
+    r.w.compose(r.dev, r.ctx, true, &mut r.svc);
+    assert!(!r.w.is_lost());
+}
+
+#[test]
+fn p5_4_handle_counter_stops_at_the_largest() {
+    let c = AtomicU32::new(1);
+    assert_eq!(next_from(&c), Some(1));
+    assert_eq!(next_from(&c), Some(2));
+    let c = AtomicU32::new(u32::MAX - 1);
+    assert_eq!(next_from(&c), Some(u32::MAX - 1));
+    assert_eq!(next_from(&c), None);
+    assert_eq!(next_from(&c), None);
+    // Never 0, so never WFC_INVALID_HANDLE.
+    assert_eq!(c.load(Ordering::Relaxed), u32::MAX);
+}
+
+#[test]
+fn p5_4_fold_survives_any_input() {
+    for r in [0, 3, 4, u32::MAX] {
+        for c in [0, 3, 4, u32::MAX] {
+            let (o, _) = fold(r, true, c);
+            assert!(o < 4);
+            assert!(fold(r, false, c).0 < 4);
+        }
+    }
+    for c in 0..4 {
+        let _ = fold_rect(
+            [i32::MIN, i32::MAX, i32::MAX, i32::MIN],
+            c,
+            i32::MIN,
+            i32::MAX,
+        );
+    }
+}
+
+#[test]
+fn p5_4_create_context_on_a_lost_device_does_not_take_the_screen() {
+    let mut r = rig();
+    r.svc
+        .commit_refusals
+        .push(Status::Kernel(Error::PeerClosed));
+    r.commit();
+    let _ = r.err();
+    r.w.destroy_context(r.dev, r.ctx, &mut r.svc);
+    assert!(!r.svc.claimed);
+    assert_eq!(r.w.create_on_screen_context(r.dev, 0, &[], &mut r.svc), 0);
+    assert_eq!(r.err(), ERROR_BAD_DEVICE);
+    assert!(!r.svc.claimed);
 }

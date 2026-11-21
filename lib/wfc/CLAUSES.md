@@ -179,11 +179,12 @@ changes nothing (spec 2.11, 5.6, 7.4).
    untouched.
 5. With `wait`, `Service::wait(COMMITTED_BIT)`.
 
-`wfcCommit` never answers BUSY: the service replaces its pending scene at
-once, and the specification allows that (5.4 lets a commit fail with BUSY
-only when `wait` is false and the context is not ready). Waiting for COMMITTED
-under `wait` is stricter than the specification asks (5.4 says completion
-means the context accepts a new commit); it is the one bit the service gives.
+The service can answer BUSY to SCENE_COMMIT as it can to SCENE_COMPOSE (for
+instance while another holder has the scene). With `wait` false the BUSY is the
+result, as spec 5.4 allows ("if `wait` is WFC_FALSE and ctx is not ready"); with
+`wait` true it is waited out as in 4.3. Waiting for COMMITTED under `wait` is
+stricter than the specification asks (5.4 says completion means the context
+accepts a new commit); it is the one bit the service gives.
 
 ### 4.2 Refusals
 
@@ -213,17 +214,36 @@ ILLEGAL_ARGUMENT (it is not mapped to INCONSISTENCY).
 
 ### 4.3 Waiting
 
-`compose` always asks for COMPOSED. With `wait` true: loop { `clear(COMPOSED)`,
-send; on BUSY `pause()` and again; on another error stop }, so a stale bit of
-an earlier `compose(FALSE)` never counts for this frame and the call does not
-fail with BUSY (spec 8.3). After the service accepts, `wait(COMPOSED)`. With
-`wait` false the first BUSY is the result. `commit` uses the same loop with
-COMMITTED, so a wait that broke off with an error leaves no stale bit either.
-With `wait` false the bit is cleared before the send only when no earlier
-`compose` is pending, and cleared again after the service accepts one that
-was, because acceptance means the earlier frame is over and its bit is stale.
-`destroy_context` and `destroy_device` call `wait(COMPOSED)` while a compose
-the library sent has not been waited for (`compose_pending`).
+Both requests go through one routine. Before every send of `compose` the
+library calls `clear(COMPOSED)` (and before every send of `commit` with `wait`,
+`clear(COMMITTED)`), whatever `wait` is, and it never clears after the service
+has accepted: the service may set the bit of the new frame before its answer, so
+a clear afterwards could erase it and a later wait would never end. A stale bit
+of an earlier frame therefore never counts for this one.
+
+* With `wait` true: on BUSY the library calls `pause()` (at most a frame) and
+  sends again, so the call does not fail with BUSY (spec 5.4, 8.3). After the
+  service accepts, `wait(bit)`.
+* The tries are bounded: at most 16 sends (16 frames). A service that has not
+  taken the request by then is not usable; spec 8.3 forbids BUSY with `wait`, so
+  the call stores WFC_ERROR_BAD_DEVICE (the device is not marked lost, a later
+  call may succeed). Without `wait` the first BUSY is the result.
+* A transient refusal (kernel Interrupted or WouldBlock) says nothing about the
+  service: it is sent again within the same bound, never marks the device lost,
+  and stores WFC_ERROR_BUSY if the bound runs out. `wait` and `pause` are called
+  again the same way.
+* `compose_pending` is set when a compose was accepted and cleared when its wait
+  returned. A refusal of a later `compose` other than BUSY clears it too (the
+  clearing before the send may have erased the bit of an earlier frame that is
+  over), so `destroy_context` and `destroy_device` never wait for a bit that
+  cannot come. They call `wait(COMPOSED)` while it is set.
+
+The `Service` contract: `wait` and `pause` return `Err` (PEER_CLOSED) when the
+channel closes, so no wait outlives the service. The handle counter stops at
+`u32::MAX` (never wrapping to 0, which is WFC_INVALID_HANDLE): creating past it
+stores WFC_ERROR_OUT_OF_MEMORY. The public pure functions `fold` and `fold_rect`
+accept any input (`fold` reduces modulo 4, `fold_rect` wraps).
+`create_on_screen_context` checks the lost flag before it claims the screen.
 
 ## 5. Context rotation folded into an element
 
@@ -290,7 +310,7 @@ source goes to (0,1) and (0,0) stays at (0,0); the wrong formula with
     library so the C layer has one place for them.
 11. **Zero-size elements** are left out of the record (the service refuses a zero source side).
 
-## 7. Tests (152 in the first version, grouped by clause)
+## 7. Tests (169, grouped by clause)
 
 Every test carries its clause in its name or its first comment.
 
