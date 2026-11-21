@@ -24,6 +24,8 @@
 //! | INJECT (23) | input | one event of 16 bytes | the status alone | INVALID, NOT_ALLOWED |
 //! | SET (24) | window | `property`, `value` (u32) | the status alone | INVALID, UNSUPPORTED, NOT_ALLOWED, REVOKED |
 //! | STATS (25) | context, window, manager, input | `flags` (u32) | status, 17 counters, 33 buckets, `count` (u32), then `count` records of 32 bytes | INVALID, NOT_ALLOWED, REVOKED |
+//! | SCENE_COMMIT (26) | scene | `flags`, `bg`, `count` (u32), then `count` records of 56 bytes | the status alone, at once | INVALID, NOT_ALLOWED, UNSUPPORTED |
+//! | SCENE_COMPOSE (27) | scene | `flags` (u32) | the status alone, at once | INVALID, NOT_ALLOWED, UNSUPPORTED, BUSY |
 //!
 //! The context is the `Display` session. A window is a session of its own
 //! (a label the service gives): the window goes when the last copy of its
@@ -93,6 +95,50 @@
 //! injects an event as if the device had made it: a KEY, a MOVE with the
 //! screen's coordinates (the pointer goes there) or a BUTTON.
 //!
+//! The scene session (a label with SCENE_MARK, given by init to the clients
+//! of its table's `COMP_SCENES`, which may be processes of POSIX) is a
+//! context and a manager both (it has every right of the manager above, and
+//! its ring is the manager's) and holds a scene: the windows that show are
+//! the elements of the last scene it committed, and no others. A clone of a
+//! session (what `fork` and `posix_spawn` give a child) never has the mark, so
+//! the children of the holder of a scene are ordinary contexts; `exec` keeps
+//! the session. While a scene session has subscribed (MANAGE SUBSCRIBE) a
+//! session with MANAGER_MARK is NOT_ALLOWED in MANAGE, and the scene session's
+//! SUBSCRIBE is BUSY while a manager holds the subscription. A session that
+//! ends takes its scene with it: the windows show as they did without one at
+//! the next frame.
+//!
+//! The scene is a list of up to MAX_ELEMENTS elements, lowest first, each of
+//! SCENE_ELEMENT bytes (see `Element`): the window it shows (the `id` of
+//! WINDOW_CREATE; a number no window has shows nothing), the rectangle of the
+//! window it takes the points from, in 16.16 points, the rectangle of the
+//! screen it puts them in, the orientation (a rotation by 0, 90, 180 or 270
+//! degrees clockwise, then a reflection about the vertical axis when bit 2
+//! is set), the filter, the kind of transparency (the bits of OpenWF
+//! Composition's `WFC_TRANSPARENCY_*`: global alpha, the window's own alpha,
+//! a mask), the global alpha (0 to 255) and the mask (the number of a window
+//! of FORMAT_A8 the size of the target rectangle; "not shown" as every
+//! window of that format). SCENE_COMMIT keeps the last scene it was given
+//! as the pending one; it becomes the working one whole, at the taking of a
+//! frame, and the bands of a frame read the working scene alone, so a frame
+//! shows a scene of one commit or the one before. `flags` bit 0 (ACTIVE)
+//! says the scene is composed by itself, at the start of a period that has a
+//! change in it or in a window it shows; with the bit clear (the default of
+//! a context) a frame is made only by SCENE_COMPOSE, which is UNSUPPORTED for
+//! an active scene. `flags` bit 1 asks for the bit COMMITTED (4) on the
+//! scene's channel when the pending scene is taken into a frame, and
+//! SCENE_COMPOSE's bit 0 for COMPOSED (5) when the frame it made is over. A
+//! window that no element of the working scene shows gets the buffer it
+//! posted back at the taking (the bit of its number), and a FLUSH of the
+//! first revision on such a window is answered at once. The service draws what
+//! its operations cover and refuses at SCENE_COMMIT, with UNSUPPORTED, what
+//! they do not (`element_drawable` of the service); the refusals INVALID
+//! are for what no operation could.
+//!
+//! Input under a scene: the keys go to the window with the focus, which the
+//! scene gives by MANAGE FOCUS; the moves and buttons of the pointer go to
+//! the scene's ring as events of the screen's coordinates, and to no window.
+//!
 //! DESCRIBE's `flags` has bit 0 (HAS_MANAGER) set while a manager has
 //! subscribed, and bit 1 (CURSOR_PLANE) once the service put the pointer's
 //! picture on the display's cursor pipeline. Its `open` is the windows alive
@@ -129,12 +175,18 @@ pub const BUFFER_MAX: u64 = 1 << 20;
 /// colour premultiplied by the alpha. 2 is no format (the probes refuse it).
 pub const FORMAT_XRGB8888: u32 = proto_gpu::FORMAT_XRGB8888;
 pub const FORMAT_ARGB8888: u32 = proto_gpu::FORMAT_ARGB8888;
+/// A window of 8 bits an alpha, a point a byte, a line `stride` bytes (at
+/// least `w`, a multiple of 4): the mask of an element. It never reaches the
+/// screen by itself, under a scene or without one.
+pub const FORMAT_A8: u32 = 4;
 
 /// The labels init gives a session of the manager and of the input
 /// (services/init `comp_mark`): bits the service's own labels never have
-/// (a clone's is bit 63, a window's 62, the driver's 61).
+/// (a clone's is bit 63, a window's 62, the driver's 61). The scene's mark is
+/// bit 54: bit 58 is the label of the keyboard's grant and 55 the timer's.
 pub const MANAGER_MARK: u64 = 1 << 60;
 pub const INPUT_MARK: u64 = 1 << 59;
+pub const SCENE_MARK: u64 = 1 << 54;
 
 /// DESCRIBE's `flags`: a manager has subscribed.
 pub const HAS_MANAGER: u32 = 1;
@@ -147,6 +199,10 @@ pub const CURSOR_PLANE: u32 = 2;
 /// The bit the service sends a window's channel when its ring has events;
 /// bits 0 to 2 tell the buffer that is free.
 pub const EVENTS_BIT: u64 = 1 << 3;
+/// The bits the service sends the scene's channel: the pending scene was
+/// taken into a frame, and the frame SCENE_COMPOSE asked for is over.
+pub const COMMITTED_BIT: u64 = 1 << 4;
+pub const COMPOSED_BIT: u64 = 1 << 5;
 
 /// The codes of the service, apart from the kernel's, proto_wire's and
 /// proto_gpu's.
@@ -173,10 +229,12 @@ pub enum Method {
     Inject = 23,
     Set = 24,
     Stats = 25,
+    SceneCommit = 26,
+    SceneCompose = 27,
 }
 
 impl Method {
-    pub const ALL: [Method; 9] = [
+    pub const ALL: [Method; 11] = [
         Method::Describe,
         Method::WindowCreate,
         Method::Attach,
@@ -186,6 +244,8 @@ impl Method {
         Method::Inject,
         Method::Set,
         Method::Stats,
+        Method::SceneCommit,
+        Method::SceneCompose,
     ];
 
     pub const fn number(self) -> u16 {
@@ -729,6 +789,257 @@ pub fn union(a: Option<Rect>, b: Rect) -> Rect {
     }
 }
 
+// ------------------------------------------------------------- the scene
+
+/// The most elements of a scene: 16 records of SCENE_ELEMENT bytes and the
+/// 12 bytes of SCENE_COMMIT's numbers fit the message after the header.
+pub const MAX_ELEMENTS: usize = 16;
+/// The bytes of an element's record.
+pub const SCENE_ELEMENT: usize = 56;
+/// The most bytes of a SCENE_COMMIT: the header, `flags`, `bg`, `count`, and
+/// the records of MAX_ELEMENTS elements.
+pub const SCENE_COMMIT_MAX: usize = 8 + 12 + MAX_ELEMENTS * SCENE_ELEMENT;
+const _: () = assert!(SCENE_COMMIT_MAX == 916);
+
+/// SCENE_COMMIT's `flags`: the scene is composed by itself (ACTIVE), and the
+/// scene's channel is told by COMMITTED_BIT when the scene is taken into a
+/// frame (ASK_COMMITTED).
+pub const ACTIVE: u32 = 1;
+pub const ASK_COMMITTED: u32 = 2;
+/// SCENE_COMPOSE's `flags`: the scene's channel is told by COMPOSED_BIT when
+/// the frame is over.
+pub const ASK_COMPOSED: u32 = 1;
+
+/// An element's `orient`: the rotation, clockwise, in quarter turns (bits 0
+/// and 1), then the reflection about the vertical axis (bit 2).
+pub const ROTATION: u32 = 3;
+pub const MIRROR: u32 = 4;
+/// An element's `filter`: the nearest point, or the bilinear mean (OpenWF's
+/// FASTER and NONE are the first, BETTER the second).
+pub const NEAREST: u32 = 0;
+pub const BILINEAR: u32 = 1;
+/// An element's `transparency`, the bits of OpenWF Composition's
+/// `WFC_TRANSPARENCY_*`: none is 0; the others lie over what is below by the
+/// global `alpha`, by the alpha of the window's own points (FORMAT_ARGB8888),
+/// by the mask. The pairs the specification allows are the global alpha with
+/// the window's own alpha and the global alpha with the mask.
+pub const TRANSPARENCY_ALPHA: u32 = 1;
+pub const TRANSPARENCY_SOURCE: u32 = 2;
+pub const TRANSPARENCY_MASK: u32 = 4;
+/// The greatest magnitude of a coordinate or a side: 2^24, the limit of
+/// OpenWF's integers; the 16.16 numbers of the source rectangle are at most
+/// that in points.
+pub const COORD_MAX: i32 = 1 << 24;
+
+/// The `source` or `mask` of an element that names no window. Window numbers
+/// start at 0, so the zero a record is made of cannot mean "none".
+pub const NO_WINDOW: u32 = u32::MAX;
+
+/// One element of a scene (SCENE_ELEMENT bytes, fourteen numbers of 4 bytes
+/// in this order). `source` and `mask` are the numbers of windows, or
+/// NO_WINDOW (a number no window has also shows nothing; the mask is read
+/// only when `transparency` has TRANSPARENCY_MASK). The source rectangle (`sx`, `sy`, `sw`,
+/// `sh`) is in 16.16 points of the window, the target rectangle (`dx`, `dy`,
+/// `dw`, `dh`) in points of the screen, after the orientation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Element {
+    pub source: u32,
+    pub mask: u32,
+    pub sx: i32,
+    pub sy: i32,
+    pub sw: i32,
+    pub sh: i32,
+    pub dx: i32,
+    pub dy: i32,
+    pub dw: i32,
+    pub dh: i32,
+    pub orient: u32,
+    pub filter: u32,
+    pub transparency: u32,
+    pub alpha: u32,
+}
+
+impl Element {
+    pub const NONE: Element = Element {
+        source: NO_WINDOW,
+        mask: NO_WINDOW,
+        sx: 0,
+        sy: 0,
+        sw: 0,
+        sh: 0,
+        dx: 0,
+        dy: 0,
+        dw: 0,
+        dh: 0,
+        orient: 0,
+        filter: 0,
+        transparency: 0,
+        alpha: 0,
+    };
+
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        for n in [self.source, self.mask] {
+            w.u32(n)?;
+        }
+        for n in [
+            self.sx, self.sy, self.sw, self.sh, self.dx, self.dy, self.dw, self.dh,
+        ] {
+            w.u32(n as u32)?;
+        }
+        for n in [self.orient, self.filter, self.transparency, self.alpha] {
+            w.u32(n)?;
+        }
+        Ok(())
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> Result<Element, Status> {
+        Ok(Element {
+            source: r.u32()?,
+            mask: r.u32()?,
+            sx: r.u32()? as i32,
+            sy: r.u32()? as i32,
+            sw: r.u32()? as i32,
+            sh: r.u32()? as i32,
+            dx: r.u32()? as i32,
+            dy: r.u32()? as i32,
+            dw: r.u32()? as i32,
+            dh: r.u32()? as i32,
+            orient: r.u32()?,
+            filter: r.u32()?,
+            transparency: r.u32()?,
+            alpha: r.u32()?,
+        })
+    }
+
+    /// Whether the numbers are in the limits of the protocol, whatever the
+    /// windows are: an orientation of the listed bits, a filter of the two,
+    /// a transparency of the pairs the specification allows, an alpha to 255,
+    /// a source rectangle that has a size and starts at or after the window's
+    /// corner, a target rectangle of no negative side, and a target place and
+    /// size of no magnitude past COORD_MAX.
+    pub const fn in_limits(&self) -> bool {
+        const fn small(n: i32) -> bool {
+            n >= -COORD_MAX && n <= COORD_MAX
+        }
+        self.sw > 0
+            && self.sh > 0
+            && self.sx >= 0
+            && self.sy >= 0
+            && small(self.dx)
+            && small(self.dy)
+            && self.dw >= 0
+            && self.dh >= 0
+            && small(self.dw)
+            && small(self.dh)
+            && self.orient & !(ROTATION | MIRROR) == 0
+            && self.filter <= BILINEAR
+            && transparency_allowed(self.transparency)
+            && self.alpha <= 255
+    }
+}
+
+/// Whether `bits` are a transparency the specification allows: none, any one
+/// kind, the global alpha with the window's own alpha, the global alpha with
+/// the mask.
+pub const fn transparency_allowed(bits: u32) -> bool {
+    matches!(
+        bits,
+        0 | TRANSPARENCY_ALPHA
+            | TRANSPARENCY_SOURCE
+            | TRANSPARENCY_MASK
+            | 3 // ALPHA | SOURCE
+            | 5 // ALPHA | MASK
+    )
+}
+
+/// SCENE_COMMIT's body: the flags, the background (0xAARRGGBB, the colour
+/// premultiplied by the alpha) and the elements, lowest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SceneCommit {
+    pub flags: u32,
+    pub bg: u32,
+    pub count: u32,
+    pub elements: [Element; MAX_ELEMENTS],
+}
+
+impl SceneCommit {
+    /// A SCENE_COMMIT of `elements`; INVALID past MAX_ELEMENTS.
+    pub fn new(flags: u32, bg: u32, elements: &[Element]) -> Result<SceneCommit, Status> {
+        if elements.len() > MAX_ELEMENTS {
+            return Err(code(INVALID));
+        }
+        let mut commit = SceneCommit {
+            flags,
+            bg,
+            count: elements.len() as u32,
+            elements: [Element::NONE; MAX_ELEMENTS],
+        };
+        commit.elements[..elements.len()].copy_from_slice(elements);
+        Ok(commit)
+    }
+
+    pub fn elements(&self) -> &[Element] {
+        &self.elements[..self.count as usize]
+    }
+
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        Method::SceneCommit.header().write(w)?;
+        w.u32(self.flags)?;
+        w.u32(self.bg)?;
+        w.u32(self.count)?;
+        for e in self.elements() {
+            e.write(w)?;
+        }
+        Ok(())
+    }
+
+    /// The body after the header: BAD_SIZE unless it is the three numbers and
+    /// `count` records, INVALID for a count past MAX_ELEMENTS (read before the
+    /// records, so a count that is too big is INVALID whatever follows), a
+    /// flag the service has not, or a record out of the limits.
+    pub fn read(mut body: Reader<'_>) -> Result<SceneCommit, Status> {
+        let flags = body.u32()?;
+        let bg = body.u32()?;
+        let count = body.u32()?;
+        if count as usize > MAX_ELEMENTS {
+            return Err(code(INVALID));
+        }
+        let mut commit = SceneCommit {
+            flags,
+            bg,
+            count,
+            elements: [Element::NONE; MAX_ELEMENTS],
+        };
+        for e in &mut commit.elements[..count as usize] {
+            *e = Element::read(&mut body)?;
+        }
+        body.finish()?;
+        if flags & !(ACTIVE | ASK_COMMITTED) != 0
+            || commit.elements().iter().any(|e| !e.in_limits())
+        {
+            return Err(code(INVALID));
+        }
+        Ok(commit)
+    }
+}
+
+/// SCENE_COMPOSE's request: the header and the flags.
+pub fn write_scene_compose(flags: u32, w: &mut Writer) -> Result<(), Status> {
+    Method::SceneCompose.header().write(w)?;
+    w.u32(flags)
+}
+
+/// The flags of SCENE_COMPOSE's body: BAD_SIZE unless it is one number,
+/// INVALID for a bit the service has not.
+pub fn read_scene_compose(mut body: Reader<'_>) -> Result<u32, Status> {
+    let flags = body.u32()?;
+    body.finish()?;
+    if flags & !ASK_COMPOSED != 0 {
+        return Err(code(INVALID));
+    }
+    Ok(flags)
+}
+
 // ------------------------------------------------------- the frame clock
 
 /// The properties of SET (the methods of the frame clock, stage G5). A SET
@@ -1063,7 +1374,7 @@ mod tests {
     #[test]
     fn the_methods_keep_their_numbers_apart_from_gpus() {
         let numbers: Vec<_> = Method::ALL.iter().map(|m| m.number()).collect();
-        assert_eq!(numbers, [17, 18, 19, 20, 21, 22, 23, 24, 25]);
+        assert_eq!(numbers, [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header().version, proto_gpu::VERSION);
@@ -1480,5 +1791,206 @@ mod tests {
         for (i, n) in record.iter().enumerate() {
             assert_eq!(word(2 + COUNTERS + BUCKETS + i), *n, "record {i}");
         }
+    }
+
+    // ------------------------------------------------------------ the scene
+
+    fn element(source: u32) -> Element {
+        Element {
+            source,
+            mask: NO_WINDOW,
+            sx: 0,
+            sy: 0,
+            sw: 100 << 16,
+            sh: 50 << 16,
+            dx: 10,
+            dy: -20,
+            dw: 100,
+            dh: 50,
+            orient: 0,
+            filter: NEAREST,
+            transparency: 0,
+            alpha: 255,
+        }
+    }
+
+    fn commit_bytes(commit: &SceneCommit) -> Vec<u8> {
+        let mut w = Writer::new();
+        commit.write(&mut w).unwrap();
+        w.as_bytes().to_vec()
+    }
+
+    fn read_commit(bytes: &[u8]) -> Result<SceneCommit, Status> {
+        let mut r = Reader::new(bytes);
+        Header::read(&mut r).unwrap();
+        SceneCommit::read(r)
+    }
+
+    #[test]
+    fn the_scene_marks_and_bits_are_apart_from_the_others() {
+        let marks = [MANAGER_MARK, INPUT_MARK, SCENE_MARK];
+        for (i, a) in marks.iter().enumerate() {
+            assert_eq!(a.count_ones(), 1);
+            // Not a clone's (63), a window's (62), the driver's (61), the
+            // keyboard's and the pointer's grants (58, 57), a window's keys (56)
+            // or the timer's (55).
+            assert_eq!(
+                a & (1 << 63 | 1 << 62 | 1 << 61 | 1 << 58 | 1 << 57 | 1 << 56 | 1 << 55),
+                0
+            );
+            assert!(!marks[..i].contains(a));
+        }
+        assert_eq!(EVENTS_BIT | COMMITTED_BIT | COMPOSED_BIT, 0b111000);
+        assert_eq!(FORMAT_A8, 4);
+        assert_ne!(proto_gpu::format_bit(FORMAT_A8), 1);
+    }
+
+    #[test]
+    fn a_scene_of_sixteen_elements_is_916_bytes_of_the_1024() {
+        let commit = SceneCommit::new(ACTIVE, 0xFF10_2030, &[element(1); MAX_ELEMENTS]).unwrap();
+        let bytes = commit_bytes(&commit);
+        assert_eq!(bytes.len(), SCENE_COMMIT_MAX);
+        assert_eq!(bytes.len(), 916);
+        assert!(bytes.len() <= 1024);
+        assert_eq!(SCENE_ELEMENT, 56);
+        let mut w = Writer::new();
+        element(3).write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), SCENE_ELEMENT);
+    }
+
+    #[test]
+    fn a_scene_round_trips_with_its_flags_background_and_order() {
+        let mut a = element(2);
+        a.orient = ROTATION | MIRROR;
+        a.filter = BILINEAR;
+        a.transparency = TRANSPARENCY_ALPHA | TRANSPARENCY_MASK;
+        a.mask = 5;
+        a.alpha = 191;
+        a.sx = 3 << 16 | 0x8000;
+        let elements = [element(1), a, element(NO_WINDOW)];
+        let commit = SceneCommit::new(ACTIVE | ASK_COMMITTED, 0x8000_0000, &elements).unwrap();
+        let back = read_commit(&commit_bytes(&commit)).unwrap();
+        assert_eq!(back, commit);
+        assert_eq!(back.elements(), &elements);
+        assert_eq!((back.flags, back.bg, back.count), (3, 0x8000_0000, 3));
+        // An empty scene is only its three numbers.
+        let empty = SceneCommit::new(0, 0, &[]).unwrap();
+        assert_eq!(commit_bytes(&empty).len(), 20);
+        assert_eq!(read_commit(&commit_bytes(&empty)).unwrap().count, 0);
+    }
+
+    #[test]
+    fn the_record_has_the_fields_in_their_order_on_the_wire() {
+        let mut e = element(7);
+        e.mask = 8;
+        e.alpha = 9;
+        let mut w = Writer::new();
+        e.write(&mut w).unwrap();
+        let b = w.as_bytes();
+        let word = |i: usize| i32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap());
+        assert_eq!(word(0), 7);
+        assert_eq!(word(1), 8);
+        assert_eq!(
+            [word(2), word(3), word(4), word(5)],
+            [0, 0, 100 << 16, 50 << 16]
+        );
+        assert_eq!([word(6), word(7), word(8), word(9)], [10, -20, 100, 50]);
+        assert_eq!([word(10), word(11), word(12), word(13)], [0, 0, 0, 9]);
+    }
+
+    #[test]
+    fn a_scene_past_sixteen_elements_or_of_the_wrong_length_is_refused() {
+        assert_eq!(
+            SceneCommit::new(0, 0, &[element(1); MAX_ELEMENTS + 1]),
+            Err(code(INVALID))
+        );
+        // A count of 17 in the bytes is INVALID whatever follows.
+        let mut bytes = commit_bytes(&SceneCommit::new(0, 0, &[element(1)]).unwrap());
+        bytes[16..20].copy_from_slice(&17u32.to_le_bytes());
+        assert_eq!(read_commit(&bytes), Err(code(INVALID)));
+        // A count that says more records than the bytes hold is BAD_SIZE.
+        let mut bytes = commit_bytes(&SceneCommit::new(0, 0, &[element(1)]).unwrap());
+        bytes[16..20].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(read_commit(&bytes), Err(Status::BadSize));
+        // Bytes after the last record are BAD_SIZE.
+        let mut bytes = commit_bytes(&SceneCommit::new(0, 0, &[element(1)]).unwrap());
+        bytes.push(0);
+        assert_eq!(read_commit(&bytes), Err(Status::BadSize));
+        // A record cut short.
+        let bytes = commit_bytes(&SceneCommit::new(0, 0, &[element(1)]).unwrap());
+        assert_eq!(read_commit(&bytes[..bytes.len() - 4]), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn an_unknown_flag_or_a_record_out_of_its_limits_is_invalid() {
+        let commit = |e: Element| SceneCommit::new(0, 0, &[e]).unwrap();
+        assert_eq!(
+            read_commit(&commit_bytes(&SceneCommit::new(4, 0, &[]).unwrap())),
+            Err(code(INVALID))
+        );
+        let broken: [(&str, fn(&mut Element)); 14] = [
+            ("a zero width", |e| e.sw = 0),
+            ("a zero height", |e| e.sh = 0),
+            ("a negative source place", |e| e.sx = -1),
+            ("a negative source line", |e| e.sy = -1),
+            ("a negative target width", |e| e.dw = -1),
+            ("a negative target height", |e| e.dh = -1),
+            ("a target place past the limit", |e| e.dx = COORD_MAX + 1),
+            ("a target place under the limit", |e| e.dy = -COORD_MAX - 1),
+            ("a target side past the limit", |e| e.dw = COORD_MAX + 1),
+            ("a turn bit that is none", |e| e.orient = 8),
+            ("a filter that is none", |e| e.filter = 2),
+            ("a source with a mask", |e| {
+                e.transparency = TRANSPARENCY_SOURCE | TRANSPARENCY_MASK
+            }),
+            ("a transparency of three kinds", |e| e.transparency = 7),
+            ("an alpha past 255", |e| e.alpha = 256),
+        ];
+        for (what, change) in broken {
+            let mut e = element(1);
+            change(&mut e);
+            assert_eq!(
+                read_commit(&commit_bytes(&commit(e))),
+                Err(code(INVALID)),
+                "{what}"
+            );
+        }
+        // The edges that are allowed.
+        for change in [
+            (|e: &mut Element| e.dw = 0) as fn(&mut Element),
+            |e| e.dw = COORD_MAX,
+            |e| e.dx = -COORD_MAX,
+            |e| e.alpha = 255,
+            |e| e.transparency = TRANSPARENCY_ALPHA | TRANSPARENCY_SOURCE,
+            |e| e.transparency = TRANSPARENCY_MASK,
+            |e| e.orient = ROTATION | MIRROR,
+        ] {
+            let mut e = element(1);
+            change(&mut e);
+            assert!(read_commit(&commit_bytes(&commit(e))).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_pairs_of_transparency_are_the_ones_of_the_specification() {
+        let allowed: Vec<u32> = (0..8).filter(|&b| transparency_allowed(b)).collect();
+        assert_eq!(allowed, [0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn scene_compose_is_one_flag_word() {
+        let mut w = Writer::new();
+        write_scene_compose(ASK_COMPOSED, &mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), 12);
+        let mut r = Reader::new(w.as_bytes());
+        let header = Header::read(&mut r).unwrap();
+        assert_eq!(header.method, 27);
+        assert_eq!(read_scene_compose(r), Ok(ASK_COMPOSED));
+        let mut w = Writer::new();
+        write_scene_compose(2, &mut w).unwrap();
+        let mut r = Reader::new(w.as_bytes());
+        Header::read(&mut r).unwrap();
+        assert_eq!(read_scene_compose(r), Err(code(INVALID)));
+        assert_eq!(read_scene_compose(Reader::new(&[])), Err(Status::BadSize));
     }
 }
