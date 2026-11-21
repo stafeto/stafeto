@@ -292,6 +292,16 @@ impl Wfd {
         dev == self.device
     }
 
+    /// Stores `error` for the layers above: a function of the API that the
+    /// device does not have (an EGL source, an asynchronous event) or a
+    /// failure of a call to the service. No effect for a handle that is no
+    /// device.
+    pub fn refuse(&mut self, dev: u32, error: i32) {
+        if self.is(dev) {
+            self.raise(error);
+        }
+    }
+
     // ---------------------------------------------------------------- devices
 
     /// `wfdEnumerateDevices` (3.1): the ids written to `ids` and their total.
@@ -1853,6 +1863,15 @@ impl Wfd {
         c.head = (c.head + 1) % QUEUE_MAX;
         c.len -= 1;
         Poll::Event(c.last.kind)
+    }
+
+    /// Whether a wait on the container can end: an event is queued or the
+    /// container is gone.
+    pub fn event_ready(&self, event: u32) -> bool {
+        match self.event_index(event) {
+            Some(at) => self.events[at].as_ref().is_some_and(|c| c.len > 0),
+            None => true,
+        }
     }
 
     /// The wait timed out: the last event is NONE.
