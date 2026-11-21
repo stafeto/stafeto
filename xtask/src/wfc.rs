@@ -8,8 +8,10 @@
 //! two producers (tests/wfc-producer: a window of 100 by 200 points and one of
 //! 160 by 100, each a fixed pattern), draws a mask of A8 of its own, finds the
 //! windows by `wfcNextStreamSTAFETO`, and shows two scenes of three elements,
-//! A and B (a stretch, turns, a flip, the three filters, a global alpha and a
-//! mask).
+//! A and B: elements of one to one scale, quarter turns, the filters none and
+//! faster, a global alpha and a mask. A stretch, a flip and the bilinear filter
+//! are left out while the service's price model makes a frame of them take
+//! seconds; they come back with the change of that model.
 //!
 //! The expected frames are the host's (`tools/wfc-ref`): the scenes built
 //! through the crate `wfc` with the demo's calls and drawn point by point from
@@ -20,7 +22,14 @@
 //! which must be the host's for that scene. A frame with elements of both scenes
 //! is a third CRC and fails the probe. In the second part the context is active
 //! and the demo changes the scene 100 times without waiting; xtask takes
-//! screenshots one after another meanwhile, and each is the CRC of A or of B.
+//! screenshots one after another meanwhile, and each is the CRC of A or of B,
+//! both of them come up, and the picture changes between them at least twice (the
+//! first change of the phase sets the scene the last commit left, so a service that
+//! composed nothing would show one picture only). A last scene C shows the window of
+//! the first revision straight from its buffer. The demo prints the service's counters
+//! at five points (DESCRIBE and STATS); no frame failed, the frames of the first part
+//! are 100 or more, the bands grow under A and B and the frames shown straight do not,
+//! and scene C adds a frame shown straight.
 //!
 //! A second run under -icount (QEMU's own emulation) measures the steps of the
 //! compositor and the driver: the demo leaves out its pauses, and every step
@@ -188,6 +197,9 @@ pub struct Seen {
     /// The screenshot of scene C (the window of the first revision, shown
     /// straight from its buffer).
     pub direct: u32,
+    /// The scanouts the device's trace had when the active phase ended, a lower
+    /// bound (the file may lag): the one to the pool must come after them.
+    pub scanouts_before_c: usize,
 }
 
 /// The CRC of the picture the third producer draws on the screen of the first
@@ -239,7 +251,7 @@ fn drive(run: &mut Run, scratch: &Scratch, host: [u32; 2]) -> Result<Seen, Strin
         return Err(failed);
     }
     let mut auto = Vec::new();
-    loop {
+    let scanouts_before_c = loop {
         auto.push(take(&mut monitor, scratch)?);
         match run.expect_line(
             AUTO_END,
@@ -250,12 +262,12 @@ fn drive(run: &mut Run, scratch: &Scratch, host: [u32; 2]) -> Result<Seen, Strin
                 if let Some(failed) = failure(&line) {
                     return Err(failed);
                 }
-                break;
+                break scanouts_now(scratch);
             }
             Err(e) if e.starts_with("timed out") => {}
             Err(e) => return Err(e),
         }
-    }
+    };
     let line = run.expect_line(SCENE_C, |l| l == SCENE_C || failure(l).is_some(), WITHIN)?;
     if let Some(failed) = failure(&line) {
         return Err(failed);
@@ -269,7 +281,126 @@ fn drive(run: &mut Run, scratch: &Scratch, host: [u32; 2]) -> Result<Seen, Strin
         shots,
         auto,
         direct,
+        scanouts_before_c,
     })
+}
+
+/// The scanouts of the whole screen the device's trace has so far (0 when the file is
+/// not there yet or has nothing).
+fn scanouts_now(scratch: &Scratch) -> usize {
+    std::fs::read_to_string(scratch.trace())
+        .ok()
+        .and_then(|text| qemu::parse_gpu_trace(&text).ok())
+        .map_or(0, |events| scanouts(&events).len())
+}
+
+/// The resources the screen was set to, in order.
+fn scanouts(events: &[qemu::GpuTrace]) -> Vec<u32> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            qemu::GpuTrace::Scanout {
+                id: 0,
+                res,
+                w: 640,
+                h: 400,
+                x: 0,
+                y: 0,
+            } => Some(*res),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The service's counters the demo printed at a point (`counters` of wfc-demo.c).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Counters {
+    pub frames: u64,
+    pub direct: u64,
+    pub late: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub capped: u64,
+    pub bypassed: u64,
+    pub bands: u64,
+}
+
+/// The five lines `wfc-demo: counters P frames F direct D late L skipped S failed X
+/// capped C bypassed Y bands B`, in order of P.
+pub fn counters_of(lines: &[String]) -> Result<[Counters; 5], String> {
+    let mut found = Vec::new();
+    for point in 0..5 {
+        let prefix = format!("wfc-demo: counters {point} ");
+        let mut mine = lines.iter().filter(|l| l.starts_with(&prefix));
+        let line = mine.next().ok_or_else(|| format!("no line {prefix:?}"))?;
+        if mine.next().is_some() {
+            return Err(format!("two lines {prefix:?}"));
+        }
+        let words: Vec<&str> = line[prefix.len()..].split_whitespace().collect();
+        let names = [
+            "frames", "direct", "late", "skipped", "failed", "capped", "bypassed", "bands",
+        ];
+        let mut numbers = [0u64; 8];
+        if words.len() != 16 {
+            return Err(format!("{line:?}: eight counters expected"));
+        }
+        for (k, name) in names.iter().enumerate() {
+            if words[2 * k] != *name {
+                return Err(format!("{line:?}: {name} expected"));
+            }
+            numbers[k] = words[2 * k + 1]
+                .parse()
+                .map_err(|e| format!("{line:?}: {name}: {e}"))?;
+        }
+        found.push(Counters {
+            frames: numbers[0],
+            direct: numbers[1],
+            late: numbers[2],
+            skipped: numbers[3],
+            failed: numbers[4],
+            capped: numbers[5],
+            bypassed: numbers[6],
+            bands: numbers[7],
+        });
+    }
+    Ok(found.try_into().expect("five points"))
+}
+
+/// What the counters say (plan 8.2.4 and 7.4): no frame failed, the 100 composes of the
+/// first part are 100 frames or more, bands grew under the scenes A and B in both
+/// parts and no frame of them was shown straight, and scene C added a frame shown
+/// straight from a window's buffer. The bands of scene C are told and left unjudged: the run
+/// showed 3 285 bands in the two frames of that step (one shown straight, one put
+/// together), so "no band in frame C" is not a property of this scene.
+pub fn counters_verdict(c: &[Counters; 5]) -> Result<(), String> {
+    if let Some(k) = c.iter().position(|c| c.failed != 0) {
+        return Err(format!("counters {k}: {} frames failed", c[k].failed));
+    }
+    if c[1].frames < c[0].frames + COMMITS as u64 {
+        return Err(format!(
+            "frames {} then {}: {COMMITS} or more expected for the commits",
+            c[0].frames, c[1].frames
+        ));
+    }
+    if c[1].bands <= c[0].bands || c[2].bands <= c[1].bands {
+        return Err(format!(
+            "bands {}, {}, {}: they grow under scenes A and B",
+            c[0].bands, c[1].bands, c[2].bands
+        ));
+    }
+    if c[0].bypassed != c[1].bypassed || c[1].bypassed != c[2].bypassed {
+        return Err(format!(
+            "frames shown straight {}, {}, {}: none under scenes A and B",
+            c[0].bypassed, c[1].bypassed, c[2].bypassed
+        ));
+    }
+    if c[4].bypassed <= c[3].bypassed {
+        return Err(format!(
+            "scene C: frames shown straight {} then {}, more expected",
+            c[3].bypassed, c[4].bypassed
+        ));
+    }
+    Ok(())
 }
 
 /// The lines of commits in a run's output: each number once, in order, with
@@ -335,6 +466,24 @@ pub fn verdict(lines: &[String], seen: &Seen, host: [u32; 2]) -> Result<(), Stri
             seen.auto.len()
         ));
     }
+    let changes = seen.auto.windows(2).filter(|w| w[0] != w[1]).count();
+    if !seen.auto.contains(&host[0]) || !seen.auto.contains(&host[1]) || changes < 2 {
+        return Err(format!(
+            "the {} screenshots of the active context show {} change(s) between the scenes and A {} and B {} among them: both scenes and two changes at least expected (the active context took no frame by itself)",
+            seen.auto.len(),
+            changes,
+            if seen.auto.contains(&host[0]) {
+                "is"
+            } else {
+                "is not"
+            },
+            if seen.auto.contains(&host[1]) {
+                "is"
+            } else {
+                "is not"
+            },
+        ));
+    }
     if let Some((i, c)) = seen
         .auto
         .iter()
@@ -346,6 +495,7 @@ pub fn verdict(lines: &[String], seen: &Seen, host: [u32; 2]) -> Result<(), Stri
             host[0], host[1]
         ));
     }
+    counters_verdict(&counters_of(lines)?)?;
     if seen.direct != direct_crc() {
         return Err(format!(
             "scene C (the window of the first revision shown directly): QEMU's screenshot is {:08x}, the producer's gradient is {:08x}",
@@ -359,26 +509,14 @@ pub fn verdict(lines: &[String], seen: &Seen, host: [u32; 2]) -> Result<(), Stri
 /// The trace of the device against what the demo did: the screen went to the pool
 /// (resource 2) after the target (resource 1), which is the window of the first
 /// revision shown straight from its buffer, with no band put together.
-pub fn trace_verdict(events: &[qemu::GpuTrace]) -> Result<(), String> {
-    let scanouts: Vec<u32> = events
-        .iter()
-        .filter_map(|e| match e {
-            qemu::GpuTrace::Scanout {
-                id: 0,
-                res,
-                w: 640,
-                h: 400,
-                x: 0,
-                y: 0,
-            } => Some(*res),
-            _ => None,
-        })
-        .collect();
-    if gpu_probe::contains_in_order(&scanouts, &[1, 2]) {
+pub fn trace_verdict(events: &[qemu::GpuTrace], before_c: usize) -> Result<(), String> {
+    let scanouts = scanouts(events);
+    let first = scanouts.iter().position(|&r| r == 2);
+    if gpu_probe::contains_in_order(&scanouts, &[1, 2]) && first.is_some_and(|k| k >= before_c) {
         Ok(())
     } else {
         Err(format!(
-            "the trace of SET_SCANOUT shows resources {scanouts:?}, 1 and then 2 (scene C shown directly) expected"
+            "the trace of SET_SCANOUT shows resources {scanouts:?}: 1 and then 2 (scene C shown directly), the first 2 after the first {before_c} entries (the end of the active phase), expected"
         ))
     }
 }
@@ -419,13 +557,31 @@ pub fn probe(machine: &qemu::Machine, with_steps: bool) -> Result<(), String> {
     verdict(&outcome.lines, &seen, host).map_err(who)?;
     let text = std::fs::read_to_string(scratch.trace())
         .map_err(|e| who(format!("the trace file: {e}")))?;
-    trace_verdict(&qemu::parse_gpu_trace(&text).map_err(who)?).map_err(who)?;
+    trace_verdict(
+        &qemu::parse_gpu_trace(&text).map_err(who)?,
+        seen.scanouts_before_c,
+    )
+    .map_err(who)?;
+    let c = counters_of(&outcome.lines).map_err(who)?;
     println!(
-        "wfc-probe on {}: scene A is {:08x} and scene B {:08x} (the host's frames from the same calls, drawn point by point); {COMMITS} commits in turn, each composed on request, matched QEMU's screenshot; {} screenshots of the active context while the scene changed {COMMITS} times were each A or B; scene C, the window of the first revision, matched the producer's gradient and the scanout went to the pool (resource 2); the calls, the errors, the streams, the sources, the mask, the child and the destroy: ok",
+        "wfc-probe on {}: scene A is {:08x} and scene B {:08x} (the host's frames from the same calls, drawn point by point); {COMMITS} commits in turn, each composed on request, matched QEMU's screenshot; {} screenshots of the active context while the scene changed {COMMITS} times were each A or B (both came up, {} changes between them); scene C, the window of the first revision, matched the producer's gradient and the scanout went to the pool (resource 2) after the active phase; the service's counters: frames {} then {} then {} (commits, active phase), bands {} then {} then {}, frames shown straight {} under A and B and {} after C with {} bands in it, failed {}, late {} and capped {} (of the frames and periods since the start); the calls, the errors, the streams, the sources, the mask, the child and the destroy: ok",
         machine.name,
         host[0],
         host[1],
-        seen.auto.len()
+        seen.auto.len(),
+        seen.auto.windows(2).filter(|w| w[0] != w[1]).count(),
+        c[0].frames,
+        c[1].frames,
+        c[2].frames,
+        c[0].bands,
+        c[1].bands,
+        c[2].bands,
+        c[2].bypassed,
+        c[4].bypassed,
+        c[4].bands - c[3].bands,
+        c[4].failed,
+        c[4].late,
+        c[4].capped
     );
     if with_steps && !machine.is_hvf() {
         steps(machine)?;
@@ -433,9 +589,14 @@ pub fn probe(machine: &qemu::Machine, with_steps: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// The compositor's kinds that must come: DESCRIBE, WINDOW_CREATE, ATTACH, POST,
-/// SCENE_COMMIT, SCENE_COMPOSE, and its own (a band, the end of a frame).
-const COMP_KINDS: [(usize, &str); 7] = [
+/// The compositor's kinds that must come: OPEN and FLUSH of the producer of the first
+/// revision (scene C), DESCRIBE, WINDOW_CREATE, ATTACH, POST, SCENE_COMMIT,
+/// SCENE_COMPOSE, and its own (a band, the end of a frame). The step of the taking of a
+/// frame is no kind of its own: the lines tell the longest step of a kind, and the
+/// details seen were the band's and the work's, so it is not asked for by itself.
+const COMP_KINDS: [(usize, &str); 9] = [
+    (1, "Open"),
+    (2, "Flush"),
     (17, "Describe"),
     (18, "WindowCreate"),
     (19, "Attach"),
@@ -445,10 +606,12 @@ const COMP_KINDS: [(usize, &str); 7] = [
     (65, "a band of a frame and the end of a frame"),
 ];
 /// The driver's: SUBSCRIBE, COMMIT, PIPELINES and SOURCE (the compositor asks them
-/// when it opens the screen), and its own (the interrupt).
-const DRIVER_KINDS: [(usize, &str); 5] = [
+/// when it opens the screen), LAYERS (scene C shown straight), and its own (the
+/// interrupt).
+const DRIVER_KINDS: [(usize, &str); 6] = [
     (5, "Subscribe"),
     (6, "Commit"),
+    (11, "Layers"),
     (9, "Pipelines"),
     (10, "Source"),
     (65, "the interrupt"),
@@ -547,8 +710,37 @@ mod tests {
         for k in 0..COMMITS {
             lines.push(format!("{COMMIT}{k} scene {}", b"AB"[k % 2] as char));
         }
+        for (point, c) in good_counters().iter().enumerate() {
+            lines.push(format!(
+                "wfc-demo: counters {point} frames {} direct {} late {} skipped {} failed {} capped {} bypassed {} bands {}",
+                c.frames, c.direct, c.late, c.skipped, c.failed, c.capped, c.bypassed, c.bands
+            ));
+        }
         lines.push("wfc-demo: ok".to_owned());
         lines
+    }
+
+    fn counters_at(frames: u64, bypassed: u64, bands: u64) -> Counters {
+        Counters {
+            frames,
+            direct: bypassed,
+            late: 0,
+            skipped: 0,
+            failed: 0,
+            capped: 1,
+            bypassed,
+            bands,
+        }
+    }
+
+    fn good_counters() -> [Counters; 5] {
+        [
+            counters_at(3, 0, 100),
+            counters_at(110, 0, 90_000),
+            counters_at(150, 0, 190_000),
+            counters_at(151, 0, 190_000),
+            counters_at(152, 1, 190_000),
+        ]
     }
 
     fn good_seen() -> Seen {
@@ -563,6 +755,7 @@ mod tests {
                 .collect(),
             auto: vec![h[1], h[0], h[1], h[1], h[0]],
             direct: direct_crc(),
+            scanouts_before_c: 2,
         }
     }
 
@@ -668,9 +861,56 @@ mod tests {
             x: 0,
             y: 0,
         };
-        assert!(trace_verdict(&[at(1), at(2)]).is_ok());
-        assert!(trace_verdict(&[at(1), at(1)]).is_err());
-        assert!(trace_verdict(&[at(2), at(1)]).is_err());
+        assert!(trace_verdict(&[at(1), at(2)], 1).is_ok());
+        assert!(trace_verdict(&[at(1), at(1)], 1).is_err());
+        assert!(trace_verdict(&[at(2), at(1)], 0).is_err());
+        // The scanout to the pool must come after the end of the active phase.
+        assert!(trace_verdict(&[at(1), at(2), at(1)], 2).is_err());
+        assert!(trace_verdict(&[at(1), at(1), at(2)], 2).is_ok());
+    }
+
+    /// The active context composed nothing: every screenshot is the scene the last
+    /// commit of the first part left (B).
+    #[test]
+    fn an_active_context_that_shows_one_picture_fails() {
+        let h = host();
+        let mut seen = good_seen();
+        seen.auto = vec![h[1]; 20];
+        let e = verdict(&good_lines(), &seen, h).unwrap_err();
+        assert!(e.contains("took no frame by itself"), "{e}");
+        // Both pictures but a single change is too few.
+        seen.auto = vec![h[1], h[1], h[0], h[0]];
+        assert!(verdict(&good_lines(), &seen, h).is_err());
+        seen.auto = vec![h[1], h[0], h[1]];
+        verdict(&good_lines(), &seen, h).unwrap();
+    }
+
+    #[test]
+    fn the_counters_are_read_and_judged() {
+        let lines = good_lines();
+        assert_eq!(counters_of(&lines).unwrap(), good_counters());
+        counters_verdict(&good_counters()).unwrap();
+        let mut c = good_counters();
+        c[2].failed = 1;
+        assert!(counters_verdict(&c).unwrap_err().contains("failed"));
+        let mut c = good_counters();
+        c[1].frames = c[0].frames + 99;
+        assert!(counters_verdict(&c).is_err());
+        let mut c = good_counters();
+        c[2].bands = c[1].bands;
+        assert!(counters_verdict(&c).is_err());
+        let mut c = good_counters();
+        c[2].bypassed = 1;
+        assert!(counters_verdict(&c).is_err());
+        let mut c = good_counters();
+        c[4].bands += 3285;
+        counters_verdict(&c).unwrap();
+        let mut c = good_counters();
+        c[4].bypassed = c[3].bypassed;
+        assert!(counters_verdict(&c).is_err());
+        let mut lines = good_lines();
+        lines.retain(|l| !l.starts_with("wfc-demo: counters 3 "));
+        assert!(counters_of(&lines).is_err());
     }
 
     #[test]

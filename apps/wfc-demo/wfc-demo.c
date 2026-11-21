@@ -14,10 +14,10 @@
  * (none and the faster one), the kind of transparency (a global alpha, a mask,
  * both) and the background. The elements keep to what the service's prices make
  * cheap: a stretch, a flip or the bilinear filter make every band of a frame a
- * few points wide, and a frame takes seconds (see docs/openwf.md). With --probe it checks the API,
+ * few points wide, and a frame takes seconds (see docs/compositor.md). With --probe it checks the API,
  * commits the scenes 100 times in turn, each composed on request (the context
  * is inactive) and its number printed, and then activates the context and
- * changes the scene 100 times without waiting, and last shows a scene C of one
+ * changes the scene 100 times without waiting (every 130 ms: a frame of these scenes takes over a second, so the frames the service takes see the scene at different turns of the alternation), and last shows a scene C of one
  * element, the window of a third producer that is the screen of the first
  * revision, which the service shows straight from its buffer. The host (tools/wfc-ref)
  * draws both scenes point by point from the same calls and `cargo xtask
@@ -330,6 +330,18 @@ static int child_has_no_device(void) {
     return 0;
 }
 
+/* The service's counters at a point of the run, for the host to judge. */
+int wd_counters(uint32_t *out);
+
+static void counters(int point) {
+    uint32_t c[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (wd_counters(c) != 0) printf("wfc-demo: counters %d unavailable\n", point);
+    else
+        printf("wfc-demo: counters %d frames %u direct %u late %u skipped %u failed %u capped %u bypassed %u bands %u\n",
+               point, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+    fflush(stdout);
+}
+
 static long now_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -337,6 +349,7 @@ static long now_ms(void) {
 }
 
 static int commits(int count) {
+    if (count >= 0) counters(0);
     for (int k = 0; count < 0 || k < count; k++) {
         long t0 = now_ms();
         apply(k);
@@ -359,6 +372,7 @@ static int commits(int count) {
             pause_ns(1000000000L);
         }
     }
+    if (count >= 0) counters(1);
     printf("wfc-demo: %d commits of scenes A and B, each composed on request\n", count);
     return 0;
 }
@@ -378,13 +392,14 @@ static int changes(int count) {
         CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
         wfcCommit(dev, ctx, WFC_FALSE);
         CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
-        pause_ns(quick ? 0L : 40000000L);
+        pause_ns(quick ? 0L : 130000000L);
     }
     pause_ns(quick ? 0L : 100000000L);
     printf("wfc-demo: auto end\n");
     fflush(stdout);
     wfcDeactivate(dev, ctx);
     CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    counters(2);
     printf("wfc-demo: %d scene changes of the active context\n", count);
     return 0;
 }
@@ -403,6 +418,7 @@ static int scene_c(void) {
     pause_ns(700000000L);
     src = wfcCreateSourceFromStream(dev, ctx, id_s, NULL);
     CHECK(src != WFC_INVALID_HANDLE);
+    counters(3);
     wfcRemoveElement(dev, element[1]);
     wfcRemoveElement(dev, element[2]);
     wfcSetContextAttribi(dev, ctx, WFC_CONTEXT_BG_COLOR, 0x000000FF);
@@ -419,6 +435,7 @@ static int scene_c(void) {
     CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
     wfcCompose(dev, ctx, WFC_TRUE);
     CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    counters(4);
     printf("wfc-demo: scene C committed\n");
     fflush(stdout);
     snapshot_pause();

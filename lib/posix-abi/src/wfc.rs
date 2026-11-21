@@ -609,6 +609,27 @@ fn read_ring() -> Result<(), Status> {
     Ok(())
 }
 
+/// The counters the probe of the demo reads from the service: the frames shown,
+/// of which direct, the late ones, the starts of a period that took nothing, the
+/// frames the device failed and the periods the cap put bands off (STATS), and
+/// the frames shown straight from a window's buffer and the bands put together
+/// (DESCRIBE). None when the service does not answer.
+pub fn counters() -> Option<[u32; 8]> {
+    let reply = ask(&Method::Describe.header().bytes(), Outgoing::new()).ok()?;
+    let mut buffer = [0; MESSAGE_MAX];
+    let d = proto_comp::Description::read(reply.bytes(&mut buffer)).ok()?;
+    let mut request = Writer::new();
+    proto_comp::write_stats(0, &mut request).ok()?;
+    let reply = ask(request.as_bytes(), Outgoing::new()).ok()?;
+    let mut buffer = [0; MESSAGE_MAX];
+    let s = proto_comp::StatsReply::read(reply.bytes(&mut buffer))
+        .ok()?
+        .stats;
+    Some([
+        s.frames, s.direct, s.late, s.skipped, s.failed, s.capped, d.bypassed, d.bands,
+    ])
+}
+
 /// `wfcNextStreamSTAFETO`: 1 and the window's number when a window was made
 /// (now or within `timeout_ms`), 0 when the time ran out or a signal ended
 /// the wait, -1 when the device is gone or another thread waits (the error
