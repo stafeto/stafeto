@@ -30,7 +30,8 @@ fn version(name: &str) -> Result<String, String> {
 pub fn licence_text(name: &str) -> Result<Vec<u8>, String> {
     let target = crate::target_dir();
     match name {
-        "busybox" => read(target.join("busybox/source/LICENSE")),
+        "busybox" | "busybox-suid" => read(target.join("busybox/source/LICENSE")),
+        "doas" => read(target.join(format!("doas/opendoas-{}/LICENSE", version(name)?))),
         "bash" => read(target.join(format!("bash/bash-{}/COPYING", version(name)?))),
         "nano" => read(target.join(format!("nano/nano-{}/COPYING", version(name)?))),
         "htop" => read(target.join(format!("htop/htop-{}/COPYING", version(name)?))),

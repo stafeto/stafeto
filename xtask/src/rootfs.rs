@@ -147,8 +147,11 @@ const ROOT: (u32, u32) = (0, 0);
 /// An owner other than root, for the checks of owners in listings.
 const USER: (u32, u32) = (1000, 100);
 
+/// The rules of `doas` (/etc/doas.conf): one line, with no `keepenv` and no `persist`.
+pub const DOAS_CONF: &[u8] = b"permit nopass :wheel\n";
+
 /// Account databases are ordinary root-owned files in each shipped image.
-fn accounts() -> [RootFile; 4] {
+fn accounts() -> [RootFile; 5] {
     [
         dir("/etc"),
         of(
@@ -164,7 +167,18 @@ fn accounts() -> [RootFile; 4] {
             "/etc/group",
             0o644,
             ROOT,
-            Source::Bytes("group", b"root:x:0:root\nuser:x:100:user\nnobody:x:65534:nobody\n"),
+            Source::Bytes(
+                "group",
+                b"root:x:0:root\nwheel:x:10:user\nuser:x:100:user\nnobody:x:65534:nobody\n",
+            ),
+        ),
+        // The one rule of `doas`: the members of `wheel` run any command as root with no
+        // password (the key that opens the account is the proof). Readable by root alone.
+        of(
+            "/etc/doas.conf",
+            0o400,
+            ROOT,
+            Source::Bytes("doas.conf", DOAS_CONF),
         ),
         // Every account is locked: `!` in the password field matches no
         // hash, and the image carries no password of any owner.
@@ -278,12 +292,15 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 76] = [
+const SYSTEM_PATHS: [&str; 80] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
     "/libexec",
     "/libexec/ramfs",
+    "/bin/su",
+    "/bin/passwd",
+    "/bin/doas",
     "/dev",
     "/proc",
     "/data",
@@ -313,6 +330,7 @@ const SYSTEM_PATHS: [&str; 76] = [
     "/etc/passwd",
     "/etc/group",
     "/etc/shadow",
+    "/etc/doas.conf",
     "/etc/resolv.conf",
     // The image on VZ with a static address for its second device.
     "/etc/netd.conf",
@@ -633,6 +651,12 @@ fn shell_files(image: &str) -> Result<Vec<RootFile>, String> {
         dir("/bin"),
         dir("/libexec"),
         file("/libexec/ramfs", 0o4750, USER, "ramfs"),
+        // The three programs with the set-user-ID bit of root. They are system files and no
+        // package's: the package file refuses a set-ID mode (a package may never bring one), and
+        // the packages `busybox-suid` and `doas` only build the programs.
+        file("/bin/su", 0o4755, ROOT, "busybox-suid"),
+        file("/bin/passwd", 0o4755, ROOT, "busybox-suid"),
+        file("/bin/doas", 0o4755, ROOT, "doas"),
         dir("/dev"),
         dir("/proc"),
         // The directory of the CPUs, which htop and `nproc --all` count: a
@@ -2844,6 +2868,107 @@ mod tests {
                 ROOT,
                 "{image}: /etc/shadow owner"
             );
+        }
+    }
+
+    /// Privilege in the images (stafeto#565): the only files with the set-user-ID or set-group-ID
+    /// bit are `su`, `passwd` and `doas` (root's) and the RAM service's own file and probe fixture;
+    /// `/bin/busybox` and the links to it carry no bit (a set-user-ID BusyBox would give every
+    /// applet the bit through its links); no image has a table of applets for BusyBox
+    /// (/etc/busybox.conf); the one rule of `doas` is `permit nopass :wheel`, readable by root
+    /// alone; and no shipped shadow field is a hash.
+    #[test]
+    fn the_images_give_privilege_to_three_programs_and_to_no_other_file() {
+        const SUID: [&str; 3] = ["/bin/su", "/bin/passwd", "/bin/doas"];
+        for image in IMAGES {
+            let files = files_of(image);
+            assert!(
+                files.iter().all(|f| f.path != "/etc/busybox.conf"),
+                "{image}: /etc/busybox.conf"
+            );
+            for f in &files {
+                if f.mode & 0o6000 == 0 {
+                    continue;
+                }
+                if SUID.contains(&f.path) {
+                    assert_eq!(
+                        (f.mode, f.uid, f.gid),
+                        (0o4755, 0, 0),
+                        "{image}: {}",
+                        f.path
+                    );
+                    assert!(
+                        matches!(f.source, Some(Source::Elf(_))),
+                        "{image}: {}",
+                        f.path
+                    );
+                } else if files.iter().any(|f| f.path == "/bin/doas") {
+                    // An image with the packages of the shell has no other file with a bit but
+                    // the RAM service's own (the probe images carry fixtures of their own).
+                    assert!(
+                        ["/libexec/ramfs"].contains(&f.path),
+                        "{image}: {} has a set-ID bit",
+                        f.path
+                    );
+                }
+            }
+            if let Some(busybox) = files.iter().find(|f| f.path == "/bin/busybox") {
+                assert_eq!(busybox.mode, 0o755, "{image}: /bin/busybox");
+            }
+            let conf = files.iter().find(|f| f.path == "/etc/doas.conf").unwrap();
+            assert_eq!((conf.mode, conf.uid, conf.gid), (0o400, 0, 0), "{image}");
+            let Some(Source::Bytes(_, rules)) = conf.source else {
+                panic!("{image}: /etc/doas.conf is not bytes");
+            };
+            assert_eq!(rules, b"permit nopass :wheel\n", "{image}");
+            let shadow = files.iter().find(|f| f.path == "/etc/shadow").unwrap();
+            let Some(Source::Bytes(_, bytes)) = shadow.source else {
+                panic!("{image}: /etc/shadow is not bytes");
+            };
+            for line in std::str::from_utf8(bytes).unwrap().lines() {
+                let field = line.split(':').nth(1).unwrap();
+                assert!(
+                    field == "!" || field == "*",
+                    "{image}: a hash in /etc/shadow"
+                );
+            }
+        }
+        let shell = files_of("boot-ash-dialog.img");
+        for path in SUID {
+            assert!(
+                shell.iter().any(|f| f.path == path),
+                "the shell image has no {path}"
+            );
+        }
+    }
+
+    /// The accounts of the image keep to the rule of the account files kept on the data volume
+    /// (stafeto#565): identifiers under 1000 for the image's own accounts, except `user` (1000)
+    /// and `nobody` (65534), so that an account an operator adds never meets one of the image.
+    #[test]
+    fn the_accounts_of_the_images_keep_their_identifiers_apart_from_the_operators() {
+        for image in IMAGES {
+            let files = files_of(image);
+            let Some(Source::Bytes(_, bytes)) = files
+                .iter()
+                .find(|f| f.path == "/etc/passwd")
+                .unwrap()
+                .source
+            else {
+                panic!("{image}: /etc/passwd is not bytes");
+            };
+            for line in std::str::from_utf8(bytes).unwrap().lines() {
+                let f: Vec<&str> = line.split(':').collect();
+                let (name, uid): (&str, u32) = (f[0], f[2].parse().unwrap());
+                let probe_star = image == &"boot-ssh-probe.img" && name == SSH_PROBE_STAR;
+                assert!(
+                    uid < 1000
+                        || (name, uid) == ("user", 1000)
+                        || (name, uid) == ("nobody", 65534)
+                        || probe_star,
+                    "{image}: account {name} has uid {uid}"
+                );
+            }
         }
     }
 

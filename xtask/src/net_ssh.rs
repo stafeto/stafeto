@@ -93,6 +93,12 @@ static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 const PLACEHOLDER_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA placeholder";
 
+/// Sets the key of the run (the other probes of the image take it from here).
+pub(crate) fn set_key(line: String) -> Result<(), String> {
+    KEY.set(line)
+        .map_err(|_| "the key of the run is set twice".to_owned())
+}
+
 /// The script that stands for `ec2-key` in the image of the probe: it writes the key of the
 /// run as the metadata of an instance would give it.
 pub fn key_script() -> &'static [u8] {

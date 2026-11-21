@@ -26,6 +26,13 @@ ROOT = Path(__file__).resolve().parents[1]
 # the others pull in.
 WORK = ROOT / "target" / "busybox"
 WORK_UTILITIES = ROOT / "target" / "busybox-utils"
+# The third build, `su` and `passwd` alone, for the two set-user-ID programs
+# of the image (/bin/su and /bin/passwd). BusyBox's own set-user-ID support
+# is on here (FEATURE_SUID) and there is no table of applets (no
+# /etc/busybox.conf): the two applets are the only ones the program has, and
+# the program has a main of its own (tools/busybox/suid-main.c) with none of
+# the console branches of the main of the shell's program.
+WORK_SUID = ROOT / "target" / "busybox-suid"
 # The ready-made utilities BusyBox lacks (tools/build-ready-utils.py), built
 # from their own sources apart from BusyBox's and linked with its second build.
 WORK_READY = ROOT / "target" / "ready-utils"
@@ -104,7 +111,7 @@ BASE_OBJECTS = (
 DIRECTORIES = ("libbb", "coreutils", "coreutils/libcoreutils", "shell", "procps",
                "networking", "archival", "archival/libarchive", "editors",
                "findutils", "miscutils", "util-linux", "sysklogd", "libpwdgrp",
-               "console-tools")
+               "console-tools", "loginutils")
 
 
 # The CONFIG names of the XCU utilities BusyBox has and the shell does not
@@ -162,7 +169,21 @@ UTILITIES = tuple(name.upper() for name in (
     # terminal is waited for), no undo.
     "vi feature_vi_colon feature_vi_yankmark feature_vi_search feature_vi_dot_cmd "
     "feature_vi_readonly feature_vi_setopts feature_vi_set feature_vi_use_signals "
+    # The accounts: the applets root runs (no password hash is ever made by libc's `crypt`:
+    # BusyBox's own MD5 and SHA-256/512, with SHA-512 as the default) and the checks of names.
+    "adduser addgroup deluser delgroup chpasswd feature_shadowpasswds use_bb_crypt "
+    "use_bb_crypt_sha feature_adduser_to_group feature_del_user_from_group "
+    "feature_check_names "
     "").split()) + OWN_CONFIGS
+
+
+# What the set-user-ID build holds: `su` and `passwd`, with shadow passwords and the program's
+# own hashes. `su` does not check /etc/shells (relibc has no getusershell).
+SUID_NAMES = ("SU", "PASSWD", "FEATURE_SHADOWPASSWDS", "USE_BB_CRYPT", "USE_BB_CRYPT_SHA",
+              "FEATURE_SUID", "FEATURE_VERBOSE_USAGE")
+# The ranges of the identifiers `adduser` and `addgroup` take (BusyBox's own defaults).
+ID_RANGES = (("LAST_ID", "0", "60000"), ("FIRST_SYSTEM_ID", "0", "100"),
+             ("LAST_SYSTEM_ID", "0", "999"))
 
 
 def run(*args: str, cwd: Path | None = None) -> None:
@@ -205,14 +226,17 @@ def ready_utilities() -> None:
 def main() -> None:
     build(utilities=False)
     build(utilities=True)
+    build(utilities=False, suid=True)
     ready_utilities()
 
 
-def build(utilities: bool) -> None:
+def build(utilities: bool, suid: bool = False) -> None:
     global SOURCE, LOG, STAMP
-    work = WORK_UTILITIES if utilities else WORK
+    work = WORK_SUID if suid else WORK_UTILITIES if utilities else WORK
     SOURCE, LOG, STAMP = work / "source", work / "build.log", work / "config"
-    names = UTILITIES if utilities else ()
+    # The builds with all of libbb: the shell's and the set-user-ID one.
+    full = utilities or suid
+    names = SUID_NAMES if suid else UTILITIES if utilities else ()
     headers = sorted(COMPAT.rglob("*.h"))
     compatibility = sha256(b"".join(path.read_bytes() for path in headers)).hexdigest()
     # The script is part of the stamp: a patch it makes changes the objects.
@@ -240,7 +264,7 @@ def build(utilities: bool) -> None:
     # them like BusyBox does: an applet that runs in the shell leaves its
     # state in bb_common_bufsiz1 (ls, cat -v), and the applets the shell
     # forks (ps) start from a buffer they take for zero.
-    if not utilities:
+    if not full:
         replace(SOURCE / "coreutils/cat.c",
                 "APPLET(cat, BB_DIR_BIN, BB_SUID_DROP)",
                 "APPLET_NOFORK(cat, cat, BB_DIR_BIN, BB_SUID_DROP, cat)")
@@ -294,7 +318,7 @@ def build(utilities: bool) -> None:
     for source in own:
         shutil.copy(source, SOURCE / source.relative_to(OWN))
     kbuild = SOURCE / "libbb/Kbuild.src"
-    if utilities:
+    if full:
         dropped = {f"lib-y += {name}" for name in EXCLUDED_OBJECTS}
         kbuild.write_text("\n".join(
             line for line in kbuild.read_text().splitlines() if line.strip() not in dropped) + "\n")
@@ -307,7 +331,7 @@ def build(utilities: bool) -> None:
             content = source.read_text()
             if "//kbuild:lib-y +=" in content:
                 source.write_text(content.replace("//kbuild:lib-y +=", "//disabled-kbuild:lib-y +="))
-    if utilities:
+    if full:
         # nslookup takes its own resolver (res_mkquery, ns_initparse and
         # dn_expand of musl 1.2.4 inside networking/nslookup.c): relibc has
         # no resolv.h for the small variant.
@@ -315,71 +339,89 @@ def build(utilities: bool) -> None:
                 "#define USE_LIBC_RESOLV 1", "#define USE_LIBC_RESOLV 0")
     run("make", "allnoconfig", cwd=SOURCE)
     config = SOURCE / ".config"
-    replace(config, "# CONFIG_ECHO is not set", "CONFIG_ECHO=y")
-    replace(config, "# CONFIG_CAT is not set", "CONFIG_CAT=y")
-    replace(config, "# CONFIG_LS is not set", "CONFIG_LS=y")
-    # The applets on names (5i-5): move, remove, make and remove a
-    # directory, link, change the mode, touch, read a link.
-    for name in ("MV", "RM", "MKDIR", "RMDIR", "LN", "CHMOD", "TOUCH", "READLINK"):
-        replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
-    replace(config, "# CONFIG_WC is not set", "CONFIG_WC=y")
-    replace(config, "# CONFIG_SLEEP is not set", "CONFIG_SLEEP=y")
-    # timeout, and nc with its server and its -e.
-    for name in ("TIMEOUT", "NC", "NC_SERVER", "NC_EXTRA"):
-        replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
-    # The applets that take bytes or names from the random devices (5e').
-    replace(config, "# CONFIG_HEAD is not set", "CONFIG_HEAD=y")
-    replace(config, "# CONFIG_FEATURE_FANCY_HEAD is not set", "CONFIG_FEATURE_FANCY_HEAD=y")
-    replace(config, "# CONFIG_MKTEMP is not set", "CONFIG_MKTEMP=y")
-    replace(config, "# CONFIG_ASH_RANDOM_SUPPORT is not set", "CONFIG_ASH_RANDOM_SUPPORT=y")
-    replace(config, "# CONFIG_SHOW_USAGE is not set", "CONFIG_SHOW_USAGE=y")
-    replace(config, "# CONFIG_FEATURE_VERBOSE_USAGE is not set",
-            "CONFIG_FEATURE_VERBOSE_USAGE=y")
-    replace(config, "# CONFIG_FEATURE_CLEAN_UP is not set", "CONFIG_FEATURE_CLEAN_UP=y")
-    replace(config, "# CONFIG_ASH is not set", "CONFIG_ASH=y")
-    replace(config, "# CONFIG_ASH_ECHO is not set", "CONFIG_ASH_ECHO=y")
-    replace(config, "# CONFIG_ASH_JOB_CONTROL is not set", "CONFIG_ASH_JOB_CONTROL=y")
-    for name in ("FEATURE_SH_MATH", "ASH_TEST", "ASH_PRINTF", "ASH_GETOPTS",
-                 "ASH_ALIAS", "ASH_CMDCMD"):
-        replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
-    replace(config, "# CONFIG_KILL is not set", "CONFIG_KILL=y")
-    # The line editor of the interactive shell, in the build of the shell
-    # image only: the small build of the probes has no room for it (the
-    # quota of a test of os-test holds the shell of popen with 10% to
-    # spare). Cursor keys, Home, End, Delete, Ctrl-A/E/K/U/W, history with
-    # Ctrl-R search, Tab completion of names and the escapes of PS1. The
-    # terminal answers TIOCGWINSZ with a screen of 0 by 0 and BusyBox reads
-    # that as unknown: the editor and ls take the 80 by 24 of its default
-    # (or the sizes of LINES and COLUMNS).
-    if utilities:
-        replace(config, "# CONFIG_FEATURE_EDITING is not set", "CONFIG_FEATURE_EDITING=y")
-        replace(config, "CONFIG_FEATURE_EDITING_MAX_LEN=0", "CONFIG_FEATURE_EDITING_MAX_LEN=1024")
-        replace(config, "CONFIG_FEATURE_EDITING_HISTORY=0", "CONFIG_FEATURE_EDITING_HISTORY=255")
-        for name in ("FEATURE_REVERSE_SEARCH", "FEATURE_TAB_COMPLETION",
-                     "FEATURE_EDITING_FANCY_PROMPT", "FEATURE_EDITING_WINCH"):
+    if suid:
+        # The names of SUID_NAMES are switched on below; the string of the default hash and the
+        # ranges of the identifiers are set here.
+        replace(config, 'CONFIG_FEATURE_DEFAULT_PASSWD_ALGO=""',
+                'CONFIG_FEATURE_DEFAULT_PASSWD_ALGO="sha512"')
+        for name in SUID_NAMES:
+            text = config.read_text()
+            if f"# CONFIG_{name} is not set" in text:
+                config.write_text(text.replace(f"# CONFIG_{name} is not set", f"CONFIG_{name}=y"))
+            elif f"CONFIG_{name}=y" not in text:
+                raise SystemExit(f"BusyBox has no CONFIG_{name}")
+        replace(config, "# CONFIG_STATIC is not set", "CONFIG_STATIC=y")
+    else:
+        replace(config, "# CONFIG_ECHO is not set", "CONFIG_ECHO=y")
+        replace(config, "# CONFIG_CAT is not set", "CONFIG_CAT=y")
+        replace(config, "# CONFIG_LS is not set", "CONFIG_LS=y")
+        # The applets on names (5i-5): move, remove, make and remove a
+        # directory, link, change the mode, touch, read a link.
+        for name in ("MV", "RM", "MKDIR", "RMDIR", "LN", "CHMOD", "TOUCH", "READLINK"):
             replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
-    # The utilities of XCU that BusyBox has, with the features their
-    # pages ask for; ps is the BusyBox one, over the /proc of the layer.
-    for name in names:
-        text = config.read_text()
-        if f"# CONFIG_{name} is not set" in text:
-            config.write_text(text.replace(f"# CONFIG_{name} is not set", f"CONFIG_{name}=y"))
-        elif f"CONFIG_{name}=y" not in text:
-            raise SystemExit(f"BusyBox has no CONFIG_{name}")
-    if "VI" in names:
-        replace(config, "CONFIG_FEATURE_VI_MAX_LEN=0", "CONFIG_FEATURE_VI_MAX_LEN=4096")
-    if "HTTPD" in names:
-        # httpd serves plain files: the allnoconfig leaves every feature of it
-        # off, and its default port 0 is out of the range the build asks
-        # about, so it takes the 80 of the default.
-        replace(config, "CONFIG_FEATURE_HTTPD_PORT_DEFAULT=0", "CONFIG_FEATURE_HTTPD_PORT_DEFAULT=80")
-    replace(config, "# CONFIG_FEATURE_SH_STANDALONE is not set",
-            "CONFIG_FEATURE_SH_STANDALONE=y")
-    replace(config, "# CONFIG_FEATURE_SH_NOFORK is not set",
-            "CONFIG_FEATURE_SH_NOFORK=y")
-    replace(config, "# CONFIG_STATIC is not set", "CONFIG_STATIC=y")
-    replace(config, "CONFIG_SH_IS_ASH=y", "# CONFIG_SH_IS_ASH is not set")
-    replace(config, "# CONFIG_SH_IS_NONE is not set", "CONFIG_SH_IS_NONE=y")
+        replace(config, "# CONFIG_WC is not set", "CONFIG_WC=y")
+        replace(config, "# CONFIG_SLEEP is not set", "CONFIG_SLEEP=y")
+        # timeout, and nc with its server and its -e.
+        for name in ("TIMEOUT", "NC", "NC_SERVER", "NC_EXTRA"):
+            replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
+        # The applets that take bytes or names from the random devices (5e').
+        replace(config, "# CONFIG_HEAD is not set", "CONFIG_HEAD=y")
+        replace(config, "# CONFIG_FEATURE_FANCY_HEAD is not set", "CONFIG_FEATURE_FANCY_HEAD=y")
+        replace(config, "# CONFIG_MKTEMP is not set", "CONFIG_MKTEMP=y")
+        replace(config, "# CONFIG_ASH_RANDOM_SUPPORT is not set", "CONFIG_ASH_RANDOM_SUPPORT=y")
+        replace(config, "# CONFIG_SHOW_USAGE is not set", "CONFIG_SHOW_USAGE=y")
+        replace(config, "# CONFIG_FEATURE_VERBOSE_USAGE is not set",
+                "CONFIG_FEATURE_VERBOSE_USAGE=y")
+        replace(config, "# CONFIG_FEATURE_CLEAN_UP is not set", "CONFIG_FEATURE_CLEAN_UP=y")
+        replace(config, "# CONFIG_ASH is not set", "CONFIG_ASH=y")
+        replace(config, "# CONFIG_ASH_ECHO is not set", "CONFIG_ASH_ECHO=y")
+        replace(config, "# CONFIG_ASH_JOB_CONTROL is not set", "CONFIG_ASH_JOB_CONTROL=y")
+        for name in ("FEATURE_SH_MATH", "ASH_TEST", "ASH_PRINTF", "ASH_GETOPTS",
+                     "ASH_ALIAS", "ASH_CMDCMD"):
+            replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
+        replace(config, "# CONFIG_KILL is not set", "CONFIG_KILL=y")
+        # The line editor of the interactive shell, in the build of the shell
+        # image only: the small build of the probes has no room for it (the
+        # quota of a test of os-test holds the shell of popen with 10% to
+        # spare). Cursor keys, Home, End, Delete, Ctrl-A/E/K/U/W, history with
+        # Ctrl-R search, Tab completion of names and the escapes of PS1. The
+        # terminal answers TIOCGWINSZ with a screen of 0 by 0 and BusyBox reads
+        # that as unknown: the editor and ls take the 80 by 24 of its default
+        # (or the sizes of LINES and COLUMNS).
+        if utilities:
+            replace(config, "# CONFIG_FEATURE_EDITING is not set", "CONFIG_FEATURE_EDITING=y")
+            replace(config, "CONFIG_FEATURE_EDITING_MAX_LEN=0", "CONFIG_FEATURE_EDITING_MAX_LEN=1024")
+            replace(config, "CONFIG_FEATURE_EDITING_HISTORY=0", "CONFIG_FEATURE_EDITING_HISTORY=255")
+            for name in ("FEATURE_REVERSE_SEARCH", "FEATURE_TAB_COMPLETION",
+                         "FEATURE_EDITING_FANCY_PROMPT", "FEATURE_EDITING_WINCH"):
+                replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
+        # The utilities of XCU that BusyBox has, with the features their
+        # pages ask for; ps is the BusyBox one, over the /proc of the layer.
+        for name in names:
+            text = config.read_text()
+            if f"# CONFIG_{name} is not set" in text:
+                config.write_text(text.replace(f"# CONFIG_{name} is not set", f"CONFIG_{name}=y"))
+            elif f"CONFIG_{name}=y" not in text:
+                raise SystemExit(f"BusyBox has no CONFIG_{name}")
+        if "ADDUSER" in names:
+            for name, was, now in ID_RANGES:
+                replace(config, f"CONFIG_{name}={was}", f"CONFIG_{name}={now}")
+            replace(config, 'CONFIG_FEATURE_DEFAULT_PASSWD_ALGO=""',
+                    'CONFIG_FEATURE_DEFAULT_PASSWD_ALGO="sha512"')
+        if "VI" in names:
+            replace(config, "CONFIG_FEATURE_VI_MAX_LEN=0", "CONFIG_FEATURE_VI_MAX_LEN=4096")
+        if "HTTPD" in names:
+            # httpd serves plain files: the allnoconfig leaves every feature of it
+            # off, and its default port 0 is out of the range the build asks
+            # about, so it takes the 80 of the default.
+            replace(config, "CONFIG_FEATURE_HTTPD_PORT_DEFAULT=0", "CONFIG_FEATURE_HTTPD_PORT_DEFAULT=80")
+        replace(config, "# CONFIG_FEATURE_SH_STANDALONE is not set",
+                "CONFIG_FEATURE_SH_STANDALONE=y")
+        replace(config, "# CONFIG_FEATURE_SH_NOFORK is not set",
+                "CONFIG_FEATURE_SH_NOFORK=y")
+        replace(config, "# CONFIG_STATIC is not set", "CONFIG_STATIC=y")
+        replace(config, "CONFIG_SH_IS_ASH=y", "# CONFIG_SH_IS_ASH is not set")
+        replace(config, "# CONFIG_SH_IS_NONE is not set", "CONFIG_SH_IS_NONE=y")
     clang = tool("clang", "llvm")
     lld = tool("ld.lld", "lld")
     ar = tool("llvm-ar", "llvm")
@@ -394,7 +436,7 @@ def build(utilities: bool) -> None:
             A53_ERRATA, *UNWIND_CFLAGS,
             # clang reads a global that is const only once, before BusyBox sets
             # ptr_to_globals (awk, among others, then ran with a null pointer).
-            *(("-DBB_GLOBAL_CONST=",) if utilities else ()))), cwd=SOURCE)
+            *(("-DBB_GLOBAL_CONST=",) if full else ()))), cwd=SOURCE)
     if utilities and "WGET" in names and "CONFIG_TLS=y" not in config.read_text():
         # TLS is hidden: FEATURE_WGET_HTTPS selects it while the tree builds.
         raise SystemExit("BusyBox wget has no TLS: CONFIG_TLS is not set")

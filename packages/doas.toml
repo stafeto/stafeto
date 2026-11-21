@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# OpenDoas: runs a command as another user by the rules of /etc/doas.conf. It
+# is built with no PAM, no shadow authentication and no timestamps, so only a
+# rule with `nopass` lets anyone in. Set-user-ID root in the image.
+# Format: docs/packages.md.
+
+name = "doas"
+version = "6.8.2"
+kind = "base"
+image = "shell"
+release = "1"
+summary = "OpenDoas, run a command as another user"
+url = "https://github.com/Duncaen/OpenDoas/releases/download/v6.8.2/opendoas-6.8.2.tar.xz"
+sha256 = "4e98828056d6266bd8f2c93e6ecf12a63a71dbfd70a5ea99ccd4ab6d0745adf0"
+license = "ISC AND BSD-3-Clause"
+license_file = "LICENSE"
+notices = ["LIBOPENBSD-NOTICES = target:doas/libopenbsd-notices"]
+build = "tools/build-doas.py"
+program = "doas"

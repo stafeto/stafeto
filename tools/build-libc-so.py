@@ -835,8 +835,16 @@ def build_probes() -> list:
 # The directories of BusyBox's archives (tests/busybox/build.rs lists the same).
 BUSYBOX_DIRECTORIES = ("libbb", "coreutils", "coreutils/libcoreutils", "shell", "procps",
                        "networking", "archival", "archival/libarchive", "editors", "findutils",
-                       "miscutils", "util-linux", "sysklogd", "libpwdgrp", "console-tools")
+                       "miscutils", "util-linux", "sysklogd", "libpwdgrp", "console-tools",
+                       "loginutils")
 BUSYBOX_MAIN = ROOT / "tools" / "busybox" / "dynamic-main.c"
+# The main of the set-user-ID program (`su` and `passwd`): no console branch.
+BUSYBOX_SUID_MAIN = ROOT / "tools" / "busybox" / "suid-main.c"
+
+
+def main_of(name: str) -> Path:
+    """The C main of the BusyBox program `name`."""
+    return BUSYBOX_SUID_MAIN if name == "busybox-suid" else BUSYBOX_MAIN
 
 
 def program_inputs() -> dict:
@@ -849,6 +857,7 @@ def program_inputs() -> dict:
     return {
         "busybox": busybox("busybox", False),
         "busybox-utils": busybox("busybox-utils", True),
+        "busybox-suid": busybox("busybox-suid", False),
         "bash": [ROOT / "target" / "bash" / "bash.o"],
         "nano": [ROOT / "target" / "nano" / "nano.o"],
         "htop": [ROOT / "target" / "htop" / "htop.o"],
@@ -869,6 +878,7 @@ def program_inputs() -> dict:
         "openssl": [ROOT / "target" / "openssl" / "openssl.o"],
         "curl": [ROOT / "target" / "curl" / "curl.o"],
         "dropbear": [ROOT / "target" / "dropbear" / "dropbear.o"],
+        "doas": [ROOT / "target" / "doas" / "doas.o"],
         "nginx": [ROOT / "target" / "nginx" / "nginx.o"],
     }
 
@@ -912,7 +922,7 @@ def build_programs(wanted_names: list) -> list:
         stamp = PROGRAMS / f"{name}.stamp"
         wanted = "\n".join((digest(SYSROOT / "lib" / "libc.so"), digest(SYSROOT / "lib" / "crt1.o"),
                             digest(Path(__file__)),
-                            *((digest(BUSYBOX_MAIN),) if name.startswith("busybox") else ()),
+                            *((digest(main_of(name)),) if name.startswith("busybox") else ()),
                             *(digest(p) for p in inputs))) + "\n"
         output = PROGRAMS / name
         if stamp.exists() and stamp.read_text() == wanted and output.exists():
@@ -921,7 +931,7 @@ def build_programs(wanted_names: list) -> list:
         stamp.unlink(missing_ok=True)
         objects = list(inputs)
         if name.startswith("busybox"):
-            compile_c(BUSYBOX_MAIN, work / f"{name}-main.o")
+            compile_c(main_of(name), work / f"{name}-main.o")
             objects.insert(0, work / f"{name}-main.o")
         result = link_program(output, objects, ["--gc-sections", *PROGRAM_LINK.get(name, ())],
                               capture=True)

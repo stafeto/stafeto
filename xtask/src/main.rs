@@ -146,6 +146,7 @@ mod store_probe;
 mod stubs;
 mod symbolize;
 mod untag;
+mod users;
 mod vi_dialog;
 mod vz;
 mod wcet;
@@ -1062,7 +1063,7 @@ const SHELL_SERVICES_LAST: [ImageProgram; 4] = [
 /// programs of stack 0 go into the image as their ELF files alone, which the
 /// process service starts from the RAM files; init starts the launcher
 /// (`ash-launcher`), which spawns BusyBox from its file.
-const PACKAGE_PROGRAMS: [ImageProgram; 12] = [
+const PACKAGE_PROGRAMS: [ImageProgram; 14] = [
     (
         "busybox-probe",
         "busybox-probe",
@@ -1077,6 +1078,9 @@ const PACKAGE_PROGRAMS: [ImageProgram; 12] = [
     ("openssl", "openssl", 0, &["dynamic"]),
     ("curl", "curl", 0, &["dynamic"]),
     ("dropbear", "dropbear", 0, &["dynamic"]),
+    // The set-user-ID programs: `su` and `passwd` (a BusyBox of its own) and OpenDoas.
+    ("busybox-suid", "busybox-suid", 0, &["dynamic"]),
+    ("doas", "doas", 0, &["dynamic"]),
     ("nginx", "nginx", 0, &["dynamic"]),
     ("nginx-fast", "nginx-fast", 0, &["dynamic"]),
     // A static program on relibc (apps/lvgl-demo): its 256 KiB stack is the
@@ -2432,6 +2436,8 @@ commands:
   net-ssh [MACHINE] run the SSH server (Dropbear) of boot-ssh-probe.img: logins
             with a key from the host's `ssh`, a key and long passwords refused,
             the server's command line from /proc, the pseudo terminals
+  users     run the ordinary account and the account tools on boot-ssh-probe.img:
+            set-user-ID su, passwd and doas, adduser, chpasswd, deluser
   fstack-probe [write-blocking] [MACHINE] run `fstack-probe` in the guest:
             the TCP/IP stack of FreeBSD 15 (F-Stack) in a process on its own
             loopback: 16 MiB through a pair of sockets, kqueue, a partial
@@ -2926,6 +2932,7 @@ fn main() {
         Some("net-probe") => net_probe::command(&args[1..]),
         Some("net-curl") => net_curl::command(&args[1..]),
         Some("net-ssh") => net_ssh::command(&args[1..]),
+        Some("users") => users::command(&args[1..]),
         Some("nginx-probe") => nginx_probe::command(&args[1..]),
         Some("nginx-bench") => nginx_bench::command(&args[1..]),
         Some("net-bench") => net_bench::command(&args[1..]),
@@ -5424,6 +5431,8 @@ fn dynamic_name(package: &str, features: &[&str]) -> Result<&'static str, String
         ("openssl", _) => "openssl",
         ("curl", _) => "curl",
         ("dropbear", _) => "dropbear",
+        ("busybox-suid", _) => "busybox-suid",
+        ("doas", _) => "doas",
         ("nginx", _) => "nginx",
         ("nginx-fast", _) => "nginx-fast",
         _ => {
