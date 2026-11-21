@@ -8,10 +8,26 @@
 
 use core::mem::{align_of, offset_of, size_of};
 
-/// `STAFETO_WINDOW_XRGB8888` and `STAFETO_WINDOW_ARGB8888`: the numbers of
-/// `proto_comp::FORMAT_XRGB8888` and `FORMAT_ARGB8888`.
+/// `STAFETO_WINDOW_XRGB8888`, `STAFETO_WINDOW_ARGB8888` and
+/// `STAFETO_WINDOW_A8`: the numbers of `proto_comp::FORMAT_XRGB8888`,
+/// `FORMAT_ARGB8888` and `FORMAT_A8`.
 pub const XRGB8888: u32 = 1;
 pub const ARGB8888: u32 = 3;
+pub const A8: u32 = 4;
+
+/// The bytes of a line of `width` points of `format`: 4 a point, or for A8 a
+/// byte a point and the line rounded up to a multiple of 4. None past a
+/// `u32`.
+pub const fn line_bytes(format: u32, width: u32) -> Option<u32> {
+    if format == A8 {
+        match width.checked_add(3) {
+            Some(w) => Some(w & !3),
+            None => None,
+        }
+    } else {
+        width.checked_mul(4)
+    }
+}
 /// `STAFETO_WINDOW_BUFFERS_MAX`, `_RECTS_MAX` and `_EVENTS_MAX`.
 pub const BUFFERS_MAX: usize = 3;
 pub const RECTS_MAX: usize = 4;
@@ -97,6 +113,7 @@ const _: () = {
     // The numbers of the protocol.
     assert!(XRGB8888 == proto_comp::FORMAT_XRGB8888);
     assert!(ARGB8888 == proto_comp::FORMAT_ARGB8888);
+    assert!(A8 == proto_comp::FORMAT_A8);
     assert!(BUFFERS_MAX == proto_comp::BUFFERS);
     assert!(RECTS_MAX == proto_comp::MAX_RECTS);
     assert!(EVENTS_MAX == proto_comp::MAX_EVENTS);
@@ -108,3 +125,20 @@ const _: () = {
     assert!(EVENT_FOCUS_IN == proto_comp::FOCUS_IN);
     assert!(EVENT_FOCUS_OUT == proto_comp::FOCUS_OUT);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_line_of_a_mask_is_a_byte_a_point_rounded_to_four() {
+        assert_eq!(line_bytes(A8, 1), Some(4));
+        assert_eq!(line_bytes(A8, 4), Some(4));
+        assert_eq!(line_bytes(A8, 5), Some(8));
+        assert_eq!(line_bytes(A8, 640), Some(640));
+        assert_eq!(line_bytes(A8, u32::MAX), None);
+        assert_eq!(line_bytes(XRGB8888, 640), Some(2560));
+        assert_eq!(line_bytes(ARGB8888, 3), Some(12));
+        assert_eq!(line_bytes(XRGB8888, u32::MAX), None);
+    }
+}

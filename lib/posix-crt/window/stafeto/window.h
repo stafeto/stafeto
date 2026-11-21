@@ -53,6 +53,10 @@ extern "C" {
  * format of struct stafeto_screen and of struct stafeto_window). */
 #define STAFETO_WINDOW_XRGB8888 1
 #define STAFETO_WINDOW_ARGB8888 3
+/* A window of 8 bits an alpha, a byte a point and a line (stride) of the
+ * width rounded up to a multiple of 4: the mask of an element of a scene
+ * (OpenWF Composition's mask). It is never shown on the screen by itself. */
+#define STAFETO_WINDOW_A8 4
 
 /* The most buffers of a window, the most rectangles the service takes in
  * one post (the library merges more, see stafeto_window_post), and the most

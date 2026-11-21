@@ -150,8 +150,17 @@ const PROBE_C: Record = Record {
     ..PROBE
 };
 
+/// The fourth probe (role `s`): holds a scene. It waits until the others are
+/// done, then commits scenes of windows of its own (`table::COMP_SCENES` gives
+/// its session the scene's mark).
+const PROBE_S: Record = Record {
+    name: "comp-probe-s",
+    args: b"s",
+    ..PROBE
+};
+
 /// The probe's image on QEMU.
-pub const TABLE: &[Record] = &[DISPLAY, COMPOSITOR, PROBE, PROBE_B, PROBE_C];
+pub const TABLE: &[Record] = &[DISPLAY, COMPOSITOR, PROBE, PROBE_B, PROBE_C, PROBE_S];
 
 #[cfg(test)]
 mod tests {

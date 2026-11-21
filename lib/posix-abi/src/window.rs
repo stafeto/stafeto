@@ -274,7 +274,7 @@ fn open_window(
     ) else {
         return Err(EINVAL);
     };
-    if (format != layout::XRGB8888 && format != layout::ARGB8888)
+    if (format != layout::XRGB8888 && format != layout::ARGB8888 && format != layout::A8)
         || !(1..=layout::BUFFERS_MAX as u32).contains(&buffers)
     {
         return Err(EINVAL);
@@ -291,7 +291,7 @@ fn open_window(
     if !create.fits(screen.width, screen.height) {
         return Err(EINVAL);
     }
-    let stride = w.checked_mul(4).ok_or(EINVAL)?;
+    let stride = layout::line_bytes(format, w).ok_or(EINVAL)?;
     let len = (u64::from(stride) * u64::from(h)).div_ceil(PAGE) * PAGE;
     if len > proto_comp::BUFFER_MAX {
         return Err(EINVAL);
