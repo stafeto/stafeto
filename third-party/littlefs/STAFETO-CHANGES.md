@@ -109,6 +109,14 @@ reads at 135 directories and 256 pairs, 1,443,988 at 539 and 1,024, 6,003,785 at
   and not kept. A write that fails ends the call with its error and leaves nothing behind; the next
   mount starts with no table. The repair that runs with no power loss (`lfs_fs_deorphan(lfs, false)`,
   after a relocation) does not use the table.
+- Two parts of the table are needed for a reason that no test pins down yet, and stay. The rebuild after
+  each commit of the repair is needed when one pair is moved twice within the repair ({a,b}, then
+  the swap {b,a}, then {b,c}): the pair then keeps no block of the stale table, so a missing key would
+  answer `LFS_ERR_NOENT` and make a live directory an orphan. The key of the second block of a
+  child (`child[1]`) is needed when the block that a half-orphan shares with its entry is the
+  entry's second block (a swap by a compaction, then a relocation, then a cut before the parent is
+  updated). The tests did not reach either case (breaking them leaves the tests passing); a disk
+  image built by hand for each is a task after the release.
 - Nothing changes on the disk: the repair makes the same commits, in the same order, with or without the table
   (the test below compares the disks byte for byte).
 - The data service gives the table 48 KiB (4,096 cells, 3,072 blocks: the 1,024 directories of
