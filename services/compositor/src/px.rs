@@ -565,7 +565,7 @@ pub mod cost {
 /// painting's own frames use) count as used, so the depth is at least that.
 #[cfg(feature = "steps")]
 pub mod stack {
-    use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
     const PATTERN: u64 = 0xA5A5_A5A5_A5A5_A5A5;
     /// The bytes painted, below the entry of the program: less than its stack, so
@@ -592,7 +592,7 @@ pub mod stack {
         while at < high {
             // SAFETY: the words are of this thread's stack below its frame, free
             // of any use now, and inside the stack (PAINTED is less than its size).
-            unsafe { core::ptr::write_volatile(at as *mut u64, PATTERN) };
+            unsafe { AtomicU64::from_ptr(at as *mut u64) }.store(PATTERN, Relaxed);
             at += 8;
         }
         TOP.store(top, Relaxed);
@@ -612,7 +612,7 @@ pub mod stack {
         let end = (at + WORDS_A_STEP * 8).min(low);
         while at < end {
             // SAFETY: a word of the painted stack.
-            if unsafe { core::ptr::read_volatile(at as *const u64) } != PATTERN {
+            if unsafe { AtomicU64::from_ptr(at as *mut u64) }.load(Relaxed) != PATTERN {
                 LOW.store(at, Relaxed);
                 rt::println!(
                     "service stack: 17 depth {} painted {}",
