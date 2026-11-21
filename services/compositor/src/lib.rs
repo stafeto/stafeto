@@ -246,6 +246,11 @@ pub const ELEMENT_TERM_MEASURED: u32 = 106;
 pub const LOOKUP_MISS_MEASURED: u32 = 4_546;
 pub const LOOKUP_MISS: u32 = with_margin(LOOKUP_MISS_MEASURED);
 pub const ELEMENT_TERM: u32 = with_margin(ELEMENT_TERM_MEASURED);
+/// What a step under a scene spends beyond the terms of its elements, in ticks:
+/// the making of the groups and the entry into them. Set from the longest steps of
+/// the probe (a step of 16 344 ticks at a model that left 16 under the gate for it);
+/// it takes the band of a place that many ticks of the model off.
+pub const SCENE_STEP: u32 = 250;
 pub const FILL: Price = PRICES[0];
 pub const OPAQUE: Price = PRICES[1];
 pub const OVER: Price = PRICES[2];
@@ -2052,7 +2057,7 @@ impl Scene {
             let mut size: Option<(u32, u32)> = None;
             for g in 0..plan.groups {
                 let (calls, per_row, per_point) = plan.cost[g];
-                let calls = calls + ELEMENT_TERM * plan.elements;
+                let calls = calls + ELEMENT_TERM * plan.elements + SCENE_STEP;
                 let (w, h) = band_size(calls, per_row, per_point, damage.w);
                 size = Some(match size {
                     Some((sw, sh)) if (sh, sw) <= (h, w) => (sw, sh),
