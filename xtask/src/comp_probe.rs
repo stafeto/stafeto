@@ -91,6 +91,7 @@ const ENDED_C: &str = "init: comp-probe-c ended: exit code 0, not restarted";
 const ENDED_B: &str = "init: comp-probe-b ended: exit code 0, not restarted";
 const ENDED_S: &str = "init: comp-probe-s ended: exit code 0, not restarted";
 const B_ENDS: &str = "init: comp-probe-b ended: ";
+const S_ENDS: &str = "init: comp-probe-s ended: ";
 
 /// The lines each client prints once per check that passed, and how many
 /// times a run has each.
@@ -187,14 +188,17 @@ pub const DRIVER_TAG: &str = "12";
 pub const COMP_TAG: &str = "17";
 /// The kinds of the compositor's steps that must come: OPEN and FLUSH of
 /// proto_gpu, DESCRIBE, WINDOW_CREATE, ATTACH and POST of proto_comp, and
-/// its own (a band, the end of a frame).
-const COMP_KINDS: [(usize, &str); 7] = [
+/// its own (a band, the end of a frame), and SCENE_COMMIT and SCENE_COMPOSE of
+/// the scene's holder.
+const COMP_KINDS: [(usize, &str); 9] = [
     (1, "Open"),
     (2, "Flush"),
     (17, "Describe"),
     (18, "WindowCreate"),
     (19, "Attach"),
     (20, "Post"),
+    (26, "SceneCommit"),
+    (27, "SceneCompose"),
     (65, "a band of a frame and the end of a frame"),
 ];
 /// The driver's: SUBSCRIBE, COMMIT, PIPELINES and SOURCE (the compositor
@@ -1226,8 +1230,9 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::GPU);
     cmd.args(qemu::ICOUNT);
-    let output = run_until(cmd, crate::BOOT_TIMEOUT * 4, Some(B_ENDS), &kernel.elf)?;
-    qemu::expect_stopped_on(&output, ENDED_B)?;
+    let output = run_until(cmd, crate::BOOT_TIMEOUT * 4, Some(S_ENDS), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ENDED_S)?;
+    qemu::expect_marker(&output, ENDED_B)?;
     qemu::expect_marker(&output, ENDED)?;
     if let Some(failed) = output
         .lines
@@ -1404,7 +1409,9 @@ mod tests {
             "the check is in the good run"
         );
         lines.retain(|l| l != busy && l != RELEASED);
-        lines.push(RELEASED.to_owned());
+        for _ in 0..2 {
+            lines.push(RELEASED.to_owned());
+        }
         lines.push(format!(
             "comp-probe: OPEN is BUSY while a closed window's mapping is{RELEASED}"
         ));
