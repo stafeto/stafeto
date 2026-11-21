@@ -1238,6 +1238,93 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
     Ok(())
 }
 
+/// The image of the probe of the late opening: the compositor leaves the tries of its start out
+/// (the feature `late-open`), so the first DESCRIBE of the client opens the screen from a request.
+pub const LATE_PROGRAMS: [ImageProgram; 4] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-comp"]),
+    (
+        "virtio-gpu",
+        "virtio-gpu",
+        gpu_probe::GPU_STACK_SIZE,
+        &["steps"],
+    ),
+    ("compositor", "compositor", COMP_STACK_SIZE, &["late-open"]),
+    ("comp-probe", "comp-probe", CHILD_STACK_SIZE, &["quick"]),
+];
+
+/// The details the compositor gives the steps of the opening from a request: a portion of the
+/// frame buffer mapped, and the four steps of the finishing (SUBSCRIBE, the pipelines, the
+/// cursor, the pool's source).
+const STEP_SCREEN: u64 = 5001;
+const STEP_SCREEN_FINISH: [u64; 4] = [5002, 5003, 5004, 5005];
+
+/// The longest step of the opening of the screen, by the details of its steps: (mapping portion,
+/// finishing), judged ticks. None for a part that no line shows.
+pub fn late_steps(lines: &[String]) -> (Option<u64>, Option<u64>) {
+    let longest = |wanted: fn(u64) -> bool| {
+        lines
+            .iter()
+            .filter_map(|l| crate::step_line::parse(l).or_else(|| crate::step_line::parse_table(l)))
+            .filter(|s| s.tag == COMP_TAG && wanted(s.detail))
+            .map(|s| s.judged())
+            .max()
+    };
+    (
+        longest(|d| d == STEP_SCREEN),
+        longest(|d| STEP_SCREEN_FINISH.contains(&d)),
+    )
+}
+
+/// The verdict of the probe of the late opening: the screen opened once, no check of the client
+/// failed, and the steps of the opening are under the gate.
+pub fn late_verdict(lines: &[String]) -> Result<(u64, u64), String> {
+    if let Some(failed) = lines.iter().find(|l| l.starts_with("comp-probe: failed")) {
+        return Err(failed.clone());
+    }
+    let ready = lines.iter().filter(|l| l.as_str() == READY).count();
+    if ready != 1 {
+        return Err(format!("{ready} lines {READY:?}, 1 expected"));
+    }
+    crate::step_line::within_b(lines, COMP_TAG, crate::step_line::Kinds::All)?;
+    let (Some(mapping), Some(finishing)) = late_steps(lines) else {
+        return Err(
+            "no step of the opening in the lines (a mapping portion and a finishing step)"
+                .to_owned(),
+        );
+    };
+    for (what, ticks) in [
+        ("a mapping portion", mapping),
+        ("a finishing step", finishing),
+    ] {
+        if ticks > PORTION_MAX {
+            return Err(format!(
+                "{what} of the opening took {ticks} ticks, over {PORTION_MAX}"
+            ));
+        }
+    }
+    Ok((mapping, finishing))
+}
+
+/// The run under -icount with the screen opened late.
+pub fn late(machine: &qemu::Machine) -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-comp-late.img", &LATE_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    cmd.args(qemu::GPU);
+    cmd.args(qemu::ICOUNT);
+    let output = run_until(cmd, crate::BOOT_TIMEOUT * 4, Some(B_ENDS), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ENDED_B)?;
+    qemu::expect_marker(&output, ENDED)?;
+    let (mapping, finishing) = late_verdict(&output.lines)?;
+    println!(
+        "comp-late-probe on {}: the screen opened from a request; the longest step of the mapping work {mapping} ticks (portions of 32 pages), the longest finishing step {finishing} ticks (judged, gate {PORTION_MAX}, B {})",
+        machine.name,
+        crate::TERM_B
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1731,5 +1818,29 @@ mod tests {
         let over =
             crate::step_line::tabled(&rows(Some((COMP_TAG, 20, gpu_probe::STEP_MAX + 1)), None));
         assert!(steps_verdict(&over).is_err());
+    }
+
+    fn late_lines(mapping: u64, finishing: u64) -> Vec<String> {
+        vec![
+            READY.to_owned(),
+            format!("service step: {COMP_TAG} kind 65 {mapping} ticks detail 5001"),
+            format!("service step: {COMP_TAG} kind 65 {finishing} ticks detail 5002"),
+        ]
+    }
+
+    #[test]
+    fn the_late_opening_is_judged_by_its_longest_steps() {
+        assert_eq!(late_verdict(&late_lines(7_000, 9_000)), Ok((7_000, 9_000)));
+        assert!(late_verdict(&late_lines(PORTION_MAX + 1, 9_000)).is_err());
+        assert!(late_verdict(&late_lines(7_000, PORTION_MAX + 1)).is_err());
+        let mut lines = late_lines(7_000, 9_000);
+        lines.remove(2);
+        assert!(late_verdict(&lines).is_err());
+        let mut lines = late_lines(7_000, 9_000);
+        lines.remove(0);
+        assert!(late_verdict(&lines).is_err());
+        let mut lines = late_lines(7_000, 9_000);
+        lines.push("comp-probe: failed: DESCRIBE".to_owned());
+        assert!(late_verdict(&lines).is_err());
     }
 }

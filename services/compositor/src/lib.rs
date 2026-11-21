@@ -282,6 +282,124 @@ pub const fn dirty_after_clearing(refs: u64, base: u64) -> bool {
     refs != base
 }
 
+/// Where the screen is while the service opens it from a request: the
+/// driver's frame buffer is mapped a portion of pages a step of the work, and
+/// the screen counts as open (`Open`) only after the last portion and the
+/// steps that finish the opening (the subscription and the planes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenPhase {
+    /// No driver session: the next request asks the driver.
+    Closed,
+    /// The driver gave its buffer and `done` pages of it are mapped.
+    Mapping { done: usize },
+    /// Every page is mapped: the next step subscribes.
+    Subscribing,
+    /// The next step asks the pipelines.
+    Planes,
+    /// The next step takes the cursor's picture.
+    Cursor,
+    /// The next step asks the pool's source.
+    Pool,
+    /// The screen is open.
+    Open,
+}
+
+/// What a request that needs the screen does, by the phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenAsk {
+    /// Ask the driver (and begin the mapping when it gives its buffer).
+    Ask,
+    /// The opening is under way: the answer is CLEARING, ask again.
+    Clearing,
+    /// The screen is open: the request goes on.
+    Ready,
+}
+
+impl ScreenPhase {
+    /// The decision of a request that needs the screen.
+    pub const fn ask(self) -> ScreenAsk {
+        match self {
+            ScreenPhase::Closed => ScreenAsk::Ask,
+            ScreenPhase::Open => ScreenAsk::Ready,
+            _ => ScreenAsk::Clearing,
+        }
+    }
+
+    /// Whether the frame clock may take a frame: only an open screen.
+    pub const fn takes_frames(self) -> bool {
+        matches!(self, ScreenPhase::Open)
+    }
+
+    /// Whether a step of the work is due for the opening.
+    pub const fn has_work(self) -> bool {
+        !matches!(self, ScreenPhase::Closed | ScreenPhase::Open)
+    }
+
+    /// The driver gave its buffer: the mapping begins (a phase other than
+    /// `Closed` keeps itself).
+    pub const fn begin(self) -> ScreenPhase {
+        match self {
+            ScreenPhase::Closed => ScreenPhase::Mapping { done: 0 },
+            other => other,
+        }
+    }
+
+    /// The pages the next step maps of a buffer of `total` pages, `chunk` at
+    /// most: 0 outside `Mapping`.
+    pub const fn portion(self, total: usize, chunk: usize) -> usize {
+        match self {
+            ScreenPhase::Mapping { done } if done < total => {
+                if total - done < chunk {
+                    total - done
+                } else {
+                    chunk
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// A portion of `pages` was mapped: `Subscribing` after the last one.
+    pub const fn mapped(self, pages: usize, total: usize) -> ScreenPhase {
+        match self {
+            ScreenPhase::Mapping { done } => {
+                if done + pages >= total {
+                    ScreenPhase::Subscribing
+                } else {
+                    ScreenPhase::Mapping { done: done + pages }
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// A step of the finishing ended well: the next one, `Open` after the last.
+    pub const fn advanced(self) -> ScreenPhase {
+        match self {
+            ScreenPhase::Subscribing => ScreenPhase::Planes,
+            ScreenPhase::Planes => ScreenPhase::Cursor,
+            ScreenPhase::Cursor => ScreenPhase::Pool,
+            ScreenPhase::Pool => ScreenPhase::Open,
+            other => other,
+        }
+    }
+
+    /// A refusal, a stop notice or a dead driver in the middle: the phase
+    /// goes back to `Closed` and the pages mapped so far are to be
+    /// unmapped (`total` of them once the mapping is complete). An open
+    /// screen keeps itself.
+    pub const fn release(self, total: usize) -> (ScreenPhase, usize) {
+        match self {
+            ScreenPhase::Mapping { done } => (ScreenPhase::Closed, done),
+            ScreenPhase::Subscribing
+            | ScreenPhase::Planes
+            | ScreenPhase::Cursor
+            | ScreenPhase::Pool => (ScreenPhase::Closed, total),
+            other => (other, 0),
+        }
+    }
+}
+
 /// The owner byte of window place `i`.
 const fn window_owner(i: usize) -> u8 {
     i as u8 + 1
@@ -3933,5 +4051,141 @@ mod tests {
         s.post(b, 0, &[]).unwrap();
         s.begin().unwrap();
         assert_eq!(s.focus(), Some(b));
+    }
+
+    // ------------------------------------------------------ the screen's opening
+
+    const FB_PAGES: usize = 256;
+    const PORTION: usize = 32;
+
+    /// A model of the opening in steps, with faults planted by the tests.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Plant {
+        None,
+        /// The frame clock takes a frame while the pages are being mapped.
+        FrameWhileMapping,
+        /// A request is answered Ready before the last portion.
+        ReadyEarly,
+        /// A stop notice leaves the mapped pages.
+        KeepOnStop,
+        /// The last portion leaves a page unmapped.
+        ShortMapping,
+    }
+
+    /// Runs the opening to its end or to a stop after `stop_at` steps and
+    /// tells the first rule that broke, if any.
+    fn run(plant: Plant, stop_at: Option<usize>) -> Result<(usize, usize), &'static str> {
+        let mut phase = ScreenPhase::Closed.begin();
+        let mut mapped = 0;
+        let mut steps = 0;
+        loop {
+            if plant == Plant::FrameWhileMapping && phase.has_work() {
+                // The clock's check is replaced by a fault.
+                return Err("a frame was taken while mapping");
+            }
+            if phase.takes_frames() && mapped != FB_PAGES {
+                return Err("a frame was taken before the last portion");
+            }
+            let early = plant == Plant::ReadyEarly
+                && matches!(phase, ScreenPhase::Mapping { done } if done >= 64);
+            if !early && phase.has_work() && phase.ask() != ScreenAsk::Clearing {
+                return Err("a request was not answered while mapping");
+            }
+            if early {
+                return Err("a request was told ready before the last portion");
+            }
+            if stop_at == Some(steps) {
+                let (_, pages) = phase.release(FB_PAGES);
+                let left = if plant == Plant::KeepOnStop {
+                    mapped
+                } else {
+                    mapped - pages
+                };
+                return if left == 0 {
+                    Ok((steps, pages))
+                } else {
+                    Err("pages were left mapped")
+                };
+            }
+            match phase {
+                ScreenPhase::Mapping { .. } => {
+                    let pages = phase.portion(FB_PAGES, PORTION);
+                    // The fault: the last page of the last portion is not mapped.
+                    let short = plant == Plant::ShortMapping && mapped + pages >= FB_PAGES;
+                    mapped += pages - usize::from(short);
+                    phase = phase.mapped(pages, FB_PAGES);
+                }
+                ScreenPhase::Subscribing
+                | ScreenPhase::Planes
+                | ScreenPhase::Cursor
+                | ScreenPhase::Pool => phase = phase.advanced(),
+                ScreenPhase::Open => return Ok((steps, mapped)),
+                ScreenPhase::Closed => return Err("closed in the middle"),
+            }
+            steps += 1;
+            if mapped > FB_PAGES {
+                return Err("more pages than the buffer");
+            }
+        }
+    }
+
+    #[test]
+    fn the_screen_opens_in_portions_of_thirty_two_pages() {
+        // 8 portions, four finishing steps, then open.
+        assert_eq!(run(Plant::None, None), Ok((12, FB_PAGES)));
+        assert_eq!(ScreenPhase::Closed.ask(), ScreenAsk::Ask);
+        assert_eq!(ScreenPhase::Mapping { done: 0 }.ask(), ScreenAsk::Clearing);
+        assert_eq!(ScreenPhase::Subscribing.ask(), ScreenAsk::Clearing);
+        assert_eq!(ScreenPhase::Planes.ask(), ScreenAsk::Clearing);
+        assert_eq!(ScreenPhase::Cursor.ask(), ScreenAsk::Clearing);
+        assert_eq!(ScreenPhase::Pool.ask(), ScreenAsk::Clearing);
+        assert_eq!(ScreenPhase::Open.ask(), ScreenAsk::Ready);
+        assert!(!ScreenPhase::Closed.takes_frames());
+        assert!(!ScreenPhase::Mapping { done: 224 }.takes_frames());
+        assert!(!ScreenPhase::Pool.takes_frames());
+        assert!(ScreenPhase::Open.takes_frames());
+    }
+
+    #[test]
+    fn the_last_portion_is_the_rest_and_no_page_is_mapped_twice() {
+        assert_eq!(ScreenPhase::Mapping { done: 0 }.portion(70, 32), 32);
+        assert_eq!(ScreenPhase::Mapping { done: 64 }.portion(70, 32), 6);
+        assert_eq!(ScreenPhase::Mapping { done: 70 }.portion(70, 32), 0);
+        assert_eq!(ScreenPhase::Open.portion(70, 32), 0);
+        assert_eq!(ScreenPhase::Closed.portion(70, 32), 0);
+        assert_eq!(
+            ScreenPhase::Mapping { done: 64 }.mapped(6, 70),
+            ScreenPhase::Subscribing
+        );
+        assert_eq!(
+            ScreenPhase::Mapping { done: 32 }.mapped(32, 70),
+            ScreenPhase::Mapping { done: 64 }
+        );
+    }
+
+    #[test]
+    fn a_stop_in_the_middle_releases_what_was_mapped() {
+        for stop in 0..12 {
+            let (steps, pages) = run(Plant::None, Some(stop)).unwrap();
+            assert_eq!(steps, stop);
+            assert_eq!(pages, (stop * PORTION).min(FB_PAGES));
+        }
+        assert_eq!(
+            ScreenPhase::Planes.release(FB_PAGES),
+            (ScreenPhase::Closed, FB_PAGES)
+        );
+        assert_eq!(ScreenPhase::Open.release(FB_PAGES), (ScreenPhase::Open, 0));
+        assert_eq!(
+            ScreenPhase::Closed.release(FB_PAGES),
+            (ScreenPhase::Closed, 0)
+        );
+    }
+
+    #[test]
+    fn the_planted_faults_are_caught() {
+        assert!(run(Plant::FrameWhileMapping, None).is_err());
+        assert!(run(Plant::ReadyEarly, None).is_err());
+        assert!(run(Plant::KeepOnStop, Some(3)).is_err());
+        assert!(run(Plant::ShortMapping, None).is_err());
     }
 }
