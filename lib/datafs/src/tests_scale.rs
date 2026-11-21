@@ -2296,3 +2296,96 @@ fn scale_orphan_mount() {
         }
     }
 }
+
+/// The mount of `device` with the table of the repair of orphans on or off, then the disk as it is.
+fn mount_with_table(device: &MemDevice, table: bool) -> (Cost, Vec<u8>) {
+    let mut fs = attach(device.clone(), Win::Whole);
+    fs.set_orphan_table(table);
+    let at = now(&mut fs);
+    fs.mount().unwrap();
+    recover_orphans(&mut fs).unwrap();
+    let cost = now(&mut fs).since(at);
+    let medium = settle(fs);
+    (cost, medium.medium().to_vec())
+}
+
+type OrphanOp = fn(&mut Vol);
+
+fn orphan_ops() -> [(&'static str, OrphanOp); 3] {
+    [
+        ("mkdir", |fs| {
+            let _ = fs.mkdir(b"/z/newdir");
+        }),
+        ("rmdir", |fs| {
+            let _ = fs.remove(b"/z/d1");
+        }),
+        ("rename over a directory", |fs| {
+            let _ = fs.rename(b"/z/d2", b"/z/d3");
+        }),
+    ]
+}
+
+/// A cut at every sector of each operation, with four sets of sectors that reach the disk: the
+/// disk after the mount is the same byte for byte with the table and with the walk of the release.
+/// Returns the dearest mount with the table and with the walk.
+fn same_disk_after_every_cut(dirs: usize, pairs: usize) -> (u64, u64) {
+    let (device, _, _) = many_pairs(dirs, pairs);
+    let (mut dear_table, mut dear_walk) = (0, 0);
+    for (name, op) in orphan_ops() {
+        let mut fs = mounted(&device, Win::Whole);
+        let before = fs.device().written;
+        op(&mut fs);
+        let sectors = fs.device().written - before;
+        for cut in 0..=sectors {
+            for survive in [
+                Survive::None,
+                Survive::All,
+                Survive::Prefix(1),
+                Survive::Random(cut + 5),
+            ] {
+                let mut fs = mounted(&device, Win::Whole);
+                fs.device().cut_after(Some(cut));
+                op(&mut fs);
+                let mut dev = fs.into_device();
+                dev.power_cycle(survive);
+                let (with, a) = mount_with_table(&dev, true);
+                dear_table = dear_table.max(with.reads);
+                if std::env::var("ORPHAN_NO_WALK").is_ok() {
+                    continue;
+                }
+                let (without, b) = mount_with_table(&dev, false);
+                assert!(a == b, "{name}, cut {cut} {survive:?}: the disks differ");
+                dear_walk = dear_walk.max(without.reads);
+            }
+        }
+    }
+    (dear_table, dear_walk)
+}
+
+#[test]
+fn the_table_of_the_repair_of_orphans_leaves_the_disk_of_the_walk() {
+    let (table, walk) = same_disk_after_every_cut(40, 80);
+    assert!(table < walk, "the table {table} reads, the walk {walk}");
+}
+
+#[test]
+#[ignore = "slow: volumes with thousands of pairs; run by name, see the module text"]
+fn scale_orphan_table() {
+    std::println!("\n## The repair of orphans with the table, the dearest mount after a cut\n");
+    std::println!(
+        "| dirs | pairs | with the table: reads | s at 10,000/s | s at 3,000/s | the walk of the release: reads |"
+    );
+    std::println!("|---:|---:|---:|---:|---:|---:|");
+    let scales =
+        std::env::var("ORPHAN_SCALES").unwrap_or_else(|_| "128:256,270:512,540:1024".into());
+    for sc in scales.split(',') {
+        let (d, p) = sc.split_once(':').unwrap();
+        let (dirs, pairs): (usize, usize) = (d.parse().unwrap(), p.parse().unwrap());
+        let (table, walk) = same_disk_after_every_cut(dirs, pairs);
+        std::println!(
+            "| {dirs} | {pairs} | {table} | {:.1} | {:.1} | {walk} |",
+            table as f64 / 10_000.0,
+            table as f64 / 3_000.0
+        );
+    }
+}

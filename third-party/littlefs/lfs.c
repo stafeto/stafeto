@@ -5078,6 +5078,187 @@ static lfs_stag_t lfs_fs_parent(lfs_t *lfs, const lfs_block_t pair[2],
 }
 #endif
 
+#ifndef LFS_READONLY
+// stafeto: the parents of the directories, found with one walk of the list of
+// metadata pairs. lfs_fs_deorphan asks lfs_fs_parent for every head of a
+// directory, and each ask walks the list from its head: about two walks for
+// each directory. With cfg->orphan_buffer the repair walks the list once,
+// writes every pair that a directory entry names (under each of the pair's
+// two blocks, because lfs_pair_cmp calls pairs that share a block equal) and
+// the pair that holds the entry in a table, and answers each ask from the
+// table: a pair named by no entry has no parent (LFS_ERR_NOENT), and for a
+// pair that is named the one pair the table names is fetched with the same
+// match lfs_fs_parent makes. Whatever the table does not settle (two different
+// holders for one block, a table that is full, a fetch that finds no match) is
+// answered by lfs_fs_parent, so the answer is the one the walk gives. The table
+// lives for one call of lfs_fs_deorphan and is built again after each commit
+// of the repair, so a failed write leaves nothing behind.
+struct lfs_orphan_cell {
+    lfs_block_t key;
+    lfs_block_t pair[2];
+};
+
+struct lfs_orphan_table {
+    struct lfs_orphan_cell *cells;
+    lfs_size_t n;
+    lfs_size_t used;
+    bool built;
+    bool ok;
+};
+
+static void lfs_orphan_put(struct lfs_orphan_table *t,
+        lfs_block_t key, const lfs_block_t holder[2]) {
+    if (key == LFS_BLOCK_NULL) {
+        return;
+    }
+    lfs_size_t i = key % t->n;
+    for (lfs_size_t probes = 0; probes < t->n; probes++) {
+        struct lfs_orphan_cell *c = &t->cells[i];
+        if (c->key == LFS_BLOCK_NULL) {
+            if ((t->used+1) * 4 > t->n * 3) {
+                t->ok = false;
+                return;
+            }
+            c->key = key;
+            c->pair[0] = holder[0];
+            c->pair[1] = holder[1];
+            t->used += 1;
+            return;
+        }
+        if (c->key == key) {
+            // two holders (a move that a power loss left half done has the
+            // entry under both names): this key is answered by the walk
+            if (c->pair[0] != LFS_BLOCK_NULL
+                    && !lfs_pair_issync(c->pair, holder)) {
+                c->pair[0] = LFS_BLOCK_NULL;
+                c->pair[1] = LFS_BLOCK_NULL;
+            }
+            return;
+        }
+        i = (i+1) % t->n;
+    }
+    t->ok = false;
+}
+
+static const struct lfs_orphan_cell *lfs_orphan_get(
+        const struct lfs_orphan_table *t, lfs_block_t key) {
+    lfs_size_t i = key % t->n;
+    for (lfs_size_t probes = 0; probes < t->n; probes++) {
+        const struct lfs_orphan_cell *c = &t->cells[i];
+        if (c->key == LFS_BLOCK_NULL) {
+            return NULL;
+        }
+        if (c->key == key) {
+            return c;
+        }
+        i = (i+1) % t->n;
+    }
+    return NULL;
+}
+
+struct lfs_orphan_collect {
+    lfs_t *lfs;
+    struct lfs_orphan_table *table;
+    lfs_block_t holder[2];
+};
+
+static int lfs_orphan_collect(void *data,
+        lfs_tag_t tag, const void *buffer) {
+    struct lfs_orphan_collect *c = data;
+    const struct lfs_diskoff *disk = buffer;
+    (void)tag;
+
+    lfs_block_t child[2];
+    int err = lfs_bd_read(c->lfs,
+            &c->lfs->pcache, &c->lfs->rcache, c->lfs->cfg->block_size,
+            disk->block, disk->off, &child, sizeof(child));
+    if (err) {
+        return err;
+    }
+
+    lfs_pair_fromle32(child);
+    lfs_orphan_put(c->table, child[0], c->holder);
+    lfs_orphan_put(c->table, child[1], c->holder);
+    return LFS_CMP_LT;
+}
+
+static int lfs_orphan_build(lfs_t *lfs, struct lfs_orphan_table *t) {
+    for (lfs_size_t i = 0; i < t->n; i++) {
+        t->cells[i].key = LFS_BLOCK_NULL;
+    }
+    t->used = 0;
+    t->ok = true;
+    t->built = true;
+
+    lfs_mdir_t dir = {.tail = {0, 1}};
+    struct lfs_tortoise_t tortoise = {
+        .pair = {LFS_BLOCK_NULL, LFS_BLOCK_NULL},
+        .i = 1,
+        .period = 1,
+    };
+    while (!lfs_pair_isnull(dir.tail)) {
+        int err = lfs_tortoise_detectcycles(&dir, &tortoise);
+        if (err < 0) {
+            return err;
+        }
+
+        struct lfs_orphan_collect collect = {
+            lfs, t, {dir.tail[0], dir.tail[1]}};
+        lfs_stag_t tag = lfs_dir_fetchmatch(lfs, &dir, collect.holder,
+                LFS_MKTAG(0x7ff, 0, 0x3ff),
+                LFS_MKTAG(LFS_TYPE_DIRSTRUCT, 0, 8),
+                NULL,
+                lfs_orphan_collect, &collect);
+        if (tag < 0 && tag != LFS_ERR_NOENT) {
+            return tag;
+        }
+    }
+
+    return 0;
+}
+
+// Same answer as lfs_fs_parent.
+static lfs_stag_t lfs_fs_parent_table(lfs_t *lfs,
+        struct lfs_orphan_table *t, const lfs_block_t pair[2],
+        lfs_mdir_t *parent) {
+    if (t->n == 0) {
+        return lfs_fs_parent(lfs, pair, parent);
+    }
+    if (!t->built) {
+        int err = lfs_orphan_build(lfs, t);
+        if (err) {
+            return err;
+        }
+    }
+    if (!t->ok) {
+        return lfs_fs_parent(lfs, pair, parent);
+    }
+
+    const struct lfs_orphan_cell *a = lfs_orphan_get(t, pair[0]);
+    const struct lfs_orphan_cell *b = lfs_orphan_get(t, pair[1]);
+    if (!a && !b) {
+        return LFS_ERR_NOENT;
+    }
+    if ((a && a->pair[0] == LFS_BLOCK_NULL)
+            || (b && b->pair[0] == LFS_BLOCK_NULL)
+            || (a && b && !lfs_pair_issync(a->pair, b->pair))) {
+        return lfs_fs_parent(lfs, pair, parent);
+    }
+
+    lfs_block_t holder[2] = {(a ? a : b)->pair[0], (a ? a : b)->pair[1]};
+    lfs_stag_t tag = lfs_dir_fetchmatch(lfs, parent, holder,
+            LFS_MKTAG(0x7ff, 0, 0x3ff),
+            LFS_MKTAG(LFS_TYPE_DIRSTRUCT, 0, 8),
+            NULL,
+            lfs_fs_parent_match, &(struct lfs_fs_parent_match){
+                lfs, {pair[0], pair[1]}});
+    if (tag && tag != LFS_ERR_NOENT) {
+        return tag;
+    }
+    return lfs_fs_parent(lfs, pair, parent);
+}
+#endif
+
 static void lfs_fs_prepsuperblock(lfs_t *lfs, bool needssuperblock) {
     lfs->gstate.tag = (lfs->gstate.tag & ~LFS_MKTAG(0, 0, 0x200))
             | (uint32_t)needssuperblock << 9;
@@ -5194,6 +5375,13 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
     // references to full-orphans, effectively hiding them from the deorphan
     // search.
     //
+    // stafeto: the parents from one walk, for the repair after a power loss
+    struct lfs_orphan_table table = {0};
+    if (powerloss && lfs->cfg->orphan_buffer) {
+        table.cells = lfs->cfg->orphan_buffer;
+        table.n = lfs->cfg->orphan_size / sizeof(struct lfs_orphan_cell);
+    }
+
     int pass = 0;
     while (pass < 2) {
         // Fix any orphans
@@ -5212,7 +5400,8 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
             if (!pdir.split) {
                 // check if we have a parent
                 lfs_mdir_t parent;
-                lfs_stag_t tag = lfs_fs_parent(lfs, pdir.tail, &parent);
+                lfs_stag_t tag = lfs_fs_parent_table(lfs, &table,
+                        pdir.tail, &parent);
                 if (tag < 0 && tag != LFS_ERR_NOENT) {
                     return tag;
                 }
@@ -5255,6 +5444,7 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
                         if (state < 0) {
                             return state;
                         }
+                        table.built = false;
 
                         // did our commit create more orphans?
                         if (state == LFS_OK_ORPHANED) {
@@ -5289,6 +5479,7 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
                     if (state < 0) {
                         return state;
                     }
+                    table.built = false;
 
                     // did our commit create more orphans?
                     if (state == LFS_OK_ORPHANED) {

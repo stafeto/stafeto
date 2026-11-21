@@ -291,6 +291,16 @@ struct lfs_config {
     // to the most recent minor version when zero.
     uint32_t disk_version;
 #endif
+
+    // stafeto: optional statically allocated table of orphan_size bytes (4-byte
+    // aligned) for the repair of orphans after a power loss. With it
+    // lfs_fs_deorphan finds the parent of every directory from one walk of the
+    // list of metadata pairs, where the release walks the list for each
+    // directory. Holds two cells of 12 bytes for each directory, with the table
+    // at most three quarters full; a table that is too small (or NULL) leaves the
+    // release's walk. The disk is the same with or without it.
+    void *orphan_buffer;
+    lfs_size_t orphan_size;
 };
 
 // File info structure
