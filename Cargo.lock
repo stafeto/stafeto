@@ -847,6 +847,7 @@ dependencies = [
  "proto-wire",
  "rt",
  "trace",
+ "wfd",
 ]
 
 [[package]]
@@ -924,6 +925,7 @@ dependencies = [
  "proto-init",
  "proto-loader",
  "rt",
+ "wfd",
 ]
 
 [[package]]
@@ -1977,6 +1979,13 @@ name = "wfd"
 version = "0.1.0"
 dependencies = [
  "proto-gpu",
+]
+
+[[package]]
+name = "wfd-demo"
+version = "0.6.0-pre.0"
+dependencies = [
+ "posix-crt",
 ]
 
 [[package]]

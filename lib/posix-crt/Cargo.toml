@@ -32,6 +32,9 @@ trace = ["posix-abi/trace"]
 # (`<stafeto/window.h>`, window_c.rs) in a statically linked program. libc.so
 # is built without it.
 window = ["posix-abi/window", "dep:comp-client"]
+# The C functions of OpenWF Display (`<WF/wfd.h>`, wfd_c.rs) in a statically
+# linked program. libc.so is built without it.
+wfd = ["posix-abi/wfd", "dep:wfd"]
 
 [dependencies]
 entries = { path = "../entries" }
@@ -43,3 +46,4 @@ posix-platform = { path = "../posix-platform" }
 posix-thread = { path = "../posix-thread" }
 rt = { path = "../rt" }
 comp-client = { path = "../comp-client", optional = true }
+wfd = { path = "../wfd", optional = true }
