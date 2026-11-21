@@ -1,0 +1,21 @@
+[package]
+name = "wfc-ref"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The host reference of the probe of OpenWF Composition (cargo xtask wfc-probe): the scenes of apps/wfc-demo built through the crate wfc and drawn point by point from proto_comp::meaning, with the CRC of each frame"
+
+[lib]
+bench = false
+
+[[bin]]
+name = "wfc-ref"
+test = false
+bench = false
+
+[dependencies]
+wfc = { path = "../../lib/wfc" }
+proto-comp = { path = "../../proto/comp" }
+proto-wire = { path = "../../proto/wire" }

@@ -1005,6 +1005,8 @@ fn child() -> Result<(), &'static str> {
         crate::window::after_fork();
         #[cfg(feature = "wfd")]
         crate::wfd::after_fork();
+        #[cfg(feature = "wfc")]
+        crate::wfc::after_fork();
         // The child's session with the network service is the clone the
         // parent made, which holds the descriptions the child keeps.
         crate::net::after_fork(handle(raw(Slot::Net)));

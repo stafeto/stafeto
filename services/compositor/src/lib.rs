@@ -151,6 +151,11 @@ pub struct Price {
     pub point_measured: u32,
     pub point: u32,
     pub point_estimate: bool,
+    /// What a call of this kind pays when pixman's cache of resolved paths has
+    /// lost its key (`LOOKUP_MISS_MEASURED`): measured for the kind, ticks, and
+    /// with the margin.
+    pub miss_measured: u32,
+    pub miss: u32,
 }
 
 /// The margin over a measure, in percent.
@@ -168,6 +173,7 @@ const fn price(
     row_estimate: bool,
     point_measured: u32,
     point_estimate: bool,
+    miss_measured: u32,
 ) -> Price {
     Price {
         kind,
@@ -179,26 +185,141 @@ const fn price(
         point_measured,
         point: with_margin(point_measured),
         point_estimate,
+        miss_measured,
+        miss: with_margin(miss_measured),
     }
 }
 
-/// The prices: black, copy, over, each the upper fit of the model over the
-/// greatest ticks of 26 shapes of operations, the widths 1 to 152 and 640
+/// The prices: black, copy, over and the kinds of the elements' operations, each
+/// the upper fit of the model over the greatest ticks of 26 shapes of operations, the widths 1 to 152 and 640
 /// (`compositor::fit`, `px::calibration`),
 /// measured under -icount, the same in `comp-probe` and in `focus-probe`
-/// (the run is deterministic). Every entry is a measure.
-pub const PRICES: [Price; 11] = [
-    price("black", 209, 2_400, false, 38, false),
-    price("copy", 780, 5_480, false, 138, false),
-    price("over", 785, 18_981, false, 427, false),
-    price("scale-nearest-copy", 5711, 19_973, false, 2900, false),
-    price("scale-nearest-over", 5651, 27_984, false, 2875, false),
-    price("scale-bilinear-copy", 5741, 19_976, false, 8299, false),
-    price("scale-bilinear-over", 5664, 27_956, false, 9475, false),
-    price("rotate90", 2861, 94, false, 646, false),
-    price("alpha", 4942, 35_650, false, 969, false),
-    price("mask", 1170, 260, false, 4695, false),
-    price("mask-alpha", 3246, 4_785, false, 4820, false),
+/// (the run is deterministic). Every entry is a measure. The rows from
+/// `fast-nearest-copy` on are the fast class (`elements::Class::FastNearestCopy`):
+/// a scale by a fraction with no turn and no reflection, whose paths pixman
+/// has apart from its general path; each has the miss
+/// the calibration of the lookup measured for its kind (`measures::LOOKUPS`).
+pub const PRICES: [Price; 24] = [
+    price("black", 209, 2_400, false, 38, false, LOOKUP_MISS_MEASURED),
+    price("copy", 780, 5_480, false, 138, false, LOOKUP_MISS_MEASURED),
+    price("over", 785, 18_981, false, 427, false, LOOKUP_MISS_MEASURED),
+    price(
+        "scale-nearest-copy",
+        5_711,
+        19_973,
+        false,
+        2_900,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "scale-nearest-over",
+        5_651,
+        27_984,
+        false,
+        2_875,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "scale-bilinear-copy",
+        5_741,
+        19_976,
+        false,
+        8_299,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "scale-bilinear-over",
+        5_664,
+        27_956,
+        false,
+        9_475,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "rotate90",
+        2_861,
+        94,
+        false,
+        646,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "alpha",
+        4_942,
+        35_650,
+        false,
+        969,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price(
+        "mask",
+        1_170,
+        260,
+        false,
+        4_695,
+        false,
+        LOOKUP_MISS_MEASURED,
+    ),
+    price("mask-alpha", 3_246, 4_785, false, 4_820, false, 908),
+    price("fast-nearest-copy", 2776, 1719, false, 595, false, 3634),
+    price("fast-nearest-over", 2707, 19082, false, 1013, false, 1537),
+    price("fast-bilinear-copy", 2744, 24014, false, 1374, false, 2103),
+    price("fast-bilinear-over", 3526, 38744, false, 2098, false, 2481),
+    price("fast-nearest-alpha", 6112, 40994, false, 3268, false, 4374),
+    price("fast-bilinear-alpha", 6103, 40937, false, 9868, false, 4373),
+    price("fast-nearest-mask", 6043, 50313, false, 3737, false, 4411),
+    price("fast-bilinear-mask", 2917, 35785, false, 4001, false, 2836),
+    price(
+        "fast-bilinear-mask-alpha",
+        4464,
+        40454,
+        false,
+        4123,
+        false,
+        3298,
+    ),
+    price(
+        "fast-nearest-alpha-opaque",
+        6106,
+        29671,
+        false,
+        3428,
+        false,
+        4256,
+    ),
+    price(
+        "fast-bilinear-alpha-opaque",
+        6115,
+        30024,
+        false,
+        8766,
+        false,
+        4259,
+    ),
+    price(
+        "fast-nearest-mask-opaque",
+        6207,
+        38416,
+        false,
+        3834,
+        false,
+        4263,
+    ),
+    price(
+        "fast-bilinear-mask-opaque",
+        6218,
+        38396,
+        false,
+        9234,
+        false,
+        4249,
+    ),
 ];
 /// What every layer costs a band beyond its operation (ticks, for each window
 /// the band lays and for the pointer's picture), and what every band costs beyond
@@ -227,7 +348,7 @@ pub const LAYER: u32 = with_margin(LAYER_MEASURED);
 pub const BAND_FIXED_MEASURED: u32 = 560;
 pub const BAND_FIXED: u32 = with_margin(BAND_FIXED_MEASURED);
 /// What every step of a frame under a scene spends beyond its operations for each
-/// element of the scene that shows something over the damage (ticks): a step
+/// element of the scene, whether it shows something over the damage or not (ticks): a step
 /// makes the groups of the layers (`Scene::passes`) and asks each element
 /// whether it has something to draw on the band. Measured on the steps of the
 /// scenes of 16 elements of the probe (the greatest excess of a step's own
@@ -2052,13 +2173,12 @@ impl Scene {
                 && damage.y < r.y + r.h
         };
         if let Some(plan) = passes {
-            // Under a scene: the layers are drawn in groups, a step each, and a
-            // place of the frame is the size the dearest group allows.
+            // Under a scene: the layers are drawn in groups, each over the rectangle
+            // of its own elements. The size of a band is that of its group; the
+            // size told here is the smallest of the groups.
             let mut size: Option<(u32, u32)> = None;
             for g in 0..plan.groups {
-                let (calls, per_row, per_point) = plan.cost[g];
-                let calls = calls + ELEMENT_TERM * plan.elements + SCENE_STEP;
-                let (w, h) = band_size(calls, per_row, per_point, damage.w);
+                let (w, h) = plan.band(g);
                 size = Some(match size {
                     Some((sw, sh)) if (sh, sw) <= (h, w) => (sw, sh),
                     _ => (w, h),
@@ -2102,13 +2222,17 @@ impl Scene {
         band_size(calls, per_row, per_point, damage.w)
     }
 
-    /// How the layers of a frame over `damage` are split into steps: each
-    /// element of the working scene that shows something over the damage, in
+    /// How the layers of a frame over `damage` are split into groups, drawn in
+    /// turn, bottom up, each in bands of its own over the rectangle of its
+    /// elements (cut to the damage). The black the frame starts with (when no
+    /// element covers the damage whole) is the group of its own over the damage.
+    /// Each element of the working scene that shows something over the damage, in
     /// order, goes to the group it fits (a group's calls come to at most
-    /// GROUP_CALLS ticks, or it is one dear element alone), then the pointer's
-    /// picture when it is over the damage; the black the band starts with
-    /// is in the first group. A place of the frame is drawn group by group, so
-    /// that however dear the layers a step costs at most BAND_TICKS by the model.
+    /// GROUP_CALLS ticks, or it is one dear element alone); elements under the
+    /// topmost opaque one that covers the damage are not drawn at all. The
+    /// pointer's picture, when it is over the damage, is the last group. A band
+    /// of a group costs by the model what its group's elements cost on its width,
+    /// so that however dear the layers a step costs at most BAND_TICKS.
     pub fn passes(&self, def: &Def, damage: Rect) -> Passes {
         let touches = |r: Rect| {
             r.x < damage.x + damage.w
@@ -2117,49 +2241,81 @@ impl Scene {
                 && damage.y < r.y + r.h
         };
         let mut plan = Passes::EMPTY;
-        let mut covered = false;
-        for e in def.elements() {
+        // Every element of the scene is a term of a step (`ELEMENT_TERM`), the ones
+        // under the base and off the damage too: the step asks each of them.
+        plan.elements = def.elements().len() as u32;
+        // The topmost opaque element that covers the damage whole: the base.
+        let mut base = None;
+        for (k, e) in def.elements().iter().enumerate() {
             if let Some(r) = self.element_place(e)
-                && touches(r)
+                && e.transparency == 0
+                && covers_rect(r, damage)
             {
-                covered |= e.transparency == 0 && covers_rect(r, damage);
+                base = Some(k);
             }
         }
-        if !covered {
-            plan.add_to(0, FILL, 0);
+        if base.is_none() {
+            plan.groups = 1;
+            plan.black = true;
+            plan.cost[0] = GroupCost::of(FILL, 0, damage);
         }
-        plan.groups = 1;
-        let mut at = 0;
-        for (k, e) in def.elements().iter().enumerate() {
+        // The group that takes the next layer, when it fits.
+        let mut open: Option<usize> = None;
+        for (k, e) in def.elements().iter().enumerate().skip(base.unwrap_or(0)) {
             let Some(r) = self.element_place(e) else {
                 continue;
             };
             if !touches(r) {
                 continue;
             }
-            let (first, second) = elements::classes(e);
+            let argb = self
+                .place_of(e.source)
+                .and_then(|p| self.window(p))
+                .is_some_and(|w| w.format == Format::Argb);
+            let (first, second) = elements::classes(e, argb);
             let (a, b) = (PRICES[first.row()], second.map(|c| PRICES[c.row()]));
             // The alpha or the mask is part of the one call of pixman the stretch
-            // makes: it adds its rows and points, and no second call.
-            let calls = a.call + LAYER + LOOKUP_MISS;
-            at = plan.place(at, calls);
+            // makes: it adds its rows and points, and no second call. A stretch that
+            // is no scale, with a mask and an alpha, is two steps (the product of
+            // the mask and the alpha in the work band, then the stretch through
+            // it): the group is priced as the second, the dearer of the two, with
+            // the mask.
+            let two = second == Some(elements::Class::MaskAlpha);
+            let b = if two {
+                Some(PRICES[elements::Class::Mask.row()])
+            } else {
+                b
+            };
+            let calls = a.call + LAYER + a.miss;
+            let at = match open {
+                Some(g) if plan.cost[g].calls + calls <= GROUP_CALLS => g,
+                _ => {
+                    plan.groups += 1;
+                    plan.groups - 1
+                }
+            };
+            open = Some(at);
+            let area = intersect(r, damage);
             plan.group[k] = at as u8;
-            plan.elements += 1;
             plan.members[at] |= 1 << k;
-            plan.add_to(at, a, LAYER + LOOKUP_MISS);
+            plan.two_step[at] = two;
+            debug_assert!(
+                !two || plan.members_of(at) == 1,
+                "a group of two steps is alone"
+            );
+            let c = &mut plan.cost[at];
+            c.add(a, LAYER + a.miss, area);
             if let Some(b) = b {
-                plan.add_to(at, b, 0);
-                plan.cost[at].0 -= b.call;
+                c.add(b, 0, area);
+                c.calls -= b.call;
             }
         }
-        if self
-            .drawn_pointer()
-            .is_some_and(|p| touches(Scene::cursor_rect(p)))
-        {
+        let cursor = self.drawn_pointer().map(Scene::cursor_rect);
+        if let Some(c) = cursor.filter(|&c| touches(c)) {
             // Under a scene the picture's path may miss the cache too.
-            at = plan.place(at, OVER.call + LAYER + LOOKUP_MISS);
-            plan.pointer = at as u8;
-            plan.add_to(at, OVER, LAYER + LOOKUP_MISS);
+            plan.pointer = plan.groups as u8;
+            plan.cost[plan.groups] = GroupCost::of(OVER, LAYER + OVER.miss, intersect(c, damage));
+            plan.groups += 1;
         }
         plan
     }
@@ -2170,54 +2326,133 @@ impl Scene {
 /// work of a band. A layer dearer than that is a group of its own.
 pub const GROUP_CALLS: u32 = BAND_TICKS / 2;
 
+// An element of two steps is alone in its group: its layer (the call, the term of a
+// layer and the miss of the stretch it makes) is dearer than a group may hold, so
+// no element joins it and it joins none (`Scene::passes`).
+const _: () = {
+    let nearest = PRICES[elements::Class::ScaleNearestOver.row()];
+    let bilinear = PRICES[elements::Class::ScaleBilinearOver.row()];
+    assert!(nearest.call + LAYER + nearest.miss > GROUP_CALLS);
+    assert!(bilinear.call + LAYER + bilinear.miss > GROUP_CALLS);
+};
+
 /// The group no element is in.
 const NO_GROUP: u8 = u8::MAX;
 
+/// The rectangle both hold (they touch).
+fn intersect(a: Rect, b: Rect) -> Rect {
+    let (x0, y0) = (a.x.max(b.x), a.y.max(b.y));
+    let (x1, y1) = ((a.x + a.w).min(b.x + b.w), (a.y + a.h).min(b.y + b.h));
+    Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    }
+}
+
+/// The smallest rectangle that holds both.
+fn bounds(a: Rect, b: Rect) -> Rect {
+    let (x0, y0) = (a.x.min(b.x), a.y.min(b.y));
+    let (x1, y1) = ((a.x + a.w).max(b.x + b.w), (a.y + a.h).max(b.y + b.h));
+    Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    }
+}
+
+/// What a group costs by the model, and where it draws: the calls with the terms
+/// of its layers (ticks), the price of a line, the price of the points of one
+/// line of the group's rectangle (each layer on its own width) and the price of
+/// a column of the layers (hundredths of a tick), and the rectangle.
+#[derive(Clone, Copy, Debug)]
+pub struct GroupCost {
+    pub calls: u32,
+    pub per_row: u32,
+    /// The points of one line of `rect`, each layer cut to its own width.
+    pub per_line: u32,
+    /// A point of every layer: the price of a part of a line.
+    pub per_point: u32,
+    pub rect: Rect,
+}
+
+impl GroupCost {
+    const EMPTY: GroupCost = GroupCost {
+        calls: 0,
+        per_row: 0,
+        per_line: 0,
+        per_point: 0,
+        rect: Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        },
+    };
+
+    /// A group of one operation `p`, the term of a layer `layer`, over `area`.
+    fn of(p: Price, layer: u32, area: Rect) -> GroupCost {
+        let mut c = GroupCost::EMPTY;
+        c.add(p, layer, area);
+        c
+    }
+
+    /// An operation of price `p` and the term of a layer (`layer`) over `area`: the
+    /// group's rectangle grows to hold it when it has none yet.
+    fn add(&mut self, p: Price, layer: u32, area: Rect) {
+        self.rect = if self.rect.w == 0 {
+            area
+        } else {
+            bounds(self.rect, area)
+        };
+        self.calls += p.call + layer;
+        self.per_row += p.row;
+        self.per_line += p.point * area.w;
+        self.per_point += p.point;
+    }
+}
+
 /// The groups of layers of a frame (`Scene::passes`): the group of each element
 /// of the working scene and of the pointer's picture, and what each group costs
-/// by the model (the calls with the terms of its layers in ticks, the price of
-/// a line and of a point in hundredths of a tick).
+/// by the model.
 #[derive(Clone, Copy, Debug)]
 pub struct Passes {
     group: [u8; MAX_ELEMENTS],
     pointer: u8,
+    /// Whether group 0 is the black over the damage.
+    black: bool,
     pub groups: usize,
-    pub cost: [(u32, u32, u32); MAX_ELEMENTS + 2],
-    /// The elements of the scene that show something over the damage: each is
-    /// a term of every step (`ELEMENT_TERM`).
+    pub cost: [GroupCost; MAX_ELEMENTS + 2],
+    /// The elements of the scene: each is a term of every step (`ELEMENT_TERM`).
     pub elements: u32,
     /// The elements of each group, a bit each.
     members: [u16; MAX_ELEMENTS + 2],
+    /// The groups that are one element drawn in two steps for each band (the
+    /// product of its mask and alpha, then the element).
+    two_step: [bool; MAX_ELEMENTS + 2],
 }
 
 impl Passes {
     const EMPTY: Passes = Passes {
         group: [NO_GROUP; MAX_ELEMENTS],
         pointer: NO_GROUP,
+        black: false,
         groups: 0,
-        cost: [(0, 0, 0); MAX_ELEMENTS + 2],
+        cost: [GroupCost::EMPTY; MAX_ELEMENTS + 2],
         elements: 0,
         members: [0; MAX_ELEMENTS + 2],
+        two_step: [false; MAX_ELEMENTS + 2],
     };
 
-    /// The group a layer of `calls` ticks goes to, the layers before it being
-    /// in groups up to `at`: the same one when it fits, the next when not.
-    fn place(&mut self, at: usize, calls: u32) -> usize {
-        if self.cost[at].0 + calls > GROUP_CALLS && self.cost[at].0 > 0 {
-            self.groups = at + 2;
-            at + 1
-        } else {
-            self.groups = self.groups.max(at + 1);
-            at
-        }
-    }
-
-    /// An operation of price `p` and the term of a layer (`layer`) in group `g`.
-    fn add_to(&mut self, g: usize, p: Price, layer: u32) {
-        let c = &mut self.cost[g];
-        c.0 += p.call + layer;
-        c.1 += p.row;
-        c.2 += p.point;
+    /// The size of a band of group `g` (columns and lines): by the calls of the
+    /// group with the terms of every element of the scene and of the step, and
+    /// by the rows and the points of the group on its width.
+    pub fn band(&self, g: usize) -> (u32, u32) {
+        let c = &self.cost[g];
+        let calls = c.calls + ELEMENT_TERM * self.elements + SCENE_STEP;
+        band_size_of(calls, c)
     }
 
     /// The group of element `k` of the scene, if it draws over the damage.
@@ -2228,6 +2463,21 @@ impl Passes {
     /// The group of the pointer's picture, if it is over the damage.
     pub fn pointer_group(&self) -> Option<usize> {
         Some(usize::from(self.pointer)).filter(|&g| g != usize::from(NO_GROUP))
+    }
+
+    /// Whether group `g` is drawn in two steps for each band (`PHASE`).
+    pub fn is_two_step(&self, g: usize) -> bool {
+        self.two_step[g]
+    }
+
+    /// The elements in group `g`.
+    pub fn members_of(&self, g: usize) -> usize {
+        self.members[g].count_ones() as usize
+    }
+
+    /// Whether group `g` is the black.
+    pub fn is_black(&self, g: usize) -> bool {
+        self.black && g == 0
     }
 }
 
@@ -2515,6 +2765,27 @@ pub fn band_size(calls: u32, per_row: u32, per_point: u32, damage_w: u32) -> (u3
     (w.clamp(1, u64::from(damage_w)) as u32, 1)
 }
 
+/// The size of a band of a group that costs `c` besides `calls` ticks (its own
+/// calls, the terms of the elements and of the step): the lines of the group's
+/// width that BAND_TICKS leaves after the calls (at most BAND_ROWS), each layer
+/// on its own width, or a part of one line (every layer on the whole of it), at
+/// least one point. A group of nothing to price is a band of BAND_ROWS lines.
+pub fn band_size_of(calls: u32, c: &GroupCost) -> (u32, u32) {
+    let w = c.rect.w;
+    if c.per_row + c.per_point == 0 {
+        return (w, BAND_ROWS);
+    }
+    let budget = u64::from(BAND_TICKS.saturating_sub(calls + BAND_FIXED)) * 100;
+    let one_row = u64::from(c.per_row) + u64::from(c.per_line);
+    let rows = budget / one_row.max(1);
+    if rows >= 1 {
+        return (w, rows.min(u64::from(BAND_ROWS)) as u32);
+    }
+    let room = budget.saturating_sub(u64::from(c.per_row));
+    let part = room.checked_div(u64::from(c.per_point)).unwrap_or(0);
+    (part.clamp(1, u64::from(w)) as u32, 1)
+}
+
 /// The bands a frame of one copy over the whole screen takes by the prices of
 /// `PRICES` (a window of XRGB8888 that covers the screen, nothing above it): the
 /// figure the probes print, and the one that must stay at 45 or fewer for the
@@ -2578,6 +2849,31 @@ pub trait Raster {
     /// An element's drawing: the points of `draw.src` carried to the screen by
     /// the transform, with the mask or the global alpha (`Draw`).
     fn element(&mut self, fb: &mut [u8], draw: &Draw<'_>);
+
+    /// The first step of an element that is stretched, turned or reflected, with a
+    /// mask and an alpha: the first `size` points of the area from `at` of the A8
+    /// `mask`, times `alpha`, go to the raster's work band; the second step is
+    /// `element` with `Draw::work`, which reads that band as its mask. `owner` is
+    /// the element (its number in the scene) and the area of the band it is made
+    /// for: the raster remembers them for `product_made`. False when the product
+    /// was not made.
+    fn product(
+        &mut self,
+        owner: (u32, Rect),
+        mask: &Surface<'_>,
+        at: (u32, u32),
+        alpha: u8,
+        size: (u32, u32),
+    ) -> bool {
+        let _ = (owner, mask, at, alpha, size);
+        panic!("this raster has no work band");
+    }
+
+    /// The element and the area of the product the work band holds: the last that
+    /// `product` made, none when the last failed.
+    fn product_made(&self) -> Option<(u32, Rect)> {
+        None
+    }
 }
 
 /// A surface a band reads: a window's buffer (the points of a window of
@@ -2610,6 +2906,10 @@ pub struct Draw<'a> {
     pub transparency: u32,
     pub alpha: u8,
     pub mask: Option<(Surface<'a>, (u32, u32))>,
+    /// The mask is the work band that `Raster::product` made for this area (the
+    /// transparency has both the mask and the alpha bits, `mask` is none, and the
+    /// alpha is already in the band).
+    pub work: bool,
     pub area: Rect,
 }
 
@@ -2622,9 +2922,16 @@ pub struct Band {
     pub col: u32,
     /// The group of layers the next step draws on this place (`Plan`): 0 for the
     /// first step of a place, and for the frame of a scene of windows with no
-    /// elements, always.
+    /// elements, always. The bit `PHASE` says the next step is the second of an
+    /// element of two steps.
     pub pass: u32,
 }
+
+/// The bit of `Band::pass` that says the band is at the second step of its group
+/// (the group is one element that is stretched, turned or reflected, with a mask and
+/// an alpha: the first step makes the product of the mask and the alpha, the second
+/// draws).
+pub const PHASE: u32 = 1 << 31;
 
 /// One band of the frame, from `at` in `damage`: the lines
 /// `at.row..at.row + rows` (to the damage's end) of the columns from `at.col`
@@ -2642,38 +2949,45 @@ pub fn compose(
     raster: &mut impl Raster,
 ) -> Band {
     let passes = scene.working().map(|def| scene.passes(def, damage));
-    let size = scene.tile_with(damage, passes.as_ref());
+    // A band of a scene is the size its group allows; one of windows is the
+    // size of the layers that touch the damage.
+    let size = match passes.as_ref() {
+        Some(plan) if ((at.pass & !PHASE) as usize) < plan.groups => {
+            plan.band((at.pass & !PHASE) as usize)
+        }
+        _ => scene.tile_with(damage, passes.as_ref()),
+    };
     compose_with(scene, damage, at, size, passes.as_ref(), fb, src, raster)
 }
 
-/// The step of the band `band` of a frame of the working scene `def` that is at
-/// group `pass` of `passes`: the topmost opaque element that covers the band
-/// whole is its base (copied, so the elements under it are not drawn), and a
-/// band that no element covers whole starts as the background (in the first
-/// step of its place, `pass` 0); the elements above lie over it in their order,
-/// those of the group of this step now and the groups after it in the steps
-/// after. What an element draws is its source rectangle carried to its target
-/// rectangle (the operations of a band: `Raster::blit` for a plain copy or
-/// laying over, `Raster::element` for the rest: the stretch, the turn, the
-/// reflection, the filter, the global alpha and the mask), cut to the band and
-/// the screen; an element whose window has nothing taken or does not hold the
-/// source rectangle (a window of the number went and another took its place),
-/// or whose mask is not there, draws nothing. The group the next step of this
-/// place draws (the first after this one that has something to draw on it, the
-/// pointer's picture last), or None when the place is done; a group with
-/// nothing to draw is no step: the first group that has something is the one
-/// drawn now.
+/// The step of the band `band` of group `pass` of `passes` in a frame of the
+/// working scene `def`. The black group fills the band unless an opaque element
+/// covers it whole (that element draws over it in its own group). In the group of
+/// elements the topmost opaque element of the group that covers the band whole
+/// is its base (copied, so the elements of the group under it are not drawn); the
+/// elements above lie over it in their order. What an element draws is its
+/// source rectangle carried to its target rectangle (the operations of a band:
+/// `Raster::blit` for a plain copy or laying over, `Raster::element` for the
+/// rest: the stretch, the turn, the reflection, the filter, the global alpha and
+/// the mask), cut to the band and the screen; an element whose window has
+/// nothing taken or does not hold the source rectangle (a window of the number
+/// went and another took its place), or whose mask is not there, draws nothing.
+/// The pointer's group draws no element (`compose_with` draws the picture). A
+/// group of two steps (`Passes::is_two_step`) makes the product of the mask and
+/// the alpha at `phase` false and draws the element at `phase` true.
 #[allow(clippy::too_many_arguments)]
 fn compose_elements(
     scene: &Scene,
     def: &Def,
     passes: &Passes,
     pass: usize,
+    phase: bool,
     band: Rect,
     fb: &mut [u8],
     src: &impl Source,
     raster: &mut impl Raster,
-) -> (usize, Option<usize>) {
+) -> Product {
+    let mut product = Product::None;
     let (x0, y0) = (i64::from(band.x), i64::from(band.y));
     let (x1, y1) = (x0 + i64::from(band.w), y0 + i64::from(band.h));
     let els = def.elements();
@@ -2681,22 +2995,31 @@ fn compose_elements(
         let place = scene.place_of(e.source)?;
         scene.element_place(e).map(|_| (place, scene.window(place)))
     };
-    // The topmost element that copies and covers the band whole.
-    let base = els.iter().rposition(|e| {
+    // Whether an element copies and covers the band whole.
+    let covers = |e: &Element| {
         e.transparency == 0
             && places(e).is_some()
             && i64::from(e.dx) <= x0
             && i64::from(e.dy) <= y0
             && i64::from(e.dx) + i64::from(e.dw) >= x1
             && i64::from(e.dy) + i64::from(e.dh) >= y1
-    });
-    if pass == 0 && base.is_none() {
-        raster.fill(fb, band, def.fill());
+    };
+    if passes.is_black(pass) {
+        if !els.iter().any(covers) {
+            raster.fill(fb, band, def.fill());
+        }
+        return product;
     }
+    // The topmost element of the group that covers the band whole.
+    let base = els
+        .iter()
+        .enumerate()
+        .rposition(|(k, e)| passes.group_of(k) == Some(pass) && covers(e))
+        .unwrap_or(0);
     // The area an element covers of the band: None when nothing, or when the
     // element is under the base or has no window to draw from.
     let area_of = |k: usize, e: &Element| -> Option<(Rect, (i64, i64))> {
-        if k < base.unwrap_or(0) || places(e).is_none() {
+        if k < base || places(e).is_none() {
             return None;
         }
         let (ex0, ey0) = (i64::from(e.dx), i64::from(e.dy));
@@ -2713,42 +3036,8 @@ fn compose_elements(
         };
         Some((area, (ax0 - ex0, ay0 - ey0)))
     };
-    let pointer_on_band = || {
-        scene.drawn_pointer().is_some_and(|p| {
-            let c = Scene::cursor_rect(p);
-            let (cx0, cx1) = (x0.max(i64::from(c.x)), x1.min(i64::from(c.x + c.w)));
-            let (cy0, cy1) = (y0.max(i64::from(c.y)), y1.min(i64::from(c.y + c.h)));
-            cx0 < cx1 && cy0 < cy1
-        })
-    };
-    // The elements that have something to draw on this band, a bit each: the
-    // area of each is worked out once for the groups to be asked.
-    let mut drawable = 0u16;
     for (k, e) in els.iter().enumerate() {
-        if area_of(k, e).is_some() {
-            drawable |= 1 << k;
-        }
-    }
-    let pointer = pointer_on_band();
-    // Whether group `g` has something to draw on this band.
-    let has_work = |g: usize| {
-        passes.members[g] & drawable != 0 || (passes.pointer_group() == Some(g) && pointer)
-    };
-    let groups = passes.groups.max(1);
-    // This step's group: the first from `pass` that has something.
-    // The black of a band no element covers whole is made in the first step of
-    // its place, the group 0 (where it is priced), whether the group has an
-    // element or not: a first element too dear to share a step with it is a group
-    // of its own after it.
-    let black_now = pass == 0 && base.is_none();
-    let Some(this) = black_now
-        .then_some(0)
-        .or_else(|| (pass..groups).find(|&g| has_work(g)))
-    else {
-        return (pass, None);
-    };
-    for (k, e) in els.iter().enumerate() {
-        if passes.group_of(k) != Some(this) {
+        if passes.group_of(k) != Some(pass) {
             continue;
         }
         let Some((area, (dx, dy))) = area_of(k, e) else {
@@ -2820,6 +3109,28 @@ fn compose_elements(
         } else {
             None
         };
+        // A group of one element with a mask and an alpha that is stretched, turned or
+        // reflected is two steps: the product of the mask and the alpha, then the
+        // element drawn through it.
+        let two = passes.is_two_step(pass);
+        if two {
+            let Some((m, at)) = &mask else {
+                continue;
+            };
+            let owner = (k as u32, area);
+            if !phase {
+                let made = raster.product(owner, m, *at, e.alpha as u8, (area.w, area.h));
+                product = if made { Product::Made } else { Product::Failed };
+                continue;
+            }
+            // The work band holds the product of this element for this area, or
+            // the second step is not drawn: the plan of the step was made again
+            // and may name another element than the first step's.
+            if raster.product_made() != Some(owner) {
+                product = Product::Stale;
+                continue;
+            }
+        }
         raster.element(
             fb,
             &Draw {
@@ -2833,12 +3144,28 @@ fn compose_elements(
                 filter: e.filter,
                 transparency: e.transparency,
                 alpha: e.alpha as u8,
-                mask,
+                mask: if two { None } else { mask },
+                work: two,
                 area,
             },
         );
     }
-    (this, (this + 1..groups).find(|&g| has_work(g)))
+    product
+}
+
+/// What the step of a group of two steps did about the product of the mask and the
+/// alpha (`compose_elements`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Product {
+    /// The step had no element of such a group to draw on the band.
+    None,
+    /// The first step made the product.
+    Made,
+    /// The first step could not make it: the band is not drawn.
+    Failed,
+    /// The second step found the work band holding another product (the plan was
+    /// made again between the steps): the band goes back to the first step.
+    Stale,
 }
 
 /// `compose` for a band of `size` (columns and lines) that the caller names:
@@ -2870,16 +3197,33 @@ fn compose_with(
     raster: &mut impl Raster,
 ) -> Band {
     let (width, rows) = size;
-    let y0 = at.row.max(damage.y);
-    let y1 = (y0 + rows).min(damage.y + damage.h);
-    let x0 = damage.x + at.col;
-    let x1 = (x0 + width).min(damage.x + damage.w);
+    let (group, phase) = ((at.pass & !PHASE) as usize, at.pass & PHASE != 0);
+    let done = Band {
+        row: damage.y + damage.h,
+        col: 0,
+        pass: 0,
+    };
+    // The rectangle this band walks: the group's under a scene, the damage
+    // otherwise.
+    let groups = match (scene.working(), passes) {
+        (Some(def), Some(plan)) => Some((def, plan)),
+        _ => None,
+    };
+    let walk = match groups {
+        Some((_, plan)) => {
+            if group >= plan.groups {
+                return done;
+            }
+            plan.cost[group].rect
+        }
+        None => damage,
+    };
+    let y0 = at.row.max(walk.y);
+    let y1 = (y0 + rows).min(walk.y + walk.h);
+    let x0 = (damage.x + at.col).max(walk.x);
+    let x1 = (x0 + width).min(walk.x + walk.w);
     if y0 >= y1 || x0 >= x1 {
-        return Band {
-            row: damage.y + damage.h,
-            col: 0,
-            pass: 0,
-        };
+        return done;
     }
     let band = Rect {
         x: x0,
@@ -2887,17 +3231,12 @@ fn compose_with(
         w: x1 - x0,
         h: y1 - y0,
     };
-    // The group this step draws, and the next on this place when there is one.
-    let mut more = None;
     let mut pointer_now = true;
-    if let (Some(def), Some(passes)) = (scene.working(), passes) {
-        let (this, next) =
-            compose_elements(scene, def, passes, at.pass as usize, band, fb, src, raster);
-        more = next;
-        // The pointer's picture is the last layer: with the group it is in, or in
-        // the last step of a place when it is in a group that has nothing else
-        // to say (no step: it is in the group it was placed in, which is drawn).
-        pointer_now = passes.pointer_group() == Some(this) || passes.pointer_group().is_none();
+    let mut product = Product::None;
+    if let Some((def, passes)) = groups {
+        product = compose_elements(scene, def, passes, group, phase, band, fb, src, raster);
+        // The pointer's picture is the last group, drawn in the steps of it.
+        pointer_now = passes.pointer_group() == Some(group);
     } else {
         let (order, n) = scene.order();
         let window = |k: u8| scene.window(k as usize).copied();
@@ -2967,25 +3306,49 @@ fn compose_with(
             );
         }
     }
-    if let Some(pass) = more {
-        // The same place, the next group.
-        Band {
-            row: y0,
-            col: x0 - damage.x,
-            pass: pass as u32,
+    // The first step of an element of two steps is followed by its second, on the
+    // same band, when it made the product; the second that finds another product
+    // goes back to the first.
+    if let Some((_, plan)) = groups
+        && plan.is_two_step(group)
+    {
+        let again = match (phase, product) {
+            (false, Product::Made) => Some(at.pass | PHASE),
+            (true, Product::Stale) => Some(group as u32),
+            _ => None,
+        };
+        if let Some(pass) = again {
+            return Band {
+                row: y0,
+                col: x0 - damage.x,
+                pass,
+            };
         }
-    } else if x1 < damage.x + damage.w {
+    }
+    if x1 < walk.x + walk.w {
         Band {
             row: y0,
             col: x1 - damage.x,
-            pass: 0,
+            pass: group as u32,
         }
-    } else {
+    } else if y1 < walk.y + walk.h {
         Band {
             row: y1,
-            col: 0,
-            pass: 0,
+            col: walk.x - damage.x,
+            pass: group as u32,
         }
+    } else if let Some((_, plan)) = groups
+        && group + 1 < plan.groups
+    {
+        // The next group, from the corner of its rectangle.
+        let next = plan.cost[group + 1].rect;
+        Band {
+            row: next.y,
+            col: next.x - damage.x,
+            pass: group as u32 + 1,
+        }
+    } else {
+        done
     }
 }
 
@@ -4364,6 +4727,30 @@ mod tests {
             );
         }
         assert_eq!(LOOKUP_MISS, with_margin(LOOKUP_MISS_MEASURED));
+        // Every row's miss covers its kind's measure with the margin, and the
+        // general miss covers every general kind's; a kind with no measure keeps
+        // the general one.
+        for p in PRICES {
+            let measured = measures::LOOKUPS.iter().any(|(k, _)| *k == p.kind);
+            assert!(p.miss >= LOOKUP_MISS || measured, "{}", p.kind);
+        }
+        for (kind, greatest) in measures::LOOKUPS {
+            let p = PRICES
+                .iter()
+                .find(|p| p.kind == kind)
+                .expect("a priced kind");
+            assert_eq!(p.miss_measured, greatest, "{kind}");
+            assert!(p.miss >= with_margin(greatest), "{kind}");
+        }
+        // The product of a mask and an alpha has its own key: its measure is in.
+        assert!(measures::LOOKUPS.iter().any(|(k, _)| *k == "mask-alpha"));
+        for p in PRICES.iter().filter(|p| p.kind.starts_with("fast-")) {
+            assert!(
+                measures::LOOKUPS.iter().any(|(k, _)| *k == p.kind),
+                "{}",
+                p.kind
+            );
+        }
         // The margin of nothing would leave a measure above the constant.
         assert!(with_margin(190) > 190);
     }

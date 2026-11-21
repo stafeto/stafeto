@@ -159,12 +159,39 @@ const PROBE_S: Record = Record {
     ..PROBE
 };
 
+/// The compositor of the images of the probes that calibrate the prices of its bands
+/// before its first request (the feature `calibrate`: about 1.3 s of the CPU at its
+/// level): the same record with a deadline of 4 s, which the watchdog allows for the
+/// silence of its heartbeats (the first, after the calibration, and every one after
+/// it); the period stays.
+pub const PROBE_COMPOSITOR: Record = Record {
+    kind: Kind::Service(Watch {
+        period_ns: 250 * MS,
+        deadline_ns: 4000 * MS,
+    }),
+    ..COMPOSITOR
+};
+
 /// The probe's image on QEMU.
-pub const TABLE: &[Record] = &[DISPLAY, COMPOSITOR, PROBE, PROBE_B, PROBE_C, PROBE_S];
+pub const TABLE: &[Record] = &[DISPLAY, PROBE_COMPOSITOR, PROBE, PROBE_B, PROBE_C, PROBE_S];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The calibrating compositor of the probes differs in its deadline alone, and a
+    /// deadline holds at least three periods.
+    #[test]
+    fn the_calibrating_compositor_differs_in_its_deadline_alone() {
+        let (Kind::Service(a), Kind::Service(b)) = (PROBE_COMPOSITOR.kind, COMPOSITOR.kind) else {
+            panic!("services");
+        };
+        assert_eq!(a.period_ns, b.period_ns);
+        assert!(a.deadline_ns > b.deadline_ns);
+        assert!(a.deadline_ns / 3 >= a.period_ns);
+        assert_eq!(PROBE_COMPOSITOR.quota, COMPOSITOR.quota);
+        assert_eq!(PROBE_COMPOSITOR.connects, COMPOSITOR.connects);
+    }
 
     /// The free run is two zero words as the service reads them; the record
     /// is the compositor of the keys image with only those arguments changed.

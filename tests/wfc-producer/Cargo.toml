@@ -1,0 +1,18 @@
+[package]
+name = "wfc-producer"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The producer of the probe of OpenWF Composition: a C program that makes a window of the composition service and draws one of two fixed patterns in it, the source a scene of apps/wfc-demo shows"
+build = "build.rs"
+
+[[bin]]
+name = "wfc-producer"
+test = false
+bench = false
+
+[dependencies]
+posix-abi = { path = "../../lib/posix-abi" }
+posix-crt = { path = "../../lib/posix-crt", features = ["window"] }

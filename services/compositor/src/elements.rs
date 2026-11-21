@@ -230,7 +230,7 @@ pub enum Class {
     /// A plain laying over, by the window's own alpha.
     Over = 2,
     /// A stretch, turn or reflection with the nearest point: a copy, or a laying
-    /// over.
+    /// over (pixman's general path).
     ScaleNearestCopy = 3,
     ScaleNearestOver = 4,
     /// The same with the bilinear mean.
@@ -243,6 +243,31 @@ pub enum Class {
     Alpha = 8,
     Mask = 9,
     MaskAlpha = 10,
+    /// A scale by a fraction (no turn, no reflection: the matrix is diagonal with
+    /// a positive step on both axes, `is_scale`): the paths of pixman for a scaled
+    /// source. A copy, or a laying over, of the nearest point or of the bilinear
+    /// mean.
+    FastNearestCopy = 11,
+    FastNearestOver = 12,
+    FastBilinearCopy = 13,
+    FastBilinearOver = 14,
+    /// The same with a global alpha, with an A8 mask, with both (one operation
+    /// each, a laying over) from a source whose own alpha is used (an ARGB window
+    /// and the transparency bit of the source): pixman has the paths for a source
+    /// with an alpha, and the ones after them are the same from a source with none.
+    FastNearestAlpha = 15,
+    FastBilinearAlpha = 16,
+    FastNearestMask = 17,
+    FastBilinearMask = 18,
+    /// Only the bilinear mean with a mask and an alpha: the others cost a call so
+    /// dear (the product of the mask and the alpha is made in a call of its own)
+    /// that with the miss of the lookup a layer would not fit a step, and they are
+    /// priced as the general class (the stretch, and the mixing on top of it).
+    FastBilinearMaskAlpha = 19,
+    FastNearestAlphaOpaque = 20,
+    FastBilinearAlphaOpaque = 21,
+    FastNearestMaskOpaque = 22,
+    FastBilinearMaskOpaque = 23,
 }
 
 impl Class {
@@ -252,54 +277,115 @@ impl Class {
     }
 }
 
-/// What a band charges for an element: the operation of its geometry, and,
-/// for an alpha or a mask, the operation of that besides it. A plain element
-/// with an alpha or a mask is the one operation (its calibration is made with
-/// no transform); one that is stretched, turned or reflected pays for the
-/// stretch as a laying over, and for the alpha or the mask on top of it (the
-/// sum errs high: both prices have the call, the row and the combine).
-pub fn classes(e: &Element) -> (Class, Option<Class>) {
-    let plain = is_plain(e);
-    let bilinear = e.filter == BILINEAR;
-    let t = e.transparency;
-    let extra = match (
-        t & TRANSPARENCY_MASK != 0,
-        t & proto_comp::TRANSPARENCY_ALPHA != 0,
-    ) {
-        (true, true) => Some(Class::MaskAlpha),
-        (true, false) => Some(Class::Mask),
-        (false, true) => Some(Class::Alpha),
+/// Whether a matrix of `matrix` (the map of an element's target to its source)
+/// is a scale: no turn and no reflection, so that pixman's paths for a scaled
+/// source apply (its flags `SCALE_TRANSFORM`, a positive step along x and no
+/// shear), the steps positive on both axes.
+pub const fn is_scale(m: &[i32; 6]) -> bool {
+    m[1] == 0 && m[3] == 0 && m[0] > 0 && m[4] > 0
+}
+
+/// What an operation is, as far as its price goes (`class_of`).
+#[derive(Clone, Copy, Debug)]
+pub struct Shape4 {
+    /// None for no transform; with one, whether it is a scale (`is_scale`).
+    pub scale: Option<bool>,
+    /// A quarter turn with no stretch and no reflection (the raster is not told).
+    pub quarter: bool,
+    pub bilinear: bool,
+    /// The source's alpha is asked for (the transparency bit of the source).
+    pub over: bool,
+    /// The source is a window with an alpha channel (ARGB).
+    pub argb: bool,
+    pub mask: bool,
+    pub alpha: bool,
+}
+
+/// The class of an operation: what the raster is told of it (and the format of
+/// the window it reads). A mixed one is the one operation when it has no transform
+/// or is a scale; otherwise it pays for the stretch as a laying over and for the
+/// mixing on top of it (the sum errs high: both prices have the call, the row and
+/// the combine).
+pub fn class_of(o: Shape4) -> (Class, Option<Class>) {
+    use Class::*;
+    let extra = match (o.mask, o.alpha) {
+        (true, true) => Some(MaskAlpha),
+        (true, false) => Some(Mask),
+        (false, true) => Some(Alpha),
         (false, false) => None,
     };
-    if let Some(extra) = extra {
-        if plain {
-            return (extra, None);
+    let Some(scale) = o.scale else {
+        return match extra {
+            Some(extra) => (extra, None),
+            None => (if o.over { Over } else { Copy }, None),
+        };
+    };
+    if scale {
+        // A mixed one is a laying over: from a source with its alpha used, or from
+        // one that is opaque (an XRGB window, or the bit not set).
+        let opaque = !(o.over && o.argb);
+        // With no mix, a laying over of an opaque source is reduced by pixman to a
+        // copy, and its path and its key are the copy's.
+        let over = o.over && o.argb;
+        let fast = match (o.bilinear, extra, over, opaque) {
+            (false, None, false, _) => Some(FastNearestCopy),
+            (false, None, true, _) => Some(FastNearestOver),
+            (true, None, false, _) => Some(FastBilinearCopy),
+            (true, None, true, _) => Some(FastBilinearOver),
+            (false, Some(Alpha), _, false) => Some(FastNearestAlpha),
+            (true, Some(Alpha), _, false) => Some(FastBilinearAlpha),
+            (false, Some(Mask), _, false) => Some(FastNearestMask),
+            (true, Some(Mask), _, false) => Some(FastBilinearMask),
+            (true, Some(MaskAlpha), _, false) => Some(FastBilinearMaskAlpha),
+            (false, Some(Alpha), _, true) => Some(FastNearestAlphaOpaque),
+            (true, Some(Alpha), _, true) => Some(FastBilinearAlphaOpaque),
+            (false, Some(Mask), _, true) => Some(FastNearestMaskOpaque),
+            (true, Some(Mask), _, true) => Some(FastBilinearMaskOpaque),
+            _ => None,
+        };
+        if let Some(class) = fast {
+            return (class, None);
         }
-        let first = if bilinear {
-            Class::ScaleBilinearOver
+    }
+    if let Some(extra) = extra {
+        let first = if o.bilinear {
+            ScaleBilinearOver
         } else {
-            Class::ScaleNearestOver
+            ScaleNearestOver
         };
         return (first, Some(extra));
     }
-    let over = t & TRANSPARENCY_SOURCE != 0;
-    if plain {
-        return (if over { Class::Over } else { Class::Copy }, None);
-    }
+    let class = match (o.bilinear, o.over) {
+        (false, false) if o.quarter => Rotate90,
+        (false, false) => ScaleNearestCopy,
+        (false, true) => ScaleNearestOver,
+        (true, false) => ScaleBilinearCopy,
+        (true, true) => ScaleBilinearOver,
+    };
+    (class, None)
+}
+
+/// What a band charges for an element that reads a window with an alpha channel
+/// when `argb` (`class_of`): the operation of its geometry, and, for an alpha or
+/// a mask on a stretch that is no scale, the operation of that besides it.
+pub fn classes(e: &Element, argb: bool) -> (Class, Option<Class>) {
+    let t = e.transparency;
+    let plain = is_plain(e);
     let quarter = e.orient & ROTATION & 1 != 0
         && e.orient & MIRROR == 0
         && i64::from(e.sw) == i64::from(e.dh) << 16
         && i64::from(e.sh) == i64::from(e.dw) << 16
         && e.sx & 0xFFFF == 0
         && e.sy & 0xFFFF == 0;
-    let class = match (bilinear, over) {
-        (false, false) if quarter => Class::Rotate90,
-        (false, false) => Class::ScaleNearestCopy,
-        (false, true) => Class::ScaleNearestOver,
-        (true, false) => Class::ScaleBilinearCopy,
-        (true, true) => Class::ScaleBilinearOver,
-    };
-    (class, None)
+    class_of(Shape4 {
+        scale: (!plain).then(|| is_scale(&matrix(e))),
+        quarter,
+        bilinear: e.filter == BILINEAR,
+        over: t & TRANSPARENCY_SOURCE != 0,
+        argb,
+        mask: t & TRANSPARENCY_MASK != 0,
+        alpha: t & proto_comp::TRANSPARENCY_ALPHA != 0,
+    })
 }
 
 /// The window of an element the service shows nothing of as it is: no

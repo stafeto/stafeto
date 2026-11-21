@@ -35,6 +35,9 @@ window = ["posix-abi/window", "dep:comp-client"]
 # The C functions of OpenWF Display (`<WF/wfd.h>`, wfd_c.rs) in a statically
 # linked program. libc.so is built without it.
 wfd = ["posix-abi/wfd", "dep:wfd"]
+# The C functions of OpenWF Composition (`<WF/wfc.h>`, wfc_c.rs) in a
+# statically linked program. libc.so is built without it.
+wfc = ["posix-abi/wfc", "dep:wfc"]
 
 [dependencies]
 entries = { path = "../entries" }
@@ -47,3 +50,4 @@ posix-thread = { path = "../posix-thread" }
 rt = { path = "../rt" }
 comp-client = { path = "../comp-client", optional = true }
 wfd = { path = "../wfd", optional = true }
+wfc = { path = "../wfc", optional = true }

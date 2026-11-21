@@ -2131,6 +2131,8 @@ fn move_files(c: &Handle<Channel>) -> bool {
     crate::window::release_for_exec();
     #[cfg(feature = "wfd")]
     crate::wfd::release_for_exec();
+    #[cfg(feature = "wfc")]
+    crate::wfc::release_for_exec();
     // The operations of the stopped threads that wait in the session with the
     // network service go: the new image gets the session itself, with the
     // descriptions of the descriptors that stay.
