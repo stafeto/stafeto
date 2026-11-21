@@ -257,6 +257,13 @@ pub enum Kind {
     /// `mprotect` and `MAP_FIXED`, and taken out by `unmap_kind` when the
     /// window closes, at `exec` and at the end of the process.
     Window,
+    /// A source of the display driver that the process holds for the
+    /// OpenWF Display library (`posix_abi::wfd`): the pool buffer or the
+    /// cursor picture, one piece each, writable, never shared with a child
+    /// (a forked child has no device), refused by `munmap`, `mprotect` and
+    /// `MAP_FIXED`, and taken out by `unmap_kind` when the device is
+    /// destroyed, at `exec` and at the end of the process.
+    Source,
     /// The bitmap of a room that grew (`space::Space::extend`): `munmap`,
     /// `mprotect` and `MAP_FIXED` refuse it as they refuse the others, and
     /// `fork` copies it, since the child's copy of the room's states
@@ -1208,6 +1215,42 @@ mod tests {
         assert_eq!(handles, [20, 21, 22]);
         assert!(map.unmap_kind(Kind::Window).is_none());
         assert!(!map.meets_special(0x5000_0000, 100));
+        assert_eq!(map.display_piece(), Some((0x2000_0000, 250)));
+    }
+
+    /// The sources of the display driver (the pool and the cursor picture)
+    /// follow the rule of the window buffers: a forked child gets none,
+    /// `munmap` and `mprotect` refuse them, and `unmap_kind` takes them out
+    /// one at a time.
+    #[test]
+    fn the_driver_sources_are_not_copied_and_refuse_munmap() {
+        let mut map = with_screen();
+        for (n, (at, pages)) in [(0x5000_0000usize, 250usize), (0x5100_0000, 4)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut object = Object::new(30 + n as u32, false, None);
+            object.kind = Kind::Source;
+            map.push(at, pages, Access::ReadWrite, 0, object).unwrap();
+        }
+        let child: Vec<usize> = map.inherited().map(|p| p.address).collect();
+        assert_eq!(child, [0x1000_0000, 0x3000_0000]);
+        assert_eq!(map.kind_pieces(Kind::Source).count(), 2);
+        let piece = map.find(0x5000_0000).unwrap();
+        assert!(map.meets_special(0x5000_0000, 1));
+        assert_eq!(map.unmap(piece, 0x5000_0000, 250), Err(Refused::Special));
+        assert_eq!(
+            map.protect(piece, 0x5000_0000, 250, Access::Read),
+            Err(Refused::Special)
+        );
+        let mut handles = Vec::new();
+        while let Some((_, _, object)) = map.unmap_kind(Kind::Source) {
+            assert_eq!(object.kind, Kind::Source);
+            handles.push(object.handle);
+        }
+        handles.sort();
+        assert_eq!(handles, [30, 31]);
+        assert!(!map.meets_special(0x5000_0000, 250));
         assert_eq!(map.display_piece(), Some((0x2000_0000, 250)));
     }
 
