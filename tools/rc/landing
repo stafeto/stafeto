@@ -100,7 +100,7 @@ td { padding: 0.15rem 1rem 0.15rem 0; vertical-align: top; }
 <ul>
 <li>Open this page on the three ports: <code>http://@ADDRESS@/</code>, <code>https://@ADDRESS@/</code> and <code>http://@ADDRESS@:8080/</code>.</li>
 <li>From your machine: <code>curl -k https://@ADDRESS@/</code></li>
-<li>The package manager: <code>pkg update</code>, then <code>pkg search nginx</code>, <code>pkg install htop</code> and <code>htop</code>, run as root in a shell that holds the package session (the console). Over SSH, <code>doas pkg</code> has no package service in this release.</li>
+<li>The package manager: <code>pkg update</code>, then <code>pkg search nginx</code>, <code>pkg install htop</code> and <code>htop</code>, run as root from the console or the boot script only: over SSH, <code>doas pkg</code> and <code>su</code> report "no package service" until the loader verifies the package slot (a task of the next release).</li>
 <li>Look around: <code>ps</code>, <code>top</code>, <code>cat /proc/meminfo</code>.</li>
 </ul>
 
