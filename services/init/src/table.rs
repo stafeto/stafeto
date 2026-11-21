@@ -134,7 +134,7 @@ pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject", "lvgl-inject"
 /// it, so the mark needs nothing of the process service. The sessions a process
 /// of POSIX gives its children are clones, which carry no mark (the
 /// compositor's CLONE), and `exec` moves the session as it is.
-pub const COMP_SCENES: &[&str] = &["comp-probe-s"];
+pub const COMP_SCENES: &[&str] = &["comp-probe-s", "wfc-demo"];
 
 /// The mark of the compositor's session that `client` gets by asking for
 /// `service`: the scene's, the manager's, the input's, or none.
@@ -1569,6 +1569,7 @@ pub mod ramfs;
 pub mod shutdown;
 pub mod test;
 pub mod vz;
+pub mod wfc;
 pub mod wfd;
 pub mod window;
 
@@ -1655,6 +1656,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-display") as usize
     + cfg!(feature = "table-data-posix") as usize
     + cfg!(feature = "table-posix-window") as usize
+    + cfg!(feature = "table-wfc") as usize
+    + cfg!(feature = "table-wfc-steps") as usize
     + cfg!(feature = "table-wfd") as usize
     + cfg!(feature = "table-wfd-steps") as usize
     + cfg!(feature = "table-display") as usize
@@ -1764,6 +1767,8 @@ const _: () = assert!(
     feature = "table-posix-display",
     feature = "table-data-posix",
     feature = "table-posix-window",
+    feature = "table-wfc",
+    feature = "table-wfc-steps",
     feature = "table-wfd",
     feature = "table-wfd-steps",
     feature = "table-display",
@@ -1974,6 +1979,10 @@ pub const TABLE: &[Record] = ramfs::POSIX_DISPLAY_TABLE;
 pub const TABLE: &[Record] = ramfs::DATA_POSIX_TABLE;
 #[cfg(feature = "table-posix-window")]
 pub const TABLE: &[Record] = window::TABLE;
+#[cfg(feature = "table-wfc")]
+pub const TABLE: &[Record] = wfc::TABLE;
+#[cfg(feature = "table-wfc-steps")]
+pub const TABLE: &[Record] = wfc::STEPS_TABLE;
 #[cfg(feature = "table-wfd")]
 pub const TABLE: &[Record] = wfd::TABLE;
 #[cfg(feature = "table-wfd-steps")]
@@ -4187,7 +4196,7 @@ mod tests {
         // Every holder the table names is a record of some image.
         for name in COMP_SCENES {
             assert!(
-                [comp::TABLE]
+                [comp::TABLE, wfc::TABLE]
                     .iter()
                     .any(|t| t.iter().any(|r| r.name == *name)),
                 "{name}"
@@ -4335,6 +4344,8 @@ mod tests {
             ramfs::DATA_POSIX_TABLE,
             lvgl::TABLE,
             window::TABLE,
+            wfc::TABLE,
+            wfc::STEPS_TABLE,
             wfd::TABLE,
             wfd::STEPS_TABLE,
             ramfs::DISPLAY_TABLE,
@@ -4357,6 +4368,7 @@ mod tests {
                     "posix-data",
                     "posix-window",
                     "wfd-demo",
+                    "wfc-demo",
                     "display-run",
                     "posix-pty",
                 ]

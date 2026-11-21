@@ -78,6 +78,8 @@ pub mod timers;
 pub mod tls;
 pub mod tracing;
 pub mod wait;
+#[cfg(feature = "wfc")]
+pub mod wfc;
 #[cfg(feature = "wfd")]
 pub mod wfd;
 #[cfg(feature = "window")]

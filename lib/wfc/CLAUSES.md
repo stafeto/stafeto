@@ -138,6 +138,12 @@ changes nothing (spec 2.11, 5.6, 7.4).
 | `wfcCompose` | `compose_pending` | BAD_HANDLE; active context: UNSUPPORTED (checked here, and also the service's answer is translated); else SCENE_COMPOSE with COMPOSED asked; BUSY when `wait` is false and the service says so; with `wait` see 4.3 | 8.3 | P5.3, P5.4, R-activity |
 | `wfcFence` | none | BAD_HANDLE; then ILLEGAL_ARGUMENT: spec 9 lists no UNSUPPORTED, and with no EGL there is no valid display or sync object to pass | 9 | P3.2 |
 
+The service's LIST gives a window's size and no format, so the C binding passes
+`FORMAT_UNKNOWN` as the format of a stream; creation then accepts the stream for
+a source or a mask, and the service checks the kind of the window at the commit
+(an INVALID there comes back as ILLEGAL_ARGUMENT). A flag for the format A8 in
+LIST's `flags` would let creation answer UNSUPPORTED as 6.1.1 and 6.2.1 say.
+
 ## 4. Commit and the translation of refusals
 
 ### 4.1 What `commit` does, in order
@@ -228,10 +234,12 @@ of an earlier frame therefore never counts for this one.
   taken the request by then is not usable; spec 8.3 forbids BUSY with `wait`, so
   the call stores WFC_ERROR_BAD_DEVICE (the device is not marked lost, a later
   call may succeed). Without `wait` the first BUSY is the result.
-* A transient refusal (kernel Interrupted or WouldBlock) says nothing about the
-  service: it is sent again within the same bound, never marks the device lost,
-  and stores WFC_ERROR_BUSY if the bound runs out. `wait` and `pause` are called
-  again the same way.
+* An interrupted call (kernel Interrupted: a signal's handler ran) goes on at
+  once and is not counted, as a call restarted under SA_RESTART; it never marks
+  the device lost. A would-block refusal (WouldBlock) is sent again within the
+  bound, never marks the device lost, and stores WFC_ERROR_BUSY if the bound
+  runs out. `wait` and `pause` are called again the same way. The bound is for
+  BUSY answers and would-block refusals only.
 * `compose_pending` is set when a compose was accepted and cleared when its wait
   returned. A refusal of a later `compose` other than BUSY clears it too (the
   clearing before the send may have erased the bit of an earlier frame that is
@@ -310,7 +318,7 @@ source goes to (0,1) and (0,0) stays at (0,0); the wrong formula with
     library so the C layer has one place for them.
 11. **Zero-size elements** are left out of the record (the service refuses a zero source side).
 
-## 7. Tests (169, grouped by clause)
+## 7. Tests (176, grouped by clause)
 
 Every test carries its clause in its name or its first comment.
 
