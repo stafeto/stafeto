@@ -4735,4 +4735,582 @@ mod tests {
         assert!(run(Plant::KeepOnStop, Some(3)).is_err());
         assert!(run(Plant::ShortMapping, None).is_err());
     }
+
+    // ------------------------------------------------------------ the scene
+
+    use proto_comp::{
+        ACTIVE, ASK_COMMITTED, NO_WINDOW, ROTATION, SceneCommit, TRANSPARENCY_ALPHA,
+        TRANSPARENCY_SOURCE,
+    };
+
+    /// An element showing all of window `source` (`w` by `h` points) at (`x`, `y`).
+    fn element(source: usize, x: i32, y: i32, w: i32, h: i32) -> Element {
+        Element {
+            source: source as u32,
+            mask: NO_WINDOW,
+            sx: 0,
+            sy: 0,
+            sw: w << 16,
+            sh: h << 16,
+            dx: x,
+            dy: y,
+            dw: w,
+            dh: h,
+            orient: 0,
+            filter: 0,
+            transparency: 0,
+            alpha: 255,
+        }
+    }
+
+    fn commit(flags: u32, bg: u32, els: &[Element]) -> SceneCommit {
+        SceneCommit::new(flags, bg, els).unwrap()
+    }
+
+    /// The fixed bytes of a window's buffer 0 and the others, 0 for the rest.
+    fn solid(fills: &[(usize, u8)]) -> Flat {
+        let mut all = vec![vec![0u8; (STRIDE * HEIGHT) as usize]; MAX_WINDOWS * BUFFERS];
+        for &(window, byte) in fills {
+            all[window * BUFFERS].fill(byte);
+        }
+        Flat(all)
+    }
+
+    /// A scene of two windows of 100 by 50 (places 0 and 1), both with a buffer
+    /// posted, and a third (place 2) that no element shows, posted too.
+    fn staged() -> Scene {
+        let mut s = Scene::new();
+        s.set_manager(true);
+        for (k, label) in [1u64, 2, 3].into_iter().enumerate() {
+            let i = make(&mut s, label, 1, rect(0, 0, 100, 50), 2);
+            assert_eq!(i, k);
+        }
+        s
+    }
+
+    fn post_all(s: &mut Scene) {
+        for i in 0..3 {
+            s.post(i, 0, &[]).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_commit_waits_for_the_taking_and_a_frame_reads_the_working_scene_only() {
+        let mut s = staged();
+        s.scene_commit(&commit(ACTIVE, 0xFF00_0000, &[element(0, 0, 0, 100, 50)]))
+            .unwrap();
+        // Pending: no band could read it yet.
+        assert!(s.working().is_none());
+        post_all(&mut s);
+        let d = s.begin().unwrap();
+        assert_eq!(s.working().unwrap().elements().len(), 1);
+        let src = solid(&[(0, 0x40), (1, 0x80)]);
+        let mut fb = screen();
+        // Half of the frame is made, then a commit comes: the frame goes on
+        // with the scene it began with, and the new one waits for the next taking.
+        let mut at = Band { row: d.y, col: 0 };
+        at = compose(&s, d, at, &mut fb, &src, &mut Plain);
+        s.scene_commit(&commit(
+            ACTIVE,
+            0xFF00_0000,
+            &[element(1, 200, 100, 100, 50)],
+        ))
+        .unwrap();
+        assert_eq!(s.working().unwrap().elements()[0].source, 0);
+        assert!(s.begin().is_none(), "no second frame in work");
+        while at.row < d.y + d.h {
+            at = compose(&s, d, at, &mut fb, &src, &mut Plain);
+        }
+        s.end(true);
+        assert_eq!(at_point(&fb, 10, 10), 0x40);
+        assert_eq!(
+            at_point(&fb, 210, 110),
+            0,
+            "the second scene is not in this frame"
+        );
+        // The next taking makes the second scene the working one whole. The
+        // window it shows was given back at the first taking (no element showed
+        // it): its producer posts again.
+        s.post(1, 0, &[]).unwrap();
+        let d = s.begin().unwrap();
+        assert_eq!(s.working().unwrap().elements()[0].source, 1);
+        assert!(d.w > 0);
+        draw(&s, d, &mut fb, &src);
+        s.end(true);
+        assert_eq!(at_point(&fb, 210, 110), 0x80);
+        assert_eq!(
+            at_point(&fb, 10, 10),
+            0,
+            "the first scene is gone from the frame"
+        );
+    }
+
+    fn at_point(fb: &[u8], x: u32, y: u32) -> u8 {
+        at(fb, x, y)
+    }
+
+    #[test]
+    fn a_commit_that_is_refused_changes_nothing() {
+        let mut s = staged();
+        let good = commit(ACTIVE, 0xFF00_0000, &[element(0, 0, 0, 100, 50)]);
+        s.scene_commit(&good).unwrap();
+        // A source rectangle past the window: INVALID.
+        let mut big = element(0, 0, 0, 100, 50);
+        big.sw = 101 << 16;
+        big.dw = 101;
+        assert_eq!(
+            s.scene_commit(&commit(ACTIVE, 0, &[big])),
+            Err(Refusal::Invalid)
+        );
+        // A turn: no operation draws it, UNSUPPORTED, and so for a global alpha,
+        // a mask and a scale.
+        for change in [
+            (|e: &mut Element| e.orient = 1) as fn(&mut Element),
+            |e| e.orient = proto_comp::MIRROR,
+            |e| e.transparency = TRANSPARENCY_ALPHA,
+            |e| e.transparency = proto_comp::TRANSPARENCY_MASK,
+            |e| {
+                e.dw = 50;
+                e.dh = 25;
+            },
+        ] {
+            let mut e = element(0, 0, 0, 100, 50);
+            change(&mut e);
+            assert_eq!(
+                s.scene_commit(&commit(ACTIVE, 0, &[e])),
+                Err(Refusal::Unsupported)
+            );
+        }
+        // A mask that is a window of the wrong format: INVALID.
+        let mut e = element(0, 0, 0, 100, 50);
+        e.transparency = proto_comp::TRANSPARENCY_MASK;
+        e.mask = 1;
+        assert_eq!(
+            s.scene_commit(&commit(ACTIVE, 0, &[e])),
+            Err(Refusal::Invalid)
+        );
+        // The scene the first commit left is the one taken.
+        post_all(&mut s);
+        s.begin().unwrap();
+        assert_eq!(s.working().unwrap().elements()[0].source, 0);
+        assert_eq!(s.working().unwrap().bg, 0xFF00_0000);
+    }
+
+    #[test]
+    fn a_window_no_element_shows_gets_its_buffer_back_at_the_taking() {
+        let mut s = staged();
+        s.scene_commit(&commit(ACTIVE, 0xFF00_0000, &[element(0, 0, 0, 100, 50)]))
+            .unwrap();
+        post_all(&mut s);
+        let d = s.begin().unwrap();
+        let given = s.given_back();
+        // Windows 1 and 2 posted buffer 0 and no element shows them.
+        assert_eq!(given.freed[0], None);
+        assert_eq!(given.freed[1], Some(0));
+        assert_eq!(given.freed[2], Some(0));
+        assert_eq!(s.window(1).unwrap().bufs[0], Buf::Free);
+        assert!(s.window(1).unwrap().current.is_none());
+        assert_eq!(s.window(0).unwrap().bufs[0], Buf::Taken);
+        assert_eq!(s.given_back(), GivenBack::default(), "told once");
+        draw(&s, d, &mut screen(), &solid(&[]));
+        s.end(true);
+        // A post of a window that shows nothing damages nothing, and still asks
+        // for the taking that gives the buffer back: no frame, a buffer free.
+        s.post(1, 0, &[]).unwrap();
+        assert!(s.damaged());
+        assert!(s.begin().is_none());
+        assert_eq!(s.given_back().freed[1], Some(0));
+        assert!(!s.damaged());
+        assert_eq!(s.window(1).unwrap().bufs[0], Buf::Free);
+        // The buffer can be posted again.
+        s.post(1, 0, &[]).unwrap();
+    }
+
+    #[test]
+    fn a_buffer_given_back_is_free_for_the_windows_every_other_buffer_too() {
+        let mut s = staged();
+        s.scene_commit(&commit(ACTIVE, 0xFF00_0000, &[])).unwrap();
+        s.post(2, 0, &[]).unwrap();
+        s.post(2, 1, &[]).unwrap();
+        // "The latest wins": the second POST replaced the first (free at once),
+        // and the taking gives the second back.
+        assert!(s.begin().is_some());
+        assert_eq!(s.given_back().freed[2], Some(1));
+        assert_eq!(s.window(2).unwrap().bufs, [Buf::Free; 3]);
+    }
+
+    #[test]
+    fn a_flush_of_the_first_revision_that_no_element_shows_is_answered_at_the_taking() {
+        let mut s = Scene::new();
+        let a = legacy_window(&mut s);
+        let b = make(&mut s, 2, 2, rect(0, 0, 100, 50), 1);
+        s.scene_commit(&commit(ACTIVE, 0, &[element(b, 0, 0, 100, 50)]))
+            .unwrap();
+        // The commit made a frame to take; the window's FLUSH comes after.
+        s.flush(a, SCREEN).unwrap();
+        s.post(b, 0, &[]).unwrap();
+        s.begin().unwrap();
+        let given = s.given_back();
+        assert_eq!(given.answered, 1 << a);
+        assert_eq!(given.freed[a], None);
+        assert!(!s.window(a).unwrap().in_frame, "it waits for no frame");
+        assert!(s.window(b).unwrap().in_frame);
+        // The window that is shown is not answered.
+        s.end(true);
+        s.flush(a, rect(0, 0, 10, 10)).unwrap();
+        assert!(s.damaged());
+        s.begin();
+        assert_eq!(s.given_back().answered, 1 << a);
+    }
+
+    #[test]
+    fn under_a_scene_the_direct_frame_needs_the_top_element_to_be_the_whole_pool() {
+        let mut s = direct(true);
+        let a = legacy_window(&mut s);
+        let b = make(&mut s, 2, 2, rect(0, 0, 100, 50), 1);
+        s.post(b, 0, &[]).unwrap();
+        let full = element(a, 0, 0, WIDTH as i32, HEIGHT as i32);
+        s.scene_commit(&commit(ACTIVE, 0, &[full])).unwrap();
+        settle(&mut s);
+        assert_eq!(s.plan(), Plan::Bypass(a));
+        // Anything but a copy of all of it at the screen's own place.
+        let changed = |f: fn(&mut Element)| {
+            let mut e = full;
+            f(&mut e);
+            e
+        };
+        for e in [
+            changed(|e| e.transparency = TRANSPARENCY_SOURCE),
+            changed(|e| e.dx = 1),
+            changed(|e| e.sx = 1 << 16),
+        ] {
+            let mut t = direct(true);
+            let a = legacy_window(&mut t);
+            assert_eq!(a, 0);
+            // Their commits may be refused for the scale; the plan reads what was
+            // taken, so only the ones the service accepts count.
+            if t.scene_commit(&commit(ACTIVE, 0, &[e])).is_ok() {
+                settle(&mut t);
+                assert_eq!(t.plan(), Plan::Compose, "{e:?}");
+            }
+        }
+        // An element over it that shows something: composed.
+        s.scene_commit(&commit(ACTIVE, 0, &[full, element(b, 10, 10, 100, 50)]))
+            .unwrap();
+        // (the window b was given back while no element showed it: it posts again)
+        s.post(b, 0, &[]).unwrap();
+        settle(&mut s);
+        assert_eq!(s.plan(), Plan::Compose);
+        // An element over it whose window shows nothing (none, or never taken):
+        // the one below is the top.
+        let ghost = element(7, 0, 0, 10, 10);
+        let none = Element {
+            source: NO_WINDOW,
+            ..element(0, 0, 0, 10, 10)
+        };
+        s.scene_commit(&commit(ACTIVE, 0, &[full, ghost, none]))
+            .unwrap();
+        settle(&mut s);
+        assert_eq!(s.plan(), Plan::Bypass(a));
+        // A window of the second revision that fills the screen is composed.
+        let mut t = direct(true);
+        let c = make(&mut t, 1, 1, SCREEN, 1);
+        t.post(c, 0, &[]).unwrap();
+        t.scene_commit(&commit(
+            ACTIVE,
+            0,
+            &[element(c, 0, 0, WIDTH as i32, HEIGHT as i32)],
+        ))
+        .unwrap();
+        settle(&mut t);
+        assert_eq!(t.plan(), Plan::Compose);
+    }
+
+    #[test]
+    fn a_scene_composed_on_request_makes_a_frame_only_for_the_request() {
+        let mut s = staged();
+        let els = [element(0, 0, 0, 100, 50)];
+        s.scene_commit(&commit(ASK_COMMITTED, 0xFF00_0000, &els))
+            .unwrap();
+        // COMMITTED comes at once for a scene that does not compose by itself.
+        assert_eq!(
+            s.scene_bits(),
+            SceneBits {
+                committed: true,
+                composed: false
+            }
+        );
+        s.post(0, 0, &[]).unwrap();
+        assert!(!s.damaged(), "the change waits for SCENE_COMPOSE");
+        assert!(s.begin().is_none());
+        assert_eq!(
+            s.window(0).unwrap().posted,
+            Some(0),
+            "the buffer is not taken"
+        );
+        // The request: one frame, and one is not asked for at the same time.
+        s.scene_compose(true).unwrap();
+        assert_eq!(s.scene_compose(true), Err(Refusal::Busy));
+        let d = s.begin().unwrap();
+        assert_eq!(s.window(0).unwrap().posted, None);
+        assert_eq!(
+            s.scene_compose(true),
+            Err(Refusal::Busy),
+            "the frame is in work"
+        );
+        draw(&s, d, &mut screen(), &solid(&[]));
+        assert_eq!(s.scene_bits().composed, false);
+        s.end(true);
+        assert!(s.scene_bits().composed, "COMPOSED at the end of the frame");
+        assert_eq!(s.scene_bits(), SceneBits::default());
+        // Again, with nothing changed: the answer comes at the taking, no frame.
+        s.scene_compose(true).unwrap();
+        assert!(s.begin().is_none());
+        assert!(s.scene_bits().composed);
+        // A request that did not ask for the bit tells none.
+        s.post(0, 1, &[]).unwrap();
+        s.scene_compose(false).unwrap();
+        assert!(s.begin().is_some());
+        s.end(true);
+        assert_eq!(s.scene_bits(), SceneBits::default());
+        // A scene that composes by itself refuses a request.
+        s.scene_commit(&commit(ACTIVE, 0xFF00_0000, &els)).unwrap();
+        assert_eq!(s.scene_compose(true), Err(Refusal::Unsupported));
+    }
+
+    #[test]
+    fn a_compose_with_no_scene_shows_the_background_alone() {
+        let mut s = staged();
+        s.scene_compose(true).unwrap();
+        let d = s.begin().unwrap();
+        assert_eq!(d, SCREEN);
+        let mut fb = screen();
+        draw(&s, d, &mut fb, &solid(&[]));
+        s.end(true);
+        assert_eq!(at_point(&fb, 300, 300), 0);
+        assert!(s.scene_bits().composed);
+    }
+
+    #[test]
+    fn the_committed_bit_of_an_active_scene_comes_at_the_taking_that_makes_it_working() {
+        let mut s = staged();
+        s.scene_commit(&commit(
+            ACTIVE | ASK_COMMITTED,
+            0xFF00_0000,
+            &[element(0, 0, 0, 100, 50)],
+        ))
+        .unwrap();
+        assert_eq!(s.scene_bits(), SceneBits::default());
+        s.post(0, 0, &[]).unwrap();
+        s.begin().unwrap();
+        assert!(s.scene_bits().committed);
+        s.end(true);
+        // Without the flag, none.
+        s.scene_commit(&commit(ACTIVE, 0xFF00_0000, &[element(0, 5, 5, 100, 50)]))
+            .unwrap();
+        s.begin().unwrap();
+        assert_eq!(s.scene_bits(), SceneBits::default());
+    }
+
+    #[test]
+    fn what_a_buffer_changes_on_the_screen_is_what_its_element_carries() {
+        let mut s = staged();
+        s.scene_commit(&commit(
+            ACTIVE,
+            0xFF00_0000,
+            &[element(0, 300, 200, 100, 50)],
+        ))
+        .unwrap();
+        s.post(0, 0, &[]).unwrap();
+        s.begin().unwrap();
+        s.end(true);
+        // A rectangle of the window goes to the element's place.
+        s.post(0, 1, &[rect(10, 5, 20, 10)]).unwrap();
+        assert_eq!(s.begin(), Some(rect(310, 205, 20, 10)));
+        s.end(true);
+        // A scene that moves the element damages the old place and the new.
+        s.scene_commit(&commit(
+            ACTIVE,
+            0xFF00_0000,
+            &[element(0, 320, 200, 100, 50)],
+        ))
+        .unwrap();
+        assert_eq!(s.begin(), Some(rect(300, 200, 120, 50)));
+        s.end(true);
+        // The window that went damages what it showed.
+        s.destroy(0);
+        assert_eq!(s.begin(), Some(rect(320, 200, 100, 50)));
+    }
+
+    #[test]
+    fn a_frame_of_a_scene_draws_the_elements_in_order_over_the_background() {
+        let mut s = staged();
+        // The third window is ARGB: a point of alpha 0x40 over what is below.
+        s.set_format(2, Format::Argb);
+        let els = [element(0, 10, 10, 100, 50), element(1, 60, 30, 100, 50)];
+        s.scene_commit(&commit(ACTIVE, 0xFF00_8000, &els)).unwrap();
+        post_all(&mut s);
+        let d = s.begin().unwrap();
+        let mut fb = screen();
+        draw(&s, d, &mut fb, &solid(&[(0, 0x40), (1, 0x80)]));
+        s.end(true);
+        // The background where no element is, the first below the second, the
+        // second over the first where they meet.
+        assert_eq!(
+            fb[(300 * STRIDE + 300 * 4) as usize..][..4],
+            [0x00, 0x80, 0x00, 0x00]
+        );
+        assert_eq!(at_point(&fb, 20, 20), 0x40);
+        assert_eq!(at_point(&fb, 70, 40), 0x80);
+        assert_eq!(at_point(&fb, 5, 5), 0x00, "the background's blue is 0");
+        assert_eq!(at_point(&fb, 159, 79), 0x80);
+        assert_eq!(at_point(&fb, 160, 79), 0x00);
+        // An element laid over by the window's own alpha.
+        s.set_format(1, Format::Argb);
+        let over = Element {
+            transparency: TRANSPARENCY_SOURCE,
+            ..element(1, 60, 30, 100, 50)
+        };
+        s.scene_commit(&commit(
+            ACTIVE,
+            0xFF00_8000,
+            &[element(0, 10, 10, 100, 50), over],
+        ))
+        .unwrap();
+        s.post(1, 1, &[]).unwrap();
+        // (the buffer 1 of window 1 is a fresh one for the frame)
+        let d = s.begin().unwrap();
+        assert!(d.w > 0);
+        s.end(true);
+    }
+
+    #[test]
+    fn a_band_over_an_opaque_element_that_covers_it_has_no_background_fill() {
+        let mut s = staged();
+        s.scene_commit(&commit(ACTIVE, 0xFF00_0000, &[element(0, 0, 0, 100, 50)]))
+            .unwrap();
+        s.post(0, 0, &[]).unwrap();
+        let d = s.begin().unwrap();
+        let mut fb = screen();
+        // The band is the element's own: no fill under it (the 0xEE of the
+        // screen is replaced by the copy alone, and a fill would show in the
+        // price: the tile counts one layer).
+        let (w, rows) = s.tile(d);
+        assert!(w > 0 && rows > 0);
+        draw(&s, d, &mut fb, &solid(&[(0, 0x21)]));
+        assert_eq!(at_point(&fb, 50, 25), 0x21);
+        // A frame over more than the element is priced with the fill.
+        let whole = s.tile(SCREEN);
+        assert!(whole.1 <= rows.max(BAND_ROWS));
+    }
+
+    #[test]
+    fn the_end_of_the_scene_session_returns_the_windows_to_their_policy() {
+        let mut s = staged();
+        s.scene_commit(&commit(
+            ACTIVE,
+            0xFF00_0000,
+            &[element(0, 300, 200, 100, 50)],
+        ))
+        .unwrap();
+        s.post(0, 0, &[]).unwrap();
+        s.begin().unwrap();
+        s.end(true);
+        assert!(s.scene_on());
+        s.scene_end();
+        assert!(!s.scene_on());
+        assert!(s.working().is_none());
+        // The whole screen is to be drawn again, with the windows as they are:
+        // window 0 at its own place of the screen (0, 0).
+        assert_eq!(s.begin(), Some(SCREEN));
+        let mut fb = screen();
+        draw(&s, SCREEN, &mut fb, &solid(&[(0, 0x33)]));
+        s.end(true);
+        assert_eq!(at_point(&fb, 10, 10), 0x33);
+        assert_eq!(at_point(&fb, 310, 210), 0x00);
+        // An end in the middle of a frame waits for the next taking.
+        s.scene_commit(&commit(ACTIVE, 0xFF00_0000, &[element(0, 5, 5, 100, 50)]))
+            .unwrap();
+        let d = s.begin().unwrap();
+        s.scene_end();
+        assert!(s.scene_on(), "the frame in work still reads its scene");
+        draw(&s, d, &mut screen(), &solid(&[]));
+        s.end(true);
+        assert_eq!(s.begin(), Some(SCREEN));
+        assert!(!s.scene_on());
+    }
+
+    #[test]
+    fn under_a_scene_the_pointer_and_the_keys_follow_the_scene_not_the_windows() {
+        let mut s = staged();
+        // Without a scene a move goes to the window under the pointer.
+        s.post(0, 0, &[]).unwrap();
+        s.begin().unwrap();
+        s.end(true);
+        s.pointer_to(10, 10);
+        let mut out = [Event::default(); 8];
+        assert_eq!(s.take_events(0, &mut out).0, 1);
+        // With one it goes to the scene's ring in the screen's coordinates.
+        s.scene_commit(&commit(
+            ACTIVE,
+            0xFF00_0000,
+            &[element(0, 300, 200, 100, 50)],
+        ))
+        .unwrap();
+        let _ = s.take_manager_events(&mut out);
+        let focus = s.focus();
+        s.pointer_to(310, 210);
+        s.button(0x110, true);
+        assert_eq!(s.take_events(0, &mut out).0, 0, "the window gets none");
+        let (n, _) = s.take_manager_events(&mut out);
+        assert_eq!(n, 2);
+        assert_eq!(out[0], Event::at(proto_comp::MOVE, 0, 0, 310, 210));
+        assert_eq!(out[1], Event::at(proto_comp::BUTTON, 0x110, 1, 310, 210));
+        // The click gave no window the focus.
+        assert_eq!(s.focus(), focus);
+        // A key goes to the window with the focus, as it did.
+        s.focus_on(0).unwrap();
+        s.key(30, true);
+        assert!(s.take_events(0, &mut out).0 >= 1);
+    }
+
+    #[test]
+    fn a_mask_window_is_never_shown_and_takes_a_stride_of_its_own() {
+        let mut s = Scene::new();
+        let m = s.create(1, 1, rect(0, 0, 10, 10), false, 0).unwrap();
+        s.set_format(m, Format::A8);
+        // One byte a point: 10 points is a line of 12 bytes at least, a multiple
+        // of 4.
+        assert_eq!(s.attach(m, 1, 9), Err(Refusal::Invalid));
+        assert_eq!(s.attach(m, 1, 11), Err(Refusal::Invalid));
+        assert_eq!(s.attach(m, 1, 13), Err(Refusal::Invalid));
+        assert_eq!(s.attach(m, 1, 12), Ok(()));
+        s.post(m, 0, &[]).unwrap();
+        s.begin().unwrap();
+        s.end(true);
+        assert!(s.window(m).unwrap().current.is_some());
+        assert!(!Scene::shown(s.window(m).unwrap()));
+        assert_eq!(s.top(None), None);
+        assert_eq!(s.hit(5, 5), None);
+        // And no frame puts it on the screen.
+        let mut fb = screen();
+        let d = SCREEN;
+        draw(&s, d, &mut fb, &solid(&[(m, 0x77)]));
+        assert_eq!(at_point(&fb, 5, 5), 0);
+        assert_eq!(Format::A8.line(10), 12);
+        assert_eq!(Format::Xrgb.line(10), 40);
+    }
+
+    #[test]
+    fn the_rotation_bits_name_a_turn_of_the_elements_that_the_service_refuses_for_now() {
+        let mut s = staged();
+        for turn in 1..=ROTATION {
+            let mut e = element(0, 0, 0, 100, 50);
+            e.orient = turn;
+            assert_eq!(
+                s.scene_commit(&commit(ACTIVE, 0, &[e])),
+                Err(Refusal::Unsupported)
+            );
+        }
+    }
 }
