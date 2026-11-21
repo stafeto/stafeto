@@ -9,8 +9,11 @@
 //!
 //! A surface is 32 bits to the point: XRGB8888 (the top byte unused, the
 //! point opaque) or ARGB8888 with the colour already multiplied by the
-//! alpha, the formats of the protocol of the service. On a target that is not
-//! a program of stafeto the crate is empty.
+//! alpha, the formats of the protocol of the service; or 8 bits to the point,
+//! A8, an alpha alone (a mask). `composite_element` draws a source through a
+//! transform (a stretch, a turn by quarter turns, a reflection) with the
+//! nearest point or the bilinear mean, and a mask or a global alpha. On a
+//! target that is not a program of stafeto the crate is empty.
 
 #![no_std]
 
@@ -23,20 +26,52 @@ pub enum Format {
     Xrgb8888,
     /// The colour is premultiplied by the alpha in the top byte.
     Argb8888,
+    /// An alpha alone, a byte to the point.
+    A8,
 }
+
+/// How a transformed source is sampled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    /// The point the centre of the target's point falls in.
+    Nearest,
+    /// The mean of the four points around it, weighted by the distance.
+    Bilinear,
+}
+
+/// The affine map from the target's points to the source's, in 16.16 numbers:
+/// `[a, b, c, d, e, f]` takes (x, y) to (a x + b y + c, d x + e y + f), the
+/// coordinates of a point being those of its centre.
+pub type Matrix = [i32; 6];
+
+/// The largest area a mask of `Mask::Product` is made for.
+pub const WORK_W: u32 = 640;
+pub const WORK_H: u32 = 16;
 
 #[cfg(target_os = "none")]
 mod imp {
-    use super::Format;
+    use super::{Filter, Format, Mask, Matrix, WORK_H, WORK_W};
     use crate::kept::Kept;
     use core::ffi::c_void;
 
     // pixman.h: PIXMAN_FORMAT (bpp, type, a, r, g, b) with the type ARGB 2.
     const A8R8G8B8: u32 = 0x2002_8888;
     const X8R8G8B8: u32 = 0x2002_0888;
+    // The type A with 8 bits of alpha in 8 bits to the point.
+    const A8: u32 = 0x0801_8000;
     // pixman_op_t: PIXMAN_OP_SRC and PIXMAN_OP_OVER.
     const OP_SRC: i32 = 1;
     const OP_OVER: i32 = 3;
+    // pixman_filter_t: PIXMAN_FILTER_GOOD (an image's own, which a transform
+    // the service never sets leaves alone), NEAREST and BILINEAR.
+    const FILTER_GOOD: i32 = 1;
+    const FILTER_NEAREST: i32 = 3;
+    const FILTER_BILINEAR: i32 = 4;
+    // pixman_repeat_t: PIXMAN_REPEAT_NONE and PIXMAN_REPEAT_PAD (the points
+    // outside a source are its edge's: a bilinear mean at the edge does not
+    // blend with transparent black).
+    const REPEAT_NONE: i32 = 0;
+    const REPEAT_PAD: i32 = 2;
     /// The images kept: the screen's, the pointer's picture, the pool of the
     /// window of the first revision and the buffers of the windows: three buffers
     /// of each of eight windows, 24, are all the service can hold at once, 27 in
@@ -67,6 +102,15 @@ mod imp {
             rowstride_bytes: i32,
         ) -> *mut c_void;
         fn pixman_image_unref(image: *mut c_void) -> i32;
+        fn pixman_image_set_transform(image: *mut c_void, transform: *const [[i32; 3]; 3]) -> i32;
+        fn pixman_image_set_filter(
+            image: *mut c_void,
+            filter: i32,
+            params: *const i32,
+            n_params: i32,
+        ) -> i32;
+        fn pixman_image_set_repeat(image: *mut c_void, repeat: i32);
+        fn pixman_image_create_solid_fill(color: *const [u16; 4]) -> *mut c_void;
         fn pixman_image_composite32(
             op: i32,
             src: *mut c_void,
@@ -97,6 +141,15 @@ mod imp {
         match format {
             Format::Xrgb8888 => X8R8G8B8,
             Format::Argb8888 => A8R8G8B8,
+            Format::A8 => A8,
+        }
+    }
+
+    /// The bytes of a point.
+    const fn bytes_of(format: Format) -> u32 {
+        match format {
+            Format::A8 => 1,
+            _ => 4,
         }
     }
 
@@ -189,14 +242,15 @@ mod imp {
     }
 
     /// Whether a surface of `width` by `height` points of `stride` bytes a
-    /// line lies inside `len` bytes at `at`, with points of 4 bytes on a
-    /// 4-byte boundary.
-    fn shaped(at: usize, len: usize, stride: u32, width: u32, height: u32) -> bool {
+    /// line lies inside `len` bytes at `at`, with its lines on a 4-byte
+    /// boundary (pixman reads its memory in words) and `bytes` to the point.
+    fn shaped(at: usize, len: usize, stride: u32, size: (u32, u32), bytes: u32) -> bool {
+        let (width, height) = size;
         width > 0
             && height > 0
             && at.is_multiple_of(4)
             && stride.is_multiple_of(4)
-            && u64::from(stride) >= u64::from(width) * 4
+            && u64::from(stride) >= u64::from(width) * u64::from(bytes)
             && u64::from(stride) * u64::from(height) <= len as u64
             && i32::try_from(stride).is_ok()
             && i32::try_from(width).is_ok()
@@ -232,14 +286,14 @@ mod imp {
             dbytes.as_ptr() as usize,
             dbytes.len(),
             dstride,
-            dwidth,
-            dheight,
+            (dwidth, dheight),
+            bytes_of(dformat),
         ) || !shaped(
             sbytes.as_ptr() as usize,
             sbytes.len(),
             sstride,
-            swidth,
-            sheight,
+            (swidth, sheight),
+            bytes_of(sformat),
         ) || !inside(sx, sy, size.0, size.1, swidth, sheight)
             || !inside(dx, dy, size.0, size.1, dwidth, dheight)
         {
@@ -291,6 +345,237 @@ mod imp {
         true
     }
 
+    /// The work band of `Mask::Product`: an A8 surface of WORK_H lines of
+    /// WORK_W bytes, in the program's own memory (the service has one
+    /// thread, and the band is used inside one call).
+    struct Work(core::cell::UnsafeCell<[u32; (WORK_W * WORK_H / 4) as usize]>);
+
+    // SAFETY: the band is touched only inside `element`, by the one thread
+    // of the service.
+    unsafe impl Sync for Work {}
+
+    static WORK: Work = Work(core::cell::UnsafeCell::new(
+        [0; (WORK_W * WORK_H / 4) as usize],
+    ));
+
+    /// What a transformed source is drawn with: the map from the target's
+    /// points to the source's, how it is sampled, and the mask.
+    pub struct Spec<'a> {
+        pub over: bool,
+        pub matrix: Option<Matrix>,
+        /// Where the area's first point is in the source when there is no matrix.
+        pub from: (u32, u32),
+        pub filter: Filter,
+        pub mask: Mask<'a>,
+    }
+
+    /// A mask image made for one call, dropped after it.
+    struct Made(*mut c_void);
+
+    impl Drop for Made {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: made by pixman, dropped once.
+                unsafe { pixman_image_unref(self.0) };
+            }
+        }
+    }
+
+    /// `composite`, with a source that is drawn through `spec.matrix` (the map
+    /// of the target's points to the source's: pixman applies it to the centre
+    /// of each point of the area), sampled as `spec.filter` says, and with
+    /// the mask. The points outside the source are its edge's. The area is
+    /// the `size` points at `at` of the target; the transform takes the
+    /// target's own coordinates. False, with nothing drawn, when a surface is
+    /// not what its bytes hold, the area is not inside the target, the work
+    /// band is too small for the mask, or pixman could not make an image.
+    pub fn element(
+        images: &mut Images,
+        dst: (&mut [u8], Format, u32, u32, u32),
+        src: (&[u8], Format, u32, u32, u32),
+        hint: usize,
+        spec: &Spec<'_>,
+        at: (u32, u32),
+        size: (u32, u32),
+    ) -> bool {
+        let (dbytes, dformat, dstride, dwidth, dheight) = dst;
+        let (sbytes, sformat, sstride, swidth, sheight) = src;
+        if !shaped(
+            dbytes.as_ptr() as usize,
+            dbytes.len(),
+            dstride,
+            (dwidth, dheight),
+            bytes_of(dformat),
+        ) || !shaped(
+            sbytes.as_ptr() as usize,
+            sbytes.len(),
+            sstride,
+            (swidth, sheight),
+            bytes_of(sformat),
+        ) || !inside(at.0, at.1, size.0, size.1, dwidth, dheight)
+        {
+            return false;
+        }
+        let Some(d) = images.image(
+            Key {
+                bytes: dbytes.as_mut_ptr() as usize,
+                format: dformat,
+                stride: dstride,
+                width: dwidth,
+                height: dheight,
+            },
+            DST_HINT,
+        ) else {
+            return false;
+        };
+        let Some(s) = images.image(
+            Key {
+                bytes: sbytes.as_ptr() as usize,
+                format: sformat,
+                stride: sstride,
+                width: swidth,
+                height: sheight,
+            },
+            src_hint(hint),
+        ) else {
+            return false;
+        };
+        // The mask: an image, and where its first point is.
+        let mut mask_at = (0, 0);
+        let mut owned = Made(core::ptr::null_mut());
+        let mut plane = core::ptr::null_mut();
+        match spec.mask {
+            Mask::None => {}
+            Mask::Alpha(a) => {
+                let alpha = u16::from(a) * 257;
+                let color = [0u16, 0, 0, alpha];
+                // SAFETY: the colour is read in the call.
+                owned = Made(unsafe { pixman_image_create_solid_fill(&color) });
+                if owned.0.is_null() {
+                    return false;
+                }
+            }
+            Mask::Plane { source, at } | Mask::Product { source, at, .. } => {
+                if source.format != Format::A8
+                    || !shaped(
+                        source.bytes.as_ptr() as usize,
+                        source.bytes.len(),
+                        source.stride,
+                        (source.width, source.height),
+                        1,
+                    )
+                    || !inside(at.0, at.1, size.0, size.1, source.width, source.height)
+                {
+                    return false;
+                }
+                let Some(m) = images.image(
+                    Key {
+                        bytes: source.bytes.as_ptr() as usize,
+                        format: Format::A8,
+                        stride: source.stride,
+                        width: source.width,
+                        height: source.height,
+                    },
+                    src_hint(source.hint),
+                ) else {
+                    return false;
+                };
+                plane = m;
+                mask_at = at;
+            }
+        }
+        if let Mask::Product { alpha, .. } = spec.mask {
+            if size.0 > WORK_W || size.1 > WORK_H {
+                return false;
+            }
+            // SAFETY: the band is this call's alone (see `Work`); it is
+            // WORK_W bytes a line, and the image covers `size` of it.
+            owned = Made(unsafe {
+                pixman_image_create_bits(
+                    A8,
+                    size.0 as i32,
+                    size.1 as i32,
+                    WORK.0.get().cast::<u32>(),
+                    WORK_W as i32,
+                )
+            });
+            let color = [0u16, 0, 0, u16::from(alpha) * 257];
+            // SAFETY: the colour is read in the call.
+            let solid = Made(unsafe { pixman_image_create_solid_fill(&color) });
+            if owned.0.is_null() || solid.0.is_null() {
+                return false;
+            }
+            // The alpha times the mask, in the work band: the colour is nothing
+            // (an A8 target keeps the alpha of what SRC makes).
+            // SAFETY: images made above; the rectangle is inside the band's.
+            unsafe {
+                pixman_image_composite32(
+                    OP_SRC,
+                    solid.0,
+                    plane,
+                    owned.0,
+                    0,
+                    0,
+                    mask_at.0 as i32,
+                    mask_at.1 as i32,
+                    0,
+                    0,
+                    size.0 as i32,
+                    size.1 as i32,
+                );
+            }
+            plane = owned.0;
+            mask_at = (0, 0);
+        } else if !owned.0.is_null() {
+            plane = owned.0;
+        }
+        if let Some([a, b, c, e, f, g]) = spec.matrix {
+            let matrix = [[a, b, c], [e, f, g], [0, 0, 1 << 16]];
+            // SAFETY: the image is pixman's; the matrix is copied.
+            unsafe {
+                pixman_image_set_transform(s, &matrix);
+                pixman_image_set_filter(
+                    s,
+                    match spec.filter {
+                        Filter::Nearest => FILTER_NEAREST,
+                        Filter::Bilinear => FILTER_BILINEAR,
+                    },
+                    core::ptr::null(),
+                    0,
+                );
+                pixman_image_set_repeat(s, REPEAT_PAD);
+            }
+        }
+        // The transform takes the target's own coordinates; with none, the
+        // source's first point of the area is `spec.from`.
+        let from = if spec.matrix.is_some() { at } else { spec.from };
+        // SAFETY: the images wrap memory the checks above show holds the
+        // surfaces, which outlives the call; the area is inside the target.
+        unsafe {
+            pixman_image_composite32(
+                if spec.over { OP_OVER } else { OP_SRC },
+                s,
+                plane,
+                d,
+                from.0 as i32,
+                from.1 as i32,
+                mask_at.0 as i32,
+                mask_at.1 as i32,
+                at.0 as i32,
+                at.1 as i32,
+                size.0 as i32,
+                size.1 as i32,
+            );
+            if spec.matrix.is_some() {
+                // The image is kept: the next plain drawing finds it as it was.
+                pixman_image_set_transform(s, core::ptr::null());
+                pixman_image_set_filter(s, FILTER_GOOD, core::ptr::null(), 0);
+                pixman_image_set_repeat(s, REPEAT_NONE);
+            }
+        }
+        true
+    }
+
     /// The image of a source surface is made (when the table does not keep
     /// it), so that the first operation that reads it, in a band, does not
     /// pay for it. False when the surface is not what its bytes hold or
@@ -301,8 +586,8 @@ mod imp {
             sbytes.as_ptr() as usize,
             sbytes.len(),
             sstride,
-            swidth,
-            sheight,
+            (swidth, sheight),
+            bytes_of(sformat),
         ) {
             return false;
         }
@@ -329,7 +614,7 @@ mod imp {
         (x, y, w, h): (u32, u32, u32, u32),
         value: u32,
     ) -> bool {
-        if !shaped(dst.as_ptr() as usize, dst.len(), stride, width, height)
+        if !shaped(dst.as_ptr() as usize, dst.len(), stride, (width, height), 4)
             || !inside(x, y, w, h, width, height)
         {
             return false;
@@ -352,6 +637,8 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "none")]
+use imp::Spec;
 #[cfg(target_os = "none")]
 pub use imp::{HINTS, Images, KEPT, NO_HINT};
 
@@ -378,6 +665,27 @@ pub struct Source<'a> {
     /// `NO_HINT`): the table of images remembers where it found the image of the
     /// surface, and a later lookup is one comparison.
     pub hint: usize,
+}
+
+#[cfg(target_os = "none")]
+/// What a drawing is multiplied by, besides the source's own alpha.
+#[derive(Clone, Copy)]
+pub enum Mask<'a> {
+    None,
+    /// One alpha for every point, 0 to 255.
+    Alpha(u8),
+    /// An A8 surface, whose point at `at` goes with the first point drawn.
+    Plane {
+        source: Source<'a>,
+        at: (u32, u32),
+    },
+    /// The A8 surface times an alpha, made in the work band (at most `WORK_W`
+    /// by `WORK_H` points).
+    Product {
+        source: Source<'a>,
+        at: (u32, u32),
+        alpha: u8,
+    },
 }
 
 /// The `w` by `h` points at (`sx`, `sy`) of `src` replace those at
@@ -428,5 +736,45 @@ pub fn fill(dst: &mut Target<'_>, x: u32, y: u32, w: u32, h: u32, value: u32) ->
         (dst.width, dst.height),
         (x, y, w, h),
         value,
+    )
+}
+
+/// The `w` by `h` points at (`x`, `y`) of `dst` take `src` drawn through
+/// `matrix` (the map of the target's points, by their centres, to the
+/// source's, 16.16; None for the source's points as they are, the point at
+/// `from` of the source going to (`x`, `y`)), sampled by `filter`, with
+/// `mask`: replacing what is there, or, with `over`, laid over it
+/// (premultiplied). The points of the source outside it are its edge's. A
+/// source of XRGB8888 is opaque, and an ARGB8888 one has the alpha it says.
+/// False, with nothing drawn, when a surface is not what its bytes hold, the
+/// area is not inside the target, or pixman could not make its images.
+#[cfg(target_os = "none")]
+#[allow(clippy::too_many_arguments)]
+pub fn composite_element(
+    images: &mut Images,
+    over: bool,
+    dst: &mut Target<'_>,
+    src: Source<'_>,
+    matrix: Option<Matrix>,
+    from: (u32, u32),
+    filter: Filter,
+    mask: Mask<'_>,
+    (x, y): (u32, u32),
+    (w, h): (u32, u32),
+) -> bool {
+    imp::element(
+        images,
+        (dst.bytes, dst.format, dst.stride, dst.width, dst.height),
+        (src.bytes, src.format, src.stride, src.width, src.height),
+        src.hint,
+        &Spec {
+            over,
+            matrix,
+            from,
+            filter,
+            mask,
+        },
+        (x, y),
+        (w, h),
     )
 }

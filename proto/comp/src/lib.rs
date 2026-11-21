@@ -157,6 +157,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod meaning;
+
 use proto_wire::{Header, Reader, Status, Writer};
 
 pub use proto_gpu::Rect;
