@@ -36,7 +36,7 @@ The details of each part and the known limits are in [docs/status.md](docs/statu
 
 ## Where it is going
 
-The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) and subproject 2 (POSIX and services) are done; the network and the packages arrived in 0.3.0 and AWS EC2 Graviton in 0.4.0 and scheduler time budgets in 0.5.0; 0.5.1 adds the try-out image for AWS (SSH, nginx, the package manager and a data volume for the host key), 0.5.2 brings nginx 1.30.7 with nine security fixes and a new image, and 0.6.0 gives POSIX programs the data volume as `/data`, adds a frame clock and scene drawing to the composition service and OpenWF Display over the display driver, and freezes the ABI series 0.6.
+The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) and subproject 2 (POSIX and services) are done; the network and the packages arrived in 0.3.0 and AWS EC2 Graviton in 0.4.0 and scheduler time budgets in 0.5.0; 0.5.1 adds the try-out image for AWS (SSH, nginx, the package manager and a data volume for the host key), 0.5.2 brings nginx 1.30.7 with nine security fixes and a new image, and 0.6.0 gives POSIX programs the data volume as `/data`, adds a frame clock and scene drawing to the composition service and OpenWF Display over the display driver, and freezes the ABI series 0.6; 0.6.1 repairs the data volume after a power cut in seconds.
 
 **Next, in this order**
 
