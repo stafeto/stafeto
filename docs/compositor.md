@@ -379,9 +379,10 @@ allows, and its groups are drawn one after another on it, in order, so the pictu
 one of the single step. A group with nothing to draw on the place is no step. A step of a
 scene also pays `ELEMENT_TERM` ticks (130 with the margin of 15 %) for every element that
 shows something over the damage: it makes the groups and asks each element if it has
-something on the band. A dear scene is therefore many steps (16 of the dearest elements
-over the whole screen take about 3 300 bands a frame, 70 periods at the cap of 47), and
-shows as `capped` and `late` in STATS; the cap of 47 bands a period stays.
+something on the band. A dear scene is therefore many steps (sixteen of the dearest elements, each a bilinear
+stretch with a mask and an alpha, leave a step of one point after the calls of its group
+and the terms of the sixteen elements), which shows as `capped` and `late` in STATS; the
+cap of 47 bands a period stays.
 
 The first use of a combination of operation, formats and image flags (a transform, a
 filter, a mask, the position on the source) makes pixman scan its tables to find the path:
