@@ -366,7 +366,8 @@ the model at or above each by the margin. The call of the general path of pixman
 (`scale-*`, `alpha` and `mask` with a source of XRGB8888) is 5 700 to 6 000 ticks, against
 800 for a plain copy: the path clears three scanline buffers of 8 KiB on its stack before
 every operation (the shim's `memset` of `ports/pixman` does that in a fifth of the ticks
-the compiler's own took), so a dear element is a part of a line and the dearest (a
+the compiler's own took, and its allocator keeps the small blocks pixman makes and gives back
+with every call, a transform or a solid colour, in lists of their sizes), so a dear element is a part of a line and the dearest (a
 bilinear stretch with a mask and an alpha: about 10 000 ticks of calls) fills a step
 with the calls alone.
 
@@ -384,12 +385,14 @@ stretch with a mask and an alpha, leave a step of one point after the calls of i
 and the terms of the sixteen elements), which shows as `capped` and `late` in STATS; the
 cap of 47 bands a period stays.
 
-The first use of a combination of operation, formats and image flags (a transform, a
-filter, a mask, the position on the source) makes pixman scan its tables to find the path:
-about 6 500 ticks more than the same call later, and the 8 paths pixman caches are not
-enough for the combinations a scene makes. A step that makes such a call for the first
-time is that much longer than the model says (the longest steps of `comp-probe` under
--icount are in the report of the step).
+The calibration measures a call that repeats, which finds its path in pixman's cache of
+8 resolved paths. A call whose path is not in the cache scans the tables of every
+implementation and costs 4 000 to 6 500 ticks more; a scene makes more combinations of
+operation, formats and image flags (a transform, a filter, a mask, the position on the
+source) than the cache holds, and some combinations (a turn of 180 degrees at the edge
+of the source, bilinear) miss however the calls repeat. A step with such a call is longer
+than the model says: the longest steps of `comp-probe` under -icount are 18 100 ticks
+against the gate of 16 328.
 
 The images pixman wraps around the buffers are kept in a ring of 32 (`lib/pixman`,
 `kept.rs`), the oldest going when a new one comes, and each is made when its buffer is
