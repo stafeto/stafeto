@@ -24,8 +24,9 @@ use proto_comp::{
 };
 
 /// A scene: the flags and the background of the commit, and its elements,
-/// lowest first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// lowest first. Two scenes are equal when what they say is: the places past
+/// the last element hold what an earlier scene left there.
+#[derive(Clone, Copy, Debug)]
 pub struct Def {
     pub active: bool,
     /// The background, 0xAARRGGBB with the colour premultiplied by the alpha.
@@ -33,6 +34,14 @@ pub struct Def {
     count: usize,
     items: [Element; MAX_ELEMENTS],
 }
+
+impl PartialEq for Def {
+    fn eq(&self, other: &Def) -> bool {
+        self.active == other.active && self.bg == other.bg && self.elements() == other.elements()
+    }
+}
+
+impl Eq for Def {}
 
 impl Def {
     /// The scene with no element, black, not composed by itself: what a
@@ -46,11 +55,35 @@ impl Def {
 
     pub fn from_commit(commit: &SceneCommit) -> Def {
         let mut def = Def::EMPTY;
-        def.active = commit.flags & proto_comp::ACTIVE != 0;
-        def.bg = commit.bg;
-        def.count = commit.count as usize;
-        def.items = commit.elements;
+        def.load(commit);
         def
+    }
+
+    /// The scene of `commit`, in place of what was here.
+    pub fn load(&mut self, commit: &SceneCommit) {
+        self.active = commit.flags & proto_comp::ACTIVE != 0;
+        self.bg = commit.bg;
+        self.count = commit.count as usize;
+        self.items = commit.elements;
+    }
+
+    /// The scene of SCENE_COMMIT's body (`SceneCommit::read_into`), parsed
+    /// into this place with no copy of a whole scene; the flags. What the body
+    /// does not say (a refusal) leaves the place with no meaning: it is a place
+    /// the caller has no scene in.
+    pub fn parse(&mut self, body: proto_wire::Reader<'_>) -> Result<u32, proto_wire::Status> {
+        let (flags, bg, count) = SceneCommit::read_into(body, &mut self.items)?;
+        self.active = flags & proto_comp::ACTIVE != 0;
+        self.bg = bg;
+        self.count = count;
+        Ok(flags)
+    }
+
+    /// The empty scene, in place.
+    pub fn clear(&mut self) {
+        self.active = false;
+        self.bg = Def::EMPTY.bg;
+        self.count = 0;
     }
 
     pub fn elements(&self) -> &[Element] {
@@ -674,5 +707,42 @@ mod tests {
         assert_eq!(Def::EMPTY.fill(), 0);
         let half = Def::from_commit(&SceneCommit::new(0, 0x8040_2010, &[]).unwrap());
         assert_eq!(half.fill(), 0x0040_2010);
+    }
+
+    #[test]
+    fn a_body_is_parsed_in_place_to_the_scene_of_its_commit() {
+        let c = SceneCommit::new(
+            ACTIVE | proto_comp::ASK_COMMITTED,
+            0xFF01_0203,
+            &[el(1), el(2)],
+        )
+        .unwrap();
+        let mut w = proto_wire::Writer::new();
+        c.write(&mut w).unwrap();
+        let mut r = proto_wire::Reader::new(w.as_bytes());
+        proto_wire::Header::read(&mut r).unwrap();
+        let mut place = Def::EMPTY;
+        // Something else was here: the body replaces all of it.
+        place.load(&SceneCommit::new(0, 5, &[el(3), el(4), el(5)]).unwrap());
+        let flags = place.parse(r).unwrap();
+        assert_eq!(flags, ACTIVE | proto_comp::ASK_COMMITTED);
+        assert_eq!(place, Def::from_commit(&c));
+        assert_eq!(place.elements().len(), 2);
+        // A body out of its limits is a refusal of the protocol.
+        let mut broken = el(1);
+        broken.alpha = 300;
+        let mut raw = proto_wire::Writer::new();
+        SceneCommit::new(0, 0, &[broken])
+            .unwrap()
+            .write(&mut raw)
+            .unwrap();
+        let mut r = proto_wire::Reader::new(raw.as_bytes());
+        proto_wire::Header::read(&mut r).unwrap();
+        assert_eq!(
+            place.parse(r),
+            Err(proto_wire::Status::Unknown(proto_comp::INVALID))
+        );
+        place.clear();
+        assert!(place.elements().is_empty() && !place.active);
     }
 }

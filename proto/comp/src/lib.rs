@@ -907,22 +907,34 @@ impl Element {
     }
 
     pub fn read(r: &mut Reader<'_>) -> Result<Element, Status> {
-        Ok(Element {
-            source: r.u32()?,
-            mask: r.u32()?,
-            sx: r.u32()? as i32,
-            sy: r.u32()? as i32,
-            sw: r.u32()? as i32,
-            sh: r.u32()? as i32,
-            dx: r.u32()? as i32,
-            dy: r.u32()? as i32,
-            dw: r.u32()? as i32,
-            dh: r.u32()? as i32,
-            orient: r.u32()?,
-            filter: r.u32()?,
-            transparency: r.u32()?,
-            alpha: r.u32()?,
-        })
+        Ok(Element::from_bytes(r.bytes(SCENE_ELEMENT)?))
+    }
+
+    /// The element of a record's SCENE_ELEMENT bytes (a shorter slice reads
+    /// zeros for what it lacks).
+    pub fn from_bytes(b: &[u8]) -> Element {
+        let word = |k: usize| -> u32 {
+            match b.get(4 * k..4 * k + 4) {
+                Some(w) => u32::from_le_bytes([w[0], w[1], w[2], w[3]]),
+                None => 0,
+            }
+        };
+        Element {
+            source: word(0),
+            mask: word(1),
+            sx: word(2) as i32,
+            sy: word(3) as i32,
+            sw: word(4) as i32,
+            sh: word(5) as i32,
+            dx: word(6) as i32,
+            dy: word(7) as i32,
+            dw: word(8) as i32,
+            dh: word(9) as i32,
+            orient: word(10),
+            filter: word(11),
+            transparency: word(12),
+            alpha: word(13),
+        }
     }
 
     /// Whether the numbers are in the limits of the protocol, whatever the
@@ -1011,29 +1023,43 @@ impl SceneCommit {
     /// `count` records, INVALID for a count past MAX_ELEMENTS (read before the
     /// records, so a count that is too big is INVALID whatever follows), a
     /// flag the service has not, or a record out of the limits.
-    pub fn read(mut body: Reader<'_>) -> Result<SceneCommit, Status> {
-        let flags = body.u32()?;
-        let bg = body.u32()?;
-        let count = body.u32()?;
-        if count as usize > MAX_ELEMENTS {
-            return Err(code(INVALID));
-        }
+    pub fn read(body: Reader<'_>) -> Result<SceneCommit, Status> {
         let mut commit = SceneCommit {
-            flags,
-            bg,
-            count,
+            flags: 0,
+            bg: 0,
+            count: 0,
             elements: [Element::NONE; MAX_ELEMENTS],
         };
-        for e in &mut commit.elements[..count as usize] {
+        let (flags, bg, count) = SceneCommit::read_into(body, &mut commit.elements)?;
+        commit.flags = flags;
+        commit.bg = bg;
+        commit.count = count as u32;
+        Ok(commit)
+    }
+
+    /// `read` into `elements` (room for MAX_ELEMENTS) with no copy of a whole
+    /// scene: the flags, the background and the count of the elements set. The
+    /// service parses into the place its scene is kept in.
+    pub fn read_into(
+        mut body: Reader<'_>,
+        elements: &mut [Element],
+    ) -> Result<(u32, u32, usize), Status> {
+        let flags = body.u32()?;
+        let bg = body.u32()?;
+        let count = body.u32()? as usize;
+        if count > MAX_ELEMENTS || count > elements.len() {
+            return Err(code(INVALID));
+        }
+        for e in &mut elements[..count] {
             *e = Element::read(&mut body)?;
         }
         body.finish()?;
         if flags & !(ACTIVE | ASK_COMMITTED) != 0
-            || commit.elements().iter().any(|e| !e.in_limits())
+            || elements[..count].iter().any(|e| !e.in_limits())
         {
             return Err(code(INVALID));
         }
-        Ok(commit)
+        Ok((flags, bg, count))
     }
 }
 

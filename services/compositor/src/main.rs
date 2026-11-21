@@ -60,7 +60,7 @@ use core::slice;
 use proto_comp::{
     Attach, BUFFER_MAX, COMMITTED_BIT, COMPOSED_BIT, Create, Description, EVENTS_BIT, Event,
     FOCUSED, INPUT_MARK, MANAGER_MARK, MAX_EVENTS, Method as Comp, Post, RESET, Rect, SCENE_MARK,
-    SHOWN, STATS_WINDOWS, SceneCommit, SetBody, StatsReply, WindowRecord, WindowStats, manage,
+    SHOWN, STATS_WINDOWS, SetBody, StatsReply, WindowRecord, WindowStats, manage,
     read_scene_compose, read_stats_request,
 };
 use proto_gpu::{
@@ -2370,8 +2370,10 @@ impl Compositor {
 
     /// SCENE_COMMIT: the scene of the session's windows (proto_comp).
     fn scene_commit(&mut self, r: &mut Request<'_>) -> Answer {
-        let commit = match SceneCommit::read(r.body()) {
-            Ok(commit) => commit,
+        // The scene is parsed into the place the scenes keep for it, with no
+        // copy of a whole scene (a copy is a loop of bytes on this target).
+        let flags = match self.scene.commit_slot().parse(r.body()) {
+            Ok(flags) => flags,
             Err(status) => return Answer::Status(status),
         };
         if !r.handles.is_empty() {
@@ -2380,7 +2382,10 @@ impl Compositor {
         if self.scene_label != 0 && self.scene_label != r.label() {
             return Answer::Status(proto_comp::code(proto_comp::BUSY));
         }
-        if let Err(refusal) = self.scene.scene_commit(&commit) {
+        if let Err(refusal) = self
+            .scene
+            .commit_done(flags & proto_comp::ASK_COMMITTED != 0)
+        {
             return Answer::Status(Compositor::refusal(refusal));
         }
         self.scene_label = r.label();

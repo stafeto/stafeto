@@ -647,8 +647,12 @@ pub struct Scene {
     /// committed, which a taking makes the working one whole, and the working
     /// one, which the bands of a frame read. Neither: the windows show as the
     /// policy of the windows says.
-    pending: Option<Def>,
-    working: Option<Def>,
+    /// The three places scenes are kept in: the pending scene, the working one
+    /// and the one a commit is parsed into (no scene is copied: the places
+    /// change their roles).
+    defs: [Def; 3],
+    slot_pending: Option<u8>,
+    slot_working: Option<u8>,
     stage: Stage,
 }
 
@@ -789,8 +793,9 @@ impl Scene {
             seq: 0,
             created: 0,
             frames: 0,
-            pending: None,
-            working: None,
+            defs: [Def::EMPTY; 3],
+            slot_pending: None,
+            slot_working: None,
             stage: Stage::NEW,
         }
     }
@@ -1108,14 +1113,26 @@ impl Scene {
 
     /// Whether a scene session holds a scene (committed, or taken).
     pub fn scene_on(&self) -> bool {
-        self.pending.is_some() || self.working.is_some()
+        self.slot_pending.is_some() || self.slot_working.is_some()
+    }
+
+    /// The pending scene: the last one committed that no taking has made the
+    /// working one.
+    fn pending_def(&self) -> Option<&Def> {
+        self.slot_pending.map(|k| &self.defs[usize::from(k)])
+    }
+
+    /// The place no scene is in.
+    fn free_slot(&self) -> usize {
+        (0..3u8)
+            .find(|&k| Some(k) != self.slot_pending && Some(k) != self.slot_working)
+            .map_or(0, usize::from)
     }
 
     /// Whether the scene the last commit left is composed by itself.
     fn scene_active(&self) -> bool {
-        self.pending
-            .as_ref()
-            .or(self.working.as_ref())
+        self.pending_def()
+            .or(self.working())
             .is_some_and(|d| d.active)
     }
 
@@ -1140,10 +1157,7 @@ impl Scene {
         let rects = if rects.is_empty() { &all[..] } else { rects };
         // Both scenes: the taking that makes the pending one the working one
         // may come before or after the window's buffer is taken.
-        for def in [self.working.as_ref(), self.pending.as_ref()]
-            .into_iter()
-            .flatten()
-        {
+        for def in [self.working(), self.pending_def()].into_iter().flatten() {
             for r in rects {
                 if let Some(d) = elements::window_damage(def, i as u32, *r) {
                     sum = Some(union(sum, d));
@@ -1734,8 +1748,8 @@ impl Scene {
             return None;
         }
         if core::mem::take(&mut self.stage.ending) {
-            self.pending = None;
-            self.working = None;
+            self.slot_pending = None;
+            self.slot_working = None;
             self.stage = Stage::NEW;
             self.add_damage(SCREEN);
         }
@@ -1772,10 +1786,10 @@ impl Scene {
             // A scene that is composed on request keeps what its elements show
             // until the SCENE_COMPOSE that makes the frame.
             if frozen
-                && [self.working.as_ref(), self.pending.as_ref()]
+                && [self.slot_working, self.slot_pending]
                     .into_iter()
                     .flatten()
-                    .any(|d| d.uses(i as u32))
+                    .any(|k| self.defs[usize::from(k)].uses(i as u32))
             {
                 continue;
             }
@@ -1861,7 +1875,7 @@ impl Scene {
         if !self.direct || (self.pointer.is_some() && self.cursor.is_none()) {
             return Plan::Compose;
         }
-        if let Some(def) = &self.working {
+        if let Some(def) = self.working() {
             // Under a scene the topmost element that shows something is the
             // one that counts: it is a window of the first revision, opaque, the
             // whole of it on the whole screen, with no turn, no reflection, no
@@ -1967,7 +1981,7 @@ impl Scene {
         };
         let (mut opaque, mut over) = (0u32, 0u32);
         let covered;
-        if let Some(def) = &self.working {
+        if let Some(def) = self.working() {
             // Under a scene: each element that shows something and touches the
             // damage is a copy (no transparency) or a laying over.
             let mut whole = false;
@@ -2051,7 +2065,23 @@ impl Scene {
     /// scene composed on request only keeps the damage for SCENE_COMPOSE, and
     /// its COMMITTED, if asked, is told at once.
     pub fn scene_commit(&mut self, commit: &SceneCommit) -> Result<(), Refusal> {
-        let def = Def::from_commit(commit);
+        self.commit_slot().load(commit);
+        self.commit_done(commit.flags & proto_comp::ASK_COMMITTED != 0)
+    }
+
+    /// The place SCENE_COMMIT's body is parsed into (`Def::parse`): no scene
+    /// is in it. `commit_done` makes what was parsed the pending scene.
+    pub fn commit_slot(&mut self) -> &mut Def {
+        let k = self.free_slot();
+        &mut self.defs[k]
+    }
+
+    /// The scene parsed into `commit_slot` (with the flag ASK_COMMITTED as the
+    /// body said) is checked against the windows and becomes the pending one;
+    /// what is refused leaves the scenes as they were.
+    pub fn commit_done(&mut self, ask: bool) -> Result<(), Refusal> {
+        let k = self.free_slot();
+        let def = &self.defs[k];
         let shape = |id: u32| {
             self.window(id as usize).map(|w| Shape {
                 format: w.format,
@@ -2059,24 +2089,24 @@ impl Scene {
                 h: w.rect.h,
             })
         };
-        elements::check(&def, shape).map_err(|f| match f {
+        elements::check(def, shape).map_err(|f| match f {
             Fault::Invalid => Refusal::Invalid,
             Fault::Unsupported => Refusal::Unsupported,
         })?;
-        let ask = commit.flags & proto_comp::ASK_COMMITTED != 0;
-        let damage = elements::scene_damage(self.pending.as_ref().or(self.working.as_ref()), &def);
-        if def.active {
+        let active = def.active;
+        let damage = elements::scene_damage(self.pending_def().or(self.working()), def);
+        if active {
             self.stage.ask_committed |= ask;
             match damage {
                 Some(d) => {
                     self.add_damage(d);
-                    self.pending = Some(def);
+                    self.slot_pending = Some(k as u8);
                 }
                 // The same picture: nothing is to be drawn, so the scene is the
                 // working one now (the bands read the same elements) and is told.
                 None => {
-                    self.pending = None;
-                    self.working = Some(def);
+                    self.slot_pending = None;
+                    self.slot_working = Some(k as u8);
                     if core::mem::take(&mut self.stage.ask_committed) {
                         self.stage.committed_now = true;
                     }
@@ -2086,7 +2116,7 @@ impl Scene {
             if let Some(d) = damage {
                 self.stage.held = Some(union(self.stage.held, d));
             }
-            self.pending = Some(def);
+            self.slot_pending = Some(k as u8);
             self.stage.committed_now |= ask;
         }
         Ok(())
@@ -2104,7 +2134,9 @@ impl Scene {
             return Err(Refusal::Busy);
         }
         if !self.scene_on() {
-            self.pending = Some(Def::EMPTY);
+            let k = self.free_slot();
+            self.defs[k].clear();
+            self.slot_pending = Some(k as u8);
             self.stage.held = Some(SCREEN);
         }
         self.stage.compose_due = true;
@@ -2124,8 +2156,8 @@ impl Scene {
         if self.frame {
             self.stage.ending = true;
         } else {
-            self.pending = None;
-            self.working = None;
+            self.slot_pending = None;
+            self.slot_working = None;
             self.stage = Stage::NEW;
             self.add_damage(SCREEN);
         }
@@ -2138,12 +2170,8 @@ impl Scene {
     /// the first revision has its FLUSH answered). Whether the scene is held
     /// still: composed on request, with no request for this taking.
     fn take_scene(&mut self, compose_now: bool, damaged: bool) -> bool {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|p| p.active || compose_now)
-        {
-            self.working = self.pending.take();
+        if self.pending_def().is_some_and(|p| p.active || compose_now) {
+            self.slot_working = self.slot_pending.take();
             if core::mem::take(&mut self.stage.ask_committed) {
                 self.stage.committed_now = true;
             }
@@ -2160,7 +2188,10 @@ impl Scene {
             return false;
         }
         self.stage.give_back = false;
-        let (working, pending) = (self.working.as_ref(), self.pending.as_ref());
+        let (working, pending) = (
+            self.slot_working.map(|k| &self.defs[usize::from(k)]),
+            self.slot_pending.map(|k| &self.defs[usize::from(k)]),
+        );
         for (i, w) in self.windows.iter_mut().enumerate() {
             let Some(w) = w else {
                 continue;
@@ -2178,7 +2209,7 @@ impl Scene {
                 self.stage.given[i] = Some(b);
             }
         }
-        !self.working.as_ref().is_some_and(|d| d.active) && !compose_now
+        !self.working().is_some_and(|d| d.active) && !compose_now
     }
 
     /// What the last taking gave back of the windows no element shows.
@@ -2199,7 +2230,7 @@ impl Scene {
 
     /// The working scene, which the bands of a frame read.
     pub fn working(&self) -> Option<&Def> {
-        self.working.as_ref()
+        self.slot_working.map(|k| &self.defs[usize::from(k)])
     }
 
     /// The place on the screen where element `e` of the working scene puts
