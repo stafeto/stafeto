@@ -68,6 +68,10 @@ pub enum Group {
 /// their pinned source are all they have.
 pub const SERVICE_LIBRARIES: &[&str] = &["pixman"];
 
+/// The packages that only build a program the image holds as a file of the system (a set-user-ID
+/// file, which a package file may not be): they have a program and no file of their own.
+pub const SYSTEM_PROGRAMS: &[&str] = &["busybox-suid", "doas"];
+
 /// A package: the content of its description.
 #[derive(Clone, Debug)]
 pub struct Package {
@@ -1252,7 +1256,7 @@ files = [
     #[test]
     fn the_descriptions_of_the_workspace_are_good() {
         let packages = load().unwrap();
-        assert_eq!(packages.len(), 27);
+        assert_eq!(packages.len(), 29);
         let get = |n: &str| packages.iter().find(|p| p.name == n).unwrap();
         // FreeType: the library of the text of stage G4, no file of its own.
         let freetype = get("freetype");

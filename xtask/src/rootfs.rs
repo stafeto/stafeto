@@ -292,7 +292,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 80] = [
+const SYSTEM_PATHS: [&str; 81] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -301,6 +301,7 @@ const SYSTEM_PATHS: [&str; 80] = [
     "/bin/su",
     "/bin/passwd",
     "/bin/doas",
+    "/home",
     "/dev",
     "/proc",
     "/data",
@@ -657,6 +658,8 @@ fn shell_files(image: &str) -> Result<Vec<RootFile>, String> {
         file("/bin/su", 0o4755, ROOT, "busybox-suid"),
         file("/bin/passwd", 0o4755, ROOT, "busybox-suid"),
         file("/bin/doas", 0o4755, ROOT, "doas"),
+        // The homes of the ordinary accounts: `adduser -h /home/<name>` makes one here (in memory).
+        dir("/home"),
         dir("/dev"),
         dir("/proc"),
         // The directory of the CPUs, which htop and `nproc --all` count: a
@@ -3341,6 +3344,7 @@ mod tests {
         for p in packages.iter().filter(|p| p.files.is_empty()) {
             assert!(
                 crate::packages::SERVICE_LIBRARIES.contains(&p.name.as_str())
+                    || crate::packages::SYSTEM_PROGRAMS.contains(&p.name.as_str())
                     || packages.iter().any(|q| q.build_depends.contains(&p.name)),
                 "{} installs nothing and no package links it in",
                 p.name
@@ -3363,7 +3367,7 @@ mod tests {
         let row = |name: &str| {
             table
                 .lines()
-                .find(|l| l.starts_with(name))
+                .find(|l| l.split_whitespace().next() == Some(name))
                 .unwrap_or_else(|| panic!("no row {name}: {table}"))
                 .split_whitespace()
                 .map(str::to_owned)
@@ -3557,7 +3561,7 @@ mod tests {
         // the directories above them (it refuses a file without its
         // parent).
         let wanted = sources(&files);
-        assert_eq!(wanted.len(), 16);
+        assert_eq!(wanted.len(), 17);
         let bytes = table(&files, 3, 3 + wanted.len() as u32 + 1).unwrap();
         let read = Rootfs::parse(&bytes, 3 + wanted.len() as u32 + 1).unwrap();
         for path in [

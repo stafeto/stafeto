@@ -159,6 +159,53 @@ fn suid_busybox(run: &mut qemu::Run) -> Result<(), String> {
     )
 }
 
+/// The account files of the image are immutable; a copy renamed over each is an ordinary file.
+fn writable(run: &mut qemu::Run) -> Result<(), String> {
+    check(
+        run,
+        "image files are immutable",
+        "( : >> /etc/passwd ) 2>&1; echo rc=$?",
+        &["Read-only file system", "rc=1"],
+        &[],
+    )?;
+    check(
+        run,
+        "rename over an image file",
+        "cd /etc; for f in passwd group shadow; do cp -p $f $f.n && mv -f $f.n $f || echo FAILED $f; done; ( : >> passwd ) 2>&1; echo rc=$?; ls -ln passwd group shadow; cd /",
+        &["rc=0"],
+        &["FAILED", "Read-only"],
+    )
+}
+
+/// Step 4: the account tools.
+fn tools(run: &mut qemu::Run) -> Result<(), String> {
+    check(
+        run,
+        "adduser",
+        "adduser -D -h /home/bob -s /bin/ash bob 2>&1; addgroup -S staff 2>&1; grep '^bob:' /etc/passwd; grep '^bob:' /etc/shadow | cut -c1-12; ls -ld /home/bob",
+        &["bob:x:100", "drwx"],
+        &["adduser:", "addgroup:"],
+    )?;
+    check(
+        run,
+        "chpasswd",
+        "echo 'bob:s3cret-pw' | chpasswd 2>&1; grep '^bob:' /etc/shadow | cut -d: -f2 | cut -c1-3; grep -c 'rounds=' /etc/shadow; ls -ln /etc/shadow",
+        &[
+            "password for 'bob' changed",
+            "$6$",
+            "-rw-------    1 0        0 ",
+        ],
+        &["Read-only", "can't"],
+    )?;
+    check(
+        run,
+        "deluser",
+        "deluser bob 2>&1; delgroup staff 2>&1; grep -c '^bob:' /etc/passwd /etc/shadow",
+        &["/etc/passwd:0", "/etc/shadow:0"],
+        &["Read-only", "passwd:1", "shadow:1"],
+    )
+}
+
 pub fn command(args: &[String]) -> Result<(), String> {
     if !args.is_empty() {
         return Err("usage: cargo xtask users".to_owned());
@@ -200,6 +247,8 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         privilege(&mut run)?;
         doas(&mut run)?;
         suid_busybox(&mut run)?;
+        writable(&mut run)?;
+        tools(&mut run)?;
         if started.elapsed() > RUN_WITHIN {
             return Err("the run took too long".to_owned());
         }
