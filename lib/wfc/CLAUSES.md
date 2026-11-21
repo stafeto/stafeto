@@ -138,6 +138,12 @@ changes nothing (spec 2.11, 5.6, 7.4).
 | `wfcCompose` | `compose_pending` | BAD_HANDLE; active context: UNSUPPORTED (checked here, and also the service's answer is translated); else SCENE_COMPOSE with COMPOSED asked; BUSY when `wait` is false and the service says so; with `wait` see 4.3 | 8.3 | P5.3, P5.4, R-activity |
 | `wfcFence` | none | BAD_HANDLE; then ILLEGAL_ARGUMENT: spec 9 lists no UNSUPPORTED, and with no EGL there is no valid display or sync object to pass | 9 | P3.2 |
 
+The service's LIST gives a window's size and no format, so the C binding passes
+`FORMAT_UNKNOWN` as the format of a stream; creation then accepts the stream for
+a source or a mask, and the service checks the kind of the window at the commit
+(an INVALID there comes back as ILLEGAL_ARGUMENT). A flag for the format A8 in
+LIST's `flags` would let creation answer UNSUPPORTED as 6.1.1 and 6.2.1 say.
+
 ## 4. Commit and the translation of refusals
 
 ### 4.1 What `commit` does, in order
@@ -310,7 +316,7 @@ source goes to (0,1) and (0,0) stays at (0,0); the wrong formula with
     library so the C layer has one place for them.
 11. **Zero-size elements** are left out of the record (the service refuses a zero source side).
 
-## 7. Tests (169, grouped by clause)
+## 7. Tests (170, grouped by clause)
 
 Every test carries its clause in its name or its first comment.
 

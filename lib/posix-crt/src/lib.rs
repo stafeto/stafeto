@@ -40,6 +40,10 @@ mod window_c;
 // program; libc.so leaves them out.
 #[cfg(feature = "wfd")]
 mod wfd_c;
+// The C functions of OpenWF Composition (`<WF/wfc.h>`), for a statically linked
+// program; libc.so leaves them out.
+#[cfg(feature = "wfc")]
+mod wfc_c;
 
 // relibc's platform calls the layer through posix-platform's functions.
 extern crate posix_platform;

@@ -113,8 +113,8 @@ fn sources(dir: &Path, root: &Path, found: &mut Vec<(String, String)>) {
 /// hold, by path from the root of the repository. The wrappers are in
 /// `receiver.rs`; the others listen on a channel that is not the thread's
 /// (the EXITS channel, a probe's fake channel, the loader probe's root, the
-/// platform's parked child, the window library's and the display library's channel of its own).
-const RAW: [(&str, usize); 7] = [
+/// platform's parked child, the window library's, the display library's and the composition library's channel of its own).
+const RAW: [(&str, usize); 8] = [
     ("lib/posix-sync/src/receiver.rs", 2),
     ("lib/posix-abi/src/relibc.rs", 1),
     ("lib/posix-abi/src/process.rs", 1),
@@ -122,6 +122,7 @@ const RAW: [(&str, usize); 7] = [
     ("lib/posix-platform/src/lib.rs", 1),
     ("lib/posix-abi/src/window.rs", 3),
     ("lib/posix-abi/src/wfd.rs", 3),
+    ("lib/posix-abi/src/wfc.rs", 2),
 ];
 
 /// The number of raw receives in the code of a text: a call of

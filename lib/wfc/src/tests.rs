@@ -2318,3 +2318,15 @@ fn p5_4_create_context_on_a_lost_device_does_not_take_the_screen() {
     assert_eq!(r.err(), ERROR_BAD_DEVICE);
     assert!(!r.svc.claimed);
 }
+
+#[test]
+fn s6_1_1_unknown_format_is_taken_for_a_source_and_a_mask() {
+    let mut r = rig();
+    let s = StreamInfo {
+        format: FORMAT_UNKNOWN,
+        ..info(1, 4, 4)
+    };
+    assert!(r.w.create_source_from_stream(r.dev, r.ctx, Some(s), &[]) != 0);
+    assert!(r.w.create_mask_from_stream(r.dev, r.ctx, Some(s), &[]) != 0);
+    assert_eq!(r.err(), 0);
+}

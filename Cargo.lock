@@ -847,6 +847,7 @@ dependencies = [
  "proto-wire",
  "rt",
  "trace",
+ "wfc",
  "wfd",
 ]
 
@@ -925,6 +926,7 @@ dependencies = [
  "proto-init",
  "proto-loader",
  "rt",
+ "wfc",
  "wfd",
 ]
 

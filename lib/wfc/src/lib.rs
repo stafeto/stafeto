@@ -61,6 +61,12 @@ impl Setup {
     };
 }
 
+/// The `format` of a stream whose format the layer above could not learn (the
+/// service's LIST gives the size of a window and no format): the creation of a
+/// source or a mask accepts it, and the service checks the kind of the window
+/// at the commit.
+pub const FORMAT_UNKNOWN: u32 = u32::MAX;
+
 /// What the layer above knows of a stream (a window of the service): its id,
 /// its size and its format (`proto_comp::FORMAT_*`). Both never change
 /// (specification 2.8.1).
@@ -694,7 +700,7 @@ impl Wfc {
             self.raise(ERROR_ILLEGAL_ARGUMENT);
             return 0;
         };
-        if (info.format == FORMAT_A8) != mask {
+        if info.format != FORMAT_UNKNOWN && (info.format == FORMAT_A8) != mask {
             self.raise(ERROR_UNSUPPORTED);
             return 0;
         }
