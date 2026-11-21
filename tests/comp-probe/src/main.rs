@@ -53,9 +53,10 @@
 use abi::{Access, Error, MESSAGE_MAX, Rights, Source};
 use core::cell::Cell;
 use proto_comp::{
-    ACTIVE, ASK_COMMITTED, ASK_COMPOSED, Attach, BUSY, COMMITTED_BIT, COMPOSED_BIT, Create,
-    Description, Element, FORMAT_XRGB8888, INVALID, Method, NO_WINDOW, NOT_ALLOWED, Post, Rect,
-    SceneCommit, UNSUPPORTED, code, manage,
+    ACTIVE, ASK_COMMITTED, ASK_COMPOSED, Attach, BILINEAR, BUSY, COMMITTED_BIT, COMPOSED_BIT,
+    Create, Description, Element, FORMAT_A8, FORMAT_ARGB8888, FORMAT_XRGB8888, INVALID, MIRROR,
+    Method, NEAREST, NO_WINDOW, NOT_ALLOWED, Post, Rect, SceneCommit, TRANSPARENCY_ALPHA,
+    TRANSPARENCY_MASK, TRANSPARENCY_SOURCE, UNSUPPORTED, code, manage, meaning,
 };
 use proto_gpu::{HEIGHT, STRIDE, WIDTH};
 use proto_init::ServiceArgs;
@@ -316,6 +317,118 @@ fn in_changed(x: u32, y: u32) -> bool {
         && (CHANGED.y..CHANGED.y + CHANGED.h).contains(&y)
 }
 
+// -------------------------------------------------- the windows of the elements
+
+/// The points of the window of the elements that has no alpha of its own (64
+/// by 40): every point differs from its neighbours.
+fn pat_xrgb(x: u32, y: u32) -> u32 {
+    let r = (x * 5 + y * 2 + 1) & 0xFF;
+    let g = (y * 9 + x + 2) & 0xFF;
+    let b = (x * y * 3 + x * 7 + y + 3) & 0xFF;
+    r << 16 | g << 8 | b
+}
+
+/// The points of the window with an alpha (40 by 30): the colour premultiplied.
+fn pat_argb(x: u32, y: u32) -> u32 {
+    let a = ((x * 11 + y * 3 + 40) & 0xFF) | 0x20;
+    let c = pat_xrgb(x + 3, y + 1);
+    a << 24 | ((c >> 16) & 0xFF).min(a) << 16 | ((c >> 8) & 0xFF).min(a) << 8 | (c & 0xFF).min(a)
+}
+
+/// The points of a mask.
+fn pat_a8(x: u32, y: u32) -> u32 {
+    (x * 17 + y * 29 + 5) & 0xFF
+}
+
+/// A window of the elements as the reference needs it: its number, its size and
+/// format, and the value of a point (as the window's own format has it: the
+/// colour of XRGB8888, the premultiplied value of ARGB8888, the alpha of A8).
+struct Win {
+    id: u32,
+    w: u32,
+    h: u32,
+    format: u32,
+    point: fn(u32, u32) -> u32,
+}
+
+impl Win {
+    /// The point as the source of a drawing: premultiplied ARGB, opaque for the
+    /// window without alpha; for A8 the byte.
+    fn argb(&self, x: u32, y: u32) -> u32 {
+        let v = (self.point)(x, y);
+        if self.format == FORMAT_XRGB8888 {
+            v | 0xFF00_0000
+        } else {
+            v
+        }
+    }
+}
+
+/// The CRC of the screen the elements mean over the background `bg`, the
+/// points worked out one at a time from the geometry of each element
+/// (`proto_comp::meaning`, which knows no band and no matrix).
+#[inline(never)]
+fn reference_crc(els: &[Element], wins: &[Win], bg: u32) -> u32 {
+    let find = |id: u32| wins.iter().find(|w| w.id == id);
+    let mut crc = Crc(0xFFFF_FFFF);
+    for y in 0..HEIGHT as i32 {
+        for x in 0..WIDTH as i32 {
+            let mut value = bg & 0x00FF_FFFF;
+            for e in els {
+                if !meaning::covers(e, x, y) {
+                    continue;
+                }
+                let Some(src) = find(e.source) else {
+                    continue;
+                };
+                let m = if e.transparency & TRANSPARENCY_MASK != 0 {
+                    match find(e.mask) {
+                        Some(m) => m.argb((x - e.dx) as u32, (y - e.dy) as u32),
+                        None => continue,
+                    }
+                } else {
+                    255
+                };
+                if let Some(s) = meaning::sample(e, x, y, (src.w, src.h), |u, v| src.argb(u, v)) {
+                    value = meaning::mix(e, s, m, value);
+                }
+            }
+            crc.point(value);
+        }
+    }
+    !crc.0
+}
+
+/// An element of `window` (its whole, `w` by `h` points) on the target
+/// (`dx`, `dy`, `dw`, `dh`), turned by `orient` and drawn with `filter` and
+/// the `transparency` and `alpha` given.
+fn placed(
+    window: &Win,
+    target: [i32; 4],
+    orient: u32,
+    filter: u32,
+    transparency: u32,
+    alpha: u32,
+    mask: Option<&Win>,
+) -> Element {
+    Element {
+        source: window.id,
+        mask: mask.map_or(NO_WINDOW, |m| m.id),
+        sx: 0,
+        sy: 0,
+        sw: (window.w as i32) << 16,
+        sh: (window.h as i32) << 16,
+        dx: target[0],
+        dy: target[1],
+        dw: target[2],
+        dh: target[3],
+        orient,
+        filter,
+        transparency,
+        alpha,
+    }
+}
+
 /// What a window of the screen shows, for the expected CRC.
 #[derive(Clone, Copy)]
 enum Layer {
@@ -507,13 +620,14 @@ impl Probe<'_> {
         &self,
         window: &Handle<Channel>,
         stride: u32,
+        format: u32,
         objects: &[Option<Handle<Memory>>],
     ) -> Result<(), Fail> {
         let mut w = Writer::new();
         Attach {
             count: objects.len() as u32,
             stride,
-            format: FORMAT_XRGB8888,
+            format,
         }
         .write(&mut w)
         .map_err(Fail::Status)?;
@@ -565,20 +679,26 @@ impl Probe<'_> {
             return Err("POST before ATTACH was not refused");
         }
         let small = sys::mem_create(4096).map_err(say("mem_create"))?;
-        if !refused(self.attach(&window, stride, &[Some(small)]), code(INVALID)) {
+        if !refused(
+            self.attach(&window, stride, FORMAT_XRGB8888, &[Some(small)]),
+            code(INVALID),
+        ) {
             return Err("ATTACH of too small an object was not refused");
         }
         let fresh = sys::mem_create(bytes.div_ceil(4096) * 4096).map_err(say("mem_create"))?;
         if !refused(
-            self.attach(&window, stride - 4, &[Some(fresh)]),
+            self.attach(&window, stride - 4, FORMAT_XRGB8888, &[Some(fresh)]),
             code(INVALID),
         ) {
             return Err("ATTACH of a stride under the width was not refused");
         }
         let (objects, at) = self.buffers(2, bytes)?;
-        self.attach(&window, stride, &objects[..2])
+        self.attach(&window, stride, FORMAT_XRGB8888, &objects[..2])
             .map_err(say("ATTACH"))?;
-        if !refused(self.attach(&window, stride, &objects[..2]), code(BUSY)) {
+        if !refused(
+            self.attach(&window, stride, FORMAT_XRGB8888, &objects[..2]),
+            code(BUSY),
+        ) {
             return Err("a second ATTACH was not BUSY");
         }
         rt::println!("comp-probe: ATTACH takes the buffers once and checks them");
@@ -675,7 +795,7 @@ impl Probe<'_> {
             .create(&display, SECOND, FORMAT_XRGB8888)
             .map_err(say("the second WINDOW_CREATE"))?;
         let (objects2, at2) = self.buffers(1, 100 * 100 * 4)?;
-        self.attach(&second, 400, &objects2[..1])
+        self.attach(&second, 400, FORMAT_XRGB8888, &objects2[..1])
             .map_err(say("ATTACH"))?;
         for y in 0..100u32 {
             for x in 0..100u32 {
@@ -719,7 +839,7 @@ impl Probe<'_> {
             )
             .map_err(say("the window after one went"))?;
         let (objects3, _) = self.buffers(1, 8 * 8 * 4)?;
-        self.attach(&reuse, 32, &objects3[..1])
+        self.attach(&reuse, 32, FORMAT_XRGB8888, &objects3[..1])
             .map_err(say("ATTACH after a window went"))?;
         rt::println!("comp-probe: a window that went gives its place to a window with buffers");
         // The context's share of windows: four, the fifth is refused.
@@ -790,7 +910,7 @@ impl Probe<'_> {
             .create(&display, SECOND, FORMAT_XRGB8888)
             .map_err(say("WINDOW_CREATE over the pool"))?;
         let (objects, at) = self.buffers(1, 100 * 100 * 4)?;
-        self.attach(&window, 400, &objects[..1])
+        self.attach(&window, 400, FORMAT_XRGB8888, &objects[..1])
             .map_err(say("ATTACH"))?;
         for y in 0..100u32 {
             for x in 0..100u32 {
@@ -855,30 +975,62 @@ impl Probe<'_> {
         rect: Rect,
         point: fn(u32, u32) -> u32,
     ) -> Result<(Handle<Channel>, u32), &'static str> {
+        let (window, id, _) = self.painted_in(display, rect, FORMAT_XRGB8888, point)?;
+        Ok((window, id))
+    }
+
+    /// A window of `format` (an A8 window is `rect.w` bytes a line, rounded up to
+    /// a multiple of 4) with two buffers filled by `point`: its session, its id
+    /// and its description for the reference.
+    fn painted_in(
+        &self,
+        display: &Handle<Channel>,
+        rect: Rect,
+        format: u32,
+        point: fn(u32, u32) -> u32,
+    ) -> Result<(Handle<Channel>, u32, Win), &'static str> {
         let (window, id) = self
-            .create(display, rect, FORMAT_XRGB8888)
+            .create(display, rect, format)
             .map_err(say("WINDOW_CREATE"))?;
-        let bytes = u64::from(rect.w) * u64::from(rect.h) * 4;
+        let (stride, bytes_per_point) = if format == FORMAT_A8 {
+            ((rect.w + 3) & !3, 1)
+        } else {
+            (rect.w * 4, 4)
+        };
+        let bytes = u64::from(stride) * u64::from(rect.h);
         let (objects, at) = self.buffers(2, bytes)?;
-        self.attach(&window, rect.w * 4, &objects[..2])
+        self.attach(&window, stride, format, &objects[..2])
             .map_err(say("ATTACH"))?;
         for buffer in &at[..2] {
             for y in 0..rect.h {
                 for x in 0..rect.w {
-                    // SAFETY: the buffer is mapped for writing at `buffer`, `rect.w`
-                    // by `rect.h` points of 4 bytes, and this probe is its only user.
+                    // SAFETY: the buffer is mapped for writing at `buffer`, `stride`
+                    // bytes by `rect.h` lines, and this probe is its only user.
                     unsafe {
-                        (*buffer as *mut u32)
-                            .add((y * rect.w + x) as usize)
-                            .write(point(x, y))
-                    };
+                        let line = (*buffer as *mut u8).add((y * stride) as usize);
+                        if bytes_per_point == 1 {
+                            line.add(x as usize).write(point(x, y) as u8);
+                        } else {
+                            (line as *mut u32).add(x as usize).write(point(x, y));
+                        }
+                    }
                 }
             }
         }
         // The objects live as long as the window's session in the service, which
         // holds its own handles; the probe leaves its mappings in place.
         core::mem::forget(objects);
-        Ok((window, id))
+        Ok((
+            window,
+            id,
+            Win {
+                id,
+                w: rect.w,
+                h: rect.h,
+                format,
+                point,
+            },
+        ))
     }
 
     /// The holder of a scene.
@@ -929,10 +1081,16 @@ impl Probe<'_> {
         let mut big = first;
         big.sw += 1 << 16;
         big.dw += 1;
+        // A turn is drawn: taken. Sixteen elements that each cost a band's calls
+        // are taken too: the service draws them in groups, a step each.
         let mut turned = first;
         turned.orient = 1;
+        let mut dear = first;
+        dear.filter = BILINEAR;
+        dear.transparency = TRANSPARENCY_ALPHA | TRANSPARENCY_SOURCE;
         if !refused(self.commit(&display, ACTIVE, &[big]), code(INVALID))
-            || !refused(self.commit(&display, ACTIVE, &[turned]), code(UNSUPPORTED))
+            || self.commit(&display, ACTIVE, &[turned]).is_err()
+            || self.commit(&display, ACTIVE, &[dear; 16]).is_err()
         {
             return Err("a scene out of its limits was not refused as it should be");
         }
@@ -1111,8 +1269,135 @@ impl Probe<'_> {
             expected_crc(&[Layer::First { marked: false }, Layer::Second])
         );
         self.sleep(SNAPSHOT_NS);
-        let _ = (memory, owner);
+        // The windows so far go, for a context has four places: then the scenes
+        // of the elements, each with a kind of drawing the service has.
+        drop((a, b, c));
+        drop(owner);
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        while self.settled(&display)?.open != 0 {
+            if time::ticks_to_ns(time::now()) > end {
+                return Err("the windows of the scene never closed");
+            }
+            self.sleep(RETRY_NS);
+        }
+        self.elements(&display)?;
+        let _ = memory;
         rt::println!("comp-probe: the scene holder ends with its windows");
+        Ok(())
+    }
+
+    /// The scenes of the elements: a stretch, the eight orientations, the
+    /// bilinear filter, a global alpha and a mask, each drawn by the service and
+    /// told as the CRC of the screen the reference (`meaning`) works out for it.
+    #[inline(never)]
+    fn elements(&self, display: &Handle<Channel>) -> Result<(), &'static str> {
+        let at = |w: u32, h: u32| Rect { x: 0, y: 0, w, h };
+        let (p, p_id, pw) = self.painted_in(display, at(64, 40), FORMAT_XRGB8888, pat_xrgb)?;
+        let (q, q_id, qw) = self.painted_in(display, at(40, 30), FORMAT_ARGB8888, pat_argb)?;
+        let (m, m_id, mw) = self.painted_in(display, at(64, 40), FORMAT_A8, pat_a8)?;
+        let (n, n_id, nw) = self.painted_in(display, at(128, 80), FORMAT_A8, pat_a8)?;
+        let _ = (p_id, q_id, m_id, n_id);
+        for window in [&p, &q, &m, &n] {
+            self.post(window, 0, &[])
+                .map_err(say("POST of an element's window"))?;
+        }
+        let wins = [pw, qw, mw, nw];
+        let [pw, qw, mw, nw] = &wins;
+        let bg = 0xFF20_4060;
+        let src = TRANSPARENCY_SOURCE;
+        let alpha = TRANSPARENCY_ALPHA;
+        let mask = TRANSPARENCY_MASK;
+        // Each scene is made, shown and told in turn (the probe's stack is small).
+        let show = |name: &str, els: &[Element]| -> Result<(), &'static str> {
+            let mut w = Writer::new();
+            SceneCommit::new(ACTIVE, bg, els)
+                .and_then(|c| c.write(&mut w))
+                .map_err(say("a scene of elements"))?;
+            plain(display, w.as_bytes()).map_err(say("SCENE_COMMIT of elements"))?;
+            self.settled(display)?;
+            rt::println!(
+                "comp-probe: element {name} crc {:08x}",
+                reference_crc(els, &wins, bg)
+            );
+            self.sleep(SNAPSHOT_NS);
+            Ok(())
+        };
+        show(
+            "stretch",
+            &[
+                placed(pw, [40, 30, 128, 80], 0, NEAREST, 0, 255, None),
+                placed(pw, [200, 30, 32, 20], 0, NEAREST, 0, 255, None),
+                placed(qw, [300, 40, 80, 60], 0, NEAREST, src, 255, None),
+                placed(qw, [300, 130, 20, 15], 0, NEAREST, src, 255, None),
+                placed(pw, [40, 150, 128, 40], 0, NEAREST, 0, 255, None),
+            ],
+        )?;
+        let mut grid = [Element::NONE; 8];
+        for (k, e) in grid.iter_mut().enumerate() {
+            let (w, h) = if k & 1 != 0 { (40, 64) } else { (64, 40) };
+            let (x, y) = (10 + (k as i32 % 4) * 150, 40 + (k as i32 / 4) * 150);
+            *e = placed(pw, [x, y, w, h], k as u32, NEAREST, 0, 255, None);
+        }
+        show("orient", &grid)?;
+        show(
+            "bilinear",
+            &[
+                placed(pw, [30, 30, 128, 80], 0, BILINEAR, 0, 255, None),
+                placed(pw, [200, 30, 32, 20], 0, BILINEAR, 0, 255, None),
+                placed(qw, [300, 30, 80, 60], 0, BILINEAR, src, 255, None),
+                placed(pw, [30, 150, 80, 128], 1, BILINEAR, 0, 255, None),
+                placed(pw, [150, 150, 40, 64], 3 | MIRROR, BILINEAR, 0, 255, None),
+                placed(qw, [300, 150, 80, 60], 2, BILINEAR, src, 255, None),
+            ],
+        )?;
+        show(
+            "alpha",
+            &[
+                placed(pw, [0, 0, 256, 160], 0, NEAREST, 0, 255, None),
+                placed(pw, [50, 50, 64, 40], 0, NEAREST, alpha, 128, None),
+                placed(qw, [150, 50, 40, 30], 0, NEAREST, alpha, 160, None),
+                placed(qw, [250, 50, 40, 30], 0, NEAREST, alpha | src, 160, None),
+                placed(pw, [50, 150, 128, 80], 0, NEAREST, alpha, 200, None),
+                placed(qw, [250, 150, 60, 80], 1, BILINEAR, alpha | src, 90, None),
+            ],
+        )?;
+        show(
+            "mask",
+            &[
+                placed(pw, [0, 0, 256, 160], 0, NEAREST, 0, 255, None),
+                placed(pw, [50, 50, 64, 40], 0, NEAREST, mask, 255, Some(mw)),
+                placed(pw, [200, 50, 128, 80], 0, BILINEAR, mask, 255, Some(nw)),
+                placed(
+                    pw,
+                    [50, 150, 64, 40],
+                    0,
+                    NEAREST,
+                    mask | alpha,
+                    140,
+                    Some(mw),
+                ),
+            ],
+        )?;
+        // The edges of the screen cut the elements, and the mask goes with them.
+        show(
+            "maskcut",
+            &[
+                placed(pw, [-30, -20, 64, 40], 0, NEAREST, mask, 255, Some(mw)),
+                placed(pw, [600, 370, 64, 40], 0, NEAREST, mask, 255, Some(mw)),
+                placed(
+                    pw,
+                    [320, 300, 128, 80],
+                    0,
+                    NEAREST,
+                    mask | alpha,
+                    200,
+                    Some(nw),
+                ),
+            ],
+        )?;
+        rt::println!(
+            "comp-probe: elements are drawn: a stretch, the turns and the reflection, the bilinear mean, a global alpha, a mask"
+        );
         Ok(())
     }
 

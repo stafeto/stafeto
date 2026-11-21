@@ -42,6 +42,16 @@ static void start(void)
     started = 1;
 }
 
+// The small blocks (up to SMALL_MAX bytes) a free gives back are kept for the
+// next allocation of their size, one list for each multiple of ALIGN: a block of
+// the transform a drawing sets on an image, or of a solid colour made for one call,
+// is made and given back with every operation, and the first fit walk of the
+// arena (every block of the images kept, about a hundred) and the joining of the
+// free blocks after it cost thousands of ticks for each. A kept block is marked 2
+// and is not joined or split; the arena's walk passes it.
+#define SMALL_MAX 512
+static struct block *kept[SMALL_MAX / ALIGN + 1];
+
 void *pxs_malloc(size_t n)
 {
     if (!started)
@@ -49,8 +59,14 @@ void *pxs_malloc(size_t n)
     n = (n + ALIGN - 1) & ~(size_t)(ALIGN - 1);
     if (n == 0)
         n = ALIGN;
+    if (n <= SMALL_MAX && kept[n / ALIGN]) {
+        struct block *b = kept[n / ALIGN];
+        kept[n / ALIGN] = *(struct block **)((unsigned char *)b + HEADER);
+        b->free = 0;
+        return (unsigned char *)b + HEADER;
+    }
     for (struct block *b = (struct block *)arena; b; b = next(b)) {
-        if (!b->free || b->size < n)
+        if (b->free != 1 || b->size < n)
             continue;
         if (b->size >= n + HEADER + ALIGN) {
             struct block *rest = (struct block *)((unsigned char *)b + HEADER + n);
@@ -69,15 +85,21 @@ void pxs_free(void *p)
     if (!p)
         return;
     struct block *b = (struct block *)((unsigned char *)p - HEADER);
+    if (b->size <= SMALL_MAX) {
+        *(struct block **)p = kept[b->size / ALIGN];
+        kept[b->size / ALIGN] = b;
+        b->free = 2;
+        return;
+    }
     b->free = 1;
     // Join every run of free blocks. A block freed before its neighbour does
     // not join it backwards (the blocks have no link to the one before), so
     // joining only the blocks that follow the one freed leaves free blocks side by
     // side for good, and the walk of `pxs_malloc` grows with them.
     for (struct block *c = (struct block *)arena; c; c = next(c))
-        while (c->free) {
+        while (c->free == 1) {
             struct block *n = next(c);
-            if (!n || !n->free)
+            if (!n || n->free != 1)
                 break;
             c->size += HEADER + n->size;
         }
@@ -165,6 +187,36 @@ int strncmp(const char *a, const char *b, size_t n)
             return 0;
     }
     return 0;
+}
+
+// memset for pixman's general path, which clears three scanline buffers of
+// 8 KiB on its stack before every operation it makes (pixman-general.c). The
+// word loop of the compiler's own version took 12 000 ticks for that, a call
+// of the general path; 64 bytes a step (four 16-byte stores) takes about a
+// fifth. The vector type compiles to stores of the SIMD registers, which the
+// service already uses (pixman's NEON paths).
+typedef unsigned char byte16 __attribute__((vector_size(16)));
+
+void *memset(void *dst, int c, size_t n)
+{
+    unsigned char *p = dst;
+    unsigned char b = (unsigned char)c;
+    if (n >= 64) {
+        byte16 v = {b, b, b, b, b, b, b, b, b, b, b, b, b, b, b, b};
+        while ((uintptr_t)p & 15) {
+            *p++ = b;
+            n--;
+        }
+        for (; n >= 64; n -= 64, p += 64) {
+            ((byte16 *)p)[0] = v;
+            ((byte16 *)p)[1] = v;
+            ((byte16 *)p)[2] = v;
+            ((byte16 *)p)[3] = v;
+        }
+    }
+    while (n--)
+        *p++ = b;
+    return dst;
 }
 
 double sqrt(double x) { return __builtin_sqrt(x); }

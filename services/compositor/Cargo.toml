@@ -24,6 +24,10 @@ bench = false
 # request opens the screen by the steps of the work (the probe of the late opening).
 late-open = ["steps"]
 steps = ["rt/step-stats"]
+# `calibrate`: besides `steps`, the service measures the prices of its operations on
+# shapes of their own before its first request (`px::calibration`, seconds of the
+# CPU at its level: the images that do not read the lines leave it out).
+calibrate = ["steps"]
 # `irq-trace`: besides `steps`, each band reads the system time of the thread and the
 # entries of the table of images it looked at, to tell what an excess of a band is
 # (xtask frame-probe trace). It adds two calls of the kernel to a band.

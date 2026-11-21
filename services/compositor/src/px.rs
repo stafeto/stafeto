@@ -5,8 +5,10 @@
 //! rectangle of the screen's bytes black, and the points of a window's
 //! buffer replacing or lying over those of the screen.
 
-use compositor::{Format, Raster};
-use pixman::{Format as Px, Images, Source, Target, composite, fill, prepare};
+use compositor::{Draw, Format, Raster};
+use pixman::{
+    Filter, Format as Px, Images, Mask, Source, Target, composite, composite_element, fill, prepare,
+};
 use proto_comp::Rect;
 use proto_gpu::{HEIGHT, STRIDE, WIDTH};
 
@@ -26,13 +28,12 @@ pub struct Pixman {
 // window, the screen, the pointer's picture and the pool.
 const _: () = assert!(pixman::KEPT >= compositor::MAX_WINDOWS * proto_comp::BUFFERS + 3);
 
-/// The pixman format of a window's points; None for a mask (FORMAT_A8), which
-/// no operation of a band reads yet.
-const fn format(f: Format) -> Option<Px> {
+/// The pixman format of a window's points.
+const fn format(f: Format) -> Px {
     match f {
-        Format::Xrgb => Some(Px::Xrgb8888),
-        Format::Argb => Some(Px::Argb8888),
-        Format::A8 => None,
+        Format::Xrgb => Px::Xrgb8888,
+        Format::Argb => Px::Argb8888,
+        Format::A8 => Px::A8,
     }
 }
 
@@ -500,6 +501,7 @@ pub mod cost {
     /// each class: C the call in ticks, R the row and P the point in hundredths of
     /// a tick.
     pub fn tell() {
+        super::stack::watch();
         #[cfg(feature = "irq-trace")]
         if trace::fold() {
             trace::tell();
@@ -553,6 +555,87 @@ pub mod cost {
     }
 }
 
+/// The deepest the stack of the service goes, for the run of the probes under
+/// -icount (feature `steps`): at the start the stack below the entry is painted
+/// with a pattern (`paint`), and each step after it looks at a few words
+/// (`watch`), from the lowest painted address up, for the lowest that no longer
+/// holds the pattern; a new lowest is told as `service stack: 17 depth D painted
+/// P` (bytes from the top of the stack, bytes painted). The words between the top
+/// and the painted part (the frame of `main` and 2 KiB below it, which the
+/// painting's own frames use) count as used, so the depth is at least that.
+#[cfg(feature = "steps")]
+pub mod stack {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+
+    const PATTERN: u64 = 0xA5A5_A5A5_A5A5_A5A5;
+    /// The bytes painted, below the entry of the program: less than its stack, so
+    /// that the guard below it is not touched.
+    pub const PAINTED: usize = compositor::STACK_BYTES - 16 * 1024;
+    const _: () = assert!(PAINTED + 16 * 1024 <= compositor::STACK_BYTES);
+    const WORDS_A_STEP: usize = 128;
+
+    static TOP: AtomicUsize = AtomicUsize::new(0);
+    static BOTTOM: AtomicUsize = AtomicUsize::new(0);
+    static LOW: AtomicUsize = AtomicUsize::new(0);
+    static CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+    /// Paints the stack below the caller's frame.
+    pub fn paint() {
+        let sp: usize;
+        // SAFETY: reads the stack pointer.
+        unsafe { core::arch::asm!("mov {}, sp", out(reg) sp) };
+        // The stack is right under INIT_STACK_TOP; what is above this frame is
+        // in use (the frame of `main` holds the service).
+        let top = abi::INIT_STACK_TOP as usize;
+        let high = (sp & !15) - 2048;
+        let bottom = top - PAINTED;
+        let mut at = bottom;
+        while at < high {
+            // SAFETY: the words are of this thread's stack below its frame, free
+            // of any use now, and inside the stack (PAINTED is less than its size).
+            unsafe { AtomicU64::from_ptr(at as *mut u64) }.store(PATTERN, Relaxed);
+            at += 8;
+        }
+        TOP.store(top, Relaxed);
+        BOTTOM.store(bottom, Relaxed);
+        LOW.store(high, Relaxed);
+        CURSOR.store(bottom, Relaxed);
+    }
+
+    /// Looks at a few more words for the lowest that was written.
+    pub fn watch() {
+        let top = TOP.load(Relaxed);
+        if top == 0 {
+            return;
+        }
+        let low = LOW.load(Relaxed);
+        let mut at = CURSOR.load(Relaxed);
+        let end = (at + WORDS_A_STEP * 8).min(low);
+        while at < end {
+            // SAFETY: a word of the painted stack.
+            if unsafe { AtomicU64::from_ptr(at as *mut u64) }.load(Relaxed) != PATTERN {
+                LOW.store(at, Relaxed);
+                rt::println!(
+                    "service stack: 17 depth {} painted {}",
+                    top - at,
+                    top - BOTTOM.load(Relaxed)
+                );
+                CURSOR.store(BOTTOM.load(Relaxed), Relaxed);
+                return;
+            }
+            at += 8;
+        }
+        CURSOR.store(
+            if end >= low {
+                BOTTOM.load(Relaxed)
+            } else {
+                end
+            },
+            Relaxed,
+        );
+    }
+}
+
 impl Pixman {
     /// Makes pixman build its tables of implementations now, in the
     /// start of the service and not in the step of its first band: one
@@ -597,12 +680,9 @@ impl Pixman {
     /// The image of a window's buffer is made now (a post), so that no band
     /// pays for the first use of a surface.
     pub fn prepare(&mut self, src: &[u8], stride: u32, f: Format, size: (u32, u32), image: usize) {
-        let Some(px) = format(f) else {
-            return;
-        };
         let source = Source {
             bytes: src,
-            format: px,
+            format: format(f),
             stride,
             width: size.0,
             height: size.1,
@@ -673,9 +753,6 @@ impl Raster for Pixman {
         over: bool,
         image: usize,
     ) {
-        let Some(px) = format(f) else {
-            return;
-        };
         let mut target = Target {
             bytes: fb,
             format: Px::Xrgb8888,
@@ -685,7 +762,7 @@ impl Raster for Pixman {
         };
         let source = Source {
             bytes: src,
-            format: px,
+            format: format(f),
             stride,
             width: size.0,
             height: size.1,
@@ -704,6 +781,100 @@ impl Raster for Pixman {
             rt::time::now() - began,
         );
     }
+
+    fn element(&mut self, fb: &mut [u8], d: &Draw<'_>) {
+        let mut target = Target {
+            bytes: fb,
+            format: Px::Xrgb8888,
+            stride: STRIDE,
+            width: WIDTH,
+            height: HEIGHT,
+        };
+        #[cfg(feature = "steps")]
+        let began = rt::time::now();
+        if !draw(&mut self.images, &mut target, d) {
+            self.refuse("an element");
+        }
+        #[cfg(feature = "steps")]
+        cost::record(
+            if d.transparency == 0 {
+                cost::COPY
+            } else {
+                cost::OVER
+            },
+            u64::from(d.area.w),
+            u64::from(d.area.h),
+            rt::time::now() - began,
+        );
+    }
+}
+
+/// The A8 mask window's surface as pixman's source.
+fn plane(m: compositor::Surface<'_>) -> Source<'_> {
+    Source {
+        bytes: m.bytes,
+        format: Px::A8,
+        stride: m.stride,
+        width: m.size.0,
+        height: m.size.1,
+        hint: m.image,
+    }
+}
+
+/// One element's drawing onto `target`: pixman's composite of its source
+/// through its transform, with the alpha or the mask its transparency says. A
+/// source with no transparency bit of its own alpha is read as XRGB8888 (its
+/// alpha byte is not read, as the element's meaning has it).
+fn draw(images: &mut Images, target: &mut Target<'_>, d: &Draw<'_>) -> bool {
+    use proto_comp::{TRANSPARENCY_ALPHA, TRANSPARENCY_MASK, TRANSPARENCY_SOURCE};
+    let t = d.transparency;
+    let kind = match (d.src.format, t & TRANSPARENCY_SOURCE != 0) {
+        (Format::Argb, false) => Px::Xrgb8888,
+        (f, _) => format(f),
+    };
+    let source = Source {
+        bytes: d.src.bytes,
+        format: kind,
+        stride: d.src.stride,
+        width: d.src.size.0,
+        height: d.src.size.1,
+        hint: d.src.image,
+    };
+    let mask = match (
+        d.mask,
+        t & TRANSPARENCY_MASK != 0,
+        t & TRANSPARENCY_ALPHA != 0,
+    ) {
+        (Some((m, at)), true, false) => Mask::Plane {
+            source: plane(m),
+            at,
+        },
+        (Some((m, at)), true, true) => Mask::Product {
+            source: plane(m),
+            at,
+            alpha: d.alpha,
+        },
+        (_, false, true) => Mask::Alpha(d.alpha),
+        (_, false, false) => Mask::None,
+        // The mask bit with no mask: the band does not ask for it.
+        (None, true, _) => return false,
+    };
+    composite_element(
+        images,
+        t != 0,
+        target,
+        source,
+        d.matrix,
+        d.from,
+        if d.filter == proto_comp::BILINEAR {
+            Filter::Bilinear
+        } else {
+            Filter::Nearest
+        },
+        mask,
+        (d.area.x, d.area.y),
+        (d.area.w, d.area.h),
+    )
 }
 
 /// The prices of the three kinds measured on shapes of operations chosen for
@@ -716,9 +887,9 @@ impl Raster for Pixman {
 /// operation during which a thread of a higher level took the CPU off the
 /// service (the count of preemptions of the thread changed) is left out and
 /// counted: what is told is the thread's own work.
-#[cfg(feature = "steps")]
+#[cfg(feature = "calibrate")]
 pub mod calibration {
-    use super::{Pixman, Px, Source, Target, composite, fill};
+    use super::{Filter, Mask, Pixman, Px, Source, Target, composite, composite_element, fill};
 
     /// The scratch surfaces are two regions of the screen's own buffer (the target
     /// the service keeps, 256 pages, mapped when the screen opens): 648 by 13 points
@@ -814,6 +985,100 @@ pub mod calibration {
     ];
     const REPEAT: u32 = 3;
 
+    /// What a kind of the elements' operations draws: nearest or bilinear, the
+    /// source turned a quarter, reflected and stretched (the general path of
+    /// pixman, the dearest of the geometries) or placed as it is, a laying
+    /// over or a copy, and the mixing.
+    #[derive(Clone, Copy)]
+    pub(super) struct Recipe {
+        name: &'static str,
+        bilinear: bool,
+        transform: Transform,
+        over: bool,
+        mix: Mix,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Transform {
+        /// As it is.
+        Plain,
+        /// Turned, reflected and stretched by a ratio that is no fraction of 16.16.
+        General,
+        /// A quarter turn with no stretch: pixman's own path for it.
+        Quarter,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mix {
+        None,
+        Alpha,
+        Mask,
+        Both,
+    }
+
+    /// The kinds the elements' operations add to the three of the plain ones
+    /// (`compositor::PRICES` after the black, the copy and the laying over):
+    /// each is measured on the shapes of the plain ones narrower than 160
+    /// points (a dear band is a part of a line), at two offsets of the target.
+    pub(super) const RECIPES: [Recipe; 8] = [
+        Recipe {
+            name: "scale-nearest-copy",
+            bilinear: false,
+            transform: Transform::General,
+            over: false,
+            mix: Mix::None,
+        },
+        Recipe {
+            name: "scale-nearest-over",
+            bilinear: false,
+            transform: Transform::General,
+            over: true,
+            mix: Mix::None,
+        },
+        Recipe {
+            name: "scale-bilinear-copy",
+            bilinear: true,
+            transform: Transform::General,
+            over: false,
+            mix: Mix::None,
+        },
+        Recipe {
+            name: "scale-bilinear-over",
+            bilinear: true,
+            transform: Transform::General,
+            over: true,
+            mix: Mix::None,
+        },
+        Recipe {
+            name: "rotate90",
+            bilinear: false,
+            transform: Transform::Quarter,
+            over: false,
+            mix: Mix::None,
+        },
+        Recipe {
+            name: "alpha",
+            bilinear: false,
+            transform: Transform::Plain,
+            over: true,
+            mix: Mix::Alpha,
+        },
+        Recipe {
+            name: "mask",
+            bilinear: false,
+            transform: Transform::Plain,
+            over: true,
+            mix: Mix::Mask,
+        },
+        Recipe {
+            name: "mask-alpha",
+            bilinear: false,
+            transform: Transform::Plain,
+            over: true,
+            mix: Mix::Both,
+        },
+    ];
+
     /// One operation of a kind: its ticks, or None when a higher level
     /// preempted the thread in the middle of it.
     fn timed(thread: &rt::handle::Handle<rt::handle::Thread>, run: impl FnOnce()) -> Option<u64> {
@@ -825,18 +1090,210 @@ pub mod calibration {
         (after.1 == before.1).then(|| ended - began)
     }
 
+    /// The elements' region of the screen's buffer: a source of 160 by 160
+    /// points (stride 640 bytes), the mask (160 by 32, A8) after it, both past the
+    /// regions of the plain kinds and the layers (`LAYERS_AT`).
+    const ELEMENTS_AT: usize = 262_144;
+    const ELEMENT_SRC_SIDE: u32 = 160;
+    const ELEMENT_SRC_BYTES: usize = (ELEMENT_SRC_SIDE * ELEMENT_SRC_SIDE * 4) as usize;
+    const ELEMENT_MASK_AT: usize = ELEMENTS_AT + ELEMENT_SRC_BYTES;
+    const ELEMENT_MASK_BYTES: usize = (NARROW * NARROW_HEIGHT) as usize;
+
+    /// The operation of a kind: pixman's call for plain ones (0 black, 1 copy,
+    /// 2 over) and for a recipe of the elements' the transform, filter, mask and
+    /// formats it names; `dx` is the offset of the target, `turn` of the
+    /// source's format for the kinds that alternate it.
+    #[allow(clippy::too_many_arguments)]
+    fn operate(
+        images: &mut pixman::Images,
+        which: usize,
+        recipe: Option<&Recipe>,
+        fb: &mut [u8],
+        shape: (u32, u32),
+        offsets: (u32, u32, bool),
+    ) {
+        let (w, h) = shape;
+        let (dx, sx, inside) = offsets;
+        if let Some(r) = recipe {
+            let (head, tail) = fb.split_at_mut(ELEMENTS_AT);
+            let (src, mask) = tail.split_at_mut(ELEMENT_SRC_BYTES);
+            let mut target = Target {
+                bytes: &mut head[DST_AT..DST_AT + NARROW_BYTES],
+                format: Px::Xrgb8888,
+                stride: NARROW_STRIDE,
+                width: NARROW,
+                height: NARROW_HEIGHT,
+            };
+            // The formats alternate with the offset for the kinds that mix: the
+            // source with its alpha at 0, without at 1 (both are drawn).
+            let argb = r.over && (r.mix == Mix::None || sx == 0);
+            let from = Source {
+                bytes: src,
+                format: if argb { Px::Argb8888 } else { Px::Xrgb8888 },
+                stride: ELEMENT_SRC_SIDE * 4,
+                width: ELEMENT_SRC_SIDE,
+                height: ELEMENT_SRC_SIDE,
+                hint: 1,
+            };
+            let plane = Source {
+                bytes: &mask[..ELEMENT_MASK_BYTES],
+                format: Px::A8,
+                stride: NARROW,
+                width: NARROW,
+                height: NARROW_HEIGHT,
+                hint: 2,
+            };
+            let element = proto_comp::Element {
+                source: 0,
+                mask: 0,
+                // Inside the source (the samples of the target are far from its
+                // edges) or at its edge: pixman's flags, and with them the key of
+                // its path, differ.
+                sx: if inside { 40 << 16 } else { 0 },
+                sy: if inside { 40 << 16 } else { 0 },
+                sw: if r.transform == Transform::Quarter {
+                    (h as i32) << 16
+                } else if inside {
+                    80 << 16
+                } else {
+                    (ELEMENT_SRC_SIDE as i32) << 16
+                },
+                sh: if r.transform == Transform::Quarter {
+                    (w as i32) << 16
+                } else if inside {
+                    80 << 16
+                } else {
+                    (ELEMENT_SRC_SIDE as i32) << 16
+                },
+                dx: dx as i32,
+                dy: 0,
+                dw: w as i32,
+                dh: h as i32,
+                orient: if r.transform == Transform::General {
+                    1 | proto_comp::MIRROR
+                } else {
+                    1
+                },
+                filter: u32::from(r.bilinear),
+                transparency: 0,
+                alpha: 100,
+            };
+            let matrix =
+                (r.transform != Transform::Plain).then(|| compositor::elements::matrix(&element));
+            let mask = match r.mix {
+                Mix::None => Mask::None,
+                Mix::Alpha => Mask::Alpha(100),
+                Mix::Mask => Mask::Plane {
+                    source: plane,
+                    at: (0, 0),
+                },
+                Mix::Both => Mask::Product {
+                    source: plane,
+                    at: (0, 0),
+                    alpha: 100,
+                },
+            };
+            composite_element(
+                images,
+                r.over,
+                &mut target,
+                from,
+                matrix,
+                (0, 0),
+                if r.bilinear {
+                    Filter::Bilinear
+                } else {
+                    Filter::Nearest
+                },
+                mask,
+                (dx, 0),
+                (w, h),
+            );
+            return;
+        }
+        let (dst_region, rest) = fb.split_at_mut(SRC_AT);
+        let (dst, src) = (&mut dst_region[DST_AT..DST_AT + BYTES], &rest[..BYTES]);
+        // The width of the screen on the wide surface, the others on the narrow
+        // one (the same memory).
+        let (dst, src, stride, width, height) = if w > 160 {
+            (dst, src, WIDE_STRIDE, WIDE, WIDE_HEIGHT)
+        } else {
+            (
+                &mut dst[..NARROW_BYTES],
+                &src[..NARROW_BYTES],
+                NARROW_STRIDE,
+                NARROW,
+                NARROW_HEIGHT,
+            )
+        };
+        let mut target = Target {
+            bytes: dst,
+            format: Px::Xrgb8888,
+            stride,
+            width,
+            height,
+        };
+        let from = Source {
+            bytes: src,
+            format: if which == 2 {
+                Px::Argb8888
+            } else {
+                Px::Xrgb8888
+            },
+            stride,
+            width,
+            height,
+            hint: pixman::NO_HINT,
+        };
+        if which == 0 {
+            fill(&mut target, dx, 0, w, h, 0);
+        } else {
+            composite(
+                images,
+                which == 2,
+                &mut target,
+                from,
+                (sx, 0),
+                (dx, 0),
+                (w, h),
+            );
+        }
+    }
+
     /// Makes the operations of every shape of one kind (0 black, 1 copy, 2
-    /// over) and tells a line for each shape and one for the classes.
+    /// over, or a recipe of the elements') and tells a line for each shape and
+    /// one for the classes.
     fn kind(
         px: &mut Pixman,
         fb: &mut [u8],
         which: usize,
+        recipe: Option<&Recipe>,
         name: &str,
         thread: &rt::handle::Handle<rt::handle::Thread>,
     ) {
         let (mut call, mut row, mut point) = (Spread::new(), Spread::new(), Spread::new());
         let mut preempted = 0u32;
         let (mut call_g, mut row_g) = (0u64, 0u64);
+        // The offsets of the target and of the source, as many as the kind is
+        // measured at (the recipes at two offsets of the target and one of the
+        // source: their operations are dear).
+        // The offset of the target alone matters for a kind that has a path
+        // of NEON of its own (the turn of a quarter and the kinds that mix);
+        // the kinds that mix are drawn from both formats of the source (the
+        // second number). The rest is the general path of pixman, which does
+        // not mind the alignment.
+        let (dxs, sxs, repeat) = match recipe {
+            None => (4, 4, REPEAT),
+            Some(r) => (
+                if r.transform == Transform::General {
+                    1
+                } else {
+                    2
+                },
+                if r.mix == Mix::None { 1 } else { 2 },
+                2,
+            ),
+        };
         // The calls first, then the rows, then the points: each class takes off
         // the greatest of those before it.
         for order in [0u8, 1, 2] {
@@ -845,61 +1302,25 @@ pub mod calibration {
                 if tells != order {
                     continue;
                 }
+                // A dear kind is a part of a line: no shape wider than 160, and
+                // the product of a mask and an alpha is made in a band of 16 lines.
+                // The taller of the wide shapes are left out too: they cost much for
+                // what the two heights at the widths of the points already tell.
+                if recipe.is_some_and(|r| {
+                    w > 160
+                        || (r.mix == Mix::Both && h > 16)
+                        || (class == 2 && (h >= 32 || (w >= 150 && h >= 16)))
+                }) {
+                    continue;
+                }
                 let (mut least, mut greatest, mut n) = (u64::MAX, 0u64, 0u64);
-                for dx in 0..4u32 {
-                    for sx in 0..4u32 {
+                for dx in 0..dxs {
+                    for sx in 0..sxs {
                         // One warm-up, which makes the images pixman keeps.
-                        for turn in 0..=REPEAT {
-                            let (dst_region, rest) = fb.split_at_mut(SRC_AT);
-                            let (dst, src) =
-                                (&mut dst_region[DST_AT..DST_AT + BYTES], &rest[..BYTES]);
-                            // The width of the screen on the wide surface, the
-                            // others on the narrow one (the same memory).
-                            let (dst, src, stride, width, height) = if w > 160 {
-                                (dst, src, WIDE_STRIDE, WIDE, WIDE_HEIGHT)
-                            } else {
-                                (
-                                    &mut dst[..NARROW_BYTES],
-                                    &src[..NARROW_BYTES],
-                                    NARROW_STRIDE,
-                                    NARROW,
-                                    NARROW_HEIGHT,
-                                )
-                            };
-                            let mut target = Target {
-                                bytes: dst,
-                                format: Px::Xrgb8888,
-                                stride,
-                                width,
-                                height,
-                            };
-                            let from = Source {
-                                bytes: src,
-                                format: if which == 2 {
-                                    Px::Argb8888
-                                } else {
-                                    Px::Xrgb8888
-                                },
-                                stride,
-                                width,
-                                height,
-                                hint: pixman::NO_HINT,
-                            };
+                        for turn in 0..=repeat {
                             let images = &mut px.images;
                             let ticks = timed(thread, || {
-                                if which == 0 {
-                                    fill(&mut target, dx, 0, w, h, 0);
-                                } else {
-                                    composite(
-                                        images,
-                                        which == 2,
-                                        &mut target,
-                                        from,
-                                        (sx, 0),
-                                        (dx, 0),
-                                        (w, h),
-                                    );
-                                }
+                                operate(images, which, recipe, fb, (w, h), (dx, sx, false));
                             });
                             if turn == 0 {
                                 continue;
@@ -1040,7 +1461,7 @@ pub mod calibration {
             };
             let source = Source {
                 bytes: src,
-                format: super::format(f).expect("a drawn format"),
+                format: super::format(f),
                 stride,
                 width: size.0,
                 height: size.1,
@@ -1055,6 +1476,21 @@ pub mod calibration {
                 (to.0, to.1 - self.y0),
                 area,
             );
+        }
+
+        fn element(&mut self, _fb: &mut [u8], d: &compositor::Draw<'_>) {
+            // The bands of the layers' calibration are plain windows: the
+            // element drawing is the one of the service, on the small target.
+            let mut target = Target {
+                bytes: self.target,
+                format: Px::Xrgb8888,
+                stride: LAYER_TARGET_W * 4,
+                width: LAYER_TARGET_W,
+                height: LAYER_TARGET_H,
+            };
+            let mut shifted = *d;
+            shifted.area.y -= self.y0;
+            super::draw(self.images, &mut target, &shifted);
         }
     }
 
@@ -1160,7 +1596,11 @@ pub mod calibration {
                                         compositor::compose_sized(
                                             &scene,
                                             damage,
-                                            compositor::Band { row: dy, col: 0 },
+                                            compositor::Band {
+                                                row: dy,
+                                                col: 0,
+                                                pass: 0,
+                                            },
                                             (w, h),
                                             &mut [],
                                             &regions,
@@ -1194,6 +1634,66 @@ pub mod calibration {
     }
 
     impl Pixman {
+        /// Measures what a call pays when pixman's cache of resolved paths has
+        /// lost its key: for each kind of the elements' operations, at both
+        /// variants of the flags (inside the source and at its edge), the call of
+        /// one point as it is after eight calls of other keys, less the same call
+        /// when it repeats (`compositor::LOOKUP_MISS_MEASURED` is the greatest).
+        /// Tells a line `service lookup: 17 KIND inside I least L greatest G` for
+        /// each and `service lookup: 17 greatest G`.
+        pub fn calibrate_lookup(&mut self, fb: &mut [u8]) {
+            let Ok(thread) = rt::sys::self_thread() else {
+                return;
+            };
+            fb[ELEMENTS_AT..ELEMENTS_AT + ELEMENT_SRC_BYTES].fill(0x40);
+            fb[ELEMENT_MASK_AT..ELEMENT_MASK_AT + ELEMENT_MASK_BYTES].fill(0x80);
+            let mut greatest = 0u64;
+            for (k, r) in RECIPES.iter().enumerate() {
+                for inside in [false, true] {
+                    let shape = (1, 1);
+                    let (mut least, mut worst) = (u64::MAX, 0u64);
+                    for turn in 0..3 {
+                        let images = &mut self.images;
+                        // Warm: the call again and again.
+                        operate(images, 3, Some(r), fb, shape, (0, 0, inside));
+                        let Some(warm) = timed(&thread, || {
+                            operate(images, 3, Some(r), fb, shape, (0, 0, inside));
+                        }) else {
+                            continue;
+                        };
+                        // Evicted: nine calls of other keys (the other kinds and
+                        // the plain copy and laying over), then the call.
+                        for (j, other) in RECIPES.iter().enumerate() {
+                            if j != k {
+                                operate(images, 3, Some(other), fb, shape, (0, 0, false));
+                            }
+                        }
+                        operate(images, 1, None, fb, shape, (0, 0, false));
+                        operate(images, 2, None, fb, shape, (0, 0, false));
+                        let Some(cold) = timed(&thread, || {
+                            operate(images, 3, Some(r), fb, shape, (0, 0, inside));
+                        }) else {
+                            continue;
+                        };
+                        let _ = turn;
+                        let miss = cold.saturating_sub(warm);
+                        least = least.min(miss);
+                        worst = worst.max(miss);
+                    }
+                    if worst > 0 {
+                        rt::println!(
+                            "service lookup: 17 {} inside {} least {least} greatest {worst}",
+                            r.name,
+                            u8::from(inside)
+                        );
+                        greatest = greatest.max(worst);
+                    }
+                }
+            }
+            rt::println!("service lookup: 17 greatest {greatest}");
+            fb[ELEMENTS_AT..ELEMENT_MASK_AT + ELEMENT_MASK_BYTES].fill(0);
+        }
+
         /// Measures the three kinds on the shapes of the classes and tells a
         /// line each (`service calibration: 17 KIND call L G N W H row L G N W H
         /// point L G N W H preempted K`: for each class the least and the
@@ -1218,7 +1718,15 @@ pub mod calibration {
                 return;
             };
             for (which, name) in [(0, "black"), (1, "copy"), (2, "over")] {
-                kind(self, fb, which, name, &thread);
+                kind(self, fb, which, None, name, &thread);
+            }
+            if fb.len() >= ELEMENTS_AT + ELEMENT_SRC_BYTES + ELEMENT_MASK_BYTES {
+                fb[ELEMENTS_AT..ELEMENTS_AT + ELEMENT_SRC_BYTES].fill(0x40);
+                fb[ELEMENT_MASK_AT..ELEMENT_MASK_AT + ELEMENT_MASK_BYTES].fill(0x80);
+                for r in &RECIPES {
+                    kind(self, fb, 3, Some(r), r.name, &thread);
+                }
+                fb[ELEMENTS_AT..ELEMENT_MASK_AT + ELEMENT_MASK_BYTES].fill(0);
             }
             // The target holds zero before its first frame.
             fb[DST_AT..DST_AT + BYTES].fill(0);

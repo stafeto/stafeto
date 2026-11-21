@@ -571,7 +571,14 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                     }
                     // Skips are printed only: with the client unable to post while
                     // its frame is in work almost no change waits at a period start.
-                    if p.late != p.frames {
+                    //
+                    // The frames that released a buffer of the windows are the ones of
+                    // the scene, and each is late. A frame shown in the phase that
+                    // released none (at most one) is the frame the end of the earlier
+                    // phase made, black or tiny, which falls on either side of the
+                    // boundary of the two readings of STATS by a few thousand ticks
+                    // of difference in the cost of a band: it is made in its period.
+                    if p.late != p.frames && !(p.late + 1 == p.frames && p.releases == p.late) {
                         return fail(format!(
                             "late {} of {} frames (a frame of {bands} bands over a cap of {cap} is late every time)",
                             p.late, p.frames
@@ -1425,6 +1432,24 @@ mod tests {
             e.starts_with(&format!("overload: late {} of {f} frames", f - 1)),
             "{e}"
         );
+        // One frame shown in the phase that released no buffer, in its period (the
+        // frame of the end of the earlier phase read on this side of the boundary):
+        // the frames of the scene are all late, and it passes. Two do not.
+        let mut lines = good();
+        let f = overload_floor_frames();
+        overload_line(
+            &mut lines,
+            &format!("frames {f}"),
+            &format!("frames {}", f + 1),
+        );
+        assert!(verdict(&lines, true).is_ok());
+        let mut lines = good();
+        overload_line(
+            &mut lines,
+            &format!("frames {f}"),
+            &format!("frames {}", f + 2),
+        );
+        assert!(verdict(&lines, true).is_err());
         // Skips are printed and judge nothing.
         let mut lines = good();
         overload_line(
