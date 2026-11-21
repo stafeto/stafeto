@@ -1243,7 +1243,10 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         return Err(format!("comp-probe under -icount: {failed}"));
     }
     let (comp, driver) = steps_verdict(&output.lines)?;
-    crate::check_waits(&output.lines, &[COMP_TAG, DRIVER_TAG], "comp-probe")?;
+    println!(
+        "{}",
+        crate::frame_probe::check_waits(&output.lines, init::table::comp::TABLE, "comp-probe")?
+    );
     let text = |rows: &[(usize, u64, u64)]| -> String {
         rows.iter()
             .map(|(kind, ticks, _)| format!("kind {kind} {ticks}"))

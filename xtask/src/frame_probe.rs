@@ -55,6 +55,8 @@ const BAND: u64 = crate::PORTION_MAX;
 const STEP: u64 = crate::gpu_probe::STEP_MAX;
 const KERNEL: u64 = 38_779;
 const DRIVER: u64 = 13_596;
+/// The round trip of a call (C_ipc of the analysis of the waits, `CALL_WAIT_MAX`) with the step of the request.
+const C_IPC: u64 = 2_034;
 const REQUESTS: u64 = 10_000;
 const EVENTS: u64 = 1_875;
 const LIMIT: u64 = 10_000_000;
@@ -107,22 +109,119 @@ pub fn heartbeat_ticks() -> u64 {
     without * 8_000 + with * 2_400 + 8_000
 }
 
+/// The wakes of a budget of the record `r` in its period: the console's driver
+/// takes the kernel log on the kernel's notification, at most once in the pace
+/// of its takes (`uart::log::DRAIN_NS`), so up to its period over the pace; any
+/// other source wakes once.
+fn wakes(r: &init::table::Record, b: &init::table::Budget) -> u64 {
+    if r.program == "uart" {
+        b.t_ns.div_ceil(uart::log::DRAIN_NS)
+    } else {
+        1
+    }
+}
+
+fn ticks_of(ns: u64) -> u64 {
+    ns.div_ceil(TICK_NS)
+}
+
 /// The budgets on CPU 0 of the services above the compositor, as the sources
 /// of interference of the bound; with `only_console` the console's alone.
 pub fn sources(only_console: bool) -> Vec<Source> {
-    let ticks = |ns: u64| (ns).div_ceil(TICK_NS);
     TABLE
         .iter()
         .filter(|r| matches!(r.kind, Kind::Service(_)) && r.priority > 32)
         .filter(|r| !only_console || r.name == "uart")
-        .flat_map(|r| r.budgets.iter())
-        .filter(|b| b.cpu == 0)
-        .map(|b| Source {
-            budget: ticks(b.c_ns),
-            period: ticks(b.t_ns),
+        .flat_map(|r| r.budgets.iter().map(move |b| (r, b)))
+        .filter(|(_, b)| b.cpu == 0)
+        .map(|(r, b)| Source {
+            budget: ticks_of(b.c_ns),
+            period: ticks_of(b.t_ns),
             step: STEP,
+            wakes: wakes(r, b),
         })
         .collect()
+}
+
+/// The level of the record `name` of `table`.
+fn level_of(table: &[init::table::Record], name: &str) -> Result<u8, String> {
+    table
+        .iter()
+        .find(|r| r.name == name)
+        .map(|r| r.priority)
+        .ok_or_else(|| format!("the table has no record {name}"))
+}
+
+/// The bound of the wait of a call of the service `caller` to the service
+/// `callee` in the image whose records are `table`, in ticks: the response time
+/// of the call by the formula of the frame (`bound`). The call returns when the
+/// callee has run its step of the request, and the callee runs when no service
+/// above it does; so the work of the call is the round trip of the request, the
+/// step of the request and one step of the callee that was running (two steps of
+/// the driver), the longest path of the kernel that is not preempted, the signs of life
+/// of the services above the callee and the two steps of the disk. The sources are the budgets on CPU 0 of the
+/// services above the callee, each at most ceil(w / T) times in the wait w (the
+/// budget is a corrected sporadic server). A source adds its longest step only when
+/// its level after the budget (`low`) is not under the caller's: it then stands
+/// level with the caller and may run a step before the call returns.
+/// An error when the table lacks a record or the iteration does not settle.
+pub fn call_wait_bound(
+    table: &[init::table::Record],
+    caller: &str,
+    callee: &str,
+) -> Result<u64, String> {
+    let from = level_of(table, caller)?;
+    let to = level_of(table, callee)?;
+    let above = |r: &&init::table::Record| matches!(r.kind, Kind::Service(_)) && r.priority > to;
+    let signs: u64 = table
+        .iter()
+        .filter(above)
+        .map(|r| if r.budgets.is_empty() { 8_000 } else { 2_400 })
+        .sum();
+    let sources: Vec<Source> = table
+        .iter()
+        .filter(above)
+        .flat_map(|r| r.budgets.iter().map(move |b| (r, b)))
+        .filter(|(_, b)| b.cpu == 0)
+        .map(|(r, b)| Source {
+            budget: ticks_of(b.c_ns),
+            period: ticks_of(b.t_ns),
+            step: if b.low >= from { STEP } else { 0 },
+            wakes: wakes(r, b),
+        })
+        .collect();
+    let own = C_IPC + 2 * DRIVER + KERNEL + signs + 2 * STEP;
+    bound(own, &sources, EVENTS, LIMIT)
+        .ok_or_else(|| format!("the wait of {caller} for {callee} has no bound under {LIMIT}"))
+}
+
+/// Fails when a wait in the lines of the compositor (tag 17) passes `call_wait_bound` of its
+/// call to the display driver in the image `table`, or a wait of the driver (tag 12) passes
+/// `call_wait_max` (`check_waits`). Returns the line that tells the greatest wait of the
+/// compositor and its share of the bound.
+pub fn check_waits(
+    lines: &[String],
+    table: &[init::table::Record],
+    who: &str,
+) -> Result<String, String> {
+    use crate::comp_probe::{COMP_TAG, DRIVER_TAG};
+    let limit = call_wait_bound(table, "gpu", "display")?;
+    crate::check_waits_by(lines, &[COMP_TAG, DRIVER_TAG], who, &|tag, kind| {
+        if tag == COMP_TAG {
+            limit
+        } else {
+            crate::call_wait_max(tag, kind)
+        }
+    })?;
+    let greatest = crate::longest_waits(lines, COMP_TAG)
+        .iter()
+        .map(|r| r.1)
+        .max()
+        .unwrap_or(0);
+    Ok(format!(
+        "{who}: the greatest wait of the compositor {greatest} ticks, {} per cent of the bound {limit}",
+        greatest * 100 / limit
+    ))
 }
 
 /// The share of CPU 0 the budgets above the compositor take, in parts per
@@ -755,11 +854,8 @@ pub fn probe(args: &[String]) -> Result<(), String> {
         println!("{line}");
     }
     if timed {
-        crate::check_waits(
-            &lines,
-            &[crate::comp_probe::COMP_TAG, crate::comp_probe::DRIVER_TAG],
-            "frame-probe",
-        )?;
+        let waits = check_waits(&lines, TABLE, "frame-probe")?;
+        println!("{waits}");
         let steps = steps_verdict(&lines).map_err(|e| format!("frame-probe: {e}"))?;
         println!("frame-probe: the longest steps, ticks: {steps}");
     }
@@ -781,28 +877,120 @@ mod tests {
     use super::*;
     use frame_load::phases::Scene;
 
+    /// The bound of the wait of the compositor's call to the display driver in the image of the
+    /// frame: the work of the call (the round trip, two steps of the driver, the kernel's longest
+    /// path, the signs of life above the driver, two steps of the disk) with the budgets of CPU 0
+    /// above the driver, and the iteration settles at a bound below the limit.
+    #[test]
+    fn the_wait_of_the_call_to_the_driver_is_the_response_time_of_the_image() {
+        let w = call_wait_bound(TABLE, "gpu", "display").unwrap();
+        assert_eq!(w, 527_932);
+        // It is a fixed point of the formula: the work and the interference of the sources
+        // over the wait give the wait again, and one tick less does not.
+        let level = level_of(TABLE, "display").unwrap();
+        let signs: u64 = TABLE
+            .iter()
+            .filter(|r| matches!(r.kind, Kind::Service(_)) && r.priority > level)
+            .map(|r| if r.budgets.is_empty() { 8_000 } else { 2_400 })
+            .sum();
+        assert_eq!(signs, 6 * 2_400 + 2 * 8_000);
+        let own = C_IPC + 2 * DRIVER + KERNEL + signs + 2 * STEP;
+        let again = |w: u64, sources: &[Source]| {
+            own + sources
+                .iter()
+                .map(|s| {
+                    (w / s.period) * s.budget
+                        + (w % s.period).min(s.budget)
+                        + s.step
+                        + 2 * EVENTS * s.wakes * w.div_ceil(s.period)
+                })
+                .sum::<u64>()
+        };
+        let sources: Vec<Source> = TABLE
+            .iter()
+            .filter(|r| matches!(r.kind, Kind::Service(_)) && r.priority > level)
+            .flat_map(|r| r.budgets.iter().map(move |b| (r, b)))
+            .filter(|(_, b)| b.cpu == 0)
+            .map(|(r, b)| Source {
+                budget: ticks_of(b.c_ns),
+                period: ticks_of(b.t_ns),
+                step: if b.low >= 32 { STEP } else { 0 },
+                wakes: wakes(r, b),
+            })
+            .collect();
+        assert_eq!(again(w, &sources), w);
+        assert!(again(w - 1, &sources) > w - 1);
+        // The console wakes four times in its period and the others once; the network's step
+        // is no term (its `low` is 1).
+        assert_eq!(
+            sources
+                .iter()
+                .map(|s| s.wakes)
+                .collect::<Vec<_>>()
+                .iter()
+                .filter(|&&k| k == 4)
+                .count(),
+            1
+        );
+        assert!(sources.iter().any(|s| s.step == 0));
+        // The old bound of the calls held no interference at all.
+        assert!(w > crate::call_wait_max("17", 65) * 10);
+        // A table with no budgets above the driver has the work alone.
+        assert_eq!(
+            call_wait_bound(init::table::comp::TABLE, "gpu", "display"),
+            Ok(C_IPC + 2 * DRIVER + KERNEL + 2 * STEP)
+        );
+        assert!(call_wait_bound(TABLE, "gpu", "nowhere").is_err());
+    }
+
+    /// The greatest wait of the compositor is told with its share of the bound, and a wait past
+    /// the bound fails.
+    #[test]
+    fn a_wait_of_the_compositor_is_judged_by_the_bound_of_the_image() {
+        let w = call_wait_bound(TABLE, "gpu", "display").unwrap();
+        let at = |ticks: u64| {
+            vec![format!(
+                "service wait: 17 kind 65 {ticks} ticks of {}",
+                ticks + 2_055
+            )]
+        };
+        let said = check_waits(&at(62_481), TABLE, "t").unwrap();
+        assert_eq!(
+            said,
+            format!(
+                "t: the greatest wait of the compositor 62481 ticks, {} per cent of the bound {w}",
+                62_481 * 100 / w
+            )
+        );
+        assert!(check_waits(&at(w), TABLE, "t").is_ok());
+        assert!(check_waits(&at(w + 1), TABLE, "t").is_err());
+        // The driver stays on the bound of the calls.
+        let driver = vec!["service wait: 12 kind 6 48001 ticks of 50000".to_owned()];
+        assert!(check_waits(&driver, TABLE, "t").is_err());
+    }
+
     /// The numbers of the analysis for the image of the frame (the heartbeat 46 400).
     #[test]
     fn the_bounds_of_the_image_are_the_numbers_of_the_analysis() {
         assert_eq!(heartbeat_ticks(), 46_400);
-        assert_eq!(bound_ticks(Row::P), Some(906_578));
-        assert_eq!(bound_ticks(Row::D), Some(622_091));
+        assert_eq!(bound_ticks(Row::P), Some(929_078));
+        assert_eq!(bound_ticks(Row::D), Some(747_093));
         // The whole screen by the service's own count of the bands of the frame: the
         // row follows it, and the rows of the analysis for the counts it has had.
         let n = u64::from(compositor::full_screen_bands());
         assert!(bound_ticks(Row::F(n)).is_some());
         for (bands, own_ticks, bound) in [
-            (31, 644_681, 689_300),
-            (33, 677_337, 721_956),
-            (34, 693_665, 738_284),
-            (37, 742_649, 787_268),
+            (31, 644_681, 711_800),
+            (33, 677_337, 744_456),
+            (34, 693_665, 760_784),
+            (37, 742_649, 809_768),
         ] {
             assert_eq!(own(Row::F(bands)), own_ticks);
             assert_eq!(bound_ticks(Row::F(bands)), Some(bound));
         }
         // Under all the loads the whole screen has a bound past a period (1 041 667
         // ticks): the analysis does not promise this frame on time.
-        assert_eq!(bound_ticks(Row::FullLoaded(31)), Some(1_710_647));
+        assert_eq!(bound_ticks(Row::FullLoaded(31)), Some(1_744_397));
     }
 
     /// The limit of the whole screen holds the service's count of the bands and a bound inside
@@ -1017,11 +1205,11 @@ mod tests {
             .iter_mut()
             .find(|l| l.starts_with("frame-load: phase cpu "))
             .unwrap();
-        // The bound of P is 14 505 us.
-        *l = l.replace("compose-max-us 2950", "compose-max-us 14600");
+        // The bound of P is 14 865 us.
+        *l = l.replace("compose-max-us 2950", "compose-max-us 14900");
         let e = verdict(&lines, true).unwrap_err();
         assert!(
-            e.starts_with("cpu: compose max 14600 us over the bound 14505 us"),
+            e.starts_with("cpu: compose max 14900 us over the bound 14865 us"),
             "{e}"
         );
     }
@@ -1310,11 +1498,11 @@ mod tests {
             .iter_mut()
             .find(|l| l.starts_with("frame-load: phase full-loaded "))
             .unwrap();
-        // The bound of 40 bands is about 32 400 us.
-        *l = l.replace("compose-max-us 10000", "compose-max-us 33000");
+        // The bound of 40 bands is about 33 400 us.
+        *l = l.replace("compose-max-us 10000", "compose-max-us 34000");
         let e = verdict(&lines, true).unwrap_err();
         assert!(
-            e.starts_with("full-loaded: compose max 33000 us over the bound 32"),
+            e.starts_with("full-loaded: compose max 34000 us over the bound 33"),
             "{e}"
         );
         assert!(e.contains("a finding for the design"));
