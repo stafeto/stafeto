@@ -1389,7 +1389,11 @@ impl Compositor {
         };
         self.job = Some(Job {
             damage,
-            at: Band { row, col: 0 },
+            at: Band {
+                row,
+                col: 0,
+                pass: 0,
+            },
         });
         #[cfg(feature = "irq-trace")]
         px::cost::trace::mark_first_of_frame();

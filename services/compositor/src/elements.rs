@@ -17,9 +17,7 @@
 //! source at the fraction below (the inverse of the turns and the
 //! reflection), and `target_of` is the map the other way round.
 
-use crate::{
-    BAND_FIXED, BAND_TICKS, FILL, Format, HEIGHT, LAYER, OVER, PRICES, Price, Rect, WIDTH,
-};
+use crate::{Format, HEIGHT, Rect, WIDTH};
 use proto_comp::{
     BILINEAR, Element, MAX_ELEMENTS, MIRROR, NO_WINDOW, ROTATION, SceneCommit, TRANSPARENCY_MASK,
     TRANSPARENCY_SOURCE, union,
@@ -122,9 +120,6 @@ pub enum Fault {
     /// A number out of its place: a window of the wrong format or too small
     /// for the rectangle.
     Invalid,
-    /// The scene is dearer than one band can hold even at one point: its calls
-    /// alone (`band_floor`) are past BAND_TICKS.
-    Unsupported,
 }
 
 /// The checks of a scene against the windows (`window` says the shape of the
@@ -137,9 +132,8 @@ pub enum Fault {
 ///   Composition 7.1.9: a mask is not stretched).
 ///
 /// Every element the numbers allow is drawn: the service has an operation for
-/// each (`Class`), and a scene is refused (`Fault::Unsupported`) only when the
-/// calls of its elements cost more than a band holds even at one point
-/// (`band_floor`), after the numbers have been found right.
+/// each (`Class`), and a scene whose layers cost more than a band holds is
+/// drawn by a band in several steps (`compositor::Passes`).
 pub fn check(def: &Def, window: impl Fn(u32) -> Option<Shape>) -> Result<(), Fault> {
     for e in def.elements() {
         if let Some(s) = window(e.source) {
@@ -166,41 +160,7 @@ pub fn check(def: &Def, window: impl Fn(u32) -> Option<Shape>) -> Result<(), Fau
             return Err(Fault::Invalid);
         }
     }
-    if band_floor(def) > BAND_TICKS {
-        return Err(Fault::Unsupported);
-    }
     Ok(())
-}
-
-/// What the smallest band the service makes (one point) can cost by the model
-/// at the most, in ticks: the fixed term of a band, the black, the pointer's
-/// picture, every element that lies over what is below it (the calls, the term of
-/// its layer, a row and a point), and the dearest of the elements that replace
-/// what is below (of those, the topmost that covers the point is the base, and
-/// what lies under it is not drawn, so only one is drawn at a point and the others
-/// that touch it are above it, laid over). It is over what a real band costs, so a
-/// scene under BAND_TICKS here makes bands within the bound.
-pub fn band_floor(def: &Def) -> u32 {
-    let price = |class: Class| price_of(PRICES[class.row()]);
-    let cost = |e: &Element| {
-        let (first, second) = classes(e);
-        LAYER + price(first) + second.map_or(0, price)
-    };
-    let (mut over, mut opaque) = (0u32, 0u32);
-    for e in def.elements() {
-        if e.transparency == 0 {
-            opaque = opaque.max(cost(e));
-        } else {
-            over += cost(e);
-        }
-    }
-    let pointer = LAYER + price_of(OVER);
-    BAND_FIXED + price_of(FILL) + pointer + over + opaque
-}
-
-/// The ticks of an operation of one point by the model.
-fn price_of(p: Price) -> u32 {
-    p.call + (p.row + p.point).div_ceil(100)
 }
 
 /// Whether an element shows the window's points as they are: one point of the

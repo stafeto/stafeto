@@ -253,7 +253,11 @@ impl Rig {
             .unwrap();
         let d = self.scene.begin().expect("a frame");
         let mut fb = vec![0xEE; (STRIDE * HEIGHT) as usize];
-        let mut at = Band { row: d.y, col: 0 };
+        let mut at = Band {
+            row: d.y,
+            col: 0,
+            pass: 0,
+        };
         while at.row < d.y + d.h {
             at = compose(&self.scene, d, at, &mut fb, &self.wins, &mut Sampler);
         }
@@ -707,115 +711,134 @@ fn an_element_is_charged_by_its_geometry_and_its_mixing() {
     );
 }
 
-/// The model's charge for an element in a band of `w` by `h` points, in ticks.
-fn charge(e: &Element, w: u32, h: u32) -> u64 {
-    let (first, second) = elements::classes(e);
-    let mut centi = 0u64;
-    let mut ticks = u64::from(LAYER);
-    for class in [Some(first), second].into_iter().flatten() {
-        let p = PRICES[class.row()];
-        ticks += u64::from(p.call);
-        centi += u64::from(p.row) * u64::from(h) + u64::from(p.point) * u64::from(w) * u64::from(h);
-    }
-    ticks + centi.div_ceil(100)
-}
-
-/// The dearest element of the tests: a mask and an alpha over the whole
-/// screen with the bilinear mean (source `k` of four, mask `k` of four).
-fn dear(rig: &Rig, k: usize) -> Element {
-    let mut e = rig.whole(k % 4, [0, 0, 640, 400]);
+/// The dearest element of the tests: a mask and an alpha over the target
+/// 128 by 80 with the bilinear mean, the source (64 by 40) twice as large
+/// (`k` of four windows, the mask `k` of four A8 windows of that size).
+fn dear(rig: &Rig, k: usize, at: (i32, i32)) -> Element {
+    let mut e = rig.whole(k % 4, [at.0, at.1, 128, 80]);
     e.filter = BILINEAR;
     e.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA;
     e.mask = rig.id(4 + k % 4);
-    e.alpha = 100;
+    e.alpha = 100 + 10 * k as u32;
     e
 }
 
 fn dear_rig() -> Rig {
     let mut specs = vec![(XRGB, 64, 40); 4];
-    specs.extend(vec![(A8, 640, 400); 4]);
+    specs.extend(vec![(A8, 128, 80); 4]);
     Rig::new(&specs)
 }
 
 #[test]
-fn a_scene_whose_calls_no_band_could_hold_is_unsupported_and_one_that_fits_is_not() {
+fn a_scene_of_dear_elements_is_taken_and_drawn_in_groups_as_the_reference_has_it() {
     let mut rig = dear_rig();
-    // Sixteen of the dearest: the calls alone are past the band.
-    let els: Vec<Element> = (0..16).map(|k| dear(&rig, k)).collect();
-    let c = SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap();
-    assert_eq!(rig.scene.scene_commit(&c), Err(Refusal::Unsupported));
-    // As many as the floor allows are taken, one more is not.
-    let fits = (1..=16)
-        .take_while(|&n| {
-            let c = SceneCommit::new(proto_comp::ACTIVE, BG, &els[..n]).unwrap();
-            rig.scene.scene_commit(&c).is_ok()
-        })
-        .count();
-    assert!((2..16).contains(&fits), "{fits}");
-    // The numbers are found wrong before the scene is found dear.
-    let mut bad = els.clone();
-    bad[15].sw = 1 << 30;
-    let c = SceneCommit::new(proto_comp::ACTIVE, BG, &bad).unwrap();
-    assert_eq!(rig.scene.scene_commit(&c), Err(Refusal::Invalid));
-    // Sixteen copies are taken: only one is drawn at a point.
-    let copies: Vec<Element> = (0..16)
-        .map(|k| rig.whole(k % 4, [0, 0, 640, 400]))
+    // Six of the dearest over one place and across it: a band cannot hold the
+    // calls of all of them, so a place is drawn in several steps.
+    let mut els: Vec<Element> = (0..6)
+        .map(|k| dear(&rig, k, (40 + 12 * k as i32, 30 + 7 * k as i32)))
         .collect();
-    let c = SceneCommit::new(proto_comp::ACTIVE, BG, &copies).unwrap();
-    assert_eq!(rig.scene.scene_commit(&c), Ok(()));
+    let mut over = rig.whole(1, [60, 50, 128, 80]);
+    over.transparency = TRANSPARENCY_ALPHA | TRANSPARENCY_SOURCE;
+    over.alpha = 150;
+    over.orient = 2;
+    els.push(over);
+    rig.matches(&els, BG);
+    // And the groups are what the plan says: more than one, none past the
+    // calls of a group unless it is one element.
+    let d = rig.scene.working().copied().unwrap();
+    let plan = rig.scene.passes(&d, Rect::SCREEN);
+    assert!(plan.groups >= 2, "{} groups", plan.groups);
+    for g in 0..plan.groups {
+        let n = (0..els.len())
+            .filter(|&k| plan.group_of(k) == Some(g))
+            .count();
+        assert!(
+            n == 1 || plan.cost[g].0 <= GROUP_CALLS,
+            "group {g}: {n} elements"
+        );
+    }
 }
 
 #[test]
-fn every_band_of_the_dearest_scene_costs_at_most_the_band_ticks_by_the_model() {
+fn sixteen_of_the_dearest_are_taken_and_every_step_costs_under_the_gate_by_the_model() {
     let mut rig = dear_rig();
-    let mut els: Vec<Element> = Vec::new();
-    for k in 0..16 {
-        els.push(dear(&rig, k));
-        let c = SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap();
-        if rig.scene.scene_commit(&c).is_err() {
-            els.pop();
-            break;
-        }
-    }
-    assert!(els.len() >= 2);
+    let els: Vec<Element> = (0..16).map(|k| dear(&rig, k, (0, 0))).collect();
     rig.scene
         .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap())
         .unwrap();
     let d = rig.scene.begin().expect("a frame");
-    let mut bands = 0;
-    let mut at = Band { row: d.y, col: 0 };
+    let (mut steps, mut worst) = (0, 0);
+    let mut at = Band::default();
     let mut fb = vec![0u8; (STRIDE * HEIGHT) as usize];
     while at.row < d.y + d.h {
-        let (bw, bh) = rig.scene.tile(d);
-        let w = bw.min(d.w - at.col);
-        let h = bh.min(d.y + d.h - at.row);
-        let mut cost = u64::from(FILL.call) + u64::from(BAND_FIXED);
-        cost += (u64::from(FILL.row) * u64::from(h)
-            + u64::from(FILL.point) * u64::from(w) * u64::from(h))
-        .div_ceil(100);
-        for e in &els {
-            if rig.scene.element_place(e).is_some() {
-                cost += charge(e, w, h);
-            }
-        }
-        assert!(
-            cost <= u64::from(BAND_TICKS),
-            "a band {w} by {h} at {at:?} costs {cost} by the model"
-        );
-        at = compose(&rig.scene, d, at, &mut fb, &rig.wins, &mut Counting);
-        bands += 1;
+        let mut model = StepCost {
+            elements: els.len() as u32,
+            ..StepCost::default()
+        };
+        at = compose(&rig.scene, d, at, &mut fb, &rig.wins, &mut model);
+        worst = worst.max(model.ticks());
+        steps += 1;
     }
     rig.scene.end(true);
-    // A dear scene stretches over many bands: the cap of a period (47 bands)
+    // A layer dearer than the half of a band is a group alone (the bilinear
+    // stretch with a mask and an alpha: 10 000 ticks of calls): with the terms of
+    // 16 elements its step is over BAND_TICKS by the model, and under the gate
+    // with the 1 080 ticks a step spends around the band.
+    assert!(
+        worst <= u64::from(BAND_GATE - 1_080),
+        "a step costs {worst} by the model"
+    );
+    // A dear scene stretches over many steps: the cap of a period (47 bands)
     // spreads it over periods.
-    assert!(bands > 47, "{bands} bands");
+    assert!(steps > 47, "{steps} steps");
 }
 
-/// A raster that draws nothing.
-struct Counting;
+#[test]
+fn a_step_of_a_scene_with_a_pointer_draws_the_pointer_in_the_last_step_of_a_place() {
+    let mut rig = dear_rig();
+    let els: Vec<Element> = (0..4).map(|k| dear(&rig, k, (0, 0))).collect();
+    rig.scene.pointer_to(10, 10);
+    let fb = rig.frame(&els, BG);
+    // The pointer's picture is over the elements: the point it covers is not
+    // what the elements alone make.
+    let plain = {
+        let mut rig = dear_rig();
+        rig.frame(&els, BG)
+    };
+    assert_ne!(get(&fb, 12, 12), get(&plain, 12, 12));
+}
 
-impl Raster for Counting {
-    fn fill(&mut self, _: &mut [u8], _: Rect, _: u32) {}
+/// What the model charges for the calls of a step, from what the raster is asked.
+#[derive(Default)]
+struct StepCost {
+    calls: u32,
+    centi: u64,
+    layers: u32,
+    /// The elements of the scene that show something over the damage.
+    elements: u32,
+}
+
+impl StepCost {
+    fn add(&mut self, p: Price, area: (u32, u32)) {
+        self.calls += p.call;
+        self.centi += u64::from(p.row) * u64::from(area.1)
+            + u64::from(p.point) * u64::from(area.0) * u64::from(area.1);
+    }
+
+    fn ticks(&self) -> u64 {
+        u64::from(self.calls)
+            + u64::from(BAND_FIXED)
+            + u64::from(ELEMENT_TERM) * u64::from(self.elements)
+            + u64::from(LAYER) * u64::from(self.layers)
+            + self.centi.div_ceil(100)
+    }
+}
+
+impl Raster for StepCost {
+    fn fill(&mut self, _: &mut [u8], r: Rect, _: u32) {
+        self.add(FILL, (r.w, r.h));
+    }
+
     fn blit(
         &mut self,
         _: &mut [u8],
@@ -825,10 +848,53 @@ impl Raster for Counting {
         _: (u32, u32),
         _: (u32, u32),
         _: (u32, u32),
-        _: (u32, u32),
-        _: bool,
+        area: (u32, u32),
+        over: bool,
         _: usize,
     ) {
+        self.layers += 1;
+        self.add(if over { OVER } else { OPAQUE }, area);
     }
-    fn element(&mut self, _: &mut [u8], _: &Draw<'_>) {}
+
+    fn element(&mut self, _: &mut [u8], d: &Draw<'_>) {
+        // The classes by what the raster is told (a turn of a quarter is read as
+        // a general transform, which errs high).
+        use elements::Class::*;
+        let t = d.transparency;
+        let area = (d.area.w, d.area.h);
+        self.layers += 1;
+        let extra = match (t & TRANSPARENCY_MASK != 0, t & TRANSPARENCY_ALPHA != 0) {
+            (true, true) => Some(MaskAlpha),
+            (true, false) => Some(Mask),
+            (false, true) => Some(Alpha),
+            _ => None,
+        };
+        let geometry = match (
+            d.matrix.is_some(),
+            d.filter == BILINEAR,
+            t & TRANSPARENCY_SOURCE != 0,
+        ) {
+            (false, ..) => None,
+            (true, false, false) => Some(ScaleNearestCopy),
+            (true, false, true) => Some(ScaleNearestOver),
+            (true, true, false) => Some(ScaleBilinearCopy),
+            (true, true, true) => Some(ScaleBilinearOver),
+        };
+        // A transformed element with a mix pays for the stretch as a laying over.
+        let first = match (geometry, extra) {
+            (Some(ScaleNearestCopy), Some(_)) => Some(ScaleNearestOver),
+            (Some(ScaleBilinearCopy), Some(_)) => Some(ScaleBilinearOver),
+            (g, _) => g,
+        };
+        match (first, extra) {
+            (None, Some(x)) => self.add(PRICES[x.row()], area),
+            (Some(f), x) => {
+                self.add(PRICES[f.row()], area);
+                if let Some(x) = x {
+                    self.add(PRICES[x.row()], area);
+                }
+            }
+            (None, None) => self.add(if t != 0 { OVER } else { OPAQUE }, area),
+        }
+    }
 }

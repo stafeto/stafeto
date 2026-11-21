@@ -167,6 +167,36 @@ int strncmp(const char *a, const char *b, size_t n)
     return 0;
 }
 
+// memset for pixman's general path, which clears three scanline buffers of
+// 8 KiB on its stack before every operation it makes (pixman-general.c). The
+// word loop of the compiler's own version took 12 000 ticks for that, a call
+// of the general path; 64 bytes a step (four 16-byte stores) takes about a
+// fifth. The vector type compiles to stores of the SIMD registers, which the
+// service already uses (pixman's NEON paths).
+typedef unsigned char byte16 __attribute__((vector_size(16)));
+
+void *memset(void *dst, int c, size_t n)
+{
+    unsigned char *p = dst;
+    unsigned char b = (unsigned char)c;
+    if (n >= 64) {
+        byte16 v = {b, b, b, b, b, b, b, b, b, b, b, b, b, b, b, b};
+        while ((uintptr_t)p & 15) {
+            *p++ = b;
+            n--;
+        }
+        for (; n >= 64; n -= 64, p += 64) {
+            ((byte16 *)p)[0] = v;
+            ((byte16 *)p)[1] = v;
+            ((byte16 *)p)[2] = v;
+            ((byte16 *)p)[3] = v;
+        }
+    }
+    while (n--)
+        *p++ = b;
+    return dst;
+}
+
 double sqrt(double x) { return __builtin_sqrt(x); }
 float sqrtf(float x) { return __builtin_sqrtf(x); }
 double fabs(double x) { return __builtin_fabs(x); }

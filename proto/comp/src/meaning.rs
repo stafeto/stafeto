@@ -286,7 +286,7 @@ mod tests {
             assert_eq!(sample(&e, 10 + x, 21, (4, 2), flat), Some(0xFF40_8020));
         }
         // Between points 0 and 1 of the first row, a quarter of the way.
-        let ramp = |x: u32, _: u32| 0xFF00_0000 | x * 100;
+        let ramp = |x: u32, _: u32| 0xFF00_0000 | (x * 100);
         let got = sample(&e, 11, 20, (4, 2), ramp).unwrap() & 0xFF;
         // The centre of target point 1 is at 0.75 of source point 0's edge: 0.25
         // from the centre of point 0 towards 1: 25.
@@ -309,10 +309,7 @@ mod tests {
         e.alpha = 128;
         assert_eq!(mix(&e, 0x0000_FF00, 255, 0x0000_0000), 0x0000_8000);
         // Over a point below: the below is kept by what the alpha leaves.
-        assert_eq!(
-            mix(&e, 0x0000_FF00, 255, 0x00FF_0000),
-            0x007F_8000 + 0x0000_0000
-        );
+        assert_eq!(mix(&e, 0x0000_FF00, 255, 0x00FF_0000), 0x007F_8000);
         // The mask alone; with the alpha both multiply.
         e.transparency = TRANSPARENCY_MASK;
         assert_eq!(mix(&e, 0x00FF_FFFF, 0, 0x0001_0203), 0x0001_0203);

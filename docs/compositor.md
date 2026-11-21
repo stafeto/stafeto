@@ -348,6 +348,48 @@ soon as the commands are in the device's queue, and the driver says
 FLUSH of the first revision still waits inside the driver, for the programs
 that speak to the driver directly (the image of `gpu-probe`).
 
+Under a scene each element is charged by its class (`elements::classes`; the rows of
+`compositor::PRICES` after the black, the copy and the laying over): a stretch, turn or
+reflection with the nearest point or the bilinear mean, a copy or a laying over
+(`scale-nearest-copy`, `scale-nearest-over`, `scale-bilinear-copy`,
+`scale-bilinear-over`), a turn of a quarter with no stretch (`rotate90`, which pixman has
+a path of its own for), and a global alpha, a mask, or both with the points as they are
+(`alpha`, `mask`, `mask-alpha`); a stretched or turned element with an alpha or a mask pays
+for the stretch as a laying over and for the rows and points of the alpha or the mask
+(the sum errs high: both prices carry the combine). The prices are fitted to the shapes
+`px::calibration` measures under -icount for each kind (the shapes of the plain kinds
+narrower than 160 points, at two offsets of the target for the kinds that have a path of
+NEON of their own, with the source in both formats for the kinds that mix), with the margin
+of 15 % as for the plain ones; `services/compositor/src/measures.rs` holds the greatest
+ticks of every shape, and the test `the_constants_cover_the_measures_with_the_margin` holds
+the model at or above each by the margin. The call of the general path of pixman
+(`scale-*`, `alpha` and `mask` with a source of XRGB8888) is 5 700 to 6 000 ticks, against
+800 for a plain copy: the path clears three scanline buffers of 8 KiB on its stack before
+every operation (the shim's `memset` of `ports/pixman` does that in a fifth of the ticks
+the compiler's own took), so a dear element is a part of a line and the dearest (a
+bilinear stretch with a mask and an alpha: about 10 000 ticks of calls) fills a step
+with the calls alone.
+
+The layers of a band that cost more than a step holds are drawn in groups, a step each
+(`Scene::passes`, `Band::pass`): the elements that show something over the damage, in
+order, go to a group while its calls come to at most half of BAND_TICKS (`GROUP_CALLS`), a
+layer dearer than that is a group of its own, the black of the band is in the first group
+and the pointer's picture in the last; a place of the frame is as big as the dearest group
+allows, and its groups are drawn one after another on it, in order, so the picture is the
+one of the single step. A group with nothing to draw on the place is no step. A step of a
+scene also pays `ELEMENT_TERM` ticks (130 with the margin of 15 %) for every element that
+shows something over the damage: it makes the groups and asks each element if it has
+something on the band. A dear scene is therefore many steps (16 of the dearest elements
+over the whole screen take about 3 300 bands a frame, 70 periods at the cap of 47), and
+shows as `capped` and `late` in STATS; the cap of 47 bands a period stays.
+
+The first use of a combination of operation, formats and image flags (a transform, a
+filter, a mask, the position on the source) makes pixman scan its tables to find the path:
+about 6 500 ticks more than the same call later, and the 8 paths pixman caches are not
+enough for the combinations a scene makes. A step that makes such a call for the first
+time is that much longer than the model says (the longest steps of `comp-probe` under
+-icount are in the report of the step).
+
 The images pixman wraps around the buffers are kept in a ring of 32 (`lib/pixman`,
 `kept.rs`), the oldest going when a new one comes, and each is made when its buffer is
 posted (`Pixman::prepare`), so that no band makes it. The table also remembers, for each surface the
@@ -653,15 +695,24 @@ How a scene reaches the screen:
 - The direct frame (above) stays: the topmost element that shows something is
   the whole of a window of the first revision on the whole screen, with no turn,
   reflection, mask or transparency.
-- The service draws, so far, what its operations cover: an element is a copy of
-  the window's points (no transparency; an ARGB8888 window counts as XRGB8888) or
-  a laying over of them (the window's own alpha), at the scale of one, with no
-  turn, no reflection, no mask and no global alpha, the source rectangle on
-  whole points. SCENE_COMMIT refuses any other element with UNSUPPORTED
-  (`elements::drawable_now`), and the numbers no operation could make sense of
-  with INVALID (a source rectangle past its window, a mask that is not an A8
-  window of the target's size, an out of range field). The drawing of the rest
-  is the next step.
+- The service draws every element the numbers allow: the source rectangle (16.16
+  points of the window, a fraction of a point is fine) turned by the rotation and
+  reflected, stretched to the target rectangle, sampled by the nearest point or the
+  bilinear mean (the points outside the window are its edge's), and mixed as the
+  transparency says: none copies the points (the alpha byte is not read), the
+  window's own alpha lays them over, the global alpha and the mask multiply them
+  (the window's own alpha counts only when its bit is set), the mask is an A8 window
+  of the target rectangle's size and is not stretched. SCENE_COMMIT refuses
+  the numbers no drawing could make sense of with INVALID (a source rectangle past
+  its window, a mask that is not an A8 window of the target's size, an out of range
+  field). The meaning of every field, point by point, is `proto_comp::meaning`,
+  which the host tests and the probe hold the drawing to. A plain element (the scale
+  of one on whole points, no turn, no reflection, none or the window's alpha) is a
+  copy or a laying over as before; the others are one call of pixman through its
+  transform (`elements::matrix`: the steps are the source sides over the target
+  sides rounded to 16.16, an error of half a unit a point), and a mask with an
+  alpha is made in the work band first (an A8 surface of 16 lines of 640 points)
+  and laid on as the mask.
 - Input: the keys go to the window with the focus (the scene gives it with MANAGE
   FOCUS); the pointer's moves and buttons go to the scene's ring as events of the
   screen's coordinates and to no window. The pointer's picture is the cursor

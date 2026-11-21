@@ -24,7 +24,7 @@
 //! | INJECT (23) | input | one event of 16 bytes | the status alone | INVALID, NOT_ALLOWED |
 //! | SET (24) | window | `property`, `value` (u32) | the status alone | INVALID, UNSUPPORTED, NOT_ALLOWED, REVOKED |
 //! | STATS (25) | context, window, manager, input | `flags` (u32) | status, 17 counters, 33 buckets, `count` (u32), then `count` records of 32 bytes | INVALID, NOT_ALLOWED, REVOKED |
-//! | SCENE_COMMIT (26) | scene | `flags`, `bg`, `count` (u32), then `count` records of 56 bytes | the status alone, at once | INVALID, NOT_ALLOWED, UNSUPPORTED |
+//! | SCENE_COMMIT (26) | scene | `flags`, `bg`, `count` (u32), then `count` records of 56 bytes | the status alone, at once | INVALID, NOT_ALLOWED |
 //! | SCENE_COMPOSE (27) | scene | `flags` (u32) | the status alone, at once | INVALID, NOT_ALLOWED, UNSUPPORTED, BUSY |
 //!
 //! The context is the `Display` session. A window is a session of its own
@@ -130,10 +130,11 @@
 //! SCENE_COMPOSE's bit 0 for COMPOSED (5) when the frame it made is over. A
 //! window that no element of the working scene shows gets the buffer it
 //! posted back at the taking (the bit of its number), and a FLUSH of the
-//! first revision on such a window is answered at once. The service draws what
-//! its operations cover and refuses at SCENE_COMMIT, with UNSUPPORTED, what
-//! they do not (`element_drawable` of the service); the refusals INVALID
-//! are for what no operation could.
+//! first revision on such a window is answered at once. The service draws every
+//! element whose numbers are in their places (the stretch, the turn, the
+//! reflection, the filter, the global alpha and the mask; `meaning` says what each
+//! field comes to point by point); SCENE_COMMIT refuses with INVALID what no
+//! drawing could make sense of.
 //!
 //! Input under a scene: the keys go to the window with the focus, which the
 //! scene gives by MANAGE FOCUS; the moves and buttons of the pointer go to
