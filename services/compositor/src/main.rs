@@ -58,9 +58,10 @@ use compositor::{
 use core::mem::ManuallyDrop;
 use core::slice;
 use proto_comp::{
-    Attach, BUFFER_MAX, Create, Description, EVENTS_BIT, Event, FOCUSED, INPUT_MARK, MANAGER_MARK,
-    MAX_EVENTS, Method as Comp, Post, RESET, Rect, SHOWN, STATS_WINDOWS, SetBody, StatsReply,
-    WindowRecord, WindowStats, manage, read_stats_request,
+    Attach, BUFFER_MAX, COMMITTED_BIT, COMPOSED_BIT, Create, Description, EVENTS_BIT, Event,
+    FOCUSED, INPUT_MARK, MANAGER_MARK, MAX_EVENTS, Method as Comp, Post, RESET, Rect, SCENE_MARK,
+    SHOWN, STATS_WINDOWS, SetBody, StatsReply, WindowRecord, WindowStats, manage,
+    read_scene_compose, read_stats_request,
 };
 use proto_gpu::{
     BUFFER_BYTES, BUSY, CLEARING, FORMATS_ARGB8888, FORMATS_XRGB8888, FRAME_FAILED, FRAME_SHOWN,
@@ -178,6 +179,12 @@ fn is_manager(label: u64) -> bool {
 
 fn is_input(label: u64) -> bool {
     label & INPUT_MARK != 0 && label & (OWN | WINDOW | DRIVER | MANAGER_MARK) == 0
+}
+
+/// A session of a holder of a scene: a context that is also a manager, and
+/// commits scenes. A clone of it (a child's) has OWN and is none of this.
+fn is_scene(label: u64) -> bool {
+    label & SCENE_MARK != 0 && label & (OWN | WINDOW | DRIVER | MANAGER_MARK | INPUT_MARK) == 0
 }
 
 /// What a window holds besides what the scene decides: the objects of its
@@ -391,6 +398,11 @@ struct Compositor {
     manager: Option<Handle<Channel>>,
     /// The label of the session that subscribed: only its end clears it.
     manager_label: u64,
+    /// Whether that session is the scene's (it holds the manager's ring too).
+    manager_scene: bool,
+    /// The scene session that committed a scene (0: none): its end ends the
+    /// scene.
+    scene_label: u64,
     /// The buffer of the window of the first revision, None when the driver
     /// gave none (OPEN is BUSY then). It is cleared a step at a time once its
     /// window has gone and the display does not show it (`cleared`: the
@@ -466,6 +478,8 @@ fn main(_: u64) -> u64 {
         axes: Axes::default(),
         manager: None,
         manager_label: 0,
+        manager_scene: false,
+        scene_label: 0,
         pool: PoolState::None,
         primary: None,
         cleared: None,
@@ -534,6 +548,7 @@ fn format_of(number: u32) -> Option<Format> {
     match number {
         proto_comp::FORMAT_XRGB8888 => Some(Format::Xrgb),
         proto_comp::FORMAT_ARGB8888 => Some(Format::Argb),
+        proto_comp::FORMAT_A8 => Some(Format::A8),
         _ => None,
     }
 }
@@ -1074,7 +1089,9 @@ impl Compositor {
     /// service's own marks nor init's are set, and one of the two device
     /// bits is.
     fn device_label(label: u64) -> Option<Which> {
-        if label & (OWN | WINDOW | DRIVER | MANAGER_MARK | INPUT_MARK | WINDOW_KEYS) != 0 {
+        if label & (OWN | WINDOW | DRIVER | MANAGER_MARK | INPUT_MARK | SCENE_MARK | WINDOW_KEYS)
+            != 0
+        {
             return None;
         }
         match label & !GENERATION {
@@ -1228,10 +1245,33 @@ impl Compositor {
                 let _ = sys::notify(notify, EVENTS_BIT);
             }
         }
-        if d.manager
+        let scene = self.scene.scene_bits();
+        let bits = if d.manager { EVENTS_BIT } else { 0 }
+            | if scene.committed { COMMITTED_BIT } else { 0 }
+            | if scene.composed { COMPOSED_BIT } else { 0 };
+        if bits != 0
             && let Some(manager) = &self.manager
         {
-            let _ = sys::notify(manager, EVENTS_BIT);
+            let _ = sys::notify(manager, bits);
+        }
+    }
+
+    /// What a taking gave back of the windows no element of the scene shows:
+    /// the bit of each buffer that is free again, and the answer of a FLUSH of
+    /// the first revision that has nothing to wait for.
+    fn release_given(&mut self) {
+        let given = self.scene.given_back();
+        for i in 0..MAX_WINDOWS {
+            if let Some(b) = given.freed[i]
+                && let Some(notify) = &self.extra[i].notify
+            {
+                let _ = sys::notify(notify, 1 << b);
+            }
+            if given.answered & (1 << i) != 0
+                && let Some(pending) = self.extra[i].queued.take()
+            {
+                let _ = pending.answer(&proto_wire::reply(Status::Ok), Outgoing::new());
+            }
         }
     }
 
@@ -1313,6 +1353,7 @@ impl Compositor {
                     }
                     let wake = self.pacer.nothing_taken(now);
                     self.arm(wake);
+                    self.deliver();
                 }
             }
             Fire::Continue => {
@@ -1330,7 +1371,9 @@ impl Compositor {
         if self.screen.is_none() || self.job.is_some() || self.committed {
             return false;
         }
-        let Some(damage) = self.scene.begin_at(k.unwrap_or(u64::MAX)) else {
+        let began = self.scene.begin_at(k.unwrap_or(u64::MAX));
+        self.release_given();
+        let Some(damage) = began else {
             return false;
         };
         for i in 0..MAX_WINDOWS {
@@ -1730,6 +1773,7 @@ impl Compositor {
             Refusal::Invalid => proto_comp::code(proto_comp::INVALID),
             Refusal::Busy => proto_comp::code(proto_comp::BUSY),
             Refusal::NotAllowed => proto_comp::code(proto_comp::NOT_ALLOWED),
+            Refusal::Unsupported => proto_comp::code(proto_comp::UNSUPPORTED),
         }
     }
 
@@ -1990,7 +2034,7 @@ impl Compositor {
         let wrote = r
             .reply()
             .u32(Status::Ok.code())
-            .and_then(|()| r.reply().u32(i as u32));
+            .and_then(|()| r.reply().u32(self.scene.window(i).map_or(0, |w| w.id)));
         if wrote.is_err() {
             self.destroy(i);
             return Answer::Status(Status::BadSize);
@@ -2017,7 +2061,9 @@ impl Compositor {
         if w.attached != 0 {
             return Answer::Status(proto_comp::code(proto_comp::BUSY));
         }
-        if u64::from(attach.stride) < u64::from(w.rect.w) * 4 || attach.bytes(w.rect.h) > BUFFER_MAX
+        if u64::from(attach.stride) < w.format.line(w.rect.w)
+            || (w.format == Format::A8 && !attach.stride.is_multiple_of(4))
+            || attach.bytes(w.rect.h) > BUFFER_MAX
         {
             return Answer::Status(proto_comp::code(proto_comp::INVALID));
         }
@@ -2167,7 +2213,7 @@ impl Compositor {
                 pace.settle(self.pacer.clock(), now);
             }
             if visible && let Some(pace) = self.scene.pace(i) {
-                records[count] = pace.record(i as u32);
+                records[count] = pace.record(self.scene.window(i).map_or(i as u32, |w| w.id));
                 count += 1;
             }
         }
@@ -2258,14 +2304,28 @@ impl Compositor {
         if (op == manage::SUBSCRIBE) != (r.handles.len() == 1) || r.handles.len() > 1 {
             return Answer::Status(Status::BadSize);
         }
-        let id = a as usize;
+        let scene = is_scene(r.label());
+        // The scene's holder is the one manager once it has subscribed or has
+        // committed a scene.
+        if !compositor::manage_allowed(self.holder(), self.scene_label != 0, scene) {
+            return Answer::Status(proto_comp::code(proto_comp::NOT_ALLOWED));
+        }
+        // The window of an id: the live window that has it (a window that went
+        // has no id any more, though its place may hold another window).
+        let id = self.scene.place_of(a).unwrap_or(usize::MAX);
         let result = match op {
             manage::SUBSCRIBE => {
+                if !compositor::subscribe_allowed(self.holder(), scene)
+                    || (scene && self.manager.is_some() && self.manager_label != r.label())
+                {
+                    return Answer::Status(proto_comp::code(proto_comp::BUSY));
+                }
                 let Ok(notify) = r.handles.take::<Channel>(0) else {
                     return Answer::Status(proto_comp::code(proto_comp::INVALID));
                 };
                 self.manager = Some(notify);
                 self.manager_label = r.label();
+                self.manager_scene = scene;
                 self.scene.set_manager(true);
                 Ok(())
             }
@@ -2298,7 +2358,7 @@ impl Compositor {
                 flags |= FOCUSED;
             }
             records[depth] = WindowRecord {
-                id: u32::from(k),
+                id: w.id,
                 x: w.rect.x,
                 y: w.rect.y,
                 w: w.rect.w,
@@ -2311,6 +2371,67 @@ impl Compositor {
             Ok(()) => Answer::Reply(Outgoing::new()),
             Err(status) => Answer::Status(status),
         }
+    }
+
+    /// Who holds the subscription to the manager's ring.
+    fn holder(&self) -> compositor::Holder {
+        match (self.manager.is_some(), self.manager_scene) {
+            (false, _) => compositor::Holder::Unsubscribed,
+            (true, false) => compositor::Holder::Manager,
+            (true, true) => compositor::Holder::Scene,
+        }
+    }
+
+    /// SCENE_COMMIT: the scene of the session's windows (proto_comp).
+    fn scene_commit(&mut self, r: &mut Request<'_>) -> Answer {
+        // The scene is parsed into the place the scenes keep for it, with no
+        // copy of a whole scene (a copy is a loop of bytes on this target).
+        let flags = match self.scene.commit_slot().parse(r.body()) {
+            Ok(flags) => flags,
+            Err(status) => return Answer::Status(status),
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        if !compositor::scene_allowed(self.holder())
+            || (self.scene_label != 0 && self.scene_label != r.label())
+        {
+            return Answer::Status(proto_comp::code(proto_comp::BUSY));
+        }
+        if let Err(refusal) = self
+            .scene
+            .commit_done(flags & proto_comp::ASK_COMMITTED != 0)
+        {
+            return Answer::Status(Compositor::refusal(refusal));
+        }
+        self.scene_label = r.label();
+        self.kick();
+        Answer::Status(Status::Ok)
+    }
+
+    /// SCENE_COMPOSE: the frame of a scene that is composed on request.
+    fn scene_compose(&mut self, r: &mut Request<'_>) -> Answer {
+        let flags = match read_scene_compose(r.body()) {
+            Ok(flags) => flags,
+            Err(status) => return Answer::Status(status),
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        if !compositor::scene_allowed(self.holder())
+            || (self.scene_label != 0 && self.scene_label != r.label())
+        {
+            return Answer::Status(proto_comp::code(proto_comp::BUSY));
+        }
+        if let Err(refusal) = self
+            .scene
+            .scene_compose(flags & proto_comp::ASK_COMPOSED != 0)
+        {
+            return Answer::Status(Compositor::refusal(refusal));
+        }
+        self.scene_label = r.label();
+        self.kick();
+        Answer::Status(Status::Ok)
     }
 
     /// INJECT: an event as a device would have made it.
@@ -2345,6 +2466,8 @@ const METHODS: &[u16] = &[
     Comp::Inject.number(),
     Comp::Set.number(),
     Comp::Stats.number(),
+    Comp::SceneCommit.number(),
+    Comp::SceneCompose.number(),
 ];
 
 /// Which windows a STATS shows its session.
@@ -2366,6 +2489,16 @@ impl Service<1> for Compositor {
         let comp = Comp::from_number(method);
         if is_manager(label) {
             return self.manager_request(method, r);
+        }
+        if is_scene(label) {
+            // The holder of a scene: its own methods and the manager's, and
+            // then what any context may.
+            match comp {
+                Some(Comp::SceneCommit) => return self.scene_commit(r),
+                Some(Comp::SceneCompose) => return self.scene_compose(r),
+                Some(Comp::Events | Comp::Manage) => return self.manager_request(method, r),
+                _ => {}
+            }
         }
         if is_input(label) {
             return match comp {
@@ -2425,13 +2558,23 @@ impl Service<1> for Compositor {
             }
             return;
         }
-        if is_manager(label) {
+        if is_manager(label) || is_scene(label) {
             if label == self.manager_label {
                 self.manager = None;
                 self.manager_label = 0;
+                self.manager_scene = false;
                 self.scene.set_manager(false);
             }
-            return;
+            if !is_scene(label) {
+                return;
+            }
+            // The holder of the scene went: the windows show as they did
+            // without one from the next frame, and its own windows go with it.
+            if label == self.scene_label {
+                self.scene_label = 0;
+                self.scene.scene_end();
+                self.kick();
+            }
         }
         if is_input(label) {
             return;

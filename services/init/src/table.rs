@@ -115,21 +115,37 @@ pub fn layer_grant(client: &Record, name: &[u8]) -> bool {
 }
 
 /// The label marks of the composition service's privileged sessions
-/// (proto_comp: MANAGER_MARK and INPUT_MARK): the clients the table names get a
-/// session of the compositor (the service `gpu`) with the mark, and nothing
-/// else gives one.
+/// (proto_comp: MANAGER_MARK, INPUT_MARK and SCENE_MARK): the clients the table
+/// names get a session of the compositor (the service `gpu`) with the mark, and
+/// nothing else gives one.
 pub const COMP_MANAGER_MARK: u64 = 1 << 60;
 pub const COMP_INPUT_MARK: u64 = 1 << 59;
+pub const COMP_SCENE_MARK: u64 = 1 << 54;
 /// The window manager of the images that have one, and the probe that stands
 /// in for it.
 pub const COMP_MANAGERS: &[&str] = &["wm", "focus-wm"];
 /// The programs that inject events as a device would: the probes only.
 pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject", "lvgl-inject", "frame-load"];
 
+/// The holders of a scene: the programs that put the windows of others on the
+/// screen (the probe of the scene, and the demo and probe of the library of
+/// OpenWF Composition). A record of POSIX may be one: its session with the
+/// compositor is made here, by init, as a CONNECT of the record's program asks
+/// it, so the mark needs nothing of the process service. The sessions a process
+/// of POSIX gives its children are clones, which carry no mark (the
+/// compositor's CLONE), and `exec` moves the session as it is.
+pub const COMP_SCENES: &[&str] = &["comp-probe-s"];
+
 /// The mark of the compositor's session that `client` gets by asking for
-/// `service`: the manager's, the input's, or none.
+/// `service`: the scene's, the manager's, the input's, or none.
 pub fn comp_mark(client: &Record, service: &[u8]) -> Option<u64> {
-    if service != b"gpu" || client.is_posix() {
+    if service != b"gpu" {
+        return None;
+    }
+    if COMP_SCENES.contains(&client.name) {
+        return Some(COMP_SCENE_MARK);
+    }
+    if client.is_posix() {
         return None;
     }
     if COMP_MANAGERS.contains(&client.name) {
@@ -4032,7 +4048,8 @@ mod tests {
                 "gpu",
                 "comp-probe",
                 "comp-probe-b",
-                "comp-probe-c"
+                "comp-probe-c",
+                "comp-probe-s"
             ]
         );
         assert_eq!(
@@ -4086,6 +4103,7 @@ mod tests {
     fn the_compositor_marks_go_to_the_manager_and_the_injector_only() {
         assert_eq!(COMP_MANAGER_MARK, proto_comp::MANAGER_MARK);
         assert_eq!(COMP_INPUT_MARK, proto_comp::INPUT_MARK);
+        assert_eq!(COMP_SCENE_MARK, proto_comp::SCENE_MARK);
         let named = |name: &str| focus::TABLE.iter().find(|r| r.name == name).unwrap();
         assert_eq!(
             comp_mark(named("focus-wm"), b"gpu"),
@@ -4124,10 +4142,57 @@ mod tests {
         assert_eq!(comp_mark(named("focus-wm"), b"clock"), None);
         // The marks are bits no label of init's count reaches, and apart from
         // the compositor's own.
-        for mark in [COMP_MANAGER_MARK, COMP_INPUT_MARK] {
-            assert_eq!(mark & (1 << 63 | 1 << 62 | 1 << 61 | 1 << 58 | 1 << 57), 0);
+        for mark in [COMP_MANAGER_MARK, COMP_INPUT_MARK, COMP_SCENE_MARK] {
+            assert_eq!(
+                mark & (1 << 63 | 1 << 62 | 1 << 61 | 1 << 58 | 1 << 57 | 1 << 56 | 1 << 55),
+                0
+            );
         }
         assert_eq!(COMP_MANAGER_MARK & COMP_INPUT_MARK, 0);
+        assert_eq!(COMP_SCENE_MARK & (COMP_MANAGER_MARK | COMP_INPUT_MARK), 0);
+    }
+
+    /// The scene's mark goes to the records `COMP_SCENES` names, by the name of
+    /// the compositor, and to no other, a record of POSIX included (the scene
+    /// holder may be a process of POSIX); a record of POSIX that no table names
+    /// has no mark whatever it is called.
+    #[test]
+    fn the_scene_mark_goes_to_the_named_holders_only_posix_ones_too() {
+        let scene = comp::TABLE
+            .iter()
+            .find(|r| r.name == "comp-probe-s")
+            .expect("the image of the compositor's probe has a scene holder");
+        assert_eq!(comp_mark(scene, b"gpu"), Some(COMP_SCENE_MARK));
+        assert_eq!(comp_mark(scene, b"clock"), None);
+        let posix = |name: &'static str| Record {
+            name,
+            connects: &["gpu", PROCESS_SERVICE],
+            ..*scene
+        };
+        assert!(posix("p").is_posix());
+        assert_eq!(
+            comp_mark(&posix("comp-probe-s"), b"gpu"),
+            Some(COMP_SCENE_MARK)
+        );
+        assert_eq!(comp_mark(&posix("posix-app"), b"gpu"), None);
+        // The others of the compositor's image have no scene mark.
+        for record in comp::TABLE.iter().filter(|r| r.name != "comp-probe-s") {
+            assert_ne!(
+                comp_mark(record, b"gpu"),
+                Some(COMP_SCENE_MARK),
+                "{}",
+                record.name
+            );
+        }
+        // Every holder the table names is a record of some image.
+        for name in COMP_SCENES {
+            assert!(
+                [comp::TABLE]
+                    .iter()
+                    .any(|t| t.iter().any(|r| r.name == *name)),
+                "{name}"
+            );
+        }
     }
 
     /// The games image is the shell's dialog with the launcher's quota of
