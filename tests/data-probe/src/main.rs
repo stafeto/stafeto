@@ -332,8 +332,15 @@ fn load(c: &Client, level: u8) -> Result<(), Fail> {
         .ok_or("no phase has the file load")?;
     let wait = schedule.start_of(first).saturating_sub(now());
     sleep(level, wait);
+    // The end of the last phase that has the file load.
+    let files_end = frame_load::phases::ORDER
+        .iter()
+        .rev()
+        .find(|p| p.loads().files)
+        .map_or(0, |&p| schedule.end_of(p));
     let (mut ops, mut bytes) = (0u64, 0u64);
     while schedule.at(now()).is_some_and(|p| p.loads().files) {
+        let began = now();
         match loads::file_op(ops) {
             FileOp::Write { salt, .. } => {
                 wire(c.put(loads::TEMPORARY, FILE_BYTES, salt), "put tmp")?;
@@ -354,6 +361,11 @@ fn load(c: &Client, level: u8) -> Result<(), Fail> {
             }
         }
         ops += 1;
+        // The rest that keeps the load to its share (`loads::FILE_SHARE_PPM`), cut at the end
+        // of the last phase that has the load so that the cleanup below runs at the boundary.
+        let after = now();
+        let rest = loads::rest_ns(after.saturating_sub(began));
+        sleep(level, rest.min(files_end.saturating_sub(after)));
     }
     // What the load made goes: a file of a slot and a temporary one the stop
     // came in the middle of.
