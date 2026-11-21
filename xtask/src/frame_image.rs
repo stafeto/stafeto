@@ -109,6 +109,11 @@ pub fn images() -> Result<(), String> {
     Ok(())
 }
 
+/// The operations the file load makes in a run at least. It keeps to a quarter of the time
+/// (`FILE_SHARE_PPM`) and an operation of 64 KiB takes about 135 ms, so the four phases that
+/// have it (16 s) hold about 30 of them (29 in a local run); half of that is the bound.
+pub const FILE_OPS_MIN: u64 = 15;
+
 /// What a load printed, by the lines of the run.
 fn number_after(lines: &[String], prefix: &str, word: &str) -> Option<u64> {
     let line = lines.iter().find(|l| l.starts_with(prefix))?;
@@ -180,6 +185,11 @@ pub fn loads_verdict(lines: &[String]) -> Result<String, String> {
     let ops = number_after(lines, "data-probe: load ops", "ops")
         .filter(|n| *n > 0)
         .ok_or("the file load did no operation")?;
+    if ops < FILE_OPS_MIN {
+        return Err(format!(
+            "the file load did {ops} operations ({FILE_OPS_MIN} at least)"
+        ));
+    }
     said.push(format!("net rounds {rounds}"));
     said.push(format!("file ops {ops}"));
     Ok(said.join(", "))
@@ -295,6 +305,19 @@ mod tests {
                 .unwrap_err()
                 .contains("never said done")
         );
+    }
+
+    #[test]
+    fn a_file_load_that_did_too_little_fails() {
+        let mut lines = good();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("data-probe: load ops"))
+            .unwrap();
+        lines[at] = format!("data-probe: load ops {} bytes 1", FILE_OPS_MIN - 1);
+        assert!(loads_verdict(&lines).unwrap_err().contains("operations"));
+        lines[at] = format!("data-probe: load ops {FILE_OPS_MIN} bytes 1");
+        assert!(loads_verdict(&lines).is_ok());
     }
 
     #[test]

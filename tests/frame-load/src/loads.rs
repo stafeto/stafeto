@@ -62,6 +62,20 @@ pub const fn byte(k: usize, salt: u32) -> u8 {
         .wrapping_add((k >> 8) as u32) as u8
 }
 
+/// The share of the processor the file load keeps for itself, in parts per million of the
+/// time: a quarter. The load is a client at 30 and the work of its operations is done by the
+/// data service's worker, which no budget holds on one CPU, so the load holds itself: it
+/// rests after each operation for the time the operation took, scaled so that the operations
+/// are a quarter of the time. The CPU load at 29 and the frame's services above 32 count on
+/// this share in the floors of `frame-probe`.
+pub const FILE_SHARE_PPM: u64 = 250_000;
+
+/// The rest after an operation that took `busy_ns` of the clock: what makes the operations
+/// `FILE_SHARE_PPM` of the time (three times the operation at a quarter).
+pub const fn rest_ns(busy_ns: u64) -> u64 {
+    busy_ns * (1_000_000 - FILE_SHARE_PPM) / FILE_SHARE_PPM
+}
+
 /// The bytes one TCP round of the network load sends there and back: 64 KiB,
 /// in pieces of `NET_PIECE`.
 pub const NET_ROUND: usize = 64 * 1024;
@@ -109,6 +123,19 @@ mod tests {
             check(&files, tmp);
         }
         files
+    }
+
+    #[test]
+    fn the_rest_makes_the_operations_a_quarter_of_the_time() {
+        assert_eq!(rest_ns(0), 0);
+        for busy in [1_000u64, 135_000_000, 4_166_667] {
+            let rest = rest_ns(busy);
+            // The share of the cycle (operation and rest) the operation is, within a
+            // part per million of rounding.
+            let share = busy * 1_000_000 / (busy + rest);
+            assert!(share.abs_diff(FILE_SHARE_PPM) <= 1_000, "{busy}: {share}");
+        }
+        assert_eq!(rest_ns(100), 300);
     }
 
     #[test]

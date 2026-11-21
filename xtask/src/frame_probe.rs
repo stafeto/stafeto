@@ -85,6 +85,43 @@ fn service_share_ppm() -> u64 {
     (u64::from(frame_cap_bands()) * BAND + 3 * STEP) * 1_000_000 / (DEFAULT_PERIOD_NS / TICK_NS)
 }
 
+/// The share of the processor the service takes in a phase of the scene P or D, in parts per
+/// million: the greatest time to compose of a frame over the period, taking one frame in each
+/// period (the worst the phase shows).
+fn compose_share_ppm(compose_max_us: u64) -> u64 {
+    compose_max_us * 1_000_000 / (compositor::frame::DEFAULT_PERIOD_NS / 1_000)
+}
+
+/// The share of its loop alone the CPU load is promised in a phase that has the file load:
+/// the processor less the compositor (`service_ppm`), less the budgets of the services above
+/// the compositor, less the budget the file load keeps itself to (`FILE_SHARE_PPM`). Nothing
+/// when they take it all.
+fn files_floor_ppm(service_ppm: u64) -> u64 {
+    1_000_000u64
+        .saturating_sub(service_ppm)
+        .saturating_sub(budgets_share_ppm())
+        .saturating_sub(frame_load::loads::FILE_SHARE_PPM)
+}
+
+/// The share of its loop alone the CPU load made in `phase` against the floor `files_floor_ppm`
+/// gives for the compositor's share `service_ppm`: `(share, floor)`, or what the phase got
+/// when it fell short. A share of nothing fails whatever the floor.
+fn hog_share(lines: &[String], phase: Phase, service_ppm: u64) -> Result<(u64, u64), String> {
+    let alone = loops(lines, Phase::Quiet).unwrap_or(0);
+    let share = loops(lines, phase)
+        .map(|n| n * 1_000_000 / alone.max(1))
+        .unwrap_or(0);
+    let floor = files_floor_ppm(service_ppm);
+    if share == 0 || share < floor {
+        return Err(format!(
+            "the CPU load got {} of the loop alone (floor {}) under the file load",
+            frac(share),
+            frac(floor)
+        ));
+    }
+    Ok((share, floor))
+}
+
 /// A tick count in microseconds.
 fn us(ticks: u64) -> u64 {
     ticks * TICK_NS / 1_000
@@ -494,8 +531,17 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                         ));
                     }
                 }
+                // A phase with the file load also keeps the CPU load its share.
+                let hog = if timed && phase.loads().files {
+                    let (share, floor) =
+                        hog_share(lines, phase, compose_share_ppm(p.compose_max_us))
+                            .map_err(|e| format!("{name}: {e}"))?;
+                    format!(", cpu share {} (floor {})", frac(share), frac(floor))
+                } else {
+                    String::new()
+                };
                 said.push(format!(
-                    "frame-probe: {name}: {} frames, late {}, skipped {}, compose max {} ms (bound {} ms)",
+                    "frame-probe: {name}: {} frames, late {}, skipped {}, compose max {} ms (bound {} ms){hog}",
                     p.frames,
                     p.late,
                     p.skipped,
@@ -525,22 +571,11 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                         p.frames
                     ));
                 }
-                let alone = loops(lines, Phase::Quiet).unwrap_or(0);
-                let share = loops(lines, phase)
-                    .map(|n| n * 1_000_000 / alone.max(1))
-                    .unwrap_or(0);
                 // What the levels below the service are promised: the period less the
-                // service and the budgets above it, none when they take it all.
-                let floor = 1_000_000u64
-                    .saturating_sub(service_share_ppm())
-                    .saturating_sub(budgets_share_ppm());
-                if share == 0 || share < floor {
-                    return fail(format!(
-                        "the CPU load got {} of the loop alone (floor {})",
-                        frac(share),
-                        frac(floor)
-                    ));
-                }
+                // service, the budgets above it and the file load's share, none when they
+                // take it all.
+                let (share, floor) = hog_share(lines, phase, service_share_ppm())
+                    .map_err(|e| format!("{name}: {e}"))?;
                 said.push(format!(
                     "frame-probe: full-loaded: 240 periods, frames {}, late {}, skipped {}, compose max {} ms (bound {} ms, {per} bands under all the loads), cpu share {} (floor {})",
                     p.frames,
@@ -643,8 +678,16 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                         ));
                     }
                 }
+                let hog = if timed {
+                    let (share, floor) =
+                        hog_share(lines, phase, compose_share_ppm(p.compose_max_us))
+                            .map_err(|e| format!("{name}: {e}"))?;
+                    format!(", cpu share {} (floor {})", frac(share), frac(floor))
+                } else {
+                    String::new()
+                };
                 said.push(format!(
-                    "frame-probe: direct: {} frames, all direct, late {}, skipped {}, compose max {} ms (bound {} ms)",
+                    "frame-probe: direct: {} frames, all direct, late {}, skipped {}, compose max {} ms (bound {} ms){hog}",
                     p.frames,
                     p.late,
                     p.skipped,
@@ -1061,6 +1104,54 @@ mod tests {
         // 16 328 and 3 steps at 18 369 over a period of 1 041 666 ticks.
         let ticks = u64::from(frame_cap_bands()) * BAND + 3 * STEP;
         assert_eq!(service_share_ppm(), ticks * 1_000_000 / (period / TICK_NS));
+    }
+
+    /// The floor of the CPU load under the file load is the processor less the compositor, the
+    /// budgets above it and the file load's share, and nothing when they take it all.
+    #[test]
+    fn the_floor_of_the_cpu_load_counts_the_file_loads_share() {
+        let budgets = budgets_share_ppm();
+        assert_eq!(
+            files_floor_ppm(0),
+            1_000_000 - budgets - frame_load::loads::FILE_SHARE_PPM
+        );
+        assert!(
+            files_floor_ppm(0) > 0,
+            "the budgets and the file load leave room"
+        );
+        assert_eq!(files_floor_ppm(compose_share_ppm(1_000_000)), 0);
+        // One millisecond of composing in a period of 16.67 ms is 6 %.
+        assert_eq!(compose_share_ppm(1_000), 60_002);
+        assert_eq!(
+            files_floor_ppm(compose_share_ppm(1_000)),
+            files_floor_ppm(0) - 60_002
+        );
+        // The whole screen at the cap leaves nothing: the share only has to be above 0.
+        assert_eq!(files_floor_ppm(service_share_ppm()), 0);
+    }
+
+    #[test]
+    fn the_cpu_load_under_the_file_load_must_reach_the_floor() {
+        let lines = |files: u64| {
+            vec![
+                "frame-load: cpu quiet loops-per-s 1000000".to_owned(),
+                format!("frame-load: cpu files loops-per-s {files}"),
+            ]
+        };
+        let compose = compose_share_ppm(1_000);
+        let floor = files_floor_ppm(compose);
+        let at = floor; // the quiet loop is 1 000 000, so loops and parts per million agree
+        assert_eq!(
+            hog_share(&lines(at), Phase::Files, compose),
+            Ok((at, floor))
+        );
+        assert!(hog_share(&lines(at - 1), Phase::Files, compose).is_err());
+        // Starved: nothing, and with a floor of 0 as well.
+        assert!(hog_share(&lines(0), Phase::Files, compose).is_err());
+        assert!(hog_share(&lines(0), Phase::Files, 1_000_000).is_err());
+        assert!(hog_share(&lines(1), Phase::Files, 1_000_000).is_ok());
+        // No line of the phase is a share of nothing.
+        assert!(hog_share(&lines(5)[..1], Phase::Files, 1_000_000).is_err());
     }
 
     /// The image the probe boots has its compositor on the frame clock at the defaults the cap is
