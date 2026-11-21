@@ -5,8 +5,10 @@
 //! rectangle of the screen's bytes black, and the points of a window's
 //! buffer replacing or lying over those of the screen.
 
-use compositor::{Format, Raster};
-use pixman::{Format as Px, Images, Source, Target, composite, fill, prepare};
+use compositor::{Draw, Format, Raster};
+use pixman::{
+    Filter, Format as Px, Images, Mask, Source, Target, composite, composite_element, fill, prepare,
+};
 use proto_comp::Rect;
 use proto_gpu::{HEIGHT, STRIDE, WIDTH};
 
@@ -26,13 +28,12 @@ pub struct Pixman {
 // window, the screen, the pointer's picture and the pool.
 const _: () = assert!(pixman::KEPT >= compositor::MAX_WINDOWS * proto_comp::BUFFERS + 3);
 
-/// The pixman format of a window's points; None for a mask (FORMAT_A8), which
-/// no operation of a band reads yet.
-const fn format(f: Format) -> Option<Px> {
+/// The pixman format of a window's points.
+const fn format(f: Format) -> Px {
     match f {
-        Format::Xrgb => Some(Px::Xrgb8888),
-        Format::Argb => Some(Px::Argb8888),
-        Format::A8 => None,
+        Format::Xrgb => Px::Xrgb8888,
+        Format::Argb => Px::Argb8888,
+        Format::A8 => Px::A8,
     }
 }
 
@@ -597,12 +598,9 @@ impl Pixman {
     /// The image of a window's buffer is made now (a post), so that no band
     /// pays for the first use of a surface.
     pub fn prepare(&mut self, src: &[u8], stride: u32, f: Format, size: (u32, u32), image: usize) {
-        let Some(px) = format(f) else {
-            return;
-        };
         let source = Source {
             bytes: src,
-            format: px,
+            format: format(f),
             stride,
             width: size.0,
             height: size.1,
@@ -673,9 +671,6 @@ impl Raster for Pixman {
         over: bool,
         image: usize,
     ) {
-        let Some(px) = format(f) else {
-            return;
-        };
         let mut target = Target {
             bytes: fb,
             format: Px::Xrgb8888,
@@ -685,7 +680,7 @@ impl Raster for Pixman {
         };
         let source = Source {
             bytes: src,
-            format: px,
+            format: format(f),
             stride,
             width: size.0,
             height: size.1,
@@ -704,6 +699,100 @@ impl Raster for Pixman {
             rt::time::now() - began,
         );
     }
+
+    fn element(&mut self, fb: &mut [u8], d: &Draw<'_>) {
+        let mut target = Target {
+            bytes: fb,
+            format: Px::Xrgb8888,
+            stride: STRIDE,
+            width: WIDTH,
+            height: HEIGHT,
+        };
+        #[cfg(feature = "steps")]
+        let began = rt::time::now();
+        if !draw(&mut self.images, &mut target, d) {
+            self.refuse("an element");
+        }
+        #[cfg(feature = "steps")]
+        cost::record(
+            if d.transparency == 0 {
+                cost::COPY
+            } else {
+                cost::OVER
+            },
+            u64::from(d.area.w),
+            u64::from(d.area.h),
+            rt::time::now() - began,
+        );
+    }
+}
+
+/// The A8 mask window's surface as pixman's source.
+fn plane(m: compositor::Surface<'_>) -> Source<'_> {
+    Source {
+        bytes: m.bytes,
+        format: Px::A8,
+        stride: m.stride,
+        width: m.size.0,
+        height: m.size.1,
+        hint: m.image,
+    }
+}
+
+/// One element's drawing onto `target`: pixman's composite of its source
+/// through its transform, with the alpha or the mask its transparency says. A
+/// source with no transparency bit of its own alpha is read as XRGB8888 (its
+/// alpha byte is not read, as the element's meaning has it).
+fn draw(images: &mut Images, target: &mut Target<'_>, d: &Draw<'_>) -> bool {
+    use proto_comp::{TRANSPARENCY_ALPHA, TRANSPARENCY_MASK, TRANSPARENCY_SOURCE};
+    let t = d.transparency;
+    let kind = match (d.src.format, t & TRANSPARENCY_SOURCE != 0) {
+        (Format::Argb, false) => Px::Xrgb8888,
+        (f, _) => format(f),
+    };
+    let source = Source {
+        bytes: d.src.bytes,
+        format: kind,
+        stride: d.src.stride,
+        width: d.src.size.0,
+        height: d.src.size.1,
+        hint: d.src.image,
+    };
+    let mask = match (
+        d.mask,
+        t & TRANSPARENCY_MASK != 0,
+        t & TRANSPARENCY_ALPHA != 0,
+    ) {
+        (Some((m, at)), true, false) => Mask::Plane {
+            source: plane(m),
+            at,
+        },
+        (Some((m, at)), true, true) => Mask::Product {
+            source: plane(m),
+            at,
+            alpha: d.alpha,
+        },
+        (_, false, true) => Mask::Alpha(d.alpha),
+        (_, false, false) => Mask::None,
+        // The mask bit with no mask: the band does not ask for it.
+        (None, true, _) => return false,
+    };
+    composite_element(
+        images,
+        t != 0,
+        target,
+        source,
+        d.matrix,
+        d.from,
+        if d.filter == proto_comp::BILINEAR {
+            Filter::Bilinear
+        } else {
+            Filter::Nearest
+        },
+        mask,
+        (d.area.x, d.area.y),
+        (d.area.w, d.area.h),
+    )
 }
 
 /// The prices of the three kinds measured on shapes of operations chosen for
@@ -1040,7 +1129,7 @@ pub mod calibration {
             };
             let source = Source {
                 bytes: src,
-                format: super::format(f).expect("a drawn format"),
+                format: super::format(f),
                 stride,
                 width: size.0,
                 height: size.1,

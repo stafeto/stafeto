@@ -38,6 +38,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+#[cfg(test)]
+mod element_tests;
 pub mod elements;
 pub mod fit;
 pub mod frame;
@@ -179,10 +181,18 @@ const fn price(
 /// (`compositor::fit`, `px::calibration`),
 /// measured under -icount, the same in `comp-probe` and in `focus-probe`
 /// (the run is deterministic). Every entry is a measure.
-pub const PRICES: [Price; 3] = [
+pub const PRICES: [Price; 11] = [
     price("black", 209, 2_400, false, 38, false),
     price("copy", 780, 5_480, false, 138, false),
     price("over", 785, 18_981, false, 427, false),
+    price("scale-nearest-copy", 1_000, 10_000, true, 1_000, true),
+    price("scale-nearest-over", 1_000, 10_000, true, 1_000, true),
+    price("scale-bilinear-copy", 1_000, 10_000, true, 4_000, true),
+    price("scale-bilinear-over", 1_000, 10_000, true, 4_000, true),
+    price("rotate90", 1_000, 10_000, true, 500, true),
+    price("alpha", 1_000, 10_000, true, 1_000, true),
+    price("mask", 1_000, 10_000, true, 1_000, true),
+    price("mask-alpha", 1_000, 10_000, true, 2_000, true),
 ];
 /// What every layer costs a band beyond its operation (ticks, for each window
 /// the band lays and for the pointer's picture), and what every band costs beyond
@@ -2003,52 +2013,62 @@ impl Scene {
                 && r.y < damage.y + damage.h
                 && damage.y < r.y + r.h
         };
-        let (mut opaque, mut over) = (0u32, 0u32);
-        let covered;
+        // What the layers cost: the calls, a price for each line of each, a
+        // price for each point of each (hundredths of a tick where it is a
+        // line or a point).
+        let (mut calls, mut per_row, mut per_point) = (0u32, 0u32, 0u32);
+        let mut charge = |p: Price, layer: u32| {
+            calls += p.call + layer;
+            per_row += p.row;
+            per_point += p.point;
+        };
+        let mut covered = false;
         if let Some(def) = self.working() {
             // Under a scene: each element that shows something and touches the
-            // damage is a copy (no transparency) or a laying over.
-            let mut whole = false;
+            // damage is charged by its classes (`elements::classes`).
             for e in def.elements() {
                 let Some(r) = self.element_place(e) else {
                     continue;
                 };
                 if touches(r) {
-                    if e.transparency == 0 {
-                        opaque += 1;
-                    } else {
-                        over += 1;
+                    let (first, second) = elements::classes(e);
+                    charge(PRICES[first.row()], LAYER);
+                    if let Some(second) = second {
+                        // The second operation of an element is its alpha or
+                        // mask: a call of its own, no second layer.
+                        charge(PRICES[second.row()], 0);
                     }
-                    whole |= e.transparency == 0 && covers_rect(r, damage);
+                    covered |= e.transparency == 0 && covers_rect(r, damage);
                 }
             }
-            covered = whole;
         } else {
             for w in self.windows.iter().flatten() {
                 if Scene::shown(w) && touches(w.rect) {
-                    if w.format == Format::Argb {
-                        over += 1;
-                    } else {
-                        opaque += 1;
-                    }
+                    charge(
+                        if w.format == Format::Argb {
+                            OVER
+                        } else {
+                            OPAQUE
+                        },
+                        LAYER,
+                    );
                 }
             }
             covered = self.windows.iter().flatten().any(|w| {
                 Scene::shown(w) && w.format == Format::Xrgb && covers_rect(w.rect, damage)
             });
         }
-        over += u32::from(
-            self.drawn_pointer()
-                .is_some_and(|p| touches(Scene::cursor_rect(p))),
-        );
-        let fill = u32::from(!covered);
-        // What the layers cost: the calls, a price for each line of each, a
-        // price for each point of each (hundredths of a tick where it is a
-        // line or a point).
-        let calls =
-            OPAQUE.call * opaque + OVER.call * over + FILL.call * fill + LAYER * (opaque + over);
-        let per_row = OPAQUE.row * opaque + OVER.row * over + FILL.row * fill;
-        let per_point = OPAQUE.point * opaque + OVER.point * over + FILL.point * fill;
+        if self
+            .drawn_pointer()
+            .is_some_and(|p| touches(Scene::cursor_rect(p)))
+        {
+            charge(OVER, LAYER);
+        }
+        if !covered {
+            calls += FILL.call;
+            per_row += FILL.row;
+            per_point += FILL.point;
+        }
         band_size(calls, per_row, per_point, damage.w)
     }
 }
@@ -2110,8 +2130,9 @@ fn fills_the_screen(e: &Element) -> bool {
 
 impl Scene {
     /// SCENE_COMMIT: the scene becomes the pending one. Refused INVALID for a
-    /// number the windows make wrong, UNSUPPORTED for an element no operation
-    /// of the service draws (`elements::check`). A scene that composes by
+    /// number the windows make wrong, UNSUPPORTED for a scene whose calls no
+    /// band could hold (`elements::check`): every element the numbers allow
+    /// is drawn. A scene that composes by
     /// itself damages what changed from the scene before it (the pending one,
     /// or the working one), and a taking makes it the working one whole; a
     /// scene composed on request only keeps the damage for SCENE_COMPOSE, and
@@ -2399,6 +2420,43 @@ pub trait Raster {
         over: bool,
         image: usize,
     );
+
+    /// An element's drawing: the points of `draw.src` carried to the screen by
+    /// the transform, with the mask or the global alpha (`Draw`).
+    fn element(&mut self, fb: &mut [u8], draw: &Draw<'_>);
+}
+
+/// A surface a band reads: a window's buffer (the points of a window of
+/// `format`, `stride` bytes a line, `size` points) and the number it has for
+/// the raster's table of images (`image_of`).
+#[derive(Clone, Copy, Debug)]
+pub struct Surface<'a> {
+    pub bytes: &'a [u8],
+    pub stride: u32,
+    pub format: Format,
+    pub size: (u32, u32),
+    pub image: usize,
+}
+
+/// What a band draws of an element that is not a plain copy or laying over: the
+/// area of the screen (`area`, cut to the band and the screen), the surface the
+/// points come from, and how they come (`matrix`, the map of the screen's
+/// points to the surface's, or none when the element is plain and the area's
+/// first point is at `from`; `filter`), and what they are mixed with: the
+/// element's `transparency` bits, the global `alpha` and the mask (an A8
+/// surface the size of the element's target rectangle, `mask_at` the point of
+/// it that goes with the area's first point). The meaning of every field is
+/// `proto_comp::meaning`'s.
+#[derive(Clone, Copy, Debug)]
+pub struct Draw<'a> {
+    pub src: Surface<'a>,
+    pub matrix: Option<[i32; 6]>,
+    pub from: (u32, u32),
+    pub filter: u32,
+    pub transparency: u32,
+    pub alpha: u8,
+    pub mask: Option<(Surface<'a>, (u32, u32))>,
+    pub area: Rect,
 }
 
 /// A place in the frame: the line, and the column from the damage's left edge,
@@ -2433,11 +2491,13 @@ pub fn compose(
 /// element that covers the band whole is its base (copied, so the elements
 /// under it are not drawn), and the band that no element covers whole starts
 /// as the background; the elements above lie over it in their order. What an
-/// element draws is its source rectangle's points at the scale of one (the
-/// operations of a band so far: `elements::drawable_now`), cut to the band and
-/// the screen; an element whose window has nothing taken or does not hold the
-/// source rectangle (a window of the number went and another took its place)
-/// draws nothing.
+/// element draws is its source rectangle carried to its target rectangle (the
+/// operations of a band: `Raster::blit` for a plain copy or laying over,
+/// `Raster::element` for the rest: the stretch, the turn, the reflection, the
+/// filter, the global alpha and the mask), cut to the band and the screen; an
+/// element whose window has nothing taken or does not hold the source
+/// rectangle (a window of the number went and another took its place), or
+/// whose mask is not there, draws nothing.
 fn compose_elements(
     scene: &Scene,
     def: &Def,
@@ -2478,21 +2538,88 @@ fn compose_elements(
         if ax0 >= ax1 || ay0 >= ay1 {
             continue;
         }
+        let area = Rect {
+            x: ax0 as u32,
+            y: ay0 as u32,
+            w: (ax1 - ax0) as u32,
+            h: (ay1 - ay0) as u32,
+        };
+        let plain = elements::is_plain(e);
         let from = (
-            (i64::from(e.sx) >> 16) + (ax0 - ex0),
-            (i64::from(e.sy) >> 16) + (ay0 - ey0),
+            ((i64::from(e.sx) >> 16) + (ax0 - ex0)) as u32,
+            ((i64::from(e.sy) >> 16) + (ay0 - ey0)) as u32,
         );
-        raster.blit(
+        let surface = Surface {
+            bytes: src.pixels(place, b),
+            stride: w.stride,
+            format: w.format,
+            size: (w.rect.w, w.rect.h),
+            image: image_of(place, b),
+        };
+        if plain && (e.transparency == 0 || e.transparency == proto_comp::TRANSPARENCY_SOURCE) {
+            raster.blit(
+                fb,
+                surface.bytes,
+                surface.stride,
+                surface.format,
+                surface.size,
+                from,
+                (ax0 as u32, ay0 as u32),
+                (area.w, area.h),
+                e.transparency == proto_comp::TRANSPARENCY_SOURCE,
+                surface.image,
+            );
+            continue;
+        }
+        // The mask is a window of its own: A8, the target rectangle's size, a
+        // buffer taken. Without one (the window went, was replaced by another
+        // of another shape, or has posted nothing) the element is the mask
+        // of nothing and draws nothing.
+        let mask = if e.transparency & proto_comp::TRANSPARENCY_MASK != 0 {
+            let Some(mp) = scene.place_of(e.mask) else {
+                continue;
+            };
+            let Some(mw) = scene.window(mp) else {
+                continue;
+            };
+            let Some(mb) = mw.current else {
+                continue;
+            };
+            if mw.format != Format::A8
+                || i64::from(mw.rect.w) != i64::from(e.dw)
+                || i64::from(mw.rect.h) != i64::from(e.dh)
+            {
+                continue;
+            }
+            Some((
+                Surface {
+                    bytes: src.pixels(mp, mb),
+                    stride: mw.stride,
+                    format: Format::A8,
+                    size: (mw.rect.w, mw.rect.h),
+                    image: image_of(mp, mb),
+                },
+                ((ax0 - ex0) as u32, (ay0 - ey0) as u32),
+            ))
+        } else {
+            None
+        };
+        raster.element(
             fb,
-            src.pixels(place, b),
-            w.stride,
-            w.format,
-            (w.rect.w, w.rect.h),
-            (from.0 as u32, from.1 as u32),
-            (ax0 as u32, ay0 as u32),
-            ((ax1 - ax0) as u32, (ay1 - ay0) as u32),
-            e.transparency == proto_comp::TRANSPARENCY_SOURCE,
-            image_of(place, b),
+            &Draw {
+                src: surface,
+                matrix: if plain {
+                    None
+                } else {
+                    Some(elements::matrix(e))
+                },
+                from,
+                filter: e.filter,
+                transparency: e.transparency,
+                alpha: e.alpha as u8,
+                mask,
+                area,
+            },
         );
     }
 }
@@ -2670,6 +2797,10 @@ mod tests {
                     };
                 }
             }
+        }
+
+        fn element(&mut self, _: &mut [u8], _: &Draw<'_>) {
+            panic!("these tests draw plain elements");
         }
     }
 
@@ -3627,6 +3758,10 @@ mod tests {
             self.calls += p.call;
             self.centi += p.row * area.1 + p.point * area.0 * area.1;
         }
+
+        fn element(&mut self, _: &mut [u8], _: &Draw<'_>) {
+            panic!("these tests draw plain elements");
+        }
     }
 
     /// The most ticks one band of the frame over `d` costs, by the model.
@@ -3727,6 +3862,7 @@ mod tests {
             ) {
                 self.0.push(image);
             }
+            fn element(&mut self, _: &mut [u8], _: &Draw<'_>) {}
         }
         struct Nothing;
         impl Source for Nothing {
@@ -3900,7 +4036,7 @@ mod tests {
         // figures: a copy 1.56 to 1.62 a point at 3 840 to 5 120 points, a layer
         // laid over others 5.78 at 480 points, the black 0.44 to 0.46) are under
         // the model with the constants: the model errs only high.
-        assert!(PRICES.iter().all(|p| !p.row_estimate && !p.point_estimate));
+        assert!(PRICES[..3].iter().all(|p| !p.row_estimate && !p.point_estimate));
         let model = |p: Price, w: u32, h: u32| -> u64 {
             u64::from(p.call)
                 + (u64::from(p.row) * u64::from(h)
@@ -4835,10 +4971,7 @@ mod tests {
 
     // ------------------------------------------------------------ the scene
 
-    use proto_comp::{
-        ACTIVE, ASK_COMMITTED, NO_WINDOW, ROTATION, SceneCommit, TRANSPARENCY_ALPHA,
-        TRANSPARENCY_SOURCE,
-    };
+    use proto_comp::{ACTIVE, ASK_COMMITTED, NO_WINDOW, SceneCommit, TRANSPARENCY_SOURCE};
 
     /// An element showing all of window `source` (`w` by `h` points) at (`x`, `y`).
     fn element(source: usize, x: i32, y: i32, w: i32, h: i32) -> Element {
@@ -4958,25 +5091,6 @@ mod tests {
             s.scene_commit(&commit(ACTIVE, 0, &[big])),
             Err(Refusal::Invalid)
         );
-        // A turn: no operation draws it, UNSUPPORTED, and so for a global alpha,
-        // a mask and a scale.
-        for change in [
-            (|e: &mut Element| e.orient = 1) as fn(&mut Element),
-            |e| e.orient = proto_comp::MIRROR,
-            |e| e.transparency = TRANSPARENCY_ALPHA,
-            |e| e.transparency = proto_comp::TRANSPARENCY_MASK,
-            |e| {
-                e.dw = 50;
-                e.dh = 25;
-            },
-        ] {
-            let mut e = element(0, 0, 0, 100, 50);
-            change(&mut e);
-            assert_eq!(
-                s.scene_commit(&commit(ACTIVE, 0, &[e])),
-                Err(Refusal::Unsupported)
-            );
-        }
         // A mask that is a window of the wrong format: INVALID.
         let mut e = element(0, 0, 0, 100, 50);
         e.transparency = proto_comp::TRANSPARENCY_MASK;
@@ -5540,18 +5654,5 @@ mod tests {
         assert_eq!(at_point(&fb, 5, 5), 0);
         assert_eq!(Format::A8.line(10), 12);
         assert_eq!(Format::Xrgb.line(10), 40);
-    }
-
-    #[test]
-    fn the_rotation_bits_name_a_turn_of_the_elements_that_the_service_refuses_for_now() {
-        let mut s = staged();
-        for turn in 1..=ROTATION {
-            let mut e = element(0, 0, 0, 100, 50);
-            e.orient = turn;
-            assert_eq!(
-                s.scene_commit(&commit(ACTIVE, 0, &[e])),
-                Err(Refusal::Unsupported)
-            );
-        }
     }
 }

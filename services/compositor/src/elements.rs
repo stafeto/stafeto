@@ -17,7 +17,9 @@
 //! source at the fraction below (the inverse of the turns and the
 //! reflection), and `target_of` is the map the other way round.
 
-use crate::{Format, HEIGHT, Rect, WIDTH};
+use crate::{
+    BAND_FIXED, BAND_TICKS, FILL, Format, HEIGHT, LAYER, OVER, PRICES, Price, Rect, WIDTH,
+};
 use proto_comp::{
     BILINEAR, Element, MAX_ELEMENTS, MIRROR, NO_WINDOW, ROTATION, SceneCommit, TRANSPARENCY_MASK,
     TRANSPARENCY_SOURCE, union,
@@ -120,20 +122,24 @@ pub enum Fault {
     /// A number out of its place: a window of the wrong format or too small
     /// for the rectangle.
     Invalid,
-    /// The service has no operation that draws the element.
+    /// The scene is dearer than one band can hold even at one point: its calls
+    /// alone (`band_floor`) are past BAND_TICKS.
     Unsupported,
 }
 
 /// The checks of a scene against the windows (`window` says the shape of the
-/// window with a number, or none): INVALID before UNSUPPORTED, so a scene
-/// that no service could draw is told so whatever comes before it.
+/// window with a number, or none):
 ///
 /// - the source window, when there is one, is not of FORMAT_A8 and holds the
 ///   source rectangle;
 /// - the mask, when the transparency has the mask bit and the window exists,
 ///   is of FORMAT_A8 and the size of the target rectangle (OpenWF
-///   Composition 7.1.9: a mask is not stretched);
-/// - then each element must be one the present operations draw.
+///   Composition 7.1.9: a mask is not stretched).
+///
+/// Every element the numbers allow is drawn: the service has an operation for
+/// each (`Class`), and a scene is refused (`Fault::Unsupported`) only when the
+/// calls of its elements cost more than a band holds even at one point
+/// (`band_floor`), after the numbers have been found right.
 pub fn check(def: &Def, window: impl Fn(u32) -> Option<Shape>) -> Result<(), Fault> {
     for e in def.elements() {
         if let Some(s) = window(e.source) {
@@ -160,26 +166,180 @@ pub fn check(def: &Def, window: impl Fn(u32) -> Option<Shape>) -> Result<(), Fau
             return Err(Fault::Invalid);
         }
     }
-    if def.elements().iter().all(drawable_now) {
-        Ok(())
-    } else {
-        Err(Fault::Unsupported)
+    if band_floor(def) > BAND_TICKS {
+        return Err(Fault::Unsupported);
     }
+    Ok(())
 }
 
-/// Whether the operations of a band that exist now draw the element: the
-/// copy and the laying over of the window's points as they are, at the scale
-/// of one, with no turn and no reflection, and no mask and no global alpha.
-/// The transparency is none (a copy: the points count as XRGB8888) or the
-/// window's own alpha (laid over). The filter does not matter at a scale of
-/// one. What this says no to the service refuses at SCENE_COMMIT.
-pub fn drawable_now(e: &Element) -> bool {
+/// What the smallest band the service makes (one point) can cost by the model
+/// at the most, in ticks: the fixed term of a band, the black, the pointer's
+/// picture, every element that lies over what is below it (the calls, the term of
+/// its layer, a row and a point), and the dearest of the elements that replace
+/// what is below (of those, the topmost that covers the point is the base, and
+/// what lies under it is not drawn, so only one is drawn at a point and the others
+/// that touch it are above it, laid over). It is over what a real band costs, so a
+/// scene under BAND_TICKS here makes bands within the bound.
+pub fn band_floor(def: &Def) -> u32 {
+    let price = |class: Class| price_of(PRICES[class.row()]);
+    let cost = |e: &Element| {
+        let (first, second) = classes(e);
+        LAYER + price(first) + second.map_or(0, price)
+    };
+    let (mut over, mut opaque) = (0u32, 0u32);
+    for e in def.elements() {
+        if e.transparency == 0 {
+            opaque = opaque.max(cost(e));
+        } else {
+            over += cost(e);
+        }
+    }
+    let pointer = LAYER + price_of(OVER);
+    BAND_FIXED + price_of(FILL) + pointer + over + opaque
+}
+
+/// The ticks of an operation of one point by the model.
+fn price_of(p: Price) -> u32 {
+    p.call + (p.row + p.point).div_ceil(100)
+}
+
+/// Whether an element shows the window's points as they are: one point of the
+/// window for one of the screen (the scale of one on whole points), no turn and
+/// no reflection. What a band draws of it is a copy or a laying over of the
+/// points (`Raster::blit`, the operations that came first), or, with a global
+/// alpha or a mask, an element's drawing with no transform.
+pub fn is_plain(e: &Element) -> bool {
     e.orient == 0
-        && (e.transparency == 0 || e.transparency == TRANSPARENCY_SOURCE)
         && e.sx & 0xFFFF == 0
         && e.sy & 0xFFFF == 0
         && i64::from(e.sw) == i64::from(e.dw) << 16
         && i64::from(e.sh) == i64::from(e.dh) << 16
+}
+
+/// The map of the screen's points to the window's that carries the target
+/// rectangle's points through the element's reflection, turn and stretch:
+/// `[a, b, c, d, e, f]` takes the centre (x, y) of a target point (in points of
+/// the screen) to the window's (a x + b y + c, d x + e y + f), all in 16.16.
+/// The steps are the source sides over the target sides, rounded to the
+/// nearest 16.16 (a ratio that is not a fraction of 16.16 has an error of half a
+/// unit a point: at most 0.005 of a point over the screen's width).
+pub fn matrix(e: &Element) -> [i32; 6] {
+    let (sx, sy) = (i64::from(e.sx), i64::from(e.sy));
+    let (sw, sh) = (i64::from(e.sw), i64::from(e.sh));
+    let (dw, dh) = (i64::from(e.dw.max(1)), i64::from(e.dh.max(1)));
+    // The ratio of a source side to a target side, rounded to the nearest.
+    let ratio = |s: i64, d: i64| (2 * s + d).div_euclid(2 * d);
+    let m = e.orient & MIRROR != 0;
+    let sign = |negative: bool| if negative { -1 } else { 1 };
+    // Each source axis: its value at the target rectangle's corner, and the
+    // step along the target's x (p) and y (q).
+    let ((ub, up, uq), (vb, vp, vq)) = match e.orient & ROTATION {
+        0 => (
+            (sx + if m { sw } else { 0 }, sign(m) * ratio(sw, dw), 0),
+            (sy, 0, ratio(sh, dh)),
+        ),
+        1 => (
+            (sx, 0, ratio(sw, dh)),
+            (sy + if m { 0 } else { sh }, -sign(m) * ratio(sh, dw), 0),
+        ),
+        2 => (
+            (sx + if m { 0 } else { sw }, -sign(m) * ratio(sw, dw), 0),
+            (sy + sh, 0, -ratio(sh, dh)),
+        ),
+        _ => (
+            (sx + sw, 0, -ratio(sw, dh)),
+            (sy + if m { sh } else { 0 }, sign(m) * ratio(sh, dw), 0),
+        ),
+    };
+    let at = |base: i64, p: i64, q: i64| -> [i32; 3] {
+        let origin = base - p * i64::from(e.dx) - q * i64::from(e.dy);
+        let fit = |n: i64| n.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        [fit(p), fit(q), fit(origin)]
+    };
+    let [a, b, c] = at(ub, up, uq);
+    let [d, f, g] = at(vb, vp, vq);
+    [a, b, c, d, f, g]
+}
+
+/// The kinds of operation a band charges for an element (the rows of
+/// `compositor::PRICES` after the black, in this order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// A plain copy of the points (no transparency, scale of one, no turn).
+    Copy = 1,
+    /// A plain laying over, by the window's own alpha.
+    Over = 2,
+    /// A stretch, turn or reflection with the nearest point: a copy, or a laying
+    /// over.
+    ScaleNearestCopy = 3,
+    ScaleNearestOver = 4,
+    /// The same with the bilinear mean.
+    ScaleBilinearCopy = 5,
+    ScaleBilinearOver = 6,
+    /// A copy turned a quarter or three quarters, with no stretch and no
+    /// reflection, nearest point (pixman has a path of its own for it).
+    Rotate90 = 7,
+    /// A global alpha with a plain placing; with a mask; with both.
+    Alpha = 8,
+    Mask = 9,
+    MaskAlpha = 10,
+}
+
+impl Class {
+    /// The row of `compositor::PRICES`.
+    pub const fn row(self) -> usize {
+        self as usize
+    }
+}
+
+/// What a band charges for an element: the operation of its geometry, and,
+/// for an alpha or a mask, the operation of that besides it. A plain element
+/// with an alpha or a mask is the one operation (its calibration is made with
+/// no transform); one that is stretched, turned or reflected pays for the
+/// stretch as a laying over, and for the alpha or the mask on top of it (the
+/// sum errs high: both prices have the call, the row and the combine).
+pub fn classes(e: &Element) -> (Class, Option<Class>) {
+    let plain = is_plain(e);
+    let bilinear = e.filter == BILINEAR;
+    let t = e.transparency;
+    let extra = match (
+        t & TRANSPARENCY_MASK != 0,
+        t & proto_comp::TRANSPARENCY_ALPHA != 0,
+    ) {
+        (true, true) => Some(Class::MaskAlpha),
+        (true, false) => Some(Class::Mask),
+        (false, true) => Some(Class::Alpha),
+        (false, false) => None,
+    };
+    if let Some(extra) = extra {
+        if plain {
+            return (extra, None);
+        }
+        let first = if bilinear {
+            Class::ScaleBilinearOver
+        } else {
+            Class::ScaleNearestOver
+        };
+        return (first, Some(extra));
+    }
+    let over = t & TRANSPARENCY_SOURCE != 0;
+    if plain {
+        return (if over { Class::Over } else { Class::Copy }, None);
+    }
+    let quarter = e.orient & ROTATION & 1 != 0
+        && e.orient & MIRROR == 0
+        && i64::from(e.sw) == i64::from(e.dh) << 16
+        && i64::from(e.sh) == i64::from(e.dw) << 16
+        && e.sx & 0xFFFF == 0
+        && e.sy & 0xFFFF == 0;
+    let class = match (bilinear, over) {
+        (false, false) if quarter => Class::Rotate90,
+        (false, false) => Class::ScaleNearestCopy,
+        (false, true) => Class::ScaleNearestOver,
+        (true, false) => Class::ScaleBilinearCopy,
+        (true, true) => Class::ScaleBilinearOver,
+    };
+    (class, None)
 }
 
 /// The window of an element the service shows nothing of as it is: no
@@ -429,11 +589,7 @@ mod tests {
                 _ => None,
             }
         };
-        // Whatever the mask is, UNSUPPORTED only after the numbers are right.
-        assert_eq!(
-            check(&d, with(shape(Format::A8, 100, 50))),
-            Err(Fault::Unsupported)
-        );
+        assert_eq!(check(&d, with(shape(Format::A8, 100, 50))), Ok(()));
         assert_eq!(
             check(&d, with(shape(Format::A8, 100, 49))),
             Err(Fault::Invalid)
@@ -446,7 +602,9 @@ mod tests {
             check(&d, with(shape(Format::Xrgb, 100, 50))),
             Err(Fault::Invalid)
         );
-        assert_eq!(check(&d, with(None)), Err(Fault::Unsupported));
+        // A mask window that is not there is not an error: the element shows
+        // nothing.
+        assert_eq!(check(&d, with(None)), Ok(()));
         // The mask of an element that does not have the bit is not looked at.
         let mut plain = el(1);
         plain.mask = 2;
@@ -457,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn what_no_operation_draws_is_unsupported_and_the_rest_is_drawn() {
+    fn every_element_the_numbers_allow_passes_the_check() {
         let window = |_: u32| shape(Format::Argb, 100, 50);
         let drawn = |change: fn(&mut Element)| {
             let mut e = el(1);
@@ -469,10 +627,10 @@ mod tests {
         assert_eq!(drawn(|e| e.filter = BILINEAR), Ok(()));
         assert_eq!(drawn(|e| e.dx = -50), Ok(()));
         assert_eq!(drawn(|e| e.dx = 5_000), Ok(()));
-        assert_eq!(drawn(|e| e.dw = 0), Err(Fault::Unsupported));
+        assert_eq!(drawn(|e| e.dw = 0), Ok(()));
         for what in [
             drawn(|e| e.orient = 1),
-            drawn(|e| e.orient = proto_comp::MIRROR),
+            drawn(|e| e.orient = 3 | proto_comp::MIRROR),
             drawn(|e| e.transparency = TRANSPARENCY_ALPHA),
             drawn(|e| e.transparency = TRANSPARENCY_ALPHA | TRANSPARENCY_SOURCE),
             drawn(|e| e.transparency = TRANSPARENCY_MASK),
@@ -481,36 +639,19 @@ mod tests {
                 e.sw = 99 << 16;
                 e.dw = 99;
             }),
-            drawn(|e| {
-                e.sy = 1;
-                e.sh = 49 << 16;
-                e.dh = 49;
-            }),
             drawn(|e| e.dw = 50),
             drawn(|e| e.dh = 100),
         ] {
-            assert_eq!(what, Err(Fault::Unsupported));
+            assert_eq!(what, Ok(()));
         }
-        // INVALID comes before UNSUPPORTED, whichever element has which.
-        let mut turned = el(1);
-        turned.orient = 1;
-        let good = |id: u32| {
-            if id == 1 {
-                shape(Format::Xrgb, 100, 50)
-            } else {
-                None
-            }
-        };
+        // A number out of its place is INVALID, whichever element has it.
         let mut bad = el(2);
         bad.sw = 200 << 16;
-        let scene = def(&[turned, bad]);
         let both = |id: u32| match id {
-            1 => shape(Format::Xrgb, 100, 50),
-            2 => shape(Format::Xrgb, 100, 50),
+            1 | 2 => shape(Format::Xrgb, 100, 50),
             _ => None,
         };
-        assert_eq!(check(&scene, both), Err(Fault::Invalid));
-        assert_eq!(check(&def(&[turned]), good), Err(Fault::Unsupported));
+        assert_eq!(check(&def(&[el(1), bad]), both), Err(Fault::Invalid));
     }
 
     #[test]
