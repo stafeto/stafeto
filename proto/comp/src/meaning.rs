@@ -68,7 +68,7 @@ pub fn source_at(e: &Element, x: i32, y: i32) -> Option<(i64, i64)> {
 }
 
 /// `a * b / 255` rounded as pixman's `MUL_UN8`.
-const fn mul(a: u32, b: u32) -> u32 {
+pub const fn mul(a: u32, b: u32) -> u32 {
     let t = a * b + 0x80;
     (t + (t >> 8)) >> 8
 }
