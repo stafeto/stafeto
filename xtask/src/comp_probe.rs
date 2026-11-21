@@ -82,15 +82,19 @@ const BLACK: &str = "comp-probe: black crc ";
 const LEGACY: &str = "comp-probe: legacy crc ";
 const LEGACY_PARTIAL: &str = "comp-probe: legacy partial crc ";
 const ABOVE: &str = "comp-probe: above crc ";
+const SCENE: &str = "comp-probe: scene crc ";
+const SCENE_LEGACY: &str = "comp-probe: scene legacy crc ";
+const SCENE_COMPOSED: &str = "comp-probe: scene composed crc ";
 const LEGACY_BACK: &str = "comp-probe: legacy back crc ";
 const ENDED: &str = "init: comp-probe ended: exit code 0, not restarted";
 const ENDED_C: &str = "init: comp-probe-c ended: exit code 0, not restarted";
 const ENDED_B: &str = "init: comp-probe-b ended: exit code 0, not restarted";
+const ENDED_S: &str = "init: comp-probe-s ended: exit code 0, not restarted";
 const B_ENDS: &str = "init: comp-probe-b ended: ";
 
 /// The lines each client prints once per check that passed, and how many
 /// times a run has each.
-const CHECKS: [(&str, usize); 27] = [
+const CHECKS: [(&str, usize); 33] = [
     ("comp-probe: the screen is 640x400, no window yet", 1),
     (
         "comp-probe: windows outside the screen or of another format are refused",
@@ -156,8 +160,23 @@ const CHECKS: [(&str, usize); 27] = [
         1,
     ),
     ("comp-probe: the program ends with its window", 1),
-    ("comp-probe: ok", 3),
+    (
+        "comp-probe: a scene is committed by its session and refused past its limits",
+        1,
+    ),
+    ("comp-probe: the scene is taken whole, COMMITTED comes", 1),
+    (
+        "comp-probe: a FLUSH of a window no element shows is answered",
+        1,
+    ),
+    (
+        "comp-probe: a scene composed on request is made by SCENE_COMPOSE, COMPOSED comes",
+        1,
+    ),
+    ("comp-probe: the scene holder ends with its windows", 1),
+    ("comp-probe: ok", 4),
     (ENDED_C, 1),
+    (ENDED_S, 1),
     (DRIVER_LINE, 1),
     (DRIVER_READY, 1),
 ];
@@ -200,7 +219,7 @@ pub fn verdict(lines: &[String]) -> Result<(), String> {
     if let Some(failed) = lines.iter().find(|l| l.starts_with("comp-probe: failed")) {
         return Err(failed.clone());
     }
-    for (marker, wanted) in CHECKS.iter().chain(&[(READY, 1), (RELEASED, 2)]) {
+    for (marker, wanted) in CHECKS.iter().chain(&[(READY, 1), (RELEASED, 3)]) {
         if count(marker) != *wanted {
             let found: Vec<_> = lines
                 .iter()
@@ -1150,9 +1169,16 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
         compare(run, &mut monitor, prefix)?;
     }
     run.expect_line(ENDED_B, |l| l == ENDED_B, WITHIN)?;
+    // The holder of a scene: the two windows of the first client through
+    // their elements, the window of the first revision shown directly under a
+    // scene, and a scene composed on request.
+    for prefix in [SCENE, SCENE_LEGACY, SCENE_COMPOSED] {
+        compare(run, &mut monitor, prefix)?;
+    }
+    run.expect_line(ENDED_S, |l| l == ENDED_S, WITHIN)?;
     // The compositor paints the legacy window's place black and says so
     // once that frame is shown, which can come after the launcher's line.
-    run.expect_times(RELEASED, 2, WITHIN)?;
+    run.expect_times(RELEASED, 3, WITHIN)?;
     Ok(())
 }
 
@@ -1182,7 +1208,7 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
         qemu::parse_gpu_trace(&text).map_err(|e| format!("comp-probe on {}: {e}", machine.name))?;
     bypass_trace_verdict(&events).map_err(|e| format!("comp-probe on {}: {e}", machine.name))?;
     println!(
-        "comp-probe on {}: the screen matched the guest's frames for a window, a rectangle of it, two windows, the black screen after a process ended, a window of the first revision shown from the pool (the trace shows the scanout on resource 2, no band put together over three FLUSHes), a window over it (resource 1) and the pool again (resource 2)",
+        "comp-probe on {}: the screen matched the guest's frames for a window, a rectangle of it, two windows, the black screen after a process ended, a window of the first revision shown from the pool (the trace shows the scanout on resource 2, no band put together over three FLUSHes), a window over it (resource 1) and the pool again (resource 2), then the two windows through the elements of a scene, a window of the first revision shown directly under a scene and a scene composed on request",
         machine.name
     );
     if !machine.is_hvf() {
@@ -1331,7 +1357,7 @@ mod tests {
 
     fn good_run() -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();
-        for (marker, n) in CHECKS.iter().chain(&[(READY, 1), (RELEASED, 2)]) {
+        for (marker, n) in CHECKS.iter().chain(&[(READY, 1), (RELEASED, 3)]) {
             for _ in 0..*n {
                 lines.push((*marker).to_owned());
             }

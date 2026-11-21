@@ -33,6 +33,17 @@
 //!   have its window shown directly, makes a window over it and a line with
 //!   the CRC of the screen as it should look, and ends.
 //!
+//! - `s`, the holder of a scene (init gives its session the scene's mark):
+//!   waits until the first revision's program has gone, then refuses a
+//!   scene past the limits and what no operation draws, commits a scene of
+//!   two windows at the places the first client's windows had (the line
+//!   with the CRC of the screen is that of the first client's overlap, which
+//!   the first revision's drawing of the same windows makes), FLUSHes a window
+//!   of the first revision that no element shows (the reply must come), commits
+//!   a scene of that window alone and FLUSHes it (the display shows its pool
+//!   directly: `bands` stay as they were), and ends with a scene composed on
+//!   request (SCENE_COMPOSE). A SCENE_COMMIT of a window's session is refused.
+//!
 //! Each check prints its line, and the last says `comp-probe: ok`; xtask
 //! reads them.
 
@@ -42,8 +53,9 @@
 use abi::{Access, Error, MESSAGE_MAX, Rights, Source};
 use core::cell::Cell;
 use proto_comp::{
-    Attach, BUSY, Create, Description, FORMAT_XRGB8888, INVALID, Method, NOT_ALLOWED, Post, Rect,
-    UNSUPPORTED, code,
+    ACTIVE, ASK_COMMITTED, ASK_COMPOSED, Attach, BUSY, COMMITTED_BIT, COMPOSED_BIT, Create,
+    Description, Element, FORMAT_XRGB8888, INVALID, Method, NO_WINDOW, NOT_ALLOWED, Post, Rect,
+    SceneCommit, UNSUPPORTED, code, manage,
 };
 use proto_gpu::{HEIGHT, STRIDE, WIDTH};
 use proto_init::ServiceArgs;
@@ -95,6 +107,7 @@ fn main(_: u64) -> u64 {
         b"w" => probe.windows(),
         b"l" => probe.legacy(),
         b"x" => probe.above(),
+        b"s" => probe.scene(),
         _ => Err("an unknown role"),
     };
     match result {
@@ -784,6 +797,291 @@ impl Probe<'_> {
         rt::println!("comp-probe: above crc {:08x}", legacy_crc(true));
         self.sleep(SNAPSHOT_NS);
         rt::println!("comp-probe: the client over the pool ends with its window");
+        Ok(())
+    }
+
+    /// SCENE_COMMIT of `elements`.
+    fn commit(
+        &self,
+        session: &Handle<Channel>,
+        flags: u32,
+        elements: &[Element],
+    ) -> Result<(), Fail> {
+        let mut w = Writer::new();
+        SceneCommit::new(flags, 0xFF00_0000, elements)
+            .and_then(|c| c.write(&mut w))
+            .map_err(Fail::Status)?;
+        plain(session, w.as_bytes())
+    }
+
+    /// The window of `size` that shows through the whole of `at` on the
+    /// screen: an element.
+    fn element(window: u32, at: Rect) -> Element {
+        Element {
+            source: window,
+            mask: NO_WINDOW,
+            sx: 0,
+            sy: 0,
+            sw: (at.w as i32) << 16,
+            sh: (at.h as i32) << 16,
+            dx: at.x as i32,
+            dy: at.y as i32,
+            dw: at.w as i32,
+            dh: at.h as i32,
+            orient: 0,
+            filter: 0,
+            transparency: 0,
+            alpha: 255,
+        }
+    }
+
+    /// A window `rect` with two buffers, both filled by `point`, and its id. The
+    /// objects stay mapped for the probe's life.
+    fn painted(
+        &self,
+        display: &Handle<Channel>,
+        rect: Rect,
+        point: fn(u32, u32) -> u32,
+    ) -> Result<(Handle<Channel>, u32), &'static str> {
+        let (window, id) = self
+            .create(display, rect, FORMAT_XRGB8888)
+            .map_err(say("WINDOW_CREATE"))?;
+        let bytes = u64::from(rect.w) * u64::from(rect.h) * 4;
+        let (objects, at) = self.buffers(2, bytes)?;
+        self.attach(&window, rect.w * 4, &objects[..2])
+            .map_err(say("ATTACH"))?;
+        for buffer in &at[..2] {
+            for y in 0..rect.h {
+                for x in 0..rect.w {
+                    // SAFETY: the buffer is mapped for writing at `buffer`, `rect.w`
+                    // by `rect.h` points of 4 bytes, and this probe is its only user.
+                    unsafe {
+                        (*buffer as *mut u32)
+                            .add((y * rect.w + x) as usize)
+                            .write(point(x, y))
+                    };
+                }
+            }
+        }
+        // The objects live as long as the window's session in the service, which
+        // holds its own handles; the probe leaves its mappings in place.
+        core::mem::forget(objects);
+        Ok((window, id))
+    }
+
+    /// The holder of a scene.
+    fn scene(self) -> Result<(), &'static str> {
+        let display = self.display()?;
+        // The others are done: the first revision's program has had its frames
+        // shown directly (`bypassed` 5) and its window has gone.
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        loop {
+            let d = self.describe_when_ready(&display)?;
+            if d.open == 0 && d.bypassed >= 5 && d.busy == 0 {
+                break;
+            }
+            if time::ticks_to_ns(time::now()) > end {
+                return Err("the other clients never finished");
+            }
+            self.sleep(RETRY_NS);
+        }
+        let notify = sys::handle_duplicate(&self.channel, Rights::NOTIFY | Rights::TRANSFER)
+            .map_err(say("a handle for the scene"))?;
+        let mut w = Writer::new();
+        proto_comp::write_manage(manage::SUBSCRIBE, 0, 0, 0, &mut w).map_err(say("SUBSCRIBE"))?;
+        match call_with(&display, w.as_bytes(), [notify.erase()].into()) {
+            Ok((Status::Ok, _)) => {}
+            _ => return Err("the scene session could not subscribe"),
+        }
+        let (a, a_id) = self.painted(&display, FIRST, window_pattern)?;
+        let (b, b_id) = self.painted(&display, SECOND, second_pattern)?;
+        // A SCENE_COMMIT is the scene session's alone.
+        let first = Self::element(a_id, FIRST);
+        let second = Self::element(b_id, SECOND);
+        if !refused(self.commit(&a, ACTIVE, &[first]), code(NOT_ALLOWED)) {
+            return Err("a window's session committed a scene");
+        }
+        // Refusals: a count of 17 (the bytes of 16 and a word patched), a
+        // source rectangle past the window, a turn no operation draws.
+        let mut buffer = [0u8; MESSAGE_MAX];
+        let mut sixteen = Writer::new();
+        SceneCommit::new(ACTIVE, 0, &[first; 16])
+            .and_then(|c| c.write(&mut sixteen))
+            .map_err(say("a scene of 16"))?;
+        let bytes = sixteen.as_bytes();
+        buffer[..bytes.len()].copy_from_slice(bytes);
+        buffer[16..20].copy_from_slice(&17u32.to_le_bytes());
+        if !refused(plain(&display, &buffer[..bytes.len()]), code(INVALID)) {
+            return Err("a scene of 17 elements was not INVALID");
+        }
+        let mut big = first;
+        big.sw += 1 << 16;
+        big.dw += 1;
+        let mut turned = first;
+        turned.orient = 1;
+        if !refused(self.commit(&display, ACTIVE, &[big]), code(INVALID))
+            || !refused(self.commit(&display, ACTIVE, &[turned]), code(UNSUPPORTED))
+        {
+            return Err("a scene out of its limits was not refused as it should be");
+        }
+        self.commit(&display, ACTIVE, &[first; 16])
+            .map_err(say("a scene of 16"))?;
+        rt::println!("comp-probe: a scene is committed by its session and refused past its limits");
+        // The scene of the two windows. COMMITTED comes with the frame that takes it.
+        self.commit(&display, ACTIVE | ASK_COMMITTED, &[first, second])
+            .map_err(say("SCENE_COMMIT"))?;
+        if !self.wait_bits(COMMITTED_BIT) {
+            return Err("COMMITTED never came");
+        }
+        self.settled(&display)?;
+        self.post(&a, 0, &[]).map_err(say("POST of the first"))?;
+        self.post(&b, 0, &[]).map_err(say("POST of the second"))?;
+        self.settled(&display)?;
+        rt::println!("comp-probe: the scene is taken whole, COMMITTED comes");
+        rt::println!(
+            "comp-probe: scene crc {:08x}",
+            expected_crc(&[Layer::First { marked: false }, Layer::Second])
+        );
+        self.sleep(SNAPSHOT_NS);
+        // A window of the first revision that no element shows: its FLUSH is
+        // answered at the taking, not left to wait for a frame that has none of it.
+        let open = proto_gpu::Method::Open.header().bytes();
+        let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        let (status, mut reply) = loop {
+            let (status, reply) = call(&display, &open).map_err(say("OPEN"))?;
+            if status != proto_gpu::code(proto_gpu::CLEARING) {
+                break (status, reply);
+            }
+            if time::ticks_to_ns(time::now()) > end {
+                return Err("OPEN says CLEARING for good");
+            }
+            self.sleep(RETRY_NS);
+        };
+        if status != proto_gpu::code(proto_gpu::NO_INPUT) {
+            return Err("OPEN's status is not NO_INPUT");
+        }
+        let (Ok(memory), Ok(owner)) = (
+            reply.handles.take::<Memory>(0),
+            reply.handles.take::<Channel>(1),
+        ) else {
+            return Err("OPEN's handles");
+        };
+        let at = MAP_AT + self.maps.get() * MAP_STEP;
+        self.maps.set(self.maps.get() + 1);
+        sys::mem_map(
+            self.process,
+            &memory,
+            0,
+            u64::from(proto_gpu::SCREEN_BYTES),
+            at,
+            Access::ReadWrite,
+        )
+        .map_err(say("map the pool"))?;
+        // SAFETY: mapped for reading and writing just above; the probe is the
+        // only user, in one thread.
+        let points = unsafe {
+            core::slice::from_raw_parts_mut(at as *mut u32, (STRIDE / 4 * HEIGHT) as usize)
+        };
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                points[(y * WIDTH + x) as usize] = screen_pattern(x, y);
+            }
+        }
+        let flush = |rect: proto_gpu::Rect| -> Result<(), Fail> {
+            let mut w = Writer::new();
+            rect.write(&mut w).map_err(Fail::Status)?;
+            plain(&owner, w.as_bytes())
+        };
+        flush(proto_gpu::Rect::SCREEN).map_err(say("FLUSH of a window no element shows"))?;
+        rt::println!("comp-probe: a FLUSH of a window no element shows is answered");
+        // Its id is the 640 by 400 window of LIST.
+        let mut w = Writer::new();
+        proto_comp::write_manage(manage::LIST, 0, 0, 0, &mut w).map_err(say("LIST"))?;
+        let (status, reply) = call(&display, w.as_bytes()).map_err(say("LIST"))?;
+        if status != Status::Ok {
+            return Err("LIST was refused");
+        }
+        let mut pool_id = None;
+        let mut bytes = [0u8; MESSAGE_MAX];
+        proto_comp::read_list(reply.bytes(&mut bytes), |r| {
+            if (r.w, r.h) == (WIDTH, HEIGHT) {
+                pool_id = Some(r.id);
+            }
+        })
+        .map_err(say("LIST's reply"))?;
+        let pool_id = pool_id.ok_or("LIST has no window of the screen's size")?;
+        // The scene of that window alone: shown from its pool, no band.
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            w: WIDTH,
+            h: HEIGHT,
+        };
+        self.commit(&display, ACTIVE, &[Self::element(pool_id, whole)])
+            .map_err(say("SCENE_COMMIT of the pool"))?;
+        let before = self.settled(&display)?;
+        flush(proto_gpu::Rect::SCREEN).map_err(say("FLUSH of the shown window"))?;
+        let after = self.settled(&display)?;
+        if after.bands != before.bands || after.bypassed != before.bypassed + 1 {
+            rt::println!(
+                "comp-probe: bands {} then {}, bypassed {} then {}",
+                before.bands,
+                after.bands,
+                before.bypassed,
+                after.bypassed
+            );
+            return Err("the window of the first revision under a scene was not shown directly");
+        }
+        let mut crc = Crc(0xFFFF_FFFF);
+        for &p in &points[..(WIDTH * HEIGHT) as usize] {
+            crc.point(p);
+        }
+        rt::println!("comp-probe: scene legacy crc {:08x}", !crc.0);
+        self.sleep(SNAPSHOT_NS);
+        // A scene composed on request: SCENE_COMPOSE is refused for an active
+        // scene, and for the other it makes the frame, with COMPOSED at its end.
+        if !refused(
+            {
+                let mut w = Writer::new();
+                proto_comp::write_scene_compose(ASK_COMPOSED, &mut w).map_err(say("COMPOSE"))?;
+                plain(&display, w.as_bytes())
+            },
+            code(UNSUPPORTED),
+        ) {
+            return Err("SCENE_COMPOSE of an active scene was not UNSUPPORTED");
+        }
+        self.commit(&display, ASK_COMMITTED, &[first, second])
+            .map_err(say("SCENE_COMMIT, composed on request"))?;
+        if !self.wait_bits(COMMITTED_BIT) {
+            return Err("COMMITTED of a scene composed on request never came");
+        }
+        // The windows' buffers were given back while no element showed them, and
+        // are posted again; nothing is taken until the request.
+        self.post(&a, 1, &[])
+            .map_err(say("POST of the first again"))?;
+        self.post(&b, 1, &[])
+            .map_err(say("POST of the second again"))?;
+        let held = self.settled(&display)?;
+        let mut w = Writer::new();
+        proto_comp::write_scene_compose(ASK_COMPOSED, &mut w).map_err(say("COMPOSE"))?;
+        plain(&display, w.as_bytes()).map_err(say("SCENE_COMPOSE"))?;
+        if !self.wait_bits(COMPOSED_BIT) {
+            return Err("COMPOSED never came");
+        }
+        let done = self.settled(&display)?;
+        if done.frames <= held.frames {
+            return Err("SCENE_COMPOSE made no frame");
+        }
+        rt::println!(
+            "comp-probe: a scene composed on request is made by SCENE_COMPOSE, COMPOSED comes"
+        );
+        rt::println!(
+            "comp-probe: scene composed crc {:08x}",
+            expected_crc(&[Layer::First { marked: false }, Layer::Second])
+        );
+        self.sleep(SNAPSHOT_NS);
+        let _ = (memory, owner);
+        rt::println!("comp-probe: the scene holder ends with its windows");
         Ok(())
     }
 

@@ -600,6 +600,76 @@ revision and compares each of its two frames three ways: the demo's own CRC-32,
 QEMU's screenshot and the host reference program's CRC-32. `docs/lvgl.md` tells
 what else it compares and how.
 
+## The scene
+
+A scene session (a label with `SCENE_MARK`, bit 54 of the label, which init gives
+the clients that `COMP_SCENES` names, records of POSIX included) is a context
+and a manager both, and holds a scene: the windows on the screen are the
+elements of the last scene it committed, in its order from the lowest, each
+with the window it shows, the rectangle of the window it takes the points from
+(16.16 points), the rectangle of the screen it puts them in, the turn and
+reflection, the filter, the kind of transparency, a global alpha and a mask
+(`proto_comp::Element`, 56 bytes; up to 16 of them in a message of 916 bytes).
+The window is the `id` WINDOW_CREATE answers (a number no window has shows
+nothing; `NO_WINDOW`, 0xFFFFFFFF, names none, since window 0 is a window). A
+mask is a window of the new format `FORMAT_A8` (a byte a point, a stride that is
+a multiple of 4), the size of the target rectangle; a window of that format is
+never shown by itself. `<stafeto/window.h>` has it as `STAFETO_WINDOW_A8`.
+
+How a scene reaches the screen:
+
+- SCENE_COMMIT keeps the scene as the pending one. A taking of a frame makes the
+  last pending scene the working one whole, and the bands of a frame read the
+  working one alone. A commit that comes in the middle of a frame is in the
+  frame after it, never half in this one. The flags: ACTIVE (the scene is
+  composed at the start of a period that has a change in it or in a window it
+  shows) and ASK_COMMITTED (the bit COMMITTED, bit 4, goes to the channel the
+  session subscribed with when the scene is taken; for a scene that is not
+  ACTIVE, which only SCENE_COMPOSE composes, at once).
+- SCENE_COMPOSE (a scene that is not ACTIVE; UNSUPPORTED for one that is) makes
+  one frame at the next taking, and the bit COMPOSED (bit 5) tells the session
+  the frame is over; BUSY while an earlier request is not. The buffers of the
+  windows the elements show are not taken between requests. With no commit before
+  it the scene is the empty one: the background alone.
+- The damage of a frame is what changed: the target rectangles of the elements
+  that came, went or changed in any field, and for a posted buffer its changed
+  rectangles carried through the element (turn, reflection and stretch, a point
+  more on every side for the bilinear filter). The whole screen when the
+  background changes or the scene is the first.
+- A window that no element shows gets its buffer back at the taking: the bit of
+  its number says the buffer is free, and a FLUSH of a window of the first
+  revision on it is answered at once, so a program of the first revision under a
+  scene does not wait for a frame that has none of it. A window the scene shows
+  later shows what its producer posts after that.
+- The background is a colour: the first thing a band holds where no opaque
+  element covers it whole (the same call as the black of a band, so the same
+  price).
+- The direct frame (above) stays: the topmost element that shows something is
+  the whole of a window of the first revision on the whole screen, with no turn,
+  reflection, mask or transparency.
+- The service draws, so far, what its operations cover: an element is a copy of
+  the window's points (no transparency; an ARGB8888 window counts as XRGB8888) or
+  a laying over of them (the window's own alpha), at the scale of one, with no
+  turn, no reflection, no mask and no global alpha, the source rectangle on
+  whole points. SCENE_COMMIT refuses any other element with UNSUPPORTED
+  (`elements::drawable_now`), and the numbers no operation could make sense of
+  with INVALID (a source rectangle past its window, a mask that is not an A8
+  window of the target's size, an out of range field). The drawing of the rest
+  is the next step.
+- Input: the keys go to the window with the focus (the scene gives it with MANAGE
+  FOCUS); the pointer's moves and buttons go to the scene's ring as events of the
+  screen's coordinates and to no window. The pointer's picture is the cursor
+  pipeline's, as it was.
+- While a scene session has subscribed (MANAGE SUBSCRIBE) a session with
+  `MANAGER_MARK` is NOT_ALLOWED in MANAGE, and the scene session's SUBSCRIBE is
+  BUSY while a manager holds the subscription. When the session ends the windows
+  show as the policy of the windows says, from the next frame, the whole screen
+  drawn again. The children of a process that holds a scene (a clone of its
+  session) get an ordinary context; `exec` keeps the session.
+
+`proto_comp::VERSION` is unchanged: the two methods are new numbers (26, 27) in a
+session that only the scene session can use.
+
 ## Not yet
 
 A window's resize, a frame clock that follows the display's own vertical blank
