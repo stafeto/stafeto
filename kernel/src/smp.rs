@@ -18,7 +18,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use cpu::{CpuBlock, MAX_CPUS, UP};
 use kboot::bootinfo::MPIDR_AFFINITY;
-use kcore::gic::{Ack, SGI_CMD, SGI_GO, SGI_LOCK, SGI_PING, SGI_PONG};
+use kcore::gic::{Ack, SGI_CMD, SGI_GO, SGI_LOCK, SGI_LOG, SGI_PING, SGI_PONG};
 use kcore::layout::image_pa;
 
 /// What a CPU reads with its MMU and caches off, at the physical address
@@ -271,6 +271,13 @@ pub fn handle(ack: Ack) {
         }
         // The commands are in the queues to this CPU: any sender's.
         SGI_CMD => crate::cmd::drain(),
+        // A record claimed the arming of the log's wake on this CPU: the post, one take
+        // of `OBJ` in a turn of its own (`irq::deliver_log`, like `irq::deliver`).
+        SGI_LOG => {
+            if crate::log::take_wake() {
+                crate::irq::deliver_log();
+            }
+        }
         SGI_LOCK if gic::sgi_from(&ack, 0) && LOCK_GO[me].swap(0, Ordering::Acquire) != 0 => {
             lock_rounds(me)
         }

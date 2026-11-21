@@ -46,8 +46,12 @@ pub struct Local {
     /// The commands for other CPUs that sections posted (cmd.rs).
     pub outbox: Own<crate::cmd::Outbox>,
     /// What the end of a call has still to do (`thread::flush_copy`): the
-    /// bits `COPY` and `OUTBOX`, one load for both.
+    /// bits `COPY`, `OUTBOX` and `LOG_WAKE`, one load for all.
     pub deferred: core::sync::atomic::AtomicU32,
+    /// A record claimed the arming of the console driver's wake on this CPU, and the post
+    /// into its binding is not made: the SGI the claimant sent itself (`SGI_LOG`) makes
+    /// it in a turn of its own (`log::take_wake`, spec 9).
+    pub log_wake: core::sync::atomic::AtomicBool,
     /// The start of the open entry interval and the longest one (sched).
     pub entry: UnsafeCell<(u64, u64)>,
     /// The time this CPU has slept and spent in the kernel, which other CPUs
@@ -85,6 +89,7 @@ impl Local {
             copy: Own::new(crate::thread::PendingCopy::new()),
             outbox: Own::new(crate::cmd::Outbox::new()),
             deferred: core::sync::atomic::AtomicU32::new(0),
+            log_wake: core::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "ktest")]
             takes: core::sync::atomic::AtomicU16::new(0),
             entry: UnsafeCell::new((0, 0)),

@@ -96,6 +96,9 @@ pub const SGI_LOCK: u32 = 3;
 /// A CPU has commands for the receiver in the queues of the other CPUs, or
 /// asks it to pass a quiescent point (cmd.rs).
 pub const SGI_CMD: u32 = 4;
+/// A CPU sends it to itself when a record of the kernel log claimed the arming of the
+/// console driver's wake: the turn of this interrupt makes the post (kernel/src/log.rs).
+pub const SGI_LOG: u32 = 5;
 
 /// GICD_SGIR for SGI `intid` to the CPU interfaces in `targets` (the
 /// bits `own_interface` reads): TargetListFilter 0, the list in [23:16],

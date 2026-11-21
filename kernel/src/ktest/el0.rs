@@ -32,7 +32,9 @@ use abi::{
     Notification, OWNER_RIGHTS, Policy, ProcessState, Rights, Source, msgbuf,
 };
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering::Relaxed,
+};
 use kcore::PAGE_SIZE;
 use kcore::budget::Server;
 use kcore::esr;
@@ -69,6 +71,8 @@ unsafe extern "C" {
     static el0_count_then_exit: u8;
     static el0_take_loop: u8;
     static el0_takes_alone: u8;
+    static el0_log_writer: u8;
+    static el0_log_judge: u8;
     static el0_receive_then_poll: u8;
     static el0_raise_then_notify: u8;
     static el0_receive_then_watch: u8;
@@ -140,6 +144,7 @@ const SVC_SUSPEND_SEND: u16 = 0xFF07;
 const SVC_CONTINUE_CROWD: u16 = 0xFF08;
 const SVC_TAKE: u16 = 0xFF09;
 const SVC_TAKES_ALONE: u16 = 0xFF0A;
+const SVC_LOG_RACE: u16 = 0xFF0B;
 
 const _: () =
     ::core::assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_PEND <= *abi::TEST_CALLS.end());
@@ -468,6 +473,11 @@ const EL0_TESTS: &[El0Test] = &[
         name: "a_spent_thread_of_another_cpu_that_ends_is_heard",
         start: start_exit_remote,
         done: done_exit_remote,
+    },
+    El0Test {
+        name: "log_wake_a_writer_on_another_cpu_loses_no_wake",
+        start: start_log_race,
+        done: done_log_race,
     },
     El0Test {
         name: "obj_takes_count_this_cpu_alone",
@@ -1104,6 +1114,7 @@ pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
             }
         }
         SVC_TAKES_ALONE => takes_alone(),
+        SVC_LOG_RACE => log_race(),
         SVC_PENDING => {
             // The timer fires at once, and its interrupt is pending when
             // send looks.
@@ -4952,6 +4963,64 @@ fn takes_alone() {
     while timer::now().wrapping_sub(from) < timer::frequency() / 1000 {}
     let one = obj::takes().wrapping_sub(before) == 1;
     TAKES_ALONE.store(if one { 1 } else { 2 }, Relaxed);
+}
+
+/// The writer of the test of the log's wake (el0_log_writer) loops on debug_write on the
+/// other CPU, one record each time the word 0 of the shared page is set, and the judge on
+/// this CPU, in `svc #SVC_LOG_RACE`, is the listener: many armings in a row, each after a
+/// record the writer races against it, and each must give exactly one notification. Ends at
+/// once on a machine with one CPU.
+fn start_log_race(f: &mut Fixture) -> Result<(), &'static str> {
+    if crate::smp::cpus() < 2 {
+        return Ok(());
+    }
+    LOG_RACE.store(0, Relaxed);
+    sched_process(f)?;
+    let p = f.processes[0].expect("the test's process");
+    let h = process::insert_handle(p, Object::Resource, Rights::DEBUG)
+        .map_err(|_| "a handle did not go in")?;
+    let slot = f
+        .handles
+        .iter()
+        .position(Option::is_none)
+        .expect("room for a handle");
+    f.handles[slot] = Some((p, h));
+    let writer = sched_thread(f, 0, &raw const el0_log_writer, PRIORITY, FIFO)?;
+    let _judge = sched_thread(f, 1, &raw const el0_log_judge, PRIORITY, FIFO)?;
+    set_args(writer, &[word(0), h.0]);
+    thread::set_cpu(writer, usize::from(here() == 0));
+    LOG_RACE_GO.store(LINEAR_BASE + f.data as usize, Relaxed);
+    f.ends[0] = true;
+    Ok(())
+}
+
+/// What `log_race` found: 0 not run, 1 no wake lost and none doubled, 2 otherwise.
+static LOG_RACE: AtomicU8 = AtomicU8::new(0);
+
+/// The shared word the writer watches, through the linear map.
+static LOG_RACE_GO: AtomicUsize = AtomicUsize::new(0);
+
+/// `svc #SVC_LOG_RACE`: the listener of `start_log_race`.
+fn log_race() {
+    // SAFETY: the word is in the page of the test's process, which the linear map reaches;
+    // the writer reads it from EL0 and the listener sets it, both atomically.
+    let go = unsafe { &*(LOG_RACE_GO.load(Relaxed) as *const AtomicU64) };
+    let ok = super::calls::log_race_listener(go, 300);
+    go.store(2, Relaxed);
+    LOG_RACE.store(if ok.is_ok() { 1 } else { 2 }, Relaxed);
+    if let Err(e) = ok {
+        kprintln!("log race: {e}");
+    }
+}
+
+fn done_log_race(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.threads[0].is_none() || f.slot(t) != 1 {
+        return Ok(());
+    }
+    check(
+        LOG_RACE.load(Relaxed) == 1,
+        "a record that raced an arming was lost, or gave two notifications",
+    )
 }
 
 fn done_takes_alone(f: &Fixture, t: &Thread) -> Result<(), &'static str> {

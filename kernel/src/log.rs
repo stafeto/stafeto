@@ -16,6 +16,18 @@
 //! The kernel feature `keep-pieces` leaves the headers on the port for the
 //! probe images, whose runner assembles the lines (xtask::untag).
 //! The ring keeps the record as it came.
+//!
+//! The driver does not poll for the log while the system is idle: it binds
+//! the log's line (`irq_bind` of abi::LOG_LINE, `irq.rs`) and its `irq_ack`
+//! arms `LOG_ARMED`. A record that lands while it is armed claims the arming
+//! (`wake_if_armed`) and sets the flag of its CPU, and the way out of the
+//! kernel posts the notification: the claimant sends its CPU the SGI `SGI_LOG`,
+//! and the turn of that interrupt (`smp::handle`) posts (`take_wake`): a record
+//! takes no `OBJ`, no queue lock and posts nothing. The two sides keep the
+//! order of a Dekker pair: the writer writes the ring, fences and reads
+//! `LOG_ARMED`; `irq_ack` writes `LOG_ARMED`, fences and reads the rings
+//! (`recheck`). Records of the `trace` feature go past `record` and wake
+//! nobody.
 
 use crate::arch::cpu::MAX_CPUS;
 use crate::arch::timer;
@@ -25,7 +37,8 @@ use crate::thread::{self, Thread};
 use abi::{LOG_KERNEL_KIND, LOG_RECORD, LOG_TEXT_KIND, LogBatch};
 use core::fmt::{self, Write};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use core::sync::atomic::Ordering::{Relaxed, SeqCst};
+use core::sync::atomic::{AtomicBool, fence};
 pub use kcore::log::Ring;
 use kcore::log::{Chunks, Source, merge_unseen};
 
@@ -34,6 +47,11 @@ use kcore::log::{Chunks, Source, merge_unseen};
 pub const LOG_RECORDS: usize = 64;
 #[cfg(feature = "trace")]
 pub const LOG_RECORDS: usize = 256;
+
+/// The console's driver waits for a record: its binding of the log's line
+/// is open (`irq::ack` armed it) and no record has claimed the arming since.
+/// Written by `irq_ack` under `OBJ` and by the first record after it.
+static LOG_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// A record's `bytes` on the kernel's port: a piece of a line longer than a
 /// record without its header (console_line::strip). A function of its own,
@@ -54,6 +72,121 @@ fn record(kind: u8, bytes: &[u8]) {
         port(bytes);
     }
     local().ring.lock().push(time, kind, bytes, shown);
+    wake_if_armed();
+}
+
+/// After a record: when the driver waits, this CPU makes the post at its
+/// next way out of the kernel (`take_wake`). The barrier orders the write
+/// of the ring (the release store of its `seq`) before the read of
+/// `LOG_ARMED`, as `irq_ack` orders its write of `LOG_ARMED` before its
+/// read of the rings (`recheck`): one side sees the other. The load alone
+/// costs a barrier and a read while nobody waits; the claim is one swap a
+/// time the driver arms. No lock, no call into another module: it is safe
+/// in an interrupt and inside a section of `OBJ`.
+#[inline(always)]
+fn wake_if_armed() {
+    fence(SeqCst);
+    if LOG_ARMED.load(Relaxed) {
+        claim_arming();
+    }
+}
+
+/// Takes the arming, once: the claimant sets the flag of its CPU and sends this CPU the
+/// SGI whose turn makes the post (`take_wake`, `smp::handle`). The write of the GIC's
+/// register takes no lock, so this is safe in an interrupt and inside a section of `OBJ`;
+/// the post itself waits for the poll of the next turn of the way out of the kernel and
+/// takes `OBJ` there once, a turn of its own, whatever the claimant was doing: no
+/// stretch of the kernel gets a second take of `OBJ` for a record, and a thread that
+/// goes to EL0 meanwhile comes back at once, since the SGI is pending.
+#[inline(never)]
+fn claim_arming() {
+    if LOG_ARMED.swap(false, SeqCst) {
+        local().log_wake.store(true, Relaxed);
+        crate::arch::gic::send_sgi(crate::arch::cpu::this().index(), kcore::gic::SGI_LOG);
+        // The negative build: the post in the stretch of the claimant, a second take of `OBJ`
+        // for a call that took it (not inside a section, where the lock would not nest).
+        #[cfg(feature = "break-log-post-in-call")]
+        if !crate::obj::held() && take_wake() {
+            crate::irq::deliver_log();
+        }
+    }
+}
+
+/// Arms the wake (`irq_ack` of the log's binding, under `OBJ`, on the
+/// transition from masked to open): a record that lands from now on posts.
+pub fn arm() {
+    LOG_ARMED.store(true, SeqCst);
+}
+
+/// Disarms the wake (the last handle of the binding, under `OBJ`).
+pub fn disarm() {
+    LOG_ARMED.store(false, SeqCst);
+}
+
+/// After `arm`, outside the section: when any ring holds a record the
+/// driver has not passed, the arming is claimed at once, so that the post
+/// goes out with the call's way out of the kernel and one record or a
+/// thousand give one notification. A ring that is hard to read counts as
+/// holding one (`Ring::has_unseen_shared`). O(CPUs): one look at each ring,
+/// no retry.
+pub fn recheck() {
+    fence(SeqCst);
+    // The feature `break-log-wake` is the negative build: no look at the
+    // rings, so a record that landed before the arming is never posted.
+    let any = !cfg!(feature = "break-log-wake")
+        && (0..crate::smp::cpus()).any(|c| {
+            let ring = crate::arch::cpu::block(c).local.ring.as_ptr();
+            // SAFETY: the rings of the CPUs that are up live for good, and
+            // only their owners write them.
+            unsafe { Ring::has_unseen_shared(ring) }
+        });
+    if any {
+        claim_arming();
+    }
+}
+
+/// Whether the log's wake is armed (the kernel tests).
+#[cfg(feature = "ktest")]
+pub fn is_armed() -> bool {
+    LOG_ARMED.load(SeqCst)
+}
+
+/// Passes every record of every ring, as the driver's reads do (the kernel
+/// tests): no ring holds a record nobody has seen afterwards.
+#[cfg(feature = "ktest")]
+pub fn pass_all() {
+    let me = crate::arch::cpu::this().index();
+    for c in 0..crate::smp::cpus() {
+        if c == me {
+            while local().ring.lock().take(|_, _| {}).left != 0 {}
+            continue;
+        }
+        let ring = crate::arch::cpu::block(c).local.ring.as_ptr();
+        let mut first = 0;
+        loop {
+            // SAFETY: the rings of the CPUs that are up live for good, and
+            // the test runs while the other CPUs write nothing.
+            let (batch, next) = unsafe { Ring::peek_shared(ring, first, true, |_, _| {}) };
+            first = next;
+            if batch.left == 0 {
+                break;
+            }
+        }
+    }
+}
+
+/// Whether a post waits on this CPU (the kernel tests).
+#[cfg(feature = "ktest")]
+#[inline(always)]
+pub fn wake_due() -> bool {
+    local().log_wake.load(Relaxed)
+}
+
+/// Clears the flag of this CPU; true when it stood, and the caller posts
+/// (`irq::deliver_log`).
+#[inline(always)]
+pub fn take_wake() -> bool {
+    local().log_wake.swap(false, Relaxed)
 }
 
 /// The bytes of a debug_write, up to abi::LOG_TEXT, as one record of

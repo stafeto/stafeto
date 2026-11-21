@@ -241,6 +241,12 @@ impl Lines {
         }
     }
 
+    /// Whether a line is still open: its writer's next piece, or a few empty
+    /// batches (`quiet`), will close it.
+    pub fn any_open(&self) -> bool {
+        self.slots.iter().any(|s| s.open)
+    }
+
     /// Puts out every open line as it is.
     pub fn finish(&mut self, put: &mut impl FnMut(&[u8])) {
         for at in 0..SLOTS {

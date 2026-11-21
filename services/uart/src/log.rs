@@ -322,6 +322,100 @@ pub const DRAIN_NS: u64 = 2_500_000;
 /// An idle system wakes the driver 50 times a second.
 pub const IDLE_NS: u64 = 20_000_000;
 
+/// The period of the safety tick of the mode with the log's binding, in
+/// nanoseconds: the kernel's notification wakes the driver when a record lands
+/// (spec 9, kernel/src/log.rs), and the tick only checks that none was
+/// missed. An idle system wakes the driver once a second.
+pub const SAFETY_NS: u64 = 1_000_000_000;
+
+/// The period of the reads of the log with the binding of the log's line:
+/// DRAIN_NS while the driver is not `drained`, since it holds text, the
+/// rings hold records, a line waits for its empty batches (console_line::QUIET)
+/// or the driver stops, and the kernel will not say that nothing more comes;
+/// SAFETY_NS once it is, and the kernel's notification is what wakes it.
+pub fn period_bound_ns(drained: bool) -> u64 {
+    if drained { SAFETY_NS } else { DRAIN_NS }
+}
+
+/// Whether the driver may acknowledge the binding of the log's line, which
+/// arms the kernel's notification of the next record: the rings hold no
+/// record the driver has not taken (`more`), the text it took went out
+/// (`log_done`), no line of the log is open (`lines_open`) and the driver is
+/// not stopping (`stopping`: its exit waits for the ticks of the drain). The
+/// kernel looks at the rings once more when it takes the acknowledgement, so
+/// a record that came meanwhile posts at once.
+pub fn drained(more: bool, log_done: bool, lines_open: bool, stopping: bool) -> bool {
+    !more && log_done && !lines_open && !stopping
+}
+
+/// When the driver takes the log after the kernel's notification: at most
+/// once in DRAIN_NS, whatever the rate of the notifications, so that the
+/// work of a period (STEP_BATCHES) stays what it is with the timer alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pace {
+    last: Option<u64>,
+}
+
+/// What `Pace::notified` says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Due {
+    /// Take now.
+    Now,
+    /// Set the timer to this time, in nanoseconds, and take then.
+    At(u64),
+}
+
+impl Pace {
+    pub const fn new() -> Pace {
+        Pace { last: None }
+    }
+
+    /// The log was taken at `now` (nanoseconds): by the timer, by a
+    /// notification or at the start.
+    pub fn took(&mut self, now: u64) {
+        self.last = Some(now);
+    }
+
+    /// The kernel's notification came at `now`: now when the last take is
+    /// DRAIN_NS or more behind, otherwise the time that makes it so.
+    pub fn notified(&self, now: u64) -> Due {
+        match self.last {
+            Some(last) if now < last.saturating_add(DRAIN_NS) => Due::At(last + DRAIN_NS),
+            _ => Due::Now,
+        }
+    }
+}
+
+/// A tick of the safety timer that found records: the kernel's notification
+/// was missed unless the binding is masked (the kernel posted it, and it is
+/// on its way). The driver says it once and counts the cases.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Missed {
+    cases: u64,
+}
+
+impl Missed {
+    pub const fn new() -> Missed {
+        Missed { cases: 0 }
+    }
+
+    /// A safety tick took `records` records while the binding was `masked`
+    /// (or not: `masked` is None when it could not be read). Gives the
+    /// number to say at the first miss.
+    pub fn tick(&mut self, records: usize, masked: Option<bool>) -> Option<usize> {
+        if records == 0 || masked == Some(true) {
+            return None;
+        }
+        self.cases += 1;
+        (self.cases == 1).then_some(records)
+    }
+
+    /// The cases so far.
+    pub fn cases(&self) -> u64 {
+        self.cases
+    }
+}
+
 /// Whether the driver takes one more batch in this period: `taken` batches
 /// went in, `room` bytes of the output's ring of the log are free. A batch
 /// is taken only when its worst text fits, so nothing the driver took is
@@ -642,6 +736,8 @@ mod tests {
         lost: u64,
         peak_held: usize,
         longest_step: usize,
+        /// The units of the model the steps ran at.
+        steps_at: Vec<u32>,
     }
 
     /// `pushes` records arrive in the first `span_ms` milliseconds, evenly;
@@ -698,6 +794,7 @@ mod tests {
                         break;
                     }
                 }
+                run.steps_at.push(ms);
                 run.longest_step = run.longest_step.max(taken);
                 run.peak_held = run.peak_held.max(held.len() * LINE);
                 let room = crate::output::LOG_RING - held.len() * LINE;
@@ -711,6 +808,179 @@ mod tests {
         }
         run.lost += kernel.lost;
         run
+    }
+
+    /// As `run` for the driver that has the kernel's notification (`Pace`,
+    /// `drained`, `period_bound_ns`): it has just taken the log and
+    /// acknowledged the binding, so it sleeps until the first record, which
+    /// the kernel posts `start_ms` milliseconds into the run; the safety tick is
+    /// SAFETY_NS away. The records come as in `run`; the notification takes
+    /// the log at once when the last take is DRAIN_NS behind, and at the time
+    /// that makes it so otherwise. After a step the driver acknowledges when
+    /// the ring is empty and the buffer is out, and ticks at DRAIN_NS until then.
+    fn run_bound(pushes: u32, span_ms: u32, total_ms: u32, start_ms: u32) -> Run {
+        let mut kernel = Kernel {
+            ring: Default::default(),
+            lost: 0,
+        };
+        let mut held: std::collections::VecDeque<u32> = Default::default();
+        let mut run = Run::default();
+        let mut owed = 0usize;
+        let mut pace = Pace::new();
+        pace.took(0);
+        let mut armed = true;
+        let mut next_at = (SAFETY_NS / UNIT_NS) as u32;
+        let mut sent = 0;
+        let start = start_ms * 2;
+        for ms in 0..(total_ms + start_ms) * 2 {
+            let before = sent;
+            while ms >= start
+                && sent < pushes
+                && u64::from(sent) * u64::from(span_ms) * 2
+                    <= u64::from(ms - start) * u64::from(pushes)
+            {
+                kernel.push(sent);
+                sent += 1;
+            }
+            // The kernel posts the first record that lands while the binding
+            // is armed, and the driver sees the notification at once.
+            if armed && sent > before {
+                armed = false;
+                next_at = match pace.notified(u64::from(ms) * UNIT_NS) {
+                    Due::Now => ms,
+                    Due::At(at) => (at / UNIT_NS) as u32,
+                };
+            }
+            owed += PORT_PER_MS / 2;
+            while owed >= LINE && !held.is_empty() {
+                run.delivered.push(held.pop_front().unwrap());
+                owed -= LINE;
+            }
+            if held.is_empty() {
+                owed = owed.min(LINE);
+            }
+            if ms >= next_at {
+                let mut taken = 0;
+                let mut left = kernel.ring.len() as u64;
+                loop {
+                    let room = crate::output::LOG_RING - held.len() * LINE;
+                    if !take_more(taken, room) {
+                        break;
+                    }
+                    let (got, lost, rest) = kernel.take();
+                    run.lost += lost;
+                    held.extend(got);
+                    taken += 1;
+                    left = rest;
+                    if left == 0 {
+                        break;
+                    }
+                }
+                run.steps_at.push(ms);
+                pace.took(u64::from(ms) * UNIT_NS);
+                run.longest_step = run.longest_step.max(taken);
+                run.peak_held = run.peak_held.max(held.len() * LINE);
+                let done = drained(left > 0, held.is_empty(), false, false);
+                armed = done;
+                next_at = ms + (period_bound_ns(done) / UNIT_NS) as u32;
+            }
+        }
+        run.lost += kernel.lost;
+        run
+    }
+
+    #[test]
+    fn a_boot_burst_comes_out_whole_with_the_notification_at_any_start() {
+        // The first record lands at any time after the last take, the
+        // distance of which decides whether the notification takes at once or
+        // waits for DRAIN_NS; the idle period (SAFETY_NS) plays no part.
+        for start in 0..40 {
+            for (pushes, span) in [(150, 100), (150, 60), (64, 1)] {
+                let r = run_bound(pushes, span, 1000, start);
+                assert_eq!(r.lost, 0, "start {start}, {pushes} in {span} ms");
+                assert_eq!(
+                    r.delivered,
+                    (0..pushes).collect::<Vec<u32>>(),
+                    "start {start}, {pushes} in {span} ms"
+                );
+                assert!(r.longest_step <= STEP_BATCHES);
+                assert!(r.peak_held <= crate::output::LOG_RING);
+            }
+        }
+    }
+
+    #[test]
+    fn the_notification_takes_the_log_at_most_once_in_the_drain_period() {
+        for start in 0..40 {
+            let r = run_bound(150, 60, 1000, start);
+            let gap = (DRAIN_NS / UNIT_NS) as u32;
+            assert!(
+                r.steps_at.windows(2).all(|w| w[1] - w[0] >= gap),
+                "start {start}: {:?}",
+                &r.steps_at[..r.steps_at.len().min(12)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_record_in_an_idle_system_comes_out_within_a_step() {
+        // The driver slept since the last take: the record is taken at the
+        // unit it lands, and a lone record is out in one step.
+        let r = run_bound(1, 1, 1000, 100);
+        assert_eq!(r.delivered, [0]);
+        assert_eq!(r.steps_at[0], 200);
+        // And the driver went back to sleep: no tick in the next 900 ms
+        // but for the lines it still held and the end of its drain.
+        assert!(r.steps_at.len() <= 3, "{:?}", r.steps_at);
+    }
+
+    #[test]
+    fn an_idle_driver_with_the_notification_ticks_once_a_second() {
+        let r = run_bound(0, 1, 10_500, 0);
+        assert_eq!(r.steps_at.len(), 10);
+    }
+
+    #[test]
+    fn the_notification_comes_at_most_once_in_a_period_and_waits_for_the_pace() {
+        let mut pace = Pace::new();
+        assert_eq!(pace.notified(5), Due::Now, "nothing taken yet");
+        pace.took(1_000);
+        assert_eq!(pace.notified(1_000), Due::At(1_000 + DRAIN_NS));
+        assert_eq!(
+            pace.notified(1_000 + DRAIN_NS - 1),
+            Due::At(1_000 + DRAIN_NS)
+        );
+        assert_eq!(pace.notified(1_000 + DRAIN_NS), Due::Now);
+        assert_eq!(pace.notified(u64::MAX), Due::Now);
+    }
+
+    #[test]
+    fn the_binding_is_acknowledged_only_when_everything_is_out() {
+        assert!(drained(false, true, false, false));
+        assert!(
+            !drained(true, true, false, false),
+            "records are in the rings"
+        );
+        assert!(
+            !drained(false, false, false, false),
+            "text waits for the port"
+        );
+        assert!(!drained(false, true, true, false), "a line is open");
+        assert!(!drained(false, true, false, true), "the driver stops");
+        assert_eq!(period_bound_ns(true), SAFETY_NS);
+        assert_eq!(period_bound_ns(false), DRAIN_NS);
+    }
+
+    #[test]
+    fn a_safety_tick_that_finds_records_is_said_once_and_counted() {
+        let mut missed = Missed::new();
+        assert_eq!(missed.tick(0, Some(false)), None);
+        // The kernel posted: the notification is on its way.
+        assert_eq!(missed.tick(3, Some(true)), None);
+        assert_eq!(missed.cases(), 0);
+        assert_eq!(missed.tick(3, Some(false)), Some(3));
+        assert_eq!(missed.tick(5, None), None, "said once");
+        assert_eq!(missed.cases(), 2);
     }
 
     #[test]

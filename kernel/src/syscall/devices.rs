@@ -63,7 +63,8 @@ pub(super) fn device_window_create(thread: NonNull<Thread>, a: &Args) -> Result<
 /// room in the caller's table (LIMIT_REACHED), a slot of the channel
 /// (LIMIT_REACHED, spec 6.5), a page of the caller's pool of bindings and
 /// a block of its table (NO_MEMORY). A binding whose handle did not go in
-/// goes again, and its line with it.
+/// goes again, and its line with it. The line abi::LOG_LINE takes the branch
+/// of the log (`irq_bind_log`), before any check of a line.
 #[inline(never)]
 pub(super) fn irq_bind(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let cpu = cpu_arg(a[5], arch::cpu::MAX_CPUS)?;
@@ -74,6 +75,11 @@ pub(super) fn irq_bind(thread: NonNull<Thread>, a: &Args) -> Result<Values, Erro
     // reference, and another CPU may close the device meanwhile.
     let mut commands = None;
     let result = super::objects(|| {
+        // No event of a device has the number of the log's line, and no
+        // line of the GIC: its checks come first, whatever x0 is.
+        if a[1] == abi::LOG_LINE {
+            return irq_bind_log(thread, a, cpu);
+        }
         let device = lookup(thread, a[0], Rights::MANAGE, Object::msi);
         if !matches!(device, Err(Error::WrongType | Error::BadHandle)) {
             irq_bind_event(thread, a, cpu, device, &mut commands)
@@ -117,6 +123,46 @@ fn irq_bind_line(thread: NonNull<Thread>, a: &Args, cpu: u32) -> Result<Values, 
     let h = process::insert_handle(caller(thread), Object::Irq(b), OWNER_RIGHTS);
     // SAFETY: the reference `bind` handed out goes; the handle, if it went
     // in, holds the binding, and without it the binding and its line go.
+    unsafe { irq::release_handle(b, cause(thread)) };
+    Ok(Values::new(&[h?.0]))
+}
+
+/// The part of irq_bind that binds the kernel log (spec 9, 11): x0 a system
+/// resource with KSTATS, x1 abi::LOG_LINE, x2 a channel with NOTIFY, x3 the
+/// priority, x4 flags, which are 0 (the line is level-triggered), x5 the CPU,
+/// checked as a line's and unused. The caller has a device window, as the
+/// console's driver does for the shift of `seen` (object_info LOG). The
+/// checks in the order of spec 11: priority, flags and CPU outside the
+/// values (INVALID_ARGS); x0 (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED without
+/// KSTATS), no device window (ACCESS_DENIED), x2 (BAD_HANDLE, WRONG_TYPE,
+/// ACCESS_DENIED without NOTIFY); the priority above the caller's ceiling
+/// (ACCESS_DENIED); a binding of the log (BAD_STATE), a closed channel
+/// (PEER_CLOSED); then the resources as for a line. The binding is born
+/// masked and unarmed; irq_ack arms it.
+fn irq_bind_log(thread: NonNull<Thread>, a: &Args, cpu: u32) -> Result<Values, Error> {
+    let priority = priority_arg(a[3])?;
+    if a[4] != 0 {
+        return Err(Error::InvalidArgs);
+    }
+    check_cpu(cpu)?;
+    lookup(thread, a[0], Rights::KSTATS, Object::resource)?;
+    // SAFETY: the calling thread is alive and holds its process.
+    if process::device_windows(unsafe { thread.as_ref() }.process()) == 0 {
+        return Err(Error::AccessDenied);
+    }
+    let (c, label) = notify_channel(thread, a[2])?;
+    under_ceilings(priority, &[caller_ceiling(thread)])?;
+    if irq::log_is_bound() {
+        return Err(Error::BadState);
+    }
+    if channel::is_closed(c) {
+        return Err(Error::PeerClosed);
+    }
+    process::handle_room(caller(thread))?;
+    let b = irq::bind_log(caller(thread), c, label, priority, cpu)?;
+    let h = process::insert_handle(caller(thread), Object::Irq(b), OWNER_RIGHTS);
+    // SAFETY: the reference `bind_log` handed out goes; the handle, if it
+    // went in, holds the binding, and without it the binding goes with it.
     unsafe { irq::release_handle(b, cause(thread)) };
     Ok(Values::new(&[h?.0]))
 }
@@ -226,14 +272,21 @@ pub(super) fn msi_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Er
 /// an MSI device WOULD_BLOCK while the ITS has not run the commands of its
 /// mapping (irq_bind returned x4 = 0): the driver asks again before it
 /// unmasks its vector (spec 9). The check reads a register of the ITS and
-/// goes after the section.
+/// goes after the section. The binding of the log arms the log's wake when
+/// it opens, and a ring that holds a record the driver has not passed posts
+/// at once, with this call's way out of the kernel (`log::recheck`, after the
+/// section); an open binding does nothing.
 #[inline(never)]
 pub(super) fn irq_ack(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let mut mapping = None;
+    let mut recheck = false;
     super::objects(|| {
         let b = lookup(thread, a[0], Rights::MANAGE, Object::irq)?;
-        irq::ack(b, &mut mapping)
+        irq::ack(b, &mut mapping, &mut recheck)
     })?;
+    if recheck {
+        crate::log::recheck();
+    }
     if mapping.is_some_and(|at| !its::mapped(at)) {
         return Err(Error::WouldBlock);
     }

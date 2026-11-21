@@ -653,6 +653,7 @@ pub fn breaks() -> Result<(), String> {
         println!("budget-breaks: {feature} fails the host tests");
     }
     unbound_break()?;
+    crate::log_quiet::breaks()?;
     // init's table check: budgets that take all of a CPU must be refused.
     let out = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .current_dir(crate::root())

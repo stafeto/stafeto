@@ -1096,6 +1096,11 @@ impl Run {
         if let Some(refused) = refused_budget(&lines) {
             panic!("{refused}");
         }
+        // Every run of every image: the console's driver found records its safety tick
+        // should not have, so the kernel's notification of a record was missed (spec 9).
+        if let Some(missed) = missed_log_wake(&lines) {
+            panic!("{missed}");
+        }
         // The console volume of the step tables, as a number the log shows.
         if let Some(warning) = table_volume_warning(&lines) {
             println!("{warning}");
@@ -1127,6 +1132,18 @@ fn table_volume_warning(lines: &[String]) -> Option<String> {
     })
 }
 
+/// The first line of a run in which the console's driver says a record of the kernel log came with
+/// no notification (`uart: log wake missed N records`, services/uart), as the message that fails
+/// the run. The word is taken as far as `log wake mis`, since another line may cut the text.
+fn missed_log_wake(lines: &[String]) -> Option<String> {
+    lines
+        .iter()
+        .find(|l| l.contains("log wake mis"))
+        .map(|line| {
+            format!("the kernel did not wake the console's driver for a record of its log: {line}")
+        })
+}
+
 /// The first line of a run in which a program says its budget was refused (`<program>: the budget
 /// of <name> is refused: ...`, `rt::budget::bind`), as a message that names the program and the
 /// budget. The text may be cut by another program's line at the console, so the word `refused`
@@ -1151,6 +1168,71 @@ pub fn run_until(
     stop_marker: Option<&str>,
 ) -> Result<Outcome, String> {
     run_until_staged(cmd, timeout, stop_marker, None)
+}
+
+/// Whether `marker` is init's line for the end of a program, `init: <program> ended` and what
+/// follows: init writes it straight to the console, and the last line of a probe that prints
+/// through the terminal service comes in no fixed order with it, either side of it (the race
+/// stafeto#538 settled for five probes).
+pub fn is_init_end_marker(marker: &str) -> bool {
+    marker.starts_with("init: ") && marker.contains(" ended")
+}
+
+/// `run_until` for a probe with two lines that end it in no fixed order, init's end line
+/// (`init: <program> ended: ...`) and the probe's own last line, which goes through the terminal
+/// service: stops once every one of `markers` has come, and keeps the lines up to the last of
+/// them. The first of `markers` is init's end line: what the services print in measures
+/// (`service step:` and the like) after it is left out, as it is when a run stops on it: init is
+/// stopping them then, and a step of the shutdown is no measure of the probe.
+pub fn run_until_all(cmd: Command, timeout: Duration, markers: &[&str]) -> Result<Outcome, String> {
+    let mut run = Run::start(cmd, Input::Null)?;
+    let deadline = Instant::now() + timeout;
+    let mut seen: Vec<Option<usize>> = vec![None; markers.len()];
+    let mut checked = 0;
+    loop {
+        for (i, line) in run.lines.iter().enumerate().skip(checked) {
+            for (k, marker) in markers.iter().enumerate() {
+                if seen[k].is_none() && line.contains(marker) {
+                    seen[k] = Some(i);
+                }
+            }
+        }
+        checked = run.lines.len();
+        if seen.iter().all(Option::is_some) {
+            // The first marker is init's end line, which main's runs stopped on.
+            let first = seen[0].unwrap_or(0);
+            let last = seen.iter().flatten().max().copied().unwrap_or(0);
+            let mut outcome = run.end(End::Marker(last));
+            drop_measures_after(&mut outcome.lines, first);
+            return Ok(outcome);
+        }
+        match run.wait(deadline) {
+            Wait::Came => {}
+            Wait::Deadline => return Ok(run.end(End::TimedOut)),
+            Wait::Ended if run.line_start < run.transcript.bytes.len() => run.end_line(),
+            Wait::Ended => break,
+        }
+    }
+    loop {
+        if let Some(status) = run.child.try_wait().map_err(|e| e.to_string())? {
+            return Ok(run.end(End::Exited(status)));
+        }
+        if Instant::now() >= deadline {
+            return Ok(run.end(End::TimedOut));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Leaves out of `lines` the lines the services print for their measures (`service step:`,
+/// `service table:`, `service wait:`, `service gap:`, `service preempt:`, `service heartbeat:`)
+/// that stand after place `first`, the place of init's end line.
+fn drop_measures_after(lines: &mut Vec<String>, first: usize) {
+    let mut at = 0;
+    lines.retain(|l| {
+        at += 1;
+        at - 1 <= first || !l.starts_with("service ")
+    });
 }
 
 /// A limit on one stage of a run: once a line contains `after`, a line that
@@ -1221,7 +1303,11 @@ fn tail(lines: &[String]) -> &[String] {
 /// (run_until): the machine still ran, so the run has no exit status. No
 /// line has KERNEL PANIC.
 pub fn expect_stopped_on(o: &Outcome, line: &str) -> Result<(), String> {
-    if !o.stopped_on_marker || o.lines.last().is_none_or(|l| l != line) {
+    // The line that stopped the run is the last, or, for init's end line
+    // (`is_init_end_marker`), one of the last: the probe's own lines may follow it.
+    let stopped = o.lines.last().is_some_and(|l| l == line)
+        || (is_init_end_marker(line) && o.lines.iter().any(|l| l == line));
+    if !o.stopped_on_marker || !stopped {
         return Err(format!(
             "QEMU was not stopped on {line:?}; last lines: {:?}",
             tail(&o.lines)
@@ -2417,6 +2503,61 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         );
     }
 
+    /// Init's end line and the probe's last line come in either order: the run stops on the
+    /// later of the two and keeps both, leaves out the measures of the services that come
+    /// after the first, and waits for neither a third thing nor a line past them.
+    #[test]
+    fn a_run_waits_for_init_ending_and_the_probes_last_line_in_either_order() {
+        assert!(is_init_end_marker("init: posix-pty ended: "));
+        assert!(is_init_end_marker("init: tty-probe ended"));
+        assert!(!is_init_end_marker("KERNEL PANIC: x"));
+        assert!(!is_init_end_marker("posix-pty: ok"));
+        let ended = "init: posix-pty ended: exit code 0, not restarted";
+        let markers = ["init: posix-pty ended: ", "posix-pty: ok"];
+        let o = run_until_all(
+            sh(&format!(
+                "echo booting; echo 'service step: 1 kind 64 5 ticks'; echo '{ended}'; echo 'service step: 1 kind 64 99999 ticks detail 0 preempts 26'; echo 'ramfs: audit round 1'; sleep 0.2; echo 'posix-pty: ok'; echo 'too late'; exec sleep 10"
+            )),
+            Duration::from_secs(20),
+            &markers,
+        )
+        .unwrap();
+        assert!(o.stopped_on_marker && !o.timed_out);
+        assert!(expect_marker(&o, "posix-pty: ok").is_ok());
+        assert!(expect_stopped_on(&o, ended).is_ok());
+        assert!(
+            o.lines
+                .iter()
+                .any(|l| l == "service step: 1 kind 64 5 ticks")
+        );
+        assert!(
+            !o.lines.iter().any(|l| l.contains("99999")),
+            "{:?}",
+            o.lines
+        );
+        assert!(o.lines.iter().any(|l| l == "ramfs: audit round 1"));
+        assert!(!o.lines.iter().any(|l| l == "too late"));
+        // The other order: the probe's line first.
+        let o = run_until_all(
+            sh(&format!(
+                "echo 'posix-pty: ok'; echo '{ended}'; exec sleep 10"
+            )),
+            Duration::from_secs(20),
+            &markers,
+        )
+        .unwrap();
+        assert!(expect_marker(&o, "posix-pty: ok").is_ok());
+        assert!(expect_stopped_on(&o, ended).is_ok());
+        // A run in which one never comes times out.
+        let o = run_until_all(
+            sh("echo 'posix-pty: ok'; exec sleep 10"),
+            Duration::from_secs(1),
+            &markers,
+        )
+        .unwrap();
+        assert!(o.timed_out && !o.stopped_on_marker);
+    }
+
     #[test]
     fn stops_on_the_marker() {
         let start = Instant::now();
@@ -2717,6 +2858,26 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         .unwrap();
         run.expect("attached\n", Duration::from_secs(5)).unwrap();
         run.stop();
+    }
+
+    /// Every run of every image: the driver's line about a missed wake of the log fails the run.
+    #[test]
+    fn a_missed_log_wake_fails_every_run() {
+        let lines = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            missed_log_wake(&lines(&[
+                "uart: the kernel log wake is not available (InvalidArgs)"
+            ])),
+            None
+        );
+        assert_eq!(missed_log_wake(&[]), None);
+        let m = missed_log_wake(&lines(&[
+            "init: services started",
+            "uart: log wake missed 3 records",
+        ]))
+        .unwrap();
+        assert!(m.contains("uart: log wake missed 3 records"), "{m}");
+        assert!(missed_log_wake(&lines(&["uart: log wake missinit: x"])).is_some());
     }
 
     /// Every run of every image: a program that says its budget was refused fails the run when it

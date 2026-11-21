@@ -654,6 +654,26 @@ const TESTS: &[(&str, TestFn)] = &[
     ),
     ("irq_ack_unmasks_the_line", calls::irq_ack_unmasks_the_line),
     (
+        "log_wake_binds_with_its_rights_and_is_born_masked",
+        calls::log_wake_binds_with_its_rights_and_is_born_masked,
+    ),
+    (
+        "log_wake_posts_once_for_each_arming",
+        calls::log_wake_posts_once_for_each_arming,
+    ),
+    (
+        "log_wake_ack_posts_at_once_for_a_record_of_another_cpu",
+        calls::log_wake_ack_posts_at_once_for_a_record_of_another_cpu,
+    ),
+    (
+        "log_wake_post_is_a_turn_of_its_own",
+        calls::log_wake_post_is_a_turn_of_its_own,
+    ),
+    (
+        "log_wake_ends_with_the_last_handle",
+        calls::log_wake_ends_with_the_last_handle,
+    ),
+    (
         "masked_line_waits_for_irq_ack",
         calls::masked_line_waits_for_irq_ack,
     ),

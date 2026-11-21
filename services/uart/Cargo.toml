@@ -27,6 +27,10 @@ break-uart-poll = []
 # The longest step of the loop for each kind, printed when it grows and as a table (rt feature
 # step-stats; xtask posix-tty-steps, under -icount).
 steps = ["rt/step-stats"]
+# The quiet probe of the kernel log's wake (xtask log-quiet): the driver counts its wake-ups and
+# the overruns of its budget at each safety tick, and writes lines of its own to measure the
+# latency of a line.
+quiet-probe = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

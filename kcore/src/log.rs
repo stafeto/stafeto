@@ -256,6 +256,34 @@ impl<const N: usize> Ring<N> {
         )
     }
 
+    /// Whether the ring of another CPU holds a record no read has passed: its
+    /// `head` is past `max(taken, seen)` (the console's driver takes the
+    /// records of the ring of its own CPU and reads the others with
+    /// `peek_shared`). One look at the seqlock, no retry: a writer in the
+    /// middle of a record (an odd number) or one that wrote meanwhile (the
+    /// number changed) counts as "yes", so that a doubtful answer wakes the
+    /// reader once too often and never once too rarely. O(1).
+    ///
+    /// # Safety
+    /// As for `peek_shared`.
+    pub unsafe fn has_unseen_shared(this: *const Self) -> bool {
+        let mut looks = 1;
+        // SAFETY: the caller's promise; the reads of the cells are volatile.
+        let read = unsafe {
+            Self::stable(this, Some(&mut looks), |r| {
+                (
+                    Self::head_of(r),
+                    r.taken.load(Ordering::Relaxed),
+                    r.seen.load(Ordering::Relaxed),
+                )
+            })
+        };
+        match read {
+            Some((_, (head, taken, seen))) => head > taken.max(seen),
+            None => true,
+        }
+    }
+
     /// The owner's `head`, by a volatile load.
     fn head_of(r: &Self) -> u64 {
         // SAFETY: a field of the cell, read by address.
@@ -893,6 +921,44 @@ mod tests {
         assert_eq!(ring.seen.load(Ordering::Relaxed), 6);
         // The owner's cursor stayed.
         assert_eq!(ring.taken.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_ring_has_unseen_records_after_a_push_and_none_after_a_take_or_a_peek() {
+        let ring = Ring::<8>::new();
+        let has = |r: &Ring<8>| {
+            // SAFETY: the ring lives here and nothing writes it meanwhile.
+            unsafe { Ring::has_unseen_shared(r as *const Ring<8>) }
+        };
+        assert!(!has(&ring), "an empty ring has none");
+        for n in 1..=3 {
+            ring.push(n, LOG_TEXT_KIND, &numbered(n), false);
+        }
+        assert!(has(&ring), "a pushed record is unseen");
+        ring.take(|_, _| {});
+        assert!(!has(&ring), "a take passes them all");
+        ring.push(4, LOG_TEXT_KIND, &numbered(4), false);
+        assert!(has(&ring));
+        let mut from = 0;
+        peek_all(&ring, &mut from);
+        assert!(!has(&ring), "a peek that advances `seen` passes them");
+        ring.push(5, LOG_TEXT_KIND, &numbered(5), false);
+        // A peek that does not advance leaves the record unseen.
+        // SAFETY: as above.
+        unsafe { Ring::peek_shared(&ring as *const Ring<8>, 0, false, |_, _| {}) };
+        assert!(has(&ring));
+    }
+
+    #[test]
+    fn a_writer_in_the_middle_of_a_record_counts_as_unseen() {
+        let ring = Ring::<8>::new();
+        ring.push(1, LOG_TEXT_KIND, &numbered(1), false);
+        ring.take(|_, _| {});
+        // The owner stopped inside a push: the number is odd.
+        ring.seq
+            .store(ring.seq.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        // SAFETY: the ring lives here and nothing writes it meanwhile.
+        assert!(unsafe { Ring::has_unseen_shared(&ring as *const Ring<8>) });
     }
 
     #[test]

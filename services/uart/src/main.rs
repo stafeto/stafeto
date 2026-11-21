@@ -7,8 +7,12 @@
 //! `irq` of its level-triggered line in the reply to its REGISTER. It sets
 //! the PL011 up, serves its interrupts and WRITE and READ of proto_uart
 //! (CRASH too with the feature `crash`), and shows the kernel log: at its
-//! start and on a timer of its own (every uart::log::IDLE_NS, every DRAIN_NS
-//! while it holds text or the kernel says records are left). What it decides
+//! start, on the kernel's notification that a record landed (the binding of
+//! the log's line, abi::LOG_LINE, at most once in uart::log::DRAIN_NS) and on a
+//! timer of its own (every DRAIN_NS while it holds text or the kernel says
+//! records are left, every SAFETY_NS otherwise, which also finds a record the
+//! notification missed and says so). A kernel that refuses the binding, and
+//! a 16550 that polls, leave the timer alone: every uart::log::IDLE_NS. What it decides
 //! comes from the library (uart::irq, output, writes, input, log); here are the calls and
 //! the registers, which it reaches through rt::mmio alone [G34]. The
 //! program ends with a code of its own when its start fails; init
@@ -56,6 +60,9 @@ const PAGE: u64 = 4096;
 const TIMER_LABEL: u64 = 1;
 /// A separate one-shot timer resumes paced transmit portions.
 const TX_TIMER_LABEL: u64 = 2;
+/// The label of the copy of the driver's channel the binding of the log's
+/// line posts through.
+const LOG_LABEL: u64 = 3;
 /// How long the driver waits for the transmitter to go idle before it
 /// sets the PL011 up: the kernel wrote to the port until the window came.
 const IDLE_NS: u64 = 10_000_000;
@@ -97,6 +104,9 @@ struct State {
     /// The lines of the kernel log that go in pieces, until they are whole.
     lines: console_line::Lines,
     read: [u8; RX_RING],
+    /// The latency of the lines the quiet probe writes (feature `quiet-probe`).
+    #[cfg(feature = "quiet-probe")]
+    latency: uart::probe::Latency,
 }
 
 struct Cell(UnsafeCell<MaybeUninit<State>>);
@@ -134,6 +144,8 @@ fn state() -> Option<&'static mut State> {
         sources: uart::log::Sources::new(),
         lines: console_line::Lines::new(),
         read: [0; RX_RING],
+        #[cfg(feature = "quiet-probe")]
+        latency: uart::probe::Latency::new(),
     }))
 }
 
@@ -260,6 +272,17 @@ fn main(_: u64) -> u64 {
     let Ok(tx_timer) = sys::timer_create(&tx_view, level) else {
         return NOT_REGISTERED;
     };
+    // The kernel's notification of a record, for a driver that does not poll
+    // its port: any refusal leaves the log to the timer, every IDLE_NS, and
+    // the driver tells why (`log_wake`).
+    let (log_irq, log_view, log_refused) = if poll {
+        (None, None, None)
+    } else {
+        match bind_log(&channel, &log, level) {
+            Ok((irq, view)) => (Some(irq), Some(view), None),
+            Err(e) => (None, None, Some(e)),
+        }
+    };
     let mut uart = Uart {
         channel: Handle::borrowed(channel.raw()),
         level,
@@ -277,13 +300,38 @@ fn main(_: u64) -> u64 {
         deadline: 0,
         left: 0,
         peak: uart::log::Peak::new(),
+        log_irq,
+        _log_view: log_view,
+        pace: uart::log::Pace::new(),
+        missed: uart::log::Missed::new(),
+        safety: false,
+        #[cfg(feature = "quiet-probe")]
+        probe: Probe {
+            budget: None,
+            wakeups: 0,
+            ticks: 0,
+            first: (0, 0, 0),
+            said_latency: false,
+            reason: 4,
+            previous: 4,
+            last: 0,
+            reasons: [0; REASONS],
+            first_reasons: [0; REASONS],
+        },
         irqs: Irq::new(),
         stop_by: None,
         state,
     };
     uart.set_up();
     uart.take_log();
-    uart.arm();
+    uart.pace_took();
+    uart.settle();
+    if let Some(e) = log_refused {
+        uart.say(format_args!(
+            "uart: the kernel log wake is not available ({e:?}), reading the log every {} ms\n",
+            uart::log::IDLE_NS / 1_000_000
+        ));
+    }
     let base = args
         .and_then(|a| a.own.get(..8))
         .and_then(|b| b.try_into().ok())
@@ -313,7 +361,11 @@ fn main(_: u64) -> u64 {
     // runs under its budget" is not printed then. xtask fails the run for the refusal line in
     // any probe (`Run::end`, `refused_budget`), and the probes that require the boot line fail
     // for its absence.
-    let _ = rt::budget::bind("uart", "serve", budget, &s.thread);
+    let _bound = rt::budget::bind("uart", "serve", budget, &s.thread);
+    #[cfg(feature = "quiet-probe")]
+    {
+        uart.probe.budget = _bound.ok().flatten();
+    }
     // The tag of the driver's lines of steps (`service table: 18 kind K ...`): kind 65 is the tick
     // of the log that found no record (the idle tick), kind 64 is the other notices, and the
     // detail of kind 64 tells which: 1 the interrupt of the line, 2 the transmit wake-up, 3 a
@@ -330,6 +382,44 @@ fn main(_: u64) -> u64 {
     let _ = rt::service::run::<Uart, SESSIONS, HELD>(&channel, &mut uart, config);
     uart.say_peak(true);
     STOPPED
+}
+
+/// What the quiet probe counts (feature `quiet-probe`).
+#[cfg(feature = "quiet-probe")]
+struct Probe {
+    budget: Option<Handle<rt::handle::Budget>>,
+    wakeups: u64,
+    ticks: u32,
+    /// The wake-ups, the overruns and the time (ms) at the first safety tick.
+    first: (u64, u64, u64),
+    said_latency: bool,
+    /// The reason of the wake-up in progress (`REASON_*`), the overruns read at the end of the
+    /// last one, the overruns of each reason so far and at the first safety tick.
+    reason: usize,
+    previous: usize,
+    last: u64,
+    reasons: [u64; REASONS],
+    first_reasons: [u64; REASONS],
+}
+
+/// The reasons a wake-up of the driver is told by: the heartbeat to init (not the log's work),
+/// the kernel's notification of a record, the safety tick, a tick of the drain, the rest.
+#[cfg(feature = "quiet-probe")]
+const REASONS: usize = 5;
+#[cfg(feature = "quiet-probe")]
+const REASON_BEAT: usize = 0;
+
+/// The binding of the log's line (spec 9, 11): a copy of the driver's channel
+/// with NOTIFY and LOG_LABEL, and the binding through it at the driver's
+/// level, born masked and unarmed (`Uart::settle` acknowledges it).
+fn bind_log(
+    channel: &Handle<Channel>,
+    log: &Handle<Resource>,
+    level: u8,
+) -> Result<(Handle<Interrupt>, Handle<Channel>), Error> {
+    let view = sys::handle_label(channel, abi::Rights::NOTIFY, LOG_LABEL, level)?;
+    let irq = sys::irq_bind_log(log, &view, level)?;
+    Ok((irq, view))
 }
 
 /// The driver: the registers, the binding of the line, `log`, the timer
@@ -360,6 +450,22 @@ struct Uart {
     left: u64,
     /// The largest backlog of the rings the driver saw (uart::log::Peak).
     peak: uart::log::Peak,
+    /// The binding of the log's line, with the copy of the channel it posts
+    /// through; None when the kernel refused it or the port polls.
+    log_irq: Option<Handle<Interrupt>>,
+    _log_view: Option<Handle<Channel>>,
+    /// When the log was taken last, which spaces the takes (uart::log::Pace).
+    pace: uart::log::Pace,
+    /// The ticks of the safety timer that found records (uart::log::Missed).
+    missed: uart::log::Missed,
+    /// The timer's deadline is a safety tick: the driver acknowledged the
+    /// binding and waits for the kernel.
+    safety: bool,
+    /// The quiet probe (feature `quiet-probe`): the notices the driver
+    /// served, the safety ticks, the budget it reads the overruns of, and the
+    /// latency of the lines it writes.
+    #[cfg(feature = "quiet-probe")]
+    probe: Probe,
     irqs: Irq,
     /// Init asked the driver to stop: the time by which it exits whether
     /// or not the log reached the port (`stop`).
@@ -562,6 +668,8 @@ impl Uart {
                 records,
                 sources,
                 lines,
+                #[cfg(feature = "quiet-probe")]
+                latency,
                 ..
             } = &mut *self.state;
             if !output.accepts_log() || !uart::log::take_more(taken, output.log_room()) {
@@ -589,6 +697,18 @@ impl Uart {
                 let _ = output.put_log(bytes);
             });
             taken += 1;
+            #[cfg(feature = "quiet-probe")]
+            {
+                let now = time::ticks_to_ns(time::now());
+                for bytes in records.iter().take((batch.count as usize).min(LOG_BATCH)) {
+                    if let Ok(r) = uart::log::record(bytes)
+                        && uart::probe::is_line(r.text)
+                    {
+                        let written = time::ticks_to_ns(r.time);
+                        latency.taken(now.saturating_sub(written) / 1_000);
+                    }
+                }
+            }
             if self.left == 0 {
                 break;
             }
@@ -607,11 +727,61 @@ impl Uart {
     fn arm(&mut self) {
         let now = time::ticks_to_ns(time::now());
         let room = self.state.output.log_room();
-        let ns = uart::log::period_ns(self.left, room);
+        let ns = if self.log_irq.is_some() {
+            let drained = self.drained();
+            self.safety = drained;
+            uart::log::period_bound_ns(drained)
+        } else {
+            uart::log::period_ns(self.left, room)
+        };
         let ns = if self.poll { ns.min(POLL_NS) } else { ns };
         self.deadline = next_release(self.t0, ns, now);
         // The driver's own timer: timer_set has no error to give.
         let _ = sys::timer_set(&self.timer, self.deadline);
+    }
+
+    /// Whether everything the kernel gave is out and no record waits
+    /// (uart::log::drained).
+    fn drained(&self) -> bool {
+        let State {
+            output,
+            sources,
+            lines,
+            ..
+        } = &*self.state;
+        uart::log::drained(
+            self.left > 0 || sources.more(),
+            output.log_done(),
+            lines.any_open(),
+            self.stop_by.is_some(),
+        )
+    }
+
+    /// The log was taken now: the notification waits at least DRAIN_NS
+    /// from here (uart::log::Pace).
+    fn pace_took(&mut self) {
+        self.pace.took(time::ticks_to_ns(time::now()));
+    }
+
+    /// The end of a step that took the log: with the binding of the log's
+    /// line and nothing held, the driver acknowledges it, which arms the
+    /// kernel's notification of the next record (the kernel looks at the
+    /// rings once more, so a record that came meanwhile posts at once), and
+    /// the timer is the safety tick; otherwise the timer is the drain's.
+    /// A binding that cannot be acknowledged is dropped, and the driver
+    /// reads the log on its timer from then on.
+    fn settle(&mut self) {
+        if self.drained()
+            && let Some(irq) = &self.log_irq
+            && sys::irq_ack(irq).is_err()
+        {
+            self.log_irq = None;
+            self.say_log(format_args!(
+                "uart: the kernel log wake went away, reading the log every {} ms\n",
+                uart::log::IDLE_NS / 1_000_000
+            ));
+        }
+        self.arm();
     }
 
     /// Says the largest backlog of the kernel's rings the driver saw, once
@@ -1012,10 +1182,22 @@ impl Service<HELD> for Uart {
         self.clones.gone(label);
     }
 
-    /// The interrupt of the line, and the timer of the reads of the log:
-    /// a stale expiry, before its deadline, changes nothing.
+    /// The interrupt of the line, the kernel's notification of a record, and
+    /// the timer of the reads of the log: a stale expiry, before its
+    /// deadline, changes nothing.
     fn notification(&mut self, n: Notice) {
+        #[cfg(feature = "quiet-probe")]
+        {
+            self.probe.wakeups += 1;
+            self.probe.reason = match (n.source, n.label) {
+                (Source::Interrupt, LOG_LABEL) => 1,
+                (Source::Timer, TIMER_LABEL) if self.safety => 2,
+                (Source::Timer, TIMER_LABEL) => 3,
+                _ => 4,
+            };
+        }
         match (n.source, n.label) {
+            (Source::Interrupt, LOG_LABEL) => self.log_notified(),
             (Source::Interrupt, _) => {
                 #[cfg(feature = "steps")]
                 rt::service::step_detail(1);
@@ -1032,22 +1214,38 @@ impl Service<HELD> for Uart {
                 if self.poll {
                     self.interrupt();
                 }
-                let (batches, records) = self.take_log();
-                #[cfg(feature = "steps")]
-                if records > 0 {
-                    rt::service::step_detail(100 + records as u64);
-                } else if batches == 0 {
-                    rt::service::step_detail(3);
-                } else {
-                    rt::service::step_own();
-                }
-                #[cfg(not(feature = "steps"))]
-                let _ = (batches, records);
-                self.say_peak(false);
-                self.arm();
-                self.exit_if_drained();
+                let safety = self.safety;
+                self.log_step(safety);
             }
             _ => {}
+        }
+    }
+
+    /// The quiet probe's lines for the latency: one at each heartbeat once the
+    /// quiet window is over, which no other wake-up of the driver is near.
+    #[cfg(feature = "quiet-probe")]
+    fn maintenance(&mut self, _: &mut [Option<Session<(), HELD>>], notice: Notice) {
+        // The overruns of the budget since the last wake-up are this one's, by its reason: the
+        // heartbeat is no notification of the driver's, the rest set the reason in `notification`.
+        let reason = if notice.source == Source::Timer && notice.label == 0 {
+            REASON_BEAT
+        } else {
+            self.probe.reason
+        };
+        // The kernel counts an overrun when the budget's event fires, up to a period (10 ms)
+        // after the step that ran it out, so the ones seen now belong to the wake-up before this.
+        if let Some(now) = self.probe_overruns() {
+            self.probe.reasons[self.probe.previous] += now.wrapping_sub(self.probe.last);
+            self.probe.last = now;
+        }
+        self.probe.previous = reason;
+        self.probe.reason = 4;
+        if notice.source == Source::Timer
+            && notice.label == 0
+            && self.state.latency.writes(self.probe.ticks)
+        {
+            let n = self.state.latency.written();
+            let _ = rt::console::write_fmt(format_args!("uart: latency probe line {n}\n"));
         }
     }
 
@@ -1065,7 +1263,108 @@ impl Service<HELD> for Uart {
     }
 }
 
+#[cfg(feature = "quiet-probe")]
 impl Uart {
+    /// The overruns of the driver's budget the kernel counts, if they can be read.
+    fn probe_overruns(&self) -> Option<u64> {
+        let budget = self.probe.budget.as_ref()?;
+        sys::budget_info(budget).ok().map(|info| info.overruns)
+    }
+}
+
+impl Uart {
+    /// The kernel says a record landed, and the binding stays masked until
+    /// `settle` acknowledges it: the log is taken now when the last take is
+    /// DRAIN_NS behind, and at the time that makes it so otherwise, so that
+    /// the work of the driver in a period stays STEP_BATCHES whatever the
+    /// rate of the records (uart::log::Pace).
+    fn log_notified(&mut self) {
+        let now = time::ticks_to_ns(time::now());
+        match self.pace.notified(now) {
+            uart::log::Due::Now => self.log_step(false),
+            uart::log::Due::At(at) => {
+                #[cfg(feature = "steps")]
+                rt::service::step_detail(4);
+                self.safety = false;
+                self.deadline = at;
+                // The driver's own timer: timer_set has no error to give.
+                let _ = sys::timer_set(&self.timer, at);
+            }
+        }
+    }
+
+    /// A step of the log: the batches the period allows, then the rule for
+    /// what follows. `safety` says the tick was the safety timer's: records
+    /// it finds are a notification the kernel did not post, unless the
+    /// binding is masked (the post is on its way): the driver says so once
+    /// (uart::log::Missed), and xtask fails the run for the line.
+    fn log_step(&mut self, safety: bool) {
+        let (batches, records) = self.take_log();
+        self.pace_took();
+        #[cfg(feature = "steps")]
+        if records > 0 {
+            rt::service::step_detail(100 + records as u64);
+        } else if batches == 0 {
+            rt::service::step_detail(3);
+        } else {
+            rt::service::step_own();
+        }
+        #[cfg(not(feature = "steps"))]
+        let _ = batches;
+        // The probe says nothing before the window is over, so that no line of its own
+        // (the console's transmit interrupts and the drain that follow) is counted in it.
+        #[cfg(feature = "quiet-probe")]
+        if safety {
+            self.probe.ticks += 1;
+            let overruns = self
+                .probe
+                .budget
+                .as_ref()
+                .and_then(|b| sys::budget_info(b).ok())
+                .map_or(u64::MAX, |info| info.overruns);
+            let at = time::ticks_to_ns(time::now()) / 1_000_000;
+            let now = (self.probe.wakeups, overruns, at);
+            if self.probe.ticks == 1 {
+                self.probe.first = now;
+                self.probe.first_reasons = self.probe.reasons;
+            } else if self.probe.ticks == 11 {
+                let d: [u64; REASONS] =
+                    core::array::from_fn(|i| self.probe.reasons[i] - self.probe.first_reasons[i]);
+                self.say_log(format_args!(
+                    "uart: quiet reasons beat {} log {} safe {} drain {} other {}\n",
+                    d[0], d[1], d[2], d[3], d[4]
+                ));
+                let (w, o, t) = self.probe.first;
+                self.say_log(format_args!(
+                    "uart: quiet window wakeups {} overruns {} ms {}\n",
+                    now.0 - w,
+                    now.1.wrapping_sub(o),
+                    now.2 - t
+                ));
+            }
+            if self.state.latency.lines() >= uart::probe::LINES && !self.probe.said_latency {
+                self.probe.said_latency = true;
+                let (longest, p99) = self.state.latency.longest_and_p99();
+                self.say_log(format_args!(
+                    "uart: quiet latency max {longest} us p99 {p99} us lines {}\n",
+                    uart::probe::LINES
+                ));
+            }
+        }
+        if safety && records > 0 {
+            let masked = self
+                .log_irq
+                .as_ref()
+                .and_then(|irq| sys::irq_info(irq).ok())
+                .map(|info| info.masked);
+            if let Some(n) = self.missed.tick(records, masked) {
+                self.say_log(format_args!("uart: log wake missed {n} records\n"));
+            }
+        }
+        self.say_peak(false);
+        self.settle();
+        self.exit_if_drained();
+    }
     /// After a tick, once init asked for the stop: the process ends when
     /// the last take of the log found nothing and every byte went out, or
     /// when the time is up.
