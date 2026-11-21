@@ -17,7 +17,9 @@
  * few points wide, and a frame takes seconds (see docs/openwf.md). With --probe it checks the API,
  * commits the scenes 100 times in turn, each composed on request (the context
  * is inactive) and its number printed, and then activates the context and
- * changes the scene 100 times without waiting. The host (tools/wfc-ref)
+ * changes the scene 100 times without waiting, and last shows a scene C of one
+ * element, the window of a third producer that is the screen of the first
+ * revision, which the service shows straight from its buffer. The host (tools/wfc-ref)
  * draws both scenes point by point from the same calls and `cargo xtask
  * wfc-probe` compares QEMU's screenshots with its CRCs. --quick leaves out the
  * pauses the host takes its screenshots in. Without --probe the demo shows
@@ -116,7 +118,7 @@ static WFCNativeStreamType id_a, id_b, id_m;
 static WFCSource source[2];
 static WFCMask mask;
 static WFCElement element[3];
-static pid_t pid_a, pid_b;
+static pid_t pid_a, pid_b, pid_s;
 
 static void apply(int k) {
     const struct spec *scene = (k % 2 == 0) ? scene_a : scene_b;
@@ -387,12 +389,50 @@ static int changes(int count) {
     return 0;
 }
 
+/* Scene C: one element, the whole window of the first revision on the whole
+ * screen with no turn, mask or transparency (the service shows it straight from
+ * the window's buffer, a frame of no band). */
+static int scene_c(void) {
+    WFCNativeStreamType id_s = 0;
+    WFCSource src;
+    WFCint rect[4] = {0, 0, 640, 400};
+    WFCfloat from[4] = {0, 0, 640, 400};
+    pid_s = start_producer("s");
+    CHECK(pid_s > 0);
+    CHECK(next_stream(&id_s) == 0);
+    pause_ns(700000000L);
+    src = wfcCreateSourceFromStream(dev, ctx, id_s, NULL);
+    CHECK(src != WFC_INVALID_HANDLE);
+    wfcRemoveElement(dev, element[1]);
+    wfcRemoveElement(dev, element[2]);
+    wfcSetContextAttribi(dev, ctx, WFC_CONTEXT_BG_COLOR, 0x000000FF);
+    wfcSetElementAttribi(dev, element[0], WFC_ELEMENT_SOURCE, (WFCint)src);
+    wfcSetElementAttribfv(dev, element[0], WFC_ELEMENT_SOURCE_RECTANGLE, 4, from);
+    wfcSetElementAttribiv(dev, element[0], WFC_ELEMENT_DESTINATION_RECTANGLE, 4, rect);
+    wfcSetElementAttribi(dev, element[0], WFC_ELEMENT_SOURCE_ROTATION, WFC_ROTATION_0);
+    wfcSetElementAttribi(dev, element[0], WFC_ELEMENT_SOURCE_FLIP, 0);
+    wfcSetElementAttribi(dev, element[0], WFC_ELEMENT_SOURCE_SCALE_FILTER, WFC_SCALE_FILTER_NONE);
+    wfcSetElementAttribi(dev, element[0], WFC_ELEMENT_TRANSPARENCY_TYPES, 0);
+    wfcSetElementAttribi(dev, element[0], WFC_ELEMENT_MASK, 0);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    wfcCommit(dev, ctx, WFC_TRUE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    wfcCompose(dev, ctx, WFC_TRUE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    printf("wfc-demo: scene C committed\n");
+    fflush(stdout);
+    snapshot_pause();
+    return 0;
+}
+
 static int finish(void) {
     int status = 0;
     kill(pid_a, SIGKILL);
     kill(pid_b, SIGKILL);
+    kill(pid_s, SIGKILL);
     waitpid(pid_a, &status, 0);
     waitpid(pid_b, &status, 0);
+    waitpid(pid_s, &status, 0);
     wfcDestroyElement(dev, element[0]);
     CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
     wfcDestroyElement(dev, element[0]);
@@ -422,6 +462,7 @@ static int run_scene(int probe) {
     if (!probe) return commits(-1);
     CHECK(commits(COMMITS) == 0);
     CHECK(changes(CHANGES) == 0);
+    CHECK(scene_c() == 0);
     CHECK(finish() == 0);
     return 0;
 }

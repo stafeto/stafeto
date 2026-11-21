@@ -4,7 +4,9 @@
 /*
  * The producer of the probe of OpenWF Composition (apps/wfc-demo). Started by
  * the demo with a role: "a" makes a window of 100 by 200 points and draws the
- * first pattern in it, "b" one of 160 by 100 with the second. The window has
+ * first pattern in it, "b" one of 160 by 100 with the second, "s" opens the
+ * screen of the first revision (a window of the whole screen) and draws a
+ * gradient in it. The window has
  * one buffer, drawn once and posted whole; the demo takes its number from the
  * scene's ring (wfcNextStreamSTAFETO) and shows it through an element. The
  * patterns are the numbers of tools/wfc-ref (pattern_a, pattern_b), which draws
@@ -40,13 +42,41 @@ static uint32_t pattern_b(uint32_t x, uint32_t y) {
     return r << 16 | g << 8 | b;
 }
 
+/* The screen of the first revision, from src/main.rs. */
+int wp_screen_open(void **pixels);
+int wp_screen_flush(unsigned rows);
+
+/* The picture of the first revision's window: the gradient of frame 0 of
+ * wfd-demo (xtask's `wfd::pattern_crc(0)` is its CRC). */
+static uint32_t pattern_s(uint32_t x, uint32_t y) {
+    if (y >= 8 && y < 24 && x < 6) return 0x00FFFFFFu;
+    return (x * 255 / 639) << 16 | (y * 255 / 399) << 8 | ((x ^ y) & 0xFF);
+}
+
+static int screen_role(void) {
+    void *px = NULL;
+    CHECK(wp_screen_open(&px) == 0 && px != NULL);
+    uint32_t *points = px;
+    for (uint32_t y = 0; y < 400; y++)
+        for (uint32_t x = 0; x < 640; x++) points[y * 640 + x] = pattern_s(x, y);
+    CHECK(wp_screen_flush(400) == 0);
+    printf("wfc-producer: s drew the screen of the first revision\n");
+    fflush(stdout);
+    for (int i = 0; i < 600; i++) {
+        struct timespec t = {1, 0};
+        nanosleep(&t, NULL);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     struct stafeto_window w;
     int is_a;
     uint32_t width, height;
     struct stafeto_rect whole;
+    if (argc >= 2 && strcmp(argv[1], "s") == 0) return screen_role();
     if (argc < 2 || (strcmp(argv[1], "a") != 0 && strcmp(argv[1], "b") != 0)) {
-        printf("wfc-producer: the role is a or b\n");
+        printf("wfc-producer: the role is a, b or s\n");
         return 2;
     }
     is_a = strcmp(argv[1], "a") == 0;

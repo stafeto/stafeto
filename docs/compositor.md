@@ -744,6 +744,85 @@ How a scene reaches the screen:
 `proto_comp::VERSION` is unchanged: the two methods are new numbers (26, 27) in a
 session that only the scene session can use.
 
+## OpenWF Composition for C programs
+
+A C program shows a scene with the functions of `<WF/wfc.h>` (the Khronos
+header of OpenWF Composition 1.0, unedited, in `ports/openwf/include/WF`, with
+`wfcext.h` unedited, `wfcplatform.h` adapted to this system and
+`wfcext_stafeto.h`, the one extension). The functions are a static library, as
+those of windows: the Rust crate `lib/wfc` holds the rules (handles,
+attributes, the order of the elements, the commit that builds the scene record,
+the translation of the service's refusals, 176 host tests by clause of the
+specification, the table in `lib/wfc/CLAUSES.md`), `posix-abi` with its feature
+`wfc` the calls (`wfc.rs`) and `posix-crt` with the same feature the C functions
+(`wfc_c.rs`). `libc.so` is built without the feature, so the ABI of the series 0.6
+is as it was, and `tools/build-libc-so.py` refuses a build of `libc.so` that
+defines a name `wfc[A-Z]` or `wfd[A-Z]`. A program that uses it is statically
+linked (`apps/wfc-demo` is the model) and compiles with `-I ports/openwf/include`.
+The headers carry the Khronos notice of the Materials in their first lines, which
+stays with them.
+
+- **Who may hold a scene.** The process whose `Display` session has the scene's
+  mark: init gives it to the records `COMP_SCENES` names (`wfc-demo` and
+  `comp-probe-s`), a record of POSIX included. `wfcCreateDevice` of any other
+  process answers no device: its MANAGE is refused. A child of the holder
+  (`posix_spawn`, `fork`) has a clone of the session, which has no mark, so it
+  makes no device and is an ordinary client. A program that init starts cannot
+  fork (the layer answers EAGAIN), so the holder starts the producers with
+  `posix_spawn`.
+- **Streams.** A `WFCNativeStreamType` is the number of a window of the service,
+  the `id` of WINDOW_CREATE. `wfcNextStreamSTAFETO(dev, timeoutMs, &stream)`
+  waits for the creation of a window (the scene's ring, up to 32 numbers kept)
+  and gives its number. A source is made of the window of a producer, a mask of a
+  window of the format A8 (the process has one window; make the mask's window in
+  the holder). The service's LIST gives a window's size and no format, so the
+  library takes the format as unknown at the creation and the service refuses a
+  wrong kind at the commit.
+- **Calls.** Every attribute, element and the order of the scene lives in the
+  library and is cached until `wfcCommit`, which sends one SCENE_COMMIT (up to 16
+  elements, the context's rotation folded into each element). `wfcCompose` sends
+  SCENE_COMPOSE for a context that is not active; `wfcActivate` and `wfcDeactivate`
+  change the flag of the last committed scene. With `wait` the calls wait for the
+  bits COMMITTED and COMPOSED.
+- **Limits.** One screen (number 0) and one context, from any device: a second is
+  `WFC_ERROR_IN_USE`. No off-screen context (`wfcCreateOffScreenContext` answers
+  `WFC_ERROR_UNSUPPORTED`), and `wfcFence` answers `WFC_ERROR_ILLEGAL_ARGUMENT`
+  (there is no EGL). Up to four devices, 16 elements, 8 sources and 8 masks for
+  each. The device reports the class fully capable, which section 4.1.1 of the
+  specification ties to off-screen contexts: a departure.
+- **Threads and signals.** Each device has a lock held for a whole call, a wait
+  included, so a waiting thread blocks the calls on its own device and no other;
+  the lock is no critical section of the layer, so a signal's handler runs while a
+  call waits and the wait goes on. The functions are not async-signal-safe: calling
+  one from a handler that interrupted a call of the library, or leaving a call with
+  `siglongjmp`, is undefined.
+- **`fork` and `exec`.** The child of a fork has no device (the table, the locks
+  and the handles of the channel are reset). `exec` closes the channel and the
+  timer and drops the devices; the session stays with the new image, and so does the
+  scene the old image committed, with elements that may name windows that went (they
+  show nothing), until the new image commits its own.
+- **Cost of a scene.** The service sizes its bands from the dearest element of a
+  scene, and every element pays a fixed cost for the cache of pixman's paths. An
+  element with a stretch, a flip or the bilinear filter makes the bands of the
+  whole damage a few points wide: a frame of the dearest kind took 28 to 116 s
+  under -icount and a frame of the demo's scenes (quarter turns, a global alpha, a
+  mask) 1.2 to 1.9 s. A scene that needs a frame in each period keeps its dear
+  elements few (`compositor stats` tells the bands of a frame).
+
+`cargo xtask wfc-probe` runs `apps/wfc-demo` in `boot-wfc.img` (the table
+`table::wfc`: the services of the POSIX probes, the driver, the compositor and the
+demo, which starts `tests/wfc-producer` three times). Two scenes of three elements
+over two patterns and a mask are committed in turn 100 times and each composed on
+request, and QEMU's screenshot has the CRC of `tools/wfc-ref`, the host's frame of
+the same calls drawn point by point from `proto_comp::meaning`; then the context
+is active and the scene changes 100 times while screenshots are each one of the
+two; then scene C shows the window of the first revision straight from its buffer
+(the screenshot is the producer's gradient, and the trace of the device shows the
+scanout on resource 2). The second half runs under -icount and judges the steps of
+the compositor and the driver. The demo is a program of the probe image and has no package:
+the scene's mark comes from init's table, so a copy started from a shell holds no
+scene.
+
 ## Not yet
 
 A window's resize, a frame clock that follows the display's own vertical blank

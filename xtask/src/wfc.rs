@@ -122,11 +122,12 @@ const COMMITS: usize = 100;
 const COMMIT: &str = "wfc-demo: commit ";
 const AUTO_BEGIN: &str = "wfc-demo: auto begin";
 const AUTO_END: &str = "wfc-demo: auto end";
+const SCENE_C: &str = "wfc-demo: scene C committed";
 const ENDED: &str = concat!("init: wfc-demo ended: exit code 0,", " not restarted");
 const ENDS: &str = "init: wfc-demo ended: ";
 
 /// The lines of the demo, each a check that passed.
-const LINES: [&str; 11] = [
+const LINES: [&str; 12] = [
     "wfc-demo: the calls before a device are refused as the specification says",
     "wfc-demo: the device is made, described, and a second one has its own state",
     "wfc-demo: the context is made, a second one is in use, its attributes are as the specification says",
@@ -138,6 +139,7 @@ const LINES: [&str; 11] = [
     "wfc-demo: the device is destroyed and its handles are gone",
     AUTO_BEGIN,
     AUTO_END,
+    SCENE_C,
 ];
 
 /// The lines that end the run in failure: a check that failed (of the demo or of
@@ -183,6 +185,15 @@ pub struct Shot {
 pub struct Seen {
     pub shots: Vec<Shot>,
     pub auto: Vec<u32>,
+    /// The screenshot of scene C (the window of the first revision, shown
+    /// straight from its buffer).
+    pub direct: u32,
+}
+
+/// The CRC of the picture the third producer draws on the screen of the first
+/// revision: the gradient of frame 0 of the display demo (`wfd::pattern_crc`).
+fn direct_crc() -> u32 {
+    crate::wfd::pattern_crc(0)
 }
 
 fn take(monitor: &mut Monitor, scratch: &Scratch) -> Result<u32, String> {
@@ -245,11 +256,20 @@ fn drive(run: &mut Run, scratch: &Scratch, host: [u32; 2]) -> Result<Seen, Strin
             Err(e) => return Err(e),
         }
     }
+    let line = run.expect_line(SCENE_C, |l| l == SCENE_C || failure(l).is_some(), WITHIN)?;
+    if let Some(failed) = failure(&line) {
+        return Err(failed);
+    }
+    let direct = take(&mut monitor, scratch)?;
     let line = run.expect_line(ENDED, |l| l == ENDED || failure(l).is_some(), WITHIN)?;
     if let Some(failed) = failure(&line) {
         return Err(failed);
     }
-    Ok(Seen { shots, auto })
+    Ok(Seen {
+        shots,
+        auto,
+        direct,
+    })
 }
 
 /// The lines of commits in a run's output: each number once, in order, with
@@ -326,7 +346,41 @@ pub fn verdict(lines: &[String], seen: &Seen, host: [u32; 2]) -> Result<(), Stri
             host[0], host[1]
         ));
     }
+    if seen.direct != direct_crc() {
+        return Err(format!(
+            "scene C (the window of the first revision shown directly): QEMU's screenshot is {:08x}, the producer's gradient is {:08x}",
+            seen.direct,
+            direct_crc()
+        ));
+    }
     Ok(())
+}
+
+/// The trace of the device against what the demo did: the screen went to the pool
+/// (resource 2) after the target (resource 1), which is the window of the first
+/// revision shown straight from its buffer, with no band put together.
+pub fn trace_verdict(events: &[qemu::GpuTrace]) -> Result<(), String> {
+    let scanouts: Vec<u32> = events
+        .iter()
+        .filter_map(|e| match e {
+            qemu::GpuTrace::Scanout {
+                id: 0,
+                res,
+                w: 640,
+                h: 400,
+                x: 0,
+                y: 0,
+            } => Some(*res),
+            _ => None,
+        })
+        .collect();
+    if gpu_probe::contains_in_order(&scanouts, &[1, 2]) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the trace of SET_SCANOUT shows resources {scanouts:?}, 1 and then 2 (scene C shown directly) expected"
+        ))
+    }
 }
 
 /// `cargo xtask wfc-probe [screen|steps]`: the probe, the screenshots alone, or the run
@@ -356,14 +410,18 @@ pub fn probe(machine: &qemu::Machine, with_steps: bool) -> Result<(), String> {
         scratch.socket().display()
     ));
     cmd.args(qemu::GPU);
+    cmd.args(qemu::gpu_trace(&scratch.trace()));
     let mut run = Run::start(cmd, Input::Null)?;
     let driven = drive(&mut run, &scratch, host);
     let outcome = run.stop();
     let who = |e: String| format!("wfc-probe on {}: {e}", machine.name);
     let seen = driven.map_err(who)?;
     verdict(&outcome.lines, &seen, host).map_err(who)?;
+    let text = std::fs::read_to_string(scratch.trace())
+        .map_err(|e| who(format!("the trace file: {e}")))?;
+    trace_verdict(&qemu::parse_gpu_trace(&text).map_err(who)?).map_err(who)?;
     println!(
-        "wfc-probe on {}: scene A is {:08x} and scene B {:08x} (the host's frames from the same calls, drawn point by point); {COMMITS} commits in turn, each composed on request, matched QEMU's screenshot; {} screenshots of the active context while the scene changed {COMMITS} times were each A or B; the calls, the errors, the streams, the sources, the mask, the child and the destroy: ok",
+        "wfc-probe on {}: scene A is {:08x} and scene B {:08x} (the host's frames from the same calls, drawn point by point); {COMMITS} commits in turn, each composed on request, matched QEMU's screenshot; {} screenshots of the active context while the scene changed {COMMITS} times were each A or B; scene C, the window of the first revision, matched the producer's gradient and the scanout went to the pool (resource 2); the calls, the errors, the streams, the sources, the mask, the child and the destroy: ok",
         machine.name,
         host[0],
         host[1],
@@ -504,6 +562,7 @@ mod tests {
                 })
                 .collect(),
             auto: vec![h[1], h[0], h[1], h[1], h[0]],
+            direct: direct_crc(),
         }
     }
 
@@ -588,6 +647,30 @@ mod tests {
             .is_some()
         );
         assert!(failure(ENDED).is_none());
+    }
+
+    #[test]
+    fn scene_c_must_be_the_producers_gradient() {
+        let mut seen = good_seen();
+        seen.direct ^= 1;
+        let e = verdict(&good_lines(), &seen, host()).unwrap_err();
+        assert!(e.contains("scene C"), "{e}");
+    }
+
+    #[test]
+    fn the_trace_must_show_the_scanout_going_to_the_pool() {
+        use qemu::GpuTrace::Scanout;
+        let at = |res| Scanout {
+            id: 0,
+            res,
+            w: 640,
+            h: 400,
+            x: 0,
+            y: 0,
+        };
+        assert!(trace_verdict(&[at(1), at(2)]).is_ok());
+        assert!(trace_verdict(&[at(1), at(1)]).is_err());
+        assert!(trace_verdict(&[at(2), at(1)]).is_err());
     }
 
     #[test]

@@ -1996,6 +1996,7 @@ dependencies = [
 name = "wfc-producer"
 version = "0.1.0"
 dependencies = [
+ "posix-abi",
  "posix-crt",
 ]
 
