@@ -2319,10 +2319,6 @@ fn mount_with_cells(device: &MemDevice, cells: u32, repair_cut: Option<u64>) -> 
     (cost, medium.medium().to_vec())
 }
 
-fn mount_with_table(device: &MemDevice, table: bool) -> (Cost, Vec<u8>) {
-    mount_with_cells(device, if table { 4096 } else { 0 }, None)
-}
-
 type OrphanOp = fn(&mut Vol);
 
 fn orphan_ops() -> [(&'static str, OrphanOp); 3] {
