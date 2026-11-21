@@ -324,7 +324,10 @@ pub fn class_of(o: Shape4) -> (Class, Option<Class>) {
         // A mixed one is a laying over: from a source with its alpha used, or from
         // one that is opaque (an XRGB window, or the bit not set).
         let opaque = !(o.over && o.argb);
-        let fast = match (o.bilinear, extra, o.over, opaque) {
+        // With no mix, a laying over of an opaque source is reduced by pixman to a
+        // copy, and its path and its key are the copy's.
+        let over = o.over && o.argb;
+        let fast = match (o.bilinear, extra, over, opaque) {
             (false, None, false, _) => Some(FastNearestCopy),
             (false, None, true, _) => Some(FastNearestOver),
             (true, None, false, _) => Some(FastBilinearCopy),

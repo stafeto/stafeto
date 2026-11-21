@@ -299,6 +299,36 @@ pub fn steps_verdict(lines: &[String]) -> Result<(Rows, Rows), String> {
     ))
 }
 
+/// The most steps a frame of the probe's scenes may take (the lines `service frame: T n N
+/// bands B us U` of the service): the greatest of the scenes is 17,675, and a band of one
+/// point over the whole rectangle of an element would make up to 256,000 steps of a group.
+pub const FRAME_STEPS_MAX: u64 = 40_000;
+
+/// The frames the service told: (frame, steps, microseconds).
+pub fn frame_steps(lines: &[String], tag: &str) -> Vec<(u64, u64, u64)> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            let ["service", "frame:", t, "n", n, "bands", b, "us", u] = w.as_slice() else {
+                return None;
+            };
+            (*t == tag).then(|| Some((n.parse().ok()?, b.parse().ok()?, u.parse().ok()?)))?
+        })
+        .collect()
+}
+
+/// No frame takes more than FRAME_STEPS_MAX steps: the greatest, or the frame that did.
+pub fn frames_verdict(lines: &[String]) -> Result<u64, String> {
+    let frames = frame_steps(lines, COMP_TAG);
+    if let Some((n, bands, _)) = frames.iter().find(|f| f.1 > FRAME_STEPS_MAX) {
+        return Err(format!(
+            "the compositor: frame {n} took {bands} steps, over {FRAME_STEPS_MAX}"
+        ));
+    }
+    Ok(frames.iter().map(|f| f.1).max().unwrap_or(0))
+}
+
 /// The longest step of each kind: kind, ticks, detail.
 pub type Rows = Vec<(usize, u64, u64)>;
 
@@ -1270,6 +1300,16 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         return Err(format!("comp-probe under -icount: {failed}"));
     }
     let (comp, driver) = steps_verdict(&output.lines)?;
+    let most = frames_verdict(&output.lines)?;
+    println!(
+        "comp-probe on {}: the frames of the scenes took {most} steps at most (limit {FRAME_STEPS_MAX}): {}",
+        machine.name,
+        frame_steps(&output.lines, COMP_TAG)
+            .iter()
+            .map(|(n, b, u)| format!("frame {n} {b} steps {u} us"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     println!(
         "{}",
         crate::frame_probe::check_waits(&output.lines, init::table::comp::TABLE, "comp-probe")?
@@ -1389,6 +1429,23 @@ pub fn late(machine: &qemu::Machine) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_frames_the_service_told_are_counted_and_a_frame_over_the_limit_is_refused() {
+        let line = |n: u64, b: u64| format!("service frame: 17 n {n} bands {b} us 100");
+        let lines = vec![
+            line(1, 13),
+            "service frame: 12 n 2 bands 999999 us 5".to_owned(),
+            line(3, 17_675),
+        ];
+        assert_eq!(super::frames_verdict(&lines), Ok(17_675));
+        let lines = vec![line(1, 13), line(2, super::FRAME_STEPS_MAX + 1)];
+        assert!(
+            super::frames_verdict(&lines)
+                .unwrap_err()
+                .contains("frame 2")
+        );
+    }
+
     use super::*;
 
     fn good_run() -> Vec<String> {

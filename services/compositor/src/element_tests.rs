@@ -716,6 +716,15 @@ fn an_element_is_charged_by_its_geometry_and_its_mixing() {
         e.transparency = t;
         elements::classes(&e, false)
     };
+    // A laying over of an opaque source is a copy to pixman: its path and its key.
+    assert_eq!(xrgb(TRANSPARENCY_SOURCE), (FastNearestCopy, None));
+    let argb_over = {
+        let mut e = plain;
+        e.dw = 128;
+        e.transparency = TRANSPARENCY_SOURCE;
+        elements::classes(&e, true)
+    };
+    assert_eq!(argb_over, (FastNearestOver, None));
     assert_eq!(
         xrgb(TRANSPARENCY_MASK | TRANSPARENCY_SOURCE),
         (FastNearestMaskOpaque, None)
@@ -916,12 +925,20 @@ fn sixteen_of_the_dearest_over_the_screen_make_steps_under_the_gate_by_the_model
     }
     rig.scene.end(true);
     assert!(
-        worst <= u64::from(BAND_GATE - 1_080),
+        worst <= u64::from(BAND_GATE - 1_080) + PRODUCT,
         "a step costs {worst} by the model"
     );
     // One step for each element, the black's apart, and the pointer's.
     assert_eq!(steps, 18, "{steps} steps, worst {worst}");
 }
+
+/// The call of the product of a mask and an alpha with its miss (ticks): a bilinear
+/// stretch with both, from an opaque source, pays it besides the stretch's own call,
+/// and by the model such a layer alone is a step over the gate less the 1 080 around
+/// it, whatever the band: the one-point step may pass the gate by this much in the
+/// model (the model errs high by the margins; a run of the probe is what shows it).
+const PRODUCT: u64 = (PRICES[elements::Class::MaskAlpha.row()].call
+    + PRICES[elements::Class::MaskAlpha.row()].miss) as u64;
 
 /// Walks the frame of the scene committed in `rig` over `d` as the service does,
 /// each step through a `StepCost` raster, and checks the key of the model: every
@@ -947,7 +964,7 @@ fn walk_priced(rig: &Rig, d: Rect) -> (u32, Vec<u32>) {
         let next = compose(&rig.scene, d, at, &mut fb, &rig.wins, &mut model);
         let ticks = model.ticks() + u64::from(SCENE_STEP);
         let limit = if (w, h) == (1, 1) {
-            u64::from(BAND_GATE - 1_080)
+            u64::from(BAND_GATE - 1_080) + PRODUCT
         } else {
             u64::from(BAND_TICKS)
         };
@@ -1168,7 +1185,35 @@ impl Raster for StepCost {
             // The alpha or the mask is in the one call: rows and points.
             let x = PRICES[x.row()];
             self.add(x, area);
-            self.calls -= x.call;
+            if extra == Some(elements::Class::MaskAlpha) {
+                // The product of a mask and an alpha is a call of its own.
+                self.calls += x.miss;
+            } else {
+                self.calls -= x.call;
+            }
         }
     }
+}
+
+#[test]
+fn every_element_of_the_scene_is_a_term_of_a_step_whether_it_shows_or_not() {
+    let mut rig = Rig::new(&[(XRGB, 64, 40), (XRGB, 64, 40)]);
+    // One far from the damage, one under an opaque element that covers it.
+    let far = rig.whole(0, [500, 300, 64, 40]);
+    let under = rig.whole(0, [0, 0, 64, 40]);
+    let cover = rig.whole(1, [0, 0, 640, 400]);
+    let els = [far, under, cover];
+    rig.scene
+        .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap())
+        .unwrap();
+    rig.scene.begin().unwrap();
+    let def = rig.scene.working().copied().unwrap();
+    let d = Rect {
+        x: 0,
+        y: 0,
+        w: 100,
+        h: 100,
+    };
+    assert_eq!(rig.scene.passes(&def, d).elements, 3);
+    rig.scene.end(true);
 }

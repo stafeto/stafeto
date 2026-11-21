@@ -266,15 +266,7 @@ pub const PRICES: [Price; 24] = [
         false,
         LOOKUP_MISS_MEASURED,
     ),
-    price(
-        "mask-alpha",
-        3_246,
-        4_785,
-        false,
-        4_820,
-        false,
-        LOOKUP_MISS_MEASURED,
-    ),
+    price("mask-alpha", 3_246, 4_785, false, 4_820, false, 792),
     price("fast-nearest-copy", 2_673, 2_012, false, 600, false, 3346),
     price(
         "fast-nearest-over",
@@ -412,7 +404,7 @@ pub const LAYER: u32 = with_margin(LAYER_MEASURED);
 pub const BAND_FIXED_MEASURED: u32 = 560;
 pub const BAND_FIXED: u32 = with_margin(BAND_FIXED_MEASURED);
 /// What every step of a frame under a scene spends beyond its operations for each
-/// element of the scene that shows something over the damage (ticks): a step
+/// element of the scene, whether it shows something over the damage or not (ticks): a step
 /// makes the groups of the layers (`Scene::passes`) and asks each element
 /// whether it has something to draw on the band. Measured on the steps of the
 /// scenes of 16 elements of the probe (the greatest excess of a step's own
@@ -2305,6 +2297,9 @@ impl Scene {
                 && damage.y < r.y + r.h
         };
         let mut plan = Passes::EMPTY;
+        // Every element of the scene is a term of a step (`ELEMENT_TERM`), the ones
+        // under the base and off the damage too: the step asks each of them.
+        plan.elements = def.elements().len() as u32;
         // The topmost opaque element that covers the damage whole: the base.
         let mut base = None;
         for (k, e) in def.elements().iter().enumerate() {
@@ -2336,8 +2331,11 @@ impl Scene {
             let (first, second) = elements::classes(e, argb);
             let (a, b) = (PRICES[first.row()], second.map(|c| PRICES[c.row()]));
             // The alpha or the mask is part of the one call of pixman the stretch
-            // makes: it adds its rows and points, and no second call.
-            let calls = a.call + LAYER + a.miss;
+            // makes: it adds its rows and points, and no second call. The product
+            // of a mask and an alpha is made in a call of its own (its own key):
+            // that call and its miss are counted.
+            let product = b.filter(|_| second == Some(elements::Class::MaskAlpha));
+            let calls = a.call + LAYER + a.miss + product.map_or(0, |p| p.call + p.miss);
             let at = match open {
                 Some(g) if plan.cost[g].calls + calls <= GROUP_CALLS => g,
                 _ => {
@@ -2348,13 +2346,14 @@ impl Scene {
             open = Some(at);
             let area = intersect(r, damage);
             plan.group[k] = at as u8;
-            plan.elements += 1;
             plan.members[at] |= 1 << k;
             let c = &mut plan.cost[at];
             c.add(a, LAYER + a.miss, area);
             if let Some(b) = b {
-                c.add(b, 0, area);
-                c.calls -= b.call;
+                c.add(b, product.map_or(0, |p| p.miss), area);
+                if product.is_none() {
+                    c.calls -= b.call;
+                }
             }
         }
         let cursor = self.drawn_pointer().map(Scene::cursor_rect);
@@ -2462,8 +2461,7 @@ pub struct Passes {
     black: bool,
     pub groups: usize,
     pub cost: [GroupCost; MAX_ELEMENTS + 2],
-    /// The elements of the scene that show something over the damage: each is
-    /// a term of every step (`ELEMENT_TERM`).
+    /// The elements of the scene: each is a term of every step (`ELEMENT_TERM`).
     pub elements: u32,
     /// The elements of each group, a bit each.
     members: [u16; MAX_ELEMENTS + 2],
@@ -4658,11 +4656,8 @@ mod tests {
         // general miss covers every general kind's; a kind with no measure keeps
         // the general one.
         for p in PRICES {
-            assert!(
-                p.miss >= LOOKUP_MISS || p.kind.starts_with("fast-"),
-                "{}",
-                p.kind
-            );
+            let measured = measures::LOOKUPS.iter().any(|(k, _)| *k == p.kind);
+            assert!(p.miss >= LOOKUP_MISS || measured, "{}", p.kind);
         }
         for (kind, greatest) in measures::LOOKUPS {
             let p = PRICES
@@ -4672,6 +4667,8 @@ mod tests {
             assert_eq!(p.miss_measured, greatest, "{kind}");
             assert!(p.miss >= with_margin(greatest), "{kind}");
         }
+        // The product of a mask and an alpha has its own key: its measure is in.
+        assert!(measures::LOOKUPS.iter().any(|(k, _)| *k == "mask-alpha"));
         for p in PRICES.iter().filter(|p| p.kind.starts_with("fast-")) {
             assert!(
                 measures::LOOKUPS.iter().any(|(k, _)| *k == p.kind),

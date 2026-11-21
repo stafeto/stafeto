@@ -1016,6 +1016,8 @@ pub mod calibration {
     /// -icount being deterministic (the calibration is bounded by the display
     /// driver's watchdog, which the service's start must keep under).
     const REPEAT: u32 = 1;
+    /// How many times an operation that a higher level preempted is tried again.
+    const PREEMPT_RETRIES: u32 = 4;
 
     /// What a kind of the elements' operations draws: nearest or bilinear, the
     /// source turned a quarter, reflected and stretched (the general path of
@@ -1290,12 +1292,24 @@ pub mod calibration {
                 Src::Opaque => false,
                 Src::Both => r.over && (r.mix == Mix::None || sx == 0),
             };
+            // A scale at the edge of its source is a stretch of the whole of a
+            // source (at least 2 by 2: one point is a solid colour to pixman) that is the half of the target (its samples reach past the
+            // edge, so pixman pads them and does not cover the clip, the other
+            // flags and the other path); inside is a part of the large source, which
+            // covers the clip. The other kinds are inside or at the edge of the
+            // large source.
+            let edge = r.transform == Transform::Scale && !inside;
+            let (src_w, src_h) = if edge {
+                ((w / 2).max(2), (h / 2).max(2))
+            } else {
+                (ELEMENT_SRC_SIDE, ELEMENT_SRC_SIDE)
+            };
             let from = Source {
                 bytes: src,
                 format: if argb { Px::Argb8888 } else { Px::Xrgb8888 },
                 stride: ELEMENT_SRC_SIDE * 4,
-                width: ELEMENT_SRC_SIDE,
-                height: ELEMENT_SRC_SIDE,
+                width: src_w,
+                height: src_h,
                 hint: 1,
             };
             let plane = Source {
@@ -1316,6 +1330,8 @@ pub mod calibration {
                 sy: if inside { 40 << 16 } else { 0 },
                 sw: if r.transform == Transform::Quarter {
                     (h as i32) << 16
+                } else if edge {
+                    (src_w as i32) << 16
                 } else if inside {
                     80 << 16
                 } else {
@@ -1323,6 +1339,8 @@ pub mod calibration {
                 },
                 sh: if r.transform == Transform::Quarter {
                     (w as i32) << 16
+                } else if edge {
+                    (src_h as i32) << 16
                 } else if inside {
                     80 << 16
                 } else {
@@ -1457,7 +1475,7 @@ pub mod calibration {
                 } else {
                     2
                 },
-                1,
+                2,
                 1,
             ),
             Some(r) => (
@@ -1492,17 +1510,27 @@ pub mod calibration {
                 let (mut least, mut greatest, mut n) = (u64::MAX, 0u64, 0u64);
                 for dx in 0..dxs {
                     for sx in 0..sxs {
-                        // One warm-up, which makes the images pixman keeps.
+                        // One warm-up, which makes the images pixman keeps. A scale is
+                        // made inside its source (the first of the two) and at its edge.
+                        let inside =
+                            recipe.is_some_and(|r| r.transform == Transform::Scale && sx == 0);
                         for turn in 0..=repeat {
                             let images = &mut px.images;
-                            let ticks = timed(thread, || {
-                                operate(images, which, recipe, fb, (w, h), (dx, sx, false));
-                            });
+                            // An operation a higher level preempted is made again.
+                            let mut ticks = None;
+                            for _ in 0..PREEMPT_RETRIES {
+                                ticks = timed(thread, || {
+                                    operate(images, which, recipe, fb, (w, h), (dx, sx, inside));
+                                });
+                                if ticks.is_some() || turn == 0 {
+                                    break;
+                                }
+                                preempted += 1;
+                            }
                             if turn == 0 {
                                 continue;
                             }
                             let Some(ticks) = ticks else {
-                                preempted += 1;
                                 continue;
                             };
                             least = least.min(ticks);
@@ -1828,7 +1856,11 @@ pub mod calibration {
             let mut greatest = 0u64;
             for (k, r) in RECIPES.iter().enumerate() {
                 for inside in [false, true] {
-                    let shape = (1, 1);
+                    let shape = if r.transform == Transform::Scale {
+                        (4, 4)
+                    } else {
+                        (1, 1)
+                    };
                     let (mut least, mut worst) = (u64::MAX, 0u64);
                     for turn in 0..LOOKUP_TURNS {
                         let images = &mut self.images;
