@@ -110,6 +110,7 @@ unsafe extern "C" {
     fn datafs_set_lookahead(d: *mut c_void, buffer: *mut u8, size: u32);
     fn datafs_set_orphan_table(d: *mut c_void, on: i32);
     fn datafs_set_orphan_cells(d: *mut c_void, cells: u32);
+    fn datafs_set_block_cycles(d: *mut c_void, cycles: i32);
     fn datafs_erases(d: *const c_void) -> u32;
     fn datafs_open_attr(
         d: *mut c_void,
@@ -831,6 +832,12 @@ impl<D: Device> Fs<'_, D> {
     pub fn set_orphan_table(&mut self, on: bool) {
         // SAFETY: sets two fields of the configuration, which littlefs reads at the next mount.
         unsafe { datafs_set_orphan_table(self.state.0.as_mut_ptr().cast(), i32::from(on)) };
+    }
+
+    /// Wear levelling (`block_cycles`) before the next mount; -1 is off, the service's setting.
+    pub fn set_block_cycles(&mut self, cycles: i32) {
+        // SAFETY: as `set_orphan_table`.
+        unsafe { datafs_set_block_cycles(self.state.0.as_mut_ptr().cast(), cycles) };
     }
 
     /// A table of the repair of orphans of `cells` cells (0 is none), before the next mount.

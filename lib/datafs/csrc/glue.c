@@ -184,6 +184,13 @@ void datafs_set_orphan_table(struct datafs *d, int on)
     d->cfg.orphan_size = on ? sizeof(d->orphans) : 0;
 }
 
+// The host tests only: wear levelling on (a pair of metadata moves to a new block every `cycles`
+// compactions), which makes the half-done relocations the repair of orphans must find.
+void datafs_set_block_cycles(struct datafs *d, int32_t cycles)
+{
+    d->cfg.block_cycles = cycles;
+}
+
 // The same with a table of `cells` cells (at most ORPHAN_CELLS), for the tests of a full table.
 void datafs_set_orphan_cells(struct datafs *d, uint32_t cells)
 {

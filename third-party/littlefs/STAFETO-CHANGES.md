@@ -115,10 +115,12 @@ reads at 135 directories and 256 pairs, 1,443,988 at 539 and 1,024, 6,003,785 at
   the plan with their replaced entries), `ORPHAN_CELLS` in `lib/datafs/csrc/glue.c`. The keys of a
   volume with more are repaired with the walk.
 - Measured (`scale_orphan_table`): the dearest mount after a cut is 26,159 reads at 540 directories
-  and 1,024 pairs and 53,996 at 1,077 and 2,048 (5.4 s at 10,000 reads a second, against 600 s). Tests:
+  and 1,024 pairs and 53,996 at 1,077 and 2,048 (5.4 s at 10,000 reads a second, against 600 s);
+  with 500 of the directories moved to another parent before the cut, 53,627. Tests:
   `the_table_of_the_repair_of_orphans_leaves_the_disk_of_the_walk` (a cut at every sector of MKDIR, RMDIR and
   RENAME over a directory, four sets of surviving sectors: the disk after the mount is the same with the
-  table and without it) and `scale_orphan_table` (the same at the scale of the plan, by name).
+  table and without it; also with a table of 8 and 60 cells, with directories moved before the cut, with
+  wear levelling on, and with a cut at every sector of the repair itself) and `scale_orphan_table` (the same at the scale of the plan, by name).
 
 ## A known defect of the release that the service works around
 
