@@ -52,7 +52,8 @@
 use abi::{Access, Error, MESSAGE_MAX, Rights, Source};
 use compositor::frame::{self, Fire, Pacer, Wake};
 use compositor::{
-    Band, Format, FrameKind, MAX_WINDOWS, Refusal, SCREEN, Scene, Source as PixelSource, compose,
+    Band, Format, FrameKind, MAX_WINDOWS, Refusal, SCREEN, Scene, ScreenAsk, ScreenPhase,
+    Source as PixelSource, compose,
 };
 use core::mem::ManuallyDrop;
 use core::slice;
@@ -99,6 +100,8 @@ const CURSOR_AT: usize = 0x12_0010_0000;
 // The pool's mapping ends before the cursor's with a gap of at least a page.
 const _: () = assert!(POOL_AT + POOL_LEN + PAGE <= CURSOR_AT);
 const PAGE: usize = 4096;
+/// The pages of the driver's frame buffer.
+const BUFFER_PAGES: usize = BUFFER_BYTES as usize / PAGE;
 /// The pages one step of the service maps or unmaps at most: a page costs
 /// the kernel about 200 ticks of a mapping and 80 of an unmapping, and a
 /// step stays under 16 500 (xtask).
@@ -231,6 +234,14 @@ const STEP_TAKE: u64 = 2000;
 const STEP_COMMIT: u64 = 3000;
 const STEP_END: u64 = 4000;
 const STEP_WORK: u64 = 5000;
+/// The same for a step that maps a portion of the frame buffer, and for the
+/// step that finishes the opening of the screen (the probe of the late
+/// opening reads both).
+const STEP_SCREEN: u64 = 5001;
+const STEP_SCREEN_SUBSCRIBE: u64 = 5002;
+const STEP_SCREEN_PLANES: u64 = 5003;
+const STEP_SCREEN_CURSOR: u64 = 5004;
+const STEP_SCREEN_POOL: u64 = 5005;
 const STEP_ARM: u64 = 6000;
 
 impl PixelSource for Pixels<'_> {
@@ -315,6 +326,18 @@ struct Pool {
     dirty: bool,
 }
 
+/// What the driver gave at OPEN and the service has not finished with: the
+/// buffer to map by steps, the owner session, the screen's size.
+struct Opening {
+    buffer: Handle<Memory>,
+    owner: Handle<Channel>,
+    width: u32,
+    height: u32,
+    stride: u32,
+    /// The driver's pipelines, once asked (the phase `Planes`).
+    list: Option<Pipelines>,
+}
+
 /// Where the pool is.
 enum PoolState {
     /// The service has none and asks no more: the driver has no primary
@@ -343,6 +366,13 @@ struct Compositor {
     level: u8,
     /// The driver's owner session, once the screen is open.
     screen: Option<Handle<Channel>>,
+    /// Where the opening from a request is (`compositor::ScreenPhase`); the
+    /// frame clock and every request that needs the screen look at
+    /// `screen`, which is `Some` only in the phase `Open`.
+    phase: ScreenPhase,
+    /// The driver's buffer and session while they are being mapped and
+    /// subscribed.
+    opening: Option<Opening>,
     scene: Scene,
     extra: [Extra; MAX_WINDOWS],
     clones: Clones<CLONES>,
@@ -421,6 +451,8 @@ fn main(_: u64) -> u64 {
         process: Handle::borrowed(s.process.raw()),
         level,
         screen: None,
+        phase: ScreenPhase::Closed,
+        opening: None,
         scene: Scene::new(),
         extra: [const { Extra::new() }; MAX_WINDOWS],
         clones: Clones::new(),
@@ -457,7 +489,11 @@ fn main(_: u64) -> u64 {
     // to map): the driver says CLEARING while it sets the device up, and
     // the service asks again on a timer of its own channel. A driver that
     // does not answer is asked again at a request.
-    service.open_screen_waiting(level);
+    // A probe build of the late opening leaves the tries out: the first
+    // request opens the screen, by the steps of the work.
+    if !cfg!(feature = "late-open") {
+        service.open_screen_waiting(level);
+    }
     // The prices of the bands measured on shapes of their own, in the screen's
     // buffer, before the first request (the run under -icount, `steps` alone).
     #[cfg(feature = "steps")]
@@ -488,6 +524,8 @@ fn main(_: u64) -> u64 {
         }),
     };
     let _ = rt::service::run::<Compositor, SESSIONS, 1>(&channel, &mut service, config);
+    // A stop in the middle of the opening: the pages mapped so far go.
+    service.release_opening();
     STOPPED
 }
 
@@ -533,9 +571,11 @@ impl Compositor {
     /// is the status a client of ours gets: CLEARING while the driver is
     /// setting up or the last owner's buffer is cleared, NO_DEVICE
     /// without the driver.
-    fn open_screen(&mut self) -> Result<(), Status> {
-        if self.screen.is_some() {
-            return Ok(());
+    fn open_screen(&mut self, late: bool) -> Result<(), Status> {
+        match self.phase.ask() {
+            ScreenAsk::Ready => return Ok(()),
+            ScreenAsk::Clearing => return Err(code(CLEARING)),
+            ScreenAsk::Ask => {}
         }
         let session = match rt::service::connect(&self.parent, "display") {
             Ok(session) => session,
@@ -562,9 +602,26 @@ impl Compositor {
         ) else {
             return Err(code(IO));
         };
+        self.opening = Some(Opening {
+            buffer: fb,
+            owner,
+            width: screen.width,
+            height: screen.height,
+            stride: screen.stride,
+            list: None,
+        });
+        self.phase = self.phase.begin();
+        if late {
+            // From a request: the buffer's 256 pages are mapped by the steps
+            // of the work, and the requests meanwhile are told CLEARING.
+            let _ = sys::notify(&self.notify, WORK);
+            return Err(code(CLEARING));
+        }
+        // At the start, outside any step: all at once.
+        let opening = self.opening.as_ref().ok_or(code(IO))?;
         if sys::mem_map(
             &self.process,
-            &fb,
+            &opening.buffer,
             0,
             u64::from(BUFFER_BYTES),
             FB_AT,
@@ -572,10 +629,73 @@ impl Compositor {
         )
         .is_err()
         {
+            self.abort_opening();
             return Err(code(IO));
         }
-        // The frame bit comes through a handle of this channel with a label
-        // of its own; the driver holds it for the screen's time.
+        self.phase = self.phase.mapped(BUFFER_PAGES, BUFFER_PAGES);
+        while self.phase.has_work() {
+            self.advance_opening()?;
+        }
+        Ok(())
+    }
+
+    /// A step of the finishing of the opening: SUBSCRIBE (with the frame
+    /// bit's handle), then the pipelines and the cursor's picture, then the
+    /// pool's source, and the screen is open. A refusal of SUBSCRIBE
+    /// releases the mapping; the planes' refusals leave the old ways
+    /// (`take_planes`).
+    fn advance_opening(&mut self) -> Result<(), Status> {
+        let Some(mut opening) = self.opening.take() else {
+            self.phase = ScreenPhase::Closed;
+            return Err(code(IO));
+        };
+        match self.phase {
+            ScreenPhase::Subscribing => {
+                if let Err(status) = self.subscribe(&opening.owner) {
+                    self.release_mapping();
+                    return Err(status);
+                }
+            }
+            ScreenPhase::Planes => opening.list = self.ask_pipelines(&opening.owner),
+            ScreenPhase::Cursor => {
+                if let Some(list) = &opening.list {
+                    self.take_cursor(&opening.owner, list);
+                }
+            }
+            ScreenPhase::Pool => {
+                if let Some(list) = &opening.list
+                    && let Err(why) = self.pool_source(&opening.owner, list)
+                {
+                    rt::println!("compositor: no pool for the window of the first revision: {why}");
+                }
+            }
+            _ => {}
+        }
+        self.phase = self.phase.advanced();
+        if self.phase != ScreenPhase::Open {
+            self.opening = Some(opening);
+            return Ok(());
+        }
+        // The mapping keeps the object; the handle is not needed.
+        let Opening {
+            buffer,
+            owner,
+            width,
+            height,
+            stride,
+            ..
+        } = opening;
+        drop(buffer);
+        self.screen = Some(owner);
+        rt::println!("compositor: screen ready, {width}x{height}, stride {stride}");
+        Ok(())
+    }
+
+    /// SUBSCRIBE: the frame bit comes through a handle of this channel with
+    /// a label of its own; the driver holds it for the screen's time. A
+    /// driver that went in the middle ends the service (init starts it
+    /// again), the mapping released first.
+    fn subscribe(&mut self, owner: &Handle<Channel>) -> Result<(), Status> {
         let frame = sys::handle_label(
             &self.channel,
             Rights::NOTIFY | Rights::TRANSFER,
@@ -585,34 +705,103 @@ impl Compositor {
         .map_err(|_| code(IO))?;
         let mut request = Writer::new();
         Gpu::Subscribe.header().write(&mut request)?;
-        let subscribed = sys::send_handles(&owner, request.as_bytes(), [frame.erase()])
-            .map_err(|refused| Status::Kernel(refused.error))?;
+        let reply = match sys::send_handles(owner, request.as_bytes(), [frame.erase()]) {
+            Ok(reply) => reply,
+            Err(refused) => {
+                if refused.error == Error::PeerClosed {
+                    self.release_mapping();
+                    self.driver_gone();
+                }
+                return Err(Status::Kernel(refused.error));
+            }
+        };
         let mut buffer = [0; MESSAGE_MAX];
-        if status_of(subscribed.bytes(&mut buffer)) != Some(Status::Ok) {
-            return Err(code(IO));
+        if status_of(reply.bytes(&mut buffer)) == Some(Status::Ok) {
+            Ok(())
+        } else {
+            Err(code(IO))
         }
-        // The mapping keeps the object; the handle is not needed.
-        drop(fb);
-        self.take_planes(&owner);
-        self.screen = Some(owner);
-        rt::println!(
-            "compositor: screen ready, {}x{}, stride {}",
-            screen.width,
-            screen.height,
-            screen.stride
-        );
-        Ok(())
+    }
+
+    /// One step of the opening from a request: a portion of the buffer's
+    /// pages mapped, or, after the last one, the finishing.
+    fn open_step(&mut self) {
+        rt::service::step_detail(match self.phase {
+            ScreenPhase::Subscribing => STEP_SCREEN_SUBSCRIBE,
+            ScreenPhase::Planes => STEP_SCREEN_PLANES,
+            ScreenPhase::Cursor => STEP_SCREEN_CURSOR,
+            ScreenPhase::Pool => STEP_SCREEN_POOL,
+            _ => STEP_SCREEN,
+        });
+        match self.phase {
+            ScreenPhase::Mapping { done } => {
+                let pages = self.phase.portion(BUFFER_PAGES, CHUNK);
+                let Some(opening) = &self.opening else {
+                    self.phase = ScreenPhase::Closed;
+                    return;
+                };
+                let mapped = sys::mem_map(
+                    &self.process,
+                    &opening.buffer,
+                    (done * PAGE) as u64,
+                    (pages * PAGE) as u64,
+                    FB_AT + done * PAGE,
+                    Access::ReadWrite,
+                );
+                if mapped.is_err() {
+                    rt::println!("compositor: the frame buffer cannot be mapped");
+                    self.abort_opening();
+                    return;
+                }
+                self.phase = self.phase.mapped(pages, BUFFER_PAGES);
+            }
+            ScreenPhase::Subscribing
+            | ScreenPhase::Planes
+            | ScreenPhase::Cursor
+            | ScreenPhase::Pool => {
+                let _ = self.advance_opening();
+            }
+            ScreenPhase::Closed | ScreenPhase::Open => {}
+        }
+    }
+
+    /// Unmaps the pages of the frame buffer mapped so far and goes back to
+    /// the phase `Closed`; the session of the driver goes with the handle
+    /// (the driver takes the screen back and a request asks it again).
+    fn release_mapping(&mut self) {
+        let (phase, pages) = self.phase.release(BUFFER_PAGES);
+        if pages != 0 {
+            // SAFETY: the pages from FB_AT for `pages` were mapped by the
+            // steps of the opening, and nothing reads the buffer before the
+            // screen is open.
+            let _ = unsafe { sys::mem_unmap(&self.process, FB_AT, (pages * PAGE) as u64) };
+        }
+        self.phase = phase;
+    }
+
+    /// A refusal of the opening: the mapping and the session are released.
+    fn abort_opening(&mut self) {
+        self.release_mapping();
+        self.opening = None;
+    }
+
+    /// The stop of the service: whatever the opening mapped is released.
+    fn release_opening(&mut self) {
+        if self.phase.has_work() {
+            self.abort_opening();
+        }
     }
 
     /// What the driver's pipelines let the service do, once the screen is
-    /// open: the pointer goes onto the cursor pipeline, and the pool
-    /// becomes the buffer of the window of the first revision. Both are
-    /// calls to the driver and mappings (a pool of 250 pages), so they
-    /// belong to the opening of the screen, which no frame is waiting for.
-    /// Any refusal leaves the old way: the pointer drawn into the frame,
-    /// no direct frame, and OPEN BUSY (the pool is the only buffer of a
-    /// window of the first revision).
-    fn take_planes(&mut self, owner: &Handle<Channel>) {
+    /// subscribed: the pipelines are asked (`ask_pipelines`), the pointer
+    /// goes onto the cursor pipeline (`take_cursor`), and the pool becomes the buffer of the window of the
+    /// first revision (the next step, `pool_source`). Both are calls to the
+    /// driver and mappings, so they belong to the opening of the screen,
+    /// which no frame is waiting for, each in a step of its own. Any
+    /// refusal leaves the old way: the pointer drawn into the frame, no
+    /// direct frame, and OPEN BUSY (the pool is the only buffer of a window
+    /// of the first revision).
+    fn ask_pipelines(&mut self, owner: &Handle<Channel>) -> Option<Pipelines> {
         let list = {
             let mut buffer = [0; MESSAGE_MAX];
             let mut request = Writer::new();
@@ -628,21 +817,20 @@ impl Compositor {
             Err(why) => {
                 rt::println!("compositor: the pointer is drawn in the frame: {why}");
                 rt::println!("compositor: no pool for the window of the first revision: {why}");
-                return;
+                return None;
             }
         };
-        match self.cursor_picture(owner, &list) {
+        Some(list)
+    }
+
+    /// The cursor's pipeline and picture.
+    fn take_cursor(&mut self, owner: &Handle<Channel>, list: &Pipelines) {
+        match self.cursor_picture(owner, list) {
             Ok(plane) => {
                 self.scene.set_cursor_plane(Some(plane));
                 rt::println!("compositor: the pointer is on the cursor pipeline");
             }
             Err(why) => rt::println!("compositor: the pointer is drawn in the frame: {why}"),
-        }
-        match self.pool_source(owner, &list) {
-            Ok(()) => {}
-            Err(why) => {
-                rt::println!("compositor: no pool for the window of the first revision: {why}");
-            }
         }
     }
 
@@ -850,15 +1038,15 @@ impl Compositor {
     /// is not ready, for a second at most.
     fn open_screen_waiting(&mut self, level: u8) {
         let Ok(quiet) = sys::channel_create(level) else {
-            let _ = self.open_screen();
+            let _ = self.open_screen(false);
             return;
         };
         let Ok(waiter) = Waiter::new(&quiet, 0, level) else {
-            let _ = self.open_screen();
+            let _ = self.open_screen(false);
             return;
         };
         for _ in 0..OPEN_TRIES {
-            if self.open_screen() != Err(code(CLEARING)) {
+            if self.open_screen(false) != Err(code(CLEARING)) {
                 return;
             }
             let deadline = rt::time::ticks_to_ns(rt::time::now()).saturating_add(OPEN_PAUSE_NS);
@@ -1397,7 +1585,8 @@ impl Compositor {
 
     /// Whether a step of the work is due: clearing, unmapping, mapping.
     fn has_work(&self) -> bool {
-        self.cleared.is_some()
+        self.phase.has_work()
+            || self.cleared.is_some()
             || matches!(self.pool, PoolState::Mapping { .. })
             || self.attaching.is_some()
             || self.extra.iter().any(|e| e.dying)
@@ -1411,7 +1600,9 @@ impl Compositor {
         rt::service::step_own();
         rt::service::step_detail(STEP_WORK);
         self.regrant();
-        if let Some(done) = self.cleared {
+        if self.phase.has_work() {
+            self.open_step();
+        } else if let Some(done) = self.cleared {
             let len = CLEARED.min(POOL_LEN - done);
             // SAFETY: the service's own read and write mapping of the
             // legacy buffer, POOL_LEN long, of which `len` bytes from
@@ -1567,7 +1758,7 @@ impl Compositor {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        if let Err(status) = self.open_screen() {
+        if let Err(status) = self.open_screen(true) {
             return Answer::Status(status);
         }
         if self.scene.has_legacy() {
@@ -1731,7 +1922,7 @@ impl Compositor {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        if let Err(status) = self.open_screen() {
+        if let Err(status) = self.open_screen(true) {
             return Answer::Status(status);
         }
         let d = Description {
@@ -1775,7 +1966,7 @@ impl Compositor {
         let Ok(notify) = r.handles.take::<Channel>(0) else {
             return Answer::Status(proto_comp::code(proto_comp::INVALID));
         };
-        if let Err(status) = self.open_screen() {
+        if let Err(status) = self.open_screen(true) {
             return Answer::Status(status);
         }
         let Ok((label, session)) = self.window_session() else {

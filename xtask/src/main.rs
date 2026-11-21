@@ -2371,6 +2371,8 @@ commands:
             rectangle posted alone, two windows, the screen after a process ended and a window
             of the first revision, each compared with QEMU's screenshot by CRC-32, and the steps
             of the compositor and the display driver under -icount; with --hvf under HVF
+  comp-late-probe run the probe of the composition service with the screen opened late, from a
+            request, by the steps of the work, under -icount: the longest step of the mapping
   focus-probe [--hvf] run the probe of focus and composition of two clients in QEMU: a window
             with an alpha over another, the screen after a click that raises one, after the
             manager's Super-Tab and after the second client ended, each compared with QEMU's
@@ -2887,6 +2889,7 @@ fn main() {
             }),
             Some(_) => Err("comp-probe [--hvf]".to_owned()),
         },
+        Some("comp-late-probe") => comp_probe::late(&qemu::VIRT),
         Some("focus-probe") => match args.get(1).map(String::as_str) {
             None => focus_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -11198,6 +11201,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // screenshot, the end of a process, a program of the first
         // revision, then the steps of the services under -icount.
         job("comp-probe", || comp_probe::probe(&qemu::VIRT)),
+        // The same service when the screen opens late, from a request: the
+        // frame buffer mapped in portions and the longest step of that work.
+        job("comp-late-probe", || comp_probe::late(&qemu::VIRT)),
         // Focus and composition of two clients: a window with an alpha over
         // another, a click and Super-Tab that switch them, the keys of the
         // window with the focus alone, a tablet's click, the window manager
@@ -14857,7 +14863,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "runas",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/irq-trace,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/irq-trace,compositor/late-open,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash",
         "--target",
         PROGRAM_TARGET,
         "--",

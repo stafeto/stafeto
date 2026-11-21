@@ -291,6 +291,40 @@ comes after the last chunk; a window that went keeps its place, with its
 pages, until its chunks are unmapped one step at a time. A buffer is a
 megabyte at most.
 
+## Opening the screen
+
+The service opens the screen of the display driver at its start, with up to 150 tries 5 ms apart
+while the driver says CLEARING, outside any step: the driver's frame buffer is 256 pages to map.
+A driver that did not answer in those tries is asked again at the first request that needs the
+screen (OPEN, WINDOW_CREATE or DESCRIBE). That late opening runs in the steps of the work, so no
+step maps more than 32 pages (`CHUNK`, a page costs the kernel about 200 ticks).
+
+The phase of the opening is `compositor::ScreenPhase`, a state of the host-tested library:
+
+- `Closed`: no driver session. A request asks the driver (OPEN of `proto_gpu`); when the driver
+  gives its buffer the phase becomes `Mapping`, the work bit is set, and the request is answered
+  CLEARING.
+- `Mapping { done }`: a portion of at most 32 pages is mapped a step, and `done` counts them.
+- `Subscribing`, `Planes`, `Cursor`, `Pool`: one step each, after the last portion: SUBSCRIBE with
+  the frame bit's handle, PIPELINES, the cursor's source (4 pages, mapped and filled), the pool's
+  source (its 250 pages are then mapped by the steps of the pool, as before).
+- `Open`: `screen` holds the driver's owner session, and the frame clock and the requests go on.
+
+In every phase but `Closed` and `Open` a request that needs the screen is answered CLEARING (the
+status the driver itself says while it sets up; clients ask again, `describe_when_ready` of the
+probe does), and the frame clock takes no frame, since `screen` is `Some` only in `Open`. A refusal
+of the driver at SUBSCRIBE, a page that cannot be mapped, a driver that went in the middle
+(`PeerClosed`: the service ends, as everywhere else), and the stop of the service release the
+pages mapped so far and the session (`ScreenPhase::release`), and the next request begins again
+from `Closed`. The refusals of PIPELINES, of the cursor and of the pool leave the old ways (the
+pointer drawn in the frame, OPEN of the first revision BUSY), as at the start.
+
+`cargo xtask comp-late-probe` runs the probe comp-probe on an image whose compositor is built with
+the feature `late-open` (no tries at its start), so the first DESCRIBE of the client opens the
+screen from a request under `-icount`. It prints the longest step of the mapping work and the
+longest of the finishing steps, and fails when either is past the gate of 16 328 ticks or a step
+is past B.
+
 ## The frame
 
 A frame takes the posted buffer of every window at its start, is made in
