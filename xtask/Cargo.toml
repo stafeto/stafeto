@@ -25,6 +25,8 @@ bootimg = { path = "../lib/bootimg", features = ["write"] }
 init = { path = "../services/init" }
 # The constants of its bands, which comp-probe and focus-probe report the measured costs against.
 compositor = { path = "../services/compositor" }
+# The pace of the console driver's takes of the kernel log, which the wakes of its budget follow.
+uart = { path = "../services/uart" }
 # The ESP of the disk of the EFI loader (efi_disk.rs): FAT32 without the clock of
 # the host, so that the disk is the same file every time.
 fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }

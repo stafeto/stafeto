@@ -317,6 +317,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("display-probe", 25),
     ("lvgl-probe", 40),
     ("comp-late-probe", 25),
+    ("frame-probe", 60),
 ];
 const DEFAULT_WEIGHT: u32 = 20;
 
