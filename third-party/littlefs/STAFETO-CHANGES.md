@@ -1,7 +1,7 @@
 # The change to littlefs 2.11.3
 
 The sources in this directory are the release v2.11.3 of littlefs (tag commit
-`6cb4e86540eca0d9ba62500a298385c9d863c8be`) with the one change below. The change is also in
+`6cb4e86540eca0d9ba62500a298385c9d863c8be`) with the changes below. The change is also in
 `stafeto-changes.patch`, a unified diff against the release. The licence (BSD-3-Clause,
 `LICENSE.md`) is that of the release and stays as it is: the change adds code to `lfs.c` and
 `lfs.h` under the same licence and under the same copyright notice, and `LICENSE.md` asks only
@@ -10,7 +10,7 @@ the copy is modified, so that the notice is not read as saying it is the release
 
 ## What was added
 
-Four functions that only read. They add no field to any structure of the release, and change
+Four functions that only read (the change of the repair, further down, is the one that writes). They add no field to any structure of the release, and change
 nothing on the disk: a volume written by the release reads with the change and the other way
 round. One function of the release, `lfs_dir_find`, is split to carry the third (below): its body
 becomes `lfs_dir_find_` with one more argument, and `lfs_dir_find` calls it with that argument
@@ -77,6 +77,59 @@ the attribute of every ancestor, and a lookup of each prefix from the root costs
 depth: 60,301 reads for the 201 prefixes of a path of depth 200, against 602 for the walk (8 and 26
 reads at depth 2 and 8, against 10 and 109).
 
+## A change to the repair after a power loss
+
+One more change, to the write path, the first of its kind here: `lfs_fs_deorphan`, which the volume
+runs after a power loss that left an orphan (`lfs_fs_mkconsistent`, called by the data service at
+every mount), asks `lfs_fs_parent` for the parent of every head of a directory, and each ask walks the list
+of metadata pairs from its head: a repair costs about two walks for each directory, so D
+directories in a list of P pairs cost about 2*D*P fetches. Measured on the host
+(`scale_orphan_mount` in `lib/datafs/src/tests_scale.rs`), the dearest mount after a cut inside
+RMDIR or RENAME over a directory, with the parents of the directories far from the head of the list: 79,587
+reads at 135 directories and 256 pairs, 1,443,988 at 539 and 1,024, 6,003,785 at 1,077 and 2,048
+(10 minutes at 10,000 reads a second).
+
+- `struct lfs_config` has two more fields at its end, `orphan_buffer` and `orphan_size`. With NULL
+  (the default of a zeroed configuration) nothing changes. With a table of 4-byte alignment, the repair
+  after a power loss (`lfs_fs_deorphan(lfs, true)`) walks the list once and writes into the table, for
+  every directory entry, the pair that the entry names and the pair that holds the entry, under each of the
+  entry's two blocks (the release's `lfs_pair_cmp` calls two pairs that share a block equal). Each ask
+  for a parent is then answered from the table: no entry names the pair (the answer of the walk,
+  `LFS_ERR_NOENT`), or the one holder the table names is fetched with the very match `lfs_fs_parent`
+  uses, which gives the tag and the parent. A key that has two holders (a move a power loss left
+  half done has the entry under both names, and so has a directory moved since its old parent's log
+  was compacted: the replaced entry is still in the log), a fetch that finds no match or fails (the entry was deleted later
+  in the log of its pair) and a key that did not fit in a full table are answered by `lfs_fs_parent`
+  itself, so every answer is the one the release gives; a key that is in a full table is still
+  answered from it. A pair that cannot be read while the table is built ends the table (every ask is then
+  the walk of the release, which meets the same pair after it has repaired the heads before it).
+  The table is three quarters full at most, 12 bytes a cell; a cell holds one block that a
+  directory entry names, and the entries of the whole log of a pair count, the replaced ones too.
+- The table is scratch for one call of `lfs_fs_deorphan`, built again after each commit of the repair
+  and not kept. A write that fails ends the call with its error and leaves nothing behind; the next
+  mount starts with no table. The repair that runs with no power loss (`lfs_fs_deorphan(lfs, false)`,
+  after a relocation) does not use the table.
+- Two parts of the table are needed for a reason that no test pins down yet, and stay. The rebuild after
+  each commit of the repair is needed when one pair is moved twice within the repair ({a,b}, then
+  the swap {b,a}, then {b,c}): the pair then keeps no block of the stale table, so a missing key would
+  answer `LFS_ERR_NOENT` and make a live directory an orphan. The key of the second block of a
+  child (`child[1]`) is needed when the block that a half-orphan shares with its entry is the
+  entry's second block (a swap by a compaction, then a relocation, then a cut before the parent is
+  updated). The tests did not reach either case (breaking them leaves the tests passing); a disk
+  image built by hand for each is a task after the release.
+- Nothing changes on the disk: the repair makes the same commits, in the same order, with or without the table
+  (the test below compares the disks byte for byte).
+- The data service gives the table 48 KiB (4,096 cells, 3,072 blocks: the 1,024 directories of
+  the plan with their replaced entries), `ORPHAN_CELLS` in `lib/datafs/csrc/glue.c`. The keys of a
+  volume with more are repaired with the walk.
+- Measured (`scale_orphan_table`): the dearest mount after a cut is 26,159 reads at 540 directories
+  and 1,024 pairs and 53,996 at 1,077 and 2,048 (5.4 s at 10,000 reads a second, against 600 s);
+  with 500 of the directories moved to another parent before the cut, 53,627. Tests:
+  `the_table_of_the_repair_of_orphans_leaves_the_disk_of_the_walk` (a cut at every sector of MKDIR, RMDIR and
+  RENAME over a directory, four sets of surviving sectors: the disk after the mount is the same with the
+  table and without it; also with a table of 8 and 60 cells, with directories moved before the cut, with
+  wear levelling on, and with a cut at every sector of the repair itself) and `scale_orphan_table` (the same at the scale of the plan, by name).
+
 ## A known defect of the release that the service works around
 
 With `inline_max = -1` (no inlined files) littlefs 2.11.3, with or without this change, loses a write at the start or in the middle of an existing inline file (a file that an earlier configuration kept inside the pair of its directory): moving the file out (`lfs_file_outline`, `lfs_file_relocate`) copies only the bytes before the write position, flushing the rest then fails, and the close answers `LFS_ERR_CORRUPT`; the write is lost and the old bytes stay. Appending, `O_TRUNC` and truncating down work. The service moves every inline file out before a write can meet this: open for writing, seek to the end and write no byte (one commit, the whole file moves), by the conversion job after the mount and, for a file the job has not reached, at the first open of the path for writing or truncation. The test that reproduces the defect is `without_the_move_out_a_write_in_the_middle_of_an_old_inline_file_is_lost` in `lib/datafs/src/tests_perm.rs`: it fails when a release stops losing the write, and then the move-out can go. The release's own message about it is not sent yet.
@@ -94,8 +147,8 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 0cb4ff1daf5fdc1359c6a6ee3116092f08fc100c9d58b1b77ab17bfd801f856d  LICENSE.md
 6dd74dfc58ac93589f8e002bb73c0830a59206912cfe8c951c07eb2bd5fccad0  SPEC.md
 2a8b3459d74b9fa8bdd947738522c46331739405b1fc3d70f057f636a1dea768  DESIGN.md
-990fd7fc88fc4e9cff64e9fc0c946b51a658ff58c652a52bb673fbf890906bf5  lfs.c (with the change)
-89c6aa3d49725ac6cc50f98b366cdd4b6df17d423649b18fa4a84c9ee97fffc7  lfs.h (with the change)
+75ee60e4b8123438a1ee144ff397f6b7e5918c527b60a852085ad3e90ad35135  lfs.c (with the change)
+bc1e84ff52c58d32d8bf2973bdaaac935598545caa692f561340e6f445ca507a  lfs.h (with the change)
 ```
 
 `tools/check-littlefs.py` (run by `cargo xtask ci` as "littlefs sources") fails when a file of the
@@ -120,6 +173,7 @@ change, or when `stafeto-changes.patch` applied backwards to them does not give 
    `lfs_dir_fetch` of a pair gives the `tail` of the directory it holds, the same shape as in
    `lfs_fs_pred`; the count of directories relies on `dir.split` being true exactly when the
    pair's tail is a hard tail (a continuation of the same directory) and false for a soft tail.
+   The table of the repair relies on `lfs_fs_parent` and `lfs_fs_parent_match` (the match on `LFS_TYPE_DIRSTRUCT` with the mask `LFS_MKTAG(0x7ff, 0, 0x3ff)`) and on the two commits of `lfs_fs_deorphan` that follow a repair; keep the table's answer equal to `lfs_fs_parent`'s.
    Check that the new release's `lfs_fs_traverse_` still begins its walk with
    `dir.tail = {0, 1}`, runs the cycle check before each fetch and goes on to `dir.tail`, and keep
    the function in step with it.
@@ -130,6 +184,7 @@ change, or when `stafeto-changes.patch` applied backwards to them does not give 
    this file, in `README.md` and in `tools/check-littlefs.py`, and change the version in
    `Cargo.toml` and `src/lib.rs`.
 4. Run `cargo test -p datafs`: `tests_entry_attr.rs` compares the attribute of every entry of
-   a directory with `lfs_getattr` by path, across several metadata pairs.
+   a directory with `lfs_getattr` by path, across several metadata pairs, and
+   `tests_scale.rs` compares the disk after the repair of orphans with and without the table.
 5. When a release has the same functions, delete the change: remove the patch, this file, the use
-   of the four functions in `lib/datafs/csrc/glue.c` and `lib/datafs/src/fs.rs`, and the check.
+   of the four functions and the table of the repair in `lib/datafs/csrc/glue.c` and `lib/datafs/src/fs.rs`, and the check.

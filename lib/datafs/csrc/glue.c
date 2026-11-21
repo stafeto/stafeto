@@ -19,6 +19,14 @@
 // dozens of times inside one call of the service on a volume half full.
 #define LOOKAHEAD_MAX (128u * 1024u)
 
+// The table of the repair of orphans after a power loss (lfs_config.orphan_buffer): a cell of 12
+// bytes holds one block that a directory entry names. A directory has two blocks and its entry is
+// in the log of its parent's pair, where the entries that a later commit replaced count too, so
+// the cells are 4 times the 1,024 directories of the plan (`proto_data::DIRS_MAX`) and the table
+// is used up to three quarters: 4,096 cells, 48 KiB, 3,072 blocks. A volume with more blocks than
+// that is repaired for the keys that did not fit with the walk of the release.
+#define ORPHAN_CELLS 4096u
+
 #ifndef DATAFS_FILES
 #define DATAFS_FILES 24
 #endif
@@ -37,6 +45,7 @@ struct datafs {
     uint8_t read_cache[BLOCK];
     uint8_t prog_cache[BLOCK];
     uint8_t lookahead[LOOKAHEAD_MAX];
+    uint32_t orphans[ORPHAN_CELLS * 3u];
     lfs_file_t file[DATAFS_FILES];
     struct lfs_file_config file_cfg[DATAFS_FILES];
     uint8_t file_cache[DATAFS_FILES][BLOCK];
@@ -151,6 +160,8 @@ void datafs_setup(struct datafs *d, uint32_t blocks)
     d->cfg.read_buffer = d->read_cache;
     d->cfg.prog_buffer = d->prog_cache;
     d->cfg.lookahead_buffer = d->lookahead;
+    d->cfg.orphan_buffer = d->orphans;
+    d->cfg.orphan_size = sizeof(d->orphans);
     for (int i = 0; i < DATAFS_FILES; i++) {
         d->file_cfg[i].buffer = d->file_cache[i];
     }
@@ -163,6 +174,31 @@ void datafs_set_lookahead(struct datafs *d, uint8_t *buffer, uint32_t size)
 {
     d->cfg.lookahead_size = size;
     d->cfg.lookahead_buffer = buffer;
+}
+
+// The host tests only: the table of the repair of orphans on (the service's) or off (the walk of the
+// release), set between `datafs_setup` and the next mount.
+void datafs_set_orphan_table(struct datafs *d, int on)
+{
+    d->cfg.orphan_buffer = on ? d->orphans : NULL;
+    d->cfg.orphan_size = on ? sizeof(d->orphans) : 0;
+}
+
+// The host tests only: wear levelling on (a pair of metadata moves to a new block every `cycles`
+// compactions), which makes the half-done relocations the repair of orphans must find.
+void datafs_set_block_cycles(struct datafs *d, int32_t cycles)
+{
+    d->cfg.block_cycles = cycles;
+}
+
+// The same with a table of `cells` cells (at most ORPHAN_CELLS), for the tests of a full table.
+void datafs_set_orphan_cells(struct datafs *d, uint32_t cells)
+{
+    if (cells > ORPHAN_CELLS) {
+        cells = ORPHAN_CELLS;
+    }
+    d->cfg.orphan_buffer = cells ? d->orphans : NULL;
+    d->cfg.orphan_size = cells * 12u;
 }
 
 // The size of the window the volume was set up with, in blocks.

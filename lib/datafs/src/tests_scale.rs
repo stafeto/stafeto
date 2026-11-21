@@ -131,9 +131,15 @@ impl Meter {
     }
 }
 
+std::thread_local! {
+    /// `block_cycles` of the volumes `attach` makes (the service's -1 is no wear levelling).
+    static BLOCK_CYCLES: core::cell::Cell<i32> = const { core::cell::Cell::new(-1) };
+}
+
 fn attach(device: MemDevice, win: Win) -> Vol {
     let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
     let mut fs = Fs::new(device, state).unwrap();
+    fs.set_block_cycles(BLOCK_CYCLES.with(|c| c.get()));
     if win == Win::Narrow {
         // The window the first release had; the service's own is one bit for every block.
         fs.set_lookahead(Box::leak(vec![0u8; 128].into_boxed_slice()));
@@ -2206,4 +2212,327 @@ fn the_mount_work_of_a_volume_that_exists_leaves_the_window_empty() {
     let at = now(&mut fs);
     fs.walk().unwrap();
     assert!(now(&mut fs).since(at).reads > 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The repair of the orphans after a cut, on volumes with many directories and many pairs.
+// ---------------------------------------------------------------------------------------------
+
+/// A volume of `dirs` directories and about `pairs` metadata pairs (the rest of the pairs are made
+/// by files of 500 bytes in one directory). Returns the settled device and the exact counts.
+fn many_pairs(dirs: usize, pairs: usize) -> (MemDevice, u64, u64) {
+    many_pairs_in(65536, dirs, pairs)
+}
+
+fn many_pairs_in(blocks: u64, dirs: usize, pairs: usize) -> (MemDevice, u64, u64) {
+    // /z is made first and /w after it, so the list runs root, /w, the pairs of its files, /z, the
+    // directories of /z: the parent of every directory is as far from the head as the files put it.
+    let mut fs = fresh(blocks, Win::Whole);
+    let mut meter = Meter::new(&mut fs);
+    fs.mkdir(b"/z").unwrap();
+    fs.mkdir(b"/w").unwrap();
+    for i in 0..dirs.saturating_sub(4) {
+        fs.mkdir(format!("/z/d{i}").as_bytes()).unwrap();
+    }
+    let mut n = 0;
+    loop {
+        if n % 32 == 0 && fs.metadata_pairs().unwrap().0 >= pairs as u64 {
+            break;
+        }
+        let sub = n / 900;
+        if n % 900 == 0 {
+            fs.mkdir(format!("/w/s{sub}").as_bytes()).unwrap();
+        }
+        put(&mut fs, &mut meter, &format!("/w/s{sub}/f{n}"), 500).unwrap();
+        n += 1;
+    }
+    let (p, d) = fs.metadata_pairs().unwrap();
+    (settle(fs), p, d)
+}
+
+#[test]
+#[ignore = "slow: volumes with thousands of pairs; run by name, see the module text"]
+fn scale_orphan_mount() {
+    std::println!("\n## Mount after a cut inside MKDIR, RMDIR and RENAME over a directory\n");
+    std::println!(
+        "| dirs | pairs | op | clean mount reads | cheapest | dearest | dearest s at 10,000/s | dearest s at 3,000/s |"
+    );
+    std::println!("|---:|---:|---|---:|---:|---:|---:|---:|");
+    type Op = fn(&mut Vol);
+    let ops: [(&str, Op); 3] = [
+        ("mkdir", |fs| {
+            let _ = fs.mkdir(b"/z/newdir");
+        }),
+        ("rmdir", |fs| {
+            let _ = fs.remove(b"/z/d1");
+        }),
+        ("rename over a directory", |fs| {
+            let _ = fs.rename(b"/z/d2", b"/z/d3");
+        }),
+    ];
+    let scales: Vec<(usize, usize)> = std::env::var("ORPHAN_SCALES")
+        .unwrap_or_else(|_| "128:256,256:512,512:1024,1024:2048".into())
+        .split(',')
+        .map(|s| {
+            let (d, p) = s.split_once(':').unwrap();
+            (d.parse().unwrap(), p.parse().unwrap())
+        })
+        .collect();
+    for (dirs, pairs) in scales {
+        let (device, p, d) = many_pairs(dirs, pairs);
+        let (clean, _) = service_mount(device.clone(), Win::Whole);
+        for (name, op) in ops {
+            let mut fs = mounted(&device, Win::Whole);
+            let before = fs.device().written;
+            op(&mut fs);
+            let sectors = fs.device().written - before;
+            let (mut low, mut high) = (u64::MAX, 0u64);
+            for cut in 0..=sectors {
+                let mut fs = mounted(&device, Win::Whole);
+                fs.device().cut_after(Some(cut));
+                op(&mut fs);
+                let mut dev = fs.into_device();
+                dev.power_cycle(Survive::Random(cut + 5));
+                let (c, _) = service_mount(dev, Win::Whole);
+                low = low.min(c.reads);
+                high = high.max(c.reads);
+            }
+            std::println!(
+                "| {d} | {p} | {name} | {} | {low} | {high} | {:.1} | {:.1} |",
+                clean.reads,
+                high as f64 / 10_000.0,
+                high as f64 / 3_000.0
+            );
+        }
+    }
+}
+
+/// The mount of `device` with a table of `cells` cells for the repair of orphans (0 is the walk of
+/// the release), then the disk as it is. `repair_cut` cuts the power after that many sectors of the
+/// mount, which is then done again after the power cycle.
+fn mount_with_cells(device: &MemDevice, cells: u32, repair_cut: Option<u64>) -> (Cost, Vec<u8>) {
+    let mut fs = attach(device.clone(), Win::Whole);
+    fs.set_orphan_cells(cells);
+    if let Some(cut) = repair_cut {
+        fs.device().cut_after(Some(cut));
+        let _ = fs.mount();
+        let mut dev = fs.into_device();
+        dev.power_cycle(Survive::Random(cut + 9));
+        fs = attach(dev, Win::Whole);
+        fs.set_orphan_cells(cells);
+    }
+    let at = now(&mut fs);
+    fs.mount().unwrap();
+    recover_orphans(&mut fs).unwrap();
+    let cost = now(&mut fs).since(at);
+    let medium = settle(fs);
+    (cost, medium.medium().to_vec())
+}
+
+type OrphanOp = fn(&mut Vol);
+
+fn orphan_ops() -> [(&'static str, OrphanOp); 3] {
+    [
+        ("mkdir", |fs| {
+            let _ = fs.mkdir(b"/z/newdir");
+        }),
+        ("rmdir", |fs| {
+            let _ = fs.remove(b"/z/d1");
+        }),
+        ("rename over a directory", |fs| {
+            let _ = fs.rename(b"/z/d2", b"/z/d3");
+        }),
+    ]
+}
+
+/// 40 files made in `/z/d<K>`: its pair of metadata compacts several times, and with wear levelling
+/// it moves to a new block (a relocation the parent's entry learns of at the end of the commit).
+fn creates<const K: usize>(fs: &mut Vol) {
+    for i in 0..40 {
+        if let Ok(f) = fs.open(
+            format!("/z/d{K}/f{i}").as_bytes(),
+            Open::WRITE.with(Open::CREATE),
+        ) {
+            let _ = fs.close(f);
+        }
+    }
+}
+
+fn wear_ops() -> [(&'static str, OrphanOp); 6] {
+    [
+        ("creates in d4", creates::<4>),
+        ("creates in d5", creates::<5>),
+        ("creates in d6", creates::<6>),
+        ("creates in d7", creates::<7>),
+        ("creates in d8", creates::<8>),
+        ("creates in d9", creates::<9>),
+    ]
+}
+
+/// `device` with `k` directories of `/z` moved to `/y` (a made move leaves the replaced entry in
+/// the log of the old parent: two holders for each moved directory).
+fn with_moved(device: &MemDevice, k: usize) -> MemDevice {
+    let mut fs = mounted(device, Win::Whole);
+    fs.mkdir(b"/y").unwrap();
+    for i in 0..k {
+        fs.rename(
+            format!("/z/d{}", 10 + i).as_bytes(),
+            format!("/y/d{}", 10 + i).as_bytes(),
+        )
+        .unwrap();
+    }
+    settle(fs)
+}
+
+const SURVIVE: usize = 4;
+
+fn survive_set(cut: u64, i: usize) -> Survive {
+    [
+        Survive::None,
+        Survive::All,
+        Survive::Prefix(1),
+        Survive::Random(cut + 5),
+    ][i]
+}
+
+/// A cut at every sector of each operation, with four sets of sectors that reach the disk: the
+/// disk after the mount is the same byte for byte with the table (of `cells` cells) and with the
+/// walk of the release. With `repair` the power is also cut at every sector of the repair itself.
+/// Returns the dearest mount with the table and with the walk.
+fn same_disk_after_every_cut(
+    device: &MemDevice,
+    ops: &[(&str, OrphanOp)],
+    cells: u32,
+    repair: bool,
+) -> (u64, u64) {
+    let (mut dear_table, mut dear_walk) = (0, 0);
+    for &(name, op) in ops {
+        let mut fs = mounted(device, Win::Whole);
+        let before = fs.device().written;
+        op(&mut fs);
+        let sectors = fs.device().written - before;
+        for cut in 0..=sectors {
+            for i in 0..SURVIVE {
+                let survive = survive_set(cut, i);
+                let mut fs = mounted(device, Win::Whole);
+                fs.device().cut_after(Some(cut));
+                op(&mut fs);
+                let mut dev = fs.into_device();
+                dev.power_cycle(survive);
+                let (with, a) = mount_with_cells(&dev, cells, None);
+                dear_table = dear_table.max(with.reads);
+                if std::env::var("ORPHAN_NO_WALK").is_ok() {
+                    continue;
+                }
+                let (without, b) = mount_with_cells(&dev, 0, None);
+                assert!(a == b, "{name}, cut {cut} {survive:?}: the disks differ");
+                dear_walk = dear_walk.max(without.reads);
+                if repair {
+                    // The sectors the mount writes, then a cut at each of them.
+                    let mut probe = attach(dev.clone(), Win::Whole);
+                    probe.set_orphan_cells(0);
+                    let w = probe.device().written;
+                    probe.mount().unwrap();
+                    let repair_sectors = probe.device().written - w;
+                    for r in 0..repair_sectors {
+                        let (_, a) = mount_with_cells(&dev, cells, Some(r));
+                        let (_, b) = mount_with_cells(&dev, 0, Some(r));
+                        assert!(
+                            a == b,
+                            "{name}, cut {cut} {survive:?}, repair cut {r}: the disks differ"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    (dear_table, dear_walk)
+}
+
+fn small_volume() -> MemDevice {
+    many_pairs_in(8192, 40, 80).0
+}
+
+#[test]
+fn the_table_of_the_repair_of_orphans_leaves_the_disk_of_the_walk() {
+    let (table, walk) = same_disk_after_every_cut(&small_volume(), &orphan_ops(), 4096, true);
+    assert!(table < walk, "the table {table} reads, the walk {walk}");
+}
+
+/// `device` with `n` files made in `/z/d4` first, wear levelling on: the pair of that directory has
+/// been compacted a different number of times when the operation starts.
+fn warmed(device: &MemDevice, n: usize, cycles: i32) -> MemDevice {
+    BLOCK_CYCLES.with(|c| c.set(cycles));
+    let mut fs = mounted(device, Win::Whole);
+    for i in 0..n {
+        let f = fs
+            .open(
+                format!("/z/d4/w{i}").as_bytes(),
+                Open::WRITE.with(Open::CREATE),
+            )
+            .unwrap();
+        fs.close(f).unwrap();
+    }
+    settle(fs)
+}
+
+#[test]
+fn with_wear_levelling_the_table_leaves_the_disk_of_the_walk() {
+    // A pair of metadata moves to a new block every few compactions: a cut leaves the entry of a
+    // directory naming the old pair of its blocks (a half-orphan), which shares one block with the
+    // pair the list has. After a compaction that only swaps the two blocks the entry names the
+    // other block than the list's first, so the warm-up counts of 0 to 19 files
+    // put the relocation at every phase.
+    let base = small_volume();
+    for cycles in [2, 3] {
+        for warm in 0..20 {
+            let device = warmed(&base, warm, cycles);
+            BLOCK_CYCLES.with(|c| c.set(cycles));
+            same_disk_after_every_cut(&device, &wear_ops()[..1], 4096, false);
+        }
+    }
+    BLOCK_CYCLES.with(|c| c.set(2));
+    same_disk_after_every_cut(&base, &wear_ops()[..1], 60, false);
+    same_disk_after_every_cut(&base, &wear_ops()[..1], 4096, true);
+    BLOCK_CYCLES.with(|c| c.set(-1));
+}
+
+#[test]
+fn a_full_table_and_moved_directories_leave_the_disk_of_the_walk() {
+    // 8 and 60 cells: the table fills at once, keys that fit are answered from it, the rest by the walk.
+    for cells in [8, 60] {
+        same_disk_after_every_cut(&small_volume(), &orphan_ops(), cells, false);
+    }
+    // Directories moved before the cut: two holders for each.
+    let moved = with_moved(&small_volume(), 12);
+    same_disk_after_every_cut(&moved, &orphan_ops(), 4096, true);
+    same_disk_after_every_cut(&moved, &orphan_ops(), 60, false);
+}
+
+#[test]
+#[ignore = "slow: volumes with thousands of pairs; run by name, see the module text"]
+fn scale_orphan_table() {
+    std::println!("\n## The repair of orphans with the table, the dearest mount after a cut\n");
+    std::println!(
+        "| dirs | pairs | moved | with the table: reads | s at 10,000/s | s at 3,000/s | the walk of the release: reads |"
+    );
+    std::println!("|---:|---:|---:|---:|---:|---:|---:|");
+    let scales =
+        std::env::var("ORPHAN_SCALES").unwrap_or_else(|_| "128:256:0,270:512:0,540:1024:0".into());
+    for sc in scales.split(',') {
+        let mut it = sc.split(':').map(|x| x.parse::<usize>().unwrap());
+        let (dirs, pairs, moved) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+        let (device, _, _) = many_pairs(dirs, pairs);
+        let device = if moved > 0 {
+            with_moved(&device, moved)
+        } else {
+            device
+        };
+        let (table, walk) = same_disk_after_every_cut(&device, &orphan_ops(), 4096, false);
+        std::println!(
+            "| {dirs} | {pairs} | {moved} | {table} | {:.1} | {:.1} | {walk} |",
+            table as f64 / 10_000.0,
+            table as f64 / 3_000.0
+        );
+    }
 }
