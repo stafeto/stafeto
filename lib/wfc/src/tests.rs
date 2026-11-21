@@ -30,6 +30,7 @@ struct Fake {
     set_on_compose: bool,
     strict_wait: bool,
     pause_refusal: Option<Status>,
+    pause_once: Vec<Status>,
     claimed: bool,
 }
 
@@ -66,6 +67,9 @@ impl Service for Fake {
     }
     fn pause(&mut self) -> Result<(), Status> {
         self.log.push(Ev::Pause);
+        if !self.pause_once.is_empty() {
+            return Err(self.pause_once.remove(0));
+        }
         self.pause_refusal.map_or(Ok(()), Err)
     }
     fn claim_screen(&mut self) -> bool {
@@ -2267,7 +2271,7 @@ fn p5_4_interrupted_wait_waits_again() {
 fn p5_4_interrupted_pause_is_not_a_loss() {
     let mut r = rig();
     r.svc.compose_refusals.push(BUSY);
-    r.svc.pause_refusal = Some(Status::Kernel(Error::Interrupted));
+    r.svc.pause_once.push(Status::Kernel(Error::Interrupted));
     r.w.compose(r.dev, r.ctx, true, &mut r.svc);
     assert!(!r.w.is_lost());
 }
@@ -2329,4 +2333,90 @@ fn s6_1_1_unknown_format_is_taken_for_a_source_and_a_mask() {
     assert!(r.w.create_source_from_stream(r.dev, r.ctx, Some(s), &[]) != 0);
     assert!(r.w.create_mask_from_stream(r.dev, r.ctx, Some(s), &[]) != 0);
     assert_eq!(r.err(), 0);
+}
+
+const INTERRUPTED: Status = Status::Kernel(Error::Interrupted);
+
+#[test]
+fn p5_4_many_interrupted_waits_do_not_count() {
+    // A signal ran its handler each time: the wait goes on, as under SA_RESTART.
+    let mut r = rig();
+    for _ in 0..40 {
+        r.svc.wait_once.push(INTERRUPTED);
+    }
+    r.w.commit(r.dev, r.ctx, true, &mut r.svc);
+    assert_eq!(r.err(), 0);
+    assert!(!r.w.is_lost());
+    let waits = r
+        .svc
+        .log
+        .iter()
+        .filter(|e| matches!(e, Ev::Wait(_)))
+        .count();
+    assert_eq!(waits, 41);
+}
+
+#[test]
+fn p5_4_many_interrupted_compose_waits_do_not_count() {
+    let mut r = rig();
+    for _ in 0..40 {
+        r.svc.wait_once.push(INTERRUPTED);
+    }
+    r.w.compose(r.dev, r.ctx, true, &mut r.svc);
+    assert_eq!(r.err(), 0);
+    assert!(!r.w.ctx.unwrap().compose_pending);
+}
+
+#[test]
+fn p5_4_many_interrupted_pauses_do_not_count() {
+    let mut r = rig();
+    r.svc.compose_refusals.push(BUSY);
+    for _ in 0..40 {
+        r.svc.pause_once.push(INTERRUPTED);
+    }
+    r.w.compose(r.dev, r.ctx, true, &mut r.svc);
+    assert_eq!(r.err(), 0);
+    assert!(!r.w.is_lost());
+}
+
+#[test]
+fn p5_4_many_interrupted_requests_do_not_count() {
+    let mut r = rig();
+    for _ in 0..40 {
+        r.svc.commit_refusals.push(INTERRUPTED);
+    }
+    r.commit();
+    assert_eq!(r.err(), 0);
+    assert_eq!(r.svc.commits().len(), 41);
+    let mut r = rig();
+    for _ in 0..40 {
+        r.svc.compose_refusals.push(INTERRUPTED);
+    }
+    r.w.compose(r.dev, r.ctx, false, &mut r.svc);
+    assert_eq!(r.err(), 0);
+}
+
+#[test]
+fn p5_4_interrupted_does_not_use_up_the_busy_tries() {
+    // 15 BUSY answers, each with interrupted pauses, still end in success.
+    let mut r = rig();
+    for _ in 0..(MAX_TRIES - 1) {
+        r.svc.compose_refusals.push(BUSY);
+    }
+    for _ in 0..100 {
+        r.svc.pause_once.push(INTERRUPTED);
+    }
+    r.w.compose(r.dev, r.ctx, true, &mut r.svc);
+    assert_eq!(r.err(), 0);
+}
+
+#[test]
+fn p5_4_would_block_is_still_bounded() {
+    let mut r = rig();
+    for _ in 0..100 {
+        r.svc.wait_once.push(Status::Kernel(Error::WouldBlock));
+    }
+    r.w.commit(r.dev, r.ctx, true, &mut r.svc);
+    assert_eq!(r.err(), ERROR_BUSY);
+    assert!(!r.w.is_lost());
 }

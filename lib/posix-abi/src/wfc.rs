@@ -32,17 +32,28 @@
 //! scene session moves, plan 5.1), and so does the scene the old image
 //! committed, until the new image commits its own.
 //!
-//! Signals: a request that comes back INTERRUPTED goes again (the service
-//! never saw it); a wait or a pause that is interrupted delivers the signal
-//! and returns `Kernel(Interrupted)` to the rules, which wait again (at most
-//! 16 times, then BUSY is stored and the device stays).
+//! Signals: the lock of a device is a plain futex mutex (no critical section
+//! of the layer), so a signal's handler runs while a call waits. A request
+//! that comes back INTERRUPTED goes again (the service never saw it). A wait
+//! or a pause that is interrupted runs the handler and returns
+//! `Kernel(Interrupted)` to the rules, which wait again without counting it,
+//! as a call restarted under SA_RESTART; the 16 tries of the rules are for
+//! BUSY answers and would-block refusals only. The functions are not
+//! async-signal-safe (XSH 2.4.3): calling one from a handler that interrupted
+//! another call of the library, or jumping out of a call with `siglongjmp`,
+//! is undefined (the device lock stays held).
+//!
+//! Sleeping: one thread at a time blocks in `receive` on the channel with the
+//! library's one timer; any other waiting thread sleeps in steps of 10
+//! milliseconds on its own thread's timer and looks at the bits again, so no
+//! thread moves or cancels another's timer.
 
 use crate::constants::*;
 use crate::threads;
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use posix_sync::{LayerGuard, LayerLock};
+use posix_sync::{CLOCK_MONOTONIC, futex_wait, futex_wake};
 use proto_comp::{COMMITTED_BIT, COMPOSED_BIT, EVENTS_BIT, Method, manage};
 use proto_wire::{Status, Writer};
 use rt::abi::{Error, MESSAGE_MAX, Rights, Source};
@@ -59,27 +70,47 @@ pub const MAX_DEVICES: usize = 4;
 const POLL_NS: u64 = 100_000_000;
 const FRAME_NS: u64 = 17_000_000;
 
-/// A lock the child of a fork can make new (a thread of the parent that held
-/// it is not there).
-struct Lock(UnsafeCell<LayerLock>);
-// SAFETY: LayerLock is a lock; `reset` is for the child's only thread.
-unsafe impl Sync for Lock {}
+/// A plain futex mutex. It is no `LayerLock`: its holder is in no critical
+/// section, so a signal's handler runs while a call that holds it waits (a
+/// critical section would keep the signal pending, and every wait would end
+/// at once, interrupted). It is held for a whole call, a wait included, so it
+/// serializes the calls on one device; the child of a fork makes it new (the
+/// thread of the parent that held it is not there). A handler that jumps out
+/// of a call leaves it held: the functions are not async-signal-safe.
+struct Lock(AtomicU32);
+
+struct Held<'a>(&'a Lock);
 
 impl Lock {
     const fn new() -> Lock {
-        Lock(UnsafeCell::new(LayerLock::new()))
+        Lock(AtomicU32::new(0))
     }
 
-    fn lock(&self) -> LayerGuard<'_> {
-        // SAFETY: only `reset` writes, in the child's only thread.
-        unsafe { &*self.0.get() }.lock()
+    fn lock(&self) -> Held<'_> {
+        if self
+            .0
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            while self.0.swap(2, Ordering::Acquire) != 0 {
+                if futex_wait(&self.0, 2, CLOCK_MONOTONIC, None) == Err(EINVAL) {
+                    let _ = sys::yield_now();
+                }
+            }
+        }
+        Held(self)
     }
 
-    /// # Safety
-    /// The child's only thread.
-    unsafe fn reset(&self) {
-        // SAFETY: as the caller says.
-        unsafe { *self.0.get() = LayerLock::new() };
+    fn reset(&self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if self.0.0.swap(0, Ordering::Release) == 2 {
+            futex_wake(&self.0.0, 1);
+        }
     }
 }
 
@@ -104,7 +135,8 @@ impl Slot {
 }
 
 static SLOTS: [Slot; MAX_DEVICES] = [const { Slot::new() }; MAX_DEVICES];
-/// Makes and destroys devices and the transport; never held across a wait.
+/// Makes and destroys devices and the transport; never held across a wait for
+/// the service's bits.
 static REGISTRY: Lock = Lock::new();
 /// The devices made, under REGISTRY.
 static DEVICES: AtomicU32 = AtomicU32::new(0);
@@ -117,6 +149,16 @@ static BITS: AtomicU64 = AtomicU64::new(0);
 static SCREEN: AtomicBool = AtomicBool::new(false);
 /// A thread waits for a new stream.
 static NEXT_WAITING: AtomicBool = AtomicBool::new(false);
+/// One thread at a time sleeps in `receive` on the channel (the one timer is
+/// its own); the others sleep on their thread's timer and look at the bits
+/// again, every `LOOK_NS`.
+static SLEEPER: AtomicBool = AtomicBool::new(false);
+/// The transport is being closed: waiters leave.
+static CLOSING: AtomicBool = AtomicBool::new(false);
+/// The bit that wakes the sleeper: outside the service's bits.
+const WAKE: u64 = 1 << 32;
+/// The step a thread that is not the sleeper looks at the bits again.
+const LOOK_NS: u64 = 10_000_000;
 
 /// The numbers of the windows the scene's ring said were made and no
 /// `wfcNextStreamSTAFETO` took yet.
@@ -203,9 +245,29 @@ fn drain() -> Result<(), Status> {
     }
 }
 
-/// Sleeps until something comes on the channel or `limit_ns` pass (the
-/// timer's expiry is something): the wait of `window::wait` for one wake.
+/// Sleeps until something comes or `limit_ns` pass, and takes what the channel
+/// has. One thread (the sleeper) blocks in `receive` on the channel with the
+/// library's timer; another that waits at the same time sleeps `LOOK_NS` on its
+/// thread's timer, so the shared timer is never moved or cancelled by two
+/// threads. A signal's handler runs and `Kernel(Interrupted)` comes back.
 fn sleep(limit_ns: u64) -> Result<(), Status> {
+    if SLEEPER.swap(true, Ordering::AcqRel) {
+        let step = limit_ns.min(LOOK_NS);
+        let slept = crate::threads::sleep::pause(step as i64);
+        return match slept {
+            Err(EINTR) => {
+                crate::signals::deliver_now();
+                Err(Status::Kernel(Error::Interrupted))
+            }
+            _ => drain(),
+        };
+    }
+    let result = sleep_on_channel(limit_ns);
+    SLEEPER.store(false, Ordering::Release);
+    result
+}
+
+fn sleep_on_channel(limit_ns: u64) -> Result<(), Status> {
     let own = channel();
     let timer = Handle::<Timer>::borrowed(rt::abi::Handle(TIMER.load(Ordering::Acquire)));
     let block = threads::own_block();
@@ -345,7 +407,7 @@ pub fn create() -> Result<u32, i32> {
         Ok(w) => w,
         Err(e) => {
             if DEVICES.load(Ordering::Acquire) == 0 {
-                close_transport();
+                close_transport_now();
             }
             return Err(e);
         }
@@ -377,12 +439,13 @@ fn open_transport(setup: &mut Setup) -> Result<(), i32> {
             ask(request.as_bytes(), [notify.erase()].into()).map_err(|s| match s {
                 // A plain session is no scene's; a manager holds the service.
                 s if s == proto_comp::code(proto_comp::BUSY) => EBUSY,
-                Status::Kernel(_) => ENODEV,
+                Status::Kernel(Error::LimitReached | Error::NoMemory) => ENOMEM,
                 _ => ENODEV,
             })
         });
     if let Err(e) = made {
-        close_transport();
+        // No other thread has the transport yet.
+        close_transport_now();
         return Err(e);
     }
     if let Ok(reply) = ask(&Method::Describe.header().bytes(), Outgoing::new()) {
@@ -398,8 +461,9 @@ fn open_transport(setup: &mut Setup) -> Result<(), i32> {
     Ok(())
 }
 
-/// Closes the channel and the timer and forgets the bits and the streams.
-fn close_transport() {
+/// Closes the channel and the timer and forgets the bits and the streams,
+/// when no thread uses them: a transport that failed to open, or `exec`.
+fn close_transport_now() {
     for (cell, is_timer) in [(&TIMER, true), (&CHANNEL, false)] {
         let raw = cell.swap(0, Ordering::AcqRel);
         if raw == 0 {
@@ -413,8 +477,37 @@ fn close_transport() {
     }
     BITS.store(0, Ordering::Release);
     SCREEN.store(false, Ordering::Release);
-    // SAFETY: no wait is under way when the last device is gone.
+    // SAFETY: the callers say no thread waits for a stream.
     unsafe { *CREATED.0.get() = ([0; CREATED_MAX], 0, 0) };
+}
+
+/// The last device is gone: the threads that still use the channel and the
+/// timer (a `wfcNextStreamSTAFETO` that waits has no device lock, and the
+/// thread that sleeps in `receive`) are woken and leave, and then the
+/// transport closes. They find the device gone and return. The wait is
+/// bounded (3 seconds) so that a thread that does not leave cannot hold the
+/// destroy.
+fn close_transport() {
+    CLOSING.store(true, Ordering::Release);
+    if CHANNEL.load(Ordering::Acquire) != 0 {
+        let _ = sys::notify(&channel(), WAKE);
+    }
+    for _ in 0..3000 {
+        if !NEXT_WAITING.load(Ordering::Acquire) && !SLEEPER.load(Ordering::Acquire) {
+            break;
+        }
+        let _ = crate::threads::sleep::pause(1_000_000);
+    }
+    close_transport_now();
+    CLOSING.store(false, Ordering::Release);
+}
+
+/// Whether `dev` is a device of the table.
+fn exists(dev: u32) -> bool {
+    dev != 0
+        && SLOTS
+            .iter()
+            .any(|s| s.handle.load(Ordering::Acquire) == dev)
 }
 
 /// `wfcDestroyDevice`: the result of the call; BAD_DEVICE for a handle that
@@ -537,6 +630,9 @@ fn next_stream_waiting(dev: u32, timeout_ms: i32, out: &mut u32) -> i32 {
     let until = crate::wait::now().saturating_add(timeout_ms.max(0) as u64 * 1_000_000);
     let mut polls = 0;
     loop {
+        if CLOSING.load(Ordering::Acquire) || !exists(dev) {
+            return -1;
+        }
         if let Some(id) = pop_created() {
             *out = id;
             return 1;
@@ -592,6 +688,9 @@ pub unsafe fn after_fork() {
     SCREEN.store(false, Ordering::Release);
     NEXT_WAITING.store(false, Ordering::Release);
     DEVICES.store(0, Ordering::Release);
+    SLEEPER.store(false, Ordering::Release);
+    CLOSING.store(false, Ordering::Release);
+    REGISTRY.reset();
     // SAFETY: the child's only thread.
     unsafe {
         for slot in &SLOTS {
@@ -599,7 +698,6 @@ pub unsafe fn after_fork() {
             slot.handle.store(0, Ordering::Release);
             *slot.wfc.get() = None;
         }
-        REGISTRY.reset();
         *CREATED.0.get() = ([0; CREATED_MAX], 0, 0);
     }
 }
@@ -616,5 +714,5 @@ pub(crate) fn release_for_exec() {
         // SAFETY: exec has stopped the other threads.
         unsafe { *slot.wfc.get() = None };
     }
-    close_transport();
+    close_transport_now();
 }

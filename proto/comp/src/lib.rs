@@ -107,6 +107,10 @@
 //! SUBSCRIBE is BUSY while a manager holds the subscription. A session that
 //! ends takes its scene with it: the windows show as they did without one at
 //! the next frame.
+//! `exec` keeps the session, and so the scene: the scene the old image
+//! committed stays on screen, its elements naming windows the old image's
+//! producers may have closed (such an element shows nothing), until the new
+//! image commits its own.
 //!
 //! The scene is a list of up to MAX_ELEMENTS elements, lowest first, each of
 //! SCENE_ELEMENT bytes (see `Element`): the window it shows (the `id` of

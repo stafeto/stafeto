@@ -25,6 +25,13 @@
  * to 32 of them. Only the windows' creation is taken from the scene's ring of
  * events; its other events are dropped.
  *
+ * None of the functions of <WF/wfc.h> or this header is async-signal-safe
+ * (XSH 2.4.3). Calling one from a signal handler that interrupted a call of
+ * the library, or leaving a call with siglongjmp, is undefined. A signal that
+ * arrives while wfcCommit or wfcCompose waits runs its handler and the wait
+ * goes on, as a call restarted under SA_RESTART; wfcNextStreamSTAFETO ends
+ * with 0 when a signal interrupts it.
+ *
  * The function lives in a static library the program links (the feature
  * `wfc` of the Rust crate posix-crt), outside libc.so; this header and the
  * others of <WF/> lie outside the headers of the libc sysroot.

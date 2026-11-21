@@ -196,17 +196,21 @@ fn is_busy(s: Status) -> bool {
     s == Status::Unknown(proto_comp::BUSY)
 }
 
-/// A refusal that the call is made again after: a signal or a call that
-/// would block.
-fn transient(s: Status) -> bool {
-    matches!(
-        s,
-        Status::Kernel(abi::Error::Interrupted | abi::Error::WouldBlock)
-    )
+/// A refusal that says a signal ran its handler: the call goes on at once, as
+/// a call restarted under SA_RESTART, and the tries are not counted (each
+/// round has made progress: the handler ran).
+fn interrupted(s: Status) -> bool {
+    matches!(s, Status::Kernel(abi::Error::Interrupted))
 }
 
-/// The most times a request or a wait is made again after a transient refusal
-/// or (with `wait`) a BUSY answer: a frame each. A service that has not taken
+/// A refusal that says the call would block: sent again, counted.
+fn would_block(s: Status) -> bool {
+    matches!(s, Status::Kernel(abi::Error::WouldBlock))
+}
+
+/// The most times a request or a wait is made again after a would-block
+/// refusal or (with `wait`) a BUSY answer: a frame each. An interrupted call
+/// is made again without counting. A service that has not taken
 /// the request by then is not usable and the call stores BAD_DEVICE (BUSY
 /// when `wait` is false), `CLAUSES.md` 4.3.
 const MAX_TRIES: u32 = 16;
@@ -1405,14 +1409,17 @@ impl Wfc {
         clear: Option<u64>,
         mut send: impl FnMut(&mut S) -> Result<(), Status>,
     ) -> Sent {
-        for _ in 0..MAX_TRIES {
+        let mut tries = 0;
+        while tries < MAX_TRIES {
             if let Some(bit) = clear {
                 svc.clear(bit);
             }
             match send(svc) {
                 Ok(()) => return Sent::Accepted,
-                Err(s) if transient(s) => {}
+                Err(s) if interrupted(s) => {}
+                Err(s) if would_block(s) => tries += 1,
                 Err(s) if is_busy(s) && wait => {
+                    tries += 1;
                     if !self.pause(svc) {
                         return Sent::Failed;
                     }
@@ -1428,10 +1435,12 @@ impl Wfc {
     }
 
     fn pause<S: Service>(&mut self, svc: &mut S) -> bool {
-        for _ in 0..MAX_TRIES {
+        let mut tries = 0;
+        while tries < MAX_TRIES {
             match svc.pause() {
                 Ok(()) => return true,
-                Err(s) if transient(s) => {}
+                Err(s) if interrupted(s) => {}
+                Err(s) if would_block(s) => tries += 1,
                 Err(s) => {
                     self.fail(s);
                     return false;
@@ -1441,13 +1450,16 @@ impl Wfc {
         true
     }
 
-    /// Waits for `bit`; a transient refusal waits again, at most `MAX_TRIES`
-    /// times (then BUSY is stored).
+    /// Waits for `bit`; an interrupted wait goes on at once (not counted), a
+    /// would-block refusal waits again at most `MAX_TRIES` times (then BUSY is
+    /// stored).
     fn await_bit<S: Service>(&mut self, svc: &mut S, bit: u64) -> bool {
-        for _ in 0..MAX_TRIES {
+        let mut tries = 0;
+        while tries < MAX_TRIES {
             match svc.wait(bit) {
                 Ok(()) => return true,
-                Err(s) if transient(s) => {}
+                Err(s) if interrupted(s) => {}
+                Err(s) if would_block(s) => tries += 1,
                 Err(s) => {
                     self.fail(s);
                     return false;
