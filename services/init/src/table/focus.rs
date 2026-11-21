@@ -63,8 +63,8 @@ pub const COMPOSITOR: Record = Record {
 };
 
 /// The compositor of the image of the probe of focus, which calibrates the prices of
-/// its bands before its first request: a deadline of 4 s for its start
-/// (`comp::PROBE_COMPOSITOR`).
+/// its bands before its first request: a deadline of 4 s for the silence of its
+/// heartbeats (`comp::PROBE_COMPOSITOR`).
 const PROBE_COMPOSITOR: Record = Record {
     kind: comp::PROBE_COMPOSITOR.kind,
     ..COMPOSITOR

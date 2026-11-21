@@ -22,7 +22,13 @@ pub struct Pixman {
     /// The layers and fills that were not drawn (pixman refused: no
     /// memory in its arena, or a rectangle outside a surface).
     refused: u32,
+    /// The element and the area of the product the work band holds (the first step
+    /// of an element with a mask and an alpha), none when the last failed.
+    product: Option<(u32, Rect)>,
 }
+
+// The work band holds a band of a frame: the screen's width and the lines of a band.
+const _: () = assert!(pixman::WORK_W >= WIDTH && pixman::WORK_H >= compositor::BAND_ROWS);
 
 // The images pixman keeps cover every buffer the scene can name: three of each
 // window, the screen, the pointer's picture and the pool.
@@ -703,7 +709,11 @@ impl Pixman {
         let mut images = Images::new();
         // The image over the work band of the steps of a mask and an alpha.
         pixman::prepare_work(&mut images);
-        Pixman { images, refused: 0 }
+        Pixman {
+            images,
+            refused: 0,
+            product: None,
+        }
     }
 
     /// The image of a window's buffer is made now (a post), so that no band
@@ -813,14 +823,22 @@ impl Raster for Pixman {
 
     fn product(
         &mut self,
+        owner: (u32, Rect),
         mask: &compositor::Surface<'_>,
         at: (u32, u32),
         alpha: u8,
         size: (u32, u32),
-    ) {
-        if !pixman::product(&mut self.images, plane(*mask), at, alpha, size) {
+    ) -> bool {
+        let made = pixman::product(&mut self.images, plane(*mask), at, alpha, size);
+        if !made {
             self.refuse("a product");
         }
+        self.product = made.then_some(owner);
+        made
+    }
+
+    fn product_made(&self) -> Option<(u32, Rect)> {
+        self.product
     }
 
     fn element(&mut self, fb: &mut [u8], d: &Draw<'_>) {

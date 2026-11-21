@@ -106,15 +106,24 @@ const WORK_H: u32 = 16;
 /// the two steps of a mask and an alpha (a byte a point, 640 a line).
 struct Sampler {
     work: Vec<u8>,
+    /// The element and the area of the product in the band; the work band is lost
+    /// (a product is refused) when `refuse`.
+    made: Option<(u32, Rect)>,
+    refuse: bool,
 }
 
 impl Sampler {
     fn new() -> Sampler {
         Sampler {
             work: vec![0; (WORK_W * WORK_H) as usize],
+            made: None,
+            refuse: false,
         }
     }
 }
+
+// The work band holds a band of a frame.
+const _: () = assert!(WORK_W >= WIDTH && WORK_H >= BAND_ROWS);
 
 fn put(fb: &mut [u8], x: u32, y: u32, v: u32) {
     let at = (y * STRIDE + x * 4) as usize;
@@ -161,13 +170,30 @@ impl Raster for Sampler {
         }
     }
 
-    fn product(&mut self, mask: &Surface<'_>, at: (u32, u32), alpha: u8, size: (u32, u32)) {
+    fn product_made(&self) -> Option<(u32, Rect)> {
+        self.made
+    }
+
+    fn product(
+        &mut self,
+        owner: (u32, Rect),
+        mask: &Surface<'_>,
+        at: (u32, u32),
+        alpha: u8,
+        size: (u32, u32),
+    ) -> bool {
+        if self.refuse {
+            self.made = None;
+            return false;
+        }
+        self.made = Some(owner);
         for y in 0..size.1 {
             for x in 0..size.0 {
                 let m = point(mask.bytes, mask.stride, Format::A8, at.0 + x, at.1 + y);
                 self.work[(y * WORK_W + x) as usize] = meaning::mul(m, u32::from(alpha)) as u8;
             }
         }
+        true
     }
 
     fn element(&mut self, fb: &mut [u8], d: &Draw<'_>) {
@@ -945,12 +971,15 @@ fn sixteen_of_the_dearest_over_the_screen_make_steps_under_the_gate_by_the_model
     let mut at = Band::default();
     let mut fb = vec![0u8; (STRIDE * HEIGHT) as usize];
     let (mut steps, mut worst) = (0, 0);
+    let mut made = None;
     while at.row < d.y + d.h {
         let mut model = StepCost {
             elements: els.len() as u32,
+            made,
             ..StepCost::default()
         };
         at = compose(&rig.scene, d, at, &mut fb, &rig.wins, &mut model);
+        made = model.made;
         worst = worst.max(model.ticks());
         steps += 1;
     }
@@ -979,6 +1008,7 @@ fn walk_priced(rig: &Rig, d: Rect) -> (u32, Vec<u32>) {
     let mut fb = vec![0u8; (STRIDE * HEIGHT) as usize];
     let mut steps = 0;
     let mut first_step = 0;
+    let mut made = None;
     while at.row < d.y + d.h {
         let g = (at.pass & !PHASE) as usize;
         let second = at.pass & PHASE != 0;
@@ -986,9 +1016,11 @@ fn walk_priced(rig: &Rig, d: Rect) -> (u32, Vec<u32>) {
         let (w, h) = plan.band(g);
         let mut model = StepCost {
             elements: plan.elements,
+            made,
             ..StepCost::default()
         };
         let next = compose(&rig.scene, d, at, &mut fb, &rig.wins, &mut model);
+        made = model.made;
         let ticks = model.ticks() + u64::from(SCENE_STEP);
         let limit = if (w, h) == (1, 1) {
             u64::from(BAND_GATE - 1_080)
@@ -1161,6 +1193,8 @@ struct StepCost {
     layers: u32,
     /// The elements of the scene that show something over the damage.
     elements: u32,
+    /// The element and the area of the last product.
+    made: Option<(u32, Rect)>,
 }
 
 impl StepCost {
@@ -1203,7 +1237,15 @@ impl Raster for StepCost {
         self.add(p, area);
     }
 
-    fn product(&mut self, _: &Surface<'_>, _: (u32, u32), _: u8, size: (u32, u32)) {
+    fn product(
+        &mut self,
+        owner: (u32, Rect),
+        _: &Surface<'_>,
+        _: (u32, u32),
+        _: u8,
+        size: (u32, u32),
+    ) -> bool {
+        self.made = Some(owner);
         // The first step of an element of two steps: the product of a mask and an
         // alpha over the band's area (the price of a mask with an alpha; its own call
         // and its miss).
@@ -1211,6 +1253,11 @@ impl Raster for StepCost {
         self.layers += 1;
         self.calls += p.miss;
         self.add(p, size);
+        true
+    }
+
+    fn product_made(&self) -> Option<(u32, Rect)> {
+        self.made
     }
 
     fn element(&mut self, _: &mut [u8], d: &Draw<'_>) {
@@ -1266,5 +1313,87 @@ fn every_element_of_the_scene_is_a_term_of_a_step_whether_it_shows_or_not() {
         h: 100,
     };
     assert_eq!(rig.scene.passes(&def, d).elements, 3);
+    rig.scene.end(true);
+}
+
+/// A scene of two elements of two steps (a stretch with a mask and an alpha, by a
+/// turn of a half, so no fast path) side by side.
+fn two_of_two_steps() -> (Rig, Vec<Element>) {
+    let rig = Rig::new(&[(XRGB, 64, 40), (XRGB, 64, 40), (A8, 128, 80), (A8, 128, 80)]);
+    let mut a = rig.whole(0, [10, 10, 128, 80]);
+    a.orient = 2;
+    a.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA;
+    a.mask = rig.id(2);
+    a.alpha = 150;
+    let mut b = rig.whole(1, [200, 10, 128, 80]);
+    b.orient = 2;
+    b.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA;
+    b.mask = rig.id(3);
+    b.alpha = 90;
+    (rig, vec![a, b])
+}
+
+#[test]
+fn a_second_step_that_finds_the_product_of_another_element_goes_back_to_its_first() {
+    let (mut rig, els) = two_of_two_steps();
+    rig.scene
+        .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap())
+        .unwrap();
+    let d = rig.scene.begin().expect("a frame");
+    let def = rig.scene.working().copied().unwrap();
+    let plan = rig.scene.passes(&def, d);
+    let (ga, gb) = (plan.group_of(0).unwrap(), plan.group_of(1).unwrap());
+    assert!(plan.is_two_step(ga) && plan.is_two_step(gb) && ga != gb);
+    let mut fb = vec![0xEE; (STRIDE * HEIGHT) as usize];
+    let mut sampler = Sampler::new();
+    // The first step of the first element's first band.
+    let ra = plan.cost[ga].rect;
+    let at = Band {
+        row: ra.y,
+        col: ra.x - d.x,
+        pass: ga as u32,
+    };
+    let next = compose(&rig.scene, d, at, &mut fb, &rig.wins, &mut sampler);
+    assert_eq!(next.pass, ga as u32 | PHASE);
+    // The group numbers shift between the steps: the second step is asked of the
+    // other element's group, for the band the product was not made for.
+    let rb = plan.cost[gb].rect;
+    let wrong = Band {
+        row: rb.y,
+        col: rb.x - d.x,
+        pass: gb as u32 | PHASE,
+    };
+    let before = fb.clone();
+    let back = compose(&rig.scene, d, wrong, &mut fb, &rig.wins, &mut sampler);
+    assert_eq!(
+        back,
+        Band {
+            pass: gb as u32,
+            ..wrong
+        }
+    );
+    assert_eq!(fb, before, "nothing is drawn through another's product");
+    rig.scene.end(true);
+}
+
+#[test]
+fn a_product_that_is_refused_leaves_its_band_undrawn_and_the_frame_goes_on() {
+    let (mut rig, els) = two_of_two_steps();
+    rig.scene
+        .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap())
+        .unwrap();
+    let d = rig.scene.begin().expect("a frame");
+    let mut fb = vec![0xEE; (STRIDE * HEIGHT) as usize];
+    let mut sampler = Sampler::new();
+    sampler.refuse = true;
+    let mut at = Band::default();
+    let mut steps = 0;
+    while at.row < d.y + d.h {
+        at = compose(&rig.scene, d, at, &mut fb, &rig.wins, &mut sampler);
+        steps += 1;
+        assert!(steps < 10_000, "the frame does not end");
+    }
+    // The elements are not drawn: the point inside the first is the black's.
+    assert_eq!(get(&fb, 70, 50), BG & 0xFF_FFFF);
     rig.scene.end(true);
 }

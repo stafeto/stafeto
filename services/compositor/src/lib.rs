@@ -2299,6 +2299,10 @@ impl Scene {
             plan.group[k] = at as u8;
             plan.members[at] |= 1 << k;
             plan.two_step[at] = two;
+            debug_assert!(
+                !two || plan.members_of(at) == 1,
+                "a group of two steps is alone"
+            );
             let c = &mut plan.cost[at];
             c.add(a, LAYER + a.miss, area);
             if let Some(b) = b {
@@ -2321,6 +2325,16 @@ impl Scene {
 /// and the terms of its layers before the rows and the points, half of the
 /// work of a band. A layer dearer than that is a group of its own.
 pub const GROUP_CALLS: u32 = BAND_TICKS / 2;
+
+// An element of two steps is alone in its group: its layer (the call, the term of a
+// layer and the miss of the stretch it makes) is dearer than a group may hold, so
+// no element joins it and it joins none (`Scene::passes`).
+const _: () = {
+    let nearest = PRICES[elements::Class::ScaleNearestOver.row()];
+    let bilinear = PRICES[elements::Class::ScaleBilinearOver.row()];
+    assert!(nearest.call + LAYER + nearest.miss > GROUP_CALLS);
+    assert!(bilinear.call + LAYER + bilinear.miss > GROUP_CALLS);
+};
 
 /// The group no element is in.
 const NO_GROUP: u8 = u8::MAX;
@@ -2839,10 +2853,26 @@ pub trait Raster {
     /// The first step of an element that is stretched, turned or reflected, with a
     /// mask and an alpha: the first `size` points of the area from `at` of the A8
     /// `mask`, times `alpha`, go to the raster's work band; the second step is
-    /// `element` with `Draw::work`, which reads that band as its mask.
-    fn product(&mut self, mask: &Surface<'_>, at: (u32, u32), alpha: u8, size: (u32, u32)) {
-        let _ = (mask, at, alpha, size);
+    /// `element` with `Draw::work`, which reads that band as its mask. `owner` is
+    /// the element (its number in the scene) and the area of the band it is made
+    /// for: the raster remembers them for `product_made`. False when the product
+    /// was not made.
+    fn product(
+        &mut self,
+        owner: (u32, Rect),
+        mask: &Surface<'_>,
+        at: (u32, u32),
+        alpha: u8,
+        size: (u32, u32),
+    ) -> bool {
+        let _ = (owner, mask, at, alpha, size);
         panic!("this raster has no work band");
+    }
+
+    /// The element and the area of the product the work band holds: the last that
+    /// `product` made, none when the last failed.
+    fn product_made(&self) -> Option<(u32, Rect)> {
+        None
     }
 }
 
@@ -2956,7 +2986,8 @@ fn compose_elements(
     fb: &mut [u8],
     src: &impl Source,
     raster: &mut impl Raster,
-) {
+) -> Product {
+    let mut product = Product::None;
     let (x0, y0) = (i64::from(band.x), i64::from(band.y));
     let (x1, y1) = (x0 + i64::from(band.w), y0 + i64::from(band.h));
     let els = def.elements();
@@ -2977,7 +3008,7 @@ fn compose_elements(
         if !els.iter().any(covers) {
             raster.fill(fb, band, def.fill());
         }
-        return;
+        return product;
     }
     // The topmost element of the group that covers the band whole.
     let base = els
@@ -3086,8 +3117,17 @@ fn compose_elements(
             let Some((m, at)) = &mask else {
                 continue;
             };
+            let owner = (k as u32, area);
             if !phase {
-                raster.product(m, *at, e.alpha as u8, (area.w, area.h));
+                let made = raster.product(owner, m, *at, e.alpha as u8, (area.w, area.h));
+                product = if made { Product::Made } else { Product::Failed };
+                continue;
+            }
+            // The work band holds the product of this element for this area, or
+            // the second step is not drawn: the plan of the step was made again
+            // and may name another element than the first step's.
+            if raster.product_made() != Some(owner) {
+                product = Product::Stale;
                 continue;
             }
         }
@@ -3110,6 +3150,22 @@ fn compose_elements(
             },
         );
     }
+    product
+}
+
+/// What the step of a group of two steps did about the product of the mask and the
+/// alpha (`compose_elements`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Product {
+    /// The step had no element of such a group to draw on the band.
+    None,
+    /// The first step made the product.
+    Made,
+    /// The first step could not make it: the band is not drawn.
+    Failed,
+    /// The second step found the work band holding another product (the plan was
+    /// made again between the steps): the band goes back to the first step.
+    Stale,
 }
 
 /// `compose` for a band of `size` (columns and lines) that the caller names:
@@ -3176,8 +3232,9 @@ fn compose_with(
         h: y1 - y0,
     };
     let mut pointer_now = true;
+    let mut product = Product::None;
     if let Some((def, passes)) = groups {
-        compose_elements(scene, def, passes, group, phase, band, fb, src, raster);
+        product = compose_elements(scene, def, passes, group, phase, band, fb, src, raster);
         // The pointer's picture is the last group, drawn in the steps of it.
         pointer_now = passes.pointer_group() == Some(group);
     } else {
@@ -3250,16 +3307,23 @@ fn compose_with(
         }
     }
     // The first step of an element of two steps is followed by its second, on the
-    // same band.
+    // same band, when it made the product; the second that finds another product
+    // goes back to the first.
     if let Some((_, plan)) = groups
         && plan.is_two_step(group)
-        && !phase
     {
-        return Band {
-            row: y0,
-            col: x0 - damage.x,
-            pass: at.pass | PHASE,
+        let again = match (phase, product) {
+            (false, Product::Made) => Some(at.pass | PHASE),
+            (true, Product::Stale) => Some(group as u32),
+            _ => None,
         };
+        if let Some(pass) = again {
+            return Band {
+                row: y0,
+                col: x0 - damage.x,
+                pass,
+            };
+        }
     }
     if x1 < walk.x + walk.w {
         Band {

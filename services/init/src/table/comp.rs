@@ -161,7 +161,9 @@ const PROBE_S: Record = Record {
 
 /// The compositor of the images of the probes that calibrate the prices of its bands
 /// before its first request (the feature `calibrate`: about 1.3 s of the CPU at its
-/// level): the same record with a deadline of 4 s for its start (the period stays).
+/// level): the same record with a deadline of 4 s, which the watchdog allows for the
+/// silence of its heartbeats (the first, after the calibration, and every one after
+/// it); the period stays.
 pub const PROBE_COMPOSITOR: Record = Record {
     kind: Kind::Service(Watch {
         period_ns: 250 * MS,
