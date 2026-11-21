@@ -7653,7 +7653,10 @@ const RAM_STEP_KINDS: [(usize, &str); 26] = [
 ];
 
 /// The most a step of a service may wait in `send` for the answer of
-/// another, in ticks under -icount, the heartbeat to init included (its wait
+/// another, in ticks under -icount (it applies to the calls of the services of POSIX and to the
+/// calls to the process service: the callee of the call has no budgeted service above it. A
+/// call whose callee has budgeted services above it, the composition service's COMMIT to the
+/// display driver, has the bound of `frame_probe::call_wait_bound`), the heartbeat to init included (its wait
 /// is counted until init answers, the counter in the reply: what passes
 /// after that, until the service runs again, is the preemption by the levels
 /// above it, term I of its response time, printed with no limit). For the
@@ -7694,7 +7697,9 @@ const TICK_NS: u64 = 16;
 /// - every other kind has CALL_WAIT_MAX + ticks(C1 + C2 + C3), the C of the three budgets, as
 ///   each of the other two services and the service itself may take its C above 32 once inside
 ///   the wait (a wait is shorter than T);
-/// - a service without a budget keeps CALL_WAIT_MAX.
+/// - a service without a budget keeps CALL_WAIT_MAX, for the calls it applies to (see
+///   CALL_WAIT_MAX): the composition service's calls to the display driver are judged by
+///   `frame_probe::call_wait_bound`, whatever the tag, in the probes of the screen.
 fn call_wait_max(tag: &str, kind: usize) -> u64 {
     let budgets = match tag {
         "2" => init::table::ramfs::RAM_BUDGETS,
@@ -8180,12 +8185,23 @@ fn wait_of(waits: &[(usize, u64, u64)], kind: usize) -> u64 {
 /// every request of the terminal service; the heartbeat, kind 64, included), or when `rt` cut an
 /// accounting that added up to more than its step.
 fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String> {
+    check_waits_by(lines, tags, who, &call_wait_max)
+}
+
+/// `check_waits` with the bound of a wait given by `max` for the tag and the kind: the image
+/// whose services stand above the callee in the wait has its own (`frame_probe::call_wait_bound`).
+fn check_waits_by(
+    lines: &[String],
+    tags: &[&str],
+    who: &str,
+    max: &dyn Fn(&str, usize) -> u64,
+) -> Result<(), String> {
     if let Some(line) = lines.iter().find(|l| l.starts_with("service wait cut:")) {
         return Err(format!("{who}: the accounting of a wait was cut: {line}"));
     }
     for tag in tags {
         for (kind, wait, whole) in longest_waits(lines, tag) {
-            let max = call_wait_max(tag, kind);
+            let max = max(tag, kind);
             if wait > max {
                 return Err(format!(
                     "{who} (tag {tag}): kind {kind} waited {wait} ticks of a step of {whole}, past {max}"
@@ -11210,6 +11226,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The same service when the screen opens late, from a request: the
         // frame buffer mapped in portions and the longest step of that work.
         job("comp-late-probe", || comp_probe::late(&qemu::VIRT)),
+        // The frame time under the loads: ten phases on one boot under
+        // -icount, and the waits of the compositor's steps.
+        job("frame-probe", || frame_probe::probe(&[])),
         // Focus and composition of two clients: a window with an alpha over
         // another, a click and Super-Tab that switch them, the keys of the
         // window with the focus alone, a tablet's click, the window manager

@@ -691,19 +691,20 @@ impl Pace {
 /// The response-time bound of the frame (the analysis of the design): the
 /// least `w` with `w = own + sum I_j(w)`, in ticks, where a source above the
 /// service with a budget `c` of every `t` ticks makes
-/// `I(w) = floor(w/t) c + min(w mod t, c) + step + 2 e ceil(w/t)`: the whole
+/// `I(w) = floor(w/t) c + min(w mod t, c) + step + 2 e k ceil(w/t)`: the whole
 /// budgets of the periods that began, a part of the last, one step of the
 /// service that has it (`step`, the longest of its steps) and the events of
-/// the budget, `e` ticks each, two for each period. None when the iteration
+/// the budget, `e` ticks each, two for each wake (`k`, `Source::wakes`) in each
+/// period. None when the iteration
 /// does not settle within `limit` ticks, which is the case for shares that sum
 /// to 1 or more.
 ///
 /// The term `2 e ceil(w/t)` carries the cost of a preemption, which belongs to
 /// the preempting source: two switches of 1 300 ticks each. The bound assumes at
-/// most two preemptions from a source in its period; a source that wakes more
-/// often (the network's under load) breaks the assumption, and the term of the
-/// preemptions is separate from the events of the budget once the budgets have
-/// their specification.
+/// most two preemptions from a source in each of its wakes; a source that wakes
+/// more than once in its period says how often in `Source::wakes`, and the term
+/// of the preemptions is separate from the events of the budget once the budgets
+/// have their specification.
 pub fn bound(own: u64, sources: &[Source], e: u64, limit: u64) -> Option<u64> {
     let mut w = own;
     // A sum of shares of 1 or more never settles: the value passes the limit
@@ -714,7 +715,10 @@ pub fn bound(own: u64, sources: &[Source], e: u64, limit: u64) -> Option<u64> {
         for s in sources {
             let periods = w / s.period;
             let rest = w % s.period;
-            next += periods * s.budget + rest.min(s.budget) + s.step + 2 * e * w.div_ceil(s.period);
+            next += periods * s.budget
+                + rest.min(s.budget)
+                + s.step
+                + 2 * e * s.wakes * w.div_ceil(s.period);
         }
         if next == w {
             return Some(w);
@@ -728,13 +732,17 @@ pub fn bound(own: u64, sources: &[Source], e: u64, limit: u64) -> Option<u64> {
 }
 
 /// A source of interference above the service: a budget of `budget` ticks
-/// every `period` ticks, and the longest step `step` of the service that has
-/// it.
+/// every `period` ticks, the longest step `step` of the service that has
+/// it, and the times `wakes` the source may wake in a period and preempt the
+/// service (1 for a source that wakes by its own timer or by requests the
+/// budget counts once; the console's driver wakes by the kernel's notification
+/// of a record up to the period over the pace of its takes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Source {
     pub budget: u64,
     pub period: u64,
     pub step: u64,
+    pub wakes: u64,
 }
 
 #[cfg(test)]
@@ -1287,6 +1295,7 @@ mod tests {
             budget: 10,
             period: 100,
             step: 5,
+            wakes: 1,
         };
         let w = bound(100, &[s], 1, 1_000_000).unwrap();
         let i = |w: u64| 10 * (w / 100) + (w % 100).min(10) + 5 + 2 * w.div_ceil(100);
@@ -1298,6 +1307,7 @@ mod tests {
             budget: 100,
             period: 100,
             step: 0,
+            wakes: 1,
         };
         assert_eq!(bound(1, &[full], 0, 1_000_000), None);
         let two = [
@@ -1305,17 +1315,35 @@ mod tests {
                 budget: 60,
                 period: 100,
                 step: 0,
+                wakes: 1,
             },
             Source {
                 budget: 40,
                 period: 100,
                 step: 0,
+                wakes: 1,
             },
         ];
         assert_eq!(bound(1, &two, 0, 1_000_000), None);
         // The floor of the first term: a ceiling there gives more.
         let more = |w: u64| 10 * w.div_ceil(100) + (w % 100).min(10) + 5 + 2 * w.div_ceil(100);
         assert!(100 + more(w) > w);
+    }
+
+    #[test]
+    fn a_source_that_wakes_often_pays_the_events_of_each_wake() {
+        let src = |wakes| Source {
+            budget: 10,
+            period: 100,
+            step: 0,
+            wakes,
+        };
+        let one = bound(100, &[src(1)], 3, 1_000_000).unwrap();
+        let four = bound(100, &[src(4)], 3, 1_000_000).unwrap();
+        let i = |w: u64, k: u64| 10 * (w / 100) + (w % 100).min(10) + 2 * 3 * k * w.div_ceil(100);
+        assert_eq!(four, 100 + i(four, 4));
+        assert_eq!(one, 100 + i(one, 1));
+        assert!(four > one);
     }
 
     /// The rows of the design's table of bounds (section 9 of the plan): each
@@ -1335,6 +1363,7 @@ mod tests {
             budget,
             period,
             step,
+            wakes: 1,
         };
         let all = [
             src(9_375, 62_500),   // switch
