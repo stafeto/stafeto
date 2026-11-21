@@ -63,6 +63,11 @@ window = ["dep:comp-client", "dep:proto-comp"]
 # the map and the calls that `<WF/wfd.h>` has. Statically linked programs
 # turn it on (posix-crt's feature `wfd`); libc.so is built without it.
 wfd = ["dep:wfd", "dep:proto-comp"]
+# The OpenWF Composition devices over the scene session of the composition
+# service for a C program (wfc.rs): the table of devices, the library's channel
+# of the scene's bits and the calls that `<WF/wfc.h>` has. Statically linked
+# programs turn it on (posix-crt's feature `wfc`); libc.so is built without it.
+wfc = ["dep:wfc", "dep:proto-comp"]
 
 [dependencies]
 trace = { path = "../trace" }
@@ -101,3 +106,4 @@ comp-client = { path = "../comp-client", optional = true }
 proto-comp = { path = "../../proto/comp", optional = true }
 proto-data = { path = "../../proto/data", optional = true }
 wfd = { path = "../wfd", optional = true }
+wfc = { path = "../wfc", optional = true }

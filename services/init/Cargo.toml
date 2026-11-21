@@ -266,6 +266,10 @@ table-posix-display = []
 table-data-posix = []
 # The C probe of the window library (xtask posix-window).
 table-posix-window = []
+# The scene demo on OpenWF Composition over the compositor (xtask wfc-probe).
+table-wfc = []
+# The same under -icount: the demo leaves out the pauses of the screenshots and the services count their steps.
+table-wfc-steps = []
 # The display demo on OpenWF Display with the display driver alone, no composition service (xtask wfd-probe).
 table-wfd = []
 # The same under -icount: the demo leaves out the pauses of the screenshots and the driver counts its steps.

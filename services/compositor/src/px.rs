@@ -22,7 +22,13 @@ pub struct Pixman {
     /// The layers and fills that were not drawn (pixman refused: no
     /// memory in its arena, or a rectangle outside a surface).
     refused: u32,
+    /// The element and the area of the product the work band holds (the first step
+    /// of an element with a mask and an alpha), none when the last failed.
+    product: Option<(u32, Rect)>,
 }
+
+// The work band holds a band of a frame: the screen's width and the lines of a band.
+const _: () = assert!(pixman::WORK_W >= WIDTH && pixman::WORK_H >= compositor::BAND_ROWS);
 
 // The images pixman keeps cover every buffer the scene can name: three of each
 // window, the screen, the pointer's picture and the pool.
@@ -120,7 +126,7 @@ pub mod cost {
     /// each count of layers (1 to MAX_LAYERS - 1) how many bands, the least and
     /// the greatest ticks of `compose` less the operations in it (the work of
     /// `compose` around the calls: the stacking, the clip, the sources), and the
-    /// greatest step of the band's own code with the compose and the operations
+    /// greatest step of the band by the wall (preemptions of a higher level included) with the compose and the operations
     /// of that band.
     pub const MAX_LAYERS: usize = 10;
 
@@ -148,10 +154,21 @@ pub mod cost {
     static BAND_OPS: AtomicU64 = AtomicU64::new(0);
     static BAND_LAYERS: AtomicU32 = AtomicU32::new(0);
 
+    /// The bands of the frame in progress and the tick its first band began at, and
+    /// the frame that has just ended (told after its step, `tell`).
+    static FRAME_BANDS: AtomicU32 = AtomicU32::new(0);
+    static FRAME_FIRST: AtomicU64 = AtomicU64::new(0);
+    static ENDED_BANDS: AtomicU32 = AtomicU32::new(0);
+    static ENDED_TICKS: AtomicU64 = AtomicU64::new(0);
+    static ENDED_DUE: AtomicU32 = AtomicU32::new(0);
+
     /// A band begins: its operations are counted from zero.
     pub fn band_begin() {
         BAND_OPS.store(0, Ordering::Relaxed);
         BAND_LAYERS.store(0, Ordering::Relaxed);
+        if FRAME_BANDS.fetch_add(1, Ordering::Relaxed) == 0 {
+            FRAME_FIRST.store(rt::time::now(), Ordering::Relaxed);
+        }
     }
 
     /// The band ended: `compose` took `compose` ticks, the band's code in all
@@ -196,7 +213,7 @@ pub mod cost {
         /// last line of the conductor was lost so), so the lines of the bands are few.
         const TELL_FROM: u64 = 256;
 
-        /// The floor of a count of layers: the band whose own code took least (what a
+        /// The floor of a count of layers: the band whose step took least by the wall (what a
         /// band costs when nothing else happened in it), its `compose` and operations,
         /// and how many bands passed the gate of a band (a preempted band does too).
         struct Floor {
@@ -483,6 +500,15 @@ pub mod cost {
     pub fn frame_done() {
         FRAMES.fetch_add(1, Ordering::Relaxed);
         DUE.store(1, Ordering::Relaxed);
+        let bands = FRAME_BANDS.swap(0, Ordering::Relaxed);
+        if bands != 0 {
+            ENDED_BANDS.store(bands, Ordering::Relaxed);
+            ENDED_TICKS.store(
+                rt::time::now() - FRAME_FIRST.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            ENDED_DUE.store(1, Ordering::Relaxed);
+        }
     }
 
     /// Runs after each step of the loop (rt::service::step_after): at the
@@ -505,6 +531,15 @@ pub mod cost {
         #[cfg(feature = "irq-trace")]
         if trace::fold() {
             trace::tell();
+        }
+        // A frame made by bands: how many, and the time from its first band to its end.
+        if ENDED_DUE.swap(0, Ordering::Relaxed) != 0 {
+            rt::println!(
+                "service frame: 17 n {} bands {} us {}",
+                FRAMES.load(Ordering::Relaxed),
+                ENDED_BANDS.load(Ordering::Relaxed),
+                rt::time::ticks_to_ns(ENDED_TICKS.load(Ordering::Relaxed)) / 1_000
+            );
         }
         if DUE.swap(0, Ordering::Relaxed) == 0 {
             return;
@@ -671,9 +706,13 @@ impl Pixman {
         );
         // The two images of the warm-up wrapped memory of this frame.
         drop(images);
+        let mut images = Images::new();
+        // The image over the work band of the steps of a mask and an alpha.
+        pixman::prepare_work(&mut images);
         Pixman {
-            images: Images::new(),
+            images,
             refused: 0,
+            product: None,
         }
     }
 
@@ -782,6 +821,26 @@ impl Raster for Pixman {
         );
     }
 
+    fn product(
+        &mut self,
+        owner: (u32, Rect),
+        mask: &compositor::Surface<'_>,
+        at: (u32, u32),
+        alpha: u8,
+        size: (u32, u32),
+    ) -> bool {
+        let made = pixman::product(&mut self.images, plane(*mask), at, alpha, size);
+        if !made {
+            self.refuse("a product");
+        }
+        self.product = made.then_some(owner);
+        made
+    }
+
+    fn product_made(&self) -> Option<(u32, Rect)> {
+        self.product
+    }
+
     fn element(&mut self, fb: &mut [u8], d: &Draw<'_>) {
         let mut target = Target {
             bytes: fb,
@@ -845,6 +904,8 @@ fn draw(images: &mut Images, target: &mut Target<'_>, d: &Draw<'_>) -> bool {
         t & TRANSPARENCY_MASK != 0,
         t & TRANSPARENCY_ALPHA != 0,
     ) {
+        // The product of the mask and the alpha was made in the work band.
+        _ if d.work => Mask::Work,
         (Some((m, at)), true, false) => Mask::Plane {
             source: plane(m),
             at,
@@ -983,7 +1044,12 @@ pub mod calibration {
         (640, 8, 2),
         (640, 13, 2),
     ];
-    const REPEAT: u32 = 3;
+    /// The timed operations after the warm-up of a plain kind: one, the run under
+    /// -icount being deterministic (the calibration is bounded by the display
+    /// driver's watchdog, which the service's start must keep under).
+    const REPEAT: u32 = 1;
+    /// How many times an operation that a higher level preempted is tried again.
+    const PREEMPT_RETRIES: u32 = 4;
 
     /// What a kind of the elements' operations draws: nearest or bilinear, the
     /// source turned a quarter, reflected and stretched (the general path of
@@ -996,6 +1062,7 @@ pub mod calibration {
         transform: Transform,
         over: bool,
         mix: Mix,
+        source: Src,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1006,6 +1073,19 @@ pub mod calibration {
         General,
         /// A quarter turn with no stretch: pixman's own path for it.
         Quarter,
+        /// Stretched by a fraction, no turn and no reflection: the class of the
+        /// fast paths (`compositor::elements::Class::FastNearestCopy` and the
+        /// rest).
+        Scale,
+    }
+
+    /// The source's format: both in turn (the kinds that were measured so), or the
+    /// one named.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Src {
+        Both,
+        Argb,
+        Opaque,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1020,13 +1100,14 @@ pub mod calibration {
     /// (`compositor::PRICES` after the black, the copy and the laying over):
     /// each is measured on the shapes of the plain ones narrower than 160
     /// points (a dear band is a part of a line), at two offsets of the target.
-    pub(super) const RECIPES: [Recipe; 8] = [
+    pub(super) const RECIPES: [Recipe; 21] = [
         Recipe {
             name: "scale-nearest-copy",
             bilinear: false,
             transform: Transform::General,
             over: false,
             mix: Mix::None,
+            source: Src::Both,
         },
         Recipe {
             name: "scale-nearest-over",
@@ -1034,6 +1115,7 @@ pub mod calibration {
             transform: Transform::General,
             over: true,
             mix: Mix::None,
+            source: Src::Both,
         },
         Recipe {
             name: "scale-bilinear-copy",
@@ -1041,6 +1123,7 @@ pub mod calibration {
             transform: Transform::General,
             over: false,
             mix: Mix::None,
+            source: Src::Both,
         },
         Recipe {
             name: "scale-bilinear-over",
@@ -1048,6 +1131,7 @@ pub mod calibration {
             transform: Transform::General,
             over: true,
             mix: Mix::None,
+            source: Src::Both,
         },
         Recipe {
             name: "rotate90",
@@ -1055,6 +1139,7 @@ pub mod calibration {
             transform: Transform::Quarter,
             over: false,
             mix: Mix::None,
+            source: Src::Both,
         },
         Recipe {
             name: "alpha",
@@ -1062,6 +1147,7 @@ pub mod calibration {
             transform: Transform::Plain,
             over: true,
             mix: Mix::Alpha,
+            source: Src::Both,
         },
         Recipe {
             name: "mask",
@@ -1069,6 +1155,7 @@ pub mod calibration {
             transform: Transform::Plain,
             over: true,
             mix: Mix::Mask,
+            source: Src::Both,
         },
         Recipe {
             name: "mask-alpha",
@@ -1076,6 +1163,111 @@ pub mod calibration {
             transform: Transform::Plain,
             over: true,
             mix: Mix::Both,
+            source: Src::Both,
+        },
+        Recipe {
+            name: "fast-nearest-copy",
+            bilinear: false,
+            transform: Transform::Scale,
+            over: false,
+            mix: Mix::None,
+            source: Src::Opaque,
+        },
+        Recipe {
+            name: "fast-nearest-over",
+            bilinear: false,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::None,
+            source: Src::Argb,
+        },
+        Recipe {
+            name: "fast-bilinear-copy",
+            bilinear: true,
+            transform: Transform::Scale,
+            over: false,
+            mix: Mix::None,
+            source: Src::Opaque,
+        },
+        Recipe {
+            name: "fast-bilinear-over",
+            bilinear: true,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::None,
+            source: Src::Argb,
+        },
+        Recipe {
+            name: "fast-nearest-alpha",
+            bilinear: false,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Alpha,
+            source: Src::Argb,
+        },
+        Recipe {
+            name: "fast-bilinear-alpha",
+            bilinear: true,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Alpha,
+            source: Src::Argb,
+        },
+        Recipe {
+            name: "fast-nearest-mask",
+            bilinear: false,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Mask,
+            source: Src::Argb,
+        },
+        Recipe {
+            name: "fast-bilinear-mask",
+            bilinear: true,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Mask,
+            source: Src::Argb,
+        },
+        Recipe {
+            name: "fast-bilinear-mask-alpha",
+            bilinear: true,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Both,
+            source: Src::Argb,
+        },
+        Recipe {
+            name: "fast-nearest-alpha-opaque",
+            bilinear: false,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Alpha,
+            source: Src::Opaque,
+        },
+        Recipe {
+            name: "fast-bilinear-alpha-opaque",
+            bilinear: true,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Alpha,
+            source: Src::Opaque,
+        },
+        Recipe {
+            name: "fast-nearest-mask-opaque",
+            bilinear: false,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Mask,
+            source: Src::Opaque,
+        },
+        Recipe {
+            name: "fast-bilinear-mask-opaque",
+            bilinear: true,
+            transform: Transform::Scale,
+            over: true,
+            mix: Mix::Mask,
+            source: Src::Opaque,
         },
     ];
 
@@ -1124,15 +1316,32 @@ pub mod calibration {
                 width: NARROW,
                 height: NARROW_HEIGHT,
             };
-            // The formats alternate with the offset for the kinds that mix: the
-            // source with its alpha at 0, without at 1 (both are drawn).
-            let argb = r.over && (r.mix == Mix::None || sx == 0);
+            // The formats alternate with the offset for the kinds that mix and name
+            // no format: the source with its alpha at 0, without at 1 (both are
+            // drawn).
+            let argb = match r.source {
+                Src::Argb => true,
+                Src::Opaque => false,
+                Src::Both => r.over && (r.mix == Mix::None || sx == 0),
+            };
+            // A scale at the edge of its source is a stretch of the whole of a
+            // source (at least 2 by 2: one point is a solid colour to pixman) that is the half of the target (its samples reach past the
+            // edge, so pixman pads them and does not cover the clip, the other
+            // flags and the other path); inside is a part of the large source, which
+            // covers the clip. The other kinds are inside or at the edge of the
+            // large source.
+            let edge = r.transform == Transform::Scale && !inside;
+            let (src_w, src_h) = if edge {
+                ((w / 2).max(2), (h / 2).max(2))
+            } else {
+                (ELEMENT_SRC_SIDE, ELEMENT_SRC_SIDE)
+            };
             let from = Source {
                 bytes: src,
                 format: if argb { Px::Argb8888 } else { Px::Xrgb8888 },
                 stride: ELEMENT_SRC_SIDE * 4,
-                width: ELEMENT_SRC_SIDE,
-                height: ELEMENT_SRC_SIDE,
+                width: src_w,
+                height: src_h,
                 hint: 1,
             };
             let plane = Source {
@@ -1153,6 +1362,8 @@ pub mod calibration {
                 sy: if inside { 40 << 16 } else { 0 },
                 sw: if r.transform == Transform::Quarter {
                     (h as i32) << 16
+                } else if edge {
+                    (src_w as i32) << 16
                 } else if inside {
                     80 << 16
                 } else {
@@ -1160,6 +1371,8 @@ pub mod calibration {
                 },
                 sh: if r.transform == Transform::Quarter {
                     (w as i32) << 16
+                } else if edge {
+                    (src_h as i32) << 16
                 } else if inside {
                     80 << 16
                 } else {
@@ -1169,10 +1382,10 @@ pub mod calibration {
                 dy: 0,
                 dw: w as i32,
                 dh: h as i32,
-                orient: if r.transform == Transform::General {
-                    1 | proto_comp::MIRROR
-                } else {
-                    1
+                orient: match r.transform {
+                    Transform::General => 1 | proto_comp::MIRROR,
+                    Transform::Scale => 0,
+                    _ => 1,
                 },
                 filter: u32::from(r.bilinear),
                 transparency: 0,
@@ -1282,8 +1495,15 @@ pub mod calibration {
         // the kinds that mix are drawn from both formats of the source (the
         // second number). The rest is the general path of pixman, which does
         // not mind the alignment.
+        // The kinds of the fast class are measured once after the warm-up (the run is
+        // deterministic), from the source they name, at two offsets of the target
+        // when their path is NEON (the source has an alpha, or no mix) and at one
+        // when it is pixman's general path (an opaque source that mixes).
         let (dxs, sxs, repeat) = match recipe {
             None => (4, 4, REPEAT),
+            // One offset of the target for each of the two places in the source: the
+            // second place at the offset 1 when the path is NEON.
+            Some(r) if r.transform == Transform::Scale => (1, 2, 1),
             Some(r) => (
                 if r.transform == Transform::General {
                     1
@@ -1291,7 +1511,7 @@ pub mod calibration {
                     2
                 },
                 if r.mix == Mix::None { 1 } else { 2 },
-                2,
+                1,
             ),
         };
         // The calls first, then the rows, then the points: each class takes off
@@ -1316,17 +1536,37 @@ pub mod calibration {
                 let (mut least, mut greatest, mut n) = (u64::MAX, 0u64, 0u64);
                 for dx in 0..dxs {
                     for sx in 0..sxs {
-                        // One warm-up, which makes the images pixman keeps.
+                        // One warm-up, which makes the images pixman keeps. A scale is
+                        // made inside its source (the first of the two) and at its edge.
+                        let inside =
+                            recipe.is_some_and(|r| r.transform == Transform::Scale && sx == 0);
+                        // A scale of a NEON path is at the offset 1 of the target at its edge.
+                        let dx = match recipe {
+                            Some(r)
+                                if r.transform == Transform::Scale
+                                    && !(r.mix != Mix::None && r.source == Src::Opaque) =>
+                            {
+                                sx
+                            }
+                            _ => dx,
+                        };
                         for turn in 0..=repeat {
                             let images = &mut px.images;
-                            let ticks = timed(thread, || {
-                                operate(images, which, recipe, fb, (w, h), (dx, sx, false));
-                            });
+                            // An operation a higher level preempted is made again.
+                            let mut ticks = None;
+                            for _ in 0..PREEMPT_RETRIES {
+                                ticks = timed(thread, || {
+                                    operate(images, which, recipe, fb, (w, h), (dx, sx, inside));
+                                });
+                                if ticks.is_some() || turn == 0 {
+                                    break;
+                                }
+                                preempted += 1;
+                            }
                             if turn == 0 {
                                 continue;
                             }
                             let Some(ticks) = ticks else {
-                                preempted += 1;
                                 continue;
                             };
                             least = least.min(ticks);
@@ -1415,7 +1655,7 @@ pub mod calibration {
     /// before the first request is bounded: the watchdog of init kills a service
     /// silent for about 1.3 s, and the three kinds take the first half of that.
     const LAYER_ROW: u32 = 96;
-    const LAYER_REPEAT: u32 = 2;
+    const LAYER_REPEAT: u32 = 1;
     const _: () = assert!(LAYER_TARGET_BYTES <= BYTES);
 
     /// The pixel operations of a band of the calibration: pixman's, on a
@@ -1642,6 +1882,8 @@ pub mod calibration {
         /// Tells a line `service lookup: 17 KIND inside I least L greatest G` for
         /// each and `service lookup: 17 greatest G`.
         pub fn calibrate_lookup(&mut self, fb: &mut [u8]) {
+            /// The runs of a kind: one, the run under -icount being deterministic.
+            const LOOKUP_TURNS: u32 = 1;
             let Ok(thread) = rt::sys::self_thread() else {
                 return;
             };
@@ -1650,9 +1892,13 @@ pub mod calibration {
             let mut greatest = 0u64;
             for (k, r) in RECIPES.iter().enumerate() {
                 for inside in [false, true] {
-                    let shape = (1, 1);
+                    let shape = if r.transform == Transform::Scale {
+                        (4, 4)
+                    } else {
+                        (1, 1)
+                    };
                     let (mut least, mut worst) = (u64::MAX, 0u64);
-                    for turn in 0..3 {
+                    for turn in 0..LOOKUP_TURNS {
                         let images = &mut self.images;
                         // Warm: the call again and again.
                         operate(images, 3, Some(r), fb, shape, (0, 0, inside));
@@ -1661,12 +1907,11 @@ pub mod calibration {
                         }) else {
                             continue;
                         };
-                        // Evicted: nine calls of other keys (the other kinds and
-                        // the plain copy and laying over), then the call.
-                        for (j, other) in RECIPES.iter().enumerate() {
-                            if j != k {
-                                operate(images, 3, Some(other), fb, shape, (0, 0, false));
-                            }
+                        // Evicted: nine calls of other keys (the kinds that follow it),
+                        // then the plain copy and laying over, then the call.
+                        for i in 1..=9 {
+                            let other = &RECIPES[(k + i) % RECIPES.len()];
+                            operate(images, 3, Some(other), fb, shape, (0, 0, false));
                         }
                         operate(images, 1, None, fb, shape, (0, 0, false));
                         operate(images, 2, None, fb, shape, (0, 0, false));
