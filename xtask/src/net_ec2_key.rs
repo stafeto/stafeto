@@ -22,7 +22,7 @@
 //! 1. The boot: the launcher runs `/etc/rc`, which runs `ec2-key`; the script
 //!    prints the line with the key's type and comment, and the fake saw the
 //!    token request and one request for the key with the token.
-//! 2. `/root/.ssh` is `drwx------`, `authorized_keys` is `-rw-------` and holds the
+//! 2. `/home/user/.ssh` is `drwx------`, `authorized_keys` is `-rw-------` and holds the
 //!    key, one line; the token and the key's text did not reach the console.
 //! 3. An IMDSv1 request (no token header) gets 401 and no key.
 //! 4. A stale file is replaced when the script runs again.
@@ -427,29 +427,34 @@ fn steps(run: &mut qemu::Run, fake: &Fake) -> Result<(), String> {
     run.expect("# ", DIALOG_STEP)?;
 
     // 2. The files.
-    let file = capture(run, "cat /root/.ssh/authorized_keys", "k1", DIALOG_STEP)?;
+    let file = capture(
+        run,
+        "cat /home/user/.ssh/authorized_keys",
+        "k1",
+        DIALOG_STEP,
+    )?;
     if file != [KEY] {
         return Err(format!("authorized_keys is {file:?}"));
     }
     let listing = capture(
         run,
-        "ls -ld /root/.ssh /root/.ssh/authorized_keys",
+        "ls -ld /home/user/.ssh /home/user/.ssh/authorized_keys",
         "k2",
         DIALOG_STEP,
     )?;
     let modes = modes_of(&listing);
     if modes
         != [
-            ("drwx------ root".to_owned(), "/root/.ssh".to_owned()),
+            ("drwx------ user".to_owned(), "/home/user/.ssh".to_owned()),
             (
-                "-rw------- root".to_owned(),
-                "/root/.ssh/authorized_keys".to_owned(),
+                "-rw------- user".to_owned(),
+                "/home/user/.ssh/authorized_keys".to_owned(),
             ),
         ]
     {
         return Err(format!("the modes are {listing:?}"));
     }
-    at("/root/.ssh is 700 and authorized_keys is 600 with the key, one line");
+    at("/home/user/.ssh is 700 and authorized_keys is 600 with the key, one line");
 
     // 3. IMDSv1: no token header, no key.
     let before = fake.log().len();
@@ -468,14 +473,26 @@ fn steps(run: &mut qemu::Run, fake: &Fake) -> Result<(), String> {
     at("a request without a token gets 401 and no key");
 
     // 4. A stale file is replaced, the modes are the same.
-    run.send("echo stale > /root/.ssh/authorized_keys; chmod 644 /root/.ssh/authorized_keys")?;
+    run.send(
+        "echo stale > /home/user/.ssh/authorized_keys; chmod 644 /home/user/.ssh/authorized_keys",
+    )?;
     run.expect("# ", DIALOG_STEP)?;
     let again = capture(run, "ash /etc/rc.d/ec2-key", "k3", RUN_SCRIPT)?;
     if again != ["ec2-key: ssh-ed25519 fake-key@xtask"] {
         return Err(format!("the second run said {again:?}"));
     }
-    let file = capture(run, "cat /root/.ssh/authorized_keys", "k4", DIALOG_STEP)?;
-    let listing = capture(run, "ls -l /root/.ssh/authorized_keys", "k5", DIALOG_STEP)?;
+    let file = capture(
+        run,
+        "cat /home/user/.ssh/authorized_keys",
+        "k4",
+        DIALOG_STEP,
+    )?;
+    let listing = capture(
+        run,
+        "ls -l /home/user/.ssh/authorized_keys",
+        "k5",
+        DIALOG_STEP,
+    )?;
     if file != [KEY]
         || !listing
             .first()
@@ -487,7 +504,7 @@ fn steps(run: &mut qemu::Run, fake: &Fake) -> Result<(), String> {
 
     // 5. No key.
     fake.mode(Mode::NoKey)?;
-    run.send("rm -r /root/.ssh")?;
+    run.send("rm -r /home/user/.ssh")?;
     run.expect("# ", DIALOG_STEP)?;
     let none = capture(run, "ash /etc/rc.d/ec2-key", "k6", RUN_SCRIPT)?;
     if none != ["ec2-key: the instance has no key pair, SSH stays off"] {
@@ -496,7 +513,7 @@ fn steps(run: &mut qemu::Run, fake: &Fake) -> Result<(), String> {
     step(
         run,
         "nokey",
-        "[ ! -e /root/.ssh ] && [ ! -e /root/.ssh/authorized_keys ]",
+        "[ ! -e /home/user/.ssh ] && [ ! -e /home/user/.ssh/authorized_keys ]",
         DIALOG_STEP,
     )?;
     at("no key pair: one line, nothing written");
@@ -508,7 +525,7 @@ fn steps(run: &mut qemu::Run, fake: &Fake) -> Result<(), String> {
     if refused != ["ec2-key: the metadata service gave no token (HTTP 403), SSH stays off"] {
         return Err(format!("the run with a refused token said {refused:?}"));
     }
-    step(run, "refused", "[ ! -e /root/.ssh ]", DIALOG_STEP)?;
+    step(run, "refused", "[ ! -e /home/user/.ssh ]", DIALOG_STEP)?;
     let seen = since(&fake.log(), before);
     if seen != ["PUT /latest/api/token ttl=300 -> 403"] {
         return Err(format!("the requests after a refused token: {seen:?}"));
@@ -605,20 +622,40 @@ mod tests {
     #[test]
     fn the_listing_lines_give_mode_owner_and_path() {
         let lines = [
-            "drwx------    2 root     root             0 Nov 16 10:00 /root/.ssh".to_owned(),
-            "-rw-------    1 root     root           100 Nov 16 10:00 /root/.ssh/authorized_keys"
+            "drwx------    2 user     user             0 Nov 16 10:00 /home/user/.ssh".to_owned(),
+            "-rw-------    1 user     user           100 Nov 16 10:00 /home/user/.ssh/authorized_keys"
                 .to_owned(),
         ];
         assert_eq!(
             modes_of(&lines),
             [
-                ("drwx------ root".to_owned(), "/root/.ssh".to_owned()),
+                ("drwx------ user".to_owned(), "/home/user/.ssh".to_owned()),
                 (
-                    "-rw------- root".to_owned(),
-                    "/root/.ssh/authorized_keys".to_owned()
+                    "-rw------- user".to_owned(),
+                    "/home/user/.ssh/authorized_keys".to_owned()
                 ),
             ]
         );
+    }
+
+    /// A passwd file with the account `user` whose home is a directory of `work` (made here), for
+    /// the script on a host: the home, and the environment that makes the script use it.
+    fn account(work: &Path, name: &str, uid: u32) -> (PathBuf, Vec<(&'static str, String)>) {
+        let home = work.join(format!("home-{name}"));
+        std::fs::create_dir_all(&home).unwrap();
+        let passwd = work.join(format!("passwd-{name}"));
+        std::fs::write(
+            &passwd,
+            format!("user:x:{uid}:100:user:{}:/bin/ash\n", home.display()),
+        )
+        .unwrap();
+        (
+            home,
+            vec![
+                ("PASSWD_FILE", passwd.display().to_string()),
+                ("SSH_CHOWN", "true".to_owned()),
+            ],
+        )
     }
 
     /// The script against the fake on the host, with the host's `sh` and `nc`: the
@@ -667,12 +704,13 @@ mod tests {
                 }
                 lines
             });
-            let ssh = work.join(format!("ssh-{}", mode.name()));
+            let (home, env) = account(&work, mode.name(), 1000);
+            let ssh = home.join(".ssh");
             let out = Command::new("sh")
                 .arg(&script)
                 .env("IMDS_HOST", "127.0.0.1")
                 .env("IMDS_PORT", port.to_string())
-                .env("SSH_DIR", &ssh)
+                .envs(env)
                 .output()
                 .unwrap();
             let text = String::from_utf8_lossy(&out.stdout);
@@ -777,7 +815,8 @@ mod tests {
                 }
                 heads
             });
-            let ssh = work.join(format!("ssh-{name}"));
+            let (home, env) = account(&work, name, 1000);
+            let ssh = home.join(".ssh");
             if name == "symlink" {
                 let target = work.join("target");
                 std::fs::create_dir_all(&target).unwrap();
@@ -787,7 +826,7 @@ mod tests {
                 .arg(&script)
                 .env("IMDS_HOST", "127.0.0.1")
                 .env("IMDS_PORT", port.to_string())
-                .env("SSH_DIR", &ssh)
+                .envs(env)
                 .output()
                 .unwrap();
             // Unblocks the server's accept.
@@ -803,6 +842,56 @@ mod tests {
                 .map(|d| d.map(|e| e.unwrap().file_name()).collect())
                 .unwrap_or_default();
             assert!(found.is_empty(), "{name}: wrote {found:?}");
+        }
+    }
+
+    /// An account that is root's, or whose home is not an absolute path, never gets the key:
+    /// the script ends before it asks the metadata service for anything.
+    #[test]
+    fn the_script_refuses_an_account_that_is_root_or_has_no_absolute_home() {
+        let script = crate::root().join("tools/rc/ec2-key");
+        let work = crate::target_dir().join("net-ec2-key-accounts");
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        for (name, line, said) in [
+            (
+                "root",
+                "user:x:0:0:user:/root:/bin/ash\n",
+                "no account user with an identifier of 1000 or more",
+            ),
+            (
+                "low",
+                "user:x:999:100:user:/home/user:/bin/ash\n",
+                "no account user with an identifier of 1000 or more",
+            ),
+            (
+                "relative",
+                "user:x:1000:100:user:home/user:/bin/ash\n",
+                "the home of user is not an absolute path",
+            ),
+            (
+                "dots",
+                "user:x:1000:100:user:/home/../root:/bin/ash\n",
+                "the home of user holds a dot component",
+            ),
+            (
+                "missing",
+                "nobody:x:65534:65534:nobody:/:/bin/ash\n",
+                "no account user",
+            ),
+        ] {
+            let passwd = work.join(format!("passwd-{name}"));
+            std::fs::write(&passwd, line).unwrap();
+            let out = Command::new("sh")
+                .arg(&script)
+                .env("IMDS_HOST", "127.0.0.1")
+                .env("IMDS_PORT", "1")
+                .env("PASSWD_FILE", &passwd)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(text.contains(said), "{name}: {out:?}");
+            assert!(!out.status.success(), "{name}");
         }
     }
 }

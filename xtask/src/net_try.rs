@@ -96,9 +96,7 @@ pub fn key_script() -> &'static [u8] {
     static SCRIPT: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
     SCRIPT.get_or_init(|| {
         let key = KEY.get().map_or(PLACEHOLDER_KEY, String::as_str);
-        let text = format!(
-            "umask 077\nmkdir -p /root/.ssh\nchmod 700 /root/.ssh\necho '{key}' > /root/.ssh/authorized_keys\nchmod 600 /root/.ssh/authorized_keys\necho 'ec2-key: the key of the probe is placed'\n"
-        );
+        let text = crate::net_ssh::key_script_text(key);
         Box::leak(text.into_bytes().into_boxed_slice())
     })
 }
@@ -420,7 +418,7 @@ const PAGE_SAYS: [&str; 17] = [
     "This is an experimental system",
     "Keep no secrets on it",
     "only to your own address",
-    "ssh root@",
+    "ssh user@",
     "key pair you chose when you launched",
     "pkg update",
     "pkg search nginx",
@@ -575,8 +573,10 @@ fn guest(
     command: &str,
     within: Duration,
 ) -> Result<crate::net_ssh::Ended, String> {
-    let mut ssh = client.command("root", Some(key), true);
-    ssh.arg(command);
+    // The key opens `user`; the commands of the run need root (`pkg`, the files of nginx), so
+    // they go through `doas`.
+    let mut ssh = client.command("user", Some(key), true);
+    ssh.arg(format!("doas ash -c '{}'", command.replace('\'', "'\\''")));
     run_for(ssh, b"", within)
 }
 
@@ -772,7 +772,11 @@ fn run_probe(machine: &'static qemu::Machine, persist_only: bool) -> Result<(), 
 
         // 3. The login, the host key, the files of the instance.
         let said = guest(&client, &good, "echo ssh-ok-$((6*7)); id -u", SSH_WITHIN)?;
-        if said.code != Some(0) || !said.text().contains("ssh-ok-42") {
+        // `guest` runs the command as root through `doas` after a login as `user`: the id is 0.
+        if said.code != Some(0)
+            || !said.text().contains("ssh-ok-42")
+            || !said.text().contains("\n0")
+        {
             return Err(format!(
                 "the login with the key gave {:?}: {:?} {:?}",
                 said.code,
@@ -781,6 +785,13 @@ fn run_probe(machine: &'static qemu::Machine, persist_only: bool) -> Result<(), 
             ));
         }
         println!("net-try: the login with the probe key runs a command");
+        let mut ssh = client.command("root", Some(&good), true);
+        ssh.arg("echo root-in");
+        let root = run_for(ssh, b"", SSH_WITHIN)?;
+        if root.code == Some(0) || root.text().contains("root-in") {
+            return Err(format!("root logged in over SSH: {:?}", root.text()));
+        }
+        println!("net-try: a login as root with the probe key is refused");
         let known = Command::new("ssh-keygen")
             .arg("-l")
             .arg("-f")

@@ -1,7 +1,8 @@
 # /etc/rc.d/dropbear: the SSH server, started at each boot after `ec2-key`
-# has written /root/.ssh/authorized_keys. Without that file, or without the
-# program (an image that holds no package dropbear), nothing starts and one
-# line says so.
+# has written the authorized_keys of the account `user`, whose home is the one
+# /etc/passwd names. Without that file, or without the program (an image that
+# holds no package dropbear), nothing starts and one line says so. Root cannot
+# log in over SSH (`-w`): the key opens `user`, and `doas` reaches root from it.
 #
 # The host key is an Ed25519 key. An image with a data volume starts the service `datakey` before
 # this script: it puts the key it kept on the volume into /etc/dropbear, and this script uses that
@@ -20,15 +21,22 @@
 # -k); the build leaves both out as well. The build has no syslog, so the log
 # goes to the standard error, the console.
 
-args="-F -s -j -k"
+args="-F -s -j -k -w"
 key=/etc/dropbear/dropbear_ed25519_host_key
 
 if [ ! -x /bin/dropbear ]; then
     echo "dropbear: no /bin/dropbear in this image, SSH stays off"
     exit 0
 fi
-if [ ! -f /root/.ssh/authorized_keys ]; then
-    echo "dropbear: no /root/.ssh/authorized_keys, SSH stays off"
+home=
+while IFS=: read -r name _ _ _ _ dirname _; do
+    if [ "$name" = user ]; then
+        home=$dirname
+        break
+    fi
+done </etc/passwd
+if [ -z "$home" ] || [ ! -f "$home/.ssh/authorized_keys" ]; then
+    echo "dropbear: no authorized_keys of user, SSH stays off"
     exit 0
 fi
 

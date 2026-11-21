@@ -93,14 +93,14 @@ td { padding: 0.15rem 1rem 0.15rem 0; vertical-align: top; }
 </table>
 
 <h2>Log in</h2>
-<pre>ssh root@@ADDRESS@</pre>
-<p>Use the private key of the key pair you chose when you launched the instance. There is no password login and no other user: you are root.</p>
+<pre>ssh user@@ADDRESS@</pre>
+<p>Use the private key of the key pair you chose when you launched the instance. There is no password login and no login as root: you are the ordinary account <code>user</code>, and <code>doas</code> runs a command as root (<code>doas pkg install htop</code>, or <code>doas -s</code> for a root shell). The home of <code>user</code> is on the data volume when the instance has one, and in memory otherwise.</p>
 
 <h2>What to try</h2>
 <ul>
 <li>Open this page on the three ports: <code>http://@ADDRESS@/</code>, <code>https://@ADDRESS@/</code> and <code>http://@ADDRESS@:8080/</code>.</li>
 <li>From your machine: <code>curl -k https://@ADDRESS@/</code></li>
-<li>In the shell: <code>pkg update</code>, then <code>pkg search nginx</code>, <code>pkg install htop</code> and <code>htop</code>.</li>
+<li>In the shell: <code>doas pkg update</code>, then <code>pkg search nginx</code>, <code>doas pkg install htop</code> and <code>htop</code>.</li>
 <li>Look around: <code>ps</code>, <code>top</code>, <code>cat /proc/meminfo</code>.</li>
 </ul>
 

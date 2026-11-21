@@ -1,5 +1,8 @@
 # /etc/rc.d/ec2-key: at each boot on EC2, the public key of the instance's key
-# pair becomes /root/.ssh/authorized_keys.
+# pair becomes the authorized_keys of the ordinary account `user` (its home is the
+# one /etc/passwd names; the service `datakey` has put the home on the data volume
+# before this script runs, when the image has one). Root has no key: it is reached
+# from `user` with `doas`.
 #
 # The key comes from the instance metadata service (IMDSv2 only): a token
 # from `PUT /latest/api/token`, then `meta-data/public-keys/0/openssh-key`
@@ -11,20 +14,61 @@
 # With one, one line names its type and comment. The key itself and the token
 # are never printed.
 #
-# IMDS_HOST, IMDS_PORT and SSH_DIR are for the checks of the image.
+# The key goes into a temporary file that `set -C` makes (it never writes through a
+# link that is already there), which takes its owner and mode before it is moved into
+# place. A home or a .ssh that is a symbolic link ends the script with nothing written.
+#
+# IMDS_HOST, IMDS_PORT, PASSWD_FILE, SSH_USER, SSH_DIR and SSH_CHOWN are for the checks of the image.
 
 # No file name expansion anywhere: the words of a reply never become patterns.
 set -f
 
 host=${IMDS_HOST:-169.254.169.254}
 port=${IMDS_PORT:-80}
-dir=${SSH_DIR:-/root/.ssh}
+account=${SSH_USER:-user}
+passwd=${PASSWD_FILE:-/etc/passwd}
+chown=${SSH_CHOWN:-chown}
 nl='
 '
 
 say() {
     echo "ec2-key: $*"
 }
+
+# The account: its numbers and its home from the passwd file.
+uid= gid= home=
+while IFS=: read -r name _ id group _ dirname _; do
+    if [ "$name" = "$account" ]; then
+        uid=$id gid=$group home=$dirname
+        break
+    fi
+done <"$passwd"
+case $uid in
+    '' | *[!0-9]* | [0-9] | [0-9][0-9] | [0-9][0-9][0-9])
+        say "no account $account with an identifier of 1000 or more, SSH stays off"
+        exit 1
+        ;;
+esac
+case $gid in
+    '' | *[!0-9]*)
+        say "the group of $account is not a number, SSH stays off"
+        exit 1
+        ;;
+esac
+case $home in
+    /?* | /) ;;
+    *)
+        say "the home of $account is not an absolute path, SSH stays off"
+        exit 1
+        ;;
+esac
+case /$home/ in
+    */../* | */./*)
+        say "the home of $account holds a dot component, SSH stays off"
+        exit 1
+        ;;
+esac
+dir=${SSH_DIR:-$home/.ssh}
 
 # imds METHOD PATH [HEADER]: sets `status` (empty when nothing answered, 000 when the status line is not three digits) and
 # `body` from one request.
@@ -111,14 +155,27 @@ if [ -z "$key" ]; then
 fi
 
 umask 077
-if [ -L "$dir" ]; then
-    say "$dir is a symbolic link, SSH stays off"
+if [ -L "$home" ] || [ -L "$dir" ]; then
+    say "$home or $dir is a symbolic link, SSH stays off"
     exit 1
 fi
+# A home that is not there yet (an image with no data volume, at each boot) is made empty.
+if [ ! -d "$home" ]; then
+    mkdir -p "$home" || exit 1
+    $chown "$uid:$gid" "$home" || exit 1
+    chmod 700 "$home"
+    say "$home is made empty: it is in memory and is lost at a reboot"
+fi
 mkdir -p "$dir" || exit 1
+$chown "$uid:$gid" "$dir" || exit 1
 chmod 700 "$dir"
 tmp=$dir/.authorized_keys.$$
-printf '%s\n' "$key" >"$tmp" || exit 1
+rm -f "$tmp"
+(
+    set -C
+    printf '%s\n' "$key" >"$tmp"
+) || exit 1
+$chown "$uid:$gid" "$tmp" || exit 1
 chmod 600 "$tmp"
 mv -f "$tmp" "$dir/authorized_keys" || exit 1
 
