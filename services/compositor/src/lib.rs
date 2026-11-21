@@ -197,8 +197,8 @@ const fn price(
 /// (the run is deterministic). Every entry is a measure. The rows from
 /// `fast-nearest-copy` on are the fast class (`elements::Class::FastNearestCopy`):
 /// a scale by a fraction with no turn and no reflection, whose paths pixman
-/// has apart from its general path; their miss is the one of the general kinds
-/// until the calibration (`px::calibration`, `calibrate_lookup`) tells each kind's own.
+/// has apart from its general path; each has the miss
+/// the calibration of the lookup measured for its kind (`measures::LOOKUPS`).
 pub const PRICES: [Price; 24] = [
     price("black", 209, 2_400, false, 38, false, LOOKUP_MISS_MEASURED),
     price("copy", 780, 5_480, false, 138, false, LOOKUP_MISS_MEASURED),
@@ -275,15 +275,7 @@ pub const PRICES: [Price; 24] = [
         false,
         LOOKUP_MISS_MEASURED,
     ),
-    price(
-        "fast-nearest-copy",
-        2_673,
-        2_012,
-        false,
-        600,
-        false,
-        LOOKUP_MISS_MEASURED,
-    ),
+    price("fast-nearest-copy", 2_673, 2_012, false, 600, false, 3346),
     price(
         "fast-nearest-over",
         2_673,
@@ -291,7 +283,7 @@ pub const PRICES: [Price; 24] = [
         false,
         1_012,
         false,
-        LOOKUP_MISS_MEASURED,
+        1432,
     ),
     price(
         "fast-bilinear-copy",
@@ -300,7 +292,7 @@ pub const PRICES: [Price; 24] = [
         false,
         1_374,
         false,
-        LOOKUP_MISS_MEASURED,
+        1815,
     ),
     price(
         "fast-bilinear-over",
@@ -309,7 +301,7 @@ pub const PRICES: [Price; 24] = [
         false,
         2_142,
         false,
-        LOOKUP_MISS_MEASURED,
+        2338,
     ),
     price(
         "fast-nearest-alpha",
@@ -318,7 +310,7 @@ pub const PRICES: [Price; 24] = [
         false,
         3_268,
         false,
-        LOOKUP_MISS_MEASURED,
+        4279,
     ),
     price(
         "fast-bilinear-alpha",
@@ -327,7 +319,7 @@ pub const PRICES: [Price; 24] = [
         false,
         7_007,
         false,
-        LOOKUP_MISS_MEASURED,
+        4141,
     ),
     price(
         "fast-nearest-mask",
@@ -336,7 +328,7 @@ pub const PRICES: [Price; 24] = [
         false,
         3_737,
         false,
-        LOOKUP_MISS_MEASURED,
+        4316,
     ),
     price(
         "fast-bilinear-mask",
@@ -345,7 +337,7 @@ pub const PRICES: [Price; 24] = [
         false,
         3_999,
         false,
-        LOOKUP_MISS_MEASURED,
+        2566,
     ),
     price(
         "fast-bilinear-mask-alpha",
@@ -354,7 +346,7 @@ pub const PRICES: [Price; 24] = [
         false,
         4_120,
         false,
-        LOOKUP_MISS_MEASURED,
+        3166,
     ),
     price(
         "fast-nearest-alpha-opaque",
@@ -363,7 +355,7 @@ pub const PRICES: [Price; 24] = [
         false,
         3_370,
         false,
-        LOOKUP_MISS_MEASURED,
+        4071,
     ),
     price(
         "fast-bilinear-alpha-opaque",
@@ -372,7 +364,7 @@ pub const PRICES: [Price; 24] = [
         false,
         8_770,
         false,
-        LOOKUP_MISS_MEASURED,
+        4074,
     ),
     price(
         "fast-nearest-mask-opaque",
@@ -381,7 +373,7 @@ pub const PRICES: [Price; 24] = [
         false,
         3_837,
         false,
-        LOOKUP_MISS_MEASURED,
+        4078,
     ),
     price(
         "fast-bilinear-mask-opaque",
@@ -390,7 +382,7 @@ pub const PRICES: [Price; 24] = [
         false,
         9_237,
         false,
-        LOOKUP_MISS_MEASURED,
+        3961,
     ),
 ];
 /// What every layer costs a band beyond its operation (ticks, for each window
@@ -4662,6 +4654,31 @@ mod tests {
             );
         }
         assert_eq!(LOOKUP_MISS, with_margin(LOOKUP_MISS_MEASURED));
+        // Every row's miss covers its kind's measure with the margin, and the
+        // general miss covers every general kind's; a kind with no measure keeps
+        // the general one.
+        for p in PRICES {
+            assert!(
+                p.miss >= LOOKUP_MISS || p.kind.starts_with("fast-"),
+                "{}",
+                p.kind
+            );
+        }
+        for (kind, greatest) in measures::LOOKUPS {
+            let p = PRICES
+                .iter()
+                .find(|p| p.kind == kind)
+                .expect("a priced kind");
+            assert_eq!(p.miss_measured, greatest, "{kind}");
+            assert!(p.miss >= with_margin(greatest), "{kind}");
+        }
+        for p in PRICES.iter().filter(|p| p.kind.starts_with("fast-")) {
+            assert!(
+                measures::LOOKUPS.iter().any(|(k, _)| *k == p.kind),
+                "{}",
+                p.kind
+            );
+        }
         // The margin of nothing would leave a measure above the constant.
         assert!(with_margin(190) > 190);
     }

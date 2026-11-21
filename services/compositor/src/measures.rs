@@ -406,3 +406,22 @@ pub const SHAPES: [(&str, u32, u32, u64); 395] = [
     ("fast-bilinear-mask-opaque", 150, 8, 120010),
     ("fast-bilinear-mask-opaque", 152, 8, 120666),
 ];
+
+/// The greatest ticks a call of a fast kind pays when pixman's cache of paths has lost its key
+/// (the line `service lookup: 17 KIND inside I least L greatest G`, the greater of the two
+/// variants of the flags), under -icount.
+pub const LOOKUPS: [(&str, u32); 13] = [
+    ("fast-nearest-copy", 3346),
+    ("fast-nearest-over", 1432),
+    ("fast-bilinear-copy", 1815),
+    ("fast-bilinear-over", 2338),
+    ("fast-nearest-alpha", 4279),
+    ("fast-bilinear-alpha", 4141),
+    ("fast-nearest-mask", 4316),
+    ("fast-bilinear-mask", 2566),
+    ("fast-bilinear-mask-alpha", 3166),
+    ("fast-nearest-alpha-opaque", 4071),
+    ("fast-bilinear-alpha-opaque", 4074),
+    ("fast-nearest-mask-opaque", 4078),
+    ("fast-bilinear-mask-opaque", 3961),
+];
