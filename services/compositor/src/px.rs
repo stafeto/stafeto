@@ -570,7 +570,8 @@ pub mod stack {
     const PATTERN: u64 = 0xA5A5_A5A5_A5A5_A5A5;
     /// The bytes painted, below the entry of the program: less than its stack, so
     /// that the guard below it is not touched.
-    pub const PAINTED: usize = 112 * 1024;
+    pub const PAINTED: usize = compositor::STACK_BYTES - 16 * 1024;
+    const _: () = assert!(PAINTED + 16 * 1024 <= compositor::STACK_BYTES);
     const WORDS_A_STEP: usize = 128;
 
     static TOP: AtomicUsize = AtomicUsize::new(0);

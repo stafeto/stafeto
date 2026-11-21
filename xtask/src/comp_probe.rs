@@ -1893,6 +1893,11 @@ mod tests {
     }
 
     #[test]
+    fn the_stack_of_the_images_is_the_one_the_service_paints_in_its_steps_build() {
+        assert_eq!(COMP_STACK_SIZE as usize, compositor::STACK_BYTES);
+    }
+
+    #[test]
     fn the_late_opening_is_judged_by_its_longest_steps() {
         assert_eq!(late_verdict(&late_lines(7_000, 9_000)), Ok((7_000, 9_000)));
         assert!(late_verdict(&late_lines(PORTION_MAX + 1, 9_000)).is_err());

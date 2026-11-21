@@ -759,17 +759,42 @@ fn a_scene_of_dear_elements_is_taken_and_drawn_in_groups_as_the_reference_has_it
     }
 }
 
+/// The dearest element over the whole screen: a bilinear stretch with a mask and an
+/// alpha, the mask a window of the screen's size (four sources, four masks).
+fn dear_full(rig: &Rig, k: usize) -> Element {
+    let mut e = rig.whole(k % 4, [0, 0, 640, 400]);
+    e.filter = BILINEAR;
+    e.transparency = TRANSPARENCY_MASK | TRANSPARENCY_ALPHA;
+    e.mask = rig.id(4 + k % 4);
+    e.alpha = 100 + 5 * k as u32;
+    e
+}
+
 #[test]
-fn eight_of_the_dearest_are_taken_and_every_step_costs_under_the_gate_by_the_model() {
-    let mut rig = dear_rig();
-    let els: Vec<Element> = (0..8).map(|k| dear(&rig, k, (0, 0))).collect();
+fn sixteen_of_the_dearest_over_the_screen_make_steps_under_the_gate_by_the_model() {
+    let mut specs = vec![(XRGB, 64, 40); 4];
+    specs.extend(vec![(A8, 640, 400); 4]);
+    let mut rig = Rig::new(&specs);
+    let els: Vec<Element> = (0..MAX_ELEMENTS).map(|k| dear_full(&rig, k)).collect();
+    assert_eq!(els.len(), 16);
+    rig.scene.pointer_to(0, 0);
     rig.scene
         .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &els).unwrap())
         .unwrap();
-    let d = rig.scene.begin().expect("a frame");
-    let (mut steps, mut worst) = (0, 0);
+    rig.scene.begin().expect("a frame");
+    // The smallest place of a frame, one point, where every element lies over the
+    // others, the pointer's picture on them and the black under them: every step of
+    // it, the black's included, is under the gate by the model with the 1 080
+    // ticks a step spends around the band.
+    let d = Rect {
+        x: 0,
+        y: 0,
+        w: 1,
+        h: 1,
+    };
     let mut at = Band::default();
     let mut fb = vec![0u8; (STRIDE * HEIGHT) as usize];
+    let (mut steps, mut worst) = (0, 0);
     while at.row < d.y + d.h {
         let mut model = StepCost {
             elements: els.len() as u32,
@@ -780,17 +805,12 @@ fn eight_of_the_dearest_are_taken_and_every_step_costs_under_the_gate_by_the_mod
         steps += 1;
     }
     rig.scene.end(true);
-    // A layer dearer than the half of a band is a group alone (the bilinear
-    // stretch with a mask and an alpha: 10 000 ticks of calls): with the terms of
-    // 16 elements its step is over BAND_TICKS by the model, and under the gate
-    // with the 1 080 ticks a step spends around the band.
     assert!(
         worst <= u64::from(BAND_GATE - 1_080),
         "a step costs {worst} by the model"
     );
-    // A dear scene stretches over many steps: the cap of a period (47 bands)
-    // spreads it over periods.
-    assert!(steps > 47, "{steps} steps");
+    // One step for each element, the black's apart, and the pointer's.
+    assert_eq!(steps, 18, "{steps} steps, worst {worst}");
 }
 
 #[test]
@@ -901,35 +921,4 @@ impl Raster for StepCost {
             (None, None) => self.add(if t != 0 { OVER } else { OPAQUE }, area),
         }
     }
-}
-
-#[test]
-fn one_layer_that_misses_pixmans_cache_fits_a_step_by_the_model() {
-    // The dearest layer (a bilinear stretch with a mask and an alpha) alone, with
-    // the miss of the path, the fixed term of a band, the black and the term of
-    // the element: the smallest step (one point) is under the gate by the model.
-    let mut rig = dear_rig();
-    let e = dear(&rig, 0, (0, 0));
-    rig.scene
-        .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, BG, &[e]).unwrap())
-        .unwrap();
-    rig.scene.begin().unwrap();
-    let d = Rect {
-        x: 0,
-        y: 0,
-        w: 1,
-        h: 1,
-    };
-    let def = rig.scene.working().copied().unwrap();
-    let plan = rig.scene.passes(&def, d);
-    let (calls, row, point) = plan.cost[0];
-    let ticks = u64::from(calls)
-        + u64::from(BAND_FIXED)
-        + u64::from(ELEMENT_TERM)
-        + (u64::from(row) + u64::from(point)).div_ceil(100);
-    assert!(
-        ticks <= u64::from(BAND_GATE - 1_080),
-        "one layer costs {ticks} by the model"
-    );
-    assert!(calls >= PRICES[elements::Class::ScaleBilinearOver.row()].call + LOOKUP_MISS);
 }

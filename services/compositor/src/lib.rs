@@ -43,6 +43,10 @@ mod element_tests;
 pub mod elements;
 pub mod fit;
 pub mod frame;
+
+/// The stack of the service in the images (`COMP_STACK_SIZE` of xtask, which a test
+/// holds to this): the steps build paints the part of it that `px::stack` scans.
+pub const STACK_BYTES: usize = 128 * 1024;
 #[cfg(test)]
 mod measures;
 
@@ -2147,9 +2151,10 @@ impl Scene {
             .drawn_pointer()
             .is_some_and(|p| touches(Scene::cursor_rect(p)))
         {
-            at = plan.place(at, OVER.call + LAYER);
+            // Under a scene the picture's path may miss the cache too.
+            at = plan.place(at, OVER.call + LAYER + LOOKUP_MISS);
             plan.pointer = at as u8;
-            plan.add_to(at, OVER, LAYER);
+            plan.add_to(at, OVER, LAYER + LOOKUP_MISS);
         }
         plan
     }
@@ -2193,7 +2198,7 @@ impl Passes {
     /// The group a layer of `calls` ticks goes to, the layers before it being
     /// in groups up to `at`: the same one when it fits, the next when not.
     fn place(&mut self, at: usize, calls: u32) -> usize {
-        if self.cost[at].0 + calls > GROUP_CALLS && self.cost[at].0 > FILL.call {
+        if self.cost[at].0 + calls > GROUP_CALLS && self.cost[at].0 > 0 {
             self.groups = at + 2;
             at + 1
         } else {
@@ -2726,7 +2731,15 @@ fn compose_elements(
     };
     let groups = passes.groups.max(1);
     // This step's group: the first from `pass` that has something.
-    let Some(this) = (pass..groups).find(|&g| has_work(g)) else {
+    // The black of a band no element covers whole is made in the first step of
+    // its place, the group 0 (where it is priced), whether the group has an
+    // element or not: a first element too dear to share a step with it is a group
+    // of its own after it.
+    let black_now = pass == 0 && base.is_none();
+    let Some(this) = black_now
+        .then_some(0)
+        .or_else(|| (pass..groups).find(|&g| has_work(g)))
+    else {
         return (pass, None);
     };
     for (k, e) in els.iter().enumerate() {
