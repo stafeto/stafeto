@@ -15,25 +15,38 @@ the specification (chapters 2 to 8 and 10) and the headers `wfc.h` and
   committed scene, the last error. No setter or getter makes a system call.
 * Calls that reach the service (`commit`, `activate`, `deactivate`,
   `compose`, and `destroy_context` of an active context) take a
-  `&mut impl Service`. `Service` has three methods: `scene_commit(&SceneCommit)`,
-  `scene_compose(flags)` and `wait(bit)`; each returns `Result<(), Status>`
-  with `proto_wire::Status`. The host tests use a fake service that records
-  the messages and plays back chosen refusals.
+  `&mut impl Service`. `Service` has these methods, each returning
+  `Result<(), Status>` with `proto_wire::Status` (the claims return `bool`):
+  `scene_commit(&SceneCommit)`, `scene_compose(flags)`, `wait(bit)` (block
+  until the bit of the scene's channel is set), `clear(bit)` (forget a bit that
+  is set), `pause()` (block until the service may have moved on, at most one
+  frame) and `claim_screen()` and `release_screen()` (one context per screen
+  for the whole service session, spec 5.2). The host tests use a fake service
+  that records the messages and plays back chosen refusals.
+* Several devices may exist (spec 4.3: devices of one id are supported, each
+  with its own state). Each `Wfc` is a device. Handles come from one process-wide
+  atomic counter, so a handle of another device is simply unknown to this one
+  and is BAD_HANDLE. The second device's context on the taken screen is IN_USE
+  because the claim is the service's.
+* Thread safety (spec 2.13) is the C layer's: it holds one lock around every
+  call that takes a `Wfc` and its `Service`. Without it another thread could
+  take the bit a `wait` is for.
 * Calls that need the size and format of a stream (`create_source_from_stream`,
   `create_mask_from_stream`) take the answer of the layer above as an
   `Option<StreamInfo>` (width, height, format of the window; `None` is a
   window that does not exist). The layer above looks it up from LIST. The
   library keeps the size from creation on (spec 2.8.1: the dimensions and the
   format of a stream never change), so commit needs no lookup.
-* Handles are `u32` from one counter, 0 is `WFC_INVALID_HANDLE`, so handles
-  of distinct objects differ (spec 2.6). Only one device exists per `Wfc`.
+* Handles are `u32`, 0 is `WFC_INVALID_HANDLE`, and handles of distinct
+  objects differ (spec 2.6), also across devices.
 * Numbers of `<WF/wfc.h>` are in `consts`, under the header's names without
   the prefix `WFC_`.
 * Public pure functions (the host reference shares them): `to_fixed(f32) ->
   i32` (16.16, round to nearest, saturating), `to_alpha(f32) -> u32` (0 to
   255, round to nearest, clamped), `rect_to_fixed([f32; 4]) -> [i32; 4]`,
   `fold(rotation, flip, ctx_rotation) -> (rotation, mirror)` and
-  `fold_rect(rect, ctx_rotation, target) -> rect`.
+  `fold_rect(rect, ctx_rotation, target) -> rect`. The crate depends on
+  `proto-comp`, `proto-wire` and `abi`.
 
 ## 2. State
 
@@ -67,21 +80,21 @@ changes nothing (spec 2.11, 5.6, 7.4).
 
 | Function | State | Errors and results | Spec | Row |
 |---|---|---|---|---|
-| `wfcEnumerateDevices` | none | the filter list is pairs ending with NONE; an attribute other than SCREEN_NUMBER, a value that is no screen of the device (0 and 1 are), a repeated SCREEN_NUMBER: empty list, 0; null buffer returns the count (1); negative count writes nothing and returns 0 | 4.2, 4.2.1 | P3.1 |
-| `wfcCreateDevice` | creates the device | id 0 or 1; another id, or a non-empty attribute list: handle 0, no error stored (no device yet) | 4.3 | P3.1 |
+| `wfcEnumerateDevices` | none | the filter list is pairs ending with NONE; an attribute other than SCREEN_NUMBER, a value other than 0 (`WFC_DEFAULT_SCREEN_NUMBER`), a repeated SCREEN_NUMBER: empty list, 0; null buffer returns the count (1); negative count writes nothing and returns 0 | 4.2, 4.2.1 | P3.1 |
+| `wfcCreateDevice` | creates a device | id 0 or 1; another id, or a non-empty attribute list: handle 0, no error stored (no device yet). Creating it again gives a second device with its own state | 4.3 | P3.1 |
 | `wfcGetError` | reads and clears the error | invalid device: BAD_DEVICE; else the oldest error since the last call, then NONE | 2.11 | P5.4 |
 | `wfcGetDeviceAttribi` | none | CLASS gives FULLY_CAPABLE, ID gives 1; another attribute: BAD_ATTRIBUTE | 4.1, 4.4 | P3.1 |
-| `wfcDestroyDevice` | drops all state | invalid device: BAD_DEVICE; else NONE; every handle becomes invalid; an active context is deactivated through the service first | 4.5 | P3.1 |
-| `wfcGetStrings` | none | invalid device: 0, buffer untouched; name not VENDOR, RENDERER, VERSION, EXTENSIONS, or negative count: ILLEGAL_ARGUMENT, 0; "stafeto", "stafeto-compositor", "1.0", one extension `WFC_STAFETO_stream` | 10.3.2 | P3.1, P5.2 |
+| `wfcDestroyDevice` | drops all state | invalid device: BAD_DEVICE; else NONE; every handle becomes invalid; the context is closed as `wfcDestroyContext` does (see 3.2) | 4.5 | P3.1 |
+| `wfcGetStrings` | none | invalid device: 0, buffer untouched; name not VENDOR, RENDERER, VERSION, EXTENSIONS, or negative count: ILLEGAL_ARGUMENT, 0; "stafeto", "stafeto-compositor", "1.0", one extension `WFC_STAFETO_stream` (its function is `wfcNextStreamSTAFETO`, named by spec 10.1) | 10.1, 10.3.2 | P3.1, P5.2 |
 | `wfcIsExtensionSupported` | none | TRUE for `WFC_STAFETO_stream` only; invalid device FALSE | 10.3.2 | P5.2 |
 
 ### 3.2 Context
 
 | Function | State | Errors and results | Spec | Row |
 |---|---|---|---|---|
-| `wfcCreateOnScreenContext` | creates the context | screen 0 (default) or 1, else UNSUPPORTED; a second context while one lives: IN_USE; non-empty attribute list: BAD_ATTRIBUTE; the creation result on error is 0 | 5.2 | P3.1, R-limits |
-| `wfcCreateOffScreenContext` | none | BAD_HANDLE for no device (as always); UNSUPPORTED (no off-screen target in this release), result 0 | 5.3 | P3.2 |
-| `wfcDestroyContext` | drops the context, its elements, sources, masks and order | BAD_HANDLE; an active context is deactivated through the service (see 4); the committed scene stays on the screen (spec 8.2, footnote 15) | 5.7 | P3.1 |
+| `wfcCreateOnScreenContext` | creates the context | screen 0 (the default) only, else UNSUPPORTED; the screen already claimed (by this device or another): IN_USE; non-empty attribute list: BAD_ATTRIBUTE; the creation result on error is 0 | 5.2 | P3.1, R-limits |
+| `wfcCreateOffScreenContext` | none | UNSUPPORTED (no off-screen target in this release), result 0; see decision 10 | 5.3 | P3.2 |
+| `wfcDestroyContext` | drops the context, its elements, sources, masks and order, and releases the screen | BAD_HANDLE; the pending composition completes first (`wait(COMPOSED)` when `compose_pending`); an active context is deactivated through the service; the committed scene stays on the screen (spec 8.2, footnote 15). Limit: the service answers the deactivation at once and finishes a frame in progress by itself, so the call does not wait for that frame. On a lost device the state is dropped with no message and no error | 5.7, 4.5 | P3.1 |
 | `wfcGetContextAttribi` | none | TYPE gives ON_SCREEN, TARGET_WIDTH, TARGET_HEIGHT, LOWEST_ELEMENT (the bottom handle of the pending order, 0 for an empty scene), ROTATION (the enum), BG_COLOR (packed 0xRRGGBBAA, each channel `to_alpha`); BAD_HANDLE; BAD_ATTRIBUTE for others | 5.1, 5.5 | P3.1 |
 | `wfcGetContextAttribfv` | none | only BG_COLOR allows it: count 4, else ILLEGAL_ARGUMENT; the others: BAD_ATTRIBUTE; null buffer ILLEGAL_ARGUMENT; the values come back exactly as set (spec 2.12) | 5.5 | P3.1 |
 | `wfcSetContextAttribi` | pending rotation or background | TYPE, TARGET_*, LOWEST_ELEMENT read-only: BAD_ATTRIBUTE; ROTATION must be one of the four enums, else ILLEGAL_ARGUMENT; BG_COLOR is 0xRRGGBBAA, each channel over 255, alpha must be 255 for an on-screen context, else ILLEGAL_ARGUMENT | 5.1.4, 5.1.5, 5.6 | P3.1 |
@@ -92,7 +105,7 @@ changes nothing (spec 2.11, 5.6, 7.4).
 
 | Function | State | Errors and results | Spec | Row |
 |---|---|---|---|---|
-| `wfcCreateSourceFromStream` | new source | BAD_HANDLE (context); non-empty attribute list BAD_ATTRIBUTE; stream `None` (no such window): ILLEGAL_ARGUMENT; format A8: UNSUPPORTED (an A8 window is a mask only); 8 live or pending-release sources: OUT_OF_MEMORY; result 0 on error. BUSY and IN_USE cannot arise (no off-screen target, no other context) | 6.1.1 | P3.1, P3.2, R-limits |
+| `wfcCreateSourceFromStream` | new source | BAD_HANDLE (context); non-empty attribute list BAD_ATTRIBUTE; stream `None` (no such window): ILLEGAL_ARGUMENT; format A8: UNSUPPORTED (an A8 window is a mask only); 8 live or pending-release sources: OUT_OF_MEMORY; a lost device: BAD_DEVICE; result 0 on error. BUSY and IN_USE cannot arise (no off-screen target, no other context) | 6.1.1 | P3.1, P3.2, R-limits |
 | `wfcDestroySource` | marks dead | BAD_HANDLE; slot freed when no element refers to it | 6.1.2 | P3.1 |
 | `wfcCreateMaskFromStream` | new mask | as above; format other than A8: UNSUPPORTED | 6.2.1 | P3.1, P5.2 |
 | `wfcDestroyMask` | marks dead | BAD_HANDLE | 6.2.2 | P3.1 |
@@ -122,8 +135,8 @@ changes nothing (spec 2.11, 5.6, 7.4).
 |---|---|---|---|---|
 | `wfcActivate` | `active` | BAD_HANDLE; already active: no effect and no message; else one SCENE_COMMIT of the last committed scene with ACTIVE; success sets `active`. It does not wait for a commit and does not read the pending state | 8.1 | P5.4, R-activity |
 | `wfcDeactivate` | `active` | BAD_HANDLE; already inactive: no effect; else the same scene without ACTIVE | 8.2 | P5.4, R-activity |
-| `wfcCompose` | `compose_pending` | BAD_HANDLE; active context: UNSUPPORTED (checked here, and also the service's answer is translated); else SCENE_COMPOSE with COMPOSED asked; with `wait` the bit COMPOSED; BUSY when `wait` is false and the service says so | 8.3 | P5.3, P5.4, R-activity |
-| `wfcFence` | none | BAD_HANDLE; then UNSUPPORTED (no EGL until G8) | 9 | P3.2 |
+| `wfcCompose` | `compose_pending` | BAD_HANDLE; active context: UNSUPPORTED (checked here, and also the service's answer is translated); else SCENE_COMPOSE with COMPOSED asked; BUSY when `wait` is false and the service says so; with `wait` see 4.3 | 8.3 | P5.3, P5.4, R-activity |
+| `wfcFence` | none | BAD_HANDLE; then ILLEGAL_ARGUMENT: spec 9 lists no UNSUPPORTED, and with no EGL there is no valid display or sync object to pass | 9 | P3.2 |
 
 ## 4. Commit and the translation of refusals
 
@@ -139,27 +152,38 @@ changes nothing (spec 2.11, 5.6, 7.4).
    transparency pattern outside the allowed list never reaches commit because
    the setter refused it (R-transparency).
 3. Build the record, bottom up, one `proto_comp::Element` per element of the
-   scene that draws something. An element is left out when its destination
-   rectangle or source rectangle has a zero side or when it has no source
+   scene that draws something (the order is: the float consistency check of
+   step 2, then the rounding, then the trim, then the dropping). An element is
+   left out when its destination rectangle or its source rectangle (in 16.16
+   after the trim) has a zero side or when it has no source
    (spec 7.1.1, 7.1.2, 7.1.3: such an element does not affect the result;
    the service refuses a zero source side). A zero global alpha with the alpha
    bit stays in the record and the service draws nothing for it.
    * `source`: the window id, `mask`: the window id of the mask when the MASK bit is on and a mask
      is set, else `NO_WINDOW`. A MASK bit with no mask set is cleared in the record (spec 7.1.9: no masking
      is the same as a mask of ones).
-   * source rectangle: `rect_to_fixed`, then the width and height are
-     reduced by what the rounding added past the window's edge, so a rectangle
-     that the float check accepted is also inside in 16.16.
+   * source rectangle: `rect_to_fixed`; then the width and height are
+     trimmed to the window's edge in 16.16 (floor 0), so a rectangle that the
+     float check accepted is also inside in 16.16; only then the element is
+     dropped if a side is zero in 16.16 (`sw` of 1e-6 rounds to 0, and the
+     trim can bring a side to 0).
    * `orient` and the destination: the context rotation is folded in (see 5).
    * `filter`: NONE and FASTER give NEAREST, BETTER gives BILINEAR.
    * `transparency`: the bits as they are (the record uses the `WFC_TRANSPARENCY_*` bits);
      `alpha`: `to_alpha(global alpha)`.
    * `bg`: the context colour, each channel `to_alpha`, premultiplied by the alpha (always 255 on-screen).
    * `flags`: ACTIVE if the context is active, ASK_COMMITTED if `wait`.
-4. `Service::scene_commit`. On success the record (without ASK_COMMITTED)
+4. With `wait`, `Service::clear(COMMITTED_BIT)` first, then `Service::scene_commit`
+   (a BUSY answer with `wait` is waited out as in 4.3). On success the record (without ASK_COMMITTED)
    becomes `committed`; on refusal it stays as it was and the pending state is
    untouched.
 5. With `wait`, `Service::wait(COMMITTED_BIT)`.
+
+`wfcCommit` never answers BUSY: the service replaces its pending scene at
+once, and the specification allows that (5.4 lets a commit fail with BUSY
+only when `wait` is false and the context is not ready). Waiting for COMMITTED
+under `wait` is stricter than the specification asks (5.4 says completion
+means the context accepts a new commit); it is the one bit the service gives.
 
 ### 4.2 Refusals
 
@@ -173,13 +197,30 @@ changes nothing (spec 2.11, 5.6, 7.4).
 | INVALID, BAD_SIZE, BAD_VERSION, UNKNOWN_METHOD, anything else | WFC_ERROR_ILLEGAL_ARGUMENT for INVALID and BAD_SIZE; BAD_DEVICE for BAD_VERSION and UNKNOWN_METHOD; see question 3 in section 6 |
 
 A lost device answers BAD_DEVICE from every function that would call the
-service (`commit`, `activate`, `deactivate`, `compose`, `fence`) without
-calling it. Plain setters and getters keep working on the cached state (see
-question 2).
+service (`commit`, `activate`, `deactivate`, `compose`), from
+`create_source_from_stream`, `create_mask_from_stream` and from the check the
+extension `wfcNextStreamSTAFETO` makes (`Wfc::stream_allowed`), without
+calling the service. Plain setters and getters keep working on the cached
+state. `destroy_context` and `destroy_device` on a lost device drop the state
+silently.
 
-A BUSY answer to `compose` with `wait` is waited out: `Service::wait(COMPOSED_BIT)` for the earlier
-frame, then one retry. `compose` always asks for COMPOSED so that a later
-`compose` with `wait` has a bit to wait for.
+Finding on window ids (checked in `services/compositor`): an id is the place
+and a generation that grows (`window_id`, `ID_GENERATION_MAX`), so the id of a
+window that went is never another window's, and a window keeps its size. An
+INVALID from SCENE_COMMIT after the library's own checks therefore cannot be a
+stale id naming a window of another size; it is a bug of the library and stays
+ILLEGAL_ARGUMENT (it is not mapped to INCONSISTENCY).
+
+### 4.3 Waiting
+
+`compose` always asks for COMPOSED. With `wait` true: loop { `clear(COMPOSED)`,
+send; on BUSY `pause()` and again; on another error stop }, so a stale bit of
+an earlier `compose(FALSE)` never counts for this frame and the call does not
+fail with BUSY (spec 8.3). After the service accepts, `wait(COMPOSED)`. With
+`wait` false the first BUSY is the result. `commit` uses the same loop with
+COMMITTED, so a wait that broke off with an error leaves no stale bit either.
+`destroy_context` and `destroy_device` call `wait(COMPOSED)` while a compose
+the library sent has not been waited for (`compose_pending`).
 
 ## 5. Context rotation folded into an element
 
@@ -201,6 +242,16 @@ against an independent point-by-point reference built straight from spec 3
 (`proto_comp::meaning` is the service's reference of the record; the fold is
 the library's step from the API's attributes to that record).
 
+The specification contradicts itself on the flip. The introduction of chapter
+7 says flipping is "performed about the vertical axis running through the
+centre of the source rectangle"; stage 3 of section 3 and section 7.1.4 say
+the image is inverted "top-to-bottom about the horizontal centerline", and the
+Khronos sample implementation flips vertically. The table follows stage 3 and
+7.1.4 (top to bottom, before the rotation). Check from the review: element
+rotation 0, context rotation 90, flip on: source point (1,0) of a 2 by 2
+source goes to (0,1) and (0,0) stays at (0,0); the wrong formula with
+`q = r + c + 2` gives (1,0) at (1,0), so the test tells them apart.
+
 ## 6. Decisions that are mine and need a word from the review
 
 1. **Transparency pattern refused at the setter.** The specification allows
@@ -216,20 +267,24 @@ the library's step from the API's attributes to that record).
    UNKNOWN_METHOD) gives BAD_DEVICE. Neither is listed in P5.4.
 4. **Limits.** 16 elements created (inserted or not), 8 sources and 8 masks.
    P3.1 gives 16 elements in the scene and 8 streams.
-5. **One context.** Creating a second context gives IN_USE (spec 5.2: one per
-   screen). The test "insert with a subordinate from another context" of
-   P8.1 has no second context to use, so it checks the destroyed-context
-   handle (BAD_HANDLE) and the second-context refusal.
+5. **One context per screen.** A second context on the screen, from this
+   device or another, is IN_USE (spec 5.2). The test "insert with a
+   subordinate from another context" of P8.1 uses the element of a second
+   device (BAD_HANDLE) and of a destroyed context.
 6. **SOURCE and MASK values.** A handle that is not a live source (a mask
    handle, a destroyed one, junk) is ILLEGAL_ARGUMENT, because 7.4 gives BAD_HANDLE only for the element.
-7. **Screens.** Screen number 0 (the default) and 1 both name the one
-   screen.
-8. **Consistency checks run on the elements in the scene,** not on every
-   element of the context.
+7. **Screens.** Only 0 (`WFC_DEFAULT_SCREEN_NUMBER`) names the screen.
+8. **Consistency checks run on the elements in the scene** (spec 7.1.3,
+   7.1.9 and 7.5: the scene is the ordered list used for rendering; an element
+   outside it has no effect).
 9. **Destroying an active context** sends a deactivation first, so the
    service stops composing for it; the last image stays on the screen.
-10. **`wfcCreateOffScreenContext` and `wfcFence`** exist in the library and
-    answer UNSUPPORTED, so the C layer has one place for them.
+10. **Off-screen context and fence.** Departure: section 4.1.1 says a
+    fully-capable device can render off-screen and chapter 5 requires several
+    off-screen contexts. The device reports FULLY_CAPABLE but
+    `wfcCreateOffScreenContext` answers UNSUPPORTED (no stream as a target
+    until G8). `wfcFence` answers ILLEGAL_ARGUMENT (see 3.5). Both live in the
+    library so the C layer has one place for them.
 11. **Zero-size elements** are left out of the record (the service refuses a zero source side).
 
 ## 7. Tests (about 85), by clause
@@ -240,13 +295,14 @@ Every test carries its clause in its name or its first comment.
 |---|---|---|
 | device: enumeration filters (empty, screen 0 and 1, bad value, bad attribute, repeated, null buffer, negative count), create (ids 0, 1, other, attribute list), class and id, bad attribute, destroy, strings and extensions | 4.1 to 4.5, 10.3.2 | 14 |
 | error state: starts NONE, oldest kept, cleared by the read, invalid device gives BAD_DEVICE and stores nothing, setters on an invalid device do nothing | 2.11 | 6 |
+| device: second device, its context IN_USE, handles of one device on the other BAD_HANDLE | 4.3, 5.2 | 4 |
 | context: create (screens, second one IN_USE, attributes), off-screen UNSUPPORTED, defaults, read-only attributes, rotation values, background by `i` and `fv` (range, alpha 1, round trip), target size, lowest element, destroy invalidates elements, sources and masks | 5.1 to 5.7 | 14 |
 | sources and masks: creation (no stream, wrong format, limit), destroy while attached, destroy frees the slot after the element goes, wrong-kind handle | 6.1, 6.2 | 8 |
 | elements: defaults of all nine attributes, accessor matrix (BAD_ATTRIBUTE), count and null, rectangle limits, negative sizes, floor conversion, the float round trip, alpha `i` and `f` forms, filter, flip, rotation, transparency patterns (all 8), limit of 16 | 7.1 to 7.4 | 16 |
 | ordering: insert at the bottom, above, re-insert, onto itself, outside-scene subordinate, above and below, remove, destroy removes, lowest element follows | 7.5, 7.6 | 9 |
-| commit: record order bottom up, empty elements left out, source rectangle in 16.16 and the clamp at the edge, mask size mismatch INCONSISTENCY, source outside INCONSISTENCY sends nothing, mask bit cleared without a mask, filter map, alpha, background, wait asks COMMITTED, committed scene kept on refusal, pending kept | 5.4, 7.1 | 12 |
-| fold: four context rotations on corner rectangles (checked against the point-by-point reference), flip with each rotation (8 cases), 16 combinations as one table | 3, 5.1.4, 7.1.4, 7.1.5 | 5 |
-| activation and composition: inactive at creation, activate sends the committed scene, twice no second message, deactivate, compose on active UNSUPPORTED, compose asks COMPOSED, BUSY, wait retry, fence | 8 | 8 |
+| commit: record order bottom up, empty elements left out, source rectangle in 16.16, the clamp at the edge, a zero side after rounding, mask size mismatch INCONSISTENCY, source outside INCONSISTENCY sends nothing, mask bit cleared without a mask, filter map, alpha, background, wait asks COMMITTED, committed scene kept on refusal, pending kept | 5.4, 7.1 | 12 |
+| fold: four context rotations on corner rectangles (checked against the point-by-point reference), flip with each rotation, r = 0 c = 90 flip (1,0) to (0,1), 16 combinations as one table | 3, 5.1.4, 7.1.4, 7.1.5 | 6 |
+| activation and composition: inactive at creation, activate sends the committed scene, twice no second message, deactivate, compose on active UNSUPPORTED, compose asks COMPOSED, BUSY, wait with a stale COMPOSED bit, fence, destroy waits for a pending compose | 8 | 10 |
 | refusals: each service answer to its code (table 4.2), a lost device from each calling function | P5.4 | 8 |
 | pure functions: `to_fixed`, `to_alpha` (ties, range, saturation) | P5.4 | 4 |
 
