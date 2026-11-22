@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The line `service step: T kind K N ticks detail D preempts P` of `rt::service` (`preempts P`
-//! is left out when P is 0) and the judgement of a step against the bound B.
+//! The line `service step: T kind K N ticks detail D preempts P wall W` of `rt::service` (`preempts P`
+//! is left out when P is 0 and no wall is told; `wall W` is told when the clock's part of the
+//! step, W, is longer than N) and the judgement of a step against the bound B.
 //!
 //! The line carries the raw time N of the step, the CPU ticks of the thread in it, and is
 //! printed when the raw time of a kind grows (a step with a shorter raw time and more work does
@@ -40,6 +41,9 @@ pub struct StepLine<'a> {
     pub detail: u64,
     /// The preemptions in the step (0 for a line that has no count).
     pub preempts: u64,
+    /// The step's whole time less its waits, when the line carries it (`wall W`): the figure
+    /// the raw time would have had without the thread's own CPU time. None for a line without it.
+    pub wall: Option<u64>,
 }
 
 impl StepLine<'_> {
@@ -162,6 +166,41 @@ pub fn clean_longest(lines: &[String], tag: &str, kind: usize) -> Option<u64> {
         .max()
 }
 
+/// The longest raw line of each kind of the service `tag`, with the wall time the line carries
+/// when the thread's CPU time was the shorter figure (None: the two were equal): (kind, ticks,
+/// wall, preempts), in the order the kinds came.
+pub fn ran_and_wall(lines: &[String], tag: &str) -> Vec<(usize, u64, Option<u64>, u64)> {
+    let mut out: Vec<(usize, u64, Option<u64>, u64)> = Vec::new();
+    for step in lines
+        .iter()
+        .filter_map(|l| parse_any(l))
+        .filter(|s| s.tag == tag)
+    {
+        let row = (step.kind, step.ticks, step.wall, step.preempts);
+        match out.iter_mut().find(|(k, ..)| *k == step.kind) {
+            Some(old) if old.1 > row.1 => {}
+            Some(old) => *old = row,
+            None => out.push(row),
+        }
+    }
+    out
+}
+
+/// Tells `ran_and_wall` of the service `tag`: for each kind the ticks by the thread's CPU time
+/// beside the wall ticks (the step's whole less its waits), a report line, no verdict.
+pub fn say_ran_and_wall(lines: &[String], tag: &str) {
+    for (kind, ticks, wall, preempts) in ran_and_wall(lines, tag) {
+        match wall {
+            Some(w) => println!(
+                "step cpu and wall: service {tag} kind {kind}: ran {ticks} ticks, wall {w} ticks, preempts {preempts}"
+            ),
+            None => println!(
+                "step cpu and wall: service {tag} kind {kind}: ran {ticks} ticks, wall the same, preempts {preempts}"
+            ),
+        }
+    }
+}
+
 /// The line, when it is a line of a step (with or without the count of preemptions).
 pub fn parse(line: &str) -> Option<StepLine<'_>> {
     parse_word(line, "step:")
@@ -183,7 +222,7 @@ fn parse_any(line: &str) -> Option<StepLine<'_>> {
 
 fn parse_word<'a>(line: &'a str, word: &str) -> Option<StepLine<'a>> {
     let words: Vec<&str> = line.split_whitespace().collect();
-    let (tag, kind, ticks, detail, preempts) = match words.as_slice() {
+    let (tag, kind, ticks, detail, preempts, wall) = match words.as_slice() {
         [
             "service",
             w,
@@ -194,7 +233,7 @@ fn parse_word<'a>(line: &'a str, word: &str) -> Option<StepLine<'a>> {
             "ticks",
             "detail",
             detail,
-        ] if *w == word => (tag, kind, ticks, detail, "0"),
+        ] if *w == word => (tag, kind, ticks, detail, "0", None),
         [
             "service",
             w,
@@ -207,7 +246,22 @@ fn parse_word<'a>(line: &'a str, word: &str) -> Option<StepLine<'a>> {
             detail,
             "preempts",
             preempts,
-        ] if *w == word => (tag, kind, ticks, detail, *preempts),
+        ] if *w == word => (tag, kind, ticks, detail, *preempts, None),
+        [
+            "service",
+            w,
+            tag,
+            "kind",
+            kind,
+            ticks,
+            "ticks",
+            "detail",
+            detail,
+            "preempts",
+            preempts,
+            "wall",
+            wall,
+        ] if *w == word => (tag, kind, ticks, detail, *preempts, Some(*wall)),
         _ => return None,
     };
     Some(StepLine {
@@ -216,6 +270,10 @@ fn parse_word<'a>(line: &'a str, word: &str) -> Option<StepLine<'a>> {
         ticks: ticks.parse().ok()?,
         detail: detail.parse().ok()?,
         preempts: preempts.parse().ok()?,
+        wall: match wall {
+            Some(w) => Some(w.parse().ok()?),
+            None => None,
+        },
     })
 }
 
@@ -385,6 +443,46 @@ mod tests {
             8000,
         );
         assert_eq!(warned.len(), 1);
+    }
+
+    #[test]
+    fn ran_and_wall_keep_the_longest_line_of_each_kind() {
+        let got = ran_and_wall(
+            &lines(&[
+                "service step: 4 kind 14 9000 ticks detail 0",
+                "service step: 4 kind 14 15000 ticks detail 0 preempts 0 wall 19800",
+                "service step: 5 kind 14 99999 ticks detail 0",
+                "service table: 4 kind 15 7000 ticks detail 0 preempts 1",
+            ]),
+            "4",
+        );
+        assert_eq!(got, [(14, 15_000, Some(19_800), 0), (15, 7_000, None, 1)]);
+    }
+
+    #[test]
+    fn the_wall_field_is_optional() {
+        let w =
+            parse("service step: 4 kind 14 15000 ticks detail 0 preempts 0 wall 19800").unwrap();
+        assert_eq!(
+            (w.kind, w.ticks, w.preempts, w.wall),
+            (14, 15_000, 0, Some(19_800))
+        );
+        assert_eq!(
+            parse("service step: 4 kind 14 15000 ticks detail 0")
+                .unwrap()
+                .wall,
+            None
+        );
+        assert_eq!(
+            parse("service step: 4 kind 14 15000 ticks detail 0 preempts 2")
+                .unwrap()
+                .wall,
+            None
+        );
+        assert!(parse("service step: 4 kind 14 15000 ticks detail 0 preempts 0 wall x").is_none());
+        let t =
+            parse_table("service table: 4 kind 14 15000 ticks detail 0 preempts 1 wall 9").unwrap();
+        assert_eq!(t.wall, Some(9));
     }
 
     #[test]

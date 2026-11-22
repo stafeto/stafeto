@@ -672,6 +672,8 @@ mod steps {
         /// had run when the step in progress began.
         own: AtomicU64,
         ran_begin: AtomicU64,
+        /// Whether the read at the start of the step in progress failed.
+        begin_lost: AtomicBool,
         /// The count of preemptions of the loop's thread when the step in progress began.
         preempt_begin: AtomicU64,
         /// A number the handler of the step gives (`super::step_detail`), for the line a new
@@ -688,6 +690,7 @@ mod steps {
             preempted: AtomicU64::new(0),
             own: AtomicU64::new(0),
             ran_begin: AtomicU64::new(0),
+            begin_lost: AtomicBool::new(false),
             preempt_begin: AtomicU64::new(0),
             detail: AtomicU64::new(0),
         }
@@ -822,13 +825,12 @@ mod steps {
     /// The CPU ticks the loop's thread has run (object_info THREAD_STATE x5), the time of its own
     /// stints, which a thread of a higher level that runs in the middle of a step does not
     /// lengthen, as the clock does, and the count of preemptions (x7), from one call (the count
-    /// wraps at 2^16, so differences are taken modulo 2^16). 0 and 0 when the thread has no
-    /// handle to itself.
-    fn own_state(slot: &Slot) -> (u64, u64) {
-        match own_thread(slot) {
-            Some(own) => crate::sys::thread_ran_preempts(&own).unwrap_or((0, 0)),
-            None => (0, 0),
-        }
+    /// wraps at 2^16, so differences are taken modulo 2^16). None when the thread has no
+    /// handle to itself or the call failed: the step is then invalid, and there is no fallback
+    /// to the clock.
+    fn own_state(slot: &Slot) -> Option<(u64, u64)> {
+        let own = own_thread(slot)?;
+        crate::sys::thread_ran_preempts(&own).ok()
     }
 
     fn own_thread(
@@ -887,7 +889,16 @@ mod steps {
     /// (between steps) waited does not belong to it.
     pub fn restart() {
         let Some(slot) = claim() else { return };
-        let (ran, preempts) = own_state(slot);
+        let (ran, preempts) = match own_state(slot) {
+            Some(state) => {
+                slot.begin_lost.store(false, Ordering::Relaxed);
+                state
+            }
+            None => {
+                slot.begin_lost.store(true, Ordering::Relaxed);
+                (0, 0)
+            }
+        };
         slot.ran_begin.store(ran, Ordering::Relaxed);
         slot.preempt_begin.store(preempts, Ordering::Relaxed);
         slot.waited.store(0, Ordering::Relaxed);
@@ -928,7 +939,7 @@ mod steps {
         let whole = super::time::now().saturating_sub(began);
         let Some(slot) = mine() else {
             // A loop that never restarted (no place was free): no accounting for it.
-            return super::StepSample::measured(kind, 0, whole, 0).cpu(0);
+            return super::StepSample::measured(kind, 0, whole, 0).cpu(None);
         };
         let counted = slot.waited.swap(0, Ordering::Relaxed);
         let preempted = slot.preempted.swap(0, Ordering::Relaxed);
@@ -945,12 +956,23 @@ mod steps {
         // the wait for another service nor a thread of a higher level that
         // ran in the middle belongs to it (spec 2, 2: the levels of the
         // services are above those of the processes they serve).
-        let (ran_now, preempts_now) = own_state(slot);
-        let ran = ran_now.saturating_sub(slot.ran_begin.load(Ordering::Relaxed));
-        let n_preempt =
-            preempts_now.wrapping_sub(slot.preempt_begin.load(Ordering::Relaxed)) & 0xFFFF;
-        let sample = super::StepSample::measured(kind, detail, whole, counted).cpu(ran);
-        let (waited, took) = (sample.waited, sample.took);
+        // A read that failed at the start or the end, or one that went backwards, loses the
+        // step's CPU time: the step is invalid and says so (`service step cpu lost`).
+        let begin = slot.ran_begin.load(Ordering::Relaxed);
+        let cpu = match own_state(slot) {
+            Some((ran_now, preempts_now))
+                if !slot.begin_lost.load(Ordering::Relaxed) && ran_now >= begin =>
+            {
+                let n =
+                    preempts_now.wrapping_sub(slot.preempt_begin.load(Ordering::Relaxed)) & 0xFFFF;
+                Some((ran_now - begin, n))
+            }
+            _ => None,
+        };
+        let (ran, n_preempt) = cpu.unwrap_or((0, 0));
+        let sample =
+            super::StepSample::measured(kind, detail, whole, counted).cpu(cpu.map(|(ran, _)| ran));
+        let (waited, took, wall) = (sample.waited, sample.took, sample.wall);
         if detail == 32 {
             FULL[kind].fetch_max(took, Ordering::Relaxed);
         } else if detail == 16 {
@@ -958,6 +980,9 @@ mod steps {
         }
         let tag = REPORT.load(Ordering::Relaxed);
         let printing = tag != 0 && !QUIET.load(Ordering::Relaxed);
+        if cpu.is_none() && printing {
+            crate::println!("service step cpu lost: {tag} kind {kind}");
+        }
         if counted > whole {
             // The sends of the leading thread cannot add up to more than
             // the step: the accounting is lost, and `xtask` fails the run.
@@ -974,7 +999,13 @@ mod steps {
         if took > KIND_LONGEST[kind].fetch_max(took, Ordering::Relaxed) && printing {
             // The count is left out when it is 0 (most steps): a reader takes a missing count as
             // 0, and the console, which is slow, has less to write.
-            if n_preempt == 0 {
+            if wall > took {
+                // The step's whole time less its waits, when the thread's CPU time is the
+                // shorter of the two: the line shows both.
+                crate::println!(
+                    "service step: {tag} kind {kind} {took} ticks detail {detail} preempts {n_preempt} wall {wall}"
+                );
+            } else if n_preempt == 0 {
                 crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
             } else {
                 crate::println!(
@@ -997,7 +1028,7 @@ mod steps {
             }
         }
         let gap = whole.saturating_sub(counted).saturating_sub(ran);
-        if gap > GAP.fetch_max(gap, Ordering::Relaxed) && printing {
+        if cpu.is_some() && gap > GAP.fetch_max(gap, Ordering::Relaxed) && printing {
             crate::println!("service gap: {tag} kind {kind} {gap} ticks of {whole}");
         }
         if waited > WAITS[kind].fetch_max(waited, Ordering::Relaxed) && printing {

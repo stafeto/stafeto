@@ -6024,6 +6024,7 @@ fn watch_bound(tag: &str, kind: usize) -> u64 {
 fn check_watch_steps(lines: &[String]) -> Result<(), String> {
     for (tag, methods) in [("4", [14, 15, 16]), ("5", [25, 26, 27])] {
         check_waits(lines, &[tag], "watch steps")?;
+        step_line::say_ran_and_wall(lines, tag);
         let steps = longest_steps(lines, tag);
         step_line::within_b(lines, tag, step_line::Kinds::All)?;
         for &(kind, ticks, _) in &steps {
@@ -8218,6 +8219,12 @@ fn check_waits_by(
 ) -> Result<(), String> {
     if let Some(line) = lines.iter().find(|l| l.starts_with("service wait cut:")) {
         return Err(format!("{who}: the accounting of a wait was cut: {line}"));
+    }
+    if let Some(line) = lines
+        .iter()
+        .find(|l| l.starts_with("service step cpu lost:"))
+    {
+        return Err(format!("{who}: the CPU time of a step was lost: {line}"));
     }
     for tag in tags {
         for (kind, wait, whole) in longest_waits(lines, tag) {
@@ -15861,6 +15868,9 @@ mod tests {
         assert!(check_waits(&call(CALL_WAIT_MAX + 1), &["10"], "t").is_err());
         let cut = vec!["service wait cut: 2 kind 25 9000 ticks of 8000".to_owned()];
         assert!(check_waits(&cut, &["5"], "t").is_err());
+        let lost = vec!["service step cpu lost: 4 kind 14".to_owned()];
+        assert!(check_waits(&lost, &["4"], "t").is_err());
+        assert!(check_waits(&lost, &["10"], "t").is_err());
         let ok = vec![format!(
             "service wait: 10 kind 25 {CALL_WAIT_MAX} ticks of 600000"
         )];
