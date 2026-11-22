@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The host reference of `cargo xtask wfc-probe`. The demo (`apps/wfc-demo`)
-//! shows two scenes, A and B, of three elements each over three windows: two
+//! shows three scenes, A, B and D, of three elements each over three windows: two
 //! patterns that `tests/wfc-producer` draws (`pattern_a`, `pattern_b`) and a
 //! mask of A8 that the demo draws (`mask`). The reference builds the scenes
 //! through the crate `wfc` with the same calls as the demo (so the matrices,
@@ -96,14 +96,14 @@ const A: [Spec; 3] = [
     },
     Spec {
         window: P1,
-        src: [10.0, 20.0, 60.0, 120.0],
+        src: [10.0, 20.0, 40.0, 60.0],
         rotation: ROTATION_0,
         flip: false,
-        filter: SCALE_FILTER_NONE,
+        filter: SCALE_FILTER_FASTER,
         transparency: 1,
         alpha: 128,
         mask: false,
-        dst: [40, 230, 60, 120],
+        dst: [40, 230, 80, 120],
     },
 ];
 
@@ -132,20 +132,61 @@ const B: [Spec; 3] = [
     },
     Spec {
         window: P1,
-        src: [0.0, 0.0, 100.0, 200.0],
+        src: [10.0, 20.0, 50.0, 60.0],
         rotation: ROTATION_0,
-        flip: false,
+        flip: true,
         filter: SCALE_FILTER_NONE,
         transparency: 1,
         alpha: 255,
         mask: false,
-        dst: [460, 150, 100, 200],
+        dst: [460, 150, 50, 60],
+    },
+];
+
+/// Scene D: the bilinear filter, committed once.
+const D: [Spec; 3] = [
+    Spec {
+        window: P2,
+        src: [0.0, 0.0, 80.0, 50.0],
+        rotation: ROTATION_0,
+        flip: false,
+        filter: SCALE_FILTER_BETTER,
+        transparency: 0,
+        alpha: 255,
+        mask: false,
+        dst: [20, 20, 160, 100],
+    },
+    Spec {
+        window: P1,
+        src: [0.0, 0.0, 100.0, 200.0],
+        rotation: ROTATION_0,
+        flip: true,
+        filter: SCALE_FILTER_BETTER,
+        transparency: 0,
+        alpha: 255,
+        mask: false,
+        dst: [300, 40, 50, 100],
+    },
+    Spec {
+        window: P1,
+        src: [10.0, 20.0, 60.0, 120.0],
+        rotation: ROTATION_270,
+        flip: false,
+        filter: SCALE_FILTER_BETTER,
+        transparency: 1,
+        alpha: 128,
+        mask: false,
+        dst: [400, 200, 120, 60],
     },
 ];
 
 /// The scenes: the background (0xRRGGBBAA, as `wfcSetContextAttribi` has it)
-/// and the elements, lowest first.
-const SCENES: [(i32, &[Spec; 3]); 2] = [(0x2030_40FFu32 as i32, &A), (0x4020_10FFu32 as i32, &B)];
+/// and the elements, lowest first. Index 2 is scene D.
+const SCENES: [(i32, &[Spec; 3]); 3] = [
+    (0x2030_40FFu32 as i32, &A),
+    (0x4020_10FFu32 as i32, &B),
+    (0x1828_18FFu32 as i32, &D),
+];
 
 /// A service that keeps the last scene it was given.
 #[derive(Default)]
@@ -174,7 +215,7 @@ impl Service for Keep {
     fn release_screen(&mut self) {}
 }
 
-/// The record of scene `which` (0 for A, 1 for B), built through the
+/// The record of scene `which` (0 for A, 1 for B, 2 for D), built through the
 /// library's calls as the demo makes them, and the background.
 pub fn scene(which: usize) -> SceneCommit {
     let (bg, specs) = SCENES[which];
@@ -278,9 +319,9 @@ pub fn crc(frame: &[u32]) -> u32 {
     !crc
 }
 
-/// The CRCs of scenes A and B.
-pub fn crcs() -> [u32; 2] {
-    [crc(&frame(0)), crc(&frame(1))]
+/// The CRCs of scenes A, B and D.
+pub fn crcs() -> [u32; 3] {
+    [crc(&frame(0)), crc(&frame(1)), crc(&frame(2))]
 }
 
 #[cfg(test)]
@@ -294,6 +335,25 @@ mod tests {
             assert_eq!(s.count, 3);
             assert_eq!(s.flags, 0);
         }
+        // A stretches with the nearest filter, B flips, D is bilinear and flips.
+        let a0 = scene(0);
+        assert_ne!(a0.elements[2].dw, a0.elements[2].sw >> 16);
+        assert_eq!(
+            scene(1).elements[2].orient & proto_comp::MIRROR,
+            proto_comp::MIRROR
+        );
+        let d = scene(2);
+        assert_eq!(d.count, 3);
+        assert!(
+            d.elements
+                .iter()
+                .take(3)
+                .all(|e| e.filter == proto_comp::BILINEAR)
+        );
+        assert_eq!(
+            d.elements[1].orient & proto_comp::MIRROR,
+            proto_comp::MIRROR
+        );
         let a = scene(0);
         assert_eq!(a.elements[1].transparency, 5);
         assert_eq!(a.elements[1].mask, M);
@@ -305,8 +365,10 @@ mod tests {
 
     #[test]
     fn the_two_frames_differ_and_draw_something_over_the_background() {
-        let [a, b] = [frame(0), frame(1)];
+        let [a, b, d] = [frame(0), frame(1), frame(2)];
         assert_ne!(crc(&a), crc(&b));
+        assert_ne!(crc(&a), crc(&d));
+        assert!(d.iter().any(|&p| p != 0x0018_2818));
         assert!(a.iter().any(|&p| p != 0x0020_3040));
         assert!(b.iter().any(|&p| p != 0x0040_2010));
         // The corner no element reaches is the background.

@@ -801,22 +801,25 @@ stays with them.
   timer and drops the devices; the session stays with the new image, and so does the
   scene the old image committed, with elements that may name windows that went (they
   show nothing), until the new image commits its own.
-- **Cost of a scene.** The service sizes its bands from the dearest element of a
-  scene, and every element pays a fixed cost for the cache of pixman's paths. An
-  element with a stretch, a flip or the bilinear filter makes the bands of the
-  whole damage a few points wide: a frame of the dearest kind took 28 to 116 s
-  under -icount and a frame of the demo's scenes (quarter turns, a global alpha, a
-  mask) 1.2 to 1.9 s. A scene that needs a frame in each period keeps its dear
-  elements few (`compositor stats` tells the bands of a frame).
+- **Cost of a scene.** The layers of a scene are drawn in groups, each with
+  bands sized from its own dearest element, and a stretch with no turn and no flip
+  has a path of its own in pixman. The elements of the demo's scenes (a stretch, a
+  quarter turn, a flip, a global alpha, a mask, the bilinear filter) are therefore
+  all in the probe; the times of their frames are in `docs/openwf.md`. A flip or a
+  turn by 180 degrees with a stretch still uses the general path of pixman, so a
+  large flipped element makes its group's bands a few points wide. A scene that needs
+  a frame in each period keeps its dear elements few (`compositor stats` tells the
+  bands of a frame).
 
 `cargo xtask wfc-probe` runs `apps/wfc-demo` in `boot-wfc.img` (the table
 `table::wfc`: the services of the POSIX probes, the driver, the compositor and the
 demo, which starts `tests/wfc-producer` three times). Two scenes of three elements
-over two patterns and a mask are committed in turn 100 times and each composed on
-request, and QEMU's screenshot has the CRC of `tools/wfc-ref`, the host's frame of
+(a stretch, quarter turns, a flip, a global alpha and a mask) over two patterns and a
+mask are committed in turn 100 times and each composed on request, and QEMU's screenshot has the CRC of `tools/wfc-ref`, the host's frame of
 the same calls drawn point by point from `proto_comp::meaning`; then the context
 is active and the scene changes 100 times while screenshots are each one of the
-two; then scene C shows the window of the first revision straight from its buffer
+two; then scene D (the bilinear filter) is committed once and its frame time is
+printed; then scene C shows the window of the first revision straight from its buffer
 (the screenshot is the producer's gradient, and the trace of the device shows the
 scanout on resource 2). The second half runs under -icount and judges the steps of
 the compositor and the driver. The demo is a program of the probe image and has no package:
@@ -838,4 +841,5 @@ pointer in the base image, the layers of the display
 controller, a window of the second revision shown directly (the flag `SCANOUT`
 of WINDOW_CREATE is reserved), and the C functions for windows in `libc.so`
 (a change of the ABI series, 0.6; the static library above has them now, and
-`docs/lvgl.md` tells the program that uses them).
+`docs/lvgl.md` tells the program that uses them). `docs/openwf.md` is the page
+for the OpenWF interfaces.
