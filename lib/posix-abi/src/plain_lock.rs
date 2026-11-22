@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
 //! A plain futex mutex for a long section of a layer (the devices of OpenWF
 //! Composition and Display). It has no priority inheritance, and it must not be
 //! taken from a signal handler (the thread that holds it would wait for itself).
