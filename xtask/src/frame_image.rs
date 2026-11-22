@@ -236,6 +236,7 @@ pub fn run_traced(steps: bool, trace: bool) -> Result<Vec<String>, String> {
     let output = output?;
     for line in output.lines.iter().filter(|l| {
         l.starts_with("frame-load: ")
+            || l.starts_with("compositor: late frame")
             || l.starts_with("net-probe: ")
             || l.starts_with("data-probe: ")
     }) {

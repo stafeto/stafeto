@@ -428,6 +428,15 @@ impl Pacer {
                 // taken before a reset (its taking is in no `releases` of
                 // this count) is a frame of the earlier count.
                 if work.taken_at >= c.since && now > self.clock.start(work.k + 1) {
+                    if let Some(slot) = c.late_log.get_mut(c.late as usize) {
+                        let committed = work.committed_at.unwrap_or(now);
+                        *slot = Some(LateFrame {
+                            k: work.k,
+                            take_ns: work.taken_at.saturating_sub(start),
+                            compose_ns: committed.saturating_sub(work.taken_at),
+                            device_ns: now.saturating_sub(committed),
+                        });
+                    }
                     c.late += 1;
                 }
             }
@@ -447,6 +456,14 @@ impl Pacer {
         self.arm(self.clock.next(now))
     }
 
+    /// The phases of the next late frame of the count that was not told yet.
+    pub fn next_late(&mut self) -> Option<LateFrame> {
+        let c = &mut self.counters;
+        let late = c.late_log.get(c.late_told).copied().flatten()?;
+        c.late_told += 1;
+        Some(late)
+    }
+
     /// STATS' counters at `now`, in microseconds.
     pub fn stats(&self, now: u64) -> Stats {
         self.counters.snapshot(now, self.cap, self.clock.period)
@@ -461,6 +478,39 @@ pub fn bucket(time: u64, period: u64) -> usize {
     }
     let b = (time * 16 / period) as usize;
     b.min(BUCKETS - 1)
+}
+
+/// How many late frames a count keeps the breakdown of.
+pub const LATE_LOG: usize = 4;
+
+/// The phases of a late frame, in nanoseconds: the delay of the taking after
+/// the start of its period, the work from the taking to the commit, and the
+/// wait for the device from the commit to FRAME_SHOWN. The three add up to the
+/// time of the frame from the start of its period.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LateFrame {
+    pub k: u64,
+    pub take_ns: u64,
+    pub compose_ns: u64,
+    pub device_ns: u64,
+}
+
+impl LateFrame {
+    /// The time of the frame from the start of its period.
+    pub const fn frame_ns(&self) -> u64 {
+        self.take_ns + self.compose_ns + self.device_ns
+    }
+
+    /// The phase that took the most.
+    pub const fn cause(&self) -> &'static str {
+        if self.device_ns >= self.compose_ns && self.device_ns >= self.take_ns {
+            "device"
+        } else if self.compose_ns >= self.take_ns {
+            "compose"
+        } else {
+            "take"
+        }
+    }
 }
 
 /// The counters of the service and the greatest values, in nanoseconds.
@@ -483,6 +533,10 @@ pub struct Counters {
     pub direct_max_ns: u64,
     pub band_max_ns: u64,
     pub hist: [u32; BUCKETS],
+    /// The first late frames of the count with their phases, and how many of
+    /// them were told (`Pacer::next_late`).
+    pub late_log: [Option<LateFrame>; LATE_LOG],
+    pub late_told: usize,
 }
 
 impl Counters {
@@ -505,6 +559,8 @@ impl Counters {
             direct_max_ns: 0,
             band_max_ns: 0,
             hist: [0; BUCKETS],
+            late_log: [None; LATE_LOG],
+            late_told: 0,
         }
     }
 
@@ -831,6 +887,62 @@ mod tests {
             assert_eq!(p.counters.late, late, "offset {offset}");
             assert_eq!(p.counters.frames, 1);
         }
+    }
+
+    #[test]
+    fn a_late_frame_tells_its_phases_and_the_one_that_took_the_most() {
+        let mut p = Pacer::new(1_000, T, 52);
+        let c = *p.clock();
+        p.change(c.start(2) - 1, None);
+        assert_eq!(p.fire(c.start(2) + 300), Fire::Take(2));
+        p.committed(c.start(2) + 1_000);
+        let shown = c.start(3) + 1_700_000;
+        p.shown(shown, true, false);
+        let late = p.next_late().expect("one late frame");
+        assert_eq!(
+            late,
+            LateFrame {
+                k: 2,
+                take_ns: 300,
+                compose_ns: 700,
+                device_ns: shown - c.start(2) - 1_000,
+            }
+        );
+        assert_eq!(late.frame_ns(), shown - c.start(2));
+        assert_eq!(late.cause(), "device");
+        // Told once.
+        assert_eq!(p.next_late(), None);
+        // A frame in time tells nothing, and a reset forgets the log.
+        p.change(c.start(5) - 1, None);
+        assert_eq!(p.fire(c.start(5)), Fire::Take(5));
+        p.committed(c.start(5) + 100);
+        p.shown(c.start(5) + 200, true, false);
+        assert_eq!(p.next_late(), None);
+        p.counters.reset(c.start(6));
+        assert_eq!(
+            (p.counters.late_told, p.counters.late_log),
+            (0, [None; LATE_LOG])
+        );
+    }
+
+    #[test]
+    fn the_log_of_late_frames_keeps_the_first_ones_and_the_count_all() {
+        let mut p = Pacer::new(1_000, T, 52);
+        let c = *p.clock();
+        for n in 0..(LATE_LOG as u64 + 2) {
+            let k = 2 * n + 1;
+            p.change(c.start(k) - 1, None);
+            assert_eq!(p.fire(c.start(k)), Fire::Take(k));
+            p.committed(c.start(k + 1) - 100);
+            p.shown(c.start(k + 1) + 10, true, false);
+        }
+        assert_eq!(p.counters.late as usize, LATE_LOG + 2);
+        let mut told = 0;
+        while let Some(late) = p.next_late() {
+            assert_eq!(late.cause(), "compose");
+            told += 1;
+        }
+        assert_eq!(told, LATE_LOG);
     }
 
     #[test]
