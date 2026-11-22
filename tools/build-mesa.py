@@ -372,8 +372,8 @@ def meson_value(value) -> str:
 
 def configured_differences(buildoptions: list[dict], required: dict = REQUIRED) -> list[str]:
     """The required options whose value in the configured build tree is not
-    the required one (the options as meson holds them, not as this script
-    meant to pass them)."""
+    the required one (the options as meson holds them after it configured the
+    tree)."""
     held = {o["name"]: meson_value(o["value"]) for o in buildoptions if "subproject" not in o}
     return [f"{k}={held.get(k)!r} (required {v!r})" for k, v in required.items()
             if held.get(k) != v]
