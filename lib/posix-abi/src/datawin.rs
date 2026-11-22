@@ -521,5 +521,33 @@ pub fn probe_window_refused() -> bool {
     STATE.load(Ordering::Acquire) == REFUSED
 }
 
+/// The cells of the window that are free now (the book of the cells): 2 when no call holds one.
+pub fn probe_free_cells() -> u32 {
+    BOOK.free_mask().count_ones()
+}
+
+/// The calls of the calling thread that have a record now (a call that holds a cell or a lease).
+pub fn probe_live_calls() -> u32 {
+    let me = owner();
+    LIVE.iter()
+        .filter(|slot| slot.owner.load(Ordering::Acquire) == me)
+        .count() as u32
+}
+
+/// Gives the window up until `exec`, as a refusal does: every large call goes by messages
+/// (`INLINE`) from here on.
+pub fn probe_ban_window() {
+    refuse();
+}
+
+/// The mappings of the window's object now, in every process (the layer's own piece is one); 0
+/// when there is no window.
+pub fn probe_window_mappings() -> u64 {
+    if !probe_window_ready() {
+        return 0;
+    }
+    sys::memory_info(&object()).map_or(0, |info| info.mappings)
+}
+
 /// The bytes the window holds for the probes that count pages (the quota of the process).
 pub const PROBE_WINDOW_BYTES: usize = WINDOW_BYTES;

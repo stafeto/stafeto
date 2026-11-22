@@ -1671,7 +1671,10 @@ impl Server {
         // The first part of a call that goes on takes the lease, when the description is a file.
         if held.is_none() && head.lease == 0 && more {
             let d = self.descriptions[di];
-            let taken = (d.kind == Kind::File)
+            // (The deliberate break `break-datafs-append-end`: an appending call takes no lease.)
+            let wanted = d.kind == Kind::File
+                && !(cfg!(feature = "break-datafs-append-end") && writing && d.append);
+            let taken = wanted
                 .then(|| self.lease_take(label, di, usize::from(d.object), writing))
                 .flatten();
             match taken {

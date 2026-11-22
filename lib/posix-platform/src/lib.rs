@@ -938,6 +938,51 @@ pub extern "C" fn stafeto_probe_file_reads() -> u64 {
     posix_abi::probe_file_reads()
 }
 
+/// The counters of the large calls on `/data` into `out[0..10]`: the parts that went through a
+/// cell, the parts by messages, the calls cut short by a lapsed lease, the parts run without a
+/// lease, the parts sent again after NO_WINDOW, the RELEASEs that failed, the free cells of the
+/// window, the calls of the calling thread that hold a record, whether the window is mapped (0 or
+/// 1) and the mappings of its object now (posix_abi::probe_data_*).
+///
+/// # Safety
+/// `out` is writable for ten words.
+#[cfg(feature = "data")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_data(out: *mut u64) {
+    let words = [
+        posix_abi::probe_data_cell_parts(),
+        posix_abi::probe_data_inline_parts(),
+        posix_abi::probe_data_lapsed(),
+        posix_abi::probe_data_unleased(),
+        posix_abi::probe_data_window_retries(),
+        posix_abi::probe_data_releases_dropped(),
+        u64::from(posix_abi::probe_data_free_cells()),
+        u64::from(posix_abi::probe_data_live_calls()),
+        u64::from(posix_abi::probe_data_window_ready()),
+        posix_abi::probe_data_window_mappings(),
+    ];
+    for (i, word) in words.into_iter().enumerate() {
+        // SAFETY: the caller's contract.
+        unsafe { out.add(i).write(word) };
+    }
+}
+
+/// The bytes the process service has left in its pool of memory, 0 when it cannot be asked (the
+/// pages a process gives back are seen here: the probe of the pages of a window).
+#[cfg(feature = "data")]
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_pool_free() -> u64 {
+    posix_abi::process::list(0).map_or(0, |listing| listing.2.free)
+}
+
+/// Gives the window for `/data` up until `exec`: the large calls then go by messages (the probe of
+/// the fallback path).
+#[cfg(feature = "data")]
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_data_ban_window() {
+    posix_abi::probe_data_ban_window();
+}
+
 /// The counters of the cache of the copies of immutable files into `out[0..4]`: copies served
 /// from memory, files copied in, SNAPSHOT_FD calls, and the `pread` calls that went to the file
 /// service; then the pieces of the arena and the pages taken in them into `out[4..6]`

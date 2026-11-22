@@ -37,6 +37,9 @@ break-datafs-lease-place = []
 break-datafs-lease-reader = []
 break-datafs-lease-renew = []
 break-datafs-lease-deref = []
+# `break-datafs-append-end`: a call on an `O_APPEND` description takes no lease, so each of its parts
+# takes the end of the file on its own and the parts of two calls mix.
+break-datafs-append-end = []
 
 [dependencies]
 littlefs = { path = "../../third-party/littlefs" }

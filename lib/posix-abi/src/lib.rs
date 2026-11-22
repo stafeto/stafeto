@@ -470,8 +470,12 @@ fn read_file_large(fd: u32, buffer: &mut [u8]) -> Option<Result<usize, c_int>> {
 /// again after NO_WINDOW.
 #[cfg(feature = "data")]
 pub use datawin::{
-    probe_cell_parts as probe_data_cell_parts, probe_inline_parts as probe_data_inline_parts,
-    probe_lapsed as probe_data_lapsed, probe_unleased as probe_data_unleased,
+    probe_ban_window as probe_data_ban_window, probe_cell_parts as probe_data_cell_parts,
+    probe_free_cells as probe_data_free_cells, probe_inline_parts as probe_data_inline_parts,
+    probe_lapsed as probe_data_lapsed, probe_live_calls as probe_data_live_calls,
+    probe_releases_dropped as probe_data_releases_dropped, probe_unleased as probe_data_unleased,
+    probe_window_mappings as probe_data_window_mappings,
+    probe_window_ready as probe_data_window_ready,
     probe_window_retries as probe_data_window_retries,
 };
 
