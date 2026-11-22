@@ -2553,7 +2553,7 @@ commands:
   posix-ipc-steps measure the steps of those calls under -icount, against term B
   nvme-breaks the deliberate breaks of lib/nvme fail its host tests
   data-image <path> [--size 2G] [--fill] the data volume of the image of EC2 made offline: a sparse file with the table and an empty file system, made by the code of the first boot of datafs
-  datafs-breaks the deliberate breaks of lib/datafs fail its host tests
+  datafs-breaks [FEATURE...] the deliberate breaks of lib/datafs fail its host tests (all, or the ones named)
   nvme-persist [breaks|lba4096|mdts1|steps|upgrade|key [nodisk|wrongdisk [breaks]|foreign|image [grown]]|blk-probe|shutdown|stop-handlers [breaks]] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught; upgrade: a data volume made as the 0.5.1 image leaves it (no attribute on any entry, the key under /ssh) converted at the first mount of this tree, the modes root 0755, /ssh 0700, key 0600 and the key fingerprint the same on two boots; key: the host key service on the NVMe data volume, the same key fingerprint on two boots of one volume; key nodisk: no data controller, the shell comes up and the key is new on each boot; key foreign: the serial the record wants over a file shaped like a fresh volume of EC2 (the first and last 4 KiB zero, bytes between), datafs says where the first non-zero byte is, prints no byte of the disk and leaves it alone, the key is new on each boot; key image [grown]: the data image of the AMI (`data-image`) as the data disk, mounted on the first boot with no formatting, the key saved and restored (grown: the file 1 GiB longer, the backup of the table moves to the end first); key wrongdisk [blank]: a controller with another serial number is left alone and its file keeps its SHA-256 (breaks: the check of the identity always passes and the case must fail); blk-probe: the probe of the disk service over NVMe with a restart of the service; shutdown: init stops the system (SHUTDOWN) with the NVMe controller stopped and the machine off; stop-handlers [breaks]: the same with two POSIX programs and a file on /data, the stop handlers of the process service and datafs, and the file read back whole on the next boot
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
@@ -2593,7 +2593,7 @@ fn main() {
         Some("efi-breaks") => efi::breaks(),
         Some("ena-breaks") => ena_breaks(),
         Some("nvme-breaks") => nvme_breaks(),
-        Some("datafs-breaks") => datafs_breaks(),
+        Some("datafs-breaks") => datafs_breaks(&args[1..]),
         Some("data-image") => data_image::run(&args[1..]),
         Some("nvme-persist") => store_probe::nvme_persist(&args[1..]),
         Some("uart-breaks") => uart_breaks(),
@@ -3269,11 +3269,30 @@ const DATAFS_BREAKS: [&str; 13] = [
     "break-datafs-append-end",
 ];
 
-fn datafs_breaks() -> Result<(), String> {
+/// The breaks to run: every one of `DATAFS_BREAKS`, or only the ones `named` (each must be one of
+/// them), so that a probe of a few fits the time limit of one job.
+fn datafs_breaks_chosen(named: &[String]) -> Result<Vec<&'static str>, String> {
+    if named.is_empty() {
+        return Ok(DATAFS_BREAKS.to_vec());
+    }
+    named
+        .iter()
+        .map(|n| {
+            DATAFS_BREAKS
+                .iter()
+                .copied()
+                .find(|f| f == n)
+                .ok_or_else(|| format!("datafs-breaks: {n} is not a break of lib/datafs"))
+        })
+        .collect()
+}
+
+fn datafs_breaks(named: &[String]) -> Result<(), String> {
+    let chosen = datafs_breaks_chosen(named)?;
     let mut ok = cargo();
     ok.args(["test", "--package", "datafs", "--lib"]);
     run_cmd(&mut ok)?;
-    for feature in DATAFS_BREAKS {
+    for feature in chosen {
         let mut broken = cargo();
         broken.args([
             "test",
@@ -15085,6 +15104,27 @@ mod tests {
         assert_eq!(
             super::PROGRAM_EPOCH.parse::<u64>().unwrap(),
             56 * 365 * 86_400 + 14 * 86_400
+        );
+    }
+    #[test]
+    fn datafs_breaks_runs_every_break_or_the_ones_named() {
+        assert_eq!(
+            datafs_breaks_chosen(&[]).unwrap().len(),
+            DATAFS_BREAKS.len()
+        );
+        let two = [
+            "break-datafs-sync".to_owned(),
+            "break-datafs-trust-prog".to_owned(),
+        ];
+        assert_eq!(
+            datafs_breaks_chosen(&two).unwrap(),
+            ["break-datafs-sync", "break-datafs-trust-prog"]
+        );
+        let wrong = ["break-datafs-none".to_owned()];
+        assert!(
+            datafs_breaks_chosen(&wrong)
+                .unwrap_err()
+                .contains("break-datafs-none")
         );
     }
 
