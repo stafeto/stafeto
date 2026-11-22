@@ -452,8 +452,13 @@ core::arch::global_asm!(
     ".global stafeto_call_on",
     ".type stafeto_call_on,%function",
     "stafeto_call_on:",
+    ".cfi_startproc",
     "stp x29, x30, [sp, #-16]!",
+    ".cfi_def_cfa_offset 16",
+    ".cfi_offset x29, -16",
+    ".cfi_offset x30, -8",
     "mov x29, sp",
+    ".cfi_def_cfa_register x29",
     "mov x9, sp",
     "mov sp, x0",
     "stp x9, xzr, [sp, #-16]!",
@@ -464,6 +469,7 @@ core::arch::global_asm!(
     "mov sp, x9",
     "ldp x29, x30, [sp], #16",
     "ret",
+    ".cfi_endproc",
 );
 
 #[cfg(test)]
