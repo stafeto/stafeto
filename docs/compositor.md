@@ -485,6 +485,30 @@ run, and `cap_us` is the value of the model: the cap's bands at their gate, at 1
 tick (the counter of a run under -icount, 62.5 MHz). On HVF and on a board `cap_us`
 does not match the wall.
 
+Each STATS tells the phases of the first late frame of the count that it has not told yet (of the
+first four kept), as one line on the console (a line is about 7 000 ticks of the step, so one is
+told a step; a STATS with RESET tells none, so the line of a phase comes just before the counters
+the conductor prints):
+`compositor: late frame period K take A us compose B us device C us frame D us (the longest: P)`.
+The take is the delay of the taking after the start of the period, the compose the time from the
+taking to the commit, the device the time from the commit to FRAME_SHOWN, and the three add up to
+the time of the frame; P names the longest of the three. The line tells which phase overran. The
+bound `frame::bound` of the scene covers the take and the compose (and the driver's own step in the
+term of the display driver). The device's own time is the emulator's: under `-icount` the virtual
+time of a wait for an emulated device moves with the host's scheduling of QEMU's main loop (the
+device's work is a bottom half there), so the time of the device in a run on a loaded host is
+longer than the model's and is the longest phase of a late frame that is late for that reason.
+
+`cargo xtask frame-probe` excuses one such frame, with a narrow rule. In a phase with the CPU load
+(cpu, files, net, direct) one late frame is excused, and reported as `late 1 (the device's, N ms:
+emulator main loop, excused)`, when all of these hold: the phase has exactly one late line and its
+longest phase is the device; take plus compose is at most the bound less the kernel path, the
+display driver's term and a step; the skipped periods are at most the periods the frame covers
+less one (its time over 16 667 us, less one); the window of the client was late once at most and
+missed none; and no step of kinds 6 and 65 of the display driver was longer than the driver's term
+(13 596 ticks). A late frame in any other phase (idle, full), a second late frame, a late frame
+with no line, or a frame that fails any of the conditions fails the probe as before.
+
 An expiry of the timer that arrives before the time the timer is armed for is
 `Fire::Early`: the kernel delivers the expiry of an earlier deadline that `timer_set`
 has moved since. The service does nothing, the timer stays armed and no wakeup is
