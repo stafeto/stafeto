@@ -20,11 +20,13 @@ model = []
 # synced. `break-datafs-consistent`: a mount leaves a half-done rename as it is. `break-datafs-busy`:
 # an open file may be removed. `break-datafs-gpt-order`: a new table is written start first.
 # `break-datafs-relocate-order`: the moved backup is announced by the primary header before it is there.
+# `break-datafs-ctz-hints`: a write or a truncation of a file leaves its wayposts for the blocks of a read.
 break-datafs-sync = []
 break-datafs-consistent = []
 break-datafs-busy = []
 break-datafs-gpt-order = []
 break-datafs-relocate-order = []
+break-datafs-ctz-hints = []
 
 [dependencies]
 littlefs = { path = "../../third-party/littlefs" }

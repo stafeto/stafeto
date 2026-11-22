@@ -10,7 +10,7 @@ the copy is modified, so that the notice is not read as saying it is the release
 
 ## What was added
 
-Four functions that only read (the change of the repair, further down, is the one that writes). They add no field to any structure of the release, and change
+Four functions that only read (the change of the repair, further down, is the one that writes). They add no field to any structure of the release (the later changes do: see their sections), and change
 nothing on the disk: a volume written by the release reads with the change and the other way
 round. One function of the release, `lfs_dir_find`, is split to carry the third (below): its body
 becomes `lfs_dir_find_` with one more argument, and `lfs_dir_find` calls it with that argument
@@ -130,6 +130,69 @@ reads at 135 directories and 256 pairs, 1,443,988 at 539 and 1,024, 6,003,785 at
   table and without it; also with a table of 8 and 60 cells, with directories moved before the cut, with
   wear levelling on, and with a cut at every sector of the repair itself) and `scale_orphan_table` (the same at the scale of the plan, by name).
 
+## A change to the read of a file: wayposts in the skip list
+
+One more change, to the read path of a file, that writes nothing. Reading a file in order finds
+the block of each new position with `lfs_ctz_find`, which walks the skip list of the file back from
+its last block: about log2(n) reads of a pointer for the n-th block, a pointer being 4 bytes inside a
+block of 4096 that is read whole (the read size). Measured on the host (`scale_ctz_read` in
+`lib/datafs/src/tests_ctz.rs`), the reads of the device for each block of a file read from its
+start to its end (the pointers and the block of data), the same for calls of 4 KiB and of 64 KiB:
+
+| file | blocks | the release | with 16 wayposts | with 8 | with 4 |
+|---:|---:|---:|---:|---:|---:|
+| 1 MiB | 257 | 4.98 | 1.99 | 1.99 | 2.18 |
+| 4 MiB | 1,027 | 6.98 | 2.00 | 2.01 | 2.43 |
+| 16 MiB | 4,105 | 7.99 | 2.00 | 2.02 | 2.56 |
+| 64 MiB | 16,417 | 8.99 | 2.00 | 2.03 | 2.69 |
+
+- `struct lfs_config` has one more field at its end, `ctz_hints`: the number of wayposts an open
+  file keeps, at most `LFS_CTZ_HINTS_MAX` (16, overridable at build time). Zero (the default of a
+  zeroed configuration) leaves the release's walk, so a build that does not set it behaves as the
+  release does. The data service sets 16 (`CTZ_HINTS` in `lib/datafs/csrc/glue.c`).
+- `lfs_file_t` has one more member, `hints`: the pair (`ctz.head`, `ctz.size`) the wayposts were
+  recorded for, and up to `LFS_CTZ_HINTS_MAX` wayposts, each the index of a block in the skip list
+  and its block number (8 bytes each; the structure grows by 144 bytes). The change adds a field to a
+  structure of the release here, which the four functions of the first section do not.
+- `lfs_ctz_find_hinted`, which `lfs_file_flushedread` calls where it called `lfs_ctz_find` (that
+  function is unchanged, and the other calls to it, in the write and truncate paths, stay as they
+  are). It forgets the wayposts if the pair of the file is not the one they were recorded for,
+  forgets those with an index below the target, starts from the waypost of the smallest index that
+  is not below the target (or from the head when there is none), walks as `lfs_ctz_find` does, and
+  records every block it passes. With 16 wayposts a read in order finds the next block from the
+  waypost the last find left next to it, with one read of a pointer; with 0 it is the release's walk.
+- The wayposts are right because the blocks of a skip list never change while the list is live:
+  littlefs writes a changed file to new blocks (copy on write) and the old list stays as it was until the
+  new head replaces it in the directory. The pair (`ctz.head`, `ctz.size`) is not enough to tell lists
+  apart: the head of an old list is freed once the new one is synced, and the allocator can hand it out
+  again at the same size with other blocks inside. The main guard is therefore the drop: the wayposts
+  are emptied by `lfs_file_write_` and `lfs_file_truncate_` when they start and where `file->ctz` is
+  assigned (the flush of a write, and the two paths of a truncation), and `lfs_file_opencfg_` starts
+  them empty. The pair is a cheap fallback that forgets wayposts recorded for another pair. A
+  block that another handle frees under a reader is no hazard: after a sync by another handle
+  littlefs marks the others `LFS_F_DUSTY`, and the walk of the allocator counts the `ctz` of every
+  such handle, so the blocks of the old snapshot, where the wayposts sit, are not given out while
+  the handle is open; the snapshot is protected by `LFS_F_DUSTY`.
+- Nothing changes on the disk. The tests compare, for the same random operations (reads, seeks
+  forward and backward, writes in place, past the end and at the end, truncations shorter and longer,
+  syncs, reopening, remounting) on volumes with 0, 1, 3 and 16 wayposts, every answer with a model of
+  the file in memory and with each other, and the media byte for byte at the end
+  (`random_operations_read_the_same_bytes_with_and_without_wayposts`); the file after a truncation and
+  after rewrites in place (`reads_after_a_truncation_and_a_rewrite_in_place`); and the file as a reader
+  sees it after a power cut at every sector of a large write, with three sets of surviving sectors,
+  with and without wayposts (`a_cut_at_every_sector_of_a_large_write_reads_the_same_with_and_without_wayposts`).
+  `a_read_in_order_costs_at_most_three_reads_for_each_block` keeps the figure of the table.
+  `a_head_given_out_again_at_the_same_size_does_not_match_old_wayposts` (a volume of 48 blocks, a file of
+  40,000 bytes rewritten with a sync k times with a second file of varying length in between, no read
+  during the rewrites) fails at k 10 when the drops are removed: only the drop covers every change of the
+  file alone, the pair does not. `a_reader_keeps_the_old_snapshot_while_another_handle_rewrites_the_file`
+  rewrites the file through a second handle while the first has wayposts and the allocator is
+  busy, with 0 and with 16 wayposts: the reader goes on reading its snapshot. The build feature
+  `break-datafs-ctz-hints` of `lib/datafs` defines `LFS_CTZ_HINTS_NO_DROP`, which makes the drop a
+  no-op (for the host tests only), and `cargo xtask datafs-breaks` checks that the probe above fails
+  with it. A wrong bound of the search (`index + 1 >= target` for the forgetting of the wayposts
+  behind the target) was checked by hand and fails every test of `tests_ctz.rs`.
+
 ## A known defect of the release that the service works around
 
 With `inline_max = -1` (no inlined files) littlefs 2.11.3, with or without this change, loses a write at the start or in the middle of an existing inline file (a file that an earlier configuration kept inside the pair of its directory): moving the file out (`lfs_file_outline`, `lfs_file_relocate`) copies only the bytes before the write position, flushing the rest then fails, and the close answers `LFS_ERR_CORRUPT`; the write is lost and the old bytes stay. Appending, `O_TRUNC` and truncating down work. The service moves every inline file out before a write can meet this: open for writing, seek to the end and write no byte (one commit, the whole file moves), by the conversion job after the mount and, for a file the job has not reached, at the first open of the path for writing or truncation. The test that reproduces the defect is `without_the_move_out_a_write_in_the_middle_of_an_old_inline_file_is_lost` in `lib/datafs/src/tests_perm.rs`: it fails when a release stops losing the write, and then the move-out can go. The release's own message about it is not sent yet.
@@ -147,8 +210,8 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 0cb4ff1daf5fdc1359c6a6ee3116092f08fc100c9d58b1b77ab17bfd801f856d  LICENSE.md
 6dd74dfc58ac93589f8e002bb73c0830a59206912cfe8c951c07eb2bd5fccad0  SPEC.md
 2a8b3459d74b9fa8bdd947738522c46331739405b1fc3d70f057f636a1dea768  DESIGN.md
-75ee60e4b8123438a1ee144ff397f6b7e5918c527b60a852085ad3e90ad35135  lfs.c (with the change)
-bc1e84ff52c58d32d8bf2973bdaaac935598545caa692f561340e6f445ca507a  lfs.h (with the change)
+14cc5c8a89ace91082f3d4dc6b482f78a8128bbb5779e8d1245d9663b26dcc57  lfs.c (with the change)
+77523060a609e674c8f98f1860a87977de38157caa828d22b297e8dfa5dc2051  lfs.h (with the change)
 ```
 
 `tools/check-littlefs.py` (run by `cargo xtask ci` as "littlefs sources") fails when a file of the
@@ -174,6 +237,7 @@ change, or when `stafeto-changes.patch` applied backwards to them does not give 
    `lfs_fs_pred`; the count of directories relies on `dir.split` being true exactly when the
    pair's tail is a hard tail (a continuation of the same directory) and false for a soft tail.
    The table of the repair relies on `lfs_fs_parent` and `lfs_fs_parent_match` (the match on `LFS_TYPE_DIRSTRUCT` with the mask `LFS_MKTAG(0x7ff, 0, 0x3ff)`) and on the two commits of `lfs_fs_deorphan` that follow a repair; keep the table's answer equal to `lfs_fs_parent`'s.
+   The wayposts rely on `lfs_ctz_index` and `lfs_ctz_find` (the walk of the skip list, which `lfs_ctz_find_hinted` repeats with the wayposts added), on `lfs_file_flushedread` calling `lfs_ctz_find` once for each new block, on `LFS_F_DUSTY` and the allocator's walk keeping the blocks of an open handle's list, and on every place that assigns `file->ctz` (`lfs_file_flush`, `lfs_file_truncate_`) or writes (`lfs_file_write_`) calling `lfs_ctz_hints_drop`.
    Check that the new release's `lfs_fs_traverse_` still begins its walk with
    `dir.tail = {0, 1}`, runs the cycle check before each fetch and goes on to `dir.tail`, and keep
    the function in step with it.
@@ -185,6 +249,7 @@ change, or when `stafeto-changes.patch` applied backwards to them does not give 
    `Cargo.toml` and `src/lib.rs`.
 4. Run `cargo test -p datafs`: `tests_entry_attr.rs` compares the attribute of every entry of
    a directory with `lfs_getattr` by path, across several metadata pairs, and
-   `tests_scale.rs` compares the disk after the repair of orphans with and without the table.
+   `tests_scale.rs` compares the disk after the repair of orphans with and without the table, and
+   `tests_ctz.rs` compares the reads with and without the wayposts and counts the reads for each block.
 5. When a release has the same functions, delete the change: remove the patch, this file, the use
-   of the four functions and the table of the repair in `lib/datafs/csrc/glue.c` and `lib/datafs/src/fs.rs`, and the check.
+   of the four functions, the table of the repair and the wayposts in `lib/datafs/csrc/glue.c` and `lib/datafs/src/fs.rs`, and the check.
