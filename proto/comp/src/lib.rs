@@ -1209,7 +1209,8 @@ pub struct Stats {
     pub releases: u32,
     pub frames: u32,
     pub direct: u32,
-    /// Frames shown after the start of the next period, starts of a period
+    /// Frames that released a buffer and were shown after the start of the
+    /// next period (a frame taken before a reset is not counted), starts of a period
     /// at which a change waited and nothing was taken, frames the device
     /// failed, periods in which the cap put bands off, firings of the frame's
     /// timer.

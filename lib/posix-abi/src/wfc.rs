@@ -49,11 +49,11 @@
 //! thread moves or cancels another's timer.
 
 use crate::constants::*;
+use crate::plain_lock::Lock;
 use crate::threads;
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use posix_sync::{CLOCK_MONOTONIC, futex_wait, futex_wake};
 use proto_comp::{COMMITTED_BIT, COMPOSED_BIT, EVENTS_BIT, Method, manage};
 use proto_wire::{Status, Writer};
 use rt::abi::{Error, MESSAGE_MAX, Rights, Source};
@@ -69,50 +69,6 @@ pub const MAX_DEVICES: usize = 4;
 /// again, and the one frame a pause lasts (at 60 hertz).
 const POLL_NS: u64 = 100_000_000;
 const FRAME_NS: u64 = 17_000_000;
-
-/// A plain futex mutex. It is no `LayerLock`: its holder is in no critical
-/// section, so a signal's handler runs while a call that holds it waits (a
-/// critical section would keep the signal pending, and every wait would end
-/// at once, interrupted). It is held for a whole call, a wait included, so it
-/// serializes the calls on one device; the child of a fork makes it new (the
-/// thread of the parent that held it is not there). A handler that jumps out
-/// of a call leaves it held: the functions are not async-signal-safe.
-struct Lock(AtomicU32);
-
-struct Held<'a>(&'a Lock);
-
-impl Lock {
-    const fn new() -> Lock {
-        Lock(AtomicU32::new(0))
-    }
-
-    fn lock(&self) -> Held<'_> {
-        if self
-            .0
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            while self.0.swap(2, Ordering::Acquire) != 0 {
-                if futex_wait(&self.0, 2, CLOCK_MONOTONIC, None) == Err(EINVAL) {
-                    let _ = sys::yield_now();
-                }
-            }
-        }
-        Held(self)
-    }
-
-    fn reset(&self) {
-        self.0.store(0, Ordering::Release);
-    }
-}
-
-impl Drop for Held<'_> {
-    fn drop(&mut self) {
-        if self.0.0.swap(0, Ordering::Release) == 2 {
-            futex_wake(&self.0.0, 1);
-        }
-    }
-}
 
 struct Slot {
     lock: Lock,

@@ -2948,16 +2948,38 @@ pub fn compose(
     src: &impl Source,
     raster: &mut impl Raster,
 ) -> Band {
-    let passes = scene.working().map(|def| scene.passes(def, damage));
+    let passes = plan(scene, damage);
+    compose_planned(scene, damage, at, passes.as_ref(), fb, src, raster)
+}
+
+/// The groups of the layers of a frame over `damage` (`Scene::passes` of the
+/// working scene), None with no scene. The caller of a place makes them once
+/// and gives them to every `compose_planned` of the place: the place walks one
+/// set of groups however the windows change in the middle of it (a window
+/// that goes draws nothing in its group; `at.pass` keeps its meaning).
+pub fn plan(scene: &Scene, damage: Rect) -> Option<Passes> {
+    scene.working().map(|def| scene.passes(def, damage))
+}
+
+/// `compose` with the groups of the place made by `plan` (None with no scene).
+pub fn compose_planned(
+    scene: &Scene,
+    damage: Rect,
+    at: Band,
+    passes: Option<&Passes>,
+    fb: &mut [u8],
+    src: &impl Source,
+    raster: &mut impl Raster,
+) -> Band {
     // A band of a scene is the size its group allows; one of windows is the
     // size of the layers that touch the damage.
-    let size = match passes.as_ref() {
+    let size = match passes {
         Some(plan) if ((at.pass & !PHASE) as usize) < plan.groups => {
             plan.band((at.pass & !PHASE) as usize)
         }
-        _ => scene.tile_with(damage, passes.as_ref()),
+        _ => scene.tile_with(damage, passes),
     };
-    compose_with(scene, damage, at, size, passes.as_ref(), fb, src, raster)
+    compose_with(scene, damage, at, size, passes, fb, src, raster)
 }
 
 /// The step of the band `band` of group `pass` of `passes` in a frame of the
@@ -5761,6 +5783,78 @@ mod tests {
             0,
             "the first scene is gone from the frame"
         );
+    }
+
+    /// A window that goes in the middle of a place changes the groups `Scene::passes`
+    /// makes: the black group appears once the opaque element that covered the
+    /// damage is gone.
+    fn two_over_a_screen() -> (Scene, Rect) {
+        let mut s = staged();
+        s.scene_commit(&commit(
+            ACTIVE,
+            0xFF00_0000,
+            &[element(0, 0, 0, 100, 50), element(1, 20, 10, 100, 50)],
+        ))
+        .unwrap();
+        post_all(&mut s);
+        let d = s.begin().unwrap();
+        (s, d)
+    }
+
+    #[test]
+    fn a_window_that_goes_in_the_middle_of_a_place_changes_the_groups() {
+        let (mut s, d) = two_over_a_screen();
+        let before = plan(&s, d).unwrap();
+        s.destroy(0);
+        let after = plan(&s, d).unwrap();
+        assert_ne!(before.groups, after.groups);
+    }
+
+    /// The groups the bands of a place walk, in order, when window 0 goes after
+    /// the first band, with the groups made once (`plan`) or made again at each
+    /// band (`compose`).
+    fn walked(frozen: bool) -> (Vec<u32>, usize) {
+        let (mut s, d) = two_over_a_screen();
+        let src = solid(&[(0, 0x40), (1, 0x80)]);
+        let mut fb = screen();
+        let made = plan(&s, d);
+        let groups = made.unwrap().groups;
+        let mut at = Band {
+            row: d.y,
+            col: 0,
+            pass: 0,
+        };
+        let mut passes = Vec::new();
+        while at.row < d.y + d.h {
+            passes.push(at.pass & !PHASE);
+            at = if frozen {
+                compose_planned(&s, d, at, made.as_ref(), &mut fb, &src, &mut Plain)
+            } else {
+                compose(&s, d, at, &mut fb, &src, &mut Plain)
+            };
+            if passes.len() == 1 {
+                s.destroy(0);
+            }
+        }
+        (passes, groups)
+    }
+
+    #[test]
+    fn a_place_walks_the_groups_it_began_with_when_a_window_goes() {
+        let (passes, groups) = walked(true);
+        assert_eq!(groups, 3);
+        // Every group once, in order: the bands of a group are consecutive.
+        let mut seen: Vec<u32> = passes.clone();
+        seen.dedup();
+        assert_eq!(seen, (0..groups as u32).collect::<Vec<_>>(), "{passes:?}");
+    }
+
+    #[test]
+    fn groups_made_again_at_each_band_lose_their_place_when_a_window_goes() {
+        let (passes, groups) = walked(false);
+        let mut seen = passes.clone();
+        seen.dedup();
+        assert_ne!(seen, (0..groups as u32).collect::<Vec<_>>(), "{passes:?}");
     }
 
     fn at_point(fb: &[u8], x: u32, y: u32) -> u8 {
