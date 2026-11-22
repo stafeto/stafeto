@@ -1965,6 +1965,11 @@ static int mix_body(unsigned writers, unsigned writes, unsigned reads) {
     for (unsigned k = 0; k < writers; k++) DATA_CHECK(wait_ok(pids[k]) == 0);
     printf("posix-data: mix: %lu reads saw the first pattern, %lu the pattern of A, %lu the pattern of B\n", seen[0],
            seen[1], seen[2]);
+    /* The single-writer form judges nothing unless the reads overlapped the writes. */
+    if (writers == 1 && seen[1] + seen[2] == 0) {
+        printf("posix-data: mix: no read overlapped the writes\n");
+        return 22;
+    }
     DATA_CHECK(close(fd) == 0 && unlink("/data/mix") == 0);
     return 0;
 }

@@ -78,7 +78,7 @@ static RETRIES: AtomicU64 = AtomicU64::new(0);
 /// The RELEASEs of leases that were not sent or got no answer.
 static RELEASES_DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// The calls a jump or an exit ended after a part was sent and before the lease of its answer was
+/// The calls (counted once each, at their first part) that a jump or an exit ended after a part was sent and before the lease of its answer was
 /// recorded (the lease then runs out on its timer; the entries deferred around the send of a part
 /// keep this at 0).
 static LEASES_UNRECORDED: AtomicU64 = AtomicU64::new(0);
