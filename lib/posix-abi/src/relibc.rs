@@ -1549,6 +1549,8 @@ pub fn release(id: u64) {
 /// Ends the calling thread; its stack, `stack` and `length` bytes as relibc
 /// mapped it, goes with its TCB after its end.
 pub fn exit_thread(stack: usize, length: usize) -> ! {
+    // A call of parts on `/data` that a handler's `pthread_exit` leaves gives its cell and lease up.
+    crate::data::abandon_thread();
     let id = current();
     if let Some(place) = usize::try_from(id)
         .ok()

@@ -4,36 +4,55 @@
 //! The process's window for the large calls on `/data`: a memory object of `WINDOW_BYTES`
 //! (128 KiB, 32 pages) of the process's own quota, mapped as the *data window piece* of the memory
 //! map (posix_map::Kind::DataWindow) and sent to the data file service with WINDOW. It holds
-//! `CELLS` cells of `CELL_BYTES`. A `read`, `pread`, `write`, `pwrite`, `readv` or `writev` of
-//! more than one message takes a cell and moves its bytes in parts of the cell (READ_INTO,
-//! PREAD_INTO, WRITE_FROM, PWRITE_FROM); the program's own thread copies into the cell before a
-//! part and out of it after the reply, and the service maps the cell for the one job.
+//! `CELLS` cells of `CELL_BYTES`. A `read`, `pread`, `write` or `pwrite` of more than one message
+//! takes a cell and moves its bytes in parts of the cell (READ_INTO, PREAD_INTO, WRITE_FROM,
+//! PWRITE_FROM); the program's own thread copies into the cell before a part and out of it after
+//! the reply, and the service maps the cell for the one job. (`data::readv` and `data::writev` use
+//! the same parts but have no caller yet: the C library's `readv` and `writev` wait for a hook,
+//! and nothing is promised for them.)
 //!
 //! * The first large call asks for the window; the other threads go by messages (`INLINE` parts)
-//!   meanwhile. A refusal (no memory, no room in the map, a service that refuses WINDOW four
-//!   times) is final until `exec`.
+//!   meanwhile. A refusal (no memory, no room in the map, a service that refuses WINDOW with
+//!   INVALID four times in a row) is final until `exec`. A WINDOW that fails for another reason
+//!   (a busy or restarting service) sends that call by messages and counts for nothing.
 //! * The window is registered with the service for one session: `REGISTERED` is the session the
 //!   service holds it for. A session of a new instance (the service restarted) differs, so the
 //!   next call registers again, and a part that nevertheless finds the service without a window
-//!   (NO_WINDOW) registers once and sends the part again before it goes by messages.
+//!   (NO_WINDOW) registers once and sends the part again before it goes by messages. The wait of
+//!   a thread for another's WINDOW (`claim`) is bounded (2,000 turns, then messages).
 //! * A cell is held from the first part of a call to the last, so a second thread that makes a
 //!   large call takes the other cell, or goes by messages when both are taken. A call never waits
 //!   for a cell, and a call from a signal handler never takes one.
-//! * A `siglongjmp` out of a handler that interrupted a call leaves the frame of the call:
-//!   the call's slot in `LIVE` gives its cell back and its lease up (RELEASE) from the hook of the
-//!   jump (`abandon`), next to the holds of the files (`abandon_holds` at an exec). No request of
-//!   the call is outstanding at a jump: a signal is delivered before the service takes a request,
-//!   never while the layer waits for a reply, so the service no longer writes into the cell. A
-//!   deferred cancellation acts only at the C boundary after the call has returned and dropped
-//!   its cell.
+//! * Every call under way has a record (`Live`) in a table, and the record holds its cell
+//!   (`posix_fs::data::CellBook`): the cell goes back by one swap of the record, whoever does it
+//!   first (the call's end, the hook of a jump, the exit of the thread), so it never goes back
+//!   twice. A `siglongjmp` out of a handler that interrupted a call leaves the frame of the call:
+//!   the hook of the jump (`abandon`, from `shared::jump_mark`) gives the cell back and the lease
+//!   up (RELEASE, a blocking round trip). No request of the call is outstanding at a jump: a
+//!   signal is delivered before the service takes a request, never while the layer waits for a
+//!   reply, so the service no longer writes into the cell. The exit of a thread (`pthread_exit`
+//!   from a handler that interrupted a call) does the same for all its records
+//!   (`relibc::exit_thread`). A deferred cancellation acts only at the C boundary after the call
+//!   has returned and dropped its cell, and the waits inside the calls are no points of
+//!   cancellation (`sleep::pause`).
+//! * A lease of a part belongs to the record only once its reply came (`Live::set_lease`): a
+//!   handler that jumps out between the reply and that store leaves the lease to run out on its
+//!   timer (`LEASE_GAP`, 1 s), and so does a jump in the few instructions between taking a cell
+//!   and recording it (the cell stays lost to the process until `exec`).
+//! * A large call from a signal handler on a file whose lease the interrupted call holds waits for
+//!   that lease (up to `LEASE_CLIENT_MAX`, 1 s, when it is waited for) and the interrupted call
+//!   returns short with the lapse (`LAPSED`); the handler's call goes by messages (no cell).
 //! * A forked child has neither the piece (`Map::inherited` leaves it out) nor the cells, and asks
-//!   for its own; its session is a clone the service knows nothing of. An exec'd image starts
-//!   without one, and the service lets the old window go with the session's UNBIND.
+//!   for its own; its session is a clone the service knows nothing of. A fork inside a handler
+//!   whose child returns into the call finds the generation word changed (`generation`) and the
+//!   call goes on by messages, touching no cell. An exec'd image starts without a window, and the
+//!   service lets the old one go with the session's UNBIND.
 //! * The state and the cells are atomic words; no lock of the layer is held over a request. The
 //!   object is made and mapped under the lock of the heap alone.
 
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use entries::{Frame, nested};
+use posix_fs::data::CellBook;
 use proto_data::{CELL_BYTES, CELLS, WINDOW_BYTES};
 use rt::handle::{Handle, Memory};
 use rt::sys;
@@ -52,6 +71,18 @@ static LAPSED: AtomicU64 = AtomicU64::new(0);
 static UNLEASED: AtomicU64 = AtomicU64::new(0);
 /// The parts sent again after NO_WINDOW and a new WINDOW.
 static RETRIES: AtomicU64 = AtomicU64::new(0);
+
+/// The RELEASEs of leases that were not sent or got no answer.
+static RELEASES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// How many RELEASEs of leases failed (the lease then runs out on its timer).
+pub fn probe_releases_dropped() -> u64 {
+    RELEASES_DROPPED.load(Ordering::Relaxed)
+}
+
+pub(crate) fn count_release_dropped() {
+    RELEASES_DROPPED.fetch_add(1, Ordering::Relaxed);
+}
 
 /// How many parts went through a cell so far.
 pub fn probe_cell_parts() -> u64 {
@@ -109,8 +140,10 @@ const REFUSED: usize = 2;
 static STATE: AtomicUsize = AtomicUsize::new(ABSENT);
 /// The handle of the object, which the map of the layer owns; valid while `STATE` is `Ready`.
 static OBJECT: AtomicU64 = AtomicU64::new(0);
-/// The free cells, a bit each.
-static FREE: AtomicU8 = AtomicU8::new(0);
+/// The cells and the cell each record of `LIVE` holds.
+static BOOK: CellBook<LIVE_SLOTS> = CellBook::new();
+/// Counts the forks of the process: a value a call noted before a fork differs in the child.
+static GENERATION: AtomicU32 = AtomicU32::new(0);
 /// The session (its raw handle) the service holds the window for, 0 for none. A session parked
 /// after its service went is never closed, so its number is never the next session's.
 static REGISTERED: AtomicU64 = AtomicU64::new(0);
@@ -124,10 +157,14 @@ const FAILS_MAX: u32 = 4;
 /// The turns a thread waits for another's WINDOW before it goes by messages.
 const WAIT: u32 = 2000;
 
-/// A cell a call holds; it goes back when the value drops.
+/// A cell a call holds; it goes back when the value drops, through the record of the call (the
+/// record is cleared first, then the cell is free). A value that outlives a fork (a child that
+/// returns into the call) gives nothing back.
 pub(crate) struct Cell {
     index: u32,
     base: usize,
+    slot: usize,
+    generation: u32,
 }
 
 impl Cell {
@@ -155,17 +192,19 @@ impl Cell {
         // SAFETY: as for `bytes_mut`; the service wrote the bytes before it replied.
         unsafe { core::slice::from_raw_parts(self.address(), n) }
     }
-
-    /// Gives the cell back at a jump: the value never drops.
-    fn give_back(index: u32) {
-        FREE.fetch_or(1 << index, Ordering::AcqRel);
-    }
 }
 
 impl Drop for Cell {
     fn drop(&mut self) {
-        Cell::give_back(self.index);
+        if self.generation == generation() {
+            BOOK.release(self.slot);
+        }
     }
+}
+
+/// The forks of this process so far, as the call that notes it before a fork can compare.
+pub(crate) fn generation() -> u32 {
+    GENERATION.load(Ordering::Acquire)
 }
 
 /// The window is asked for by one thread: the object and its piece. The address of the piece, or
@@ -187,7 +226,7 @@ fn ask() -> Option<usize> {
     }
     match make() {
         Ok(base) => {
-            FREE.store(((1u16 << CELLS) - 1) as u8, Ordering::Release);
+            BOOK.reset(CELLS);
             STATE.store(base, Ordering::Release);
             Some(base)
         }
@@ -249,11 +288,12 @@ pub(crate) enum Claim {
 pub(crate) fn claim(session: u64) -> Claim {
     let me = owner();
     for turn in 0..WAIT {
+        // No window in this image (a forked child, a refusal, one not yet made): nothing to send.
+        if STATE.load(Ordering::Acquire) <= REFUSED {
+            return Claim::Unavailable;
+        }
         if registered() == session {
             return Claim::Registered;
-        }
-        if STATE.load(Ordering::Acquire) == REFUSED {
-            return Claim::Unavailable;
         }
         if REGISTERING
             .compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire)
@@ -275,42 +315,52 @@ pub(crate) fn claim(session: u64) -> Claim {
     Claim::Unavailable
 }
 
-/// The end of a claimed sending: the service took the window for `session`, or did not.
-pub(crate) fn done(session: u64, accepted: bool) {
-    if accepted {
-        FAILS.store(0, Ordering::Release);
-        REGISTERED.store(session, Ordering::Release);
-    } else if FAILS.fetch_add(1, Ordering::AcqRel) + 1 >= FAILS_MAX {
-        refuse();
+/// How a claimed sending of WINDOW ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sent {
+    /// The service took the window for the session.
+    Accepted,
+    /// The service refused it (INVALID): four in a row give the window up until `exec`.
+    Refused,
+    /// A busy or restarting service, a handle that could not be copied: nothing is learned.
+    Failed,
+}
+
+/// The end of a claimed sending.
+pub(crate) fn done(session: u64, sent: Sent) {
+    match sent {
+        Sent::Accepted => {
+            FAILS.store(0, Ordering::Release);
+            REGISTERED.store(session, Ordering::Release);
+        }
+        Sent::Refused => {
+            if FAILS.fetch_add(1, Ordering::AcqRel) + 1 >= FAILS_MAX {
+                refuse();
+            }
+        }
+        Sent::Failed => {}
     }
     REGISTERING.store(0, Ordering::Release);
 }
 
-/// A free cell of the window, None when every one is taken. The window must be `Ready` and
-/// registered (the caller checked).
-pub(crate) fn take(base: usize) -> Option<Cell> {
-    let mut free = FREE.load(Ordering::Acquire);
-    loop {
-        if free == 0 {
-            return None;
-        }
-        let index = free.trailing_zeros();
-        match FREE.compare_exchange_weak(
-            free,
-            free & !(1 << index),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return Some(Cell { index, base }),
-            Err(now) => free = now,
-        }
-    }
+/// A free cell of the window for the call whose record is `live`, None when every one is taken.
+/// The window must be `Ready` and registered (the caller checked).
+pub(crate) fn take(base: usize, live: &Live) -> Option<Cell> {
+    let index = BOOK.take(live.index)?;
+    Some(Cell {
+        index,
+        base,
+        slot: live.index,
+        generation: live.generation,
+    })
 }
 
-/// A forked child: no window, no cell, no call under way.
+/// A forked child: no window, no cell, no call under way; the calls of the parent's frames that
+/// it returns into find the generation changed.
 pub(crate) fn after_fork() {
+    GENERATION.fetch_add(1, Ordering::AcqRel);
     STATE.store(ABSENT, Ordering::Release);
-    FREE.store(0, Ordering::Release);
+    BOOK.reset(0);
     REGISTERED.store(0, Ordering::Release);
     REGISTERING.store(0, Ordering::Release);
     FAILS.store(0, Ordering::Release);
@@ -339,11 +389,7 @@ struct Slot {
     lease: AtomicU32,
     /// The session the lease belongs to (its raw handle).
     session: AtomicU64,
-    /// The cell the call holds, or `NO_CELL`.
-    cell: AtomicU32,
 }
-
-const NO_CELL: u32 = u32::MAX;
 
 impl Slot {
     const fn new() -> Slot {
@@ -353,26 +399,28 @@ impl Slot {
             alternate: AtomicU32::new(0),
             lease: AtomicU32::new(0),
             session: AtomicU64::new(0),
-            cell: AtomicU32::new(NO_CELL),
         }
     }
 }
 
-/// The slots: the two cells' calls always find one, and a call by messages that finds none goes
-/// on without a record (its lease lapses by its time if a jump leaves it).
+/// The slots. A call that finds none free takes no cell and goes by messages without a record
+/// (its lease then runs out on its timer if a jump leaves it).
 const LIVE_SLOTS: usize = 16;
 static LIVE: [Slot; LIVE_SLOTS] = [const { Slot::new() }; LIVE_SLOTS];
 
 /// A call's record in `LIVE`; it is freed when the value drops (a call that ends or fails). A
-/// jump frees it from the hook.
+/// jump or a thread's exit frees it from the hook. Declare it before the cell, so that the cell
+/// drops first.
 pub(crate) struct Live {
     index: usize,
+    generation: u32,
 }
 
 impl Live {
     /// Records a call of the frame `frame` on the thread. None when no slot is free.
     pub(crate) fn enter(frame: Frame) -> Option<Live> {
         let me = owner();
+        let generation = generation();
         for (index, slot) in LIVE.iter().enumerate() {
             if slot
                 .owner
@@ -383,21 +431,10 @@ impl Live {
                 slot.alternate.store(u32::from(frame.z), Ordering::Relaxed);
                 slot.lease.store(0, Ordering::Relaxed);
                 slot.session.store(0, Ordering::Relaxed);
-                slot.cell.store(NO_CELL, Ordering::Release);
-                return Some(Live { index });
+                return Some(Live { index, generation });
             }
         }
         None
-    }
-
-    /// The call holds `cell` from now on.
-    pub(crate) fn hold_cell(&self, cell: &Cell) {
-        LIVE[self.index].cell.store(cell.index(), Ordering::Release);
-    }
-
-    /// The call's cell went back (the call goes on by messages).
-    pub(crate) fn drop_cell(&self) {
-        LIVE[self.index].cell.store(NO_CELL, Ordering::Release);
     }
 
     /// The lease the next part carries, for the session `session` (0 and 0 for none).
@@ -406,21 +443,41 @@ impl Live {
         slot.session.store(session, Ordering::Relaxed);
         slot.lease.store(lease, Ordering::Release);
     }
+
+    /// Whether a fork happened since the call began: its cell and record are the parent's.
+    pub(crate) fn forked(&self) -> bool {
+        self.generation != generation()
+    }
 }
 
 impl Drop for Live {
     fn drop(&mut self) {
-        LIVE[self.index].owner.store(0, Ordering::Release);
+        if self.generation == generation() {
+            LIVE[self.index].owner.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// Ends the record `slot` of this thread: its cell goes back (through the book, once) and its
+/// lease goes to `release` (the session's raw handle and the number).
+fn end(slot: usize, release: &impl Fn(u64, u32)) {
+    let record = &LIVE[slot];
+    let lease = record.lease.swap(0, Ordering::AcqRel);
+    let session = record.session.load(Ordering::Relaxed);
+    BOOK.release(slot);
+    record.owner.store(0, Ordering::Release);
+    if lease != 0 {
+        release(session, lease);
     }
 }
 
 /// A jump of the calling thread to the frame `target`: every call of this thread whose frame lies
-/// below it is over. Its cell goes back, and `release` is called for the lease it held (the
-/// session's raw handle and the number). A WINDOW the thread was sending goes with it.
+/// below it is over. Its cell goes back, and `release` is called for the lease it held. A WINDOW
+/// the thread was sending goes with it.
 pub(crate) fn abandon(target: Frame, release: impl Fn(u64, u32)) {
     let me = owner();
     let _ = REGISTERING.compare_exchange(me, 0, Ordering::AcqRel, Ordering::Acquire);
-    for slot in &LIVE {
+    for (index, slot) in LIVE.iter().enumerate() {
         if slot.owner.load(Ordering::Acquire) != me {
             continue;
         }
@@ -428,25 +485,28 @@ pub(crate) fn abandon(target: Frame, release: impl Fn(u64, u32)) {
             z: slot.alternate.load(Ordering::Relaxed) as u8,
             sp: slot.sp.load(Ordering::Relaxed),
         };
-        if !nested(frame, target) {
-            continue;
+        if nested(frame, target) {
+            end(index, &release);
         }
-        let cell = slot.cell.swap(NO_CELL, Ordering::AcqRel);
-        let lease = slot.lease.swap(0, Ordering::AcqRel);
-        let session = slot.session.load(Ordering::Relaxed);
-        slot.owner.store(0, Ordering::Release);
-        if cell != NO_CELL {
-            Cell::give_back(cell);
-        }
-        if lease != 0 {
-            release(session, lease);
+    }
+}
+
+/// The calling thread ends: all its calls under way are over.
+pub(crate) fn abandon_thread(release: impl Fn(u64, u32)) {
+    let me = owner();
+    let _ = REGISTERING.compare_exchange(me, 0, Ordering::AcqRel, Ordering::Acquire);
+    for (index, slot) in LIVE.iter().enumerate() {
+        if slot.owner.load(Ordering::Acquire) == me {
+            end(index, &release);
         }
     }
 }
 
 /// Whether the calling thread runs inside a signal handler (a part there goes by messages).
 pub(crate) fn in_handler() -> bool {
-    rt::upcall::query().is_ok_and(|q| q.depth != 0)
+    // The layer's own count: the kernel's depth stays above zero for good after a long jump out of
+    // a handler.
+    crate::handlers::active()
 }
 
 /// Whether a window is mapped (for the probes and tests of the layer).

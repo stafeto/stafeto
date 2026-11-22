@@ -27,6 +27,7 @@ pub use close_driver::{Probe as CloseProbe, probe_hook as probe_close_hook};
 pub mod constants;
 mod fifo_io;
 pub mod fork;
+mod handlers;
 pub mod loader_probe;
 mod lock_call;
 #[cfg(feature = "lock-probe")]

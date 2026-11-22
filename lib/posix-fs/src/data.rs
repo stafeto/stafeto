@@ -589,7 +589,11 @@ impl Parts {
         let count = answer.count as usize;
         if count > plan.len {
             // The lease this part may hold is released by the caller.
-            self.lease = plan.lease.max(answer.lease);
+            self.lease = if answer.lease != 0 {
+                answer.lease
+            } else {
+                plan.lease
+            };
             return Step::Bad;
         }
         self.done += count;
@@ -652,6 +656,88 @@ impl Parts {
         } else {
             Err(error)
         }
+    }
+}
+
+/// The value of a record that holds no cell.
+pub const NO_CELL: u32 = u32::MAX;
+
+/// The cells of a window and the record each call under way keeps of the cell it holds. A cell is
+/// free (a bit) or held by one record (`SLOTS` records); a record that holds a cell is what
+/// gives it back, by one atomic swap that clears the record first and then sets the bit, so
+/// that a call that ends and a jump that abandons it (or a thread's exit) cannot both give the
+/// same cell back: the second finds the record empty.
+pub struct CellBook<const SLOTS: usize> {
+    free: core::sync::atomic::AtomicU8,
+    held: [core::sync::atomic::AtomicU32; SLOTS],
+}
+
+impl<const SLOTS: usize> CellBook<SLOTS> {
+    pub const fn new() -> Self {
+        CellBook {
+            free: core::sync::atomic::AtomicU8::new(0),
+            held: [const { core::sync::atomic::AtomicU32::new(NO_CELL) }; SLOTS],
+        }
+    }
+
+    /// The first `cells` cells are free, no record holds one (the window was made, or a forked
+    /// child starts with none: `cells` 0).
+    pub fn reset(&self, cells: usize) {
+        use core::sync::atomic::Ordering::Release;
+        for record in &self.held {
+            record.store(NO_CELL, Release);
+        }
+        self.free.store(((1u16 << cells) - 1) as u8, Release);
+    }
+
+    /// A free cell for the record `slot`, which then holds it. None when every cell is taken.
+    pub fn take(&self, slot: usize) -> Option<u32> {
+        use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        let mut free = self.free.load(Acquire);
+        loop {
+            if free == 0 {
+                return None;
+            }
+            let index = free.trailing_zeros();
+            match self
+                .free
+                .compare_exchange_weak(free, free & !(1 << index), AcqRel, Acquire)
+            {
+                Ok(_) => {
+                    self.held[slot].store(index, Release);
+                    return Some(index);
+                }
+                Err(now) => free = now,
+            }
+        }
+    }
+
+    /// The record `slot` gives its cell back: whether it held one.
+    pub fn release(&self, slot: usize) -> bool {
+        use core::sync::atomic::Ordering::AcqRel;
+        let cell = self.held[slot].swap(NO_CELL, AcqRel);
+        if cell == NO_CELL {
+            return false;
+        }
+        self.free.fetch_or(1 << cell, AcqRel);
+        true
+    }
+
+    /// The cell the record holds, if any.
+    pub fn held(&self, slot: usize) -> Option<u32> {
+        let cell = self.held[slot].load(core::sync::atomic::Ordering::Acquire);
+        (cell != NO_CELL).then_some(cell)
+    }
+
+    /// The free cells, a bit each.
+    pub fn free_mask(&self) -> u8 {
+        self.free.load(core::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl<const SLOTS: usize> Default for CellBook<SLOTS> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1412,5 +1498,59 @@ mod tests {
             }
         }
         assert_eq!(joined, data.concat());
+    }
+
+    #[test]
+    fn a_cell_is_given_back_once_whatever_gives_it_back_first() {
+        let book = CellBook::<4>::new();
+        book.reset(2);
+        assert_eq!(book.free_mask(), 0b11);
+        let a = book.take(0).unwrap();
+        let b = book.take(1).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(book.take(2), None);
+        assert_eq!(book.held(0), Some(a));
+        // The call ends and drops its cell; the cell is free and another call takes it.
+        assert!(book.release(0));
+        let c = book.take(2).unwrap();
+        assert_eq!(c, a);
+        // A jump (or an exit of the thread) that abandons the first call's record finds it empty:
+        // it gives nothing back, so the cell the third call holds stays its own.
+        assert!(!book.release(0));
+        assert_eq!(book.free_mask(), 0);
+        assert_eq!(book.take(3), None);
+        // Each of the others gives back its own.
+        assert!(book.release(1));
+        assert!(book.release(2));
+        assert_eq!(book.free_mask(), 0b11);
+        assert!(!book.release(1) && !book.release(2));
+        assert_eq!(book.free_mask(), 0b11);
+    }
+
+    #[test]
+    fn a_forked_child_starts_with_no_cell_and_no_record() {
+        let book = CellBook::<2>::new();
+        book.reset(2);
+        book.take(0).unwrap();
+        book.reset(0);
+        assert_eq!(book.free_mask(), 0);
+        assert_eq!(book.held(0), None);
+        assert!(!book.release(0));
+    }
+
+    #[test]
+    fn a_bad_reply_keeps_the_lease_of_the_reply_for_the_release() {
+        let mut parts = Parts::new(2 * p::CELL_BYTES, p::CELL_BYTES);
+        let first = parts.next_part().unwrap();
+        assert_eq!(parts.took(&first, ans(first.len, 0, 5)), Step::Next);
+        let second = parts.next_part().unwrap();
+        assert_eq!(parts.took(&second, ans(second.len + 1, 0, 8)), Step::Bad);
+        assert_eq!(parts.live_lease(), Some(8));
+        let mut parts = Parts::new(2 * p::CELL_BYTES, p::CELL_BYTES);
+        let first = parts.next_part().unwrap();
+        assert_eq!(parts.took(&first, ans(first.len, 0, 5)), Step::Next);
+        let second = parts.next_part().unwrap();
+        assert_eq!(parts.took(&second, ans(second.len + 1, 0, 0)), Step::Bad);
+        assert_eq!(parts.live_lease(), Some(5));
     }
 }

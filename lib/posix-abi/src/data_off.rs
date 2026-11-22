@@ -147,6 +147,9 @@ pub fn writev(_handle: u32, _offset: Option<u64>, _iov: &[&[u8]]) -> Result<usiz
 /// A jump out of a handler: this build has no calls of parts to give up.
 pub fn abandon_frames(_target: entries::Frame) {}
 
+/// The calling thread ends: no calls of parts in this build.
+pub fn abandon_thread() {}
+
 pub fn truncate(_handle: u32, _size: u64) -> Result<(), i32> {
     Err(EBADF)
 }

@@ -316,18 +316,13 @@ fn busy_code() -> u32 {
 /// The calls repeated for a busy service, a millisecond apart: one second.
 const BUSY_TRIES: u32 = 1000;
 
-/// Waits a millisecond with a timed sleep: the thread leaves the processor whatever its level (the
-/// worker of the service runs), and a signal that is caught ends the wait with EINTR.
+/// Waits a millisecond with a timed sleep that is no point of cancellation (`sleep::pause`): the
+/// calls of the volume hold a cell, a lease, a hold of the description or the sending of WINDOW
+/// while they wait, and a deferred cancellation must not leave by `pthread_exit` from here. The
+/// thread leaves the processor whatever its level (the worker of the service runs), and a signal
+/// that is caught ends the wait with EINTR.
 fn pause() -> Result<(), i32> {
-    crate::threads::sleep::clock_nanosleep(
-        crate::clock::CLOCK_MONOTONIC,
-        0,
-        posix_types::Timespec {
-            tv_sec: 0,
-            tv_nsec: 1_000_000,
-        },
-    )
-    .map_err(|(errno, _)| errno)
+    crate::threads::sleep::pause(1_000_000)
 }
 
 /// A reply: its bytes after the status (in `bytes`, `len` of them) and the handle it brought.
@@ -803,32 +798,56 @@ pub fn close_description(handle: u32) {
 
 /// read of the description at its position: the bytes, 0 at the end of the file. A read of more
 /// than one message (`MAX_READ`) goes in parts of a cell (`transfer`), the whole call atomic against
-/// the other calls on the file; a shorter one is one READ.
+/// the other calls on the file; a shorter one is one READ. A call that comes back short because
+/// its lease lapsed goes on without the lease (the rest is another call), so the result is short
+/// only at the end of the file or on an error, as for any read of a regular file.
 pub fn read(handle: u32, out: &mut [u8]) -> Result<usize, i32> {
-    if !pure::fits_one_message(out.len(), p::MAX_READ) {
-        return transfer(handle, None, &mut Reading(Dst::One(out)));
-    }
-    let count = out.len() as u32;
-    let answer = ask(|w| p::read(handle, count, w))?;
-    copy_bytes(&answer, out)
+    read_filling(handle, None, out)
 }
 
 /// pread at `offset`, the position of the description untouched; in parts as `read`.
 pub fn pread(handle: u32, offset: u64, out: &mut [u8]) -> Result<usize, i32> {
-    if !pure::fits_one_message(out.len(), p::MAX_READ) {
-        return transfer(handle, Some(offset), &mut Reading(Dst::One(out)));
+    read_filling(handle, Some(offset), out)
+}
+
+/// A read into `out` at `offset` (or at the position): one READ when it fits a message, else
+/// parts; a part sequence that lapsed is finished by further calls.
+fn read_filling(handle: u32, offset: Option<u64>, out: &mut [u8]) -> Result<usize, i32> {
+    let mut done = 0;
+    loop {
+        let rest = &mut out[done..];
+        let at = offset.map(|o| o.saturating_add(done as u64));
+        let step = if pure::fits_one_message(rest.len(), p::MAX_READ) {
+            let count = rest.len() as u32;
+            let answer = match at {
+                None => ask(|w| p::read(handle, count, w)),
+                Some(at) => ask(|w| p::pread(handle, count, at, w)),
+            };
+            answer.and_then(|answer| copy_bytes(&answer, rest).map(|n| (n, false)))
+        } else {
+            transfer(handle, at, &mut Reading(Dst::One(rest)))
+        };
+        match step {
+            Ok((n, lapsed)) => {
+                done += n;
+                if !lapsed || n == 0 || done == out.len() {
+                    return Ok(done);
+                }
+            }
+            Err(_) if done > 0 => return Ok(done),
+            Err(errno) => return Err(errno),
+        }
     }
-    let count = out.len() as u32;
-    let answer = ask(|w| p::pread(handle, count, offset, w))?;
-    copy_bytes(&answer, out)
 }
 
 /// readv at the position of the description (`offset` None) or at `offset` (preadv): the bytes
-/// read into the buffers in order. One call to the service whatever the vector, atomic as `read`.
+/// read into the buffers in order, as one call atomic as `read`. No caller yet: the C library's
+/// `readv` waits for a hook of the layer, so nothing is promised for `readv` to a program. A
+/// lapsed lease ends it short.
 pub fn readv(handle: u32, offset: Option<u64>, iov: &mut [&mut [u8]]) -> Result<usize, i32> {
     let total = pure::total_len_mut(iov);
     if !pure::fits_one_message(total, p::MAX_READ) {
-        return transfer(handle, offset, &mut Reading(Dst::Many(iov)));
+        return transfer(handle, offset, &mut Reading(Dst::Many(iov))).map(|(n, _)| n);
     }
     let mut bytes = [0u8; p::MAX_READ];
     let n = match offset {
@@ -891,7 +910,7 @@ pub fn fstat(handle: u32) -> Result<proto_fs::NodeInfo, i32> {
 /// the layer's mark for SIGXFSZ).
 pub fn write(handle: u32, bytes: &[u8]) -> Result<usize, i32> {
     if !pure::fits_one_message(bytes.len(), pure::WRITE_MAX) {
-        return transfer(handle, None, &mut Writing(Src::One(bytes)));
+        return transfer(handle, None, &mut Writing(Src::One(bytes))).map(|(n, _)| n);
     }
     let mut split = pure::Splitter::new(bytes.len(), pure::WRITE_MAX);
     while let Some(n) = split.next_len() {
@@ -913,7 +932,7 @@ pub fn write(handle: u32, bytes: &[u8]) -> Result<usize, i32> {
 /// pwrite at `offset`, the position of the description untouched, in parts as `write`.
 pub fn pwrite(handle: u32, offset: u64, bytes: &[u8]) -> Result<usize, i32> {
     if !pure::fits_one_message(bytes.len(), pure::PWRITE_MAX) {
-        return transfer(handle, Some(offset), &mut Writing(Src::One(bytes)));
+        return transfer(handle, Some(offset), &mut Writing(Src::One(bytes))).map(|(n, _)| n);
     }
     let mut split = pure::Splitter::new(bytes.len(), pure::PWRITE_MAX);
     while let Some(n) = split.next_len() {
@@ -933,7 +952,8 @@ pub fn pwrite(handle: u32, offset: u64, bytes: &[u8]) -> Result<usize, i32> {
 }
 
 /// writev at the position of the description (`offset` None) or at `offset` (pwritev): all the
-/// buffers as one call, atomic as `write`.
+/// buffers as one call, atomic as `write`. No caller yet: the C library's `writev` waits for a
+/// hook of the layer, so nothing is promised for `writev` to a program.
 pub fn writev(handle: u32, offset: Option<u64>, iov: &[&[u8]]) -> Result<usize, i32> {
     let total = pure::total_len(iov);
     let one = match offset {
@@ -941,7 +961,7 @@ pub fn writev(handle: u32, offset: Option<u64>, iov: &[&[u8]]) -> Result<usize, 
         Some(_) => pure::PWRITE_MAX,
     };
     if !pure::fits_one_message(total, one) {
-        return transfer(handle, offset, &mut Writing(Src::Many(iov)));
+        return transfer(handle, offset, &mut Writing(Src::Many(iov))).map(|(n, _)| n);
     }
     let mut bytes = [0u8; pure::WRITE_MAX];
     let n = pure::gather(iov, 0, &mut bytes[..total]);
@@ -1047,31 +1067,42 @@ impl Side for Reading<'_, '_> {
 }
 
 /// WINDOW: the window's object goes to the service for the session. One try, with the retries for
-/// a busy service that every call has.
-fn send_window(session: rt::abi::Handle) -> Result<(), i32> {
+/// a busy service that every call has. A service that went (PEER_CLOSED) drops the session.
+fn send_window(session: rt::abi::Handle) -> datawin::Sent {
     let mut w = Writer::new();
-    p::window(&mut w).map_err(|_| EIO)?;
+    if p::window(&mut w).is_err() {
+        return datawin::Sent::Failed;
+    }
     let channel = Handle::<Channel>::borrowed(session);
     let object = datawin::object();
     let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
     let mut tries = 0;
     loop {
         // A refusal consumes the outgoing handle: each send owns a fresh copy.
-        let copy = rt::sys::handle_duplicate(&object, rights).map_err(|_| EIO)?;
+        let Ok(copy) = rt::sys::handle_duplicate(&object, rights) else {
+            return datawin::Sent::Failed;
+        };
         let reply = match rt::sys::send_handles(&channel, w.as_bytes(), [copy.erase()]) {
             Ok(reply) => reply,
             Err(refused) if refused.error == Error::Interrupted => continue,
-            Err(_) => return Err(EIO),
+            Err(refused) => {
+                if refused.error == Error::PeerClosed {
+                    forget(session);
+                }
+                return datawin::Sent::Failed;
+            }
         };
         let mut buffer = [0; MESSAGE_MAX];
         match Reader::new(reply.bytes(&mut buffer)).u32() {
-            Ok(0) => return Ok(()),
+            Ok(0) => return datawin::Sent::Accepted,
             Ok(status) if status == busy_code() && tries < BUSY_TRIES => {
                 tries += 1;
-                pause()?;
+                if pause().is_err() {
+                    return datawin::Sent::Failed;
+                }
             }
-            Ok(status) => return Err(errno_of(status)),
-            Err(_) => return Err(EIO),
+            Ok(p::INVALID) => return datawin::Sent::Refused,
+            _ => return datawin::Sent::Failed,
         }
     }
 }
@@ -1083,17 +1114,18 @@ fn register(session: rt::abi::Handle) -> bool {
         datawin::Claim::Registered => true,
         datawin::Claim::Unavailable => false,
         datawin::Claim::Mine => {
-            let accepted = send_window(session).is_ok();
-            datawin::done(session.0, accepted);
-            accepted
+            let sent = send_window(session);
+            datawin::done(session.0, sent);
+            sent == datawin::Sent::Accepted
         }
     }
 }
 
-/// A free cell for a call of the session `session`, with the window made and registered for it on
-/// the way. None for a call inside a signal handler, a window that is refused or not yet there, a
-/// registration that failed, and when every cell is taken: the call then goes by messages.
-fn acquire_cell(session: rt::abi::Handle) -> Option<datawin::Cell> {
+/// A free cell for the call whose record is `live`, of the session `session`, with the window made
+/// and registered for it on the way. None for a call inside a signal handler, a window that is
+/// refused or not yet there, a registration that failed, and when every cell is taken: the call
+/// then goes by messages.
+fn acquire_cell(session: rt::abi::Handle, live: &datawin::Live) -> Option<datawin::Cell> {
     if datawin::in_handler() {
         return None;
     }
@@ -1101,20 +1133,26 @@ fn acquire_cell(session: rt::abi::Handle) -> Option<datawin::Cell> {
     if datawin::registered() != session.0 && !register(session) {
         return None;
     }
-    datawin::take(base)
+    datawin::take(base, live)
 }
 
-/// RELEASE of a lease, once and with no wait for an answer: the call that held it broke off.
+/// RELEASE of a lease: one send, which is a blocking round trip (the layer waits for the service's
+/// answer, which the service gives at once: it does no volume work for it). The call that held the
+/// lease broke off. A RELEASE that could not be sent is counted (`probe_releases_dropped`): the
+/// lease then runs out on its timer.
 fn release_lease(session: u64, lease: u32) {
     if session == 0 || lease == 0 {
         return;
     }
     let mut w = Writer::new();
     if p::release(lease, &mut w).is_err() {
+        datawin::count_release_dropped();
         return;
     }
     let channel = Handle::<Channel>::borrowed(rt::abi::Handle(session));
-    let _ = rt::sys::send(&channel, w.as_bytes());
+    if rt::sys::send(&channel, w.as_bytes()).is_err() {
+        datawin::count_release_dropped();
+    }
 }
 
 /// A jump out of a handler to the frame `target` (posix_abi::shared::jump_mark): the calls of
@@ -1123,20 +1161,26 @@ pub fn abandon_frames(target: entries::Frame) {
     datawin::abandon(target, release_lease);
 }
 
+/// The calling thread ends (`relibc::exit_thread`): its calls of parts give their cells back and
+/// their leases up.
+pub fn abandon_thread() {
+    datawin::abandon_thread(release_lease);
+}
+
 /// A call of more than one message on the description `handle`, in parts: at `offset` or at the
 /// position of the description. A cell if one is free, else messages; the lease the first part
 /// takes keeps the other calls on the file out until the last part (the call is one atomic
 /// step). The bytes done: the sum of the parts, a short count for an end of file, a limit or a
-/// lapsed lease, and an error only when no part went.
+/// lapsed lease, and an error only when no part went. With the bytes goes whether the call
+/// ended because its lease lapsed.
 #[inline(never)]
-fn transfer<S: Side>(handle: u32, offset: Option<u64>, side: &mut S) -> Result<usize, i32> {
+fn transfer<S: Side>(handle: u32, offset: Option<u64>, side: &mut S) -> Result<(usize, bool), i32> {
     let session = ensure()?;
     let positional = offset.is_some();
-    let live = datawin::Live::enter(crate::change::frame());
-    let mut cell = acquire_cell(session);
-    if let (Some(live), Some(cell)) = (&live, &cell) {
-        live.hold_cell(cell);
-    }
+    // The record comes before the cell, so that the cell drops first; a call with no record (no
+    // slot free) takes no cell.
+    let mut live = datawin::Live::enter(crate::change::frame());
+    let mut cell = live.as_ref().and_then(|live| acquire_cell(session, live));
     let mut parts = pure::Parts::new(
         side.total(),
         pure::part_max(cell.is_some(), S::WRITE, positional),
@@ -1151,6 +1195,13 @@ fn transfer<S: Side>(handle: u32, offset: Option<u64>, side: &mut S) -> Result<u
     let mut retried = false;
     let mut local_fault = false;
     let outcome = loop {
+        // A child of a fork inside a handler that returns into this call: the cell and the record
+        // are the parent's. Nothing of them is touched, and the rest goes by messages.
+        if live.as_ref().is_some_and(datawin::Live::forked) {
+            cell = None;
+            live = None;
+            parts.set_max(pure::part_max(false, S::WRITE, positional));
+        }
         let Some(plan) = parts.next_part() else {
             break Ok(());
         };
@@ -1192,10 +1243,8 @@ fn transfer<S: Side>(handle: u32, offset: Option<u64>, side: &mut S) -> Result<u
                         }
                     }
                 }
+                // The cell goes back through its record.
                 cell = None;
-                if let Some(live) = &live {
-                    live.drop_cell();
-                }
                 parts.set_max(pure::part_max(false, S::WRITE, positional));
                 continue;
             }
@@ -1220,6 +1269,10 @@ fn transfer<S: Side>(handle: u32, offset: Option<u64>, side: &mut S) -> Result<u
         }
         if let Some(live) = &live {
             live.set_lease(session_now().map_or(0, |s| s.0), parts.lease());
+        }
+        if reply.count > 0 && live.as_ref().is_some_and(datawin::Live::forked) {
+            // A fork inside a handler since the reply: the cell is not the child's to read.
+            break Err(EIO);
         }
         if reply.count > 0 {
             match &cell {
@@ -1252,8 +1305,8 @@ fn transfer<S: Side>(handle: u32, offset: Option<u64>, side: &mut S) -> Result<u
     }
     datawin::count_unleased(parts.unleased());
     match outcome {
-        Ok(()) => Ok(parts.finish()),
-        Err(errno) => parts.failed(errno),
+        Ok(()) => Ok((parts.finish(), parts.lapsed())),
+        Err(errno) => parts.failed(errno).map(|n| (n, false)),
     }
 }
 

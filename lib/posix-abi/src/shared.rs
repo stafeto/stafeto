@@ -370,7 +370,9 @@ pub fn jump_mark(target_sp: u64) {
     let preparation = posix_sync::DeliveryPreparation::begin(block);
     // The calls of parts on `/data` that the jump leaves give their cells back and their leases
     // up (no request of theirs is outstanding at a jump).
-    crate::data::abandon_frames(crate::change::frame_at(target_sp));
+    let target = crate::change::frame_at(target_sp);
+    crate::handlers::trim(target);
+    crate::data::abandon_frames(target);
     if let Some(owner) =
         crate::relibc::jump_owner().and_then(|owner| posix_fs::change::OwnerToken::new(owner).ok())
     {
