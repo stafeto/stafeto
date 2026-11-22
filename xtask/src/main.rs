@@ -2657,7 +2657,9 @@ fn main() {
         Some("budget-hog") => budget_hog::run(&args[1..]),
         Some("service-budget") => service_budget::run(&args[1..]),
         Some("budget-breaks") => budget_hog::breaks(),
-        Some("stint-visit-break") => budget_hog::stint_visit_break(),
+        Some("stint-visit-break") => {
+            budget_hog::stint_visit_host_break().and_then(|()| budget_hog::stint_visit_break())
+        }
         Some("budget-break-unbound") => budget_hog::unbound_break(),
         Some("budget-journal") => budget_journal::run(&args[1..]),
         Some("log-quiet") => log_quiet::run(&args[1..]),

@@ -640,7 +640,6 @@ pub fn breaks() -> Result<(), String> {
         "break-budget-exit-no-charge",
         "break-budget-early-replenish",
         "break-budget-full-queue-delay",
-        "break-stint-visit",
     ] {
         let out =
             std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
@@ -653,6 +652,7 @@ pub fn breaks() -> Result<(), String> {
         }
         println!("budget-breaks: {feature} fails the host tests");
     }
+    stint_visit_host_break()?;
     stint_visit_break()?;
     unbound_break()?;
     crate::log_quiet::breaks()?;
@@ -679,13 +679,48 @@ pub fn breaks() -> Result<(), String> {
     crate::service_budget::breaks(None)
 }
 
+/// The host tests of kcore with `break-stint-visit` fail, and the two tests of
+/// the stint's begin and end name it: the stint that runs from the return to
+/// EL0 and stops at the entries (K1), and the budget that ends in a visit
+/// (K2).
+pub fn stint_visit_host_break() -> Result<(), String> {
+    let out = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .current_dir(crate::root())
+        .args(["test", "-p", "kcore", "--features", "break-stint-visit"])
+        .output()
+        .map_err(|e| format!("cargo test: {e}"))?;
+    if out.status.success() {
+        return Err("the host tests of kcore passed with break-stint-visit".into());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for name in STINT_VISIT_HOST_TESTS {
+        let line = format!("test sched::tests::{name} ... FAILED");
+        if !text.lines().any(|l| l == line) {
+            return Err(format!(
+                "the host test {name} did not fail with break-stint-visit"
+            ));
+        }
+    }
+    println!("budget-breaks: break-stint-visit fails the host tests that name it");
+    Ok(())
+}
+
+/// The host tests that `break-stint-visit` must fail by name.
+const STINT_VISIT_HOST_TESTS: [&str; 2] = [
+    "a_stint_runs_from_the_return_to_el0_and_skips_the_visits",
+    "a_budget_that_ends_in_a_visit_counts_a_preemption_and_no_time",
+];
+
 /// The kernel whose stints run through the entries for interrupts
 /// (`break-stint-visit`) fails the overrun test of the test init under
 /// -icount on one CPU: the time of the entries lands in the thread's.
 pub fn stint_visit_break() -> Result<(), String> {
     match crate::init_tests_in(Variant::StintVisitBreak, &qemu::VIRT, true, 1) {
         Ok(_) => Err("the test init passed with break-stint-visit".into()),
-        Err(e) if e.contains("a_budget_overrun_adds_no_entry_time_to_the_thread") => {
+        Err(e)
+            if e.contains("a_budget_overrun_adds_no_entry_time_to_the_thread")
+                && e.contains("the entries of the overrun were charged to the thread") =>
+        {
             println!("budget-breaks: break-stint-visit fails the overrun test of the test init");
             Ok(())
         }

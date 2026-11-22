@@ -2377,12 +2377,16 @@ extern "C" fn timer_helper(arg: u64) -> ! {
 /// The count of preemptions (object_info THREAD_STATE x7) and what one
 /// costs the preempted thread: a burn of init with no other thread, then
 /// the same burn with a thread above it woken by a timer PREEMPTS times.
-/// The time (x5) of the second burn is above the first by the exception
-/// entry, the handler, the wake, the decision and the way back to init,
-/// charged to init; the difference over the count is c_sw, the cost of
-/// one preemption in this setup (the preemptor is a thread of the same
+/// The time (x5) of the second burn is above the first by the save and the
+/// restore of the registers around each preemption: a thread's stint ends at
+/// the entry for the timer's interrupt and begins again at its return to EL0
+/// (spec 8), so the entry, the handler, the wake and the decision are not
+/// charged to init. The difference over the count is c_sw, the cost of one
+/// EL0 preemption in this setup (the preemptor is a thread of the same
 /// process on one CPU: no address-space switch, no SGI, likely no FP save),
-/// so a lower bound; a preemption by another process costs more. A step measured by `thread_ran` holds once per
+/// about 95 ticks, and the same whatever the preemptor is; a preemption that
+/// the thread's own call decides (the call wakes a higher thread) costs about
+/// nothing, since the stint closes and reopens in one visit. A step measured by `thread_ran` holds once per
 /// preemption. Under -icount it prints `preempt charge ticks:`; elsewhere
 /// the numbers mean little and it prints nothing. On one CPU the count must
 /// be above 0 (a burn with no preemption waits up to LATE_PREEMPT_NS for the first, which
@@ -2667,6 +2671,10 @@ extern "C" fn overrun_helper(channel: u64) -> ! {
     sys::thread_exit()
 }
 
+/// The most the thread's time may grow in the episode of the overrun test,
+/// whatever the kernel: two preemptions at about 95 ticks each, with room.
+const OVERRUN_RAN_MAX: u64 = 300;
+
 /// A budget that runs out in the middle of a loop of EL0 costs the thread
 /// no time for the entries it caused (spec 8, stafeto#498). The worker, at 40
 /// with a budget and a place for its notifications, runs one loop under a
@@ -2674,7 +2682,7 @@ extern "C" fn overrun_helper(channel: u64) -> ! {
 /// the loop: the timer enters the kernel, the budget falls to its low level,
 /// the event posts the overrun to the helper at 50, which runs and waits, and
 /// the worker goes on. The time of the second loop is above the first by at
-/// most the two entries of `c_sw` each (the saves and restores of the
+/// most `OVERRUN_RAN_MAX` (a fixed bound: the saves and restores of the
 /// registers), the wall time by at least 1 000 ticks (the episode took place),
 /// the overrun count of the second budget is 1 and x7 grew by 1, and the
 /// time grew by no more than an eighth of the wall time. Under -icount
@@ -2739,16 +2747,22 @@ fn a_budget_overrun_adds_no_entry_time_to_the_thread() -> Outcome {
         p1 == 0 && preempts == 1,
         "the overrun was not counted as one preemption",
     )?;
-    let c_sw = C_SW.load(Relaxed);
+    // The bound is fixed and holds for any kernel under test: the episode
+    // holds one preemption, by the budget's end, at about the registers'
+    // save and restore (95 ticks under -icount), and the entries of the
+    // kernel are the system's. A kernel that charges them takes the episode
+    // well above this bound.
     check(
-        ran2 <= ran1 + 2 * c_sw,
+        C_SW.load(Relaxed) > 0,
+        "the preemption test measured no cost of a preemption before the overrun test",
+    )?;
+    check(
+        ran <= OVERRUN_RAN_MAX,
         "the entries of the overrun were charged to the thread",
     )?;
-    // A kernel that charges the entries counts them in `c_sw` too (the entry
-    // of the timer and the way back), so the bound above lets some of them
-    // by: the share of the thread's time in the episode is at most an
-    // eighth of the episode's wall time, which the registers' save and
-    // restore take and the entries of the kernel do not.
+    // The share of the thread's time in the episode is at most an eighth of
+    // the episode's wall time, which the registers' save and restore take
+    // and the entries of the kernel do not.
     check(
         ran <= wall / 8,
         "more than an eighth of the overrun's time was charged to the thread",
