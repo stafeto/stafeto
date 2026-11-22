@@ -1,0 +1,17 @@
+[package]
+name = "cxx-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "A C++ program on relibc with libc++, libc++abi and libunwind: exceptions, run-time type information, threads, thread-local destructors, waits by address, iostreams, locales and static constructors"
+build = "build.rs"
+
+[[bin]]
+name = "cxx-probe"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }
