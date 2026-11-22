@@ -1,8 +1,26 @@
 diff --git a/third-party/littlefs/lfs.c b/third-party/littlefs/lfs.c
-index c83c7e0..9d7e787 100644
+index c83c7e0..dd5a849 100644
 --- a/third-party/littlefs/lfs.c
 +++ b/third-party/littlefs/lfs.c
-@@ -1481,8 +1481,78 @@ static int lfs_dir_find_match(void *data,
+@@ -186,7 +186,16 @@ static int lfs_bd_flush(lfs_t *lfs,
+             return err;
+         }
+ 
+-        if (validate) {
++        if (validate && lfs->cfg->trust_prog) {
++            // the device took the program: the cache holds what the block now holds
++            // (LFS_TRUST_PROG_NO_COPY is for the host tests of the guard only)
++#ifndef LFS_TRUST_PROG_NO_COPY
++            memcpy(rcache->buffer, pcache->buffer, diff);
++#endif
++            rcache->block = pcache->block;
++            rcache->off = pcache->off;
++            rcache->size = diff;
++        } else if (validate) {
+             // check data on disk
+             lfs_cache_drop(lfs, rcache);
+             int res = lfs_bd_cmp(lfs,
+@@ -1481,8 +1490,78 @@ static int lfs_dir_find_match(void *data,
  // - 0                  if file is found
  // - LFS_ERR_NOENT      if file or parent is not found
  // - LFS_ERR_NOTDIR     if parent is not a dir
@@ -83,7 +101,7 @@ index c83c7e0..9d7e787 100644
      // we reduce path to a single name if we can find it
      const char *name = *path;
  
-@@ -1496,6 +1566,13 @@ static lfs_stag_t lfs_dir_find(lfs_t *lfs, lfs_mdir_t *dir,
+@@ -1496,6 +1575,13 @@ static lfs_stag_t lfs_dir_find(lfs_t *lfs, lfs_mdir_t *dir,
          return LFS_ERR_INVAL;
      }
  
@@ -97,7 +115,7 @@ index c83c7e0..9d7e787 100644
      while (true) {
  nextname:
          // skip slashes if we're a directory
-@@ -1585,11 +1662,24 @@ nextname:
+@@ -1585,11 +1671,24 @@ nextname:
              }
          }
  
@@ -122,7 +140,7 @@ index c83c7e0..9d7e787 100644
  // commit logic
  struct lfs_commit {
      lfs_block_t block;
-@@ -2815,6 +2905,33 @@ static int lfs_dir_read_(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
+@@ -2815,6 +2914,33 @@ static int lfs_dir_read_(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
      return true;
  }
  
@@ -156,7 +174,7 @@ index c83c7e0..9d7e787 100644
  static int lfs_dir_seek_(lfs_t *lfs, lfs_dir_t *dir, lfs_off_t off) {
      // simply walk from head dir
      int err = lfs_dir_rewind_(lfs, dir);
-@@ -2918,6 +3035,104 @@ static int lfs_ctz_find(lfs_t *lfs,
+@@ -2918,6 +3044,104 @@ static int lfs_ctz_find(lfs_t *lfs,
      return 0;
  }
  
@@ -261,7 +279,7 @@ index c83c7e0..9d7e787 100644
  #ifndef LFS_READONLY
  static int lfs_ctz_extend(lfs_t *lfs,
          lfs_cache_t *pcache, lfs_cache_t *rcache,
-@@ -3085,6 +3300,9 @@ static int lfs_file_opencfg_(lfs_t *lfs, lfs_file_t *file,
+@@ -3085,6 +3309,9 @@ static int lfs_file_opencfg_(lfs_t *lfs, lfs_file_t *file,
      file->pos = 0;
      file->off = 0;
      file->cache.buffer = NULL;
@@ -271,7 +289,7 @@ index c83c7e0..9d7e787 100644
  
      // allocate entry for file if it doesn't exist
      lfs_stag_t tag = lfs_dir_find(lfs, &file->m, &path, &file->id);
-@@ -3418,6 +3636,7 @@ relocate:
+@@ -3418,6 +3645,7 @@ relocate:
          }
  
          // actual file updates
@@ -279,7 +297,7 @@ index c83c7e0..9d7e787 100644
          file->ctz.head = file->block;
          file->ctz.size = file->pos;
          file->flags &= ~LFS_F_WRITING;
-@@ -3515,8 +3734,7 @@ static lfs_ssize_t lfs_file_flushedread(lfs_t *lfs, lfs_file_t *file,
+@@ -3515,8 +3743,7 @@ static lfs_ssize_t lfs_file_flushedread(lfs_t *lfs, lfs_file_t *file,
          if (!(file->flags & LFS_F_READING) ||
                  file->off == lfs->cfg->block_size) {
              if (!(file->flags & LFS_F_INLINE)) {
@@ -289,7 +307,7 @@ index c83c7e0..9d7e787 100644
                          file->pos, &file->block, &file->off);
                  if (err) {
                      return err;
-@@ -3665,6 +3883,9 @@ static lfs_ssize_t lfs_file_write_(lfs_t *lfs, lfs_file_t *file,
+@@ -3665,6 +3892,9 @@ static lfs_ssize_t lfs_file_write_(lfs_t *lfs, lfs_file_t *file,
          const void *buffer, lfs_size_t size) {
      LFS_ASSERT((file->flags & LFS_O_WRONLY) == LFS_O_WRONLY);
  
@@ -299,7 +317,7 @@ index c83c7e0..9d7e787 100644
      if (file->flags & LFS_F_READING) {
          // drop any reads
          int err = lfs_file_flush(lfs, file);
-@@ -3765,6 +3986,9 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
+@@ -3765,6 +3995,9 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
          return LFS_ERR_INVAL;
      }
  
@@ -309,7 +327,7 @@ index c83c7e0..9d7e787 100644
      lfs_off_t pos = file->pos;
      lfs_off_t oldsize = lfs_file_size_(lfs, file);
      if (size < oldsize) {
-@@ -3784,6 +4008,7 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
+@@ -3784,6 +4017,7 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
                  return (int)res;
              }
  
@@ -317,7 +335,7 @@ index c83c7e0..9d7e787 100644
              file->ctz.head = LFS_BLOCK_INLINE;
              file->ctz.size = size;
              file->flags |= LFS_F_DIRTY | LFS_F_READING | LFS_F_INLINE;
-@@ -3810,6 +4035,7 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
+@@ -3810,6 +4044,7 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
              // need to set pos/block/off consistently so seeking back to
              // the old position does not get confused
              file->pos = size;
@@ -325,7 +343,7 @@ index c83c7e0..9d7e787 100644
              file->ctz.head = file->block;
              file->ctz.size = size;
              file->flags |= LFS_F_DIRTY | LFS_F_READING;
-@@ -3884,6 +4110,73 @@ static int lfs_stat_(lfs_t *lfs, const char *path, struct lfs_info *info) {
+@@ -3884,6 +4119,73 @@ static int lfs_stat_(lfs_t *lfs, const char *path, struct lfs_info *info) {
      return lfs_dir_getinfo(lfs, &cwd, lfs_tag_id(tag), info);
  }
  
@@ -399,7 +417,7 @@ index c83c7e0..9d7e787 100644
  #ifndef LFS_READONLY
  static int lfs_remove_(lfs_t *lfs, const char *path) {
      // deorphan if we haven't yet, needed at most once after poweron
-@@ -4894,6 +5187,200 @@ static lfs_stag_t lfs_fs_parent(lfs_t *lfs, const lfs_block_t pair[2],
+@@ -4894,6 +5196,200 @@ static lfs_stag_t lfs_fs_parent(lfs_t *lfs, const lfs_block_t pair[2],
  }
  #endif
  
@@ -600,7 +618,7 @@ index c83c7e0..9d7e787 100644
  static void lfs_fs_prepsuperblock(lfs_t *lfs, bool needssuperblock) {
      lfs->gstate.tag = (lfs->gstate.tag & ~LFS_MKTAG(0, 0, 0x200))
              | (uint32_t)needssuperblock << 9;
-@@ -5010,6 +5497,13 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
+@@ -5010,6 +5506,13 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
      // references to full-orphans, effectively hiding them from the deorphan
      // search.
      //
@@ -614,7 +632,7 @@ index c83c7e0..9d7e787 100644
      int pass = 0;
      while (pass < 2) {
          // Fix any orphans
-@@ -5028,7 +5522,8 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
+@@ -5028,7 +5531,8 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
              if (!pdir.split) {
                  // check if we have a parent
                  lfs_mdir_t parent;
@@ -624,7 +642,7 @@ index c83c7e0..9d7e787 100644
                  if (tag < 0 && tag != LFS_ERR_NOENT) {
                      return tag;
                  }
-@@ -5071,6 +5566,7 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
+@@ -5071,6 +5575,7 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
                          if (state < 0) {
                              return state;
                          }
@@ -632,7 +650,7 @@ index c83c7e0..9d7e787 100644
  
                          // did our commit create more orphans?
                          if (state == LFS_OK_ORPHANED) {
-@@ -5105,6 +5601,7 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
+@@ -5105,6 +5610,7 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
                      if (state < 0) {
                          return state;
                      }
@@ -640,7 +658,7 @@ index c83c7e0..9d7e787 100644
  
                      // did our commit create more orphans?
                      if (state == LFS_OK_ORPHANED) {
-@@ -5195,6 +5692,48 @@ static lfs_ssize_t lfs_fs_size_(lfs_t *lfs) {
+@@ -5195,6 +5701,48 @@ static lfs_ssize_t lfs_fs_size_(lfs_t *lfs) {
      return size;
  }
  
@@ -689,7 +707,7 @@ index c83c7e0..9d7e787 100644
  // explicit garbage collection
  #ifndef LFS_READONLY
  static int lfs_fs_gc_(lfs_t *lfs) {
-@@ -6096,6 +6635,42 @@ int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info) {
+@@ -6096,6 +6644,42 @@ int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info) {
      return err;
  }
  
@@ -732,7 +750,7 @@ index c83c7e0..9d7e787 100644
  lfs_ssize_t lfs_getattr(lfs_t *lfs, const char *path,
          uint8_t type, void *buffer, lfs_size_t size) {
      int err = LFS_LOCK(lfs->cfg);
-@@ -6391,6 +6966,23 @@ int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
+@@ -6391,6 +6975,23 @@ int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
      return err;
  }
  
@@ -756,7 +774,7 @@ index c83c7e0..9d7e787 100644
  int lfs_dir_seek(lfs_t *lfs, lfs_dir_t *dir, lfs_off_t off) {
      int err = LFS_LOCK(lfs->cfg);
      if (err) {
-@@ -6462,6 +7054,20 @@ lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
+@@ -6462,6 +7063,20 @@ lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
      return res;
  }
  
@@ -778,10 +796,10 @@ index c83c7e0..9d7e787 100644
      int err = LFS_LOCK(lfs->cfg);
      if (err) {
 diff --git a/third-party/littlefs/lfs.h b/third-party/littlefs/lfs.h
-index 8fbd5b4..574bdf2 100644
+index 8fbd5b4..79fcf12 100644
 --- a/third-party/littlefs/lfs.h
 +++ b/third-party/littlefs/lfs.h
-@@ -291,6 +291,29 @@ struct lfs_config {
+@@ -291,6 +291,35 @@ struct lfs_config {
      // to the most recent minor version when zero.
      uint32_t disk_version;
  #endif
@@ -808,10 +826,16 @@ index 8fbd5b4..574bdf2 100644
 +    // configuration) leaves the release's walk. The disk is the same with or
 +    // without the wayposts, and the file structure has the room either way.
 +    lfs_size_t ctz_hints;
++
++    // stafeto: nonzero: the device reports every failed program (a disk with a
++    // status for each write, never raw flash). A program is not read back and
++    // compared, and the block it wrote stays in the read cache. Zero is the
++    // release.
++    lfs_size_t trust_prog;
  };
  
  // File info structure
-@@ -397,6 +420,14 @@ typedef struct lfs_dir {
+@@ -397,6 +426,14 @@ typedef struct lfs_dir {
      lfs_block_t head[2];
  } lfs_dir_t;
  
@@ -826,7 +850,7 @@ index 8fbd5b4..574bdf2 100644
  // littlefs file type
  typedef struct lfs_file {
      struct lfs_file *next;
-@@ -416,6 +447,19 @@ typedef struct lfs_file {
+@@ -416,6 +453,19 @@ typedef struct lfs_file {
      lfs_cache_t cache;
  
      const struct lfs_file_config *cfg;
@@ -846,7 +870,7 @@ index 8fbd5b4..574bdf2 100644
  } lfs_file_t;
  
  typedef struct lfs_superblock {
-@@ -526,6 +570,45 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
+@@ -526,6 +576,45 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
  // Returns a negative error code on failure.
  int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info);
  
@@ -892,7 +916,7 @@ index 8fbd5b4..574bdf2 100644
  // Get a custom attribute
  //
  // Custom attributes are uniquely identified by an 8-bit type and limited
-@@ -686,6 +769,21 @@ int lfs_dir_close(lfs_t *lfs, lfs_dir_t *dir);
+@@ -686,6 +775,21 @@ int lfs_dir_close(lfs_t *lfs, lfs_dir_t *dir);
  // or a negative error code on failure.
  int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info);
  
@@ -914,7 +938,7 @@ index 8fbd5b4..574bdf2 100644
  // Change the position of the directory
  //
  // The new off must be a value previous returned from tell and specifies
-@@ -724,6 +822,15 @@ int lfs_fs_stat(lfs_t *lfs, struct lfs_fsinfo *fsinfo);
+@@ -724,6 +828,15 @@ int lfs_fs_stat(lfs_t *lfs, struct lfs_fsinfo *fsinfo);
  // Returns the number of allocated blocks, or a negative error code on failure.
  lfs_ssize_t lfs_fs_size(lfs_t *lfs);
  
