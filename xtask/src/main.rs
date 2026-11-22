@@ -2539,7 +2539,7 @@ commands:
   posix-random-net-two the same with two stack instances of the network service on two CPUs: a socket homed on the second instance survives
   posix-random-net-two-steps the same under -icount, the steps of both instances
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
-  data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU
+  data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU; with an argument: write, cap, full, restart, throughput, fast (64 MiB through the window against the bounds of the plan), atomic (atomicity, lease, signals, fork, restart of the large calls), steps (the service's steps and the CPU time of its parts under -icount, on one CPU and on two), atomic-break FEATURE (the atomic probe on a service with a deliberate break, which it must catch)
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
   wfc-probe run the scene demo on OpenWF Composition (<WF/wfc.h>) in QEMU with the compositor: two scenes of three elements (a stretch, quarter turns, a flip, the filters none and faster, a global alpha and a mask) over the windows of two producers, and a third scene of the window of the first revision shown straight, committed in turn 100 times and each composed on request, QEMU's screenshot compared with the CRC of the host's reference (tools/wfc-ref), then the scene changed 100 times on an active context with every screenshot one of the two and both of them among the shots; then scene D (the bilinear filter: two stretches, a flip, a quarter turn) committed once, its screenshot compared and its frame time printed; the counters of the service (no frame failed, bands grow, scene C a frame shown straight) and the device's trace; then the steps of the compositor and the driver under -icount
   wfd-probe run the display demo on OpenWF Display (<WF/wfd.h>) in QEMU with the display driver alone: 100 frames bound to the primary pipeline in turn, each compared with the guest's CRC, the host's own and QEMU's screenshot, and the cursor moved 100 times (the device's trace); then the driver's steps under -icount
@@ -2553,7 +2553,7 @@ commands:
   posix-ipc-steps measure the steps of those calls under -icount, against term B
   nvme-breaks the deliberate breaks of lib/nvme fail its host tests
   data-image <path> [--size 2G] [--fill] the data volume of the image of EC2 made offline: a sparse file with the table and an empty file system, made by the code of the first boot of datafs
-  datafs-breaks the deliberate breaks of lib/datafs fail its host tests
+  datafs-breaks [FEATURE...] the deliberate breaks of lib/datafs fail its host tests (all, or the ones named)
   nvme-persist [breaks|lba4096|mdts1|steps|upgrade|key [nodisk|wrongdisk [breaks]|foreign|image [grown]]|blk-probe|shutdown|stop-handlers [breaks]] the package service on an NVMe disk under QEMU with edk2: the store probe, QEMU killed, the machine again on the same disk file; breaks: the service that writes one sector off must be caught; upgrade: a data volume made as the 0.5.1 image leaves it (no attribute on any entry, the key under /ssh) converted at the first mount of this tree, the modes root 0755, /ssh 0700, key 0600 and the key fingerprint the same on two boots; key: the host key service on the NVMe data volume, the same key fingerprint on two boots of one volume; key nodisk: no data controller, the shell comes up and the key is new on each boot; key foreign: the serial the record wants over a file shaped like a fresh volume of EC2 (the first and last 4 KiB zero, bytes between), datafs says where the first non-zero byte is, prints no byte of the disk and leaves it alone, the key is new on each boot; key image [grown]: the data image of the AMI (`data-image`) as the data disk, mounted on the first boot with no formatting, the key saved and restored (grown: the file 1 GiB longer, the backup of the table moves to the end first); key wrongdisk [blank]: a controller with another serial number is left alone and its file keeps its SHA-256 (breaks: the check of the identity always passes and the case must fail); blk-probe: the probe of the disk service over NVMe with a restart of the service; shutdown: init stops the system (SHUTDOWN) with the NVMe controller stopped and the machine off; stop-handlers [breaks]: the same with two POSIX programs and a file on /data, the stop handlers of the process service and datafs, and the file read back whole on the next boot
   ena-breaks  the deliberate breaks of lib/pci, lib/ena and the places of init's table fail their host tests
   entropy-seed run the entropy service on QEMU with no driver, from the boot seed alone: keys at once, a key again after the service is crashed and restarted; the service that ignores the page must be caught
@@ -2593,7 +2593,7 @@ fn main() {
         Some("efi-breaks") => efi::breaks(),
         Some("ena-breaks") => ena_breaks(),
         Some("nvme-breaks") => nvme_breaks(),
-        Some("datafs-breaks") => datafs_breaks(),
+        Some("datafs-breaks") => datafs_breaks(&args[1..]),
         Some("data-image") => data_image::run(&args[1..]),
         Some("nvme-persist") => store_probe::nvme_persist(&args[1..]),
         Some("uart-breaks") => uart_breaks(),
@@ -3253,25 +3253,46 @@ const NVME_BREAKS: [&str; 10] = [
 /// The deliberate breaks of the data volume (`cargo xtask datafs-breaks`): each is a feature of
 /// `lib/datafs` that does one wrong thing, and its host tests (a cut of the power at every sector of a
 /// workload, the table of a new volume, the protocol) pass without it and fail with it.
-const DATAFS_BREAKS: [&str; 11] = [
+const DATAFS_BREAKS: [&str; 13] = [
     "break-datafs-sync",
     "break-datafs-consistent",
     "break-datafs-busy",
     "break-datafs-gpt-order",
     "break-datafs-relocate-order",
     "break-datafs-ctz-hints",
+    "break-datafs-trust-prog",
     "break-datafs-lease-hold",
     "break-datafs-lease-place",
     "break-datafs-lease-reader",
     "break-datafs-lease-renew",
     "break-datafs-lease-deref",
+    "break-datafs-append-end",
 ];
 
-fn datafs_breaks() -> Result<(), String> {
+/// The breaks to run: every one of `DATAFS_BREAKS`, or only the ones `named` (each must be one of
+/// them), so that a probe of a few fits the time limit of one job.
+fn datafs_breaks_chosen(named: &[String]) -> Result<Vec<&'static str>, String> {
+    if named.is_empty() {
+        return Ok(DATAFS_BREAKS.to_vec());
+    }
+    named
+        .iter()
+        .map(|n| {
+            DATAFS_BREAKS
+                .iter()
+                .copied()
+                .find(|f| f == n)
+                .ok_or_else(|| format!("datafs-breaks: {n} is not a break of lib/datafs"))
+        })
+        .collect()
+}
+
+fn datafs_breaks(named: &[String]) -> Result<(), String> {
+    let chosen = datafs_breaks_chosen(named)?;
     let mut ok = cargo();
     ok.args(["test", "--package", "datafs", "--lib"]);
     run_cmd(&mut ok)?;
-    for feature in DATAFS_BREAKS {
+    for feature in chosen {
         let mut broken = cargo();
         broken.args([
             "test",
@@ -11215,6 +11236,16 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("data-posix write", || {
             data_posix::probe(data_posix::Mode::Write, &qemu::VIRT)
         }),
+        // The large calls on /data through the window: 64 MiB against the bounds of the plan, the
+        // atomicity of a call, the lease, signals, fork and a restart in the middle of a call, and
+        // the steps of the service under -icount.
+        job("data-fast", || {
+            data_posix::probe(data_posix::Mode::Fast, &qemu::VIRT)
+        }),
+        job("data-atomic", || {
+            data_posix::probe(data_posix::Mode::Atomic, &qemu::VIRT)
+        }),
+        job("data-steps", || data_posix::steps(&qemu::VIRT)),
         job("vi-dialog", vi_dialog::vi_dialog),
         // The window library of C programs against QEMU's screenshots.
         job("posix-window", || posix_window::probe(&qemu::VIRT)),
@@ -15061,6 +15092,27 @@ mod tests {
         assert_eq!(
             super::PROGRAM_EPOCH.parse::<u64>().unwrap(),
             56 * 365 * 86_400 + 14 * 86_400
+        );
+    }
+    #[test]
+    fn datafs_breaks_runs_every_break_or_the_ones_named() {
+        assert_eq!(
+            datafs_breaks_chosen(&[]).unwrap().len(),
+            DATAFS_BREAKS.len()
+        );
+        let two = [
+            "break-datafs-sync".to_owned(),
+            "break-datafs-trust-prog".to_owned(),
+        ];
+        assert_eq!(
+            datafs_breaks_chosen(&two).unwrap(),
+            ["break-datafs-sync", "break-datafs-trust-prog"]
+        );
+        let wrong = ["break-datafs-none".to_owned()];
+        assert!(
+            datafs_breaks_chosen(&wrong)
+                .unwrap_err()
+                .contains("break-datafs-none")
         );
     }
 

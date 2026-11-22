@@ -525,3 +525,190 @@ fn a_reader_keeps_the_old_snapshot_while_another_handle_rewrites_the_file() {
         }
     }
 }
+
+/// A fresh volume of `blocks` blocks mounted with `trust_prog` as given (1 is the service's).
+fn fresh(blocks: u64, trust_prog: u32) -> Vol {
+    let mut fs = attach(MemDevice::new(blocks * BLOCK_SECTORS));
+    fs.set_trust_prog(trust_prog);
+    fs.format().unwrap();
+    fs.mount().unwrap();
+    fs
+}
+
+/// Writes `bytes` bytes to a new file `/f` in calls of 64 KiB and syncs it; the reads and the
+/// programs of the device for the writes (the open and the close are not counted).
+fn write_cost(fs: &mut Vol, bytes: u64) -> (u64, u64) {
+    let f = fs.open(b"/f", Open::WRITE.with(Open::CREATE)).unwrap();
+    let (reads, programs) = (fs.device().reads, fs.device().programs);
+    let mut at = 0;
+    while at < bytes {
+        let n = (bytes - at).min(65536) as usize;
+        assert_eq!(fs.write(f, &pattern(at, n)).unwrap(), n);
+        at += n as u64;
+    }
+    fs.sync(f).unwrap();
+    let cost = (fs.device().reads - reads, fs.device().programs - programs);
+    fs.close(f).unwrap();
+    cost
+}
+
+#[test]
+fn a_write_in_order_is_not_read_back_with_trust_prog() {
+    let bytes = 1u64 << 20;
+    let blocks = bytes / BLOCK_DATA + 1;
+    let (reads_on, programs_on) = write_cost(&mut fresh(2048, 1), bytes);
+    let (reads_off, programs_off) = write_cost(&mut fresh(2048, 0), bytes);
+    std::println!(
+        "write of {blocks} blocks: trust_prog 1: {reads_on} reads {programs_on} programs, \
+         0: {reads_off} reads {programs_off} programs"
+    );
+    // One program for each block of data (the metadata commit adds a few) and at most 0.6 reads.
+    assert!(
+        programs_on <= blocks + blocks / 50 + 4,
+        "{programs_on} programs for {blocks} blocks"
+    );
+    assert_eq!(programs_on, programs_off);
+    assert!(
+        reads_on * 10 <= blocks * 6,
+        "{reads_on} reads for {blocks} blocks"
+    );
+    // The release reads each block back, and the pointers of the skip list too.
+    assert!(
+        reads_off * 10 >= blocks * 12,
+        "{reads_off} reads for {blocks} blocks"
+    );
+}
+
+/// The same random operations on two volumes, `trust_prog` 0 and 1: every answer is the model's and
+/// the media are the same byte for byte.
+#[test]
+fn random_operations_leave_the_same_disk_with_and_without_trust_prog() {
+    for seed in 1..=4u64 {
+        let mut rng = Rng((seed * 104_729) | 1);
+        let mut sides: Vec<Side> = [0u32, 1]
+            .iter()
+            .map(|&on| {
+                let mut s = Side::new(16);
+                s.fs.close(s.file).unwrap();
+                s.fs.unmount().unwrap();
+                s.fs.set_trust_prog(on);
+                s.fs.mount().unwrap();
+                s.file = s.fs.open(b"/f", Open::READ_WRITE).unwrap();
+                s
+            })
+            .collect();
+        let mut model: Vec<u8> = Vec::new();
+        for step in 0..300 {
+            let len = if rng.below(8) == 0 {
+                rng.below(200_000)
+            } else {
+                rng.below(9000)
+            } as usize;
+            let at = rng.below(model.len() as u64 + 10_000);
+            match rng.below(10) {
+                0..=4 => {
+                    let data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+                    let start = at.min(model.len() as u64 + 1000) as usize;
+                    if model.len() < start + len {
+                        model.resize(start + len, 0);
+                    }
+                    model[start..start + len].copy_from_slice(&data);
+                    for s in sides.iter_mut() {
+                        s.fs.seek(s.file, start as i32, Whence::Set).unwrap();
+                        assert_eq!(s.fs.write(s.file, &data).unwrap(), len);
+                    }
+                }
+                5 | 6 => {
+                    let size = at.min(model.len() as u64) as usize;
+                    model.truncate(size);
+                    for s in sides.iter_mut() {
+                        s.fs.truncate(s.file, size as u32).unwrap();
+                    }
+                }
+                7 => {
+                    for s in sides.iter_mut() {
+                        s.fs.sync(s.file).unwrap();
+                    }
+                }
+                _ => {
+                    let pos = at.min(model.len() as u64);
+                    let want = model_read(&model, pos, len);
+                    for s in sides.iter_mut() {
+                        s.fs.seek(s.file, pos as i32, Whence::Set).unwrap();
+                        let mut buf = vec![0u8; len];
+                        let n = s.fs.read(s.file, &mut buf).unwrap();
+                        assert_eq!(buf[..n], want[..], "seed {seed} step {step}");
+                    }
+                }
+            }
+        }
+        let mut media = Vec::new();
+        for mut s in sides {
+            s.fs.close(s.file).unwrap();
+            s.fs.unmount().unwrap();
+            let mut dev = s.fs.into_device();
+            dev.flush().unwrap();
+            media.push(dev);
+        }
+        assert!(
+            media[0].medium() == media[1].medium(),
+            "seed {seed}: the disk with trust_prog is not the disk without"
+        );
+    }
+}
+
+#[test]
+fn a_cut_at_every_sector_of_a_large_write_reads_the_same_with_and_without_trust_prog() {
+    let mut fs = volume_with_file(512, 150_000, 16);
+    fs.unmount().unwrap();
+    let mut base = fs.into_device();
+    base.flush().unwrap();
+    let op = |fs: &mut Vol| {
+        if let Ok(f) = fs.open(b"/f", Open::READ_WRITE) {
+            let _ = fs.seek(f, 40_000, Whence::Set);
+            let _ = fs.write(f, &pattern(7, 300_000));
+            let _ = fs.sync(f);
+        }
+    };
+    let mut probe = attach(base.clone());
+    probe.mount().unwrap();
+    let before = probe.device().written;
+    op(&mut probe);
+    let sectors = probe.device().written - before;
+    assert!(sectors > 500, "{sectors} sectors");
+    // The sectors that reach the disk before a cut are the same with both settings: the cut counts
+    // written sectors, and a program is the same bytes either way.
+    let mut with = attach(base.clone());
+    with.set_trust_prog(0);
+    with.mount().unwrap();
+    let before = with.device().written;
+    op(&mut with);
+    assert_eq!(with.device().written - before, sectors);
+    for cut in 0..=sectors {
+        for survive in [
+            crate::mem::Survive::None,
+            crate::mem::Survive::All,
+            crate::mem::Survive::Random(cut + 3),
+        ] {
+            let mut seen = Vec::new();
+            for on in [0u32, 1] {
+                let mut fs = attach(base.clone());
+                fs.set_trust_prog(on);
+                fs.mount().unwrap();
+                fs.device().cut_after(Some(cut));
+                op(&mut fs);
+                let mut dev = fs.into_device();
+                dev.power_cycle(survive);
+                seen.push((what_a_reader_sees(&dev, 16, 6000), dev));
+            }
+            assert!(
+                seen[0].0 == seen[1].0,
+                "cut {cut} {survive:?}: the reads differ"
+            );
+            assert!(
+                seen[0].1.medium() == seen[1].1.medium(),
+                "cut {cut} {survive:?}: the media differ"
+            );
+        }
+    }
+}

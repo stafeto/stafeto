@@ -169,6 +169,9 @@ void datafs_setup(struct datafs *d, uint32_t blocks)
     // The wayposts of an open file for the blocks of a read in order (a file read from start to end
     // costs a few reads of the disk for each block, and about log2(n) without them).
     d->cfg.ctz_hints = CTZ_HINTS;
+    // The disk service answers every program with a status, so a program is not read back: the
+    // block it wrote stays in the read cache (lfs_config.trust_prog).
+    d->cfg.trust_prog = 1;
     for (int i = 0; i < DATAFS_FILES; i++) {
         d->file_cfg[i].buffer = d->file_cache[i];
     }
@@ -203,6 +206,13 @@ void datafs_set_block_cycles(struct datafs *d, int32_t cycles)
 void datafs_set_ctz_hints(struct datafs *d, uint32_t hints)
 {
     d->cfg.ctz_hints = hints;
+}
+
+// The host tests only: 1 (the service's) leaves a program unread and its block in the read cache, 0
+// is the release's read back, set between `datafs_setup` and the next mount.
+void datafs_set_trust_prog(struct datafs *d, uint32_t on)
+{
+    d->cfg.trust_prog = on;
 }
 
 // The same with a table of `cells` cells (at most ORPHAN_CELLS), for the tests of a full table.
