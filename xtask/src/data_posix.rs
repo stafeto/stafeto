@@ -632,10 +632,11 @@ pub const FAST_READ_MS_REFERENCE: u64 = 8_000;
 /// The blocks of the 64 MiB file.
 const FAST_BLOCKS: u64 = 64 * 1024 * 1024 / 4096;
 /// The write phase writes at most one block of the disk for each block of the file and 64 more
-/// (the tree and the log), and reads at most this many for each block (the read-back 1.0 and the
-/// ctz skip list 0.5, with 0.05 of margin).
+/// (the tree and the log), and reads at most this many for each block (the pointers of the ctz skip
+/// list, 0.5, with 0.1 of margin): littlefs does not read a program back (`trust_prog`) and keeps the
+/// block it wrote in the read cache.
 pub const FAST_WRITE_DISK_WRITES_MAX: u64 = FAST_BLOCKS + 64;
-pub const FAST_WRITE_DISK_READS_PER_BLOCK_MAX: f64 = 1.55;
+pub const FAST_WRITE_DISK_READS_PER_BLOCK_MAX: f64 = 0.6;
 /// The reads of the disk for each block of 4 KiB of the file in the read, at most.
 pub const FAST_READS_PER_BLOCK_MAX: f64 = 2.05;
 /// The time of one disk operation in the write phase (reads and writes of the disk) is at most this
@@ -1523,7 +1524,7 @@ mod tests {
     }
 
     const GOOD_OPS: Ops = Ops {
-        write_reads: 24_576,
+        write_reads: 8_192,
         write_writes: 16_416,
         read_reads: 32_768,
     };
@@ -1568,9 +1569,9 @@ mod tests {
 
     #[test]
     fn data_fast_passes_a_run_inside_the_bounds_and_says_the_numbers() {
-        let report = fast_verdict(&fast_lines(6200, 6000, GOOD_OPS, 10_900)).unwrap();
+        let report = fast_verdict(&fast_lines(4200, 6000, GOOD_OPS, 10_900)).unwrap();
         assert!(
-            report.contains("6200 ms") && report.contains("2.00 for each"),
+            report.contains("4200 ms") && report.contains("2.00 for each"),
             "{report}"
         );
         // The edges: at the bound passes, one past fails.
@@ -1580,24 +1581,24 @@ mod tests {
             (FAST_READS_PER_BLOCK_MAX * FAST_BLOCKS as f64) as u64,
         );
         assert!(fast_verdict(&fast_lines(8000, 8000, top, 10_900)).is_ok());
-        let top = || ops(24_576, 16_416, 32_768);
+        let top = || ops(8_192, 16_416, 32_768);
         for (lines, what) in [
             (
-                fast_lines(6200, 6000, ops(25_396, 16_416, 32_768), 10_900),
+                fast_lines(4200, 6000, ops(9_831, 16_416, 32_768), 10_900),
                 "the write made",
             ),
             (
-                fast_lines(6200, 6000, ops(24_576, 16_449, 32_768), 10_900),
+                fast_lines(4200, 6000, ops(8_192, 16_449, 32_768), 10_900),
                 "the write made",
             ),
             (
-                fast_lines(6200, 6000, ops(24_576, 16_416, 33_600), 10_900),
+                fast_lines(4200, 6000, ops(8_192, 16_416, 33_600), 10_900),
                 "reads of the disk",
             ),
             // The write phase slower for each operation than the read phase.
             (fast_lines(11_000, 6000, top(), 10_900), "a disk operation"),
             // The big read as slow as the old path.
-            (fast_lines(6200, 6000, top(), 3_000), "times the control"),
+            (fast_lines(4200, 6000, top(), 3_000), "times the control"),
         ] {
             let error = fast_verdict(&lines).unwrap_err();
             assert!(error.contains(what), "{error}");
@@ -1606,7 +1607,7 @@ mod tests {
 
     #[test]
     fn data_fast_refuses_a_run_that_lacks_a_line_a_counter_or_the_parts() {
-        let good = fast_lines(6200, 6000, GOOD_OPS, 10_900);
+        let good = fast_lines(4200, 6000, GOOD_OPS, 10_900);
         // No line of the controls, no counter after the read.
         for gone in [11, 7] {
             let mut lines = good.clone();

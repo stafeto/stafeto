@@ -21,12 +21,15 @@ model = []
 # an open file may be removed. `break-datafs-gpt-order`: a new table is written start first.
 # `break-datafs-relocate-order`: the moved backup is announced by the primary header before it is there.
 # `break-datafs-ctz-hints`: a write or a truncation of a file leaves its wayposts for the blocks of a read.
+# `break-datafs-trust-prog`: a program that is not read back marks its block as held by the read cache without
+# copying the bytes in.
 break-datafs-sync = []
 break-datafs-consistent = []
 break-datafs-busy = []
 break-datafs-gpt-order = []
 break-datafs-relocate-order = []
 break-datafs-ctz-hints = []
+break-datafs-trust-prog = []
 # The deliberate breaks of the leases (tests_lease.rs): `break-datafs-lease-hold` no lease holds a
 # job back; `break-datafs-lease-place` a part of the holder keeps its own place in the queue;
 # `break-datafs-lease-reader` a new read lease does not wait behind a writer that waits;
