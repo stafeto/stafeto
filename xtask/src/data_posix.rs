@@ -889,7 +889,7 @@ pub fn fast_verdict(lines: &[String]) -> Result<String, String> {
 
 /// Under `-icount` on one CPU the worker's own time for a part of 64 KiB, the mean over the pass of
 /// 64 MiB, at most this many microseconds: 31.5 ms for a write part (a block of 4 KiB written costs
-/// the copy, the read-back and the walk of the skip list of littlefs) and 3.8 ms for a read part.
+/// the copy, the program and the walk of the skip list of littlefs) and 3.8 ms for a read part.
 pub const PART_OWN_WRITE_MEAN_MAX_US: u64 = 31_500;
 pub const PART_OWN_READ_MEAN_MAX_US: u64 = 3_800;
 /// On two CPUs in real time the share of the worker's CPU time in the span of the parts, at most, in
