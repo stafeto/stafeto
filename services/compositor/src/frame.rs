@@ -424,8 +424,10 @@ impl Pacer {
                     c.direct_max_ns = c.direct_max_ns.max(time);
                 }
                 // Late: shown after the start of the next period; on it is
-                // in time.
-                if now > self.clock.start(work.k + 1) {
+                // in time. Only a frame that released a buffer counts: one
+                // taken before a reset (its taking is in no `releases` of
+                // this count) is a frame of the earlier count.
+                if work.taken_at >= c.since && now > self.clock.start(work.k + 1) {
                     c.late += 1;
                 }
             }
@@ -829,6 +831,25 @@ mod tests {
             assert_eq!(p.counters.late, late, "offset {offset}");
             assert_eq!(p.counters.frames, 1);
         }
+    }
+
+    #[test]
+    fn a_frame_taken_before_a_reset_is_not_counted_late() {
+        let mut p = pacer();
+        let c = *p.clock();
+        p.change(c.start(1) - 1, None);
+        assert_eq!(p.fire(c.start(1)), Fire::Take(1));
+        p.counters.reset(c.start(1) + 10);
+        // Shown two periods on: late, but its taking is in no count of this one.
+        p.shown(c.start(3) + 5, true, false);
+        assert_eq!((p.counters.frames, p.counters.releases), (1, 0));
+        assert_eq!(p.counters.late, 0);
+        // A frame taken after the reset and shown late is counted.
+        p.change(c.start(4) - 1, None);
+        assert_eq!(p.fire(c.start(4)), Fire::Take(4));
+        p.shown(c.start(6) + 5, true, false);
+        assert_eq!((p.counters.frames, p.counters.releases), (2, 1));
+        assert_eq!(p.counters.late, 1);
     }
 
     #[test]
