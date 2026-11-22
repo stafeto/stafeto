@@ -1011,6 +1011,24 @@ pub const RELIBC_THREADS_TABLE: &[Record] = &[
     super::entropy::ENTROPY,
 ];
 
+/// The C++ probe (tests/cxx-probe): the services of POSIX_PROCS_TABLE (its
+/// threads, its fork for the terminate checks) with the probe as the
+/// program that runs. Its quota is the one of a child of fork.
+pub const CXX_PROBE_TABLE: &[Record] = &[
+    POSIX_PROCS_TABLE[0],
+    POSIX_PROCS_TABLE[1],
+    POSIX_PROCS_TABLE[2],
+    POSIX_PROCS_TABLE[3],
+    Record {
+        name: "cxx-probe",
+        program: "cxx-probe",
+        args: b"cxx-probe\0",
+        ..POSIX_PROCS_TABLE[4]
+    },
+    POSIX_PROCS_TABLE[5],
+    POSIX_PROCS_TABLE[6],
+];
+
 /// The service of long operations of rtbench 2 (tests/svc, role `l`)
 /// under the name of the console's driver: standard input of the
 /// benchmark reads from it. Above the benchmark's ceiling, as a service.

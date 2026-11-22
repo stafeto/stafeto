@@ -55,6 +55,7 @@ mod ci;
 mod clock_probe;
 mod comp_probe;
 mod cpus_dialog;
+mod cxx_probe;
 mod cyrillic;
 mod data_image;
 mod data_posix;
@@ -2199,6 +2200,11 @@ commands:
   posix-shared verify cross-thread Rust POSIX file and directory state
   relibc    build relibc for stafeto from the fork at its pinned commit
             (tools/build-relibc.py) into target/relibc/sysroot
+  libcxx    build libc++, libc++abi and libunwind for stafeto against relibc
+            (tools/build-libcxx.py) into target/libcxx
+  cxx-probe run a C++ program on relibc with libc++ in QEMU: exceptions through
+            five frames and a C frame, RTTI, threads, thread_local destructors, waits
+            by address, iostreams, locales, static constructors and terminate
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
   sporadic-probe SCHED_SPORADIC in 0.5.0 through relibc and the layer: refused for root and for a user
@@ -2700,6 +2706,8 @@ fn main() {
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
         Some("relibc") => relibc(),
+        Some("libcxx") => libcxx(),
+        Some("cxx-probe") => cxx_probe::probe(&qemu::VIRT),
         Some("os-test") => match &args[1..] {
             [flag, rest @ ..] if flag == "--full-basic" => {
                 jobs::parse_jobs("os-test --full-basic", rest).and_then(ostest::run_full_basic)
@@ -5419,6 +5427,7 @@ fn bash_terms() -> Result<(Vec<u8>, String), String> {
 /// The builds of relibc and of BusyBox of this run of xtask: one is
 /// enough for every check that takes them.
 static RELIBC_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
+static LIBCXX_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static LIBC_SO_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static DYNAMIC_BUILT: Mutex<Vec<(String, ())>> = Mutex::new(Vec::new());
 static BUSYBOX_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
@@ -5429,6 +5438,15 @@ static PACKAGE_SCRIPTS_BUILT: Mutex<Vec<(String, ())>> = Mutex::new(Vec::new());
 /// relibc built, once in a run of xtask.
 fn relibc() -> Result<(), String> {
     once(&RELIBC_BUILT, (), build_relibc)
+}
+
+/// libc++, libc++abi and libunwind built (tools/build-libcxx.py), once in a
+/// run of xtask, after relibc: they are compiled against its sysroot.
+fn libcxx() -> Result<(), String> {
+    once(&LIBCXX_BUILT, (), || {
+        relibc()?;
+        run_cmd(&mut build_script(root().join("tools/build-libcxx.py")))
+    })
 }
 
 /// libc.so and the programs of its probe built (tools/build-libc-so.py,
@@ -10921,6 +10939,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-tty-steps", || posix_tty_probe(false, true)),
         job("relibc-hello", relibc_hello_probe),
         job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
+        job("cxx-probe", || cxx_probe::probe(&qemu::VIRT)),
         job("posix-files", posix_files_probe),
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
@@ -11464,6 +11483,7 @@ fn host_tests() -> Result<(), String> {
         "tools/test_os_test_headers.py",
         "tools/test_ca_bundle.py",
         "tools/test_build_freetype.py",
+        "tools/test_build_libcxx.py",
         "tools/test_build_lvgl.py",
         "tools/test_lvgl_port.py",
         "tools/test_build_libc_so.py",
@@ -15020,6 +15040,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "relibc-threads",
         "--package",
+        "cxx-probe",
+        "--package",
         "posix-procs",
         "--package",
         "os-test-run",
@@ -17824,6 +17846,7 @@ mod entropy_in_images_tests {
             ("posix_display::PROGRAMS", &crate::posix_display::PROGRAMS),
             ("data_posix::PROGRAMS", &crate::data_posix::PROGRAMS),
             ("posix_window::PROGRAMS", &crate::posix_window::PROGRAMS),
+            ("cxx_probe::PROGRAMS", &crate::cxx_probe::PROGRAMS),
             ("wfd::PROGRAMS", &crate::wfd::PROGRAMS),
             ("wfd::STEPS_PROGRAMS", &crate::wfd::STEPS_PROGRAMS),
             ("store_probe::PROGRAMS", &crate::store_probe::PROGRAMS),

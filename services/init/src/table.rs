@@ -1595,6 +1595,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-abi") as usize
     + cfg!(feature = "table-relibc") as usize
     + cfg!(feature = "table-relibc-threads") as usize
+    + cfg!(feature = "table-cxx-probe") as usize
     + cfg!(feature = "table-posix-procs") as usize
     + cfg!(feature = "table-posix-lock-ring") as usize
     + cfg!(feature = "table-posix-shares") as usize
@@ -1706,6 +1707,7 @@ const _: () = assert!(
     feature = "table-posix-abi",
     feature = "table-relibc",
     feature = "table-relibc-threads",
+    feature = "table-cxx-probe",
     feature = "table-posix-procs",
     feature = "table-posix-lock-ring",
     feature = "table-posix-shares",
@@ -1823,6 +1825,8 @@ pub const TABLE: &[Record] = vz::POSIX_NATIVE_TABLE;
 pub const TABLE: &[Record] = ramfs::POSIX_STEPS_TABLE;
 #[cfg(feature = "table-relibc-threads")]
 pub const TABLE: &[Record] = ramfs::RELIBC_THREADS_TABLE;
+#[cfg(feature = "table-cxx-probe")]
+pub const TABLE: &[Record] = ramfs::CXX_PROBE_TABLE;
 #[cfg(feature = "table-os-test")]
 pub const TABLE: &[Record] = ramfs::OS_TEST_TABLE;
 #[cfg(feature = "table-os-test-data")]
@@ -2076,6 +2080,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     ramfs::POSIX_STEPS_TABLE,
     ramfs::OS_TEST_TABLE,
     ramfs::RELIBC_THREADS_TABLE,
+    ramfs::CXX_PROBE_TABLE,
     ramfs::RTBENCH_POSIX_TABLE,
     ramfs::TTY_TABLE,
     ramfs::TTY_STEPS_TABLE,
@@ -3787,6 +3792,7 @@ mod tests {
             ramfs::POSIX_STEPS_TABLE,
             ramfs::OS_TEST_TABLE,
             ramfs::RELIBC_THREADS_TABLE,
+            ramfs::CXX_PROBE_TABLE,
             ramfs::RTBENCH_POSIX_TABLE,
             ramfs::POSIX_RANDOM_TABLE,
             ramfs::POSIX_RANDOM_RESTART_TABLE,
@@ -4332,6 +4338,7 @@ mod tests {
             ramfs::POSIX_PROCS_TABLE,
             ramfs::RELIBC_TABLE,
             ramfs::RELIBC_THREADS_TABLE,
+            ramfs::CXX_PROBE_TABLE,
             ramfs::OS_TEST_TABLE,
             ramfs::POSIX_PTY_TABLE,
             vz::POSIX_ABI_TABLE,
@@ -4362,6 +4369,7 @@ mod tests {
                     "posix-procs",
                     "relibc-hello",
                     "relibc-threads",
+                    "cxx-probe",
                     "os-test-run",
                     "rtbench-posix",
                     "posix-random",

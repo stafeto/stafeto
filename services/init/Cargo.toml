@@ -79,6 +79,8 @@ table-layer-probe = []
 table-posix-abi = []
 table-relibc = []
 table-relibc-threads = []
+# The C++ probe (xtask cxx-probe): the services of posix-procs with the C++ probe as the program that runs.
+table-cxx-probe = []
 # The probe of POSIX processes (posix-procs) and the records it spawns.
 table-posix-procs = []
 table-posix-lock-ring = []

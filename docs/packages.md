@@ -101,6 +101,16 @@ them for the licence notes of the image.
   package without files and without a package that links it in is accepted. Its
   licence text is `COPYING` of the archive, and its notice directory
   `/usr/share/licenses/pixman/` carries it with the note of the source.
+- libc++ (`packages/libcxx.toml`, Apache-2.0 WITH LLVM-exception OR MIT OR NCSA, 23.1.6) is an
+  optional package of the games image that installs no file: C++ programs
+  link it. `tools/build-libcxx.py` fetches the release archive of the LLVM
+  project (a copy is kept in `target/libcxx-src/`), checks its SHA-256 and
+  builds `target/libcxx/lib/{libc++,libc++abi,libunwind}.a` with the headers
+  in `target/libcxx/include/c++/v1` (`docs/cxx.md`). `xtask/src/packages.rs`
+  names it in `SERVICE_LIBRARIES`, as no package links it in yet; its licence
+  text is the three `LICENSE.TXT` files of libcxx, libcxxabi and libunwind.
+  `python3 tools/test_build_libcxx.py` checks the site configuration, the patch
+  of libunwind and the names the libraries leave undefined.
 - FreeType (`packages/freetype.toml`, FTL, 2.14.3) is an optional package of the
   image kind `games` that installs no file: the package `lvgl` links it and
   names it in `build_depends`, so the notices of `lvgl` carry its licence.
