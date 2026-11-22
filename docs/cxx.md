@@ -2,7 +2,8 @@
 
 Programs written in C++ run on relibc with the C++ standard library and runtime
 of the LLVM project: libc++, libc++abi and libunwind, version 23.1.6
-(Apache-2.0 WITH LLVM-exception; `packages/libcxx.toml`). They are linked
+(Apache-2.0 WITH LLVM-exception OR MIT OR NCSA, the dual licence of
+LLVM's libc++; `packages/libcxx.toml`). They are linked
 statically into the program. The libraries are built by `cargo xtask libcxx`
 (`tools/build-libcxx.py`) against the relibc sysroot and live in
 `target/libcxx/`: the headers in `include/c++/v1` and the archives
@@ -64,19 +65,41 @@ One program, one line per check, compared by xtask in order (weight 20 in
   the site configuration).
 - Locales: `newlocale` and `uselocale` of relibc carry libc++'s locale
   support; `strtod_l`, `strtof_l` and `strtold_l` of relibc ignore the locale,
-  as the conversions are those of the "C" locale. A name with no locale file
-  makes `std::locale(name)` throw `std::runtime_error`; `std::locale("")` has
-  an empty name.
+  until `strtod` honours `LC_NUMERIC` (the conversions are those of the "C"
+  locale). `setlocale` and `newlocale` resolve the name "" by `LC_ALL`, then
+  `LC_<category>`, then `LANG`, with "C" when none is set. A name from the
+  environment of the form `*.UTF-8` or `*.utf8` with no locale file takes the
+  data of C.UTF-8 under its own name (the one encoding is UTF-8); a name the
+  program gives, and any other name with no file, fails, so that
+  `std::locale(name)` throws `std::runtime_error`. A name with a slash fails in a set-ID program.
 - Waits by address use only the two operations above; requeue, bit sets and
   priority inheritance of `futex` answer ENOSYS.
 - libunwind: its check of the Linux signal-return trampoline is off for
   `__stafeto__` (it reads memory through a raw `rt_sigprocmask` call and
   decodes the trampoline of Linux).
 - `pthread_cancel` ends a C++ thread without running the destructors of its
-  frames and without a `catch (...)` block seeing it (no forced unwinding).
+  frames and without a `catch (...)` block seeing it (no forced unwinding). A
+  thread cancelled inside `condition_variable::wait` dies holding the mutex,
+  so later waiters on that mutex block for good. `pthread_exit` called from
+  C++ code behaves the same: the frames are left without their destructors.
+  The cleanup handlers of `pthread_cleanup_push` run first, then the
+  thread-local objects of C++, then the keys' destructors.
+- A throw from a signal handler works for a synchronous `raise` (or `kill` of
+  the thread itself) into a plain `sa_handler` installed with no `SA_ONSTACK`.
+  The handler's signal mask stays blocked after the throw, as on Linux (the
+  catching code unblocks it). A handler installed with `SA_SIGINFO`, an
+  asynchronous signal and a fault signal that throws call `std::terminate`.
+- `__dso_handle` in `libc.a` suits static programs only: a shared object needs
+  its own, which a loader of several libraries would provide.
+- The flag `FUTEX_CLOCK_REALTIME` of `futex` answers ENOSYS: the timeout of a
+  wait is relative and runs on the monotonic clock.
 - Not built: the time zone database (`std::chrono::tzdb`), the experimental
   library and the parallel backends of `<execution>` (serial only). A shared
   libc++ waits for a loader that handles several libraries.
 - `fork` of a process with other threads leaves the child with the calling
   thread alone, as POSIX has it; a `std::mutex` that another thread held stays
-  locked in the child.
+  locked in the child. In that child the initialisation of a function-local
+  static, `std::call_once` and a throw (which takes the lock of the unwinder's
+  registry) may deadlock when another thread of the parent was inside one of
+  them at the fork. The lists of `atexit` functions and the allocator are
+  safe: `fork` holds their locks across the fork.

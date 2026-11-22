@@ -101,7 +101,7 @@ them for the licence notes of the image.
   package without files and without a package that links it in is accepted. Its
   licence text is `COPYING` of the archive, and its notice directory
   `/usr/share/licenses/pixman/` carries it with the note of the source.
-- libc++ (`packages/libcxx.toml`, Apache-2.0 WITH LLVM-exception, 23.1.6) is an
+- libc++ (`packages/libcxx.toml`, Apache-2.0 WITH LLVM-exception OR MIT OR NCSA, 23.1.6) is an
   optional package of the games image that installs no file: C++ programs
   link it. `tools/build-libcxx.py` fetches the release archive of the LLVM
   project (a copy is kept in `target/libcxx-src/`), checks its SHA-256 and

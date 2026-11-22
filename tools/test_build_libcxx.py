@@ -50,7 +50,7 @@ class PackageTests(unittest.TestCase):
     def test_the_record_pins_the_archive_of_the_release(self):
         package = builder.PACKAGE
         self.assertEqual(package["version"], "23.1.6")
-        self.assertEqual(package["license"], "Apache-2.0 WITH LLVM-exception")
+        self.assertEqual(package["license"], "Apache-2.0 WITH LLVM-exception OR MIT OR NCSA")
         self.assertRegex(package["sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(
             package["url"],

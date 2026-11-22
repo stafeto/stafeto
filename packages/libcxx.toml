@@ -11,9 +11,10 @@
 # written in C++ link them. The archive is the release asset
 # llvm-project-23.1.6.src.tar.xz of tag llvmorg-23.1.6 (commit
 # 5b10d2d74929eae78912771222c9855af97496f4); the SHA-256 is the digest GitHub
-# publishes for the asset. The licence is Apache-2.0 with the LLVM exception:
-# the exception lifts the notice duties for the object code of a program that
-# links the libraries.
+# publishes for the asset. The licence is the dual one of LLVM's
+# libc++: Apache-2.0 with the LLVM exception, or MIT, or NCSA; the exception
+# lifts the notice duties for the object code of a program that links the
+# libraries.
 # Format: docs/packages.md.
 
 name = "libcxx"
@@ -24,7 +25,7 @@ release = "1"
 summary = "LLVM libc++, libc++abi and libunwind, linked into programs written in C++"
 url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.6/llvm-project-23.1.6.src.tar.xz"
 sha256 = "d3b86ab29cfb4445a6652e5c2642ccc75e04e38084dde3701d323320f35a31da"
-license = "Apache-2.0 WITH LLVM-exception"
+license = "Apache-2.0 WITH LLVM-exception OR MIT OR NCSA"
 license_file = "libcxx/LICENSE.TXT"
 build = "tools/build-libcxx.py"
 files = []

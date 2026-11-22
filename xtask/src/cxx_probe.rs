@@ -92,6 +92,7 @@ pub const LINES: &[&str] = &[
     "condition_variable wait_for timeout 1 after at least 40 ms 1",
     "condition_variable notified before the deadline: 1",
     "thread_local destructors after 3 threads: 3, their plain values 24",
+    "thread exit order: cleanup handler 1, thread_local destructor 2",
     "std::atomic::wait woken by notify_one: 40",
     "std::latch released 3 threads",
     "std::barrier 5 rounds of 3 threads: 15",

@@ -190,8 +190,12 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # program; exit runs the destructors of static objects and the thread-local
 # objects of the exiting thread (atexit shares the list of __cxa_atexit and
 # runs in one order with them; __cxa_finalize holds no lock during a call);
-# tagged pin-449875aa.
-COMMIT = "449875aa74709215ba397efa98ce48c92af6f82d"
+# Review of that: the list of exit functions is a library mutex that fork
+# holds (before the allocator), futex checks its arguments before it reads
+# the clock, thread exit runs the cleanup handlers before the thread-local
+# destructors, setlocale and newlocale resolve "" from LC_ALL, LC_<category>
+# and LANG, atexit reports out of memory; tagged pin-dbedefc1.
+COMMIT = "dbedefc10041b685968df3d219c6832e7e7b5374"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

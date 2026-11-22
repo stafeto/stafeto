@@ -44,8 +44,8 @@ decisions that belong to stafeto:
 
 The result is target/libcxx/: include/c++/v1 (the headers of libc++, the
 site file, the assertion handler, cxxabi.h) and lib/libc++.a, libc++abi.a,
-libunwind.a, and LICENSE.TXT (the three licence files, Apache-2.0 with the
-LLVM exception). Checks after the build: the names the objects leave
+libunwind.a, and LICENSE.TXT (the licence files of libcxx, libcxxabi,
+libunwind and libc). Checks after the build: the names the objects leave
 undefined are defined by the libraries themselves or by relibc's libc.a and
 libm.a, and no object holds the path of the build directory.
 
@@ -392,7 +392,7 @@ def main() -> None:
     notice = WORK / "LICENSE.TXT"
     notice.write_text("\n\n".join(
         f"==== {part}/LICENSE.TXT ====\n\n" + (source / part / "LICENSE.TXT").read_text()
-        for part in ("libcxx", "libcxxabi", "libunwind")))
+        for part in ("libcxx", "libcxxabi", "libunwind", "libc")))
     shutil.rmtree(obj)
     shutil.rmtree(source)
     stamp.write_text(text)

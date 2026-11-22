@@ -31,6 +31,7 @@
 #include <typeinfo>
 #include <vector>
 
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -386,6 +387,44 @@ static void check_threads() {
     CHECK(registered != nullptr);
 }
 
+// ---- order at thread exit ---------------------------------------------------
+
+// pthread_exit runs the handlers of pthread_cleanup_push first, then the
+// destructors of the thread-local objects of C++.
+static std::atomic<int> exit_order{0};
+static int cleanup_position = 0;
+static int tls_position = 0;
+struct OrderTls {
+    bool used = false;
+    ~OrderTls() {
+        if (used) tls_position = exit_order.fetch_add(1) + 1;
+    }
+};
+static thread_local OrderTls order_tls;
+
+static void cleanup_handler(void *) { cleanup_position = exit_order.fetch_add(1) + 1; }
+
+// The macro of relibc's <pthread.h> leaves a field of its entry out.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wmissing-designated-field-initializers"
+static void *order_thread(void *) {
+    order_tls.used = true;
+    pthread_cleanup_push(cleanup_handler, nullptr);
+    pthread_exit(nullptr);
+    pthread_cleanup_pop(0);
+    return nullptr;
+}
+#pragma clang diagnostic pop
+
+static void check_exit_order() {
+    pthread_t thread;
+    CHECK(pthread_create(&thread, nullptr, order_thread, nullptr) == 0);
+    pthread_join(thread, nullptr);
+    std::printf("cxx-probe: thread exit order: cleanup handler %d, thread_local destructor %d\n",
+                cleanup_position, tls_position);
+    CHECK(cleanup_position == 1 && tls_position == 2);
+}
+
 // ---- waits by address -----------------------------------------------------
 
 static void check_atomic_wait() {
@@ -603,6 +642,7 @@ static int run_checks() {
     check_exception_from_signal_handler();
     check_terminate();
     check_threads();
+    check_exit_order();
     check_atomic_wait();
     say("ok");
     return 0;
