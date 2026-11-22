@@ -34,11 +34,41 @@ use proto_data as p;
 use proto_data::Method;
 use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 
+mod lease;
 mod mount;
 mod names;
 
+pub use lease::{CANDIDATES_MAX, Candidate, LEASE_CLIENT_MAX_NS, LEASE_GAP_NS, Pick};
 pub use mount::{Mounted, Recovered, StartWork, Step, bump_epoch, ensure_orphans, recover_orphans};
 use names::{denied, entry_of, split, stat_record};
+
+/// The memory of one cell of a window for the job of one part (`Server::handle_with`): the worker
+/// maps the cell for the job, read only for a part that writes the file and read-write for a part
+/// that reads it, and passes the bytes of the part. The client may change a cell while the job runs,
+/// which spoils only its own bytes: the service reads no field of the protocol from a cell.
+pub enum Cell<'a> {
+    /// No cell is mapped (a request that names none, or a worker that could not map it).
+    Absent,
+    /// The bytes a part that writes the file takes (WRITE_FROM, PWRITE_FROM): `count` of them.
+    Source(&'a [u8]),
+    /// The room a part that reads the file fills (READ_INTO, PREAD_INTO): `count` bytes.
+    Sink(&'a mut [u8]),
+}
+
+/// The method, the cell and the count of a request that is a part (READ_INTO, PREAD_INTO,
+/// WRITE_FROM, PWRITE_FROM) of the right shape, None for any other request or a part that
+/// `proto_data::read_part` refuses (the server answers that one itself). The worker maps the cell
+/// before the job from this.
+pub fn part_of(request: &[u8]) -> Option<(Method, u32, u32)> {
+    let mut r = Reader::new(request);
+    let header = Header::read(&mut r).ok()?;
+    if header.version != p::VERSION {
+        return None;
+    }
+    let method = Method::from_number(header.method)?;
+    let part = p::read_part(method, r).ok()?;
+    Some((method, part.part.cell, part.part.count))
+}
 
 /// The sessions of the table: the loop of the service holds as many.
 pub const SESSIONS: usize = 64;
@@ -187,6 +217,9 @@ struct Session {
     /// client of init, the root of the expenditure for a session made by SESSION): the limits of a
     /// process tree count by it.
     root: Root,
+    /// The session gave the service a window (WINDOW): the worker holds its handle. Parts with a
+    /// cell are served only while this is set.
+    window: bool,
 }
 
 impl Session {
@@ -198,6 +231,7 @@ impl Session {
         parent: 0,
         birth: 0,
         root: Root::Label(0),
+        window: false,
     };
 }
 
@@ -303,6 +337,13 @@ pub struct Server {
     epoch: u32,
     birth_seq: u16,
     orphan_seq: u32,
+    /// The leases on files (`lease.rs`) and the monotonic clock of the worker, in nanoseconds.
+    leases: [lease::Lease; p::LEASES],
+    mono: u64,
+    /// The instant the request thread queued the job that runs, and the parts that answered
+    /// `UNLEASED` so far.
+    job_queued: u64,
+    unleased: u64,
     #[cfg(test)]
     pub(crate) fail_reopen: bool,
     #[cfg(test)]
@@ -457,7 +498,14 @@ pub fn needs_blocks(request: &[u8]) -> bool {
     };
     match Method::from_number(header.method) {
         Some(
-            Method::Write | Method::Pwrite | Method::Mkdir | Method::Truncate | Method::Rename,
+            Method::Write
+            | Method::Pwrite
+            | Method::WriteFrom
+            | Method::PwriteFrom
+            | Method::Mkdir
+            | Method::Truncate
+            | Method::Rename
+            | Method::OpenNumbered,
         ) => true,
         Some(Method::Open) => r
             .u32()
@@ -514,6 +562,10 @@ impl Server {
             },
             birth_seq: 0,
             orphan_seq: 0,
+            leases: [lease::Lease::EMPTY; p::LEASES],
+            mono: 0,
+            job_queued: 0,
+            unleased: 0,
             #[cfg(test)]
             fail_reopen: false,
             #[cfg(test)]
@@ -673,6 +725,8 @@ impl Server {
             let _ = self.deref(fs, usize::from(self.passes[i].description));
             return;
         }
+        // The leases of the session end first: each gives back its reference of a description.
+        self.leases_end_of(fs, label);
         if let Some(si) = self
             .sessions
             .iter()
@@ -690,6 +744,7 @@ impl Server {
     /// Closes every file and directory still open, for the stop of the service: a file's data
     /// reaches the volume when it is closed. The number of the descriptions that did not close.
     pub fn close_all<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> usize {
+        self.leases_end_all(fs);
         let mut failed = 0;
         for i in 0..DESCRIPTIONS {
             if self.descriptions[i].used {
@@ -908,10 +963,23 @@ impl Server {
         aux: u64,
         request: &[u8],
     ) -> Writer {
+        self.handle_with(fs, owner, aux, request, Cell::Absent)
+    }
+
+    /// `handle` for a request that may name a cell of the session's window: `cell` is the memory of
+    /// that cell for the job (the worker maps it, see `Cell`), `Absent` when the request names none.
+    pub fn handle_with<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        owner: u64,
+        aux: u64,
+        request: &[u8],
+        cell: Cell<'_>,
+    ) -> Writer {
         let mut w = Writer::new();
         let done = w
             .u32(0)
-            .and_then(|()| self.run(fs, owner, aux, request, &mut w));
+            .and_then(|()| self.run(fs, owner, aux, request, cell, &mut w));
         match done {
             Ok(()) => w,
             Err(status) => {
@@ -928,6 +996,7 @@ impl Server {
         owner: u64,
         aux: u64,
         request: &[u8],
+        cell: Cell<'_>,
         w: &mut Writer,
     ) -> Res<()> {
         let mut r = Reader::new(request);
@@ -966,7 +1035,7 @@ impl Server {
                 let (flags, mode, raw) = p::read_open(r)?;
                 let n = canonical(raw, &mut path)?;
                 visible(&path[..n])?;
-                self.do_open(fs, si, &caller, (flags, mode), &path[..n], w)
+                self.do_open(fs, si, &caller, (flags, mode, None), &path[..n], w)
             }
             Method::Close => {
                 let di = self.find(si, r.u32()?)?;
@@ -998,7 +1067,15 @@ impl Server {
                 let data = r.bytes(r.left())?;
                 let pos = self.descriptions[di].pos;
                 let append = self.descriptions[di].append;
-                let (at, n) = self.write_at(fs, di, &caller, pos, append, data)?;
+                let (at, n) = self.write_at(
+                    fs,
+                    di,
+                    &caller,
+                    pos,
+                    append,
+                    data,
+                    self.descriptions[di].sync,
+                )?;
                 self.descriptions[di].pos = at + n as u32;
                 w.u32(n as u32)
             }
@@ -1010,8 +1087,48 @@ impl Server {
                     .ok()
                     .filter(|&o| o <= i32::MAX as u32)
                     .ok_or_else(|| p::code(p::TOO_BIG))?;
-                let (_, n) = self.write_at(fs, di, &caller, offset, false, data)?;
+                let (_, n) = self.write_at(
+                    fs,
+                    di,
+                    &caller,
+                    offset,
+                    false,
+                    data,
+                    self.descriptions[di].sync,
+                )?;
                 w.u32(n as u32)
+            }
+            Method::ReadInto | Method::PreadInto | Method::WriteFrom | Method::PwriteFrom => {
+                let part = p::read_part(method, r)?;
+                self.run_part(fs, si, &caller, method, &part, cell, w)
+            }
+            // WINDOW carries a handle and RELEASE a lease; the worker takes the handle (see
+            // `set_window`), and no lease exists yet, so a lease number is one the service
+            // never gave.
+            Method::Window => Err(p::code(p::INVALID)),
+            Method::Release => {
+                let number = p::read_release(r)?;
+                match self.lease_lookup(number) {
+                    lease::Number::Stale => Err(p::code(p::STALE)),
+                    lease::Number::Never => Err(bad_handle()),
+                    // A lease that lapsed or ended is over: releasing it again changes nothing.
+                    lease::Number::Ended => Ok(()),
+                    lease::Number::Live(slot) if self.leases[slot].owner == owner => {
+                        self.lease_end(fs, slot);
+                        Ok(())
+                    }
+                    lease::Number::Live(_) => Err(bad_handle()),
+                }
+            }
+            Method::OpenNumbered => {
+                // Only a native client names the number of a file: the layered file service.
+                if !p::is_service(owner) {
+                    return Err(p::code(p::PERMISSION));
+                }
+                let (flags, mode, ino, raw) = p::read_open_numbered(r)?;
+                let n = canonical(raw, &mut path)?;
+                visible(&path[..n])?;
+                self.do_open(fs, si, &caller, (flags, mode, Some(ino)), &path[..n], w)
             }
             Method::Seek => {
                 let di = self.find(si, r.u32()?)?;
@@ -1273,15 +1390,6 @@ impl Server {
             // BIND, SESSION and VERIFY_SESSION carry a handle of the call and a vouching of the
             // process service, which the worker does (`Server::bind`, `Server::bind_new`).
             Method::Bind | Method::Session | Method::VerifySession => Err(p::code(p::INVALID)),
-            // The methods of version 4 are listed in the protocol and not served yet: the step
-            // that gives the service its window answers them.
-            Method::Window
-            | Method::ReadInto
-            | Method::PreadInto
-            | Method::WriteFrom
-            | Method::PwriteFrom
-            | Method::Release
-            | Method::OpenNumbered => Err(p::code(p::INVALID)),
             Method::Clone => {
                 let count = r.u32()?;
                 let mut handles = [0; CLONE_MAX];
@@ -1310,6 +1418,7 @@ impl Server {
                     parent: owner,
                     birth: self.birth_seq,
                     root,
+                    window: false,
                 };
                 self.add_refs(mask);
                 w.u32((ci as u32 + 1) | (u32::from(self.birth_seq) << 16))
@@ -1451,6 +1560,22 @@ impl Server {
         count: usize,
         w: &mut Writer,
     ) -> Res<usize> {
+        let mut buffer = [0u8; p::MAX_READ];
+        let n = self.read_into(fs, di, pos, &mut buffer[..count])?;
+        w.u32(n as u32)?;
+        w.bytes(&buffer[..n])?;
+        Ok(n)
+    }
+
+    /// Reads up to `out.len()` bytes at `pos` of the file of description `di` into `out`; the count
+    /// read (short only at the end of the file).
+    fn read_into<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        di: usize,
+        pos: u32,
+        out: &mut [u8],
+    ) -> Res<usize> {
         let d = self.descriptions[di];
         // A directory read as a file is EISDIR; one opened with no access bits has no READ at all.
         if d.kind != Kind::File {
@@ -1466,11 +1591,217 @@ impl Server {
         let ni = usize::from(d.object);
         let file = self.place(fs, ni, pos)?;
         self.nodes[ni].at = None;
-        let mut buffer = [0u8; p::MAX_READ];
-        let n = volume(fs.read(file, &mut buffer[..count]))?;
+        let n = volume(fs.read(file, out))?;
         self.nodes[ni].at = Some(pos + n as u32);
-        w.u32(n as u32)?;
-        w.bytes(&buffer[..n])?;
+        Ok(n)
+    }
+
+    /// One part of READ_INTO, PREAD_INTO, WRITE_FROM or PWRITE_FROM: the work of READ, PREAD, WRITE
+    /// or PWRITE on the bytes of a cell of the session's window, or of the message with `INLINE`.
+    /// A part with a cell in a session that gave no window is NO_WINDOW and touches nothing, a lease
+    /// included. The first part of a call (`MORE`, lease 0) takes a lease on the file when a limit
+    /// allows (else the answer says `UNLEASED` and the part is a call of its own); the next parts
+    /// carry its number. A part with the number of a lease that ended or lapsed is not run: the answer
+    /// says `LAPSED` and 0 bytes (`lease.rs`). The lease ends with the last part (no `MORE`), a part a limit
+    /// stopped, a part that failed, RELEASE, and the end of the session; `SYNC` of the description
+    /// runs after the part that ended the call.
+    #[allow(clippy::too_many_arguments)]
+    fn run_part<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        si: usize,
+        caller: &Caller,
+        method: Method,
+        part: &p::PartIn<'_>,
+        cell: Cell<'_>,
+        w: &mut Writer,
+    ) -> Res<()> {
+        let head = part.part;
+        if !part.inline() && !self.sessions[si].window {
+            return Err(p::code(p::NO_WINDOW));
+        }
+        let label = self.sessions[si].label;
+        let more = head.flags & p::MORE != 0;
+        let writing = matches!(method, Method::WriteFrom | Method::PwriteFrom);
+        // The lease the part runs under, or that it found over.
+        let (mut held, mut flags): (Option<usize>, u32) = (None, 0);
+        if head.lease != 0 {
+            match self.lease_lookup(head.lease) {
+                lease::Number::Stale => return Err(p::code(p::STALE)),
+                lease::Number::Never => return Err(bad_handle()),
+                // The lease lapsed or ended: the part is not run, so that a call is never done in
+                // pieces with another call's work between them. The answer says `LAPSED` and 0 bytes;
+                // the layer returns the sum of the parts done.
+                lease::Number::Ended => {
+                    return p::write_part_reply(0, p::LAPSED, 0, &[], w);
+                }
+                lease::Number::Live(slot) => {
+                    if self.leases[slot].owner != label || self.leases[slot].write != writing {
+                        return Err(bad_handle());
+                    }
+                    held = Some(slot);
+                    self.lease_client_gap(slot);
+                }
+            }
+        }
+        // A part under a lease names the description of the lease: a CLOSE of it by another thread
+        // does not end the call.
+        let di = match held {
+            Some(slot) => {
+                let di = usize::from(self.leases[slot].description);
+                if self.handle_of(di) != head.handle {
+                    return Err(bad_handle());
+                }
+                di
+            }
+            None => self.find(si, head.handle)?,
+        };
+        let count = head.count as usize;
+        let positional = matches!(method, Method::PreadInto | Method::PwriteFrom);
+        let offset = if positional {
+            Some(
+                u32::try_from(head.offset)
+                    .ok()
+                    .filter(|&o| o <= i32::MAX as u32)
+                    .ok_or_else(|| p::code(p::TOO_BIG))?,
+            )
+        } else {
+            None
+        };
+        // The first part of a call that goes on takes the lease, when the description is a file.
+        if held.is_none() && head.lease == 0 && more {
+            let d = self.descriptions[di];
+            let taken = (d.kind == Kind::File)
+                .then(|| self.lease_take(label, di, usize::from(d.object), writing))
+                .flatten();
+            match taken {
+                Some(number) => held = self.lease_slot(number),
+                None => {
+                    flags |= p::UNLEASED;
+                    self.unleased += 1;
+                }
+            }
+        }
+        let done = self.part_work(
+            fs,
+            caller,
+            (di, method, offset, more),
+            (held, flags),
+            part,
+            cell,
+            w,
+        );
+        // The lease goes on for another gap after a part that leaves more to come, and ends after
+        // the last part, after a part that a limit or the end of the file stopped, and after a
+        // failure: nobody waits for a call that is over.
+        if let Some(slot) = held {
+            match done {
+                Ok(n) if more && n == count => self.lease_renew(slot),
+                Ok(_) => self.lease_end(fs, slot),
+                Err(_) => {
+                    // A part that failed with nothing written ends the call: what the parts
+                    // before it wrote is made durable now when the call has `SYNC`, since the
+                    // layer returns their sum and no later part will.
+                    if self.leases[slot].sync && self.leases[slot].write {
+                        let ni = usize::from(self.leases[slot].node);
+                        let _ = self.sync_node(fs, ni);
+                    }
+                    self.lease_end(fs, slot);
+                }
+            }
+        }
+        done.map(drop)
+    }
+
+    /// The slot a lease number of this instance names.
+    fn lease_slot(&self, number: u32) -> Option<usize> {
+        match self.lease_lookup(number) {
+            lease::Number::Live(slot) => Some(slot),
+            _ => None,
+        }
+    }
+
+    /// The work of one part on the description `di`, and its reply. The count of bytes moved.
+    #[allow(clippy::too_many_arguments)]
+    fn part_work<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        caller: &Caller,
+        (di, method, offset, more): (usize, Method, Option<u32>, bool),
+        (held, flags): (Option<usize>, u32),
+        part: &p::PartIn<'_>,
+        cell: Cell<'_>,
+        w: &mut Writer,
+    ) -> Res<usize> {
+        let head = part.part;
+        let count = head.count as usize;
+        // The lease number in the answer is that of a lease still held after the part: found at the end.
+        let number_of = |server: &Server, slot: Option<usize>| match slot {
+            Some(slot) if more => server.lease_number(slot),
+            _ => 0,
+        };
+        if matches!(method, Method::WriteFrom | Method::PwriteFrom) {
+            let data: &[u8] = if part.inline() {
+                part.bytes
+            } else {
+                match cell {
+                    Cell::Source(bytes) if bytes.len() == count => bytes,
+                    _ => return Err(p::code(p::IO)),
+                }
+            };
+            let d = self.descriptions[di];
+            // A call takes the `APPEND` and `SYNC` of its description at its first part.
+            let (append, sync) = match held {
+                Some(slot) => (self.leases[slot].append, self.leases[slot].sync),
+                None => (d.append, d.sync),
+            };
+            let pos = offset.unwrap_or(d.pos);
+            let append = append && offset.is_none();
+            // `SYNC` waits for the part that ends the call; a part that holds no lease (a call of
+            // one part, or one that found no lease to take) is synced as a write is.
+            let last = !more || held.is_none();
+            let (at, n) = self.write_at(fs, di, caller, pos, append, data, sync && last)?;
+            if offset.is_none() {
+                self.descriptions[di].pos = at + n as u32;
+            }
+            if more && n < count && n > 0 && sync && !last {
+                self.sync_node(fs, usize::from(d.object))?;
+            }
+            let ends = !more || n < count;
+            let lease = if ends { 0 } else { number_of(self, held) };
+            p::write_part_reply(n as u32, flags, lease, &[], w)?;
+            return Ok(n);
+        }
+        let pos = offset.unwrap_or(self.descriptions[di].pos);
+        let n = if part.inline() {
+            let mut buffer = [0u8; p::INLINE_READ];
+            let n = self.read_into(fs, di, pos, &mut buffer[..count])?;
+            let lease = if !more || n < count {
+                0
+            } else {
+                number_of(self, held)
+            };
+            p::write_part_reply(n as u32, flags, lease, &buffer[..n], w)?;
+            n
+        } else {
+            let Cell::Sink(out) = cell else {
+                return Err(p::code(p::IO));
+            };
+            if out.len() != count {
+                return Err(p::code(p::IO));
+            }
+            let n = self.read_into(fs, di, pos, out)?;
+            let lease = if !more || n < count {
+                0
+            } else {
+                number_of(self, held)
+            };
+            p::write_part_reply(n as u32, flags, lease, &[], w)?;
+            n
+        };
+        if offset.is_none() {
+            self.descriptions[di].pos = pos + n as u32;
+        }
         Ok(n)
     }
 
@@ -1490,6 +1821,7 @@ impl Server {
     /// end taken now. The write stops short at the file size limit of the caller (and `FILE_MAX`) or
     /// at the last free block the caller may use, and answers the count; a status comes only when no
     /// byte could be written. The place written and the count.
+    #[allow(clippy::too_many_arguments)]
     fn write_at<D: Device>(
         &mut self,
         fs: &mut Fs<'_, D>,
@@ -1498,6 +1830,7 @@ impl Server {
         pos: u32,
         append: bool,
         data: &[u8],
+        sync: bool,
     ) -> Res<(u32, usize)> {
         let d = self.descriptions[di];
         if d.kind != Kind::File || !d.write {
@@ -1544,7 +1877,9 @@ impl Server {
         if n > 0 {
             self.nodes[ni].wrote = true;
             self.nodes[ni].wrote_at = self.now;
-            if d.sync {
+            // A description with `SYNC` makes the write durable before the reply; the parts of one
+            // call (`last` false) leave it to the part that ends the call.
+            if sync {
                 self.sync_node(fs, ni)?;
             }
         }
@@ -1610,7 +1945,7 @@ impl Server {
         fs: &mut Fs<'_, D>,
         si: usize,
         caller: &Caller,
-        (flags, mode): (u32, u32),
+        (flags, mode, number): (u32, u32, Option<u64>),
         path: &[u8],
         w: &mut Writer,
     ) -> Res<()> {
@@ -1728,7 +2063,7 @@ impl Server {
                     self.reserve_allows(fs, caller)?;
                     created = Some((
                         parent_record,
-                        self.new_record(fs, caller, &parent_attr, Kind::File, mode)?,
+                        self.new_record(fs, caller, &parent_attr, Kind::File, mode, number)?,
                     ));
                 }
                 let (ni, fresh) = match self.node_at(path) {
@@ -1878,6 +2213,34 @@ impl Server {
             .map(|s| s.root)
     }
 
+    /// The session of `label` has given the service a window (`on`), or the worker let go of its
+    /// handle (`!on`: a replaced window is a new `on`). A session the service has not seen is made.
+    pub fn set_window(&mut self, label: u64, on: bool) -> Result<(), Status> {
+        if self.refused {
+            return Err(p::code(p::NOT_READY));
+        }
+        if !on {
+            if let Some(s) = self
+                .sessions
+                .iter_mut()
+                .find(|s| s.used && s.label == label)
+            {
+                s.window = false;
+            }
+            return Ok(());
+        }
+        let si = self.session(label)?;
+        self.sessions[si].window = true;
+        Ok(())
+    }
+
+    /// Whether the session of `label` has a window: its parts with a cell are served.
+    pub fn has_window(&self, label: u64) -> bool {
+        self.sessions
+            .iter()
+            .any(|s| s.used && s.label == label && s.window)
+    }
+
     /// The session of `label` passed VERIFY_SESSION, which only a loader sends, for the session a
     /// parent gave a set-ID program: the binding of the parent's identity ends, and the program's
     /// layer binds the session to its own (BIND). The descriptions it holds stay, with their
@@ -1891,6 +2254,8 @@ impl Server {
         {
             s.binding = Binding::Unbound;
         }
+        // The program that follows has no window of the old one: the worker lets go of the handle.
+        let _ = self.set_window(label, false);
     }
 
     /// Whether `label` is a live session of the service (VERIFY_SESSION).

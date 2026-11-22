@@ -354,7 +354,7 @@
 //! The client maps the whole window once. The service keeps the handle in the session, maps one
 //! cell for the time of one job (read only to write a file, read and write to read one), moves up
 //! to `CELL_BYTES` between the cell and the volume and unmaps it. A new WINDOW replaces the old one
-//! (the service closes the old handle). The service accepts only a memory object with MAP_READ and
+//! (the service closes the old handle); a WINDOW the service refuses leaves the old window as it was. The service accepts only a memory object with MAP_READ and
 //! MAP_WRITE of exactly `WINDOW_BYTES`, else INVALID. The service never reads a field of the
 //! protocol from a cell: the client may change a cell while a job runs, which spoils only its own
 //! bytes. A part that names a cell in a session with no window is NO_WINDOW; the layer then sends
@@ -378,25 +378,43 @@
 //! part; the answer to the last part carries 0. A lease number is not 0 and carries a generation
 //! counter (and the epoch of the instance, as a handle does), so that a number that ended is not
 //! taken for a later lease: a part that carries the number of a lease of this instance that has
-//! ended or run out is answered with `LAPSED`, and a number the service never gave is BAD_HANDLE. While a lease on a file is held, the jobs of other
-//! calls on the same file wait for the end of the call: a write lease is exclusive, a read lease
-//! lets other reads go, so one call of any size is atomic to the others (POSIX.1-2024 XSH 2.9.7
-//! lists `read`, `write`, `pread`, `pwrite`, `readv`, `writev`, `ftruncate` and `fstat` as atomic
-//! with respect to each other on a file of the hierarchy, and `write` says each write is atomic).
-//! The answer's `flags` are `LAPSED` (1: the lease ran out before this part, which then ran
-//! without one, so the call was not atomic) and `UNLEASED` (2: no lease was given, because a limit
-//! was reached; the part ran as a call of its own, and the lease it carries in the answer is 0).
-//! Any other bit is BAD_SIZE in a reply, and so is `UNLEASED` with a lease number. A part that
-//! comes after `LAPSED` goes as a separate call (with `APPEND` it takes the end of the file again).
-//! A lease
-//! ends when the last part is answered, at RELEASE, when the session goes, or when the service
-//! lets it run out (a policy of the service, `LEASE_GAP` of 1 second between two parts). RELEASE
-//! with a lease that is not the session's is BAD_HANDLE, one of an earlier instance STALE. The
-//! limits `LEASES_PER_SESSION` (4) and `LEASES` (64) are minimums the service guarantees. A part
-//! that is stopped by a limit (file size, `FILE_MAX`, free space) answers the count it did and
-//! ends the lease (rule 13). With `APPEND` the first part takes the end of the file and the next
-//! ones follow it; the synchronisation of `SYNC` runs after the part that ended the call (the last
-//! one, or the one a limit of rule 13 stopped).
+//! ended or run out is answered with `LAPSED`, and a number the service never gave is BAD_HANDLE.
+//! The generation is 8 bits, so a number 128 or more leases of its slot old is taken for one never
+//! given, and one 256 old for the live lease; a call keeps its number for a few parts only.
+//!
+//! While a lease on a file is held, the jobs of other calls on the same file wait for the end of the
+//! call: a write lease is exclusive, a read lease lets other reads go, so one call of any size is
+//! atomic to the others (POSIX.1-2024 XSH 2.9.7 lists `read`, `write`, `pread`, `pwrite`, `readv`,
+//! `writev`, `ftruncate`, `fstat`, `lseek` and `open` as atomic with respect to each other on a file
+//! of the hierarchy, and `write` says each write is atomic). The jobs that wait are the reads, writes,
+//! truncations, `fstat`, `stat` by path, opens with truncation and seeks of the file (a seek moves the
+//! position the call goes on from, and `SEEK_END` reads the size it changes); the jobs on other
+//! files never wait. A call takes the `APPEND` and `SYNC` of its description at its first part: a
+//! SET_FLAGS in the middle does not change it. The parts of one lease run one at a time, in the order
+//! they came (a client sends the next after the answer to the last). A part that would take a lease
+//! when the limits allow none waits until a lease ends; `UNLEASED` is left for the part that cannot
+//! be given a lease for another reason (the description cannot take one more reference).
+//!
+//! The answer's `flags` are `LAPSED` (1: the lease ran out or ended before this part; the part is NOT
+//! run, and its count is 0, so that a call is never done in pieces with another call's work between
+//! them; the layer returns the sum of the parts it did, a short `read` or `write`) and `UNLEASED` (2:
+//! no lease was given; the part ran as a call of its own, and the lease it carries in the answer is
+//! 0). Any other bit is BAD_SIZE in a reply, and so is `UNLEASED` with a lease number. A lease ends
+//! when the last part is answered, at RELEASE, when the session goes or runs a new image, at the
+//! stop, or when the service lets it lapse (the policy of the service): after `LEASE_GAP` of 1 second
+//! with no next part, and, while jobs of the file wait for it, when the client time (the sum of the
+//! gaps from the answer to a part to the arrival of the next, over the whole lease) passes
+//! `LEASE_CLIENT_MAX` of 1 second. A lease whose next part has arrived in time and waits in the queue
+//! does not lapse. With `SYNC` the node is synced when the lease lapses, before the part that finds it
+//! is answered. RELEASE with a lease that is not the session's is BAD_HANDLE, one of an earlier
+//! instance STALE, one that ended nothing. The limits `LEASES_PER_SESSION` (4) and `LEASES` (64) are
+//! minimums the service guarantees, and a part of a live lease is admitted outside the limits of jobs
+//! of its session and tree. A part that is stopped by a limit (file size, `FILE_MAX`, free space) or
+//! by the end of the file answers the count it did and ends the lease (rule 13), and a part that
+//! fails ends it and, with `SYNC`, makes what the parts before it wrote durable. With `APPEND` each
+//! part takes the end of the file, which under a write lease is the end of the part before; the
+//! synchronisation of `SYNC` runs after the part that ended the call, and after every part that
+//! holds no lease.
 //!
 //! OPEN_NUMBERED is OPEN with the number of the file chosen by the caller, for a native client
 //! (label `SERVICE`) such as the layered file service; any other session is PERMISSION. `ino` has

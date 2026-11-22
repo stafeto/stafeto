@@ -36,11 +36,15 @@ mod tests_cut;
 #[cfg(test)]
 mod tests_entry_attr;
 #[cfg(test)]
+mod tests_lease;
+#[cfg(test)]
 mod tests_open;
 #[cfg(test)]
 mod tests_perm;
 #[cfg(test)]
 mod tests_scale;
+#[cfg(test)]
+mod tests_window;
 pub mod volume;
 pub mod vouching;
 pub mod watch;

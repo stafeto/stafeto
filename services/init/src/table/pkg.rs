@@ -483,7 +483,13 @@ pub const DATAFS: Record = Record {
     priority: 36,
     ceiling: 36,
     quota: 512 * PAGE,
-    handle_limit: 128,
+    // The handles the service holds at most: 64 windows (one for each session, until it goes),
+    // 64 copies of identity sessions (one for each bound session), 32 identity handles of SESSION
+    // requests that wait for a job (`admit::WAITING_MAX`), 24 handles in the jobs in flight (a queued
+    // WINDOW, an identity session or a handle for a reply: `admit::JOBS`), and about 40 of its own
+    // (the channels, the notifications, the timers, the budgets, the buffer of the disk service and
+    // the pages of the clock and of the generations): 224, and a limit of 256.
+    handle_limit: 256,
     restart: Restart::Always,
     console: true,
     log: false,
@@ -525,7 +531,8 @@ pub const DATA_PROBE: Record = Record {
     kind: Kind::Client,
     priority: 30,
     ceiling: 30,
-    quota: 64 * PAGE,
+    // The window of the version 4 series (32 pages) beside the probe's own.
+    quota: 112 * PAGE,
     handle_limit: 32,
     restart: Restart::Never,
     console: true,

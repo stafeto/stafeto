@@ -8,7 +8,7 @@
 //! state sees the bytes that went before it.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use proto_data as p;
 
 /// A static the threads share by the rules above.
@@ -31,6 +31,9 @@ pub use datafs::admit::JOBS;
 pub const FREE: u8 = 0;
 pub const QUEUED: u8 = 1;
 pub const DONE: u8 = 2;
+/// A job the worker found held back (it waits for a lease): the worker marks and unmarks it, the
+/// request thread counts it with the queued jobs. A PARKED job is still in the queue.
+pub const PARKED: u8 = 3;
 
 /// What a job is: a request of a session, or the close of what a session held.
 pub const REQUEST: u8 = 0;
@@ -124,6 +127,15 @@ pub static WALKING: AtomicBool = AtomicBool::new(false);
 /// this).
 pub static YIELD_OK: AtomicBool = AtomicBool::new(false);
 pub static YIELDED: AtomicBool = AtomicBool::new(false);
+
+/// The numbers of the leases held, which the worker publishes after each job and the request thread
+/// reads to admit the part of a live lease outside the shares (0: a free slot).
+pub static LIVE_LEASES: [AtomicU32; p::LEASES] = [const { AtomicU32::new(0) }; p::LEASES];
+
+/// A job waits in the queue, runnable or parked.
+pub fn waiting_job(i: usize) -> bool {
+    matches!(state(i).load(Ordering::Acquire), QUEUED | PARKED)
+}
 
 /// A job is QUEUED: the main thread has queued it and the worker has not taken it.
 pub fn queued_job() -> bool {

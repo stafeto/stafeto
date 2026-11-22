@@ -10,6 +10,7 @@
 use crate::clock::Clock;
 use crate::identity::{Identities, Notary};
 use crate::shared::*;
+use crate::window::{self, Windows};
 use abi::{Access, MESSAGE_MAX, Rights, Source};
 use core::sync::atomic::AtomicBool;
 #[cfg(feature = "steps")]
@@ -23,7 +24,7 @@ use datafs::{Device, DeviceError, SECTOR};
 use proto_blk::{CELL_BYTES, CELLS, Info, Key as BlkKey, Method as Blk};
 use proto_wire::{Status, Writer, long};
 use rt::Handle;
-use rt::handle::{Any, Channel, Process};
+use rt::handle::{Any, Channel, Memory, Process};
 use rt::sys::{self, Received};
 
 /// The thread's stack: the volume's calls and the 1 KiB buffers of a request. The stack is an object
@@ -60,6 +61,52 @@ pub const LEVEL: u8 = 30;
 /// and the answer), the steps build: a walk's own work is its time less this.
 #[cfg(feature = "steps")]
 static WAITED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The steps build measures the stretches in which the worker only computes: from the end of a wait
+/// for the disk (or the pick-up of a job) to the start of the next wait (or the end of the job).
+/// The longest of each method of the request in hand is a report line, `datafs: worker wall stretch
+/// <method> <ticks> ticks`. The ticks are wall time, preemptions and the work the volume needs
+/// included: a report and no gate.
+#[cfg(feature = "steps")]
+mod stretch {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// The tick the stretch in progress began, and the method it belongs to (0 for none).
+    static FROM: AtomicU64 = AtomicU64::new(0);
+    static METHOD: AtomicU64 = AtomicU64::new(0);
+    static LONGEST: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+
+    /// A stretch begins: a job was picked up for `method`, or a wait for the disk ended.
+    pub fn begin(method: u16) {
+        METHOD.store(u64::from(method), Relaxed);
+        FROM.store(rt::time::now(), Relaxed);
+    }
+
+    /// A wait begins, or the job ended: the stretch is over.
+    pub fn end() {
+        let from = FROM.swap(0, Relaxed);
+        if from == 0 {
+            return;
+        }
+        let took = rt::time::now().saturating_sub(from);
+        let number = METHOD.load(Relaxed);
+        let slot = &LONGEST[number as usize % LONGEST.len()];
+        if took > slot.load(Relaxed) {
+            slot.store(took, Relaxed);
+            match proto_data::Method::from_number(number as u16) {
+                Some(method) => {
+                    rt::println!("datafs: worker wall stretch {method:?} {took} ticks")
+                }
+                None => rt::println!("datafs: worker wall stretch other {took} ticks"),
+            }
+        }
+    }
+
+    /// A wait ended: the next stretch begins, for the same method.
+    pub fn resume() {
+        FROM.store(rt::time::now(), Relaxed);
+    }
+}
 
 /// The reads, writes and flushes of the disk when the conversion job took its first step.
 static CONVERSION_BASE: [core::sync::atomic::AtomicU64; 3] =
@@ -295,6 +342,8 @@ impl Device for Disk {
             }
         }
         self.reads += 1;
+        #[cfg(feature = "steps")]
+        stretch::end();
         for (i, chunk) in out.chunks_mut(CELL_BYTES as usize).enumerate() {
             let at = sector + (i * CELL_BYTES as usize / SECTOR) as u64;
             #[cfg(feature = "steps")]
@@ -305,6 +354,8 @@ impl Device for Disk {
             self.finish(key).map_err(|_| DeviceError)?;
             #[cfg(feature = "steps")]
             WAITED.fetch_add(rt::time::now().saturating_sub(asked), Relaxed);
+            #[cfg(feature = "steps")]
+            stretch::resume();
             // SAFETY: cell 0 of the mapped buffer; READY: the disk service wrote it, and no
             // request of it is in flight.
             unsafe {
@@ -316,6 +367,8 @@ impl Device for Disk {
 
     fn write(&mut self, sector: u64, data: &[u8]) -> Result<(), DeviceError> {
         self.writes += 1;
+        #[cfg(feature = "steps")]
+        stretch::end();
         for (i, chunk) in data.chunks(CELL_BYTES as usize).enumerate() {
             let at = sector + (i * CELL_BYTES as usize / SECTOR) as u64;
             #[cfg_attr(not(feature = "crash"), allow(unused_mut))]
@@ -327,6 +380,8 @@ impl Device for Disk {
             if count > 0 {
                 let key = self.io(Blk::Write, count, at).map_err(|_| DeviceError)?;
                 self.finish(key).map_err(|_| DeviceError)?;
+                #[cfg(feature = "steps")]
+                stretch::resume();
             }
             #[cfg(feature = "crash")]
             if stop {
@@ -338,10 +393,15 @@ impl Device for Disk {
 
     fn flush(&mut self) -> Result<(), DeviceError> {
         self.flushes += 1;
-        match self.call(&Blk::Flush.header().bytes(), None) {
+        #[cfg(feature = "steps")]
+        stretch::end();
+        let done = match self.call(&Blk::Flush.header().bytes(), None) {
             Ok(Got::Wait(key)) => self.finish(key).map_err(|_| DeviceError),
             _ => Err(DeviceError),
-        }
+        };
+        #[cfg(feature = "steps")]
+        stretch::resume();
+        done
     }
 }
 
@@ -582,6 +642,7 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
     let process = view::<Process>(PROCESS);
     let mut notary = Notary::new();
     let mut identities = Identities::new();
+    let mut windows = Windows::new();
     let kicks = Handle::<Channel>::borrowed(abi::Handle(JOBS_CHANNEL.load(Acquire)));
     // The idle work: the first walk after READY, and the walk that finds the blocks removals gave
     // back. A timer on the kick channel wakes the thread when the queue has been empty for
@@ -598,8 +659,10 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             .as_ref()
             .is_some_and(|fs| u64::from(fs.window_state().2) == fs.blocks()),
     };
+    // The timer that wakes the worker when a lease lapses: the jobs that wait for it go then.
+    let lease_timer = sys::timer_create(&kicks, LEVEL).ok();
     loop {
-        while let Some(i) = oldest() {
+        while let Some(i) = next_job(server, &mut volume) {
             if STOPPING.load(Acquire) && stop_decision() == Drain::GiveUp {
                 break;
             }
@@ -621,8 +684,19 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                     );
                 }
             }
+            server.set_job_queued(job.queued_at.load(Acquire));
             #[cfg(feature = "steps")]
             let began = rt::time::now();
+            #[cfg(feature = "steps")]
+            stretch::begin(
+                request
+                    .get(..2)
+                    .map_or(0, |b| u16::from_le_bytes([b[0], b[1]])),
+            );
+            // The handle of a WINDOW the request thread passed on is the worker's from here: it is
+            // kept, or it closes at the end of this job.
+            let offered = (job.kind == REQUEST && window_method(request) && job.aux != 0)
+                .then(|| Handle::<Memory>::from_raw(abi::Handle(job.aux)));
             match (&mut volume, job.kind) {
                 // At the stop a job that would take blocks from an empty window would walk the
                 // whole volume inside the 3 s of the stop (an aborted walk empties the window):
@@ -633,6 +707,13 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                         && datafs::server::needs_blocks(request) =>
                 {
                     let bytes = proto_wire::reply(Status::Kernel(abi::Error::BadState));
+                    job.reply[..bytes.len()].copy_from_slice(&bytes);
+                    job.reply_len = bytes.len();
+                }
+                // WINDOW: the memory object of the session's cells, checked and kept.
+                (Some(_), REQUEST) if offered.is_some() && !proto_data::is_root(job.owner) => {
+                    let bytes =
+                        window_job(server, &mut windows, &process, job.owner, request, offered);
                     job.reply[..bytes.len()].copy_from_slice(&bytes);
                     job.reply_len = bytes.len();
                 }
@@ -662,7 +743,22 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                         );
                         sys::process_exit(1);
                     }
-                    let reply = server.handle(fs, job.owner, job.aux, request);
+                    let reply = match datafs::server::part_of(request) {
+                        // A part with a cell: the worker maps the cell for the job.
+                        Some((method, cell, count))
+                            if cell != proto_data::INLINE && server.has_window(job.owner) =>
+                        {
+                            cell_job(
+                                (server, fs),
+                                &windows,
+                                &process,
+                                job.owner,
+                                request,
+                                (method, cell, count as usize),
+                            )
+                        }
+                        _ => server.handle(fs, job.owner, job.aux, request),
+                    };
                     let bytes = reply.as_bytes();
                     job.reply[..bytes.len()].copy_from_slice(bytes);
                     job.reply_len = bytes.len();
@@ -670,15 +766,18 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                     report(request);
                 }
                 // The session passed VERIFY_SESSION: the identity of its old holder is not its own.
-                (Some(_), UNBIND) => {
+                (Some(fs), UNBIND) => {
+                    server.leases_end_of(fs, job.owner);
                     server.unbind(job.owner);
                     identities.remove(job.owner);
+                    windows.remove(job.owner);
                     job.reply_len = 0;
                 }
                 (Some(fs), _) => {
                     server.gone(fs, job.owner);
-                    // The session's identity copy closes with it.
+                    // The session's identity copy and its window close with it.
                     identities.remove(job.owner);
+                    windows.remove(job.owner);
                     job.reply_len = 0;
                 }
                 (None, _) => {
@@ -693,14 +792,30 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             if job.kind == REQUEST {
                 longest_job(request, began);
             }
+            // The gap of a lease a part ran under counts from the answer to it, and the request
+            // thread learns which leases are live.
+            server.leases_stamp(now_ns());
+            let mut live = [0u32; proto_data::LEASES];
+            server.lease_numbers(&mut live);
+            for (slot, number) in live.iter().zip(LIVE_LEASES.iter()) {
+                number.store(*slot, Release);
+            }
             // A creation that found the estimate at the cap counted the pairs: the line tells it.
             tell_pairs();
+            #[cfg(feature = "steps")]
+            stretch::end();
             state(i).store(DONE, Release);
             idle.last_job = rt::time::ticks_to_ns(rt::time::now());
             if STOPPING.load(Acquire) {
                 STOP_JOBS.fetch_add(1, Release);
             }
             let _ = sys::notify(wake, 1);
+        }
+        // Jobs that wait for a lease run when it lapses: the worker wakes at the first expiry.
+        // (Without the timer the heartbeat of the request thread wakes the worker for a job that
+        // waits: a lapse is seen within a beat.)
+        if let (Some(timer), Some(at)) = (&lease_timer, server.next_lease_expiry()) {
+            let _ = sys::timer_set(timer, at.max(now_ns() + 1));
         }
         if STOPPING.load(Acquire) {
             put_away(server, &mut volume);
@@ -1011,9 +1126,7 @@ impl core::fmt::Display for AbortedTries {
 
 /// The drain step for the jobs queued now, after the time since the stop notice.
 fn stop_decision() -> Drain {
-    let queued = (0..JOBS)
-        .filter(|&i| state(i).load(Acquire) == QUEUED)
-        .count();
+    let queued = (0..JOBS).filter(|&i| waiting_job(i)).count();
     // 0 is a stop time not stored yet: no time has passed.
     let at = STOP_AT.load(Acquire);
     let since = if at == 0 {
@@ -1049,11 +1162,72 @@ fn report(request: &[u8]) {
     }
 }
 
+/// The monotonic clock in nanoseconds, for the leases.
+fn now_ns() -> u64 {
+    rt::time::ticks_to_ns(rt::time::now())
+}
+
+/// The job to run next. With a volume the server chooses (`Server::pick`): the leases that lapsed end
+/// first, and the oldest job that no lease holds back goes, with the parts of a lease holder at the
+/// place of the oldest job that waits for its file; a stop ends every lease so that every job runs.
+/// With no volume the oldest job goes (every one answers NOT_READY).
+fn next_job(server: &mut Server, volume: &mut Option<Volume>) -> Option<usize> {
+    let Some(fs) = volume.as_mut() else {
+        return oldest();
+    };
+    server.set_mono(now_ns());
+    if STOPPING.load(Acquire) {
+        server.leases_end_all(fs);
+    }
+    let mut seen = [datafs::server::Candidate {
+        id: 0,
+        ticket: 0,
+        owner: 0,
+        queued_at: 0,
+        request: &[],
+    }; datafs::server::CANDIDATES_MAX];
+    let mut n = 0;
+    for i in 0..JOBS {
+        if waiting_job(i) && n < seen.len() {
+            // SAFETY: a QUEUED job's request and ticket are set before the state is released, and
+            // the main thread does not touch it until it is DONE.
+            let job = unsafe { &*job(i) };
+            seen[n] = datafs::server::Candidate {
+                id: i,
+                ticket: job.ticket.load(Acquire),
+                owner: job.owner,
+                queued_at: job.queued_at.load(Acquire),
+                request: &job.request[..job.request_len],
+            };
+            n += 1;
+        }
+    }
+    // The leases whose time is over end first, except those whose next part is queued.
+    if !STOPPING.load(Acquire) {
+        server.leases_sweep(fs, &seen[..n]);
+    }
+    let choice = server.pick(&seen[..n]);
+    // The jobs that wait for a lease are marked, so that the request thread and the heartbeat see them.
+    for (k, c) in seen[..n].iter().enumerate() {
+        let wanted = if choice.parked & (1 << k) != 0 {
+            PARKED
+        } else {
+            QUEUED
+        };
+        let at = state(c.id);
+        let now = at.load(Acquire);
+        if (now == QUEUED || now == PARKED) && now != wanted {
+            at.store(wanted, Release);
+        }
+    }
+    choice.run
+}
+
 /// The oldest QUEUED job.
 fn oldest() -> Option<usize> {
     let mut best: Option<(u64, usize)> = None;
     for i in 0..JOBS {
-        if state(i).load(Acquire) == QUEUED {
+        if waiting_job(i) {
             // SAFETY: a QUEUED job's ticket is set before the state is released.
             let ticket = unsafe { (*job(i)).ticket.load(Acquire) };
             if best.is_none_or(|(t, _)| ticket < t) {
@@ -1062,6 +1236,101 @@ fn oldest() -> Option<usize> {
         }
     }
     best.map(|(_, i)| i)
+}
+
+/// Whether the request is WINDOW.
+fn window_method(request: &[u8]) -> bool {
+    request.get(..2) == Some(&proto_data::Method::Window.number().to_le_bytes()[..])
+}
+
+/// WINDOW: `offered` is the memory object the session sent. It is the session's window when it is a
+/// memory object of exactly `WINDOW_BYTES` that maps read-write; the window it replaces closes.
+fn window_job(
+    server: &mut Server,
+    windows: &mut Windows,
+    process: &Handle<Process>,
+    owner: u64,
+    request: &[u8],
+    offered: Option<Handle<Memory>>,
+) -> [u8; proto_wire::HEADER_LEN] {
+    use proto_data as p;
+    let status = |code: u32| proto_wire::reply(Status::Unknown(code));
+    let mut reader = proto_wire::Reader::new(request);
+    let header = match proto_wire::Header::read(&mut reader) {
+        Ok(header) => header,
+        Err(e) => return proto_wire::reply(e),
+    };
+    if header.version != p::VERSION {
+        return proto_wire::reply(Status::BadVersion);
+    }
+    if reader.left() != 0 {
+        return proto_wire::reply(Status::BadSize);
+    }
+    let Some(memory) = offered else {
+        return proto_wire::reply(Status::BadSize);
+    };
+    if !window::acceptable(process, &memory) {
+        return status(p::INVALID);
+    }
+    // The session is made if the service has not seen it, and has a window from here on.
+    match server.set_window(owner, true) {
+        Ok(()) if windows.put(owner, memory) => proto_wire::reply(Status::Ok),
+        Ok(()) => {
+            let _ = server.set_window(owner, false);
+            status(p::TABLE_FULL)
+        }
+        Err(Status::Unknown(code)) => status(code),
+        Err(_) => status(p::INVALID),
+    }
+}
+
+/// A part that names a cell of the session's window: the cell is mapped for this job alone, read
+/// only for a part that writes the file and read-write for one that reads it, the server does the
+/// part on its bytes, and the cell is unmapped. `(method, cell, count)` are the fields of the part.
+fn cell_job(
+    (server, fs): (&mut Server, &mut Volume),
+    windows: &Windows,
+    process: &Handle<Process>,
+    owner: u64,
+    request: &[u8],
+    (method, cell, count): (proto_data::Method, u32, usize),
+) -> proto_wire::Writer {
+    use datafs::server::Cell;
+    use proto_data::Method;
+    let writing = matches!(method, Method::WriteFrom | Method::PwriteFrom);
+    let failed = |code: u32| {
+        let mut w = proto_wire::Writer::new();
+        let _ = w.u32(code);
+        w
+    };
+    if count == 0 {
+        // Nothing to map: a part of no bytes.
+        let none = if writing {
+            Cell::Source(&[])
+        } else {
+            Cell::Sink(&mut [])
+        };
+        return server.handle_with(fs, owner, 0, request, none);
+    }
+    let Some(window) = windows.get(owner) else {
+        return failed(proto_data::IO);
+    };
+    let Ok(mapped) = window::map(process, window, cell, count, !writing) else {
+        return failed(proto_data::IO);
+    };
+    // SAFETY: the cell is mapped for `count` bytes at WINDOW_AT until `unmap`. The client may change
+    // the bytes while the job runs; the service reads no field of the protocol from them.
+    let reply = unsafe {
+        let at = window::WINDOW_AT;
+        let memory = if writing {
+            Cell::Source(core::slice::from_raw_parts(at as *const u8, count))
+        } else {
+            Cell::Sink(core::slice::from_raw_parts_mut(at as *mut u8, count))
+        };
+        server.handle_with(fs, owner, 0, request, memory)
+    };
+    window::unmap(process, mapped);
+    reply
 }
 
 /// Whether the request is BIND.

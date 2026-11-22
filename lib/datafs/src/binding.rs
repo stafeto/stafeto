@@ -171,7 +171,8 @@ pub fn initial(label: u64) -> Binding {
 }
 
 /// Whether a request needs the session to be bound (rule 2): everything except BIND, CLOSE, CLONE,
-/// CLONE_MORE and the requests that only read or hand on a description the session holds.
+/// CLONE_MORE, WINDOW, RELEASE and the requests that only read or hand on a description the session
+/// holds (READ, PREAD and their READ_INTO and PREAD_INTO).
 pub const fn needs_binding(method: Method) -> bool {
     !matches!(
         method,
@@ -189,6 +190,10 @@ pub const fn needs_binding(method: Method) -> bool {
             | Method::GetFlags
             | Method::Export
             | Method::Adopt
+            | Method::Window
+            | Method::ReadInto
+            | Method::PreadInto
+            | Method::Release
     )
 }
 
@@ -282,6 +287,10 @@ mod tests {
                     | Method::GetFlags
                     | Method::Export
                     | Method::Adopt
+                    | Method::Window
+                    | Method::ReadInto
+                    | Method::PreadInto
+                    | Method::Release
             );
             assert_eq!(needs_binding(m), !free, "{m:?}");
         }
@@ -290,6 +299,9 @@ mod tests {
             Method::Open,
             Method::Write,
             Method::Pwrite,
+            Method::WriteFrom,
+            Method::PwriteFrom,
+            Method::OpenNumbered,
             Method::Truncate,
             Method::Fsync,
             Method::SetFlags,

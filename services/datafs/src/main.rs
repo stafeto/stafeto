@@ -15,6 +15,7 @@
 mod clock;
 mod identity;
 mod shared;
+mod window;
 mod worker;
 
 use abi::{Rights, Source};
@@ -23,7 +24,7 @@ use datafs::admit::{self, Adopt, Fifo, Forgotten, Held, Wait};
 use proto_data::{METHODS as DATA_METHODS, Method, VERSION};
 use proto_init::ServiceArgs;
 use proto_wire::Status;
-use rt::handle::{Any, Channel, Outgoing, Process};
+use rt::handle::{Any, Channel, Memory, Outgoing, Process};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
 use rt::{Handle, sys};
 use shared::*;
@@ -325,7 +326,7 @@ impl Datafs {
             self.since = now;
         }
         let queued = (0..JOBS)
-            .filter(|&i| state(i).load(Acquire) == QUEUED)
+            .filter(|&i| waiting_job(i))
             // SAFETY: the instant is written before the job is QUEUED; it is read through the atomic.
             .map(|i| unsafe { (*job(i)).queued_at.load(Acquire) });
         let progress = PROGRESS.load(Acquire);
@@ -407,7 +408,7 @@ impl Datafs {
     /// A free job for a request of `owner`: None when the table is full, the session has its share
     /// in flight, or its root has (the sessions of one process tree share `ROOT_JOBS`: no session
     /// and no tree fills the table alone).
-    fn job_for(&self, owner: u64) -> Option<usize> {
+    fn job_for(&self, owner: u64, holder: bool) -> Option<usize> {
         let (root, expense) = ROOTS.root_of(owner);
         let (mut mine, mut tree) = (0, 0);
         for j in (0..JOBS).filter(|&j| state(j).load(Acquire) != FREE) {
@@ -426,6 +427,7 @@ impl Datafs {
             mine,
             tree,
             native: proto_data::is_service(owner),
+            holder,
         })
     }
 
@@ -435,7 +437,7 @@ impl Datafs {
     /// the pass of a request that found no job free.
     fn adopt(&mut self, r: &mut Request<'_>) -> Answer {
         let owner = r.label();
-        let job = self.job_for(owner);
+        let job = self.job_for(owner, false);
         match admit::adopt_plan(r.handles.len(), job.is_some()) {
             Adopt::BadSize => return Answer::Status(Status::BadSize),
             Adopt::GiveBack | Adopt::Queue => {}
@@ -458,6 +460,38 @@ impl Datafs {
         self.pending[i] = Some(pending);
         self.outgoing[i] = Some((Held::Spent, pass.erase()));
         self.queue(i, REQUEST, owner, label, r.bytes());
+        Answer::Deferred
+    }
+
+    /// WINDOW: the one handle of the request is a memory object. The root channel has no window.
+    /// The handle goes to the worker in the job's `aux` (raw), which keeps it or closes it; a
+    /// request that finds no job free is busy and the handle stays with the request.
+    fn window(&mut self, r: &mut Request<'_>, owner: u64) -> Answer {
+        if proto_data::is_root(owner) {
+            return Answer::Status(proto_data::code(proto_data::IS_ROOT));
+        }
+        if r.handles.len() != 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        // The kind and the rights come with the message: a device window (the kernel's `Memory`
+        // accepts one) or a handle that cannot be mapped both ways is no window.
+        match r.handles.info(0) {
+            Some((kind, rights)) if admit::window_offered(kind, rights) => {}
+            _ => return Answer::Status(proto_data::code(proto_data::INVALID)),
+        }
+        let Some(i) = self.job_for(owner, false) else {
+            return Answer::Status(busy());
+        };
+        let Ok(memory) = r.handles.take::<Memory>(0) else {
+            return Answer::Status(Status::Kernel(abi::Error::WrongType));
+        };
+        let Some(pending) = r.defer() else {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        };
+        self.pending[i] = Some(pending);
+        self.outgoing[i] = None;
+        self.carried[i] = None;
+        self.queue(i, REQUEST, owner, memory.into_raw().0, r.bytes());
         Answer::Deferred
     }
 
@@ -512,7 +546,7 @@ impl Datafs {
                 // The job is admitted under the rules of every request, for the label of the
                 // session verified: a loop of VERIFY_SESSION on one session takes its share and no
                 // more, and leaves the native places and the other roots' alone.
-                let Some(i) = self.job_for(label) else {
+                let Some(i) = self.job_for(label, false) else {
                     return Answer::Status(proto_data::code(proto_data::BAD_HANDLE));
                 };
                 if r.reply().u32(0).is_err() {
@@ -601,7 +635,7 @@ impl Datafs {
     /// The waiting requests go to the worker in the order they came, while jobs are admitted.
     fn release_waiting(&mut self) {
         while let Some(front) = self.waiting.front() {
-            let Some(i) = self.job_for(front.owner) else {
+            let Some(i) = self.job_for(front.owner, false) else {
                 break;
             };
             let Some(waiting) = self.waiting.pop() else {
@@ -656,7 +690,16 @@ impl Service<0> for Datafs {
             return self.verify_session(r);
         }
         let owner = r.label();
-        let job = self.job_for(owner);
+        // A part of a call that holds a lease takes a job outside the shares.
+        let holder = admit::holder_part(r.bytes(), |number| {
+            LIVE_LEASES.iter().any(|l| l.load(Acquire) == number)
+        });
+        // WINDOW brings the memory object of the session's cells. It goes to the worker, which owns
+        // it from here (it keeps it or closes it), in the `aux` of the job.
+        if Method::from_number(r.method()) == Some(Method::Window) {
+            return self.window(r, owner);
+        }
+        let job = self.job_for(owner, holder);
         // Every SESSION arrives with the one root label and shares its jobs: over the share the
         // request waits its turn, and busy answers only a full queue.
         if Method::from_number(r.method()) == Some(Method::Session) && proto_data::is_root(owner) {
@@ -731,6 +774,11 @@ impl Service<0> for Datafs {
     fn maintenance(&mut self, _: &mut [Option<Session<(), 0>>], notice: Notice) {
         if notice.source == Source::Timer && notice.label == 0 {
             self.watch_worker();
+            // A job that waits for a lease is looked at again each beat, whatever the worker's own
+            // timer did: no wake is lost for good.
+            if (0..JOBS).any(|i| state(i).load(Acquire) == PARKED) {
+                let _ = sys::notify(&self.kick, 1);
+            }
             #[cfg(feature = "steps")]
             serve_line();
         }

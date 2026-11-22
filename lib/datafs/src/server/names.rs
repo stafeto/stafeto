@@ -355,13 +355,18 @@ impl Server {
         parent: &perm::Attr,
         kind: Kind,
         mode: u32,
+        number: Option<u64>,
     ) -> Res<Attr> {
         let pkind = match kind {
             Kind::File => perm::Kind::File,
             Kind::Directory => perm::Kind::Directory,
         };
         let made = perm::creation(caller.identity(false), parent, pkind, mode, 0);
-        let ino = self.next_ino(fs)?;
+        // OPEN_NUMBERED names the number; every other creation takes the next of the counter.
+        let ino = match number {
+            Some(ino) => ino,
+            None => self.next_ino(fs)?,
+        };
         Ok(Attr {
             uid: made.uid,
             gid: made.gid,
@@ -395,7 +400,7 @@ impl Server {
         self.room_for_dir(fs)?;
         self.room_for_pair(fs)?;
         self.reserve_allows(fs, caller)?;
-        let record = self.new_record(fs, caller, &parent_attr, Kind::Directory, mode)?;
+        let record = self.new_record(fs, caller, &parent_attr, Kind::Directory, mode, None)?;
         volume(fs.mkdir(path))?;
         self.pairs_added(2);
         self.dirs_changed(1);

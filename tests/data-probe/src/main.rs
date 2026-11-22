@@ -38,11 +38,11 @@
 #![no_std]
 #![no_main]
 
-use abi::{MESSAGE_MAX, Source};
+use abi::{Access, MESSAGE_MAX, Rights, Source};
 use proto_data as p;
 use proto_data::Method;
 use proto_wire::{Status, Writer};
-use rt::handle::{Channel, Resource};
+use rt::handle::{Channel, Memory, Resource};
 use rt::sys::Received;
 use rt::{Handle, sys};
 
@@ -415,6 +415,7 @@ fn write(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
     wire(c.call(p::statfs), "statfs")?;
     if V3 {
         v3_write(c, start)?;
+        v4_window(c, start)?;
     }
     rt::println!("data-probe: finished");
     Ok(())
@@ -528,6 +529,173 @@ fn v3_write(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
         return Err("a BIND with a copy that is no identity session was not ACCESS");
     }
     rt::println!("data-probe: unbound session refused ok");
+    Ok(())
+}
+
+/// Where the probe maps its window.
+const WINDOW_AT: usize = 0x50_0000_0000;
+
+impl Client {
+    /// A part: the request, the status or the three words of the reply and the bytes after them.
+    fn part(&self, request: &[u8]) -> Result<Reply, Status> {
+        let reply = sys::send(&self.session, request)?;
+        let mut out = Reply {
+            bytes: [0; MESSAGE_MAX],
+            len: 0,
+        };
+        let bytes = reply.bytes(&mut out.bytes);
+        out.len = bytes.len();
+        p::reply(&out.bytes[..out.len])?;
+        Ok(out)
+    }
+
+    /// WINDOW with a copy of `memory` that has MAP_READ, MAP_WRITE and TRANSFER.
+    fn give_window(&self, memory: &Handle<Memory>) -> Result<(), Status> {
+        let copy = sys::handle_duplicate(
+            memory,
+            Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER,
+        )?;
+        let mut w = Writer::new();
+        p::window(&mut w)?;
+        let reply =
+            sys::send_handles(&self.session, w.as_bytes(), [copy.erase()]).map_err(|r| r.error)?;
+        let mut buffer = [0u8; MESSAGE_MAX];
+        p::reply(reply.bytes(&mut buffer)).map(drop)
+    }
+}
+
+/// The version 4 series, on the writing boot: a window given to the service, a file of 200,000
+/// bytes written in parts of a cell from the window and read back in parts into it, the old READ
+/// and an `INLINE` part agreeing with it, a part with no window refused with NO_WINDOW, a window
+/// of the wrong size refused, a window given again, and a file made with OPEN_NUMBERED.
+fn v4_window(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
+    let part = |handle: u32, count: usize, cell: u32, flags: u32| p::Part {
+        handle,
+        count: count as u32,
+        offset: 0,
+        cell,
+        flags,
+        lease: 0,
+    };
+    let handle = wire(
+        c.open(b"/v4", p::READ | p::WRITE | p::CREATE | p::TRUNCATE),
+        "open v4",
+    )?;
+    // No window yet: a part with a cell is NO_WINDOW and does nothing.
+    let mut w = Writer::new();
+    wire(p::read_into(&part(handle, 10, 0, 0), &mut w), "request")?;
+    match c.part(w.as_bytes()) {
+        Err(Status::Unknown(p::NO_WINDOW)) => {}
+        _ => return Err("a part with a cell and no window was not NO_WINDOW"),
+    }
+    // A memory object of the wrong size is not a window.
+    let small = sys::mem_create(4096).map_err(|_| "no memory for a small object")?;
+    if c.give_window(&small) != Err(Status::Unknown(p::INVALID)) {
+        return Err("a window of one page was taken");
+    }
+    drop(small);
+    let window = sys::mem_create(p::WINDOW_BYTES as u64).map_err(|_| "no memory for a window")?;
+    sys::mem_map(
+        &start.process,
+        &window,
+        0,
+        p::WINDOW_BYTES as u64,
+        WINDOW_AT,
+        Access::ReadWrite,
+    )
+    .map_err(|_| "the window did not map")?;
+    wire(c.give_window(&window), "WINDOW")?;
+    let cell = |i: usize| (WINDOW_AT + i * p::CELL_BYTES) as *mut u8;
+    // 200,000 bytes in parts of a cell, alternating the two cells.
+    let total = 200_000usize;
+    let (mut at, mut which, mut parts, mut lease) = (0usize, 0usize, 0u32, 0u32);
+    while at < total {
+        let n = (total - at).min(p::CELL_BYTES);
+        // SAFETY: the window is mapped at WINDOW_AT for 128 KiB and a cell is 64 KiB of it; the
+        // service reads the cell only while this call is in flight.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(cell(which), n) };
+        fill(bytes, at, 77);
+        let more = if at + n < total { p::MORE } else { 0 };
+        let mut head = part(handle, n, which as u32, more);
+        // The first part takes a lease on the file, the next ones carry it, the last one ends it.
+        head.lease = lease;
+        let mut w = Writer::new();
+        wire(p::write_from(&head, &[], &mut w), "request")?;
+        let reply = wire(c.part(w.as_bytes()), "WRITE_FROM")?;
+        if reply.word(0) as usize != n || reply.word(4) != 0 {
+            return Err("a part of a cell was written short or lapsed");
+        }
+        lease = reply.word(8);
+        if (lease != 0) != (more != 0) {
+            return Err("the lease of a call in parts is not held until its last part");
+        }
+        at += n;
+        which ^= 1;
+        parts += 1;
+    }
+    // A lease number the service never gave is BAD_HANDLE.
+    if !matches!(
+        c.call(|w| p::release(0x0001_0777, w)),
+        Err(Status::Unknown(p::BAD_HANDLE))
+    ) {
+        return Err("a RELEASE of a number never given was not BAD_HANDLE");
+    }
+    // Back with PREAD_INTO into the cells, compared to the bytes their salt says.
+    let mut at = 0usize;
+    while at < total {
+        let n = (total - at).min(p::CELL_BYTES);
+        let mut w = Writer::new();
+        let mut head = part(handle, n, 1, 0);
+        head.offset = at as u64;
+        wire(p::pread_into(&head, &mut w), "request")?;
+        let reply = wire(c.part(w.as_bytes()), "PREAD_INTO")?;
+        if reply.word(0) as usize != n {
+            return Err("a part read short");
+        }
+        let mut expected = [0u8; 4096];
+        // SAFETY: as above; the part is over.
+        let got = unsafe { core::slice::from_raw_parts(cell(1), n) };
+        let mut k = 0;
+        while k < n {
+            let m = (n - k).min(expected.len());
+            fill(&mut expected[..m], at + k, 77);
+            if got[k..k + m] != expected[..m] {
+                return Err("a part of a cell read back other bytes");
+            }
+            k += m;
+        }
+        at += n;
+    }
+    // The old READ from the start agrees, and so does an INLINE part.
+    wire(c.call(|w| p::seek(handle, 0, p::SEEK_SET, w)), "seek")?;
+    if !wire(c.matches(handle, total, 77), "read v4")? {
+        return Err("the old READ read other bytes than the parts wrote");
+    }
+    let mut w = Writer::new();
+    let mut head = part(handle, p::INLINE_READ, p::INLINE, 0);
+    head.offset = 150_000;
+    wire(p::pread_into(&head, &mut w), "request")?;
+    let reply = wire(c.part(w.as_bytes()), "INLINE read")?;
+    let n = reply.word(0) as usize;
+    let mut expected = [0u8; p::INLINE_READ];
+    fill(&mut expected[..n], 150_000, 77);
+    if n != p::INLINE_READ || reply.bytes[16..16 + n] != expected[..n] {
+        return Err("an INLINE part read other bytes");
+    }
+    wire(c.close(handle), "close v4")?;
+    // The window given again replaces the old one and the parts go on.
+    wire(c.give_window(&window), "WINDOW again")?;
+    // OPEN_NUMBERED: the native client names the number of a new file.
+    let ino = p::INO_NUMBERED | 4242;
+    let reply = wire(
+        c.call(|w| p::open_numbered(b"/v4n", p::WRITE | p::CREATE | p::EXCLUSIVE, 0o644, ino, w)),
+        "OPEN_NUMBERED",
+    )?;
+    wire(c.close(reply.word(0)), "close v4n")?;
+    if stat_of(c, b"/v4n")?.ino != ino {
+        return Err("OPEN_NUMBERED did not give the number asked");
+    }
+    rt::println!("data-probe: window parts ok ({parts} parts of a cell, inline, numbered)");
     Ok(())
 }
 
