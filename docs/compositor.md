@@ -485,6 +485,18 @@ run, and `cap_us` is the value of the model: the cap's bands at their gate, at 1
 tick (the counter of a run under -icount, 62.5 MHz). On HVF and on a board `cap_us`
 does not match the wall.
 
+Each STATS tells the phases of the late frames of the count that it has not told yet, two at
+most, from the first four late frames of the count, one line each to the console:
+`compositor: late frame period K take A us compose B us device C us frame D us (the longest: P)`.
+The take is the delay of the taking after the start of the period, the compose the time from the
+taking to the commit, the device the time from the commit to FRAME_SHOWN, and the three add up to
+the time of the frame; P names the longest of the three. The line tells which phase overran. The
+bound `frame::bound` of the scene covers the take and the compose (and the driver's own step in the
+term of the display driver). The device's own time is the emulator's: under `-icount` the virtual
+time of a wait for an emulated device moves with the host's scheduling of QEMU's main loop (the
+device's work is a bottom half there), so the time of the device in a run on a loaded host is
+longer than the model's and is the longest phase of a late frame that is late for that reason.
+
 An expiry of the timer that arrives before the time the timer is armed for is
 `Fire::Early`: the kernel delivers the expiry of an earlier deadline that `timer_set`
 has moved since. The service does nothing, the timer stays armed and no wakeup is
