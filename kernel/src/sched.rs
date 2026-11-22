@@ -907,6 +907,20 @@ pub fn interrupt_entered(now: u64) {
     unsafe { g.s.interrupt_entered(now) };
 }
 
+/// The handling of an interrupt begins: `interrupt_entered` at the time of
+/// now, unless an entry from EL0 closed the stint already (the vector reads
+/// the time once, and the second call would change nothing). One section of
+/// the scheduler's lock; the counter is read only when it is needed.
+#[inline(never)]
+pub fn interrupt_handled() {
+    let mut g = local().sched.lock();
+    if g.s.visit_open() {
+        return;
+    }
+    // SAFETY: the scheduler's threads are alive.
+    unsafe { g.s.interrupt_entered(timer::now()) };
+}
+
 /// The thread `next` returns to EL0 at `now`: its stint begins, if it
 /// waited for this (`Node::stint_pending`).
 #[inline(always)]

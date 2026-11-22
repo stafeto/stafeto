@@ -29,7 +29,7 @@ pub fn poll() {
 pub fn handle(ack: Ack) {
     // The time of the visit is the system's, never the running thread's
     // (spec 8); a visit that began at an entry from EL0 did this already.
-    sched::interrupt_entered(timer::now());
+    sched::interrupt_handled();
     let intid = ack.intid();
     if intid < 16 {
         // A software-generated interrupt: a command from another CPU, or the

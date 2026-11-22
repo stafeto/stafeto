@@ -880,8 +880,10 @@ pub const INFO_MEMORY: u64 = 5;
 /// its user time), and in x7 the times the kernel took the thread off the
 /// CPU while it was ready: a higher level or the cleanup queue took it, or
 /// it lost its level with its budget gone; not a block, a yield or the end
-/// of a quantum (the count wraps at 2^16). A preemption adds the saving and
-/// the restoring of the registers to the ticks of x5, and no more.
+/// of a quantum (the count wraps at 2^16). A preemption of a thread at
+/// EL0 adds about the saving and the restoring of the registers to the ticks
+/// of x5, and no more; a preemption that the thread's own call decides (the
+/// call wakes a thread above it) adds about nothing.
 pub const INFO_THREAD_STATE: u64 = 6;
 /// CHANNEL takes a channel handle, a labelled copy too, with no right
 /// needed, and returns `ChannelInfo::to_words` in x1-x4.
