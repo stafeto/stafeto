@@ -1274,7 +1274,7 @@ files = [
         assert_eq!(lvgl.needs, ["display", "input"]);
         // libc++ and its runtime: the C++ programs link them, no file of its own.
         let libcxx = get("libcxx");
-        assert_eq!(libcxx.license, "Apache-2.0 WITH LLVM-exception");
+        assert_eq!(libcxx.license, "Apache-2.0 WITH LLVM-exception OR MIT OR NCSA");
         assert_eq!(libcxx.group(), Group::Game);
         assert!(libcxx.files.is_empty());
         assert_eq!(get("busybox").group(), Group::Base);
