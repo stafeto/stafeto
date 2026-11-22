@@ -53,7 +53,7 @@ use abi::{Access, Error, MESSAGE_MAX, Rights, Source};
 use compositor::frame::{self, Fire, Pacer, Wake};
 use compositor::{
     Band, Format, FrameKind, MAX_WINDOWS, Refusal, SCREEN, Scene, ScreenAsk, ScreenPhase,
-    Source as PixelSource, compose,
+    Source as PixelSource, compose_planned,
 };
 use core::mem::ManuallyDrop;
 use core::slice;
@@ -316,6 +316,8 @@ struct Axes {
 struct Job {
     damage: Rect,
     at: Band,
+    /// The groups of the layers of the place, made once when it began.
+    passes: Option<compositor::Passes>,
 }
 
 /// The pool: the buffer of the window of the first revision, the driver's
@@ -1392,8 +1394,14 @@ impl Compositor {
         } else {
             damage.y
         };
+        let passes = if self.scene.frame_kind() == FrameKind::Bypass {
+            None
+        } else {
+            compositor::plan(&self.scene, damage)
+        };
         self.job = Some(Job {
             damage,
+            passes,
             at: Band {
                 row,
                 col: 0,
@@ -1443,10 +1451,11 @@ impl Compositor {
         let (times_began, scan_began) = (px::cost::trace::times(), self.raster.scanned());
         #[cfg(feature = "steps")]
         let compose_began = rt::time::now();
-        job.at = compose(
+        job.at = compose_planned(
             &self.scene,
             job.damage,
             job.at,
+            job.passes.as_ref(),
             fb,
             &Pixels(&self.scene),
             &mut self.raster,
