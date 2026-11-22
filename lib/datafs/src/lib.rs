@@ -30,6 +30,8 @@ pub mod stop;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_ctz;
+#[cfg(test)]
 mod tests_cut;
 #[cfg(test)]
 mod tests_entry_attr;
