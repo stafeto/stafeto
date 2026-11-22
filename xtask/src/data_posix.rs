@@ -897,6 +897,20 @@ pub const PART_OWN_READ_MEAN_MAX_US: u64 = 3_800;
 pub const WORKER_SHARE_MAX_PERCENT: u64 = 30;
 /// The service's step of a part, in ticks, the most (the goal of READ and WRITE).
 const PART_STEP_MAX: u64 = 6_000;
+/// The step of a write part that carries its data in the message (kinds 39 WriteFrom and 40
+/// PwriteFrom, a call with no cell), in ticks, the most: the loop copies the whole message twice in
+/// the step (the receive into the loop's buffer and the queue into the job), at about half a tick a
+/// byte each, and the same again is margin.
+const INLINE_PART_STEP_MAX: u64 = PART_STEP_MAX + 2 * abi::MESSAGE_MAX as u64;
+
+/// The bound of a step of the parts method `kind`: the write parts that may carry their data in the
+/// message have their own.
+fn part_step_max(kind: usize) -> u64 {
+    match kind {
+        39 | 40 => INLINE_PART_STEP_MAX,
+        _ => PART_STEP_MAX,
+    }
+}
 
 /// What a line `datafs: parts write|read n N cpu mean M us max X us total T us own mean M us max X us
 /// span S us` tells (all in microseconds).
@@ -989,10 +1003,11 @@ pub fn steps_verdict(lines: &[String], cpus: usize) -> Result<String, String> {
         }
         if let Some(row) = rows
             .iter()
-            .find(|r| (36..=42).contains(&r.0) && r.1 > PART_STEP_MAX)
+            .find(|r| (36..=42).contains(&r.0) && r.1 > part_step_max(r.0))
         {
             return Err(format!(
-                "data-steps: a step of a method of the parts past {PART_STEP_MAX} ticks: {row:?}"
+                "data-steps: a step of a method of the parts past {} ticks: {row:?}",
+                part_step_max(row.0)
             ));
         }
         let wall = crate::data_probe::cell_longest(lines)?;
@@ -1771,15 +1786,21 @@ mod tests {
         let one = steps_lines(0, 9000, 900);
         assert!(steps_verdict(&one, 1).unwrap().contains("own mean 900"));
         assert!(steps_verdict(&one, 2).unwrap_err().contains("no CPU time"));
-        // On one CPU the steps are judged: a step past 0.9 B, a method of the parts past 6,000 ticks,
+        // On one CPU the steps are judged: a step past 0.9 B, a method of the parts past its bound,
         // a cell map past B; on two CPUs they are told.
         let mut over = steps_lines(500_000, 9000, 900);
         over[0] = "service step: 17 kind 37 19000 ticks detail 65536".into();
         assert!(steps_verdict(&over, 1).is_err());
         assert!(steps_verdict(&over, 2).is_ok());
         let mut part = steps_lines(500_000, 9000, 900);
-        part[1] = "service step: 17 kind 39 6500 ticks detail 65536".into();
+        part[0] = "service step: 17 kind 37 6500 ticks detail 65536".into();
         assert!(steps_verdict(&part, 1).unwrap_err().contains("6000"));
+        // A write part with its data in the message copies it twice: its own bound of 8,048 ticks.
+        let mut inline = steps_lines(500_000, 9000, 900);
+        inline[1] = "service step: 17 kind 39 7305 ticks detail 102411".into();
+        assert!(steps_verdict(&inline, 1).is_ok());
+        inline[1] = "service step: 17 kind 39 8049 ticks detail 102411".into();
+        assert!(steps_verdict(&inline, 1).unwrap_err().contains("8048"));
         let mut missing = steps_lines(500_000, 9000, 900);
         missing.remove(1);
         assert!(
