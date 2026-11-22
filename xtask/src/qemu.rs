@@ -20,9 +20,12 @@ pub const HEADLESS: &[&str] = &["-display", "none", "-serial", "stdio", "-monito
 
 /// Virtual time counts instructions, one per 2^4 ns, which at the 62.5 MHz
 /// of the counter is one per tick; with `sleep=off` it jumps to the next
-/// timer deadline while the CPU sleeps in `wfi`. Every run of a kernel
-/// then sees the same times, whatever the host does. An idle kernel with
-/// no deadline stops time and hangs.
+/// timer deadline while the CPU sleeps in `wfi`. The times of the CPU and its
+/// timers are the same in every run. A wait for a device that QEMU serves in
+/// its main loop thread (a bottom half, as the virtio-gpu control queue is)
+/// counts the instructions or the jump of the clock that pass until that thread
+/// has run, so on a loaded host it is longer than on a quiet one. An idle kernel
+/// with no deadline stops time and hangs.
 pub const ICOUNT: &[&str] = &["-icount", "shift=4,sleep=off"];
 
 /// A QEMU machine type with its options, a CPU model and an accelerator.
