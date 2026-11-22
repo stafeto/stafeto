@@ -10,9 +10,11 @@
 //! `leave` after it) with the frame of the call, and the hook of the jump takes off the ones the
 //! jump leaves (`trim`, called from `posix_abi::shared::jump_mark`).
 //!
-//! The record of a thread holds `FRAMES` frames; a thread nested deeper is counted but not
-//! trimmed exactly, so it stays "inside a handler" until it returns from them, which sends its
-//! large calls on `/data` by messages, never into a wrong state.
+//! The record of a thread holds `FRAMES` frames; a thread nested deeper is counted, and a jump
+//! that leaves the last recorded frame leaves every deeper level too, so the count drops to the
+//! recorded ones and trimming goes on. A jump that stops short of the last recorded frame leaves
+//! the deeper levels counted, which sends the thread's large calls on `/data` by messages, never
+//! into a wrong state.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use entries::{Frame, nested};
@@ -52,10 +54,13 @@ fn row() -> &'static Row {
 /// The calling thread calls a handler from the frame `frame`.
 pub(crate) fn enter(frame: Frame) {
     let row = row();
-    let at = row.depth.fetch_add(1, Ordering::Relaxed) as usize;
+    // The frame first, then the depth: a signal that comes between the two reads the depth of the
+    // handlers before this one and a frame no one reads yet. Only the thread itself writes its row.
+    let at = row.depth.load(Ordering::Relaxed) as usize;
     if let Some(slot) = row.frames.get(at) {
         slot.store(frame.sp | u64::from(frame.z), Ordering::Relaxed);
     }
+    row.depth.store(at as u32 + 1, Ordering::Relaxed);
 }
 
 /// The handler returned.
@@ -74,11 +79,24 @@ pub(crate) fn active() -> bool {
 pub(crate) fn trim(target: Frame) {
     let row = row();
     loop {
-        let depth = row.depth.load(Ordering::Relaxed) as usize;
-        if depth == 0 || depth > FRAMES {
+        let mut depth = row.depth.load(Ordering::Relaxed) as usize;
+        if depth == 0 {
             return;
         }
-        let word = row.frames[depth - 1].load(Ordering::Relaxed);
+        // Levels past the recorded ones lie deeper than the last recorded frame: when the jump
+        // leaves that one it leaves them all.
+        let recorded = depth.min(FRAMES);
+        let word = row.frames[recorded - 1].load(Ordering::Relaxed);
+        if depth > FRAMES {
+            let frame = Frame {
+                z: (word & 1) as u8,
+                sp: word & !1,
+            };
+            if !nested(frame, target) {
+                return;
+            }
+            depth = FRAMES;
+        }
         let frame = Frame {
             z: (word & 1) as u8,
             sp: word & !1,
