@@ -161,15 +161,18 @@ start to its end (the pointers and the block of data), the same for calls of 4 K
   is not below the target (or from the head when there is none), walks as `lfs_ctz_find` does, and
   records every block it passes. With 16 wayposts a read in order finds the next block from the
   waypost the last find left next to it, with one read of a pointer; with 0 it is the release's walk.
-- The wayposts are right because the blocks of a skip list never change while the head is the
-  same: littlefs writes a changed file to new blocks (copy on write) and the old list stays as it
-  was until the new head replaces it in the directory. The pair is the check: a write that
-  extends or changes the file, a truncation and a relocation all give the file a new head or a new
-  size. As a second guard, `lfs_file_write_` and `lfs_file_truncate_` drop the wayposts when they
-  start, and `lfs_file_opencfg_` sets them empty, so a head that came back to the same number and
-  size after the old blocks were freed and given out again cannot match a stale waypost. A block that
-  another handle frees and rewrites under a reader is the release's own hazard (the reader walks the
-  same freed blocks) and the wayposts do not widen it.
+- The wayposts are right because the blocks of a skip list never change while the list is live:
+  littlefs writes a changed file to new blocks (copy on write) and the old list stays as it was until the
+  new head replaces it in the directory. The pair (`ctz.head`, `ctz.size`) is not enough to tell lists
+  apart: the head of an old list is freed once the new one is synced, and the allocator can hand it out
+  again at the same size with other blocks inside. The main guard is therefore the drop: the wayposts
+  are emptied by `lfs_file_write_` and `lfs_file_truncate_` when they start and where `file->ctz` is
+  assigned (the flush of a write, and the two paths of a truncation), and `lfs_file_opencfg_` starts
+  them empty. The pair is a cheap fallback that forgets wayposts recorded for another pair. A
+  block that another handle frees under a reader is no hazard: after a sync by another handle
+  littlefs marks the others `LFS_F_DUSTY`, and the walk of the allocator counts the `ctz` of every
+  such handle, so the blocks of the old snapshot, where the wayposts sit, are not given out while
+  the handle is open; the snapshot is protected by `LFS_F_DUSTY`.
 - Nothing changes on the disk. The tests compare, for the same random operations (reads, seeks
   forward and backward, writes in place, past the end and at the end, truncations shorter and longer,
   syncs, reopening, remounting) on volumes with 0, 1, 3 and 16 wayposts, every answer with a model of
@@ -178,10 +181,17 @@ start to its end (the pointers and the block of data), the same for calls of 4 K
   after rewrites in place (`reads_after_a_truncation_and_a_rewrite_in_place`); and the file as a reader
   sees it after a power cut at every sector of a large write, with three sets of surviving sectors,
   with and without wayposts (`a_cut_at_every_sector_of_a_large_write_reads_the_same_with_and_without_wayposts`).
-  `a_read_in_order_costs_at_most_three_reads_for_each_block` keeps the figure of the table. Each of the two guards, the comparison of the pair and the drop at the start of a write
-  or a truncation, covers every change of the file alone, so removing either leaves the tests
-  passing; removing both (wayposts that outlive a write) gives a wrong read at step 22 of the first
-  seed of the random test (checked by hand and then undone).
+  `a_read_in_order_costs_at_most_three_reads_for_each_block` keeps the figure of the table.
+  `a_head_given_out_again_at_the_same_size_does_not_match_old_wayposts` (a volume of 48 blocks, a file of
+  40,000 bytes rewritten with a sync k times with a second file of varying length in between, no read
+  during the rewrites) fails at k 10 when the drops are removed: only the drop covers every change of the
+  file alone, the pair does not. `a_reader_keeps_the_old_snapshot_while_another_handle_rewrites_the_file`
+  rewrites the file through a second handle while the first has wayposts and the allocator is
+  busy, with 0 and with 16 wayposts: the reader goes on reading its snapshot. The build feature
+  `break-datafs-ctz-hints` of `lib/datafs` defines `LFS_CTZ_HINTS_NO_DROP`, which makes the drop a
+  no-op (for the host tests only), and `cargo xtask datafs-breaks` checks that the probe above fails
+  with it. A wrong bound of the search (`index + 1 >= target` for the forgetting of the wayposts
+  behind the target) was checked by hand and fails every test of `tests_ctz.rs`.
 
 ## A known defect of the release that the service works around
 
@@ -200,8 +210,8 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 0cb4ff1daf5fdc1359c6a6ee3116092f08fc100c9d58b1b77ab17bfd801f856d  LICENSE.md
 6dd74dfc58ac93589f8e002bb73c0830a59206912cfe8c951c07eb2bd5fccad0  SPEC.md
 2a8b3459d74b9fa8bdd947738522c46331739405b1fc3d70f057f636a1dea768  DESIGN.md
-d3430f6c4445dc9e53ccba04b1d52b1ddeb05d8644c871f21deb339fd5a8a167  lfs.c (with the change)
-4779bc0fb29263a3d10149eda8f472fac017213c2cda4c7b212b5010b80932e9  lfs.h (with the change)
+14cc5c8a89ace91082f3d4dc6b482f78a8128bbb5779e8d1245d9663b26dcc57  lfs.c (with the change)
+77523060a609e674c8f98f1860a87977de38157caa828d22b297e8dfa5dc2051  lfs.h (with the change)
 ```
 
 `tools/check-littlefs.py` (run by `cargo xtask ci` as "littlefs sources") fails when a file of the
@@ -227,7 +237,7 @@ change, or when `stafeto-changes.patch` applied backwards to them does not give 
    `lfs_fs_pred`; the count of directories relies on `dir.split` being true exactly when the
    pair's tail is a hard tail (a continuation of the same directory) and false for a soft tail.
    The table of the repair relies on `lfs_fs_parent` and `lfs_fs_parent_match` (the match on `LFS_TYPE_DIRSTRUCT` with the mask `LFS_MKTAG(0x7ff, 0, 0x3ff)`) and on the two commits of `lfs_fs_deorphan` that follow a repair; keep the table's answer equal to `lfs_fs_parent`'s.
-   The wayposts rely on `lfs_ctz_index` and `lfs_ctz_find` (the walk of the skip list, which `lfs_ctz_find_hinted` repeats with the wayposts added), on `lfs_file_flushedread` calling `lfs_ctz_find` once for each new block, and on a changed file always getting a new head or size (`lfs_file_flush`, `lfs_file_truncate_`).
+   The wayposts rely on `lfs_ctz_index` and `lfs_ctz_find` (the walk of the skip list, which `lfs_ctz_find_hinted` repeats with the wayposts added), on `lfs_file_flushedread` calling `lfs_ctz_find` once for each new block, on `LFS_F_DUSTY` and the allocator's walk keeping the blocks of an open handle's list, and on every place that assigns `file->ctz` (`lfs_file_flush`, `lfs_file_truncate_`) or writes (`lfs_file_write_`) calling `lfs_ctz_hints_drop`.
    Check that the new release's `lfs_fs_traverse_` still begins its walk with
    `dir.tail = {0, 1}`, runs the cycle check before each fetch and goes on to `dir.tail`, and keep
    the function in step with it.

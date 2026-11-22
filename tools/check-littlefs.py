@@ -37,8 +37,8 @@ UPSTREAM = {
 }
 # The two files the change touches, with the change.
 CHANGED = {
-    "lfs.c": "d3430f6c4445dc9e53ccba04b1d52b1ddeb05d8644c871f21deb339fd5a8a167",
-    "lfs.h": "4779bc0fb29263a3d10149eda8f472fac017213c2cda4c7b212b5010b80932e9",
+    "lfs.c": "14cc5c8a89ace91082f3d4dc6b482f78a8128bbb5779e8d1245d9663b26dcc57",
+    "lfs.h": "77523060a609e674c8f98f1860a87977de38157caa828d22b297e8dfa5dc2051",
 }
 PATCH = "stafeto-changes.patch"
 DOCS = ("README.md", "STAFETO-CHANGES.md")

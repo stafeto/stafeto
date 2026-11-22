@@ -3041,6 +3041,18 @@ static int lfs_ctz_find(lfs_t *lfs,
 // never changes while the list has the same head, so a waypost is right as
 // long as the pair (head, size) is the one it was recorded for; the writes and
 // the truncations of the file drop the wayposts as well.
+//
+// Dropping the wayposts where the file changes is the main guard: the head of
+// an old list is freed once the new one is synced, and the allocator may hand
+// it out again at the same size with other blocks inside, so the pair alone
+// does not tell the lists apart. The pair is a cheap fallback.
+// LFS_CTZ_HINTS_NO_DROP is for the host tests of the guard only.
+#ifdef LFS_CTZ_HINTS_NO_DROP
+#define lfs_ctz_hints_drop(file) ((void)0)
+#else
+#define lfs_ctz_hints_drop(file) ((void)((file)->hints.count = 0))
+#endif
+
 static void lfs_ctz_hint_add(struct lfs_ctz_hints *hints, lfs_size_t limit,
         lfs_size_t index, lfs_block_t block) {
     lfs_size_t worst = 0;
@@ -3624,6 +3636,7 @@ relocate:
         }
 
         // actual file updates
+        lfs_ctz_hints_drop(file);
         file->ctz.head = file->block;
         file->ctz.size = file->pos;
         file->flags &= ~LFS_F_WRITING;
@@ -3871,7 +3884,7 @@ static lfs_ssize_t lfs_file_write_(lfs_t *lfs, lfs_file_t *file,
     LFS_ASSERT((file->flags & LFS_O_WRONLY) == LFS_O_WRONLY);
 
     // the list the wayposts name is about to change
-    file->hints.count = 0;
+    lfs_ctz_hints_drop(file);
 
     if (file->flags & LFS_F_READING) {
         // drop any reads
@@ -3974,7 +3987,7 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
     }
 
     // the list the wayposts name is about to change
-    file->hints.count = 0;
+    lfs_ctz_hints_drop(file);
 
     lfs_off_t pos = file->pos;
     lfs_off_t oldsize = lfs_file_size_(lfs, file);
@@ -3995,6 +4008,7 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
                 return (int)res;
             }
 
+            lfs_ctz_hints_drop(file);
             file->ctz.head = LFS_BLOCK_INLINE;
             file->ctz.size = size;
             file->flags |= LFS_F_DIRTY | LFS_F_READING | LFS_F_INLINE;
@@ -4021,6 +4035,7 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
             // need to set pos/block/off consistently so seeking back to
             // the old position does not get confused
             file->pos = size;
+            lfs_ctz_hints_drop(file);
             file->ctz.head = file->block;
             file->ctz.size = size;
             file->flags |= LFS_F_DIRTY | LFS_F_READING;

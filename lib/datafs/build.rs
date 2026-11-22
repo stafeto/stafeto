@@ -50,6 +50,10 @@ fn main() {
         build.define("DATAFS_BREAK_CONSISTENT", None);
     }
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BREAK_DATAFS_CONSISTENT");
+    if env::var_os("CARGO_FEATURE_BREAK_DATAFS_CTZ_HINTS").is_some() {
+        build.define("LFS_CTZ_HINTS_NO_DROP", None);
+    }
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BREAK_DATAFS_CTZ_HINTS");
     build
         .file(lfs.join("lfs.c"))
         .file(lfs.join("lfs_util.c"))

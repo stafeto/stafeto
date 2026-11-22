@@ -440,3 +440,88 @@ fn a_cut_at_every_sector_of_a_large_write_reads_the_same_with_and_without_waypos
         }
     }
 }
+
+#[test]
+fn a_head_given_out_again_at_the_same_size_does_not_match_old_wayposts() {
+    // The head of an old list is freed once the new one is synced, and the allocator can hand it out
+    // again at the same size with other blocks inside: the pair (head, size) alone is no proof.
+    // Only the drop at a write tells the lists apart. A small volume and a second file of varying
+    // length make the allocator reuse blocks in many orders; the reads with the wayposts of an old
+    // list in the handle must give the bytes of the new one.
+    let size = 40_000usize;
+    let mut fs = volume_with_file(48, size as u64, 16);
+    let f = fs.open(b"/f", Open::READ_WRITE).unwrap();
+    let mut model = pattern(0, size);
+    let mut era = 1u64;
+    for k in 1..=120usize {
+        fs.seek(f, 0, Whence::Set).unwrap();
+        let mut one = [0u8; 1];
+        fs.read(f, &mut one).unwrap();
+        for _ in 0..k {
+            era += 1;
+            model = pattern(era * 1_000_003, size);
+            fs.seek(f, 0, Whence::Set).unwrap();
+            let g = fs
+                .open(b"/g", Open::WRITE.with(Open::CREATE).with(Open::TRUNCATE))
+                .unwrap();
+            let half = size / 2;
+            fs.write(f, &model[..half]).unwrap();
+            fs.write(g, &pattern(era, 4096 * (1 + (era as usize * 7) % 5)))
+                .unwrap();
+            fs.sync(g).unwrap();
+            fs.write(f, &model[half..]).unwrap();
+            fs.sync(f).unwrap();
+            fs.close(g).unwrap();
+        }
+        for start in [0usize, 5000, 20_000, 39_000] {
+            fs.seek(f, start as i32, Whence::Set).unwrap();
+            let mut buf = vec![0u8; size - start];
+            let n = fs.read(f, &mut buf).unwrap();
+            assert!(buf[..n] == model[start..], "k {k} start {start}");
+        }
+    }
+}
+
+#[test]
+fn a_reader_keeps_the_old_snapshot_while_another_handle_rewrites_the_file() {
+    // B reads (and leaves wayposts), A rewrites the file and syncs, other files make the allocator
+    // hand out blocks: B goes on reading the snapshot it opened, the same with and without wayposts
+    // (littlefs marks B dusty and its walk keeps the blocks of B's list).
+    for hints in [0u32, 16] {
+        let size = 120_000usize;
+        let mut fs = volume_with_file(160, size as u64, hints);
+        let old = pattern(0, size);
+        let b = fs.open(b"/f", Open::READ).unwrap();
+        let mut buf = vec![0u8; 5000];
+        for at in [100_000i32, 60_000, 0] {
+            fs.seek(b, at, Whence::Set).unwrap();
+            fs.read(b, &mut buf).unwrap();
+        }
+        for round in 1..=4u64 {
+            let a = fs.open(b"/f", Open::READ_WRITE).unwrap();
+            fs.write(a, &pattern(round * 77, size)).unwrap();
+            fs.sync(a).unwrap();
+            fs.close(a).unwrap();
+            for n in 0..6 {
+                let name = std::format!("/x{n}");
+                let x = fs
+                    .open(
+                        name.as_bytes(),
+                        Open::WRITE.with(Open::CREATE).with(Open::TRUNCATE),
+                    )
+                    .unwrap();
+                fs.write(x, &pattern(round * 10 + n, 30_000)).unwrap();
+                fs.close(x).unwrap();
+            }
+            for start in [0usize, 4088, 30_000, 99_999, 119_000] {
+                fs.seek(b, start as i32, Whence::Set).unwrap();
+                let mut got = vec![0u8; size - start];
+                let n = fs.read(b, &mut got).unwrap();
+                assert!(
+                    got[..n] == old[start..start + n] && n == size - start,
+                    "wayposts {hints}, round {round}, from {start}"
+                );
+            }
+        }
+    }
+}

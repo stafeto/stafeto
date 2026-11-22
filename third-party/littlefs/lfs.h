@@ -425,6 +425,9 @@ typedef struct lfs_dir {
 #define LFS_CTZ_HINTS_MAX 16
 #endif
 
+// the count of wayposts is a byte
+typedef char lfs_ctz_hints_fit_in_a_byte[(LFS_CTZ_HINTS_MAX) <= 255 ? 1 : -1];
+
 // littlefs file type
 typedef struct lfs_file {
     struct lfs_file *next;
