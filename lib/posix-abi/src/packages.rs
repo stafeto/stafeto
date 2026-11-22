@@ -15,7 +15,8 @@
 //!   gives no right.
 //! * A forked or spawned child gets a session of its own (a CLONE the
 //!   parent made, `clone_session`); `exec` moves the session to the new
-//!   image. A set-ID program starts without one (`posix-crt`).
+//!   image. The session of a set-ID program is the service's: the loader verifies it with the
+//!   service's root (a forged one is replaced by a new clone).
 //!
 //! The session is cloned for every `fork` and spawn that has one: one
 //! request to the package service (`cargo xtask pkg-slot` measures the

@@ -281,7 +281,7 @@ them for the licence notes of the image.
   on the console); it refuses an account with an identifier under 1000, a home that is not an absolute path, and a home or
   `.ssh` that is a symbolic link, and writes the key through a temporary file made with `set -C` that has its owner and mode
   before it moves into place. To log in: `ssh -i KEY user@ADDRESS` (on QEMU, `ssh -i KEY -p PORT user@127.0.0.1` through the
-  forward), then `doas -s` for a root shell or `doas COMMAND` for one command. `pkg` is the one exception, for now: `doas` and `su` are set-user-ID programs, and a set-ID program takes no package session from its caller (the caller could have put a channel of its own there), so a root `pkg` started through them reports "no package service". Until the loader verifies the package slot (a separate task of series 0.7 that blocks the v0.7.0 tag), `pkg` works from the boot script and the console only, and over SSH it reports "no package service"; the server is started again a second after it ends, and a line
+  forward), then `doas -s` for a root shell or `doas COMMAND` for one command. `doas pkg update` works over SSH: the loader verifies the package session of a set-user-ID program with the root of the package service (below), so a root `pkg` started through `doas` or `su` has a genuine session. A start that offers a channel of the caller's own gets a new session of the service, and the program never sends the forged channel a request. The server is started again a second after it ends, and a line
   it prints is shown once until it changes. The build has no syslog, so the log goes to the
   standard error, and `-E` is not an option of it. `cargo xtask net-ssh` runs it on
   `boot-ssh-probe.img`: logins with a key made by the host's `ssh-keygen`, a refused key, refused
@@ -1090,8 +1090,12 @@ process.
 `pkgd` in the slot `Packages` (13 of 14 slots of the start area; `START_VERSION` 8, the header
 grows by one handle, so every image and libc.so is built again). A process of an `init` record gets
 it by the name `pkgd` (`posix-crt`), a process that the loader starts takes the slot, and a set-ID
-program takes none, since its caller could put a channel of its own there and make it believe the
-answers. `fork` and a spawn give the child a CLONE of the session (one request, 68 µs under
+program takes the service's own session: the loader sends the offered channel to the root of the
+service (VERIFY_SESSION, protocol version 2), which returns a live session of the service as it is and
+answers any other channel with a new CLONE, so a forged channel never receives a request or makes the
+program believe false answers. The root is the label `ROOT` of the service's channel, which `pkgd`
+registers with the process service (the notary mark `PKG`, root `ROOT_PKG`); a set-ID start while no root
+is registered runs with no package session. `fork` and a spawn give the child a CLONE of the session (one request, 68 µs under
 QEMU's emulation: 2.127 ms against 2.098 ms for the call of fork with and without it, 1.4 %), `exec`
 moves it. A process that is not the superuser's has the session and is `NOT_ALLOWED` for the methods
 that change the store (the service asks the process service, with the identity session the request

@@ -5,8 +5,9 @@
 //! packages attached to the file service as layers, the settings and the
 //! revocation list. This library holds what the service decides, apart from
 //! the calls: the format of the store and the steps that touch the disk
-//! (`store`, `commit`), the checks of a package (`verify`), the settings
-//! layer (`settings`) and the table of packages in memory (`packages`). The
+//! (`store`, `commit`), the checks of a package (`verify`), which channel is
+//! a session of its own (`session`), the settings layer (`settings`) and the
+//! table of packages in memory (`packages`). The
 //! program (`main.rs`) is for stafeto alone; with the feature `host` the
 //! library also writes a store to a file for xtask (`host`).
 
@@ -17,6 +18,7 @@ pub mod packages;
 pub mod plans;
 pub mod receipts;
 pub mod seq;
+pub mod session;
 pub mod settings;
 pub mod store;
 pub mod verify;

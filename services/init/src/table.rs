@@ -209,7 +209,7 @@ pub const PACKAGE_SERVICE: &str = "pkgd";
 pub const TERMINAL_SERVICE: &str = "tty";
 /// The services that send their root to the process service with Register
 /// (proto_process::ROOT_MARKS), each with the mark init gives its notary
-/// session and no other entry: the terminal, channel, network, entropy and data
+/// session and no other entry: the terminal, channel, network, entropy, data and package
 /// services.
 pub const ROOT_SERVICES: &[(&str, u64)] = &[
     (TERMINAL_SERVICE, proto_process::TERMINAL),
@@ -217,6 +217,7 @@ pub const ROOT_SERVICES: &[(&str, u64)] = &[
     (NET_SERVICE, proto_process::NET),
     (ENTROPY_SERVICE, proto_process::ENTROPY),
     (DATA_SERVICE, proto_process::DATAFS),
+    (PACKAGE_SERVICE, proto_process::PKG),
 ];
 
 /// The label mark of the notary session of the voucher `name`: NOTARY, with

@@ -13,6 +13,13 @@
 //! and detaches the layers of the file service and takes all the long calls, so the
 //! main thread never waits for them. A change asks for UID 0 of the process service
 //! (Vouch). The packages of the boot image are read here, before the service registers.
+//!
+//! The service's root (proto_pkg::ROOT) goes to the process service with Register, for a loader
+//! to send VERIFY_SESSION for the Packages session of a set-ID program: the session comes back
+//! when it is a live session of the service, and a new clone replaces any other. A thread of
+//! its own makes the registration (rt::roots::keep): the connection to the process service
+//! waits in init until the process service has started, which the loop (and its heartbeat)
+//! must not do, and the thread tries again until it succeeds.
 
 #![no_std]
 #![no_main]
@@ -25,11 +32,12 @@ use abi::{Access, Error, Rights, Source};
 use core::sync::atomic::Ordering::{Acquire, Release};
 use pkgd::packages::Entry;
 use pkgd::receipts::{check_feed, orphan_drops_group};
+use pkgd::session::{self, OWN};
 use pkgd::store::{self, PACKAGES};
 use proto_pkg::{
     BEGIN_WORLD, BUFFER_SIZE, CELL_BYTES, COMMIT_END, Feed, INFO_MAX, LIST_MAX, Method,
-    STATUS_DAMAGED, STATUS_READ_ONLY, STATUS_STARTING, Stat, VERSION, code, read_begin,
-    read_commit, read_info, read_remove, read_serial, read_take, read_word, read_world,
+    ROOT_CLONES, STATUS_DAMAGED, STATUS_READ_ONLY, STATUS_STARTING, Stat, VERSION, code,
+    read_begin, read_commit, read_info, read_remove, read_serial, read_take, read_word, read_world,
 };
 use proto_wire::clones::Clones;
 use proto_wire::{Status, long};
@@ -60,16 +68,34 @@ const _: () = assert!(
     SESSIONS >= 255 + 64 && CLONES >= 255,
     "a session for each process and its clone"
 );
+const _: () = assert!(SESSIONS > 255 + 64, "and one for the root");
 const CLONES: usize = 320;
 /// The long operations at once: one change of the store at a time.
 const OPERATIONS: usize = 4;
-const OWN: u64 = 1 << 63;
 
 /// The codes of a start that failed.
 const NO_START_DATA: u64 = 1;
 const NOT_CONNECTED: u64 = 2;
 const NOT_REGISTERED: u64 = 3;
 const STOPPED: u64 = 5;
+
+/// The registrar's stack and message buffer (the page after the worker's), and the raw handles
+/// of the parent and the channel it registers the root from.
+const REGISTRAR_STACK: usize = 16 * 1024;
+static REGISTRAR: rt::Stack<REGISTRAR_STACK> = rt::Stack::new();
+const REGISTRAR_BUFFER: usize = abi::INIT_MSGBUF as usize + 2 * 4096;
+static PARENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static CHANNEL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LEVEL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The registrar thread: the root goes to the process service, tried until it is there
+/// (rt::roots::keep), and the thread ends.
+extern "C" fn register_root(_: u64) -> ! {
+    let parent = Handle::<Channel>::borrowed(abi::Handle(PARENT.load(Acquire)));
+    let channel = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Acquire)));
+    let level = LEVEL.load(Acquire) as u8;
+    rt::roots::keep(&parent, &channel, proto_pkg::ROOT, level, "pkgd")
+}
 
 fn main(_: u64) -> u64 {
     BEGAN.store(rt::time::now(), Release);
@@ -128,6 +154,28 @@ fn main(_: u64) -> u64 {
     let Ok(_thread) = worker::start(&s.process) else {
         return NOT_REGISTERED;
     };
+    PARENT.store(s.parent.raw().0, Release);
+    CHANNEL.store(channel.raw().0, Release);
+    LEVEL.store(u64::from(level), Release);
+    // SAFETY: REGISTRAR is the registrar's alone, and the page after the worker's message
+    // buffer is free.
+    let registrar = unsafe {
+        sys::thread_create(
+            &s.process,
+            register_root,
+            REGISTRAR.top(),
+            0,
+            level,
+            abi::Policy::Fifo,
+            REGISTRAR_BUFFER,
+        )
+    };
+    match registrar {
+        Ok(thread) if sys::thread_start(&thread).is_ok() => core::mem::forget(thread),
+        _ => rt::println!(
+            "pkgd: no thread to register the root; set-ID starts keep no package session until it is registered"
+        ),
+    }
     #[cfg(feature = "steps")]
     {
         rt::service::report_steps(16);
@@ -897,7 +945,44 @@ impl Pkgd {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        let Ok(label) = self.clones.give(OWN, r.label()) else {
+        let given = self.clones.give(OWN, r.label());
+        self.new_session(r, given)
+    }
+
+    /// VERIFY_SESSION through the root: the offered channel comes back when it is a live
+    /// session of a client of the service; any other gets a new clone, and the offered channel is
+    /// let go of with no request sent through it. Every step is O(1).
+    fn verify_session(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || r.handles.len() != 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        if !matches!(r.handles.info(0), Some((abi::ObjectKind::Channel, rights)) if rights.contains(Rights::SEND | Rights::TRANSFER))
+        {
+            return Answer::Status(Status::BadSize);
+        }
+        let Ok(offered) = r.handles.take::<Channel>(0) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let label = sys::copy_label(&self.channel, &offered).ok();
+        if session::genuine(&self.clones, label) {
+            if r.reply().u32(0).is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            return Answer::Reply([offered.erase()].into());
+        }
+        drop(offered);
+        let given = self.clones.give_within(OWN, proto_pkg::ROOT, ROOT_CLONES);
+        self.new_session(r, given)
+    }
+
+    /// The session for the clone `given` (a label, or Full): a copy of the service's channel with
+    /// that label.
+    fn new_session(
+        &mut self,
+        r: &mut Request<'_>,
+        given: Result<u64, proto_wire::clones::Full>,
+    ) -> Answer {
+        let Ok(label) = given else {
             return Answer::Status(code(proto_pkg::BUSY));
         };
         let rights = Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER;
@@ -956,6 +1041,7 @@ const METHODS: &[u16] = &[
     Method::Buffer.number(),
     Method::Status.number(),
     Method::WorldSet.number(),
+    Method::VerifySession.number(),
 ];
 
 impl Service<0> for Pkgd {
@@ -964,6 +1050,10 @@ impl Service<0> for Pkgd {
     type Data = Sess;
 
     fn request(&mut self, s: &mut Session<Sess, 0>, r: &mut Request<'_>) -> Answer {
+        // VERIFY_SESSION goes through the root alone, and the root has no other request.
+        if (r.label() == proto_pkg::ROOT) != (r.method() == Method::VerifySession.number()) {
+            return Answer::Status(Status::Kernel(Error::AccessDenied));
+        }
         match Method::from_number(r.method()) {
             Some(Method::List) => self.list(r),
             Some(Method::Info) => self.info(r),
@@ -982,6 +1072,7 @@ impl Service<0> for Pkgd {
             Some(Method::Buffer) => self.give_buffer(s, r),
             Some(Method::Status) => self.status(r),
             Some(Method::WorldSet) => self.world_set(s, r),
+            Some(Method::VerifySession) => self.verify_session(r),
             None => Answer::Status(Status::UnknownMethod),
         }
     }

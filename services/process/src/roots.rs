@@ -118,6 +118,7 @@ mod tests {
             (NET, 2),
             (ENTROPY, 3),
             (proto_process::DATAFS, 4),
+            (proto_process::PKG, 5),
         ] {
             assert_eq!(
                 registration(NOTARY | mark | 4, 1),
@@ -154,6 +155,12 @@ mod tests {
             }
         }
         assert_eq!(roots.taken(proto_process::ROOT_NET), Err(PERMISSION));
+        // The package service's root goes to the loaders alone, registered or not.
+        assert_eq!(roots.taken(proto_process::ROOT_PKG), Err(PERMISSION));
+        assert_eq!(
+            Roots::<u32>::new().taken(proto_process::ROOT_PKG),
+            Err(PERMISSION)
+        );
         assert_eq!(roots.taken(ROOTS as u32), Err(PERMISSION));
         // The data service has not registered: UNREGISTERED and no root.
         let empty = Roots::<u32>::new();

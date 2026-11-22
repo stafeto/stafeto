@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The protocol of the package service (services/pkgd), proto_wire, version
-//! 1: the numbers of its methods, which never change once given, its codes
+//! 2: the numbers of its methods, which never change once given, its codes
 //! and the bodies of its requests. Every number goes low byte first.
 //!
 //! | Method | Who | Request after the header | Reply after the status |
@@ -24,6 +24,7 @@
 //! | BUFFER (15) | all | `size` u32 and a memory object with MAP_READ and MAP_WRITE; optionally the identity session after it | none |
 //! | STATUS (16) | all | none | `generation` u64, `blocks` u64, `free` u64, `disk` u32, `image` u32, `flags` u32 |
 //! | WORLD_SET (17) | UID 0 | the package name, `world` u32 (1 the world, 0 a dependency); the identity session | long: none |
+//! | VERIFY_SESSION (18) | the root session (`ROOT`) alone | the header alone and one channel with SEND and TRANSFER | status 0 and the channel itself when it is a live session of the service (a copy of its channel with the label of an init client's session or of a clone), a new clone with no buffer otherwise, so that a channel that is not the service's never receives a request; BAD_SIZE for a body, no channel or more than one, or a channel without the two rights; ACCESS_DENIED from any session other than the root, and for any other method through the root |
 //!
 //! A string is one byte of length and the bytes. The buffer is CELLS cells
 //! of CELL_BYTES, the client's object, as in proto_blk. The service has four
@@ -44,7 +45,19 @@ use proto_wire::{Header, Reader, Status, Writer};
 pub mod blob;
 
 /// The version of the protocol, in the header of each request.
-pub const VERSION: u16 = 1;
+///
+/// Version 2: the root session `ROOT` and its one request VERIFY_SESSION.
+pub const VERSION: u16 = 2;
+
+/// The label of the service's root session, which it registers with the process service
+/// (Register with the PKG mark) and the loaders send VERIFY_SESSION: no other request goes
+/// through it. Bit 63 marks the labels the service gives itself, and bit 60 lies above any
+/// place or generation of its clones.
+pub const ROOT: u64 = 1 << 63 | 1 << 60;
+
+/// The clones the root's VERIFY_SESSION gives at most, for all the programs that start with a
+/// session that is not the service's.
+pub const ROOT_CLONES: usize = 64;
 
 /// The cells of the buffer of a session and the bytes of each.
 pub const CELLS: u32 = 4;
@@ -151,10 +164,11 @@ pub enum Method {
     Buffer = 15,
     Status = 16,
     WorldSet = 17,
+    VerifySession = 18,
 }
 
 impl Method {
-    pub const ALL: [Method; 17] = [
+    pub const ALL: [Method; 18] = [
         Method::List,
         Method::Info,
         Method::InstallBegin,
@@ -172,6 +186,7 @@ impl Method {
         Method::Buffer,
         Method::Status,
         Method::WorldSet,
+        Method::VerifySession,
     ];
 
     pub const fn number(self) -> u16 {

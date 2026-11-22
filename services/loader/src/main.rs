@@ -1093,11 +1093,12 @@ fn loader_root(session: &Handle<Channel>, root: u32) -> Result<Option<Handle<Cha
 
 /// The slots whose sessions a set-ID program takes only from their service,
 /// each with the root the process service keeps for it.
-const VERIFIED: [(Slot, u32); 4] = [
+const VERIFIED: [(Slot, u32); 5] = [
     (Slot::Pipes, proto_process::ROOT_PIPES),
     (Slot::Net, proto_process::ROOT_NET),
     (Slot::Entropy, proto_process::ROOT_ENTROPY),
     (Slot::Data, proto_process::ROOT_DATA),
+    (Slot::Packages, proto_process::ROOT_PKG),
 ];
 
 /// The roots of `VERIFIED`, in its order.
@@ -1219,6 +1220,7 @@ fn verify_header(slot: Slot) -> [u8; 8] {
         Slot::Net => proto_net::Method::VerifySession.header().bytes(),
         Slot::Entropy => proto_entropy::Method::VerifySession.header().bytes(),
         Slot::Data => proto_data::Method::VerifySession.header().bytes(),
+        Slot::Packages => proto_pkg::Method::VerifySession.header().bytes(),
         _ => proto_pipe::Method::VerifySession.header().bytes(),
     }
 }
@@ -2375,12 +2377,18 @@ fn finish(
     let c = taken.credentials;
     // A set-ID program starts in the secure mode (AT_SECURE).
     let secure = c.uid != c.euid || c.gid != c.egid;
-    // A set-ID program takes its Pipes, Net, Entropy and Data sessions from their
+    // A set-ID program takes its Pipes, Net, Entropy, Data and Packages sessions from their
     // services alone: a forged one is replaced, and a start a service cannot
     // verify is refused. Any other program keeps what its parent gave.
     if secure {
         for (root, &(slot, _)) in roots.iter().zip(&VERIFIED) {
             if let Some(offered) = given[slot as usize].take() {
+                // The package service has sent no root (it is not up yet, or its registration
+                // failed): the slot stays empty and the program runs with no package session,
+                // where a refusal would stop every set-ID program of the image.
+                if slot == Slot::Packages && root.is_none() {
+                    continue;
+                }
                 if slot == Slot::Data {
                     match verify_data(root.as_ref(), offered) {
                         Ok(session) => given[slot as usize] = session,

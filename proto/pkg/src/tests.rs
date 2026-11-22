@@ -13,14 +13,23 @@ fn bytes(write: impl FnOnce(&mut Writer) -> Result<(), Status>) -> Vec<u8> {
 fn method_numbers_are_fixed() {
     assert_eq!(
         Method::ALL.map(Method::number),
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+        ]
     );
     for m in Method::ALL {
         assert_eq!(Method::from_number(m.number()), Some(m));
         assert_eq!(m.header(), Header::new(m.number(), VERSION));
     }
     assert_eq!(Method::from_number(0), None);
-    assert_eq!(Method::from_number(18), None);
+    assert_eq!(Method::from_number(19), None);
+}
+
+#[test]
+fn the_root_session_has_a_label_of_its_own_and_version_2() {
+    assert_eq!(VERSION, 2);
+    assert_eq!(Method::VerifySession.number(), 18);
+    assert_eq!(ROOT, 1 << 63 | 1 << 60);
 }
 
 #[test]
