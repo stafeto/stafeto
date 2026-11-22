@@ -460,7 +460,7 @@ fn programs_of(mode: Mode, breaks: &[&'static str]) -> Vec<ImageProgram> {
 /// The boot of one mode: the image with the role of the mode, a volume made offline, QEMU until the
 /// probe ends; the lines and the seconds it took.
 fn boot(mode: Mode, machine: &qemu::Machine, how: Boot) -> Result<(qemu::Outcome, u64), String> {
-    boot_with(mode, machine, how, &[])
+    boot_with(mode, machine, how, &[], None)
 }
 
 /// `boot` with deliberate breaks (features of `datafsd`) in the service.
@@ -469,6 +469,7 @@ fn boot_with(
     machine: &qemu::Machine,
     how: Boot,
     breaks: &[&'static str],
+    stop_on: Option<(&[String], std::time::Duration)>,
 ) -> Result<(qemu::Outcome, u64), String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
@@ -506,7 +507,14 @@ fn boot_with(
         cmd.args(["-icount", "shift=4,sleep=on"]);
     }
     let started = std::time::Instant::now();
-    let output = run_until(cmd, mode.limit(), Some(ENDS), &kernel.elf)?;
+    let output = match stop_on {
+        // The lines that end the run once all of them are on the console: the guest is stopped then.
+        Some((markers, limit)) => {
+            let markers: Vec<&str> = markers.iter().map(String::as_str).collect();
+            crate::run_until_all(cmd, limit, &markers, &kernel.elf)?
+        }
+        None => run_until(cmd, mode.limit(), Some(ENDS), &kernel.elf)?,
+    };
     Ok((output, started.elapsed().as_secs()))
 }
 
@@ -584,6 +592,10 @@ pub const BREAKS: [(&str, &str); 3] = [
     ("break-datafs-cell-kept", "the service keeps no cell mapped"),
 ];
 
+/// The longest an atomic-break run lasts: a break is caught within minutes, and a run that is not
+/// caught by then is a failure that names what was missing.
+const ATOMIC_BREAK_LIMIT: std::time::Duration = std::time::Duration::from_secs(8 * 60);
+
 /// `cargo xtask data-posix atomic-break FEATURE[,FEATURE]`: the atomic probe on a service with the
 /// breaks (the features that do not spoil each other's check go in one boot); it passes when the check
 /// of each break FAILED.
@@ -598,12 +610,33 @@ pub fn atomic_break(features: &str, machine: &qemu::Machine) -> Result<(), Strin
         };
         chosen.push(entry);
     }
+    // The run ends as soon as every expected line of a failed check is on the console, and a run that
+    // ends or times out before that fails with the lines still missing.
+    let wanted: Vec<String> = chosen
+        .iter()
+        .map(|(_, check)| format!("{PREFIX}{check} FAILED"))
+        .collect();
     let (output, seconds) = boot_with(
         Mode::Atomic,
         machine,
         Boot::default(),
         &chosen.iter().map(|b| b.0).collect::<Vec<_>>(),
+        Some((&wanted, ATOMIC_BREAK_LIMIT)),
     )?;
+    if !output.stopped_on_marker {
+        let missing: Vec<&String> = wanted
+            .iter()
+            .filter(|w| !output.lines.iter().any(|l| l.contains(w.as_str())))
+            .collect();
+        let how = if output.timed_out {
+            format!("timed out after {} s", ATOMIC_BREAK_LIMIT.as_secs())
+        } else {
+            "ended".to_owned()
+        };
+        return Err(format!(
+            "data-posix atomic-break: the run {how} in {seconds} s before the failed checks showed; missing: {missing:?}"
+        ));
+    }
     let failed: Vec<&str> = output
         .lines
         .iter()
