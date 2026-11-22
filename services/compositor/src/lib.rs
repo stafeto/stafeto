@@ -78,7 +78,8 @@ pub const BAND_ROWS: u32 = 16;
 /// model of the work is over the measure (the prices and the terms carry the margin
 /// of 15 %), and the real operations of eight windows came to 1.08 of the model's
 /// before the terms were set from the real bands: at 14 000 the band of eight layers
-/// is 45 points of a line and its step is expected near 15 500.
+/// is 43 points of a line (45 before the call of the black was raised to its measure of
+/// 264 ticks) and its step is expected near 15 500.
 pub const BAND_TICKS: u32 = 14_000;
 
 /// The gate of a band: 0.8 of term B, the most one step of a portion may take
@@ -200,7 +201,7 @@ const fn price(
 /// has apart from its general path; each has the miss
 /// the calibration of the lookup measured for its kind (`measures::LOOKUPS`).
 pub const PRICES: [Price; 24] = [
-    price("black", 209, 2_400, false, 38, false, LOOKUP_MISS_MEASURED),
+    price("black", 264, 2_400, false, 38, false, LOOKUP_MISS_MEASURED),
     price("copy", 780, 5_480, false, 138, false, LOOKUP_MISS_MEASURED),
     price("over", 785, 18_981, false, 427, false, LOOKUP_MISS_MEASURED),
     price(
@@ -321,6 +322,59 @@ pub const PRICES: [Price; 24] = [
         4249,
     ),
 ];
+/// What the model charges for one operation of `price` over `w` by `h` points, ticks:
+/// the call, the rows and the points, rounded up.
+pub const fn model_ticks(price: Price, w: u32, h: u32) -> u64 {
+    price.call as u64
+        + (price.row as u64 * h as u64 + price.point as u64 * w as u64 * h as u64).div_ceil(100)
+}
+
+/// The kinds of the calibration that are two steps of the service: a stretch with a
+/// mask and an alpha that is no scale, each with the class of its stretch.
+pub const TWO_STEP_KINDS: [(&str, elements::Class); 2] = [
+    (
+        "scale-nearest-mask-alpha",
+        elements::Class::ScaleNearestOver,
+    ),
+    (
+        "scale-bilinear-mask-alpha",
+        elements::Class::ScaleBilinearOver,
+    ),
+];
+
+/// What the model charges for one operation of the calibration's kind `kind` over `w`
+/// by `h` points, ticks: its row of `PRICES`, or for a kind of two steps the sum of
+/// the product of the mask and the alpha (`MaskAlpha`) and the stretch through it (the
+/// laying over with the rows and the points of a mask, and no call of the mask's).
+/// None for a kind with no price.
+pub fn kind_model_ticks(kind: &str, w: u32, h: u32) -> Option<u64> {
+    if let Some((_, class)) = TWO_STEP_KINDS.iter().find(|(k, _)| *k == kind) {
+        let product = model_ticks(PRICES[elements::Class::MaskAlpha.row()], w, h);
+        let mask = PRICES[elements::Class::Mask.row()];
+        let stretch = PRICES[class.row()];
+        let through = model_ticks(stretch, w, h)
+            + (u64::from(mask.row) * u64::from(h)
+                + u64::from(mask.point) * u64::from(w) * u64::from(h))
+            .div_ceil(100);
+        return Some(product + through);
+    }
+    PRICES
+        .iter()
+        .find(|p| p.kind == kind)
+        .map(|p| model_ticks(*p, w, h))
+}
+
+/// What the model charges a call of the calibration's kind `kind` when pixman's cache of
+/// paths has lost its key, ticks (the constant with the margin): the miss of its row of
+/// `PRICES`, or for a kind of two steps the misses of the product and of the stretch.
+/// None for a kind with no price.
+pub fn kind_miss_ticks(kind: &str) -> Option<u32> {
+    if let Some((_, class)) = TWO_STEP_KINDS.iter().find(|(k, _)| *k == kind) {
+        return Some(PRICES[elements::Class::MaskAlpha.row()].miss + PRICES[class.row()].miss);
+    }
+    PRICES.iter().find(|p| p.kind == kind).map(|p| p.miss)
+}
+
 /// What every layer costs a band beyond its operation (ticks, for each window
 /// the band lays and for the pointer's picture), and what every band costs beyond
 /// its layers: the work of `compose` around the calls (the stacking, the clip,
@@ -4576,10 +4630,10 @@ mod tests {
         };
         let (w8, h8) = width_of(8);
         assert_eq!(h8, 1, "eight layers make a part of a line");
-        // By the terms measured on the real bands and 14 000 ticks eight layers get 45
+        // By the terms measured on the real bands and 14 000 ticks eight layers get 43
         // points of a line (a frame of the 320 by 200 windows is 8 bands a line,
         // 1 600 in all; 151 points and 600 bands before the terms).
-        assert_eq!(w8, 45);
+        assert_eq!(w8, 43);
         assert_eq!(320u32.div_ceil(w8) * 200, 1_600);
         let (w4, _) = width_of(4);
         assert!(w8 < w4);
@@ -4735,17 +4789,19 @@ mod tests {
                 model(p, w, h)
             );
         }
+        // The black of one row, the greatest of the calibration's shapes of the call
+        // (the measure of the call was 280 ticks at 1 by 1 and 311 at 64 by 1 when the
+        // comp-probe judged the constants): the model is above both, margin or none.
+        for (w, greatest) in [(1u32, 280u64), (64, 311)] {
+            assert!(model(FILL, w, 1) >= greatest, "black {w}x1");
+        }
         // The kinds of the elements' operations: every shape the calibration
         // measured is under the model with the constants, by the margin.
         for (kind, w, h, greatest) in measures::SHAPES {
-            let p = PRICES
-                .iter()
-                .find(|p| p.kind == kind)
-                .expect("a priced kind");
+            let priced = kind_model_ticks(kind, w, h).expect("a priced kind");
             assert!(
-                model(*p, w, h) * 100 >= greatest * u64::from(100 + MARGIN_PERCENT),
-                "{kind} {w}x{h}: {} below {greatest} with the margin",
-                model(*p, w, h)
+                priced * 100 >= greatest * u64::from(100 + MARGIN_PERCENT),
+                "{kind} {w}x{h}: {priced} below {greatest} with the margin"
             );
         }
         assert_eq!(LOOKUP_MISS, with_margin(LOOKUP_MISS_MEASURED));
@@ -4775,6 +4831,40 @@ mod tests {
         }
         // The margin of nothing would leave a measure above the constant.
         assert!(with_margin(190) > 190);
+    }
+
+    /// A stretch that is no scale, with a mask and an alpha, is two steps of the service
+    /// (the product of the mask and the alpha, then the stretch through it). Its price is
+    /// the sum of the prices of the two kinds, never measured on its own until the
+    /// calibration drew it (`scale-nearest-mask-alpha`, `scale-bilinear-mask-alpha`): the
+    /// sum is above every measured shape, by the margin, at both filters.
+    #[test]
+    fn the_sum_of_a_stretch_and_its_mixing_covers_the_measured_two_steps() {
+        for (kind, class) in TWO_STEP_KINDS {
+            let shapes: Vec<_> = measures::SHAPES.iter().filter(|s| s.0 == kind).collect();
+            assert_eq!(shapes.len(), 17, "{kind}");
+            for &&(_, w, h, greatest) in &shapes {
+                let sum = kind_model_ticks(kind, w, h).unwrap();
+                assert!(
+                    sum * 100 >= greatest * u64::from(100 + MARGIN_PERCENT),
+                    "{kind} {w}x{h}: the sum {sum} is below {greatest} with the margin"
+                );
+                // The sum is the two kinds' prices: the product and the stretch with
+                // the rows and the points of the mask.
+                let (m, a, x) = (
+                    PRICES[elements::Class::MaskAlpha.row()],
+                    PRICES[class.row()],
+                    PRICES[elements::Class::Mask.row()],
+                );
+                let (w64, h64) = (u64::from(w), u64::from(h));
+                let mixing =
+                    (u64::from(x.row) * h64 + u64::from(x.point) * w64 * h64).div_ceil(100);
+                assert_eq!(sum, model_ticks(m, w, h) + model_ticks(a, w, h) + mixing);
+            }
+            // The widest measured row is 152 points: the largest shape is pinned.
+            assert_eq!(shapes.iter().map(|s| s.1).max(), Some(152), "{kind}");
+        }
+        assert!(kind_model_ticks("no-such-kind", 1, 1).is_none());
     }
 
     /// Eight windows with an alpha over the whole screen, the worst case of a

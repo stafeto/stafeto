@@ -1100,7 +1100,7 @@ pub mod calibration {
     /// (`compositor::PRICES` after the black, the copy and the laying over):
     /// each is measured on the shapes of the plain ones narrower than 160
     /// points (a dear band is a part of a line), at two offsets of the target.
-    pub(super) const RECIPES: [Recipe; 21] = [
+    pub(super) const RECIPES: [Recipe; 23] = [
         Recipe {
             name: "scale-nearest-copy",
             bilinear: false,
@@ -1269,6 +1269,25 @@ pub mod calibration {
             mix: Mix::Mask,
             source: Src::Opaque,
         },
+        // A stretch with a mask and an alpha that is no scale (a turn, a
+        // reflection): the two steps of the service, the product of the mask and
+        // the alpha in the work band, then the stretch through it.
+        Recipe {
+            name: "scale-nearest-mask-alpha",
+            bilinear: false,
+            transform: Transform::General,
+            over: true,
+            mix: Mix::Both,
+            source: Src::Both,
+        },
+        Recipe {
+            name: "scale-bilinear-mask-alpha",
+            bilinear: true,
+            transform: Transform::General,
+            over: true,
+            mix: Mix::Both,
+            source: Src::Both,
+        },
     ];
 
     /// One operation of a kind: its ticks, or None when a higher level
@@ -1393,6 +1412,12 @@ pub mod calibration {
             };
             let matrix =
                 (r.transform != Transform::Plain).then(|| compositor::elements::matrix(&element));
+            // A stretch with a mask and an alpha is two steps, as the service
+            // makes it: the product in the work band, then the stretch through it.
+            let two = r.mix == Mix::Both && r.transform != Transform::Plain;
+            if two {
+                pixman::product(images, plane, (0, 0), 100, (w, h));
+            }
             let mask = match r.mix {
                 Mix::None => Mask::None,
                 Mix::Alpha => Mask::Alpha(100),
@@ -1400,6 +1425,7 @@ pub mod calibration {
                     source: plane,
                     at: (0, 0),
                 },
+                Mix::Both if two => Mask::Work,
                 Mix::Both => Mask::Product {
                     source: plane,
                     at: (0, 0),

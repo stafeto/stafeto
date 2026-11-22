@@ -9,7 +9,7 @@
 //! with the margin.
 
 /// (kind, width, height, greatest ticks).
-pub const SHAPES: [(&str, u32, u32, u64); 395] = [
+pub const SHAPES: [(&str, u32, u32, u64); 429] = [
     ("scale-nearest-copy", 1, 1, 5931),
     ("scale-nearest-copy", 2, 1, 5968),
     ("scale-nearest-copy", 4, 1, 6017),
@@ -405,6 +405,40 @@ pub const SHAPES: [(&str, u32, u32, u64); 395] = [
     ("fast-bilinear-mask-opaque", 76, 16, 124641),
     ("fast-bilinear-mask-opaque", 150, 8, 120017),
     ("fast-bilinear-mask-opaque", 152, 8, 120673),
+    ("scale-nearest-mask-alpha", 1, 1, 7716),
+    ("scale-nearest-mask-alpha", 2, 1, 7752),
+    ("scale-nearest-mask-alpha", 4, 1, 7824),
+    ("scale-nearest-mask-alpha", 4, 16, 16704),
+    ("scale-nearest-mask-alpha", 8, 1, 7868),
+    ("scale-nearest-mask-alpha", 8, 8, 12320),
+    ("scale-nearest-mask-alpha", 8, 16, 17408),
+    ("scale-nearest-mask-alpha", 12, 8, 14472),
+    ("scale-nearest-mask-alpha", 16, 1, 8175),
+    ("scale-nearest-mask-alpha", 16, 8, 14776),
+    ("scale-nearest-mask-alpha", 16, 16, 22320),
+    ("scale-nearest-mask-alpha", 32, 1, 8769),
+    ("scale-nearest-mask-alpha", 64, 1, 10101),
+    ("scale-nearest-mask-alpha", 64, 16, 53036),
+    ("scale-nearest-mask-alpha", 76, 16, 62220),
+    ("scale-nearest-mask-alpha", 150, 8, 57871),
+    ("scale-nearest-mask-alpha", 152, 8, 57428),
+    ("scale-bilinear-mask-alpha", 1, 1, 7783),
+    ("scale-bilinear-mask-alpha", 2, 1, 7873),
+    ("scale-bilinear-mask-alpha", 4, 1, 8053),
+    ("scale-bilinear-mask-alpha", 4, 16, 20816),
+    ("scale-bilinear-mask-alpha", 8, 1, 8340),
+    ("scale-bilinear-mask-alpha", 8, 8, 16432),
+    ("scale-bilinear-mask-alpha", 8, 16, 25680),
+    ("scale-bilinear-mask-alpha", 12, 8, 20657),
+    ("scale-bilinear-mask-alpha", 16, 1, 9167),
+    ("scale-bilinear-mask-alpha", 16, 8, 23048),
+    ("scale-bilinear-mask-alpha", 16, 16, 38912),
+    ("scale-bilinear-mask-alpha", 32, 1, 10801),
+    ("scale-bilinear-mask-alpha", 64, 1, 14206),
+    ("scale-bilinear-mask-alpha", 64, 16, 119541),
+    ("scale-bilinear-mask-alpha", 76, 16, 141205),
+    ("scale-bilinear-mask-alpha", 150, 8, 135816),
+    ("scale-bilinear-mask-alpha", 152, 8, 136413),
 ];
 
 /// The greatest ticks a call of a kind pays when pixman's cache of paths has lost its key
