@@ -10,20 +10,21 @@
  * a fixed pattern, makes a window of A8 for a mask and draws a disc in it, and
  * finds the numbers of the three windows with wfcNextStreamSTAFETO. It makes a
  * source of each pattern and the mask, and three elements it sets to the two
- * scenes in turn, A and B, which differ in places, quarter turns, the filter
+ * scenes in turn, A and B, which differ in places, quarter turns, a stretch (A) and a flip (B), the filter
  * (none and the faster one), the kind of transparency (a global alpha, a mask,
- * both) and the background. The elements keep to what the service's prices make
- * cheap: a stretch, a flip or the bilinear filter make every band of a frame a
- * few points wide, and a frame takes seconds (see docs/compositor.md). With --probe it checks the API,
- * commits the scenes 100 times in turn, each composed on request (the context
- * is inactive) and its number printed, and then activates the context and
- * changes the scene 100 times without waiting (every 130 ms: a frame of these scenes takes over a second, so the frames the service takes see the scene at different turns of the alternation), and last shows a scene C of one
- * element, the window of a third producer that is the screen of the first
- * revision, which the service shows straight from its buffer. The host (tools/wfc-ref)
- * draws both scenes point by point from the same calls and `cargo xtask
- * wfc-probe` compares QEMU's screenshots with its CRCs. --quick leaves out the
- * pauses the host takes its screenshots in. Without --probe the demo shows
- * the scenes in turn for ever.
+ * both) and the background. A third scene D has the bilinear filter: a stretch up,
+ * a stretch down of a flipped window, and a quarter turn with a global alpha.
+ * With --probe it checks the API, commits the scenes A and B 100 times in turn,
+ * each composed on request (the context is inactive) and its number printed, then
+ * activates the context and changes the scene 100 times without waiting (every
+ * 130 ms, so the frames the service takes see the scene at different turns of the
+ * alternation), then commits scene D once and prints the time of its frame, and
+ * last shows a scene C of one element, the window of a third producer that is the
+ * screen of the first revision, which the service shows straight from its buffer.
+ * The host (tools/wfc-ref) draws the scenes point by point from the same calls and
+ * `cargo xtask wfc-probe` compares QEMU's screenshots with its CRCs. --quick leaves
+ * out the pauses the host takes its screenshots in. Without --probe the demo shows
+ * the scenes A and B in turn for ever.
  *
  * The scenes' numbers are the ones of tools/wfc-ref/src/lib.rs. Built with
  * -fno-builtin; every result is compared.
@@ -99,20 +100,29 @@ static const struct spec scene_a[3] = {
     {0, {0, 0, 100, 200}, WFC_ROTATION_90, 0, WFC_SCALE_FILTER_NONE, 0, 255, 0, {20, 20, 200, 100}},
     {1, {0, 0, 160, 100}, WFC_ROTATION_0, 0, WFC_SCALE_FILTER_FASTER,
      WFC_TRANSPARENCY_ELEMENT_GLOBAL_ALPHA | WFC_TRANSPARENCY_MASK, 200, 1, {300, 150, 160, 100}},
-    {0, {10, 20, 60, 120}, WFC_ROTATION_0, 0, WFC_SCALE_FILTER_NONE,
-     WFC_TRANSPARENCY_ELEMENT_GLOBAL_ALPHA, 128, 0, {40, 230, 60, 120}},
+    {0, {10, 20, 40, 60}, WFC_ROTATION_0, 0, WFC_SCALE_FILTER_FASTER,
+     WFC_TRANSPARENCY_ELEMENT_GLOBAL_ALPHA, 128, 0, {40, 230, 80, 120}},
 };
 
 static const struct spec scene_b[3] = {
     {0, {20, 30, 60, 120}, WFC_ROTATION_90, 0, WFC_SCALE_FILTER_NONE, 0, 255, 0, {200, 40, 120, 60}},
     {1, {0, 0, 160, 100}, WFC_ROTATION_0, 0, WFC_SCALE_FILTER_NONE, WFC_TRANSPARENCY_MASK, 255, 1,
      {20, 200, 160, 100}},
-    {0, {0, 0, 100, 200}, WFC_ROTATION_0, 0, WFC_SCALE_FILTER_NONE,
-     WFC_TRANSPARENCY_ELEMENT_GLOBAL_ALPHA, 255, 0, {460, 150, 100, 200}},
+    {0, {10, 20, 50, 60}, WFC_ROTATION_0, 1, WFC_SCALE_FILTER_NONE,
+     WFC_TRANSPARENCY_ELEMENT_GLOBAL_ALPHA, 255, 0, {460, 150, 50, 60}},
+};
+
+/* Scene D: the bilinear filter, shown once. */
+static const struct spec scene_d[3] = {
+    {1, {0, 0, 80, 50}, WFC_ROTATION_0, 0, WFC_SCALE_FILTER_BETTER, 0, 255, 0, {20, 20, 160, 100}},
+    {0, {0, 0, 100, 200}, WFC_ROTATION_0, 1, WFC_SCALE_FILTER_BETTER, 0, 255, 0, {300, 40, 50, 100}},
+    {0, {10, 20, 60, 120}, WFC_ROTATION_270, 0, WFC_SCALE_FILTER_BETTER,
+     WFC_TRANSPARENCY_ELEMENT_GLOBAL_ALPHA, 128, 0, {400, 200, 120, 60}},
 };
 
 #define BG_A 0x203040FF
 #define BG_B 0x402010FF
+#define BG_D 0x182818FF
 
 static WFCNativeStreamType id_a, id_b, id_m;
 static WFCSource source[2];
@@ -120,9 +130,11 @@ static WFCMask mask;
 static WFCElement element[3];
 static pid_t pid_a, pid_b, pid_s;
 
-static void apply(int k) {
-    const struct spec *scene = (k % 2 == 0) ? scene_a : scene_b;
-    wfcSetContextAttribi(dev, ctx, WFC_CONTEXT_BG_COLOR, (WFCint)((k % 2 == 0) ? BG_A : BG_B));
+/* Scene 0 is A, 1 is B and 2 is D. */
+static void apply_scene(int which) {
+    const struct spec *scene = which == 2 ? scene_d : which == 0 ? scene_a : scene_b;
+    wfcSetContextAttribi(dev, ctx, WFC_CONTEXT_BG_COLOR,
+                         (WFCint)(which == 2 ? BG_D : which == 0 ? BG_A : BG_B));
     for (int i = 0; i < 3; i++) {
         const struct spec *s = &scene[i];
         wfcSetElementAttribi(dev, element[i], WFC_ELEMENT_SOURCE, (WFCint)source[s->window]);
@@ -136,6 +148,9 @@ static void apply(int k) {
         wfcSetElementAttribi(dev, element[i], WFC_ELEMENT_MASK, s->mask ? (WFCint)mask : 0);
     }
 }
+
+/* The scene of turn k: A and B in turn. */
+static void apply(int k) { apply_scene(k % 2); }
 
 /* The calls that a device that is not there, and arguments that are none,
  * refuse in the ways the specification says. */
@@ -404,6 +419,27 @@ static int changes(int count) {
     return 0;
 }
 
+/* Scene D: the bilinear filter, committed once on request; the host takes its
+ * screenshot, and the time of the frame is printed. */
+static int scene_d_frame(void) {
+    long t0, t1, t2;
+    apply_scene(2);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    t0 = now_ms();
+    wfcCommit(dev, ctx, WFC_TRUE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    t1 = now_ms();
+    wfcCompose(dev, ctx, WFC_TRUE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    t2 = now_ms();
+    printf("wfc-demo: scene D frame time, milliseconds: commit %ld, compose %ld\n", t1 - t0,
+           t2 - t1);
+    printf("wfc-demo: scene D committed\n");
+    fflush(stdout);
+    snapshot_pause();
+    return 0;
+}
+
 /* Scene C: one element, the whole window of the first revision on the whole
  * screen with no turn, mask or transparency (the service shows it straight from
  * the window's buffer, a frame of no band). */
@@ -479,6 +515,7 @@ static int run_scene(int probe) {
     if (!probe) return commits(-1);
     CHECK(commits(COMMITS) == 0);
     CHECK(changes(CHANGES) == 0);
+    CHECK(scene_d_frame() == 0);
     CHECK(scene_c() == 0);
     CHECK(finish() == 0);
     return 0;
