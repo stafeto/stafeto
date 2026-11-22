@@ -9,6 +9,8 @@ pub struct StepSample {
     pub whole: u64,
     pub waited: u64,
     pub took: u64,
+    /// The step's clock time less its waits, whatever the CPU time says.
+    pub wall: u64,
     pub accounting_valid: bool,
 }
 impl StepSample {
@@ -20,6 +22,7 @@ impl StepSample {
             whole,
             waited,
             took: whole - waited,
+            wall: whole - waited,
             accounting_valid: counted <= whole,
         }
     }
@@ -27,10 +30,13 @@ impl StepSample {
     /// The sample with `ran`, the CPU ticks of the thread in the step, as
     /// its own part when that is shorter than the clock's: a thread of a
     /// higher level that ran in the middle lengthens `whole`, not `ran`.
-    /// 0 stands for a thread that could not read its time.
-    pub fn cpu(mut self, ran: u64) -> Self {
-        if ran != 0 {
-            self.took = self.took.min(ran);
+    /// `None` stands for a thread whose time could not be read, or read
+    /// backwards: the sample is invalid and `took` keeps the clock's part
+    /// for the callers that must use some figure.
+    pub fn cpu(mut self, ran: Option<u64>) -> Self {
+        match ran {
+            Some(ran) => self.took = self.took.min(ran),
+            None => self.accounting_valid = false,
         }
         self
     }
@@ -53,11 +59,28 @@ mod tests {
     }
     #[test]
     fn a_thread_above_that_ran_in_the_middle_is_not_the_steps() {
-        let s = StepSample::measured(50, 32, 22_349, 0).cpu(19_699);
-        assert_eq!((s.whole, s.waited, s.took), (22_349, 0, 19_699));
-        // A reading longer than the clock's part, or none, changes nothing.
-        assert_eq!(StepSample::measured(50, 32, 100, 10).cpu(500).took, 90);
-        assert_eq!(StepSample::measured(50, 32, 100, 10).cpu(0).took, 90);
+        let s = StepSample::measured(50, 32, 22_349, 0).cpu(Some(19_699));
+        assert_eq!(
+            (s.whole, s.waited, s.took, s.wall),
+            (22_349, 0, 19_699, 22_349)
+        );
+        assert!(s.accounting_valid);
+        // A reading longer than the clock's part changes nothing.
+        assert_eq!(
+            StepSample::measured(50, 32, 100, 10).cpu(Some(500)).took,
+            90
+        );
+    }
+
+    #[test]
+    fn a_lost_cpu_reading_makes_the_sample_invalid_and_is_no_zero() {
+        let s = StepSample::measured(50, 32, 100, 10).cpu(None);
+        assert!(!s.accounting_valid);
+        assert_eq!((s.took, s.wall), (90, 90));
+        // A real reading of 0 is a step that ran 0 ticks.
+        let z = StepSample::measured(50, 32, 100, 10).cpu(Some(0));
+        assert!(z.accounting_valid);
+        assert_eq!((z.took, z.wall), (0, 90));
     }
 
     #[test]

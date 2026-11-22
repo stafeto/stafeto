@@ -33,7 +33,10 @@ const SELF_RIGHTS: Rights = abi::OWNER_RIGHTS;
 /// abi::KernelStats in x1-x8 (spec 16). MEMORY takes a memory object's
 /// handle, a device window's too, with any rights and returns
 /// abi::MemoryInfo in x1-x4. THREAD_STATE takes a thread's handle and
-/// returns abi::ThreadInfo in x1-x4, the ticks the thread has run in x5 and those it spent in the kernel in x6.
+/// returns abi::ThreadInfo in x1-x4, the ticks the thread has run in x5 (from
+/// each return to EL0, the entries for interrupts and the switches left out),
+/// those of them it spent in the kernel in x6 and the times the kernel took
+/// it off the CPU while it was ready in x7.
 /// CHANNEL takes a channel's handle, a labelled copy too, and returns
 /// abi::ChannelInfo in x1-x4; IRQ an interrupt binding's and returns
 /// abi::IrqInfo in x1-x3.

@@ -2177,8 +2177,8 @@ mod tests {
         // A band past the portion bound fails for the own kind alone.
         assert!(steps_verdict(&rows(Some((COMP_TAG, 65, PORTION_MAX + 1)), None)).is_err());
         assert!(steps_verdict(&rows(Some((COMP_TAG, 20, PORTION_MAX + 1)), None)).is_ok());
-        // A portion is judged like 0.9 B, by N - P * 1 300: 18 807 with three preemptions passes
-        // (14 907), 17 000 with none and 18 000 with one (16 700) fail, and a kind with lines that
+        // A portion is judged like 0.9 B, by N - P * 900: 18 807 with three preemptions passes
+        // (16 107), 17 000 with none and 18 000 with one (17 100) fail, and a kind with lines that
         // all have preemptions is judged.
         let with = |text: &str| {
             let mut lines = rows(Some((COMP_TAG, 65, 100)), None);
@@ -2188,7 +2188,7 @@ mod tests {
         assert!(steps_verdict(&with("18807 ticks detail 0 preempts 3")).is_ok());
         assert!(steps_verdict(&with("17000 ticks detail 0")).is_err());
         let error = steps_verdict(&with("18000 ticks detail 0 preempts 1")).unwrap_err();
-        assert!(error.contains("16700"), "{error}");
+        assert!(error.contains("17100"), "{error}");
         let only_preempted: Vec<String> = rows(None, None)
             .into_iter()
             .filter(|l| !l.contains(&format!("{COMP_TAG} kind 65 ")))
