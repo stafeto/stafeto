@@ -181,7 +181,7 @@ start to its end (the pointers and the block of data), the same for calls of 4 K
   `a_read_in_order_costs_at_most_three_reads_for_each_block` keeps the figure of the table. Each of the two guards, the comparison of the pair and the drop at the start of a write
   or a truncation, covers every change of the file alone, so removing either leaves the tests
   passing; removing both (wayposts that outlive a write) gives a wrong read at step 22 of the first
-  seed of the random test (checked by hand, not kept).
+  seed of the random test (checked by hand and then undone).
 
 ## A known defect of the release that the service works around
 
