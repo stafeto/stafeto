@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The line `service step: T kind K N ticks detail D preempts P` of `rt::service` (`preempts P`
-//! is left out when P is 0) and the judgement of a step against the bound B.
+//! The line `service step: T kind K N ticks detail D preempts P wall W` of `rt::service` (`preempts P`
+//! is left out when P is 0 and no wall is told; `wall W` is told when the clock's part of the
+//! step, W, is longer than N) and the judgement of a step against the bound B.
 //!
 //! The line carries the raw time N of the step, the CPU ticks of the thread in it, and is
 //! printed when the raw time of a kind grows (a step with a shorter raw time and more work does
@@ -16,19 +17,33 @@
 //! - 0.9 B: the greatest by kind of `N - P * PREEMPT_CHARGE` (`judged`, `longest`) at most 0.9 B,
 //!   which the callers check. A warning names the raw time when it is above the bound.
 
-/// The ticks one preemption adds to the time of the preempted thread, at the least: the lower
-/// bound the kernel test measures for a switch inside one process (the `preempt charge ticks`
-/// row). A lower bound cannot hide step work: a step that took N with P preemptions did at least
+/// The ticks one preemption adds to the time of the preempted thread, at the least. A preemption
+/// decided inside the thread's own call (the call wakes a thread of a higher level, or the cleanup
+/// queue is at or above its level, and `pick` takes the thread off the CPU) closes the stint at
+/// the top of `exit_loop` and reopens it at the `now` of `thread::run`, so it costs the thread
+/// about nothing: the bound is 0. The 95 ticks that the `preempt charge ticks` row of the kernel
+/// test measures are the cost of an EL0 timer preemption alone (the registers' save and restore).
+/// A lower bound cannot hide step work: a step that took N with P preemptions did at least
 /// `N - P * c` ticks of its own for any true charge c at or above the bound, so judging by that
-/// value never passes a step that a true charge would fail. It judges the bound B.
-pub const PREEMPT_CHARGE_MIN: u64 = 487;
+/// value never passes a step that a true charge would fail. It judges the bound B. The residual
+/// of the bound 0 is at most P times the path from the top of `exit_loop` to the `now` of
+/// `thread::run`, a fraction of `NULL_MAX`.
+pub const PREEMPT_CHARGE_MIN: u64 = 0;
 
-/// The measured cost of a preemption of the worst kind seen (a preemptor of another process, SIMD
-/// state live, a budget event), for the target 0.9 B. A probe is to measure it (the `preempt
-/// charge ticks` rows); until then it is the largest seen, 1 261 ticks in a step of the RAM file
-/// service on 19 November, with a margin. A c that is too small can only eat the margin between
-/// 0.9 B and B, since `over_bound` holds B by the lower bound.
-pub const PREEMPT_CHARGE: u64 = 1_300;
+/// The cost of a preemption of the worst kind seen (a preemptor of another process), for the
+/// target 0.9 B. The stint of a thread begins at its return to EL0, so the entries for interrupts,
+/// the budget events and the SIMD switches are outside the time a step is measured by. In
+/// `thread::run` the save and load of the FP state (thread.rs) and the switch of TTBR0 and the
+/// setup of the upcall happen before `now` is read, and the budget event runs between the entry
+/// and the reopening of the stint, so an EL0 preemption costs about 95 ticks under -icount
+/// whatever the preemptor is: the registers' save and restore. The `preempt charge ticks` row of
+/// the kernel test fell from 487 to 95 with that change, a drop of 392 ticks in every preemption,
+/// and the worst step seen before it left 1 261 ticks in a step of the RAM file service on 19
+/// November: 869 ticks now, with the margin of that figure (3 per cent, rounded up to the
+/// hundred) 900. The 900 stays for now; a follow-up lowers it after a probe run. A c that is too
+/// small can only eat the margin between 0.9 B and B, since `over_bound` holds B by the lower
+/// bound.
+pub const PREEMPT_CHARGE: u64 = 900;
 
 /// A line of a step, read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +55,9 @@ pub struct StepLine<'a> {
     pub detail: u64,
     /// The preemptions in the step (0 for a line that has no count).
     pub preempts: u64,
+    /// The step's whole time less its waits, when the line carries it (`wall W`): the figure
+    /// the raw time would have had without the thread's own CPU time. None for a line without it.
+    pub wall: Option<u64>,
 }
 
 impl StepLine<'_> {
@@ -162,6 +180,41 @@ pub fn clean_longest(lines: &[String], tag: &str, kind: usize) -> Option<u64> {
         .max()
 }
 
+/// The longest raw line of each kind of the service `tag`, with the wall time the line carries
+/// when the thread's CPU time was the shorter figure (None: the two were equal): (kind, ticks,
+/// wall, preempts), in the order the kinds came.
+pub fn ran_and_wall(lines: &[String], tag: &str) -> Vec<(usize, u64, Option<u64>, u64)> {
+    let mut out: Vec<(usize, u64, Option<u64>, u64)> = Vec::new();
+    for step in lines
+        .iter()
+        .filter_map(|l| parse_any(l))
+        .filter(|s| s.tag == tag)
+    {
+        let row = (step.kind, step.ticks, step.wall, step.preempts);
+        match out.iter_mut().find(|(k, ..)| *k == step.kind) {
+            Some(old) if old.1 > row.1 => {}
+            Some(old) => *old = row,
+            None => out.push(row),
+        }
+    }
+    out
+}
+
+/// Tells `ran_and_wall` of the service `tag`: for each kind the ticks by the thread's CPU time
+/// beside the wall ticks (the step's whole less its waits), a report line, no verdict.
+pub fn say_ran_and_wall(lines: &[String], tag: &str) {
+    for (kind, ticks, wall, preempts) in ran_and_wall(lines, tag) {
+        match wall {
+            Some(w) => println!(
+                "step cpu and wall: service {tag} kind {kind}: ran {ticks} ticks, wall {w} ticks, preempts {preempts}"
+            ),
+            None => println!(
+                "step cpu and wall: service {tag} kind {kind}: ran {ticks} ticks, wall the same, preempts {preempts}"
+            ),
+        }
+    }
+}
+
 /// The line, when it is a line of a step (with or without the count of preemptions).
 pub fn parse(line: &str) -> Option<StepLine<'_>> {
     parse_word(line, "step:")
@@ -183,7 +236,7 @@ fn parse_any(line: &str) -> Option<StepLine<'_>> {
 
 fn parse_word<'a>(line: &'a str, word: &str) -> Option<StepLine<'a>> {
     let words: Vec<&str> = line.split_whitespace().collect();
-    let (tag, kind, ticks, detail, preempts) = match words.as_slice() {
+    let (tag, kind, ticks, detail, preempts, wall) = match words.as_slice() {
         [
             "service",
             w,
@@ -194,7 +247,7 @@ fn parse_word<'a>(line: &'a str, word: &str) -> Option<StepLine<'a>> {
             "ticks",
             "detail",
             detail,
-        ] if *w == word => (tag, kind, ticks, detail, "0"),
+        ] if *w == word => (tag, kind, ticks, detail, "0", None),
         [
             "service",
             w,
@@ -207,7 +260,22 @@ fn parse_word<'a>(line: &'a str, word: &str) -> Option<StepLine<'a>> {
             detail,
             "preempts",
             preempts,
-        ] if *w == word => (tag, kind, ticks, detail, *preempts),
+        ] if *w == word => (tag, kind, ticks, detail, *preempts, None),
+        [
+            "service",
+            w,
+            tag,
+            "kind",
+            kind,
+            ticks,
+            "ticks",
+            "detail",
+            detail,
+            "preempts",
+            preempts,
+            "wall",
+            wall,
+        ] if *w == word => (tag, kind, ticks, detail, *preempts, Some(*wall)),
         _ => return None,
     };
     Some(StepLine {
@@ -216,6 +284,10 @@ fn parse_word<'a>(line: &'a str, word: &str) -> Option<StepLine<'a>> {
         ticks: ticks.parse().ok()?,
         detail: detail.parse().ok()?,
         preempts: preempts.parse().ok()?,
+        wall: match wall {
+            Some(w) => Some(w.parse().ok()?),
+            None => None,
+        },
     })
 }
 
@@ -388,6 +460,46 @@ mod tests {
     }
 
     #[test]
+    fn ran_and_wall_keep_the_longest_line_of_each_kind() {
+        let got = ran_and_wall(
+            &lines(&[
+                "service step: 4 kind 14 9000 ticks detail 0",
+                "service step: 4 kind 14 15000 ticks detail 0 preempts 0 wall 19800",
+                "service step: 5 kind 14 99999 ticks detail 0",
+                "service table: 4 kind 15 7000 ticks detail 0 preempts 1",
+            ]),
+            "4",
+        );
+        assert_eq!(got, [(14, 15_000, Some(19_800), 0), (15, 7_000, None, 1)]);
+    }
+
+    #[test]
+    fn the_wall_field_is_optional() {
+        let w =
+            parse("service step: 4 kind 14 15000 ticks detail 0 preempts 0 wall 19800").unwrap();
+        assert_eq!(
+            (w.kind, w.ticks, w.preempts, w.wall),
+            (14, 15_000, 0, Some(19_800))
+        );
+        assert_eq!(
+            parse("service step: 4 kind 14 15000 ticks detail 0")
+                .unwrap()
+                .wall,
+            None
+        );
+        assert_eq!(
+            parse("service step: 4 kind 14 15000 ticks detail 0 preempts 2")
+                .unwrap()
+                .wall,
+            None
+        );
+        assert!(parse("service step: 4 kind 14 15000 ticks detail 0 preempts 0 wall x").is_none());
+        let t =
+            parse_table("service table: 4 kind 14 15000 ticks detail 0 preempts 1 wall 9").unwrap();
+        assert_eq!(t.wall, Some(9));
+    }
+
+    #[test]
     fn a_line_is_read_with_and_without_the_count() {
         let old = parse("service step: 14 kind 33 16000 ticks detail 64").unwrap();
         assert_eq!(
@@ -406,10 +518,10 @@ mod tests {
     #[test]
     fn a_step_is_judged_less_the_charge_of_its_preemptions() {
         let bound = 18_369;
-        // 19 000 raw with 2 preemptions is 16 400 of work at the measured charge: it passes the
+        // 19 000 raw with 2 preemptions is 17 200 of work at the measured charge: it passes the
         // judgement, and the raw time is named by a warning.
         let rows = lines(&["service step: 14 kind 33 19000 ticks detail 64 preempts 2"]);
-        assert_eq!(longest(&rows, "14"), vec![(33, 16_400, 64)]);
+        assert_eq!(longest(&rows, "14"), vec![(33, 17_200, 64)]);
         assert!(longest(&rows, "14")[0].1 <= bound);
         let warnings = raw_warnings(&rows, "14", bound);
         assert_eq!(warnings.len(), 1);
@@ -442,10 +554,10 @@ mod tests {
         assert_eq!(verdict(18_807, 3), (true, true));
         // No preemption: 19 000 fails 0.9 B.
         assert_eq!(verdict(19_000, 0), (true, false));
-        // 21 000 with one preemption is 20 513 of work at least: fails B.
+        // 21 000 with one preemption is 21 000 of work at least (the least charge is 0): fails B.
         assert_eq!(verdict(21_000, 1), (false, false));
-        // 20 800 with one preemption passes B (20 313) and fails 0.9 B (19 500).
-        assert_eq!(verdict(20_800, 1), (true, false));
+        // 20 400 with one preemption passes B (20 400 of work at least) and fails 0.9 B (19 500).
+        assert_eq!(verdict(20_400, 1), (true, false));
     }
 
     #[test]
@@ -455,8 +567,8 @@ mod tests {
         assert!(
             said.contains("kind 33") && said.contains("raw 21000") && said.contains("preempts 1")
         );
-        assert!(said.contains("= 19700 against 0.9 B 18369"), "{said}");
-        assert!(said.contains("= 20513 against B 20410"), "{said}");
+        assert!(said.contains("= 20100 against 0.9 B 18369"), "{said}");
+        assert!(said.contains("= 21000 against B 20410"), "{said}");
         // Another service's lines are not read.
         assert!(over_bound(&rows, "4", 20_410, Kinds::All).is_none());
         // The probes call it for the kinds they judge: an exempt kind is not checked.
@@ -472,18 +584,21 @@ mod tests {
         // The services tell the pairs (kind, preemptions) no other pair beats in the table at the
         // end of a run (`service table:`), and the line of a new longest as the run goes on: the
         // three steps give three lines of the table, and the judged maximum is the second,
-        // 16 700 (the raw maximum alone gave 14 907).
+        // 17 100 (the raw maximum alone gave 16 107).
         let rows = lines(&[
             "service step: 17 kind 65 18807 ticks detail 0 preempts 3",
             "service table: 17 kind 65 18000 ticks detail 1 preempts 1",
             "service table: 17 kind 65 16400 ticks detail 2 preempts 0",
         ]);
-        assert_eq!(longest(&rows, "17"), vec![(65, 16_700, 1)]);
-        assert!(longest(&rows[..1], "17")[0].1 == 14_907);
+        assert_eq!(longest(&rows, "17"), vec![(65, 17_100, 1)]);
+        assert!(longest(&rows[..1], "17")[0].1 == 16_107);
         // The pair of 8 and more is judged with 8 preemptions, whatever the count of the line.
         let many = lines(&["service step: 17 kind 65 20000 ticks detail 0 preempts 12"]);
-        assert_eq!(longest(&many, "17"), vec![(65, 20_000 - 8 * 1_300, 0)]);
-        assert_eq!(parse(&many[0]).unwrap().least(), 20_000 - 8 * 487);
+        assert_eq!(longest(&many, "17"), vec![(65, 20_000 - 8 * 900, 0)]);
+        assert_eq!(
+            parse(&many[0]).unwrap().least(),
+            20_000 - 8 * PREEMPT_CHARGE_MIN
+        );
     }
 
     #[test]

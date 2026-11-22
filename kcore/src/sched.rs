@@ -50,13 +50,30 @@
 use crate::budget::Server;
 use crate::must::Must;
 use abi::{Error, PRIORITY_LEVELS, Policy};
-use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::ptr::{self, NonNull};
+use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 const LEVELS: usize = PRIORITY_LEVELS as usize;
 
 /// The tag of `Node::stamp` that says the thread runs; no counter reaches it.
 const RUNNING: u64 = 1 << 63;
+
+/// The tag of `Node::stamp` next to `RUNNING`: the thread was chosen or
+/// went on after an entry for an interrupt, and its stint begins when it
+/// returns to EL0 (`stint_starts`); until then the word holds no counter
+/// value and the thread's time does not run. No counter reaches it either.
+const PENDING: u64 = 1 << 62;
+
+/// The word of a thread that runs and whose stint waits for EL0. With
+/// `break-stint-visit` the stint begins at once, at the decision.
+#[inline(always)]
+const fn begins(now: u64) -> u64 {
+    if cfg!(feature = "break-stint-visit") {
+        now | RUNNING
+    } else {
+        RUNNING | PENDING
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -266,13 +283,14 @@ pub struct Node<T> {
     ran: u64,
     /// Times a higher level (or the cleanup queue) took the thread off the
     /// CPU while it was ready: counted in `pick`, where it calls `preempt`,
-    /// and nowhere else. A block, a `yield`, the end of a quantum and a
-    /// budget's end do not count. It wraps at 2^16: the field takes the two
+    /// and in `tick`, when the budget's end takes the thread's level. A
+    /// block, a `yield` and the end of a quantum do not count. It wraps at 2^16: the field takes the two
     /// spare bytes of the node, so the thread keeps its size, and a reader
     /// takes the difference of two readings modulo 2^16.
     preempts: u16,
     /// While the thread runs, the counter value at which its stint began
-    /// with `RUNNING` set; otherwise the ticks left of a round-robin quantum
+    /// with `RUNNING` set, or `RUNNING | PENDING` with no counter value
+    /// while the stint waits for the thread's return to EL0; otherwise the ticks left of a round-robin quantum
     /// while it is ready. One word for both keeps the node, and so the
     /// thread, in the size the pool of threads needs: a page holds three. A
     /// reader on another CPU takes the stint from the tag in the word
@@ -392,7 +410,9 @@ impl<T> Node<T> {
         self.ran
     }
 
-    /// One more preemption. Kept out of line, and this fixes no defect: with
+    /// One more preemption: the kernel took the thread off the CPU while it
+    /// was ready, a higher level or the cleanup queue in `pick`, or the loss
+    /// of its level with its budget in `tick`. Kept out of line, and this fixes no defect: with
     /// the increment inline `exit_loop` comes out 128 bytes smaller (12392
     /// to 12264) with other registers and stack slots across the whole
     /// function, and the timer interrupts land elsewhere in the probes. In
@@ -414,23 +434,63 @@ impl<T> Node<T> {
     /// The counter value at which the current stint began, for the running
     /// thread.
     pub fn since(&self) -> u64 {
-        self.stamp & !RUNNING
+        self.stamp & !(RUNNING | PENDING)
+    }
+
+    /// Whether the thread runs and its stint waits for the return to EL0.
+    pub fn stint_pending(&self) -> bool {
+        // PENDING is set only with RUNNING: one bit to test.
+        self.stamp & PENDING != 0
+    }
+
+    /// The word of the stint, read with acquire ordering: a reader on another
+    /// CPU that sees a value of the owner's release store (`set_stamp`) sees
+    /// the `ran` that went before it.
+    fn stamp_acquire(&self) -> u64 {
+        // SAFETY: the pointer is of a live, aligned word; the owner's CPU
+        // stores to it with no lock, and an atomic load of it is the read
+        // that tolerates this.
+        unsafe {
+            AtomicU64::from_ptr(ptr::from_ref(&self.stamp).cast_mut()).load(Ordering::Acquire)
+        }
+    }
+
+    /// Stores the word of the stint after the change of `ran` that goes with
+    /// it, with release ordering (`ran_at` reads in the other order).
+    fn set_stamp(&mut self, value: u64) {
+        // SAFETY: as in `stamp_acquire`; the node is borrowed mutably.
+        unsafe { AtomicU64::from_ptr(&raw mut self.stamp).store(value, Ordering::Release) }
     }
 
     /// Ticks the thread has run at `now`: the finished stints and, for the
-    /// running thread, the current one. O(1). The thread's own CPU changes
+    /// running thread, the current one, which counts from its return to EL0
+    /// and stops at an entry for an interrupt (spec 8). O(1). The thread's own CPU changes
     /// these fields with no lock of the objects, so a reader on another CPU,
-    /// as object_info and times() are, may see a stint that ended while it
-    /// read counted again, or missing: the sum of two reads can fall below
-    /// the first by the length of one stint's end. Each reading is right
-    /// to within that, and the sum of a thread that is not running is exact.
+    /// as object_info and times() are, reads the word of the stint, `ran` and
+    /// the word again, and reads once more when the word changed between the
+    /// two reads (the owner's stores of the two fields are in the order `ran`,
+    /// then the word with release ordering). What stays is the window between
+    /// the owner's two stores, a few instructions long, in which a reader may
+    /// see a stint that ended while it read counted again; and a second
+    /// change of the word during the second read. The sum of two reads can
+    /// fall below the first by the length of one stint's end. Each reading is
+    /// right to within that, and the sum of a thread that is not running is
+    /// exact.
     pub fn ran_at(&self, now: u64) -> u64 {
-        let stamp = self.stamp;
-        if stamp & RUNNING != 0 {
-            self.ran
-                .saturating_add(now.saturating_sub(stamp & !RUNNING))
+        let mut stamp = self.stamp_acquire();
+        let mut ran = self.ran;
+        // The second read of the word is the check; the load above is the
+        // one the retry starts from.
+        fence(Ordering::Acquire);
+        let again = self.stamp_acquire();
+        if again != stamp {
+            stamp = again;
+            ran = self.ran;
+        }
+        if stamp & (RUNNING | PENDING) == RUNNING {
+            ran.saturating_add(now.saturating_sub(stamp & !RUNNING))
         } else {
-            self.ran
+            ran
         }
     }
 
@@ -734,7 +794,18 @@ pub struct Scheduler<T> {
     /// a round-robin thread only.
     slice_end: u64,
     quantum: u64,
+    /// Ticks the CPU spent in the kernel for no thread's stint: the entries
+    /// for interrupts, the switches and cleanup (spec 8). With the threads'
+    /// `ran` it makes the time outside idle.
+    system: u64,
+    /// The counter value at which the time that belongs to no stint began:
+    /// the end of a stint, or the entry that woke the CPU; `IDLE` while the
+    /// CPU sleeps, which belongs to nobody.
+    gap: u64,
 }
+
+/// `Scheduler::gap` while the CPU idles.
+const IDLE: u64 = u64::MAX;
 
 // SAFETY: the scheduler holds pointers to threads that the kernel hands
 // it, and moving it moves them along, as moving the threads would.
@@ -749,6 +820,66 @@ impl<T: Schedulable> Scheduler<T> {
             running: None,
             slice_end: 0,
             quantum,
+            system: 0,
+            gap: IDLE,
+        }
+    }
+
+    /// Ticks of the entries for interrupts, switches and cleanup that no
+    /// stint holds, counted at the stints that began (`stint_starts`).
+    pub fn system(&self) -> u64 {
+        self.system
+    }
+
+    /// The CPU enters the kernel for an interrupt at `now`: the stint of
+    /// the running thread ends here and the thread's `ran` stops, and the
+    /// time up to the thread's return to EL0 (`stint_starts`) is the
+    /// system's. A second call in the same visit changes nothing. An entry
+    /// that wakes an idle CPU begins the time of the system.
+    ///
+    /// # Safety
+    /// As for `pick`.
+    pub unsafe fn interrupt_entered(&mut self, now: u64) {
+        if cfg!(feature = "break-stint-visit") {
+            return;
+        }
+        if let Some(r) = self.running {
+            // SAFETY: the running thread is alive.
+            let n = unsafe { node(r) };
+            if n.stamp & PENDING == 0 {
+                n.ran = n.ran.saturating_add(now.saturating_sub(n.stamp & !RUNNING));
+                n.set_stamp(RUNNING | PENDING);
+                self.gap = now;
+                return;
+            }
+        }
+        if self.gap == IDLE {
+            self.gap = now;
+        }
+    }
+
+    /// Whether the running thread's stint is closed already, by an entry for
+    /// an interrupt or because it waits for its return to EL0: the visit of
+    /// the kernel is open, and `interrupt_entered` would change nothing.
+    pub fn visit_open(&self) -> bool {
+        // SAFETY: the running thread is alive.
+        self.running
+            .is_some_and(|r| unsafe { node(r) }.stamp & PENDING != 0)
+    }
+
+    /// The running thread `t` returns to EL0 at `now`: its stint begins, if
+    /// it waited for this, and the time since the stint before it ended
+    /// goes to the system's. Nothing happens for a thread whose stint runs.
+    ///
+    /// # Safety
+    /// `t` is alive.
+    pub unsafe fn stint_starts(&mut self, t: NonNull<T>, now: u64) {
+        // SAFETY: the caller's promise.
+        let n = unsafe { node(t) };
+        if n.stamp & PENDING != 0 {
+            n.stamp = now | RUNNING;
+            self.system = self.system.saturating_add(now.saturating_sub(self.gap));
+            self.gap = IDLE;
         }
     }
 
@@ -774,13 +905,19 @@ impl<T: Schedulable> Scheduler<T> {
     ///
     /// # Safety
     /// `r` is alive and was the running thread.
-    unsafe fn charge(r: NonNull<T>, now: u64, leave: Leave) -> bool {
+    unsafe fn charge(&mut self, r: NonNull<T>, now: u64, leave: Leave) -> bool {
         // SAFETY: the caller's promise.
         unsafe {
             let n = node(r);
-            n.ran = n.ran.saturating_add(now.saturating_sub(n.stamp & !RUNNING));
+            // A stint that waits for EL0 has nothing to add: an entry for an
+            // interrupt closed it, or the thread never returned to EL0 since
+            // it was chosen; the time since then is the system's.
+            if n.stamp & PENDING == 0 {
+                n.ran = n.ran.saturating_add(now.saturating_sub(n.stamp & !RUNNING));
+                self.gap = now;
+            }
             // The stint is over: the word holds no counter value any more.
-            n.stamp = 0;
+            n.set_stamp(0);
             if leave == Leave::Exit {
                 return false;
             }
@@ -955,6 +1092,10 @@ impl<T: Schedulable> Scheduler<T> {
             return Decision::Clean;
         }
         let Some(top) = top else {
+            // The time up to here is the system's; sleep belongs to nobody,
+            // and the entry that wakes the CPU begins the next gap.
+            self.system = self.system.saturating_add(now.saturating_sub(self.gap));
+            self.gap = IDLE;
             return Decision::Idle;
         };
         let next = self.ready.first(top).must("a level with its bit set");
@@ -966,9 +1107,10 @@ impl<T: Schedulable> Scheduler<T> {
             self.slice_end = now.saturating_add(n.stamp);
             // The field counts the quantum only while the thread is ready:
             // whatever puts it back gives it a quantum or the rest of this one.
-            n.stamp = now | RUNNING;
+            n.stamp = begins(now);
             Self::with_server(next, Op::Run, now);
         }
+        self.gap = self.gap.min(now);
         self.running = Some(next);
         Decision::Run(next)
     }
@@ -991,7 +1133,7 @@ impl<T: Schedulable> Scheduler<T> {
         // SAFETY: the caller's promise; the node's borrow ends before the
         // list takes the thread.
         unsafe {
-            let demoted = Self::charge(r, now, Leave::Preempt);
+            let demoted = self.charge(r, now, Leave::Preempt);
             let n = node(r);
             let ended = demoted || n.policy == Policy::RoundRobin && rest == 0;
             n.state = State::Ready;
@@ -1028,15 +1170,20 @@ impl<T: Schedulable> Scheduler<T> {
             if !slice_over && !exhausted {
                 return;
             }
-            let demoted = Self::charge(r, now, Leave::Preempt);
+            let demoted = self.charge(r, now, Leave::Preempt);
             if !slice_over && !demoted {
                 // The next replenishment of the budget was due already: the
                 // thread goes on, with a budget that ends later.
                 Self::with_server(r, Op::Run, now);
-                node(r).stamp = now | RUNNING;
+                node(r).stamp = begins(now);
                 return;
             }
             let n = node(r);
+            if demoted {
+                // The budget ran out and the thread lost its level: the
+                // kernel took it off the CPU while it was ready.
+                n.count_preemption();
+            }
             n.state = State::Ready;
             n.stamp = self.quantum;
             self.ready.push_tail(r);
@@ -1057,7 +1204,7 @@ impl<T: Schedulable> Scheduler<T> {
         };
         // SAFETY: the running thread is alive.
         unsafe {
-            Self::charge(r, now, Leave::Preempt);
+            self.charge(r, now, Leave::Preempt);
             let n = node(r);
             n.state = State::Ready;
             n.stamp = self.quantum;
@@ -1143,7 +1290,7 @@ impl<T: Schedulable> Scheduler<T> {
                     self.ready.push_tail(t);
                 }
                 (true, State::Running) => {
-                    Self::charge(t, now, Leave::Preempt);
+                    self.charge(t, now, Leave::Preempt);
                     let n = node(t);
                     n.link.set_level(n.effective());
                     n.state = State::Ready;
@@ -1245,7 +1392,7 @@ impl<T: Schedulable> Scheduler<T> {
         let r = self.running.take().must("no thread runs to wait");
         // SAFETY: the running thread is alive.
         unsafe {
-            Self::charge(r, now, Leave::Block);
+            self.charge(r, now, Leave::Block);
             node(r).state = State::Waiting;
         }
         r
@@ -1286,7 +1433,7 @@ impl<T: Schedulable> Scheduler<T> {
         self.running = None;
         // SAFETY: the caller holds the running thread.
         unsafe {
-            Self::charge(t, now, Leave::Block);
+            self.charge(t, now, Leave::Block);
             node(t).state = State::Parked;
         }
     }
@@ -1341,7 +1488,8 @@ impl<T: Schedulable> Scheduler<T> {
                 return false;
             }
             n.state = State::Running;
-            n.stamp = now | RUNNING;
+            n.stamp = begins(now);
+            self.gap = self.gap.min(now);
             self.slice_end = now.saturating_add(self.quantum);
             self.running = Some(t);
             Self::with_server(t, Op::Run, now);
@@ -1377,7 +1525,7 @@ impl<T: Schedulable> Scheduler<T> {
                 );
                 self.running = None;
                 // SAFETY: the caller's promise.
-                unsafe { Self::charge(t, now, Leave::Exit) };
+                unsafe { self.charge(t, now, Leave::Exit) };
             }
             // SAFETY: a ready thread is in the queue.
             State::Ready => unsafe { self.ready.remove(t) },
@@ -1835,7 +1983,12 @@ mod tests {
             self.now = now;
             // SAFETY: as above.
             match unsafe { self.s.pick(now, cleanup) } {
-                Decision::Run(t) => name(t),
+                Decision::Run(t) => {
+                    // The tests return to EL0 at the moment they decide.
+                    // SAFETY: the thread is alive.
+                    unsafe { self.s.stint_starts(t, now) };
+                    name(t)
+                }
                 Decision::Clean => '*',
                 Decision::Idle => '-',
             }
@@ -3147,6 +3300,238 @@ mod tests {
         assert_eq!(charged(&w), 8 * MS);
     }
 
+    /// A stint begins when the thread returns to EL0 (spec 8): the way from
+    /// the decision to EL0 is no one's, and an entry for an interrupt takes
+    /// its time out of the stint and gives the rest back at the return.
+    #[test]
+    fn a_stint_runs_from_the_return_to_el0_and_skips_the_visits() {
+        let mut w = World::new();
+        let a = w.started('a', 10, FIFO);
+        // SAFETY: the world keeps its threads alive.
+        assert!(matches!(unsafe { w.s.pick(100, None) }, Decision::Run(_)));
+        // SAFETY: as above; the thread returns to EL0 at 160.
+        unsafe { w.s.stint_starts(a, 160) };
+        assert_eq!(node(a).ran_at(1000), 840);
+        // An interrupt enters the kernel from 500 and the thread returns at
+        // 650, with no switch in between.
+        // SAFETY: as above.
+        unsafe { w.s.interrupt_entered(500) };
+        assert_eq!(node(a).ran_at(600), 340);
+        // A second entry in the visit changes nothing.
+        // SAFETY: as above.
+        unsafe { w.s.interrupt_entered(520) };
+        // SAFETY: as above.
+        assert!(matches!(unsafe { w.s.pick(650, None) }, Decision::Run(_)));
+        // SAFETY: as above.
+        unsafe { w.s.stint_starts(a, 650) };
+        assert_eq!(node(a).ran_at(1000), (500 - 160) + (1000 - 650));
+        assert_eq!(w.s.system(), 160 - 100 + (650 - 500));
+        // A thread that returns while its stint runs changes nothing.
+        // SAFETY: as above.
+        unsafe { w.s.stint_starts(a, 700) };
+        assert_eq!(node(a).ran_at(1000), (500 - 160) + (1000 - 650));
+    }
+
+    /// The budget runs out in a visit: the thread is taken off the CPU
+    /// ready, counted as a preemption, and what passes before it returns to
+    /// EL0 is not its time.
+    #[test]
+    fn a_budget_that_ends_in_a_visit_counts_a_preemption_and_no_time() {
+        let mut w = World::new();
+        let hog = w.thread('h', 50, FIFO);
+        w.budget(hog, 2 * MS, 10 * MS, 1);
+        w.start(hog);
+        let other = w.started('o', 10, FIFO);
+        assert_eq!(w.pick(0), 'h');
+        let e = 2 * MS;
+        // SAFETY: the world keeps its threads alive.
+        unsafe { w.s.interrupt_entered(e) };
+        // SAFETY: as above.
+        unsafe { w.s.tick(e + 40) };
+        assert_eq!(node(hog).preempts(), 1);
+        assert_eq!(node(hog).ran(), e);
+        assert_eq!(w.pick(e + 40), 'o');
+        w.now = 3 * MS;
+        assert_eq!(w.block(), other);
+        // The thread is chosen again at the level it fell to, and returns to
+        // EL0 at x.
+        // SAFETY: as above.
+        assert!(matches!(
+            unsafe { w.s.pick(3 * MS, None) },
+            Decision::Run(_)
+        ));
+        let x = 3 * MS + 500;
+        // SAFETY: as above.
+        unsafe { w.s.stint_starts(hog, x) };
+        assert_eq!(node(hog).ran_at(x), e);
+        assert_eq!(node(hog).ran_at(x + 100), e + 100);
+    }
+
+    /// The budget's side of a run: what it was charged, its usage, overruns,
+    /// the time its budget ends at, the queue of replenishments and the
+    /// event, as the tests read them.
+    type BudgetSide = (u64, u64, u32, u64, Vec<(u64, u64)>, Option<u64>);
+
+    fn budget_side(w: &World) -> BudgetSide {
+        let server = &w.servers[0];
+        (
+            server.ran(),
+            server.usage(),
+            server.overruns(),
+            server.exhaust_at(),
+            server.queue().iter().map(|r| (r.time, r.amount)).collect(),
+            w.threads[0].event,
+        )
+    }
+
+    /// A visit that spans the end of the budget (spec 8): the timer enters
+    /// the kernel just after the budget's end, the budget falls to its low
+    /// level and the thread is taken off the CPU. The time of the visit
+    /// goes from the thread's `ran` and stays in the budget's, so the
+    /// budget's side holds the constants below with the stint of a thread
+    /// that begins at the decision as well (`break-stint-visit`); only the
+    /// thread's own time tells the two apart.
+    #[test]
+    fn a_visit_across_exhaustion_leaves_the_budget_as_it_was() {
+        let mut w = World::new();
+        let t = w.thread('t', 50, FIFO);
+        w.budget(t, 2 * MS, 10 * MS, 1);
+        w.start(t);
+        w.started('o', 10, FIFO);
+        assert_eq!(w.pick(0), 't');
+        // SAFETY: the world keeps its threads alive.
+        unsafe { w.s.interrupt_entered(2 * MS + 100) };
+        // SAFETY: as above.
+        unsafe { w.s.tick(2 * MS + 400) };
+        assert_eq!(w.pick(2 * MS + 400), 'o');
+        // The budget was charged to the tick, 400 past the end of its time,
+        // fell to its low level (one overrun) and has the replenishment and
+        // its event a period after the end of the budget; the usage is the
+        // overrun, which the next chunk pays by coming later.
+        assert_eq!(
+            budget_side(&w),
+            (
+                2 * MS + 400,
+                400,
+                1,
+                2 * MS,
+                vec![(2 * MS + 400 + 8 * MS, 2 * MS)],
+                Some(2 * MS + 400 + 8 * MS)
+            )
+        );
+        assert_eq!(node(t).preempts(), 1);
+        // The thread's own time ends at the entry: the 300 ticks from there
+        // to the tick are the system's, and the budget's.
+        assert_eq!(node(t).ran(), 2 * MS + 100);
+    }
+
+    /// The tick that finds the budget's end with a replenishment due goes on
+    /// with the thread (the continue path of `tick`): the time of the visit
+    /// up to the thread's return to EL0 is not its own, and the budget's
+    /// side is the one the constants name, with or without the break.
+    #[test]
+    fn a_tick_that_goes_on_takes_the_visit_out_of_the_thread() {
+        let mut w = World::new();
+        let t = w.thread('t', 50, FIFO);
+        w.budget(t, 2 * MS, 3 * MS, 1);
+        w.start(t);
+        let h = w.thread('h', 60, FIFO);
+        assert_eq!(w.pick(0), 't');
+        // The thread runs 0..1 ms and waits. At 1.5 ms it is ready with
+        // the head of its queue at 1.5 ms, and the next replenishment, at
+        // 3 ms, still ahead; a thread above it holds the CPU until 2.2 ms,
+        // so the chunk of the thread ends at 3.2 ms, after that replenishment.
+        w.now = MS;
+        assert_eq!(w.block(), t);
+        assert_eq!(w.pick(MS), '-');
+        w.now = MS + MS / 2;
+        w.wake(t);
+        w.start(h);
+        assert_eq!(w.pick(MS + MS / 2), 'h');
+        w.now = 2 * MS + MS / 5;
+        assert_eq!(w.block(), h);
+        assert_eq!(w.pick(w.now), 't');
+        assert_eq!(
+            budget_side(&w),
+            (
+                MS,
+                0,
+                0,
+                3 * MS + MS / 5,
+                vec![(MS + MS / 2, MS), (3 * MS, MS)],
+                None
+            )
+        );
+        assert_eq!(node(t).ran(), MS);
+        // The timer enters the kernel at 3.2 ms, at the budget's end.
+        let end = 3 * MS + MS / 5;
+        // SAFETY: the world keeps its threads alive.
+        unsafe { w.s.interrupt_entered(end) };
+        // SAFETY: as above.
+        unsafe { w.s.tick(end + 200) };
+        assert!(w.s.running.is_some());
+        // The tick charged the chunk to the tick, found its replenishment
+        // due and gave the thread a new chunk: no overrun, no event, one
+        // preemption less than a demotion would make.
+        assert_eq!(node(t).preempts(), 0);
+        assert_eq!(
+            budget_side(&w),
+            (
+                MS + (end + 200 - (2 * MS + MS / 5)),
+                200,
+                0,
+                end + 200 + MS - 200,
+                vec![(3 * MS + 200, MS), (4 * MS + MS / 2, MS)],
+                None
+            )
+        );
+        // The thread's time stopped at the entry.
+        assert_eq!(node(t).ran(), 2 * MS);
+        // The kernel returns to the thread 400 ticks after the entry.
+        assert_eq!(w.pick(end + 400), 't');
+        // The decision at 400 past the entry changes nothing in the budget,
+        // and the thread's time counts again from its return to EL0.
+        assert_eq!(node(t).ran(), 2 * MS);
+        assert_eq!(node(t).ran_at(end + 1000), 2 * MS + 600);
+        assert_eq!(budget_side(&w).1, 200);
+    }
+
+    /// What the threads were charged and the system's time are the time
+    /// outside idle, entries for interrupts and switches included.
+    #[test]
+    fn charges_and_the_systems_time_are_the_time_outside_idle() {
+        let mut w = World::new();
+        let a = w.started('a', 10, FIFO);
+        // SAFETY: the world keeps its threads alive.
+        assert!(matches!(unsafe { w.s.pick(0, None) }, Decision::Run(_)));
+        // SAFETY: as above.
+        unsafe { w.s.stint_starts(a, 30) };
+        // SAFETY: as above.
+        unsafe { w.s.interrupt_entered(1000) };
+        // SAFETY: as above.
+        assert!(matches!(unsafe { w.s.pick(1200, None) }, Decision::Run(_)));
+        // SAFETY: as above.
+        unsafe { w.s.stint_starts(a, 1250) };
+        w.now = 2000;
+        w.block();
+        // Idle from 2100 to 3000, an interrupt wakes the CPU at 3000.
+        w.now = 2100;
+        assert_eq!(w.pick(2100), '-');
+        // SAFETY: as above.
+        unsafe { w.s.interrupt_entered(3000) };
+        w.now = 3010;
+        w.wake(a);
+        // SAFETY: as above.
+        assert!(matches!(unsafe { w.s.pick(3050, None) }, Decision::Run(_)));
+        // SAFETY: as above.
+        unsafe { w.s.stint_starts(a, 3100) };
+        w.now = 4000;
+        w.exit(a);
+        // Outside idle: 0..2100 and 3000..4000.
+        assert_eq!(charged(&w) + w.s.system(), 2100 + 1000);
+        assert_eq!(charged(&w), (1000 - 30) + (2000 - 1250) + (4000 - 3100));
+    }
+
     fn a_charged(w: &World, name: char) -> u64 {
         w.threads
             .iter()
@@ -3226,6 +3611,8 @@ mod tests {
         // The sender sent, so the receiver runs at once.
         // SAFETY: the receiver waits, above every ready thread.
         assert!(unsafe { w.s.hand_off(receiver, 2 * MS, None) });
+        // SAFETY: as above; the receiver returns to EL0 at once.
+        unsafe { w.s.stint_starts(receiver, 2 * MS) };
         assert_eq!(node(receiver).ran_at(5 * MS), MS + 3 * MS);
         assert_eq!(node(sender).ran(), MS);
     }

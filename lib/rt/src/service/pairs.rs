@@ -16,7 +16,7 @@
 //! A pair that beat its maximum after the last table stays untold unless the service is stopped in
 //! order (`steps::stopping`): a step hidden that way is no longer than the raw maximum printed for
 //! its kind, so it cannot pass the check against B; against 0.9 B the figure is understated by at
-//! most P x 1 300 ticks from the printed maximum.
+//! most P x 900 ticks from the printed maximum.
 
 use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
@@ -180,9 +180,9 @@ mod tests {
         // One maximum per kind printed the first only; a maximum per pair prints all three.
         let steps = [(18_807, 3), (18_000, 1), (16_400, 0)];
         assert_eq!(told(&steps).lines(), steps);
-        // Judged at a charge of 1 300 the second is 16 700, the greatest of the three.
-        let judged = |&(n, p): &(u64, u64)| n - p * 1_300;
-        assert_eq!(told(&steps).lines().iter().map(judged).max(), Some(16_700));
+        // Judged at a charge of 900 the second is 17 100, the greatest of the three.
+        let judged = |&(n, p): &(u64, u64)| n - p * 900;
+        assert_eq!(told(&steps).lines().iter().map(judged).max(), Some(17_100));
     }
 
     #[test]

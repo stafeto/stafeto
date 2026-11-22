@@ -1726,15 +1726,15 @@ mod tests {
     /// a service the probe does not judge are the business of its own probe.
     #[test]
     fn a_step_past_b_by_the_least_charge_fails_in_any_kind_of_both_services() {
-        // Eight preemptions at the measured charge leave 15 600 ticks (under 0.9 B), and at the
-        // least charge 22 104, past B.
+        // Eight preemptions at the measured charge leave 16 800 ticks (under 0.9 B), and at the
+        // least charge 23 240, past B.
         for (tag, kind) in [
             (crate::comp_probe::COMP_TAG, 20usize),
             (crate::comp_probe::DRIVER_TAG, 6),
         ] {
             let mut lines = steps(&[]);
             lines.push(format!(
-                "service step: {tag} kind {kind} 26000 ticks detail 0 preempts 8"
+                "service step: {tag} kind {kind} 24000 ticks detail 0 preempts 8"
             ));
             let e = steps_verdict(&lines).unwrap_err();
             assert!(
@@ -1745,12 +1745,12 @@ mod tests {
         }
         // The same step of a service this probe does not judge passes.
         let mut lines = steps(&[]);
-        lines.push("service step: 99 kind 20 26000 ticks detail 0 preempts 8".to_owned());
+        lines.push("service step: 99 kind 20 24000 ticks detail 0 preempts 8".to_owned());
         assert!(steps_verdict(&lines).is_ok());
-        // A step of 20 500 ticks with two preemptions is within B by the least charge.
+        // A step of 20 000 ticks with two preemptions is within B by the least charge.
         let mut lines = steps(&[]);
         lines.push(format!(
-            "service step: {} kind 20 20500 ticks detail 0 preempts 2",
+            "service step: {} kind 20 20000 ticks detail 0 preempts 2",
             crate::comp_probe::COMP_TAG
         ));
         assert!(steps_verdict(&lines).is_ok());

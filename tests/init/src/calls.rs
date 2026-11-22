@@ -13,7 +13,7 @@ use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 44] = [
+pub(crate) const TESTS: [Test; 45] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -141,6 +141,10 @@ pub(crate) const TESTS: [Test; 44] = [
     (
         "a_preemption_is_counted_and_costed",
         a_preemption_is_counted_and_costed,
+    ),
+    (
+        "a_budget_overrun_adds_no_entry_time_to_the_thread",
+        a_budget_overrun_adds_no_entry_time_to_the_thread,
     ),
 ];
 
@@ -1155,24 +1159,48 @@ fn loops_split_the_time() -> Result<bool, &'static str> {
         spin_kernel < spin_user / 8,
         "a loop at EL0 with no call grew the kernel time",
     )?;
+    // A call that keeps the thread on the CPU: its whole way in the kernel,
+    // from the entry to the return to EL0, is the thread's own time (x6).
+    let mut call_count = 0u64;
     let call_elapsed = until_elapsed(four_ms, 256, || {
-        let _ = sys::yield_now();
+        call_count += 1;
+        let _ = sys::thread_times(&me());
     });
     let (_, kernel2) = user_and_kernel()?;
     let call_kernel = kernel2.saturating_sub(kernel1);
+    // A `yield` is a decision: the thread's stint ends where the scheduler
+    // takes it off the CPU, and the way from there to its return to EL0, the
+    // switch, is the system's (spec 8), so a loop of yields grows the kernel
+    // time by the entry and the call and by no more.
+    let mut yield_count = 0u64;
+    let yield_elapsed = until_elapsed(four_ms, 256, || {
+        yield_count += 1;
+        let _ = sys::yield_now();
+    });
+    let (_, kernel3) = user_and_kernel()?;
+    let yield_kernel = kernel3.saturating_sub(kernel2);
     // A call's entry and return count as the program's own time: the stamps
     // lie inside the kernel's path, and on a slow host (TCG without
     // -icount) the exception entry and return are most of it. What the
-    // loop of calls shows is that the kernel time grows with the calls.
+    // loops of calls show is that the kernel time grows with the calls.
     // The loops are compared by the kernel time per tick of the counter
     // they ran (a loop of calls overshoots its 4 ms by up to a batch, more
-    // on a slow host): the share of the loop of calls is above 1/16, and 50
-    // times the share of the loop with no call.
+    // on a slow host): the share of the loop of calls that stay on the CPU
+    // is above 1/16, and 50 times the share of the loop with no call. The
+    // switch of a yield is the system's (the loop of yields grew 9 to 15 per
+    // cent of its ticks in the runs of ci and under -icount), and the loop
+    // with no call takes the timer's interrupts, which are a few tenths of a
+    // per cent of its ticks on a host that is slow: the share of the loop of
+    // yields is above 1/32 and 10 times the share of the loop with no call.
     let (spin_share, call_share) = (spin_kernel * call_elapsed, call_kernel * spin_elapsed);
-    let grew = call_kernel * 16 > call_elapsed && call_share > 50 * spin_share;
+    let yield_share = yield_kernel * spin_elapsed;
+    let spin_share_y = spin_kernel * yield_elapsed;
+    let calls_grew = call_kernel * 16 > call_elapsed && call_share > 50 * spin_share;
+    let yields_grew = yield_kernel * 32 > yield_elapsed && yield_share > 10 * spin_share_y;
+    let grew = calls_grew && yields_grew;
     if !grew {
         println!(
-            "cpu_time: the loop at EL0 grew user {spin_user} and kernel {spin_kernel} in {spin_elapsed} ticks, the loop of calls kernel {call_kernel} in {call_elapsed} ticks (4 ms are {four_ms} ticks)"
+            "cpu_time: the loop at EL0 grew user {spin_user} and kernel {spin_kernel} in {spin_elapsed} ticks, the loop of {call_count} calls kernel {call_kernel} in {call_elapsed} ticks ({calls_grew}), the loop of {yield_count} yields kernel {yield_kernel} in {yield_elapsed} ticks ({yields_grew}) (4 ms are {four_ms} ticks)"
         );
     }
     Ok(grew)
@@ -2330,6 +2358,8 @@ static HELPER_DONE: AtomicU64 = AtomicU64::new(0);
 /// How long `a_preemption_is_counted_and_costed` waits after a burn with no preemption for
 /// the first one: the host's delay of an interrupt it delivers late.
 const LATE_PREEMPT_NS: u64 = 1_000_000_000;
+/// The `c_sw` of the last `a_preemption_is_counted_and_costed` under -icount.
+static C_SW: AtomicU64 = AtomicU64::new(0);
 /// The period of the helper's timer, in nanoseconds.
 static HELPER_PERIOD_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -2371,12 +2401,16 @@ extern "C" fn timer_helper(arg: u64) -> ! {
 /// The count of preemptions (object_info THREAD_STATE x7) and what one
 /// costs the preempted thread: a burn of init with no other thread, then
 /// the same burn with a thread above it woken by a timer PREEMPTS times.
-/// The time (x5) of the second burn is above the first by the exception
-/// entry, the handler, the wake, the decision and the way back to init,
-/// charged to init; the difference over the count is c_sw, the cost of
-/// one preemption in this setup (the preemptor is a thread of the same
+/// The time (x5) of the second burn is above the first by the save and the
+/// restore of the registers around each preemption: a thread's stint ends at
+/// the entry for the timer's interrupt and begins again at its return to EL0
+/// (spec 8), so the entry, the handler, the wake and the decision are not
+/// charged to init. The difference over the count is c_sw, the cost of one
+/// EL0 preemption in this setup (the preemptor is a thread of the same
 /// process on one CPU: no address-space switch, no SGI, likely no FP save),
-/// so a lower bound; a preemption by another process costs more. A step measured by `thread_ran` holds once per
+/// about 95 ticks, and the same whatever the preemptor is; a preemption that
+/// the thread's own call decides (the call wakes a higher thread) costs about
+/// nothing, since the stint closes and reopens in one visit. A step measured by `thread_ran` holds once per
 /// preemption. Under -icount it prints `preempt charge ticks:`; elsewhere
 /// the numbers mean little and it prints nothing. On one CPU the count must
 /// be above 0 (a burn with no preemption waits up to LATE_PREEMPT_NS for the first, which
@@ -2458,6 +2492,7 @@ fn a_preemption_is_counted_and_costed() -> Outcome {
     }
     if under_icount() && count > 0 {
         let c_sw = charged.saturating_sub(pure) / count;
+        C_SW.store(c_sw, Relaxed);
         println!(
             "preempt charge ticks: same-process one-cpu lower bound c_sw={c_sw} count={count} pure={pure} charged={charged}"
         );
@@ -2605,4 +2640,155 @@ fn process_control_checks_its_arguments() -> Outcome {
     close(weak)?;
     close(p)?;
     result
+}
+
+/// The turns of the loop of `overrun_worker`: about 12 500 ticks under -icount.
+const OVERRUN_SPINS: u32 = 6_000;
+/// The handle of the worker, and the two budgets it works under (raw values).
+static OVERRUN_HANDLES: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// Per run of the loop: the counter ticks it took, the time x5 grew by and the
+/// count x7 grew by; then 1 when the rebind failed.
+static OVERRUN_READ: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// The loop of the worker, twice: the second time under the budget of 50 us,
+/// which runs out inside the loop. Each time it reads its own time (x5), its
+/// count (x7) and the counter before and after.
+extern "C" fn overrun_worker(_: u64) -> ! {
+    let me = Handle::<Thread>::borrowed(abi::Handle(OVERRUN_HANDLES[0].load(Relaxed)));
+    for run in 0..2 {
+        if run == 1 {
+            let old = Handle::<rt::handle::Budget>::borrowed(abi::Handle(
+                OVERRUN_HANDLES[1].load(Relaxed),
+            ));
+            let new = Handle::<rt::handle::Budget>::borrowed(abi::Handle(
+                OVERRUN_HANDLES[2].load(Relaxed),
+            ));
+            if sys::thread_rebind_budget(&me, &new, &old).is_err() {
+                OVERRUN_READ[6].store(1, Relaxed);
+            }
+        }
+        let Ok((ran, preempts)) = sys::thread_ran_preempts(&me) else {
+            OVERRUN_READ[6].store(1, Relaxed);
+            break;
+        };
+        let began = time::now();
+        for i in 0..OVERRUN_SPINS {
+            core::hint::black_box(i);
+        }
+        let wall = time::now() - began;
+        let Ok((ran_after, preempts_after)) = sys::thread_ran_preempts(&me) else {
+            OVERRUN_READ[6].store(1, Relaxed);
+            break;
+        };
+        OVERRUN_READ[run * 3].store(wall, Relaxed);
+        OVERRUN_READ[run * 3 + 1].store(ran_after - ran, Relaxed);
+        OVERRUN_READ[run * 3 + 2].store(preempts_after - preempts, Relaxed);
+    }
+    sys::thread_exit()
+}
+
+/// The helper above the worker: it waits for the notification of the overrun
+/// of the worker's budget, takes it and ends.
+extern "C" fn overrun_helper(channel: u64) -> ! {
+    let _ = receive_x0_to_x11(abi::Handle(channel), 0, 0, 0);
+    HELPER_DONE.store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// The most the thread's time may grow in the episode of the overrun test,
+/// whatever the kernel: two preemptions at about 95 ticks each, with room.
+const OVERRUN_RAN_MAX: u64 = 300;
+
+/// A budget that runs out in the middle of a loop of EL0 costs the thread
+/// no time for the entries it caused (spec 8, stafeto#498). The worker, at 40
+/// with a budget and a place for its notifications, runs one loop under a
+/// budget of 1 ms for each 5 ms, and one under 50 us, which runs out inside
+/// the loop: the timer enters the kernel, the budget falls to its low level,
+/// the event posts the overrun to the helper at 50, which runs and waits, and
+/// the worker goes on. The time of the second loop is above the first by at
+/// most `OVERRUN_RAN_MAX` (a fixed bound: the saves and restores of the
+/// registers), the wall time by at least 1 000 ticks (the episode took place),
+/// the overrun count of the second budget is 1 and x7 grew by 1, and the
+/// time grew by no more than an eighth of the wall time. Under -icount
+/// on one CPU; elsewhere the numbers mean little and the test checks only that
+/// the calls work. Prints `overrun charge ticks:` under -icount.
+fn a_budget_overrun_adds_no_entry_time_to_the_thread() -> Outcome {
+    reset_marks();
+    HELPER_DONE.store(0, Relaxed);
+    for m in &OVERRUN_READ {
+        m.store(0, Relaxed);
+    }
+    let c = channel(QUIET)?;
+    let notice = copy(&c, Rights::NOTIFY)?;
+    let first = sys::budget_create_with_notice(&resource(), 0, 1_000_000, 5_000_000, 32, &notice)
+        .map_err(|_| "budget_create failed")?;
+    let second = sys::budget_create_with_notice(&resource(), 0, 50_000, 5_000_000, 32, &notice)
+        .map_err(|_| "budget_create failed")?;
+    let helper = spawn(1, overrun_helper, c.raw().0, 50, Policy::Fifo)?;
+    let worker = thread(0, overrun_worker, 0, 40, Policy::Fifo)?;
+    OVERRUN_HANDLES[0].store(worker.raw().0, Relaxed);
+    OVERRUN_HANDLES[1].store(first.raw().0, Relaxed);
+    OVERRUN_HANDLES[2].store(second.raw().0, Relaxed);
+    sys::thread_bind_budget(&worker, &first).map_err(|_| "thread_bind_budget failed")?;
+    // The worker runs at once, above init, and ends.
+    sys::thread_start(&worker).map_err(|_| "thread_start failed")?;
+    let overruns = sys::budget_info(&second).map(|i| i.overruns);
+    let overruns_first = sys::budget_info(&first).map(|i| i.overruns);
+    // Whatever happened, the helper ends.
+    if HELPER_DONE.load(Relaxed) == 0 {
+        sys::notify(&notice, 1).map_err(|_| "notify failed")?;
+        let_run()?;
+    }
+    close(helper)?;
+    close(worker)?;
+    close(first)?;
+    close(second)?;
+    close(notice)?;
+    close(c)?;
+    check(
+        OVERRUN_READ[6].load(Relaxed) == 0,
+        "the worker could not rebind its budget or read its time",
+    )?;
+    let read = |i: usize| OVERRUN_READ[i].load(Relaxed);
+    let (wall1, ran1, p1, wall2, ran2, p2) = (read(0), read(1), read(2), read(3), read(4), read(5));
+    check(ran1 > 0 && ran2 > 0, "the worker's loops took no time")?;
+    if !under_icount() || sys::cpu_info(0).map_err(|_| "CPU info failed")?.cpus != 1 {
+        return Ok(());
+    }
+    let wall = wall2.saturating_sub(wall1);
+    let ran = ran2.saturating_sub(ran1);
+    let preempts = p2.wrapping_sub(p1);
+    println!("overrun charge ticks: wall={wall} ran={ran} preempts={preempts}");
+    check(
+        overruns == Ok(1) && overruns_first == Ok(0),
+        "the second budget did not run out exactly once, or the first did",
+    )?;
+    check(
+        wall >= 1_000,
+        "the loop with the overrun was not longer on the wall",
+    )?;
+    check(
+        p1 == 0 && preempts == 1,
+        "the overrun was not counted as one preemption",
+    )?;
+    // The bound is fixed and holds for any kernel under test: the episode
+    // holds one preemption, by the budget's end, at about the registers'
+    // save and restore (95 ticks under -icount), and the entries of the
+    // kernel are the system's. A kernel that charges them takes the episode
+    // well above this bound.
+    check(
+        C_SW.load(Relaxed) > 0,
+        "the preemption test measured no cost of a preemption before the overrun test",
+    )?;
+    check(
+        ran <= OVERRUN_RAN_MAX,
+        "the entries of the overrun were charged to the thread",
+    )?;
+    // The share of the thread's time in the episode is at most an eighth of
+    // the episode's wall time, which the registers' save and restore take
+    // and the entries of the kernel do not.
+    check(
+        ran <= wall / 8,
+        "more than an eighth of the overrun's time was charged to the thread",
+    )
 }

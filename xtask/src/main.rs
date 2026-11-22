@@ -1563,7 +1563,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 276;
+const INIT_TESTS: u32 = 277;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1789,6 +1789,10 @@ enum Variant {
     /// (`BudgetOverrunSilentTest`), the test of the place.
     BudgetOverrunSilent,
     BudgetOverrunSilentTest,
+    /// A stint that begins at the decision and runs through the entries for
+    /// interrupts (`break-stint-visit`): the test init's overrun test must
+    /// catch it (`budget-breaks`).
+    StintVisitBreak,
     /// An unbind that leaves the thread at the level its budget gave it
     /// (`break-budget-unbind-keeps`): the kernel tests of the unbind must
     /// catch it.
@@ -1847,7 +1851,7 @@ enum Variant {
 }
 
 impl Variant {
-    const ALL: [Variant; 80] = [
+    const ALL: [Variant; 81] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1910,6 +1914,7 @@ impl Variant {
         Variant::ReplyReceiveSplitTest,
         Variant::BudgetOverrunSilent,
         Variant::BudgetOverrunSilentTest,
+        Variant::StintVisitBreak,
         Variant::BudgetUnbindKeepsTest,
         Variant::NoticeHolderKeepsTest,
         Variant::ReplyReceiveCopyTest,
@@ -1998,6 +2003,7 @@ impl Variant {
             Variant::ReplyReceiveSplitTest => Some("ktest,break-reply-receive-split"),
             Variant::BudgetOverrunSilent => Some("break-budget-overrun-silent"),
             Variant::BudgetOverrunSilentTest => Some("ktest,break-budget-overrun-silent"),
+            Variant::StintVisitBreak => Some("break-stint-visit"),
             Variant::BudgetUnbindKeepsTest => Some("ktest,break-budget-unbind-keeps"),
             Variant::NoticeHolderKeepsTest => Some("ktest,break-notice-holder-keeps"),
             Variant::ReplyReceiveCopyTest => Some("ktest,break-reply-receive-copy"),
@@ -2104,6 +2110,7 @@ impl Variant {
             Variant::ReplyReceiveSplitTest => "stafeto-ktest-reply-receive-split",
             Variant::BudgetOverrunSilent => "stafeto-budget-overrun-silent",
             Variant::BudgetOverrunSilentTest => "stafeto-ktest-budget-overrun-silent",
+            Variant::StintVisitBreak => "stafeto-stint-visit-break",
             Variant::BudgetUnbindKeepsTest => "stafeto-ktest-budget-unbind-keeps",
             Variant::NoticeHolderKeepsTest => "stafeto-ktest-notice-holder-keeps",
             Variant::ReplyReceiveCopyTest => "stafeto-ktest-reply-receive-copy",
@@ -2650,6 +2657,9 @@ fn main() {
         Some("budget-hog") => budget_hog::run(&args[1..]),
         Some("service-budget") => service_budget::run(&args[1..]),
         Some("budget-breaks") => budget_hog::breaks(),
+        Some("stint-visit-break") => {
+            budget_hog::stint_visit_host_break().and_then(|()| budget_hog::stint_visit_break())
+        }
         Some("budget-break-unbound") => budget_hog::unbound_break(),
         Some("budget-journal") => budget_journal::run(&args[1..]),
         Some("log-quiet") => log_quiet::run(&args[1..]),
@@ -6033,6 +6043,7 @@ fn watch_bound(kind: usize) -> u64 {
 fn check_watch_steps(lines: &[String]) -> Result<(), String> {
     for (tag, methods) in [("4", [14, 15, 16]), ("5", [25, 26, 27])] {
         check_waits(lines, &[tag], "watch steps")?;
+        step_line::say_ran_and_wall(lines, tag);
         let steps = longest_steps(lines, tag);
         step_line::within_b(lines, tag, step_line::Kinds::All)?;
         for &(kind, ticks, _) in &steps {
@@ -7564,6 +7575,10 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// changed it, so the store is on every pass, whatever the switches); 275 measured, 4 over, a load of
 /// the thread's level, the store, and the test of a switch with the store of the stint start.
 /// The change is of the path, so the reviewer of the kernel decides whether it stays.
+/// `NULL_MAX` 275 -> 277 (the stint of a thread begins at its return to EL0, stafeto#498): every
+/// pass of `thread::run` reads the tag that says the stint waits for EL0 (one load, one test of a
+/// bit); the paths that start a stint call out of line. 277 measured, 2 over, which are those two
+/// instructions. The change is of the path, so the reviewer of the kernel decides whether it stays.
 ///
 /// Rules for a guard that fires (the paths are deterministic under -icount,
 /// so a firing is no noise and a repeat does not clear it):
@@ -7584,7 +7599,7 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 ///    room the guard keeps (4, and 16 for S5; it does not fail), and
 ///    the next commit lowers the constant, so that a shorter path does not
 ///    turn into room for later growth.
-const NULL_MAX: u64 = 275;
+const NULL_MAX: u64 = 277;
 /// The longest hold of the lock OBJ (kernel/src/obj.rs) in instructions
 /// under -icount, over every kernel test and EL0 test of both images: the
 /// term of each other CPU's wait for it (B_N = B + (N-1) * OBJ_HOLD_MAX +
@@ -8227,6 +8242,12 @@ fn check_waits_by(
 ) -> Result<(), String> {
     if let Some(line) = lines.iter().find(|l| l.starts_with("service wait cut:")) {
         return Err(format!("{who}: the accounting of a wait was cut: {line}"));
+    }
+    if let Some(line) = lines
+        .iter()
+        .find(|l| l.starts_with("service step cpu lost:"))
+    {
+        return Err(format!("{who}: the CPU time of a step was lost: {line}"));
     }
     for tag in tags {
         for (kind, wait, whole) in longest_waits(lines, tag) {
@@ -15901,6 +15922,9 @@ mod tests {
         assert!(check_waits(&call(CALL_WAIT_MAX + 1), &["10"], "t").is_err());
         let cut = vec!["service wait cut: 2 kind 25 9000 ticks of 8000".to_owned()];
         assert!(check_waits(&cut, &["5"], "t").is_err());
+        let lost = vec!["service step cpu lost: 4 kind 14".to_owned()];
+        assert!(check_waits(&lost, &["4"], "t").is_err());
+        assert!(check_waits(&lost, &["10"], "t").is_err());
         let ok = vec![format!(
             "service wait: 10 kind 25 {CALL_WAIT_MAX} ticks of 600000"
         )];

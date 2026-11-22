@@ -50,6 +50,7 @@ fn measured_line(line: &str) -> bool {
         "call maximum ticks:",
         "fp switch ticks:",
         "preempt charge ticks:",
+        "overrun charge ticks:",
         "upcall ticks:",
         "obj hold ticks:",
     ]
