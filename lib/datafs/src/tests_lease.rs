@@ -1030,3 +1030,64 @@ fn a_session_that_ran_a_new_image_loses_its_leases_and_its_window() {
     assert!(!fx.rig.server.has_window(B));
     assert_eq!(fx.rig.server.open_count(), before - 1);
 }
+
+#[test]
+fn the_wake_up_of_the_worker_is_never_in_the_past_when_no_job_waits_for_the_file() {
+    let mut fx = fixture();
+    let lease = fx.write_lease(A, fx.ha);
+    // Six gaps of 0.3 s: the client time of the lease is 1.8 s, over the bound, with nobody waiting.
+    let mut t = 0;
+    for _ in 0..6 {
+        t += 300_000_000;
+        fx.at(t);
+        fx.part(A, Method::PwriteFrom, fx.ha, 10, lease, true)
+            .unwrap();
+        fx.sweep(t, &[]);
+        assert_eq!(fx.rig.server.lease_count(), 1);
+        // The wake-up is the gap after the answer, ahead of now: no timer that fires at once.
+        assert_eq!(fx.rig.server.next_lease_expiry(), Some(t + LEASE_GAP_NS));
+    }
+    // A sweep a little later, still with nobody waiting: the same instant, and in the future.
+    fx.sweep(t + 100, &[]);
+    let at = fx.rig.server.next_lease_expiry().unwrap();
+    assert_eq!(at, t + LEASE_GAP_NS);
+    assert!(at > t + 100);
+    // A job that waits for the file brings the wake-up forward to the bound, which is still ahead
+    // of now at that sweep, and the lease lapses when the bound is passed.
+    let waiter = read_job(fx.hb);
+    let queued = [Candidate {
+        id: 0,
+        ticket: 1,
+        owner: B,
+        queued_at: t,
+        request: &waiter,
+    }];
+    fx.sweep(t + 100, &queued);
+    assert_eq!(
+        fx.rig.server.lease_count(),
+        0,
+        "over the bound with a waiter"
+    );
+}
+
+#[test]
+fn with_a_waiter_the_wake_up_is_when_the_client_time_reaches_the_bound() {
+    let mut fx = fixture();
+    let lease = fx.write_lease(A, fx.ha);
+    fx.at(400_000_000);
+    fx.part(A, Method::PwriteFrom, fx.ha, 10, lease, true)
+        .unwrap();
+    let waiter = read_job(fx.hb);
+    let queued = [Candidate {
+        id: 0,
+        ticket: 1,
+        owner: B,
+        queued_at: 400_000_000,
+        request: &waiter,
+    }];
+    fx.sweep(400_000_000, &queued);
+    // 0.4 s of client time so far: 0.6 s left, sooner than the gap of 1 s.
+    let at = fx.rig.server.next_lease_expiry().unwrap();
+    assert_eq!(at, 400_000_000 + 600_000_000 + 1);
+    assert!(at < 400_000_000 + LEASE_GAP_NS + 1);
+}

@@ -79,6 +79,10 @@ pub(super) struct Lease {
     /// of the lease so far: the sum of the gaps from an answer to the arrival of the next part.
     pub(super) answered: u64,
     pub(super) client: u64,
+    /// The instant the worker wakes to look at the lease again: the gap after the answer, and, while
+    /// jobs of the file wait, the earlier instant the client time reaches its bound. Set by the sweep
+    /// from the jobs it looked at, so that the timer never fires for a lapse that cannot come.
+    pub(super) expiry: u64,
 }
 
 impl Lease {
@@ -94,6 +98,7 @@ impl Lease {
         stamp: false,
         answered: 0,
         client: 0,
+        expiry: 0,
     };
 }
 
@@ -207,6 +212,7 @@ impl Server {
             stamp: true,
             answered: self.mono,
             client: 0,
+            expiry: self.mono.saturating_add(LEASE_GAP_NS),
         };
         self.descriptions[di].refs += 1;
         Some(self.lease_number(slot))
@@ -238,6 +244,7 @@ impl Server {
         for l in self.leases.iter_mut().filter(|l| l.used && l.stamp) {
             l.stamp = false;
             l.answered = now;
+            l.expiry = now.saturating_add(LEASE_GAP_NS);
         }
     }
 
@@ -304,6 +311,18 @@ impl Server {
             let gap = to.saturating_sub(l.answered);
             let lapsed = gap >= LEASE_GAP_NS
                 || (waiting && l.client.saturating_add(gap) > LEASE_CLIENT_MAX_NS);
+            if !lapsed {
+                // When to look again: the gap, and with a waiter the sooner instant its client time
+                // reaches the bound. With no waiter the bound does not apply, so the instant is never
+                // in the past and the timer does not fire for nothing.
+                let left = LEASE_CLIENT_MAX_NS.saturating_sub(l.client);
+                let step = if waiting {
+                    LEASE_GAP_NS.min(left + 1)
+                } else {
+                    LEASE_GAP_NS
+                };
+                self.leases[slot].expiry = l.answered.saturating_add(step);
+            }
             if lapsed {
                 if l.sync && l.write {
                     let _ = self.sync_node(fs, usize::from(l.node));
@@ -313,16 +332,13 @@ impl Server {
         }
     }
 
-    /// The instant the first lease may lapse, None when no lease is held: the worker wakes then and
-    /// the sweep decides (it is early when no job waits for the file).
+    /// The instant the worker wakes to look at the leases again, None when none is held: the first
+    /// `expiry` the last sweep set (a lease taken or renewed since has the gap after its answer).
     pub fn next_lease_expiry(&self) -> Option<u64> {
         self.leases
             .iter()
-            .filter(|l| l.used && !l.stamp)
-            .map(|l| {
-                let left = LEASE_CLIENT_MAX_NS.saturating_sub(l.client);
-                l.answered.saturating_add(LEASE_GAP_NS.min(left))
-            })
+            .filter(|l| l.used)
+            .map(|l| l.expiry)
             .min()
     }
 
