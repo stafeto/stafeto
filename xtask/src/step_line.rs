@@ -17,21 +17,32 @@
 //! - 0.9 B: the greatest by kind of `N - P * PREEMPT_CHARGE` (`judged`, `longest`) at most 0.9 B,
 //!   which the callers check. A warning names the raw time when it is above the bound.
 
-/// The ticks one preemption adds to the time of the preempted thread, at the least: the lower
-/// bound the kernel test measures for a switch inside one process (the `preempt charge ticks`
-/// row). A lower bound cannot hide step work: a step that took N with P preemptions did at least
+/// The ticks one preemption adds to the time of the preempted thread, at the least. A preemption
+/// decided inside the thread's own call (the call wakes a thread of a higher level, or the cleanup
+/// queue is at or above its level, and `pick` takes the thread off the CPU) closes the stint at
+/// the top of `exit_loop` and reopens it at the `now` of `thread::run`, so it costs the thread
+/// about nothing: the bound is 0. The 95 ticks that the `preempt charge ticks` row of the kernel
+/// test measures are the cost of an EL0 timer preemption alone (the registers' save and restore).
+/// A lower bound cannot hide step work: a step that took N with P preemptions did at least
 /// `N - P * c` ticks of its own for any true charge c at or above the bound, so judging by that
-/// value never passes a step that a true charge would fail. It judges the bound B.
-pub const PREEMPT_CHARGE_MIN: u64 = 95;
+/// value never passes a step that a true charge would fail. It judges the bound B. The residual
+/// of the bound 0 is at most P times the path from the top of `exit_loop` to the `now` of
+/// `thread::run`, a fraction of `NULL_MAX`.
+pub const PREEMPT_CHARGE_MIN: u64 = 0;
 
 /// The cost of a preemption of the worst kind seen (a preemptor of another process), for the
 /// target 0.9 B. The stint of a thread begins at its return to EL0, so the entries for interrupts,
-/// the budget events and the SIMD switches are outside the time a step is measured by. The
-/// `preempt charge ticks` row of the kernel test fell from 487 to 95 with that change, a drop of
-/// 392 ticks in every preemption, and the worst step seen before it left 1 261 ticks in a step of
-/// the RAM file service on 19 November: 869 ticks now, with the margin of that figure (3 per
-/// cent, rounded up to the hundred) 900. A c that is too small can only eat the margin between
-/// 0.9 B and B, since `over_bound` holds B by the lower bound.
+/// the budget events and the SIMD switches are outside the time a step is measured by. In
+/// `thread::run` the save and load of the FP state (thread.rs) and the switch of TTBR0 and the
+/// setup of the upcall happen before `now` is read, and the budget event runs between the entry
+/// and the reopening of the stint, so an EL0 preemption costs about 95 ticks under -icount
+/// whatever the preemptor is: the registers' save and restore. The `preempt charge ticks` row of
+/// the kernel test fell from 487 to 95 with that change, a drop of 392 ticks in every preemption,
+/// and the worst step seen before it left 1 261 ticks in a step of the RAM file service on 19
+/// November: 869 ticks now, with the margin of that figure (3 per cent, rounded up to the
+/// hundred) 900. The 900 stays for now; a follow-up lowers it after a probe run. A c that is too
+/// small can only eat the margin between 0.9 B and B, since `over_bound` holds B by the lower
+/// bound.
 pub const PREEMPT_CHARGE: u64 = 900;
 
 /// A line of a step, read.
@@ -543,10 +554,10 @@ mod tests {
         assert_eq!(verdict(18_807, 3), (true, true));
         // No preemption: 19 000 fails 0.9 B.
         assert_eq!(verdict(19_000, 0), (true, false));
-        // 21 000 with one preemption is 20 905 of work at least: fails B.
+        // 21 000 with one preemption is 21 000 of work at least (the least charge is 0): fails B.
         assert_eq!(verdict(21_000, 1), (false, false));
-        // 20 500 with one preemption passes B (20 405) and fails 0.9 B (19 600).
-        assert_eq!(verdict(20_500, 1), (true, false));
+        // 20 400 with one preemption passes B (20 400 of work at least) and fails 0.9 B (19 500).
+        assert_eq!(verdict(20_400, 1), (true, false));
     }
 
     #[test]
@@ -557,7 +568,7 @@ mod tests {
             said.contains("kind 33") && said.contains("raw 21000") && said.contains("preempts 1")
         );
         assert!(said.contains("= 20100 against 0.9 B 18369"), "{said}");
-        assert!(said.contains("= 20905 against B 20410"), "{said}");
+        assert!(said.contains("= 21000 against B 20410"), "{said}");
         // Another service's lines are not read.
         assert!(over_bound(&rows, "4", 20_410, Kinds::All).is_none());
         // The probes call it for the kinds they judge: an exempt kind is not checked.
@@ -584,7 +595,10 @@ mod tests {
         // The pair of 8 and more is judged with 8 preemptions, whatever the count of the line.
         let many = lines(&["service step: 17 kind 65 20000 ticks detail 0 preempts 12"]);
         assert_eq!(longest(&many, "17"), vec![(65, 20_000 - 8 * 900, 0)]);
-        assert_eq!(parse(&many[0]).unwrap().least(), 20_000 - 8 * 95);
+        assert_eq!(
+            parse(&many[0]).unwrap().least(),
+            20_000 - 8 * PREEMPT_CHARGE_MIN
+        );
     }
 
     #[test]
