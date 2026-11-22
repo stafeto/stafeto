@@ -618,12 +618,27 @@ pub fn package_files(packages: &[crate::packages::Package]) -> Result<Vec<RootFi
 /// How many names of /bin beyond `ash`, `sh` and `busybox` are links to
 /// BusyBox in the shell image: the utilities of the packages that BusyBox
 /// carries.
+#[cfg(test)]
 pub fn utilities() -> usize {
     files_of("boot-ash-dialog.img")
         .iter()
         .filter(|f| f.source == Some(Source::Link("busybox")))
         .count()
         - 2
+}
+
+/// How many names `ls /bin` shows in the shell image of the dialogs: every file and link of the
+/// image directly under /bin (the set-user-ID programs and the links to BusyBox among them).
+pub fn bin_entries() -> usize {
+    files_of("boot-ash-dialog.img")
+        .iter()
+        .filter(|f| {
+            f.source.is_some()
+                && f.path
+                    .strip_prefix("/bin/")
+                    .is_some_and(|rest| !rest.contains('/'))
+        })
+        .count()
 }
 
 /// The shell's image: the base system (the RAM service, its directories and
@@ -3036,6 +3051,21 @@ mod tests {
         assert_eq!(service.mode, rootfs::REGULAR | 0o4750);
         assert_eq!((service.uid, service.gid), USER);
         assert!(find("/bin").is_directory());
+    }
+
+    /// The count of /bin the dialogs wait for is the entries of the image list; the names that
+    /// are no link to BusyBox are 8 programs (busybox, bash, htop, nano, ncdu, su, passwd and
+    /// doas) and the names ash and sh, which `utilities` leaves out.
+    #[test]
+    fn the_count_of_bin_follows_the_list_of_the_shell_image() {
+        assert_eq!(bin_entries(), utilities() + 10);
+        let files = files_of("boot-ash-dialog.img");
+        for name in ["su", "passwd", "doas"] {
+            assert!(
+                files.iter().any(|f| f.path == format!("/bin/{name}")),
+                "{name}"
+            );
+        }
     }
 
     #[test]

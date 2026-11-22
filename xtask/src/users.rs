@@ -11,7 +11,7 @@
 //!    /etc/busybox.conf; /etc/doas.conf is 0400 root with the one rule.
 //! 2. `doas`: `user` (a member of `wheel`) runs `id` as root, and as `nobody`; `nobody`
 //!    (not a member) is refused; no password is asked for.
-//! 3. The console: mode 0600 root, refused to `user`, and the `ash-getty` name of the shell's
+//! 3. The console: mode 0620 root, refused to `user`, and the `ash-getty` name of the shell's
 //!    BusyBox as `user` ends with 126.
 //! 4. `su` and `passwd`, the set-user-ID BusyBox: `user` runs `id` and an ordinary program
 //!    after them with its own identifiers; `su root` by `user` without a password is refused;
@@ -144,7 +144,7 @@ fn console(run: &mut qemu::Run) -> Result<(), String> {
         run,
         "console mode",
         "ls -ln /dev/console",
-        &["crw-------", " 0        0 "],
+        &["crw--w----", " 0        0 "],
         &["No such file"],
     )?;
     check(

@@ -9888,7 +9888,7 @@ fn ash_dialog() -> Result<(), String> {
         link("wc"),
     ];
     // The entries of /bin: the table of the image lists them (rootfs.rs).
-    let bin_count = (bin_listing.len() + rootfs::utilities() - 8).to_string();
+    let bin_count = rootfs::bin_entries().to_string();
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
