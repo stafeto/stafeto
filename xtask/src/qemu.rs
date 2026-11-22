@@ -1832,10 +1832,11 @@ pub fn unglued(lines: &[String], marker: &str) -> Vec<String> {
 /// The starts of the lines that a service or init prints on its own while another program's
 /// long line goes out in several writes from another CPU: the timing lines of lib/rt
 /// (`service step:`, `service table:`, `service heartbeat:`, `service wait:`, `service wait cut:`,
-/// `service gap:`, `service preempt:`, `service beats:`), the lines of the compositor's bands
+/// `service step cpu lost:`, `service gap:`, `service preempt:`, `service beats:`), the lines of the compositor's bands
 /// (`service band`), the audit and profile lines of ramfs, and the lines of init.
-const INTRUDERS: [&str; 12] = [
+const INTRUDERS: [&str; 13] = [
     "service step: ",
+    "service step cpu lost: ",
     "service table: ",
     "service heartbeat: ",
     "service wait: ",
@@ -1936,6 +1937,7 @@ mod tests {
             "service heartbeat: send failed with Busy (period 250000000 ns, priority 50)",
             "service wait: 10 kind 64 29846 ticks of 31452",
             "service wait cut: 10 kind 64 2 ticks of 31452",
+            "service step cpu lost: 10 kind 64",
             "service gap: 10 kind 64 3 ticks of 31452",
             "service preempt: 10 kind 64 4 ticks of 31452",
             "service beats: 10 12",

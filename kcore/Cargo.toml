@@ -78,6 +78,9 @@ break-budget-forgive-loan = []
 # A full queue carries the remnant into the future (issue 744).
 break-budget-full-queue-delay = []
 break-budget-overrun-silent = []
+# The stint of a thread begins at the decision that chose it and goes through
+# the entries for interrupts, as it did before stafeto#498 (spec 8).
+break-stint-visit = []
 break-budget-unbind-keeps = []
 break-budget-unbind-no-charge = []
 break-budget-unbind-keeps-event = []

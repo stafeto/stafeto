@@ -1331,18 +1331,20 @@ pub fn run(next: NonNull<Thread>) -> ! {
             user::load_fp(&next.as_ref().fp);
         }
         process.as_mut().activate();
-        let thread = &mut *next.as_ptr();
-        // Neither the look nor the entry takes `OBJ`: the thread runs on
-        // this CPU alone, so the state of its entry is this CPU's own
-        // (syscall::upcall).
-        if thread.upcall.is_pending()
-            && let Some((entry, sp)) = prepare_entry(thread)
         {
-            thread.regs.elr = entry;
-            thread.regs.sp = sp;
-            // The dispatcher starts a new control flow and leaves the
-            // interrupted indirect branch unfinished. Return restores the old BTYPE.
-            thread.regs.spsr &= !kcore::upcall::BRANCH_TYPE;
+            let thread = &mut *next.as_ptr();
+            // Neither the look nor the entry takes `OBJ`: the thread runs on
+            // this CPU alone, so the state of its entry is this CPU's own
+            // (syscall::upcall).
+            if thread.upcall.is_pending()
+                && let Some((entry, sp)) = prepare_entry(thread)
+            {
+                thread.regs.elr = entry;
+                thread.regs.sp = sp;
+                // The dispatcher starts a new control flow and leaves the
+                // interrupted indirect branch unfinished. Return restores the old BTYPE.
+                thread.regs.spsr &= !kcore::upcall::BRANCH_TYPE;
+            }
         }
         // The stretch of the thread at EL0 starts here, and the next entry
         // from EL0 ends it (`user_ran`): the way out of the kernel up to
@@ -1350,6 +1352,13 @@ pub fn run(next: NonNull<Thread>) -> ! {
         let now = crate::arch::timer::now_unordered();
         #[cfg(feature = "measure")]
         crate::obj::stretch_ends(now);
+        // A stint that waited for this begins here (spec 8). No reference
+        // to the thread is alive across the call: the scheduler takes its
+        // node through the pointer.
+        if next.as_ref().sched.stint_pending() {
+            sched::stint_starts(next, now);
+        }
+        let thread = &mut *next.as_ptr();
         // For object_info THREAD_PLACE: the level at EL0 on every pass, the stint's start at a
         // change of thread or after the idle loop.
         crate::local::local()
