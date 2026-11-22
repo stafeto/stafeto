@@ -310,6 +310,7 @@ pub(crate) fn reset_taken_before_live(id: u64) {
         repeats.store(0, Ordering::Relaxed);
     }
     crate::altstack::reset(id);
+    crate::handlers::reset(id);
 }
 
 fn clear_taken(row: &[Taken; 64]) {
@@ -2311,7 +2312,11 @@ unsafe fn deliver_signal(
                     unsafe { upcall::enable() }.expect("nested signal entry");
                 }
                 marks::mark(4);
+                let noted = crate::handlers::enter();
                 unsafe { callback(signal, &raw mut info, (&raw mut context).cast()) };
+                if noted {
+                    crate::handlers::leave();
+                }
                 marks::report();
                 if entered {
                     upcall::mask().expect("signal handler mask restoration");
@@ -2336,7 +2341,11 @@ unsafe fn deliver_signal(
                     unsafe { upcall::enable() }.expect("nested signal entry");
                 }
                 marks::mark(4);
+                let noted = crate::handlers::enter();
                 unsafe { callback(signal) };
+                if noted {
+                    crate::handlers::leave();
+                }
                 marks::report();
                 if entered {
                     upcall::mask().expect("signal handler mask restoration");

@@ -478,6 +478,351 @@ impl Splitter {
     }
 }
 
+/// What a call of one part in a cell or one `INLINE` message needs to know of the next part of a
+/// call that goes in parts (READ_INTO, PREAD_INTO, WRITE_FROM, PWRITE_FROM with the leases of
+/// `proto_data`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartPlan {
+    /// Where the part starts in the call's bytes.
+    pub at: usize,
+    /// The bytes of the part.
+    pub len: usize,
+    /// More parts of the call follow this one (`MORE`).
+    pub more: bool,
+    /// The lease number the part carries: 0 on the first part, which asks for a lease, and on a
+    /// part after one that was `UNLEASED`.
+    pub lease: u32,
+}
+
+impl PartPlan {
+    /// The `flags` field of the request.
+    pub const fn flags(&self) -> u32 {
+        if self.more { p::MORE } else { 0 }
+    }
+}
+
+/// The reply to a part as the layer holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartAnswer {
+    pub count: u32,
+    pub flags: u32,
+    pub lease: u32,
+}
+
+/// What a part's reply leaves to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// The next part goes.
+    Next,
+    /// The call is over: all went, a part came back short (the end of the file, a limit), or the
+    /// lease lapsed. `Parts::finish` gives the result.
+    Done,
+    /// The reply broke the protocol (more bytes than the part had, `LAPSED` with bytes). The call
+    /// is over and a lease that may be live is the caller's to RELEASE (`Parts::live_lease`).
+    Bad,
+}
+
+/// The state of a call of more than one message, which goes in parts of at most `max` bytes: the
+/// bytes done, the lease the next part carries and what the replies said. It decides the parts, the
+/// result (the sum; an error after some parts is that sum, the error alone when none went), and
+/// the numbers the probes count. A read and a write go the same way: a part that comes back with
+/// fewer bytes than it had ends the call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Parts {
+    total: usize,
+    done: usize,
+    max: usize,
+    lease: u32,
+    lapsed: bool,
+    unleased: u32,
+}
+
+impl Parts {
+    pub const fn new(total: usize, max: usize) -> Parts {
+        Parts {
+            total,
+            done: 0,
+            max,
+            lease: 0,
+            lapsed: false,
+            unleased: 0,
+        }
+    }
+
+    /// The next part, None when the call is over. A call of no bytes sends none.
+    pub fn next_part(&self) -> Option<PartPlan> {
+        if self.lapsed {
+            return None;
+        }
+        let left = self.total - self.done;
+        if left == 0 {
+            return None;
+        }
+        let len = left.min(self.max);
+        Some(PartPlan {
+            at: self.done,
+            len,
+            more: left > len,
+            lease: self.lease,
+        })
+    }
+
+    /// The bytes one part carries from now on: the call goes on by messages after its cell failed.
+    /// The parts already done stay done.
+    pub fn set_max(&mut self, max: usize) {
+        self.max = max;
+    }
+
+    /// The reply to the part `plan`.
+    pub fn took(&mut self, plan: &PartPlan, answer: PartAnswer) -> Step {
+        if answer.flags & p::LAPSED != 0 {
+            // The lease ended before the part: the part did not run, and the call is as short as
+            // the parts before it.
+            if answer.count != 0 {
+                self.lease = 0;
+                return Step::Bad;
+            }
+            self.lapsed = true;
+            self.lease = 0;
+            return Step::Done;
+        }
+        let count = answer.count as usize;
+        if count > plan.len {
+            // The lease this part may hold is released by the caller.
+            self.lease = if answer.lease != 0 {
+                answer.lease
+            } else {
+                plan.lease
+            };
+            return Step::Bad;
+        }
+        self.done += count;
+        if answer.flags & p::UNLEASED != 0 {
+            self.unleased += 1;
+        }
+        // A lease goes on only after a part that left more to come and filled its bytes; a part
+        // that fell short ended it in the service.
+        self.lease = if plan.more && count == plan.len {
+            answer.lease
+        } else {
+            0
+        };
+        if count < plan.len || self.done == self.total {
+            Step::Done
+        } else {
+            Step::Next
+        }
+    }
+
+    /// The lease a call that broke off by its own fault (`Step::Bad`) may still hold in the
+    /// service, to RELEASE; None when there is none.
+    pub const fn live_lease(&self) -> Option<u32> {
+        if self.lease != 0 {
+            Some(self.lease)
+        } else {
+            None
+        }
+    }
+
+    /// The lease the next part carries, for the hook that gives a lease back at a jump.
+    pub const fn lease(&self) -> u32 {
+        self.lease
+    }
+
+    /// Whether a reply said `LAPSED`: the call is short because its lease ran out.
+    pub const fn lapsed(&self) -> bool {
+        self.lapsed
+    }
+
+    /// How many replies said `UNLEASED`.
+    pub const fn unleased(&self) -> u32 {
+        self.unleased
+    }
+
+    /// The bytes done.
+    pub const fn done(&self) -> usize {
+        self.done
+    }
+
+    /// The result of a call that ended without an error of its own.
+    pub const fn finish(&self) -> usize {
+        self.done
+    }
+
+    /// The result when a part failed with `error` (what the parts before it did is the sum).
+    pub fn failed(&self, error: i32) -> Result<usize, i32> {
+        if self.done > 0 {
+            Ok(self.done)
+        } else {
+            Err(error)
+        }
+    }
+}
+
+/// The value of a record that holds no cell.
+pub const NO_CELL: u32 = u32::MAX;
+
+/// The cells of a window and the record each call under way keeps of the cell it holds. A cell is
+/// free (a bit) or held by one record (`SLOTS` records); a record that holds a cell is what
+/// gives it back, by one atomic swap that clears the record first and then sets the bit, so
+/// that a call that ends and a jump that abandons it (or a thread's exit) cannot both give the
+/// same cell back: the second finds the record empty.
+pub struct CellBook<const SLOTS: usize> {
+    free: core::sync::atomic::AtomicU8,
+    held: [core::sync::atomic::AtomicU32; SLOTS],
+}
+
+impl<const SLOTS: usize> CellBook<SLOTS> {
+    pub const fn new() -> Self {
+        CellBook {
+            free: core::sync::atomic::AtomicU8::new(0),
+            held: [const { core::sync::atomic::AtomicU32::new(NO_CELL) }; SLOTS],
+        }
+    }
+
+    /// The first `cells` cells are free, no record holds one (the window was made, or a forked
+    /// child starts with none: `cells` 0).
+    pub fn reset(&self, cells: usize) {
+        use core::sync::atomic::Ordering::Release;
+        for record in &self.held {
+            record.store(NO_CELL, Release);
+        }
+        self.free.store(((1u16 << cells) - 1) as u8, Release);
+    }
+
+    /// A free cell for the record `slot`, which then holds it. None when every cell is taken.
+    pub fn take(&self, slot: usize) -> Option<u32> {
+        use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        let mut free = self.free.load(Acquire);
+        loop {
+            if free == 0 {
+                return None;
+            }
+            let index = free.trailing_zeros();
+            match self
+                .free
+                .compare_exchange_weak(free, free & !(1 << index), AcqRel, Acquire)
+            {
+                Ok(_) => {
+                    self.held[slot].store(index, Release);
+                    return Some(index);
+                }
+                Err(now) => free = now,
+            }
+        }
+    }
+
+    /// The record `slot` gives its cell back: whether it held one.
+    pub fn release(&self, slot: usize) -> bool {
+        use core::sync::atomic::Ordering::AcqRel;
+        let cell = self.held[slot].swap(NO_CELL, AcqRel);
+        if cell == NO_CELL {
+            return false;
+        }
+        self.free.fetch_or(1 << cell, AcqRel);
+        true
+    }
+
+    /// The cell the record holds, if any.
+    pub fn held(&self, slot: usize) -> Option<u32> {
+        let cell = self.held[slot].load(core::sync::atomic::Ordering::Acquire);
+        (cell != NO_CELL).then_some(cell)
+    }
+
+    /// The free cells, a bit each.
+    pub fn free_mask(&self) -> u8 {
+        self.free.load(core::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl<const SLOTS: usize> Default for CellBook<SLOTS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Whether a call of `total` bytes fits in one message of the old methods: `max` is the bytes of
+/// one message of the method (`WRITE_MAX`, `PWRITE_MAX`, `proto_data::MAX_READ`).
+pub const fn fits_one_message(total: usize, max: usize) -> bool {
+    total <= max
+}
+
+/// The bytes of a part in the message when the call has no cell: `INLINE_WRITE`, `INLINE_PWRITE`
+/// or `INLINE_READ` by the method.
+pub const fn inline_max(write: bool, positional: bool) -> usize {
+    match (write, positional) {
+        (false, _) => p::INLINE_READ,
+        (true, false) => p::INLINE_WRITE,
+        (true, true) => p::INLINE_PWRITE,
+    }
+}
+
+/// The bytes of a part of a call: the cell, or the message.
+pub const fn part_max(cell: bool, write: bool, positional: bool) -> usize {
+    if cell {
+        p::CELL_BYTES
+    } else {
+        inline_max(write, positional)
+    }
+}
+
+/// Copies `len` bytes that start `at` bytes into the concatenation of the buffers of `iov` to
+/// `out` (the part of a `writev` that goes in a cell or a message). The bytes copied: `len`
+/// unless the buffers end first.
+pub fn gather(iov: &[&[u8]], at: usize, out: &mut [u8]) -> usize {
+    let mut skip = at;
+    let mut done = 0;
+    for part in iov {
+        if skip >= part.len() {
+            skip -= part.len();
+            continue;
+        }
+        let take = (part.len() - skip).min(out.len() - done);
+        out[done..done + take].copy_from_slice(&part[skip..skip + take]);
+        done += take;
+        skip = 0;
+        if done == out.len() {
+            break;
+        }
+    }
+    done
+}
+
+/// Copies `bytes` into the concatenation of the buffers of `iov` from `at` bytes in (the part of
+/// a `readv` that came back). The bytes copied: all unless the buffers end first.
+pub fn scatter(iov: &mut [&mut [u8]], at: usize, bytes: &[u8]) -> usize {
+    let mut skip = at;
+    let mut done = 0;
+    for part in iov.iter_mut() {
+        if skip >= part.len() {
+            skip -= part.len();
+            continue;
+        }
+        let take = (part.len() - skip).min(bytes.len() - done);
+        part[skip..skip + take].copy_from_slice(&bytes[done..done + take]);
+        done += take;
+        skip = 0;
+        if done == bytes.len() {
+            break;
+        }
+    }
+    done
+}
+
+/// The total bytes of the buffers of a vector.
+pub fn total_len(iov: &[&[u8]]) -> usize {
+    iov.iter()
+        .map(|part| part.len())
+        .fold(0, usize::saturating_add)
+}
+
+/// The total bytes of the buffers of a vector to read into.
+pub fn total_len_mut(iov: &[&mut [u8]]) -> usize {
+    iov.iter()
+        .map(|part| part.len())
+        .fold(0, usize::saturating_add)
+}
+
 /// A time of `utimensat` (the seconds and the nanoseconds or a mark, as the layer holds them) as
 /// the protocol has it: a time outside the range the volume keeps (i64 nanoseconds) is the nearest
 /// end of it.
@@ -523,6 +868,7 @@ pub fn route_of(old_on_volume: bool, new_on_volume: bool) -> Route {
 mod tests {
     extern crate std;
     use super::*;
+    use std::vec;
     use std::vec::Vec;
 
     #[test]
@@ -911,5 +1257,300 @@ mod tests {
         assert_eq!(route_of(false, true), Route::Across);
         assert_eq!(link_errno(false), errno::EMLINK);
         assert_eq!(link_errno(true), errno::EPERM);
+    }
+
+    fn ans(count: usize, flags: u32, lease: u32) -> PartAnswer {
+        PartAnswer {
+            count: count as u32,
+            flags,
+            lease,
+        }
+    }
+
+    /// Runs a call of `total` bytes in parts of `max` against a service that gives lease 7 and
+    /// takes every part whole: the plans it sent.
+    fn run_whole(total: usize, max: usize) -> (Vec<PartPlan>, Parts) {
+        let mut parts = Parts::new(total, max);
+        let mut sent = Vec::new();
+        while let Some(plan) = parts.next_part() {
+            sent.push(plan);
+            let lease = if plan.more { 7 } else { 0 };
+            let step = parts.took(&plan, ans(plan.len, 0, lease));
+            assert_ne!(step, Step::Bad);
+            if step == Step::Done {
+                break;
+            }
+        }
+        (sent, parts)
+    }
+
+    #[test]
+    fn a_call_goes_in_parts_of_the_cell_with_more_and_the_lease() {
+        let total = 3 * p::CELL_BYTES + 100;
+        let (sent, parts) = run_whole(total, p::CELL_BYTES);
+        assert_eq!(sent.len(), 4);
+        let at: Vec<usize> = sent.iter().map(|x| x.at).collect();
+        assert_eq!(at, [0, 65_536, 131_072, 196_608]);
+        let lens: Vec<usize> = sent.iter().map(|x| x.len).collect();
+        assert_eq!(lens, [65_536, 65_536, 65_536, 100]);
+        let more: Vec<bool> = sent.iter().map(|x| x.more).collect();
+        assert_eq!(more, [true, true, true, false]);
+        // The first part asks for a lease, the next ones carry its number.
+        let lease: Vec<u32> = sent.iter().map(|x| x.lease).collect();
+        assert_eq!(lease, [0, 7, 7, 7]);
+        assert_eq!(sent[0].flags(), p::MORE);
+        assert_eq!(sent[3].flags(), 0);
+        assert_eq!(parts.finish(), total);
+        assert_eq!(parts.live_lease(), None);
+        assert!(!parts.lapsed());
+    }
+
+    #[test]
+    fn a_call_of_exact_cells_ends_without_more_on_the_last() {
+        let (sent, parts) = run_whole(2 * p::CELL_BYTES, p::CELL_BYTES);
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].more && !sent[1].more);
+        assert_eq!(parts.finish(), 2 * p::CELL_BYTES);
+    }
+
+    #[test]
+    fn a_call_of_no_bytes_sends_no_part() {
+        assert_eq!(Parts::new(0, p::CELL_BYTES).next_part(), None);
+    }
+
+    #[test]
+    fn inline_parts_have_the_bounds_of_their_method() {
+        assert_eq!(part_max(true, true, false), p::CELL_BYTES);
+        assert_eq!(part_max(false, true, false), 996);
+        assert_eq!(part_max(false, true, true), 988);
+        assert_eq!(part_max(false, false, true), 1008);
+        assert_eq!(part_max(false, false, false), 1008);
+        let (sent, _) = run_whole(5000, part_max(false, true, true));
+        assert_eq!(sent.len(), 6);
+        assert!(sent.iter().all(|x| x.len <= 988));
+        assert!(fits_one_message(WRITE_MAX, WRITE_MAX));
+        assert!(!fits_one_message(WRITE_MAX + 1, WRITE_MAX));
+    }
+
+    #[test]
+    fn a_short_part_ends_the_call_with_the_sum() {
+        // A read that meets the end of the file in the third part.
+        let mut parts = Parts::new(10 * p::CELL_BYTES, p::CELL_BYTES);
+        for k in 0..3 {
+            let plan = parts.next_part().unwrap();
+            let got = if k == 2 { 1234 } else { plan.len };
+            let lease = if got == plan.len { 9 } else { 0 };
+            let step = parts.took(&plan, ans(got, 0, lease));
+            assert_eq!(step, if k == 2 { Step::Done } else { Step::Next });
+        }
+        assert_eq!(parts.finish(), 2 * p::CELL_BYTES + 1234);
+        assert_eq!(parts.live_lease(), None);
+        assert_eq!(
+            parts.next_part().map(|x| x.at),
+            Some(2 * p::CELL_BYTES + 1234)
+        );
+        // The caller stops on Done: next_part is not asked again.
+    }
+
+    #[test]
+    fn a_read_at_the_end_of_the_file_is_the_sum_of_the_parts_before() {
+        let mut parts = Parts::new(2 * p::CELL_BYTES, p::CELL_BYTES);
+        let plan = parts.next_part().unwrap();
+        assert_eq!(parts.took(&plan, ans(0, 0, 0)), Step::Done);
+        assert_eq!(parts.finish(), 0);
+    }
+
+    #[test]
+    fn a_lapsed_lease_gives_a_short_result_and_is_noted() {
+        let mut parts = Parts::new(4 * p::CELL_BYTES, p::CELL_BYTES);
+        let first = parts.next_part().unwrap();
+        assert_eq!(parts.took(&first, ans(first.len, 0, 5)), Step::Next);
+        let second = parts.next_part().unwrap();
+        assert_eq!(second.lease, 5);
+        assert_eq!(parts.took(&second, ans(0, p::LAPSED, 0)), Step::Done);
+        assert!(parts.lapsed());
+        assert_eq!(parts.finish(), p::CELL_BYTES);
+        assert_eq!(parts.next_part(), None);
+        assert_eq!(parts.live_lease(), None);
+    }
+
+    #[test]
+    fn a_lapsed_reply_with_bytes_breaks_the_protocol() {
+        let mut parts = Parts::new(2 * p::CELL_BYTES, p::CELL_BYTES);
+        let first = parts.next_part().unwrap();
+        assert_eq!(parts.took(&first, ans(10, p::LAPSED, 0)), Step::Bad);
+    }
+
+    #[test]
+    fn a_reply_with_more_bytes_than_the_part_is_bad_and_its_lease_is_to_release() {
+        let mut parts = Parts::new(2 * p::CELL_BYTES, p::CELL_BYTES);
+        let first = parts.next_part().unwrap();
+        assert_eq!(parts.took(&first, ans(p::CELL_BYTES + 1, 0, 3)), Step::Bad);
+        assert_eq!(parts.live_lease(), Some(3));
+        assert_eq!(parts.done(), 0);
+        assert_eq!(parts.failed(5), Err(5));
+        // Bad after a part that went well keeps the lease the part before it gave.
+        let mut parts = Parts::new(3 * p::CELL_BYTES, p::CELL_BYTES);
+        let a = parts.next_part().unwrap();
+        assert_eq!(parts.took(&a, ans(a.len, 0, 3)), Step::Next);
+        let b = parts.next_part().unwrap();
+        assert_eq!(parts.took(&b, ans(b.len + 1, 0, 0)), Step::Bad);
+        assert_eq!(parts.live_lease(), Some(3));
+        assert_eq!(parts.failed(5), Ok(p::CELL_BYTES));
+    }
+
+    #[test]
+    fn an_unleased_part_runs_alone_and_the_next_asks_again() {
+        let mut parts = Parts::new(3 * p::CELL_BYTES, p::CELL_BYTES);
+        let first = parts.next_part().unwrap();
+        assert_eq!(
+            parts.took(&first, ans(first.len, p::UNLEASED, 0)),
+            Step::Next
+        );
+        assert_eq!(parts.unleased(), 1);
+        let second = parts.next_part().unwrap();
+        assert_eq!((second.lease, second.more), (0, true));
+        assert_eq!(parts.took(&second, ans(second.len, 0, 4)), Step::Next);
+        let third = parts.next_part().unwrap();
+        assert_eq!((third.lease, third.more), (4, false));
+        assert_eq!(parts.took(&third, ans(third.len, 0, 0)), Step::Done);
+        assert_eq!(parts.finish(), 3 * p::CELL_BYTES);
+        assert_eq!(parts.unleased(), 1);
+    }
+
+    #[test]
+    fn an_error_after_some_parts_is_the_sum_and_the_first_alone_is_the_error() {
+        let mut parts = Parts::new(3 * p::CELL_BYTES, p::CELL_BYTES);
+        assert_eq!(parts.failed(28), Err(28));
+        let first = parts.next_part().unwrap();
+        assert_eq!(parts.took(&first, ans(first.len, 0, 2)), Step::Next);
+        assert_eq!(parts.failed(28), Ok(p::CELL_BYTES));
+    }
+
+    #[test]
+    fn the_call_goes_on_by_messages_after_the_cell_is_given_up() {
+        let mut parts = Parts::new(p::CELL_BYTES + 2000, p::CELL_BYTES);
+        let first = parts.next_part().unwrap();
+        assert_eq!(parts.took(&first, ans(first.len, 0, 6)), Step::Next);
+        parts.set_max(p::INLINE_WRITE);
+        let next = parts.next_part().unwrap();
+        assert_eq!(
+            (next.at, next.len, next.more, next.lease),
+            (p::CELL_BYTES, 996, true, 6)
+        );
+    }
+
+    #[test]
+    fn a_part_that_filled_its_bytes_but_lost_its_lease_asks_for_another() {
+        let mut parts = Parts::new(2 * p::CELL_BYTES, p::CELL_BYTES);
+        let first = parts.next_part().unwrap();
+        assert_eq!(parts.took(&first, ans(first.len, 0, 0)), Step::Next);
+        assert_eq!(parts.next_part().unwrap().lease, 0);
+    }
+
+    #[test]
+    fn gather_and_scatter_walk_a_vector_across_its_buffers() {
+        let a = [1u8, 2, 3];
+        let b = [4u8, 5];
+        let c: [u8; 0] = [];
+        let d = [6u8, 7, 8, 9];
+        let iov: [&[u8]; 4] = [&a, &b, &c, &d];
+        assert_eq!(total_len(&iov), 9);
+        let mut out = [0u8; 4];
+        assert_eq!(gather(&iov, 2, &mut out), 4);
+        assert_eq!(out, [3, 4, 5, 6]);
+        let mut out = [0u8; 8];
+        assert_eq!(gather(&iov, 6, &mut out), 3);
+        assert_eq!(&out[..3], &[7, 8, 9]);
+        assert_eq!(gather(&iov, 9, &mut out), 0);
+
+        let mut x = [0u8; 3];
+        let mut y = [0u8; 0];
+        let mut z = [0u8; 4];
+        let mut vec: [&mut [u8]; 3] = [&mut x, &mut y, &mut z];
+        assert_eq!(total_len_mut(&vec), 7);
+        assert_eq!(scatter(&mut vec, 2, &[1, 2, 3]), 3);
+        assert_eq!(scatter(&mut vec, 5, &[9, 9, 9, 9]), 2);
+        assert_eq!(x, [0, 0, 1]);
+        assert_eq!(z, [2, 3, 9, 9]);
+    }
+
+    #[test]
+    fn a_vector_in_cell_parts_reassembles_to_the_same_bytes() {
+        // 3 buffers of odd sizes across 3 parts of 64 KiB.
+        let sizes = [70_001usize, 5, 100_000, 31_000];
+        let data: Vec<Vec<u8>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(k, n)| (0..*n).map(|i| (i * 7 + k * 13) as u8).collect())
+            .collect();
+        let iov: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let total = total_len(&iov);
+        let mut parts = Parts::new(total, p::CELL_BYTES);
+        let mut joined = Vec::new();
+        let mut cell = vec![0u8; p::CELL_BYTES];
+        while let Some(plan) = parts.next_part() {
+            let n = gather(&iov, plan.at, &mut cell[..plan.len]);
+            assert_eq!(n, plan.len);
+            joined.extend_from_slice(&cell[..n]);
+            if parts.took(&plan, ans(plan.len, 0, if plan.more { 1 } else { 0 })) == Step::Done {
+                break;
+            }
+        }
+        assert_eq!(joined, data.concat());
+    }
+
+    #[test]
+    fn a_cell_is_given_back_once_whatever_gives_it_back_first() {
+        let book = CellBook::<4>::new();
+        book.reset(2);
+        assert_eq!(book.free_mask(), 0b11);
+        let a = book.take(0).unwrap();
+        let b = book.take(1).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(book.take(2), None);
+        assert_eq!(book.held(0), Some(a));
+        // The call ends and drops its cell; the cell is free and another call takes it.
+        assert!(book.release(0));
+        let c = book.take(2).unwrap();
+        assert_eq!(c, a);
+        // A jump (or an exit of the thread) that abandons the first call's record finds it empty:
+        // it gives nothing back, so the cell the third call holds stays its own.
+        assert!(!book.release(0));
+        assert_eq!(book.free_mask(), 0);
+        assert_eq!(book.take(3), None);
+        // Each of the others gives back its own.
+        assert!(book.release(1));
+        assert!(book.release(2));
+        assert_eq!(book.free_mask(), 0b11);
+        assert!(!book.release(1) && !book.release(2));
+        assert_eq!(book.free_mask(), 0b11);
+    }
+
+    #[test]
+    fn a_forked_child_starts_with_no_cell_and_no_record() {
+        let book = CellBook::<2>::new();
+        book.reset(2);
+        book.take(0).unwrap();
+        book.reset(0);
+        assert_eq!(book.free_mask(), 0);
+        assert_eq!(book.held(0), None);
+        assert!(!book.release(0));
+    }
+
+    #[test]
+    fn a_bad_reply_keeps_the_lease_of_the_reply_for_the_release() {
+        let mut parts = Parts::new(2 * p::CELL_BYTES, p::CELL_BYTES);
+        let first = parts.next_part().unwrap();
+        assert_eq!(parts.took(&first, ans(first.len, 0, 5)), Step::Next);
+        let second = parts.next_part().unwrap();
+        assert_eq!(parts.took(&second, ans(second.len + 1, 0, 8)), Step::Bad);
+        assert_eq!(parts.live_lease(), Some(8));
+        let mut parts = Parts::new(2 * p::CELL_BYTES, p::CELL_BYTES);
+        let first = parts.next_part().unwrap();
+        assert_eq!(parts.took(&first, ans(first.len, 0, 5)), Step::Next);
+        let second = parts.next_part().unwrap();
+        assert_eq!(parts.took(&second, ans(second.len + 1, 0, 0)), Step::Bad);
+        assert_eq!(parts.live_lease(), Some(5));
     }
 }

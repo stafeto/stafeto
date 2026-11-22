@@ -16,6 +16,8 @@ pub mod clock;
 mod close_driver;
 pub mod cpu;
 pub mod cpus;
+#[cfg(feature = "data")]
+pub mod datawin;
 mod drain_driver;
 mod drain_hooks;
 mod filebuf;
@@ -25,6 +27,7 @@ pub use close_driver::{Probe as CloseProbe, probe_hook as probe_close_hook};
 pub mod constants;
 mod fifo_io;
 pub mod fork;
+mod handlers;
 pub mod loader_probe;
 mod lock_call;
 #[cfg(any(feature = "wfc", feature = "wfd"))]
@@ -407,6 +410,12 @@ fn read_inner(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
     {
         return result;
     }
+    // A read of a file of the data volume of more than one message goes in parts of a cell.
+    if buffer.len() > posix_request::MAX_READ
+        && let Some(result) = read_data_large(fd, buffer)
+    {
+        return result;
+    }
     let count = buffer.len().min(posix_request::MAX_READ);
     match shared::dispatch(
         Request::Read {
@@ -450,6 +459,37 @@ fn read_file_large(fd: u32, buffer: &mut [u8]) -> Option<Result<usize, c_int>> {
                 .map(|result| result.map_err(error))),
             _ => Ok(None),
         });
+    match result {
+        Ok(read) => read,
+        Err(errno) => Some(Err(errno)),
+    }
+}
+
+/// The counters of the parts of the large calls on `/data` (for the probes): parts through a cell,
+/// parts by messages, calls cut short by a lapsed lease, parts run with no lease, parts sent
+/// again after NO_WINDOW.
+#[cfg(feature = "data")]
+pub use datawin::{
+    probe_cell_parts as probe_data_cell_parts, probe_inline_parts as probe_data_inline_parts,
+    probe_lapsed as probe_data_lapsed, probe_unleased as probe_data_unleased,
+    probe_window_retries as probe_data_window_retries,
+};
+
+/// A read of the file `fd` of the data volume for more than one message, in parts (`data::read`):
+/// all the bytes asked unless the file ends. None for any other descriptor and for a directory.
+#[inline(never)]
+fn read_data_large(fd: u32, buffer: &mut [u8]) -> Option<Result<usize, c_int>> {
+    // The kind is looked at under the lock of the files without a hold, so that the other
+    // descriptors are held once, by their own reads.
+    let data = shared::with_fd(fd, |files| files.target(fd).map_err(error))
+        .is_ok_and(|target| matches!(target, posix_fs::Target::Data(d) if !d.directory));
+    if !data {
+        return None;
+    }
+    let result = shared::held(fd, |_, target| match target {
+        posix_fs::Target::Data(d) if !d.directory => Ok(Some(data::read(d.handle, buffer))),
+        _ => Ok(None),
+    });
     match result {
         Ok(read) => read,
         Err(errno) => Some(Err(errno)),
