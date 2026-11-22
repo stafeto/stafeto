@@ -102,20 +102,20 @@ fn cell_verdict(lines: &[String]) -> Result<(u64, u64), String> {
     Ok((map, unmap))
 }
 
-/// The longest the worker computes between two waits for the disk (or from the pick-up of a job to
-/// its first wait, or from the last wait to its end), in ticks: the portion of the data service, the
-/// copy of one block of 4 KiB with the logic of littlefs around it. The worker stands below the
-/// services and keeps no higher level waiting, but on a table of one CPU with no budget it is the
-/// length of a stretch the programs below it wait.
+/// The portion of the data service in ticks: the copy of one block of 4 KiB with the logic of
+/// littlefs around it, the longest the worker should compute between two waits for the disk. The
+/// stretches the probe prints are wall time (preemptions and the volume's own work included), so
+/// they are reported against it and judge nothing; the rule that judges is the CPU time of a job
+/// by the budget of the worker, a later step.
 const WORKER_STRETCH_MAX: u64 = 16_328;
 
-/// The stretches of the worker in the lines of a run (`datafs: worker computes longest <method>
+/// The stretches of the worker in the lines of a run (`datafs: worker wall stretch <method>
 /// <ticks> ticks`): the longest of each method, in the order they came. The run must show the parts
 /// it made. The ticks are wall time of the stretch: a preemption by the loop or a client, and the
 /// computing the volume needs (a creation, a first allocation), count in it, so the figure is an
 /// upper bound that is reported and not yet a gate (`WORKER_STRETCH_MAX` is the goal).
 fn worker_verdict(lines: &[String]) -> Result<Vec<(String, u64)>, String> {
-    let key = "datafs: worker computes longest ";
+    let key = "datafs: worker wall stretch ";
     let mut longest: Vec<(String, u64)> = Vec::new();
     for l in lines {
         let Some(at) = l.find(key) else { continue };
@@ -538,7 +538,7 @@ pub fn probe() -> Result<(), String> {
     println!("data-probe: steps of the request loop (kind, ticks, whole step): {rows:?}");
     let stretches = worker_verdict(&written)?;
     println!(
-        "data-probe: the worker's longest stretch between waits for the disk, in ticks, wall time with the preemptions: {stretches:?}; goal {WORKER_STRETCH_MAX}, {}",
+        "data-probe: report, no gate: the worker's longest wall-clock stretch between waits for the disk, in ticks, preemptions included: {stretches:?}; the portion is {WORKER_STRETCH_MAX}, {}",
         if stretches
             .iter()
             .any(|(m, t)| m.ends_with("Into") | m.ends_with("From") && *t > WORKER_STRETCH_MAX)

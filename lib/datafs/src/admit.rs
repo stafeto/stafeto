@@ -7,6 +7,17 @@
 
 use proto_data as p;
 
+/// Whether the one handle of a WINDOW request may be a window: a memory object (not a device
+/// window, whose bytes are registers: littlefs would copy into device memory with accesses the
+/// device refuses and with side effects) that the sender let the service map for reading and
+/// writing. The kind and the rights come with the message, so the request thread checks them before
+/// it takes the handle; the worker's test map is a second guard.
+pub fn window_offered(kind: abi::ObjectKind, rights: abi::Rights) -> bool {
+    kind == abi::ObjectKind::Memory
+        && rights.contains(abi::Rights::MAP_READ)
+        && rights.contains(abi::Rights::MAP_WRITE)
+}
+
 /// The requests in flight at once, and the notice of a session that went.
 pub const JOBS: usize = 24;
 
@@ -278,6 +289,35 @@ pub const fn closers(sessions: usize, passes: usize, jobs: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_memory_object_with_both_map_rights_is_a_window() {
+        use abi::{ObjectKind as K, Rights as R};
+        let rw = R(R::MAP_READ.0 | R::MAP_WRITE.0 | R::TRANSFER.0);
+        assert!(super::window_offered(K::Memory, rw));
+        // A window of a device is memory the program may map, but its bytes are registers.
+        assert!(!super::window_offered(K::DeviceWindow, rw));
+        for kind in [
+            K::Channel,
+            K::Process,
+            K::Thread,
+            K::Timer,
+            K::Resource,
+            K::Interrupt,
+        ] {
+            assert!(!super::window_offered(kind, rw), "{kind:?}");
+        }
+        // Both rights are needed: a cell is read to write the file and written to read it.
+        assert!(!super::window_offered(
+            K::Memory,
+            R(R::MAP_READ.0 | R::TRANSFER.0)
+        ));
+        assert!(!super::window_offered(
+            K::Memory,
+            R(R::MAP_WRITE.0 | R::TRANSFER.0)
+        ));
+        assert!(!super::window_offered(K::Memory, R(0)));
+    }
+
     use super::*;
 
     fn reply(status: u32) -> [u8; 8] {

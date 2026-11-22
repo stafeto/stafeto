@@ -64,8 +64,9 @@ static WAITED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::ne
 
 /// The steps build measures the stretches in which the worker only computes: from the end of a wait
 /// for the disk (or the pick-up of a job) to the start of the next wait (or the end of the job).
-/// The longest of each method of the request in hand says so, `datafs: worker computes longest
-/// <method> <ticks> ticks`, which the probe judges against the portion of 16,328 ticks.
+/// The longest of each method of the request in hand is a report line, `datafs: worker wall stretch
+/// <method> <ticks> ticks`. The ticks are wall time, preemptions and the work the volume needs
+/// included: a report and no gate.
 #[cfg(feature = "steps")]
 mod stretch {
     use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -94,9 +95,9 @@ mod stretch {
             slot.store(took, Relaxed);
             match proto_data::Method::from_number(number as u16) {
                 Some(method) => {
-                    rt::println!("datafs: worker computes longest {method:?} {took} ticks")
+                    rt::println!("datafs: worker wall stretch {method:?} {took} ticks")
                 }
-                None => rt::println!("datafs: worker computes longest other {took} ticks"),
+                None => rt::println!("datafs: worker wall stretch other {took} ticks"),
             }
         }
     }

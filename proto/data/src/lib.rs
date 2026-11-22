@@ -354,7 +354,7 @@
 //! The client maps the whole window once. The service keeps the handle in the session, maps one
 //! cell for the time of one job (read only to write a file, read and write to read one), moves up
 //! to `CELL_BYTES` between the cell and the volume and unmaps it. A new WINDOW replaces the old one
-//! (the service closes the old handle). The service accepts only a memory object with MAP_READ and
+//! (the service closes the old handle); a WINDOW the service refuses leaves the old window as it was. The service accepts only a memory object with MAP_READ and
 //! MAP_WRITE of exactly `WINDOW_BYTES`, else INVALID. The service never reads a field of the
 //! protocol from a cell: the client may change a cell while a job runs, which spoils only its own
 //! bytes. A part that names a cell in a session with no window is NO_WINDOW; the layer then sends

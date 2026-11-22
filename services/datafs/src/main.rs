@@ -472,6 +472,12 @@ impl Datafs {
         if r.handles.len() != 1 {
             return Answer::Status(Status::BadSize);
         }
+        // The kind and the rights come with the message: a device window (the kernel's `Memory`
+        // accepts one) or a handle that cannot be mapped both ways is no window.
+        match r.handles.info(0) {
+            Some((kind, rights)) if admit::window_offered(kind, rights) => {}
+            _ => return Answer::Status(proto_data::code(proto_data::INVALID)),
+        }
         let Some(i) = self.job_for(owner) else {
             return Answer::Status(busy());
         };
