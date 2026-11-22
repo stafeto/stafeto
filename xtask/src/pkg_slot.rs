@@ -4,7 +4,7 @@
 //! `cargo xtask pkg-slot`: the place `Packages` of the start area (tests/pkg-slot; sub-project 5,
 //! part 3b; pk3-design R13, R17) on QEMU's `virt` with the disk and package services: the session
 //! the start gives, the CLONE of it for a forked child, a spawned program and the program a child
-//! execs, a set-ID program that gets none, the right of the superuser alone to begin an
+//! execs, a set-ID program that has the service's own session (a forged channel in the place is replaced and gets no request), the right of the superuser alone to begin an
 //! installation (NOT_ALLOWED through the session of the place), and the price of the session in a
 //! fork, which the probe prints from the call of fork with and without it.
 
@@ -50,11 +50,12 @@ pub const PROGRAMS: [ImageProgram; 12] = [
 ];
 
 /// The lines of the C probe, each a check that passed.
-const LINES: [&str; 7] = [
+const LINES: [&str; 8] = [
     "pkg-slot: the start gave a session that answers a LIST and a CLONE",
     "pkg-slot: a forked child has a session of its own that answers, the parent's answers after the child ended",
     "pkg-slot: a spawned program has a session of its own",
-    "pkg-slot: a set-ID program gets no session",
+    "pkg-slot: a set-ID program has the session of the service, the parent's passing as it is",
+    "pkg-slot: a set-ID program given a forged channel gets a new session of the service and the forgery gets no request",
     "pkg-slot: exec keeps the session, and the parent's answers after the program ended",
     "pkg-slot: INSTALL_BEGIN is NOT_ALLOWED for a process that is not the superuser, and taken from the superuser",
     "pkg-slot: BUFFER of a process that is user 1000 is BUSY when the places for any session are in use, the superuser still has one",
@@ -105,7 +106,7 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     qemu::expect_stopped_on(&output, "init: pkg-slot ended: exit code 0, not restarted")?;
     let (with, without, clone) = price(&output.lines)?;
     println!(
-        "pkg-slot on {}: the session in fork, spawn and exec, none for a set-ID program, NOT_ALLOWED for a process that is not the superuser: ok; the call of fork {with} ns with the session, {without} ns without it, a CLONE alone {clone} ns",
+        "pkg-slot on {}: the session in fork, spawn and exec, the service's own session for a set-ID program, NOT_ALLOWED for a process that is not the superuser: ok; the call of fork {with} ns with the session, {without} ns without it, a CLONE alone {clone} ns",
         machine.name
     );
     Ok(())
