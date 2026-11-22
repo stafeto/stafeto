@@ -21,13 +21,16 @@ const C: u64 = 13;
 /// user), and a handle of A, B and C on it (read and write).
 struct Fx {
     rig: Rig,
+    /// The clock of the worker, in nanoseconds: every part arrives, runs and is answered at it, and the
+    /// lease is stamped after it, as the worker does.
+    now: u64,
     c: [Vec<u8>; 2],
     ha: u32,
     hb: u32,
     hc: u32,
 }
 
-fn fx() -> Fx {
+fn fixture() -> Fx {
     let mut rig = volume();
     // The sessions of the rig are bound already: OWNER, GROUP and OTHER.
     for label in [A, B, C] {
@@ -55,7 +58,14 @@ fn fx() -> Fx {
     let hb = rig.open(B, b"/d/f", p::READ | p::WRITE, 0).unwrap();
     let hc = rig.open(C, b"/d/f", p::READ | p::WRITE, 0).unwrap();
     rig.mkdir(ROOT, b"/e", 0o777).unwrap();
-    Fx { rig, c, ha, hb, hc }
+    Fx {
+        rig,
+        now: 0,
+        c,
+        ha,
+        hb,
+        hc,
+    }
 }
 
 impl Fx {
@@ -72,7 +82,23 @@ impl Fx {
         let mut part = head(h, count, 0, 0, if more { p::MORE } else { 0 });
         part.lease = lease;
         let data = vec![7u8; count];
-        self.rig.part(who, method, part, &data, &mut self.c)
+        self.rig.server.set_mono(self.now);
+        self.rig.server.set_job_queued(self.now);
+        let r = self.rig.part(who, method, part, &data, &mut self.c);
+        self.rig.server.leases_stamp(self.now);
+        r
+    }
+
+    /// The clock moves to `ns`.
+    fn at(&mut self, ns: u64) {
+        self.now = ns;
+        self.rig.server.set_mono(ns);
+    }
+
+    /// The leases that lapse by `ns` end, with the jobs `queued` waiting.
+    fn sweep(&mut self, ns: u64, queued: &[Candidate<'_>]) {
+        self.at(ns);
+        self.rig.server.leases_sweep(&mut self.rig.fs, queued);
     }
 
     /// The first part of a write call that goes on: the lease number.
@@ -105,10 +131,11 @@ fn pick(rig: &Rig, jobs: &[(u64, Vec<u8>)]) -> Option<usize> {
             id: i,
             ticket: i as u64 + 1,
             owner: *owner,
+            queued_at: 0,
             request,
         })
         .collect();
-    rig.server.pick(&cands)
+    rig.server.pick(&cands).run
 }
 
 fn read_job(h: u32) -> Vec<u8> {
@@ -148,7 +175,7 @@ fn part_job(method: Method, h: u32, lease: u32, more: bool) -> Vec<u8> {
 
 #[test]
 fn a_call_in_parts_takes_a_lease_on_its_first_part_and_ends_it_with_its_last() {
-    let mut fx = fx();
+    let mut fx = fixture();
     assert_eq!(fx.rig.server.lease_count(), 0);
     let lease = fx.write_lease(A, fx.ha);
     assert_eq!(fx.rig.server.lease_count(), 1);
@@ -177,7 +204,7 @@ fn a_call_in_parts_takes_a_lease_on_its_first_part_and_ends_it_with_its_last() {
 
 #[test]
 fn a_write_lease_holds_back_every_other_call_on_the_file_and_nothing_else() {
-    let mut fx = fx();
+    let mut fx = fixture();
     let lease = fx.write_lease(A, fx.ha);
     for (name, job) in [
         ("read", read_job(fx.hb)),
@@ -223,7 +250,7 @@ fn a_write_lease_holds_back_every_other_call_on_the_file_and_nothing_else() {
 
 #[test]
 fn a_read_lease_holds_back_writes_and_truncations_and_lets_reads_go() {
-    let mut fx = fx();
+    let mut fx = fixture();
     let lease = fx.read_lease(A, fx.ha);
     for (name, job) in [
         ("write", write_job(fx.hb)),
@@ -266,7 +293,7 @@ fn a_read_lease_holds_back_writes_and_truncations_and_lets_reads_go() {
 
 #[test]
 fn the_part_of_a_holder_takes_the_place_of_the_oldest_job_that_waits_for_the_file() {
-    let mut fx = fx();
+    let mut fx = fixture();
     let lease = fx.write_lease(A, fx.ha);
     // Queue: a read of the file waits (ticket 1), a job on another file (2), the holder's next part (3).
     let jobs = [
@@ -287,7 +314,7 @@ fn the_part_of_a_holder_takes_the_place_of_the_oldest_job_that_waits_for_the_fil
 
 #[test]
 fn a_new_read_lease_waits_behind_a_writer_that_waits() {
-    let mut fx = fx();
+    let mut fx = fixture();
     let lease = fx.read_lease(A, fx.ha);
     // B's write waits for A's read lease (ticket 1); C asks for a new read lease (2), and a plain read
     // of C (3) goes on, as do reads of other calls.
@@ -315,66 +342,202 @@ fn a_new_read_lease_waits_behind_a_writer_that_waits() {
 }
 
 #[test]
-fn a_lease_lapses_after_a_gap_and_a_late_part_runs_alone_with_lapsed() {
-    let mut fx = fx();
-    fx.rig.server.set_mono(1_000);
+fn a_lease_lapses_after_a_gap_and_a_late_part_is_not_run() {
+    let mut fx = fixture();
+    fx.at(1_000);
     let lease = fx.write_lease(A, fx.ha);
-    let expires = fx.rig.server.next_lease_expiry().unwrap();
-    assert_eq!(expires, 1_000 + LEASE_GAP_NS);
-    // A part renews it for another gap.
-    fx.rig.server.set_mono(500_000_000);
-    fx.part(A, Method::PwriteFrom, fx.ha, 10, lease, true)
-        .unwrap();
     assert_eq!(
         fx.rig.server.next_lease_expiry(),
-        Some(500_000_000 + LEASE_GAP_NS)
+        Some(1_000 + LEASE_GAP_NS)
     );
-    // B's read waits until the gap is over, and goes when the lease has lapsed.
-    let job = [(B, read_job(fx.hb))];
-    fx.rig.server.set_mono(500_000_000 + LEASE_GAP_NS - 1);
-    fx.rig.server.leases_sweep(&mut fx.rig.fs);
-    assert_eq!(pick(&fx.rig, &job), None);
-    fx.rig.server.set_mono(500_000_000 + LEASE_GAP_NS);
-    fx.rig.server.leases_sweep(&mut fx.rig.fs);
-    assert_eq!(fx.rig.server.lease_count(), 0);
-    assert_eq!(pick(&fx.rig, &job), Some(0));
-    // The late part runs as a call of its own: it is written, the answer says LAPSED and has no lease.
-    let before = fx.rig.stat(A, b"/d/f").unwrap().size;
-    let r = fx
-        .part(A, Method::PwriteFrom, fx.ha, 20, lease, true)
+    // The gap counts from the answer to the part: a part at 0.5 s renews it for another gap.
+    fx.at(500_000_000);
+    fx.part(A, Method::PwriteFrom, fx.ha, 10, lease, true)
         .unwrap();
-    assert_eq!((r.count, r.flags, r.lease), (20, p::LAPSED, 0));
-    assert_eq!(fx.rig.stat(A, b"/d/f").unwrap().size, before);
+    let expiry = fx.rig.server.next_lease_expiry().unwrap();
+    assert!(expiry > 500_000_000 && expiry <= 500_000_000 + LEASE_GAP_NS);
+    let job = [(B, read_job(fx.hb))];
+    fx.sweep(500_000_000 + LEASE_GAP_NS - 1, &[]);
+    assert_eq!(pick(&fx.rig, &job), None);
+    fx.sweep(500_000_000 + LEASE_GAP_NS, &[]);
     assert_eq!(fx.rig.server.lease_count(), 0);
-    // It takes no lease and holds nothing back, whatever MORE says.
     assert_eq!(pick(&fx.rig, &job), Some(0));
+    // The late part is not run: nothing is written, the answer says LAPSED and 0 bytes, with MORE
+    // or without.
+    let size = fx.rig.stat(A, b"/d/f").unwrap().size;
+    for more in [true, false] {
+        let r = fx
+            .part(A, Method::PwriteFrom, fx.ha, 20, lease, more)
+            .unwrap();
+        assert_eq!((r.count, r.flags, r.lease), (0, p::LAPSED, 0), "{more}");
+    }
+    let r = fx.part(A, Method::PreadInto, fx.ha, 20, lease, false);
+    assert_eq!(
+        r.map(|r| (r.count, r.flags)),
+        Ok((0, p::LAPSED)),
+        "a read part of an ended lease"
+    );
+    assert_eq!(fx.rig.stat(A, b"/d/f").unwrap().size, size);
+    assert_eq!(fx.rig.server.lease_count(), 0);
 }
 
 #[test]
-fn a_part_that_runs_alone_after_a_lapse_with_append_takes_the_end_again() {
-    let mut fx = fx();
-    let ha = fx
-        .rig
-        .open(A, b"/d/f", p::READ | p::WRITE | p::APPEND, 0)
+fn the_gap_counts_from_the_answer_and_not_from_the_pick() {
+    let mut fx = fixture();
+    let lease = fx.write_lease(A, fx.ha);
+    // A part arrives at 0.8 s and is picked and answered at 0.9 s: the gap after it counts from 0.9 s.
+    fx.at(900_000_000);
+    fx.rig.server.set_job_queued(800_000_000);
+    let mut part = head(fx.ha, 10, 0, 0, p::MORE);
+    part.lease = lease;
+    fx.rig
+        .part(A, Method::PwriteFrom, part, &[7u8; 10], &mut fx.c)
         .unwrap();
-    fx.rig.server.set_mono(0);
-    let first = fx.part(A, Method::WriteFrom, ha, 100, 0, true).unwrap();
-    let lease = first.lease;
-    assert!(lease != 0);
-    // Another writer appends after the lapse; the late part goes after it and over nothing.
-    fx.rig.server.set_mono(LEASE_GAP_NS);
-    fx.rig.server.leases_sweep(&mut fx.rig.fs);
-    let hb = fx.rig.open(B, b"/d/f", p::WRITE | p::APPEND, 0).unwrap();
-    let size = fx.rig.stat(A, b"/d/f").unwrap().size;
-    fx.part(B, Method::WriteFrom, hb, 30, 0, false).unwrap();
-    let r = fx.part(A, Method::WriteFrom, ha, 50, lease, false).unwrap();
-    assert_eq!(r.flags, p::LAPSED);
-    assert_eq!(fx.rig.stat(A, b"/d/f").unwrap().size, size + 80);
+    fx.rig.server.leases_stamp(900_000_000);
+    // At 1.5 s (0.6 s after the answer) the lease lives; a clock that counted from the pick or from
+    // the take would have lapsed it.
+    fx.sweep(1_500_000_000, &[]);
+    assert_eq!(fx.rig.server.lease_count(), 1);
+    fx.sweep(1_900_000_000, &[]);
+    assert_eq!(fx.rig.server.lease_count(), 0);
+}
+
+#[test]
+fn a_lease_whose_next_part_is_queued_in_time_does_not_lapse() {
+    let mut fx = fixture();
+    let lease = fx.write_lease(A, fx.ha);
+    let mine = part_job(Method::PwriteFrom, fx.ha, lease, true);
+    let queued = |at: u64| {
+        [Candidate {
+            id: 0,
+            ticket: 1,
+            owner: A,
+            queued_at: at,
+            request: &mine,
+        }]
+    };
+    // The part arrived at 0.9 s and waits behind other files' jobs until 3 s: no lapse.
+    fx.sweep(3_000_000_000, &queued(900_000_000));
+    assert_eq!(fx.rig.server.lease_count(), 1);
+    // A part that arrived at 1.2 s came late: the lease lapsed.
+    fx.sweep(3_000_000_000, &queued(1_200_000_000));
+    assert_eq!(fx.rig.server.lease_count(), 0);
+}
+
+#[test]
+fn the_client_time_of_a_lease_is_bounded_while_jobs_wait_for_the_file() {
+    let mut fx = fixture();
+    // Gaps of 0.3 s between parts, five of them: no job waits, the lease lives on by the gap alone.
+    let lease = fx.write_lease(A, fx.ha);
+    let mut t = 0;
+    for _ in 0..5 {
+        t += 300_000_000;
+        fx.rig.server.set_mono(t);
+        fx.rig.server.set_job_queued(t);
+        fx.part(A, Method::PwriteFrom, fx.ha, 10, lease, true)
+            .unwrap();
+        fx.rig.server.leases_stamp(t);
+        fx.sweep(t, &[]);
+        assert_eq!(fx.rig.server.lease_count(), 1, "no waiter, no bound");
+    }
+    // A reader of the file waits now. The client time so far is 1.5 s (five gaps of 0.3 s) with
+    // the first part's, so the bound has fired already for the part that follows.
+    let waiter = read_job(fx.hb);
+    let queued = [Candidate {
+        id: 0,
+        ticket: 1,
+        owner: B,
+        queued_at: t,
+        request: &waiter,
+    }];
+    fx.sweep(t + 1, &queued);
+    assert_eq!(
+        fx.rig.server.lease_count(),
+        0,
+        "the bound fired with a waiter"
+    );
+    assert_eq!(pick(&fx.rig, &[(B, read_job(fx.hb))]), Some(0));
+}
+
+#[test]
+fn the_client_time_adds_up_over_many_short_gaps() {
+    let mut fx = fixture();
+    let waiter = read_job(fx.hb);
+    let queued = |at: u64| {
+        [Candidate {
+            id: 0,
+            ticket: 1,
+            owner: B,
+            queued_at: at,
+            request: &waiter,
+        }]
+    };
+    let lease = fx.write_lease(A, fx.ha);
+    // Nine gaps of 0.1 s with a reader waiting: 0.9 s of client time, under the bound.
+    let mut t = 0;
+    for _ in 0..9 {
+        t += 100_000_000;
+        fx.sweep(t, &queued(t));
+        assert_eq!(fx.rig.server.lease_count(), 1, "at {t}");
+        fx.rig.server.set_job_queued(t);
+        fx.part(A, Method::PwriteFrom, fx.ha, 10, lease, true)
+            .unwrap();
+    }
+    // The tenth gap takes it over 1 s in all: the lease lapses though no single gap was long.
+    t += 200_000_000;
+    fx.sweep(t, &queued(t));
+    assert_eq!(fx.rig.server.lease_count(), 0);
+}
+
+#[test]
+fn a_call_that_lapses_by_the_bound_returns_what_was_done_and_syncs_with_sync() {
+    let mut fx = fixture();
+    let h = fx.rig.open(B, b"/d/f", p::WRITE | p::SYNC, 0).unwrap();
+    let lease = fx
+        .part(B, Method::PwriteFrom, h, 4000, 0, true)
+        .unwrap()
+        .lease;
+    fx.part(B, Method::PwriteFrom, h, 4000, lease, true)
+        .unwrap();
+    let flushes = fx.rig.fs.device().flushes;
+    // A waiter, and a client that takes 1.2 s: the bound lapses the lease, syncing the node first.
+    let waiter = read_job(fx.hc);
+    let queued = [Candidate {
+        id: 0,
+        ticket: 1,
+        owner: C,
+        queued_at: 1_200_000_000,
+        request: &waiter,
+    }];
+    fx.sweep(1_200_000_000, &queued);
+    assert_eq!(fx.rig.server.lease_count(), 0);
+    assert!(
+        fx.rig.fs.device().flushes > flushes,
+        "the node was synced at the lapse"
+    );
+    // The late part is not run: 0 bytes, LAPSED; the layer returns the 8,000 bytes done.
+    let r = fx
+        .part(B, Method::PwriteFrom, h, 4000, lease, false)
+        .unwrap();
+    assert_eq!((r.count, r.flags), (0, p::LAPSED));
+    // Without a waiter no bound applies: the same client time (1.2 s in two gaps) is fine.
+    let mut fx = fixture();
+    let lease = fx.write_lease(A, fx.ha);
+    fx.at(600_000_000);
+    fx.part(A, Method::PwriteFrom, fx.ha, 10, lease, true)
+        .unwrap();
+    fx.at(1_200_000_000);
+    fx.sweep(1_200_000_000, &[]);
+    assert_eq!(
+        fx.rig.server.lease_count(),
+        1,
+        "no waiter: the gap rule alone"
+    );
 }
 
 #[test]
 fn release_ends_a_lease_and_answers_for_a_number_that_is_over_or_never_was() {
-    let mut fx = fx();
+    let mut fx = fixture();
     let lease = fx.write_lease(A, fx.ha);
     // Another session cannot release it.
     assert_eq!(
@@ -412,7 +575,7 @@ fn release_ends_a_lease_and_answers_for_a_number_that_is_over_or_never_was() {
 
 #[test]
 fn a_number_that_ended_is_not_taken_for_the_next_lease_of_its_slot() {
-    let mut fx = fx();
+    let mut fx = fixture();
     let one = fx.write_lease(A, fx.ha);
     fx.part(A, Method::PwriteFrom, fx.ha, 10, one, false)
         .unwrap();
@@ -432,7 +595,7 @@ fn a_number_that_ended_is_not_taken_for_the_next_lease_of_its_slot() {
 
 #[test]
 fn a_session_has_four_leases_and_the_service_sixty_four_and_the_rest_run_unleased() {
-    let mut fx = fx();
+    let mut fx = fixture();
     // Four read leases of A, on four calls of one description; the fifth call is UNLEASED.
     let mut leases = Vec::new();
     for _ in 0..p::LEASES_PER_SESSION {
@@ -472,7 +635,7 @@ fn a_session_has_four_leases_and_the_service_sixty_four_and_the_rest_run_unlease
 
 #[test]
 fn a_close_in_the_middle_of_a_call_does_not_end_it() {
-    let mut fx = fx();
+    let mut fx = fixture();
     let before = fx.rig.server.open_count();
     let lease = fx.write_lease(A, fx.ha);
     fx.rig.close(A, fx.ha);
@@ -494,7 +657,7 @@ fn a_close_in_the_middle_of_a_call_does_not_end_it() {
 
 #[test]
 fn a_call_ends_at_a_limit_at_the_end_of_the_file_and_at_a_failure() {
-    let mut fx = fx();
+    let mut fx = fixture();
     // A read part that the end of the file stopped short ends the call.
     let ha = fx.rig.open(A, b"/d/f", p::READ, 0).unwrap();
     let mut part = head(ha, 1000, 299_500, 0, p::MORE);
@@ -529,7 +692,7 @@ fn a_call_ends_at_a_limit_at_the_end_of_the_file_and_at_a_failure() {
 
 #[test]
 fn a_description_with_sync_is_made_durable_after_the_part_that_ends_the_call() {
-    let mut fx = fx();
+    let mut fx = fixture();
     let h = fx.rig.open(B, b"/d/f", p::WRITE | p::SYNC, 0).unwrap();
     let flushes = |fx: &mut Fx| fx.rig.fs.device().flushes;
     let before = flushes(&mut fx);
@@ -557,7 +720,7 @@ fn a_description_with_sync_is_made_durable_after_the_part_that_ends_the_call() {
 
 #[test]
 fn two_append_calls_do_not_mix() {
-    let mut fx = fx();
+    let mut fx = fixture();
     let ha = fx.rig.open(A, b"/d/f", p::WRITE | p::APPEND, 0).unwrap();
     let hb = fx.rig.open(B, b"/d/f", p::WRITE | p::APPEND, 0).unwrap();
     let start = fx.rig.stat(A, b"/d/f").unwrap().size;
@@ -601,7 +764,7 @@ fn two_append_calls_do_not_mix() {
 
 #[test]
 fn the_end_of_a_session_and_the_stop_end_its_leases() {
-    let mut fx = fx();
+    let mut fx = fixture();
     let before = fx.rig.server.open_count();
     let _ = fx.write_lease(B, fx.hb);
     let _ = fx.read_lease(C, fx.hc);
@@ -618,7 +781,7 @@ fn the_end_of_a_session_and_the_stop_end_its_leases() {
 
 #[test]
 fn jobs_on_other_files_wait_for_no_lease_however_many_are_held() {
-    let mut fx = fx();
+    let mut fx = fixture();
     // Every lease the service can give, on the one file; the jobs on /e and the statfs go at once, in
     // the order they came.
     let mut held = Vec::new();
@@ -641,4 +804,229 @@ fn jobs_on_other_files_wait_for_no_lease_however_many_are_held() {
     assert_eq!(pick(&fx.rig, &jobs), Some(idx));
     jobs.remove(idx);
     assert_eq!(pick(&fx.rig, &jobs), Some(jobs.len() - 1));
+}
+
+#[test]
+fn a_seek_waits_for_a_lease_and_the_call_goes_on_from_where_it_was() {
+    let mut fx = fixture();
+    // A call in parts on a description that has a position: the parts follow each other.
+    let at = fx.rig.ok(A, |w| p::seek(fx.ha, 0, p::SEEK_CUR, w));
+    let at = u64::from_le_bytes(at[..8].try_into().unwrap());
+    let first = fx.part(A, Method::WriteFrom, fx.ha, 100, 0, true).unwrap();
+    let lease = first.lease;
+    // A seek of the same description by another thread, or of another description by another
+    // process (SEEK_END reads the size the call is changing), waits for the lease.
+    let seek = |h: u32, whence: u32| req(|w| p::seek(h, 0, whence, w));
+    assert_eq!(pick(&fx.rig, &[(A, seek(fx.ha, p::SEEK_SET))]), None);
+    assert_eq!(pick(&fx.rig, &[(B, seek(fx.hb, p::SEEK_END))]), None);
+    // Under a read lease a seek waits too: the call reads from the position of its description.
+    fx.part(A, Method::WriteFrom, fx.ha, 100, lease, false)
+        .unwrap();
+    let rl = fx.read_lease(A, fx.ha);
+    assert_eq!(pick(&fx.rig, &[(A, seek(fx.ha, p::SEEK_SET))]), None);
+    fx.part(A, Method::PreadInto, fx.ha, 100, rl, false)
+        .unwrap();
+    assert_eq!(pick(&fx.rig, &[(A, seek(fx.ha, p::SEEK_SET))]), Some(0));
+    // The two parts of the write went one after the other (200 bytes from the start of the position).
+    let pos = fx.rig.ok(A, |w| p::seek(fx.ha, 0, p::SEEK_CUR, w));
+    assert_eq!(u64::from_le_bytes(pos[..8].try_into().unwrap()), at + 200);
+}
+
+#[test]
+fn a_call_keeps_the_append_and_sync_its_description_had_at_its_first_part() {
+    let mut fx = fixture();
+    let h = fx.rig.open(B, b"/d/f", p::WRITE, 0).unwrap();
+    let flushes = |fx: &mut Fx| fx.rig.fs.device().flushes;
+    let size = fx.rig.stat(B, b"/d/f").unwrap().size;
+    let lease = fx
+        .part(B, Method::WriteFrom, h, 100, 0, true)
+        .unwrap()
+        .lease;
+    // Another thread sets APPEND and SYNC in the middle of the call: the call is not changed by it.
+    fx.rig.ok(B, |w| p::set_flags(h, p::APPEND | p::SYNC, w));
+    let before = flushes(&mut fx);
+    fx.part(B, Method::WriteFrom, h, 100, lease, true).unwrap();
+    assert_eq!(
+        flushes(&mut fx),
+        before,
+        "SYNC set in the middle does not apply to the call"
+    );
+    fx.part(B, Method::WriteFrom, h, 100, lease, false).unwrap();
+    assert_eq!(flushes(&mut fx), before, "nor to its last part");
+    // Written where the description was, over the start of the file and nowhere near the end.
+    assert_eq!(fx.rig.stat(B, b"/d/f").unwrap().size, size);
+    // The next call takes the flags the description has now.
+    let r = fx.part(B, Method::WriteFrom, h, 100, 0, false).unwrap();
+    assert_eq!(r.count, 100);
+    assert_eq!(fx.rig.stat(B, b"/d/f").unwrap().size, size + 100);
+    assert!(flushes(&mut fx) > before);
+}
+
+#[test]
+fn with_sync_a_failed_part_makes_the_parts_before_it_durable_and_so_does_every_part_without_a_lease()
+ {
+    let mut fx = fixture();
+    let mut limited = user(1500, 100, &[]);
+    limited.fsize_limit = 300_000 + 5000;
+    fx.rig.bind(60, limited);
+    fx.rig.window(60);
+    let h = fx
+        .rig
+        .open(60, b"/d/f", p::WRITE | p::SYNC | p::APPEND, 0)
+        .unwrap();
+    let flushes = |fx: &mut Fx| fx.rig.fs.device().flushes;
+    // Part 1 goes (4,000 of the 5,000 the limit leaves); part 2 would pass the limit by 3,000: it is
+    // written short (1,000) and stops the call. A part 3 after it finds the limit and fails with 0.
+    let lease = fx
+        .part(60, Method::WriteFrom, h, 4000, 0, true)
+        .unwrap()
+        .lease;
+    let before = flushes(&mut fx);
+    let r = fx
+        .part(60, Method::WriteFrom, h, 4000, lease, true)
+        .unwrap();
+    assert_eq!(
+        (r.count, r.lease),
+        (1000, 0),
+        "a part a limit stopped ends the call"
+    );
+    assert!(
+        flushes(&mut fx) > before,
+        "the call is synced when a limit stops it"
+    );
+    // Now a call whose second part fails with nothing written.
+    let lease = fx.part(60, Method::WriteFrom, h, 100, 0, true);
+    assert_eq!(lease.map(drop), Err(p::code(p::FILE_SIZE_LIMIT)));
+    assert_eq!(fx.rig.server.lease_count(), 0);
+    // A fresh limited user: part 1 fits exactly, part 2 fails with FILE_SIZE_LIMIT; the lease ends
+    // and the node is synced.
+    let mut tight = user(1600, 100, &[]);
+    tight.fsize_limit = 305_000 + 4000;
+    fx.rig.bind(61, tight);
+    fx.rig.window(61);
+    let h2 = fx
+        .rig
+        .open(61, b"/d/f", p::WRITE | p::SYNC | p::APPEND, 0)
+        .unwrap();
+    let lease = fx
+        .part(61, Method::WriteFrom, h2, 4000, 0, true)
+        .unwrap()
+        .lease;
+    assert!(lease != 0);
+    let before = flushes(&mut fx);
+    let r = fx.part(61, Method::WriteFrom, h2, 100, lease, true);
+    assert_eq!(r.map(drop), Err(p::code(p::FILE_SIZE_LIMIT)));
+    assert_eq!(fx.rig.server.lease_count(), 0);
+    assert!(
+        flushes(&mut fx) > before,
+        "the failed part synced what the earlier parts wrote"
+    );
+}
+
+#[test]
+fn a_part_that_found_no_lease_to_take_is_synced_like_a_write() {
+    let mut fx = fixture();
+    let h = fx.rig.open(B, b"/d/f", p::WRITE | p::SYNC, 0).unwrap();
+    // The session has its four leases (on reads of another description): the fifth part is unleased.
+    let hr = fx.rig.open(B, b"/d/f", p::READ, 0).unwrap();
+    for _ in 0..p::LEASES_PER_SESSION {
+        fx.read_lease(B, hr);
+    }
+    let flushes = fx.rig.fs.device().flushes;
+    let before = fx.rig.server.unleased();
+    let r = fx.part(B, Method::PwriteFrom, h, 100, 0, true).unwrap();
+    assert_eq!((r.flags, r.lease), (p::UNLEASED, 0));
+    assert!(
+        fx.rig.fs.device().flushes > flushes,
+        "an unleased part with MORE is synced"
+    );
+    assert_eq!(fx.rig.server.unleased(), before + 1);
+}
+
+#[test]
+fn a_part_that_would_take_a_lease_beyond_the_limits_waits_for_one_to_end() {
+    let mut fx = fixture();
+    let mut leases = Vec::new();
+    for _ in 0..p::LEASES_PER_SESSION {
+        leases.push(fx.read_lease(A, fx.ha));
+    }
+    let taker = part_job(Method::PreadInto, fx.ha, 0, true);
+    let others = [(A, taker.clone()), (A, read_job(fx.ha))];
+    let cands: Vec<Candidate<'_>> = others
+        .iter()
+        .enumerate()
+        .map(|(i, (o, r))| Candidate {
+            id: i,
+            ticket: i as u64 + 1,
+            owner: *o,
+            queued_at: 0,
+            request: r,
+        })
+        .collect();
+    let choice = fx.rig.server.pick(&cands);
+    assert_eq!(
+        choice.run,
+        Some(1),
+        "the plain read goes, the fifth lease waits"
+    );
+    assert_eq!(choice.parked, 0b01);
+    fx.part(A, Method::PreadInto, fx.ha, 10, leases[0], false)
+        .unwrap();
+    let choice = fx.rig.server.pick(&cands);
+    assert_eq!(choice.run, Some(0), "it goes when a lease has ended");
+    assert_eq!(choice.parked, 0);
+}
+
+#[test]
+fn the_parts_of_one_lease_run_one_at_a_time_in_the_order_they_came() {
+    let mut fx = fixture();
+    let lease = fx.write_lease(A, fx.ha);
+    let jobs = [
+        (A, part_job(Method::PwriteFrom, fx.ha, lease, true)),
+        (A, part_job(Method::PwriteFrom, fx.ha, lease, true)),
+    ];
+    let cands: Vec<Candidate<'_>> = jobs
+        .iter()
+        .enumerate()
+        .map(|(i, (o, r))| Candidate {
+            id: i,
+            ticket: i as u64 + 1,
+            owner: *o,
+            queued_at: 0,
+            request: r,
+        })
+        .collect();
+    let choice = fx.rig.server.pick(&cands);
+    assert_eq!((choice.run, choice.parked), (Some(0), 0b10));
+}
+
+#[test]
+fn stat_and_open_with_truncation_wait_for_a_lease_whoever_asks() {
+    let mut fx = fixture();
+    let lease = fx.write_lease(A, fx.ha);
+    // A session the server has not seen holds no descriptions, and a path names the file all the same.
+    assert_eq!(pick(&fx.rig, &[(999, stat_job())]), None);
+    assert_eq!(pick(&fx.rig, &[(999, open_trunc_job())]), None);
+    fx.part(A, Method::PwriteFrom, fx.ha, 10, lease, false)
+        .unwrap();
+    assert_eq!(pick(&fx.rig, &[(999, stat_job())]), Some(0));
+}
+
+#[test]
+fn a_session_that_ran_a_new_image_loses_its_leases_and_its_window() {
+    let mut fx = fixture();
+    let before = fx.rig.server.open_count();
+    let _ = fx.write_lease(B, fx.hb);
+    fx.rig.close(B, fx.hb);
+    assert_eq!(
+        fx.rig.server.open_count(),
+        before,
+        "the lease holds the description"
+    );
+    // The worker ends the leases of the session and then unbinds it (UNBIND of VERIFY_SESSION).
+    fx.rig.server.leases_end_of(&mut fx.rig.fs, B);
+    fx.rig.server.unbind(B);
+    assert_eq!(fx.rig.server.lease_count(), 0);
+    assert!(!fx.rig.server.has_window(B));
+    assert_eq!(fx.rig.server.open_count(), before - 1);
 }

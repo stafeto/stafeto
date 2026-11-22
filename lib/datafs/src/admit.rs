@@ -33,6 +33,13 @@ pub const ROOT_JOBS: usize = 8;
 /// sessions of the process trees (many, each with its share) never leave `datakey` with no job.
 pub const NATIVE_JOBS: usize = 4;
 
+/// The jobs kept for the parts of calls that hold a lease: a part with a live lease number takes a
+/// job outside the shares of its session and its tree and outside the native reserve, so that a
+/// holder is never refused for the jobs that wait for it (readers of the same session or tree parked
+/// behind its write lease would otherwise take its place, the lease would lapse and the call would
+/// be broken). Other requests leave these places free.
+pub const HOLDER_JOBS: usize = 4;
+
 /// The SESSION requests of the root channel that wait for a job over the root's share (a first in,
 /// first out queue): every SESSION arrives with the one root label, so a process of four threads
 /// could keep the share busy and fail the first `/data` call of the others. Over the queue the
@@ -56,6 +63,8 @@ pub struct Load {
     pub tree: usize,
     /// The session is a native client's.
     pub native: bool,
+    /// The request is a part of a call that holds a live lease.
+    pub holder: bool,
 }
 
 /// A job for a request under every rule at once: the table, the session's share, the root's share
@@ -63,12 +72,36 @@ pub struct Load {
 /// VERIFY_SESSION's UNBIND too: a loop of requests of one session or of one tree fills no more than
 /// its share.
 pub fn admit(load: Load) -> Option<usize> {
-    if !leaves_for_native(load.free, load.native, NATIVE_JOBS)
+    // A part of a lease holder takes any free job: the places it is kept are the last ones.
+    if load.holder {
+        return load.free_job;
+    }
+    if load.free <= HOLDER_JOBS
+        || !leaves_for_native(load.free, load.native, NATIVE_JOBS + HOLDER_JOBS)
         || !root_has_room(load.tree, ROOT_JOBS)
     {
         return None;
     }
     job_for(load.free_job, load.mine, SESSION_JOBS)
+}
+
+/// Whether the request is a part (READ_INTO, PREAD_INTO, WRITE_FROM, PWRITE_FROM) that carries the
+/// number of a lease `live` says is held: the request thread admits it outside the shares.
+pub fn holder_part(request: &[u8], live: impl Fn(u32) -> bool) -> bool {
+    let mut r = proto_wire::Reader::new(request);
+    let Ok(header) = proto_wire::Header::read(&mut r) else {
+        return false;
+    };
+    if header.version != p::VERSION {
+        return false;
+    }
+    let Some(method) = p::Method::from_number(header.method) else {
+        return false;
+    };
+    match p::read_part(method, r) {
+        Ok(part) => part.part.lease != 0 && live(part.part.lease),
+        Err(_) => false,
+    }
 }
 
 /// What the request thread does with a request of the root channel that asks for a session.
@@ -290,6 +323,60 @@ pub const fn closers(sessions: usize, passes: usize, jobs: usize) -> usize {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_part_of_a_live_lease_is_admitted_outside_the_shares_and_the_places_are_kept() {
+        let load = |free: usize, mine, tree, native, holder| Load {
+            free_job: (free > 0).then_some(0),
+            free,
+            mine,
+            tree,
+            native,
+            holder,
+        };
+        // A thread writes in parts while four others of its session read the file and wait: the
+        // session has its four jobs in flight, the tree its eight, and the holder's next part still
+        // gets a job, as does the next part when the table is down to the places kept for holders.
+        assert!(admit(load(10, SESSION_JOBS, ROOT_JOBS, false, false)).is_none());
+        assert!(admit(load(10, SESSION_JOBS, ROOT_JOBS, false, true)).is_some());
+        assert!(admit(load(HOLDER_JOBS, SESSION_JOBS, ROOT_JOBS, false, true)).is_some());
+        assert!(admit(load(1, SESSION_JOBS, ROOT_JOBS, false, true)).is_some());
+        // With no job free there is none to give.
+        assert!(admit(load(0, 0, 0, false, true)).is_none());
+        // The places kept for the holders are not given to other requests, native clients included.
+        assert!(admit(load(HOLDER_JOBS, 0, 0, false, false)).is_none());
+        assert!(admit(load(HOLDER_JOBS, 0, 0, true, false)).is_none());
+        assert!(admit(load(HOLDER_JOBS + 1, 0, 0, true, false)).is_some());
+        assert!(admit(load(HOLDER_JOBS + NATIVE_JOBS, 0, 0, false, false)).is_none());
+        assert!(admit(load(HOLDER_JOBS + NATIVE_JOBS + 1, 0, 0, false, false)).is_some());
+    }
+
+    #[test]
+    fn a_request_is_a_holder_part_when_it_carries_the_number_of_a_live_lease() {
+        let part = |lease: u32| {
+            let mut w = proto_wire::Writer::new();
+            let head = p::Part {
+                handle: 1,
+                count: 10,
+                offset: 0,
+                cell: 0,
+                flags: p::MORE,
+                lease,
+            };
+            p::write_from(&head, &[], &mut w).unwrap();
+            w.as_bytes().to_vec()
+        };
+        assert!(holder_part(&part(0x0001_0105), |n| n == 0x0001_0105));
+        assert!(
+            !holder_part(&part(0x0001_0105), |_| false),
+            "a number that is not live"
+        );
+        assert!(!holder_part(&part(0), |_| true), "no lease");
+        let mut w = proto_wire::Writer::new();
+        p::read(1, 10, &mut w).unwrap();
+        assert!(!holder_part(w.as_bytes(), |_| true), "not a part");
+        assert!(!holder_part(&[1, 2, 3], |_| true));
+    }
+
+    #[test]
     fn only_a_memory_object_with_both_map_rights_is_a_window() {
         use abi::{ObjectKind as K, Rights as R};
         let rw = R(R::MAP_READ.0 | R::MAP_WRITE.0 | R::TRANSFER.0);
@@ -449,6 +536,7 @@ mod tests {
                 mine: in_flight,
                 tree: in_flight,
                 native: false,
+                holder: false,
             };
             if admit(load).is_some() {
                 in_flight += 1;
@@ -469,6 +557,7 @@ mod tests {
                 mine: 0,
                 tree,
                 native: false,
+                holder: false,
             };
             if admit(load).is_some() {
                 tree += 1;
@@ -483,6 +572,7 @@ mod tests {
             mine: 0,
             tree: 0,
             native,
+            holder: false,
         };
         assert!(admit(load(false, ROOT_JOBS)).is_some());
         assert!(admit(load(true, ROOT_JOBS)).is_some());

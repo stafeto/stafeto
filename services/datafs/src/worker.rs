@@ -684,6 +684,7 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                     );
                 }
             }
+            server.set_job_queued(job.queued_at.load(Acquire));
             #[cfg(feature = "steps")]
             let began = rt::time::now();
             #[cfg(feature = "steps")]
@@ -791,6 +792,14 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             if job.kind == REQUEST {
                 longest_job(request, began);
             }
+            // The gap of a lease a part ran under counts from the answer to it, and the request
+            // thread learns which leases are live.
+            server.leases_stamp(now_ns());
+            let mut live = [0u32; proto_data::LEASES];
+            server.lease_numbers(&mut live);
+            for (slot, number) in live.iter().zip(LIVE_LEASES.iter()) {
+                number.store(*slot, Release);
+            }
             // A creation that found the estimate at the cap counted the pairs: the line tells it.
             tell_pairs();
             #[cfg(feature = "steps")]
@@ -803,6 +812,8 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             let _ = sys::notify(wake, 1);
         }
         // Jobs that wait for a lease run when it lapses: the worker wakes at the first expiry.
+        // (Without the timer the heartbeat of the request thread wakes the worker for a job that
+        // waits: a lapse is seen within a beat.)
         if let (Some(timer), Some(at)) = (&lease_timer, server.next_lease_expiry()) {
             let _ = sys::timer_set(timer, at.max(now_ns() + 1));
         }
@@ -1115,9 +1126,7 @@ impl core::fmt::Display for AbortedTries {
 
 /// The drain step for the jobs queued now, after the time since the stop notice.
 fn stop_decision() -> Drain {
-    let queued = (0..JOBS)
-        .filter(|&i| state(i).load(Acquire) == QUEUED)
-        .count();
+    let queued = (0..JOBS).filter(|&i| waiting_job(i)).count();
     // 0 is a stop time not stored yet: no time has passed.
     let at = STOP_AT.load(Acquire);
     let since = if at == 0 {
@@ -1169,18 +1178,17 @@ fn next_job(server: &mut Server, volume: &mut Option<Volume>) -> Option<usize> {
     server.set_mono(now_ns());
     if STOPPING.load(Acquire) {
         server.leases_end_all(fs);
-    } else {
-        server.leases_sweep(fs);
     }
     let mut seen = [datafs::server::Candidate {
         id: 0,
         ticket: 0,
         owner: 0,
+        queued_at: 0,
         request: &[],
     }; datafs::server::CANDIDATES_MAX];
     let mut n = 0;
     for i in 0..JOBS {
-        if state(i).load(Acquire) == QUEUED && n < seen.len() {
+        if waiting_job(i) && n < seen.len() {
             // SAFETY: a QUEUED job's request and ticket are set before the state is released, and
             // the main thread does not touch it until it is DONE.
             let job = unsafe { &*job(i) };
@@ -1188,19 +1196,38 @@ fn next_job(server: &mut Server, volume: &mut Option<Volume>) -> Option<usize> {
                 id: i,
                 ticket: job.ticket.load(Acquire),
                 owner: job.owner,
+                queued_at: job.queued_at.load(Acquire),
                 request: &job.request[..job.request_len],
             };
             n += 1;
         }
     }
-    server.pick(&seen[..n])
+    // The leases whose time is over end first, except those whose next part is queued.
+    if !STOPPING.load(Acquire) {
+        server.leases_sweep(fs, &seen[..n]);
+    }
+    let choice = server.pick(&seen[..n]);
+    // The jobs that wait for a lease are marked, so that the request thread and the heartbeat see them.
+    for (k, c) in seen[..n].iter().enumerate() {
+        let wanted = if choice.parked & (1 << k) != 0 {
+            PARKED
+        } else {
+            QUEUED
+        };
+        let at = state(c.id);
+        let now = at.load(Acquire);
+        if (now == QUEUED || now == PARKED) && now != wanted {
+            at.store(wanted, Release);
+        }
+    }
+    choice.run
 }
 
 /// The oldest QUEUED job.
 fn oldest() -> Option<usize> {
     let mut best: Option<(u64, usize)> = None;
     for i in 0..JOBS {
-        if state(i).load(Acquire) == QUEUED {
+        if waiting_job(i) {
             // SAFETY: a QUEUED job's ticket is set before the state is released.
             let ticket = unsafe { (*job(i)).ticket.load(Acquire) };
             if best.is_none_or(|(t, _)| ticket < t) {

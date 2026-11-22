@@ -38,7 +38,7 @@ mod lease;
 mod mount;
 mod names;
 
-pub use lease::{CANDIDATES_MAX, Candidate, LEASE_GAP_NS};
+pub use lease::{CANDIDATES_MAX, Candidate, LEASE_CLIENT_MAX_NS, LEASE_GAP_NS, Pick};
 pub use mount::{Mounted, Recovered, StartWork, Step, bump_epoch, ensure_orphans, recover_orphans};
 use names::{denied, entry_of, split, stat_record};
 
@@ -340,6 +340,10 @@ pub struct Server {
     /// The leases on files (`lease.rs`) and the monotonic clock of the worker, in nanoseconds.
     leases: [lease::Lease; p::LEASES],
     mono: u64,
+    /// The instant the request thread queued the job that runs, and the parts that answered
+    /// `UNLEASED` so far.
+    job_queued: u64,
+    unleased: u64,
     #[cfg(test)]
     pub(crate) fail_reopen: bool,
     #[cfg(test)]
@@ -560,6 +564,8 @@ impl Server {
             orphan_seq: 0,
             leases: [lease::Lease::EMPTY; p::LEASES],
             mono: 0,
+            job_queued: 0,
+            unleased: 0,
             #[cfg(test)]
             fail_reopen: false,
             #[cfg(test)]
@@ -1061,7 +1067,15 @@ impl Server {
                 let data = r.bytes(r.left())?;
                 let pos = self.descriptions[di].pos;
                 let append = self.descriptions[di].append;
-                let (at, n) = self.write_at(fs, di, &caller, pos, append, data, true)?;
+                let (at, n) = self.write_at(
+                    fs,
+                    di,
+                    &caller,
+                    pos,
+                    append,
+                    data,
+                    self.descriptions[di].sync,
+                )?;
                 self.descriptions[di].pos = at + n as u32;
                 w.u32(n as u32)
             }
@@ -1073,7 +1087,15 @@ impl Server {
                     .ok()
                     .filter(|&o| o <= i32::MAX as u32)
                     .ok_or_else(|| p::code(p::TOO_BIG))?;
-                let (_, n) = self.write_at(fs, di, &caller, offset, false, data, true)?;
+                let (_, n) = self.write_at(
+                    fs,
+                    di,
+                    &caller,
+                    offset,
+                    false,
+                    data,
+                    self.descriptions[di].sync,
+                )?;
                 w.u32(n as u32)
             }
             Method::ReadInto | Method::PreadInto | Method::WriteFrom | Method::PwriteFrom => {
@@ -1579,8 +1601,8 @@ impl Server {
     /// A part with a cell in a session that gave no window is NO_WINDOW and touches nothing, a lease
     /// included. The first part of a call (`MORE`, lease 0) takes a lease on the file when a limit
     /// allows (else the answer says `UNLEASED` and the part is a call of its own); the next parts
-    /// carry its number. A part with the number of a lease that ended or lapsed runs as a call of its
-    /// own and the answer says `LAPSED`. The lease ends with the last part (no `MORE`), a part a limit
+    /// carry its number. A part with the number of a lease that ended or lapsed is not run: the answer
+    /// says `LAPSED` and 0 bytes (`lease.rs`). The lease ends with the last part (no `MORE`), a part a limit
     /// stopped, a part that failed, RELEASE, and the end of the session; `SYNC` of the description
     /// runs after the part that ended the call.
     #[allow(clippy::too_many_arguments)]
@@ -1602,17 +1624,23 @@ impl Server {
         let more = head.flags & p::MORE != 0;
         let writing = matches!(method, Method::WriteFrom | Method::PwriteFrom);
         // The lease the part runs under, or that it found over.
-        let (mut held, mut flags) = (None, 0);
+        let (mut held, mut flags): (Option<usize>, u32) = (None, 0);
         if head.lease != 0 {
             match self.lease_lookup(head.lease) {
                 lease::Number::Stale => return Err(p::code(p::STALE)),
                 lease::Number::Never => return Err(bad_handle()),
-                lease::Number::Ended => flags |= p::LAPSED,
+                // The lease lapsed or ended: the part is not run, so that a call is never done in
+                // pieces with another call's work between them. The answer says `LAPSED` and 0 bytes;
+                // the layer returns the sum of the parts done.
+                lease::Number::Ended => {
+                    return p::write_part_reply(0, p::LAPSED, 0, &[], w);
+                }
                 lease::Number::Live(slot) => {
                     if self.leases[slot].owner != label || self.leases[slot].write != writing {
                         return Err(bad_handle());
                     }
                     held = Some(slot);
+                    self.lease_client_gap(slot);
                 }
             }
         }
@@ -1648,7 +1676,10 @@ impl Server {
                 .flatten();
             match taken {
                 Some(number) => held = self.lease_slot(number),
-                None => flags |= p::UNLEASED,
+                None => {
+                    flags |= p::UNLEASED;
+                    self.unleased += 1;
+                }
             }
         }
         let done = self.part_work(
@@ -1666,7 +1697,17 @@ impl Server {
         if let Some(slot) = held {
             match done {
                 Ok(n) if more && n == count => self.lease_renew(slot),
-                _ => self.lease_end(fs, slot),
+                Ok(_) => self.lease_end(fs, slot),
+                Err(_) => {
+                    // A part that failed with nothing written ends the call: what the parts
+                    // before it wrote is made durable now when the call has `SYNC`, since the
+                    // layer returns their sum and no later part will.
+                    if self.leases[slot].sync && self.leases[slot].write {
+                        let ni = usize::from(self.leases[slot].node);
+                        let _ = self.sync_node(fs, ni);
+                    }
+                    self.lease_end(fs, slot);
+                }
             }
         }
         done.map(drop)
@@ -1709,16 +1750,21 @@ impl Server {
                 }
             };
             let d = self.descriptions[di];
-            let (pos, append) = match offset {
-                Some(at) => (at, false),
-                None => (d.pos, d.append),
+            // A call takes the `APPEND` and `SYNC` of its description at its first part.
+            let (append, sync) = match held {
+                Some(slot) => (self.leases[slot].append, self.leases[slot].sync),
+                None => (d.append, d.sync),
             };
-            // `SYNC` waits for the part that ends the call.
-            let (at, n) = self.write_at(fs, di, caller, pos, append, data, !more)?;
+            let pos = offset.unwrap_or(d.pos);
+            let append = append && offset.is_none();
+            // `SYNC` waits for the part that ends the call; a part that holds no lease (a call of
+            // one part, or one that found no lease to take) is synced as a write is.
+            let last = !more || held.is_none();
+            let (at, n) = self.write_at(fs, di, caller, pos, append, data, sync && last)?;
             if offset.is_none() {
                 self.descriptions[di].pos = at + n as u32;
             }
-            if more && n < count && n > 0 && d.sync {
+            if more && n < count && n > 0 && sync && !last {
                 self.sync_node(fs, usize::from(d.object))?;
             }
             let ends = !more || n < count;
@@ -1784,7 +1830,7 @@ impl Server {
         pos: u32,
         append: bool,
         data: &[u8],
-        last: bool,
+        sync: bool,
     ) -> Res<(u32, usize)> {
         let d = self.descriptions[di];
         if d.kind != Kind::File || !d.write {
@@ -1833,7 +1879,7 @@ impl Server {
             self.nodes[ni].wrote_at = self.now;
             // A description with `SYNC` makes the write durable before the reply; the parts of one
             // call (`last` false) leave it to the part that ends the call.
-            if d.sync && last {
+            if sync {
                 self.sync_node(fs, ni)?;
             }
         }
