@@ -233,16 +233,36 @@ impl<const N: usize> Pool<N> {
             .find(|r| !r.retired && r.label == label && r.key == key)
             .map(|r| &r.set)
     }
-    pub fn remove(&mut self, label: u64, key: u64) -> Option<WatchSet> {
-        let record = self
-            .list
-            .iter_mut()
-            .find(|r| r.is_some_and(|r| !r.retired && r.label == label && r.key == key))?
-            .take()?;
+    /// The place of the live record, from one scan of the places.
+    pub fn place(&self, label: u64, key: u64) -> Option<usize> {
+        self.list.iter().position(|r| {
+            r.as_ref()
+                .is_some_and(|r| !r.retired && r.label == label && r.key == key)
+        })
+    }
+    /// Takes the record at `at` (from `insert` or `place`, in the same
+    /// step) off its place.
+    pub fn remove_at(&mut self, at: usize) -> Option<WatchSet> {
+        let record = self.list[at].take()?;
         if record.open() {
             self.open -= 1;
         }
         Some(record.set)
+    }
+    pub fn remove(&mut self, label: u64, key: u64) -> Option<WatchSet> {
+        let at = self.place(label, key)?;
+        self.remove_at(at)
+    }
+    /// How many of the unique queues of the record at `at` are subscribed
+    /// so far: the first ones of `unique_queues`, as `portion` takes them.
+    pub fn registered(&self, at: usize) -> usize {
+        self.list[at]
+            .as_ref()
+            .map_or(0, |r| usize::from(r.registered))
+    }
+    /// The queues of the record at `at`.
+    pub fn queues_at(&self, at: usize) -> Option<&[u8; MAX]> {
+        self.list[at].as_ref().map(|r| &r.queues)
     }
     pub fn queues(&self, label: u64, key: u64) -> Option<&[u8; MAX]> {
         self.list
@@ -271,7 +291,7 @@ impl<const N: usize> Pool<N> {
         let slot = self
             .list
             .iter_mut()
-            .find(|r| r.is_some_and(|r| r.retired))?;
+            .find(|r| r.as_ref().is_some_and(|r| r.retired))?;
         let r = slot.as_mut()?;
         let result = (r.label, r.key, u32::from(r.queues[usize::from(r.cleaned)]));
         r.cleaned += 1;
@@ -326,6 +346,31 @@ mod tests {
         pool.refuse(1, 2);
         pool.retire(1);
         pool.retire(2);
+        assert_eq!(pool.open, 0);
+    }
+
+    #[test]
+    fn registered_counts_the_queues_a_record_subscribed() {
+        let mut pool = Pool::<3>::new();
+        let mut set = WatchSet::new();
+        set.len = 3;
+        let mut queues = [0; MAX];
+        queues[0] = 5;
+        queues[1] = 5;
+        queues[2] = 9;
+        let a = pool.insert(1, 1, &set, &queues).unwrap();
+        let b = pool.insert(1, 2, &set, &queues).unwrap();
+        assert_eq!(pool.wanted(a), 2);
+        assert_eq!(pool.registered(a), 0);
+        assert_eq!(pool.place(1, 2), Some(b));
+        assert_eq!(pool.place(1, 3), None);
+        assert_eq!(pool.queues_at(b).unwrap()[2], 9);
+        pool.complete(a);
+        assert_eq!(pool.registered(a), 2);
+        assert_eq!(pool.registered(2), 0, "a free place has none");
+        assert!(pool.remove_at(b).is_some());
+        assert!(pool.remove_at(b).is_none());
+        assert_eq!(pool.place(1, 2), None);
         assert_eq!(pool.open, 0);
     }
 
