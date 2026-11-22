@@ -184,7 +184,14 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # setitimer's old value): a passed deadline that the helper has not reloaded
 # shows the rest of the current interval, a one-shot timer 1 ns; tagged
 # pin-41301394.
-COMMIT = "41301394daef002c6e94e9e5152667893b24a4ca"
+# C++ runtime (libc++, libc++abi, libunwind): strtod_l, strtof_l and strtold_l,
+# syscall(SYS_futex) with FUTEX_WAIT and FUTEX_WAKE (private or shared) over
+# the layer's waits by address, ElfW in link.h, __dso_handle for a static
+# program; exit runs the destructors of static objects and the thread-local
+# objects of the exiting thread (atexit shares the list of __cxa_atexit and
+# runs in one order with them; __cxa_finalize holds no lock during a call);
+# tagged pin-449875aa.
+COMMIT = "449875aa74709215ba397efa98ce48c92af6f82d"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
