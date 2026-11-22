@@ -2549,7 +2549,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-data-posix-crash.img"
         | "boot-data-posix-verify.img"
         | "boot-data-posix-restart.img"
-        | "boot-data-posix-throughput.img" => {
+        | "boot-data-posix-throughput.img"
+        | "boot-data-posix-fast.img"
+        | "boot-data-posix-atomic.img"
+        | "boot-data-posix-steps.img" => {
             let mut files = vec![
                 dir("/bin"),
                 file("/bin/posix-data", 0o755, ROOT, "posix-data"),
@@ -3701,6 +3704,9 @@ mod tests {
             "boot-data-posix-verify.img",
             "boot-data-posix-restart.img",
             "boot-data-posix-throughput.img",
+            "boot-data-posix-fast.img",
+            "boot-data-posix-atomic.img",
+            "boot-data-posix-steps.img",
             "boot-posix-window.img",
             "boot-cxx-probe.img",
             "boot-wfc.img",

@@ -18,7 +18,11 @@ bench = false
 # `STAFETO_DATAFS_CRASH_AT` names was written (`cargo xtask data-crash`): that write is torn at
 # the sector, the line `datafs: crash point N` is printed, and nothing is written again.
 [features]
-steps = ["rt/step-stats"]
+steps = ["rt/step-stats", "count"]
+# `count`: the service says how many reads, writes and flushes the disk has had (`datafs: disk reads
+# R writes W flushes F`) when it has been quiet for 100 ms after a change, for the probe of the
+# reads of a block (`cargo xtask data-posix fast`).
+count = []
 crash = []
 # The probe of a restart of the service: an OPEN of the name `.die` at the root ends the service with the
 # exit code 1 (init starts it again), so that a program can see the descriptors of the old instance
@@ -26,6 +30,13 @@ crash = []
 probe-restart = []
 # The stop handler exits at once (the probe of the stop handlers must catch it).
 break-datafs-stop = []
+# The deliberate breaks of the probes of the service (`STAFETO_DATA_POSIX_BREAK`, `cargo xtask
+# data-posix atomic`): the features of lib/datafs that the probes of the layer must catch, and
+# `break-datafs-cell-kept`: a cell stays mapped in the service after its job.
+break-datafs-lease-hold = ["datafs/break-datafs-lease-hold"]
+break-datafs-lease-reader = ["datafs/break-datafs-lease-reader"]
+break-datafs-append-end = ["datafs/break-datafs-append-end"]
+break-datafs-cell-kept = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }
