@@ -136,6 +136,17 @@ pub fn pwrite(_handle: u32, _offset: u64, _bytes: &[u8]) -> Result<usize, i32> {
     Err(EBADF)
 }
 
+pub fn readv(_handle: u32, _offset: Option<u64>, _iov: &mut [&mut [u8]]) -> Result<usize, i32> {
+    Err(EBADF)
+}
+
+pub fn writev(_handle: u32, _offset: Option<u64>, _iov: &[&[u8]]) -> Result<usize, i32> {
+    Err(EBADF)
+}
+
+/// A jump out of a handler: this build has no calls of parts to give up.
+pub fn abandon_frames(_target: entries::Frame) {}
+
 pub fn truncate(_handle: u32, _size: u64) -> Result<(), i32> {
     Err(EBADF)
 }

@@ -242,6 +242,10 @@ pub enum Kind {
     /// The buffer of the large reads of files: the memory object the file service fills in
     /// one step of a read (`READ_FD_INTO`), writable, never shared with a child.
     FileBuffer,
+    /// The window of the process's session with the data file service (`posix-abi` `datawin`): the
+    /// memory object whose two cells carry the parts of the large calls on `/data`, writable, never
+    /// shared with a child, refused by `munmap`, `mprotect` and `MAP_FIXED`.
+    DataWindow,
     /// A piece of the arena of copies of immutable files (`posix-abi` `filecache`): up to eight
     /// of them, each a memory object of the process's own, writable, never shared with a child.
     FileCache,
@@ -1113,6 +1117,32 @@ mod tests {
         // A range that ends inside the hole frees what lies below its end.
         assert_eq!(run(&mut make(), 0x1C000, 2), (vec![(0x1D000, 1)], 2));
         assert_eq!(run(&mut make(), 0x1E000, 1), (vec![(0x1D000, 2)], 1));
+    }
+
+    /// The data window piece follows the same rule as the file buffer piece.
+    #[test]
+    fn the_data_window_piece_is_special_and_stays_out_of_a_child() {
+        let mut map = with_screen();
+        let mut object = Object::new(11, false, None);
+        object.kind = Kind::DataWindow;
+        map.push(0x4900_0000, 32, Access::ReadWrite, 0, object)
+            .unwrap();
+        let child: Vec<usize> = map.inherited().map(|p| p.address).collect();
+        assert_eq!(child, [0x1000_0000, 0x3000_0000]);
+        assert_eq!(map.kind_piece(Kind::DataWindow), Some((0x4900_0000, 32)));
+        assert_eq!(map.kind_piece(Kind::FileBuffer), None);
+        let at = map.find(0x4900_0000).unwrap();
+        assert_eq!(map.unmap(at, 0x4900_0000, 32), Err(Refused::Special));
+        assert_eq!(
+            map.protect(at, 0x4900_0000, 32, Access::Read),
+            Err(Refused::Special)
+        );
+        let (address, pages, object) = map.unmap_kind(Kind::DataWindow).unwrap();
+        assert_eq!(
+            (address, pages, object.handle, object.kind),
+            (0x4900_0000, 32, 11, Kind::DataWindow)
+        );
+        assert!(map.unmap_kind(Kind::DataWindow).is_none());
     }
 
     /// The file buffer piece (the cells of the large reads of files) follows the same rule, and

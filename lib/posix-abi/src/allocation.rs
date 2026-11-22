@@ -369,6 +369,7 @@ pub unsafe fn after_fork(
     let display = state.map.display_piece();
     let network = state.map.kind_piece(posix_map::Kind::NetBuffer);
     let files = state.map.kind_piece(posix_map::Kind::FileBuffer);
+    let data_window = state.map.kind_piece(posix_map::Kind::DataWindow);
     // The arena of the file cache: up to eight pieces (filecache::PIECES_MAX).
     let mut cache = [(0usize, 0usize); 8];
     for (slot, piece) in cache
@@ -395,7 +396,7 @@ pub unsafe fn after_fork(
         *slot = piece;
     }
     state.map.forget();
-    for (address, pages) in [display, network, files]
+    for (address, pages) in [display, network, files, data_window]
         .into_iter()
         .flatten()
         .chain(cache.into_iter().filter(|piece| piece.1 != 0))

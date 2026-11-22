@@ -38,13 +38,17 @@
 //!   stays true. A forked child shares it; an exec or a spawn opens it again at the first path call.
 //! * Writes. `open` takes O_CREAT, O_EXCL, O_TRUNC, O_APPEND and O_SYNC (`posix_fs::data::open_plan`:
 //!   an open for reading with O_TRUNC is an open for writing of its own that truncates and closes,
-//!   then the reading open), the creation mode has the umask applied here. `write` and `pwrite` go
-//!   in messages of at most 1,012 bytes, each one atomic against the other writers and readers of
-//!   the file, and the end of an O_APPEND file is taken for each message: a write of more than one
-//!   message can have another writer's bytes between its messages (the service has no longer
-//!   atomic unit). The result is the sum of the messages that went; a failure after some (ENOSPC,
-//!   EFBIG, EINTR) is that sum, the next call meets the error again, and the first message alone
-//!   fails with the error (the limit of the file size gives SIGXFSZ then). `rename` takes two
+//!   then the reading open), the creation mode has the umask applied here. A `write`, `pwrite`,
+//!   `read` or `pread` of up to one message (1,012 bytes written, 1,016 read) is one request, atomic
+//!   against the other calls on the file. A larger call, and a `readv` or `writev` of more than one
+//!   message in all, goes in parts of a cell of the process's window (`datawin`: 64 KiB each) under a
+//!   lease the first part takes, so the whole call is atomic against the other calls on the file and
+//!   the end of an O_APPEND file is taken once for it; with no free cell the parts go in messages
+//!   (about 1,000 bytes) under the same lease. The result is the sum of the parts: a failure after
+//!   some of them is that sum (the next call meets the error again: ENOSPC, EFBIG), and the error of
+//!   the first alone when none went (the limit of the file size gives SIGXFSZ then). A lease that
+//!   lapsed (the call stopped between parts for more than a second while others wait) ends the call
+//!   short, with the bytes of the parts before it. `rename` takes two
 //!   names of the volume (EXDEV across the mount), `link` of a file is EMLINK (a name of the volume
 //!   has one), `symlink`, `mkfifo` and `mknod` are EPERM, `unlink` of a directory is EISDIR, and
 //!   record locks are ENOLCK. A program is never run from the volume (EACCES).
@@ -74,6 +78,7 @@ macro_rules! why {
         }
     };
 }
+use crate::datawin;
 use core::ffi::c_int;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use posix_fs::data::{self as pure, errno_of};
@@ -147,6 +152,8 @@ pub unsafe fn after_fork(session: Option<Handle<Channel>>) {
         CWD_CHECKED.store(false, Ordering::Release);
     }
     LISTINGS.forget_all();
+    // The child asks for a window of its own.
+    datawin::after_fork();
 }
 
 /// The session with the data file service, if the process has one: for the requests that need no
@@ -371,14 +378,32 @@ fn call(request: &[u8]) -> Result<Answer, i32> {
 /// `call`; with `take` false a process with no session fails with EIO at once and takes none (the
 /// close of a description needs none).
 fn call_with(request: &[u8], take: bool) -> Result<Answer, i32> {
+    call_status(request, take).map_err(|failed| failed.errno)
+}
+
+/// Why a call failed: the errno, and the status of the reply that gave it (0 for a failure of the
+/// layer's own).
+struct Failed {
+    errno: i32,
+    status: u32,
+}
+
+impl Failed {
+    const fn local(errno: i32) -> Failed {
+        Failed { errno, status: 0 }
+    }
+}
+
+/// `call_with`, with the status of a failed reply kept (a part needs NO_WINDOW).
+fn call_status(request: &[u8], take: bool) -> Result<Answer, Failed> {
     let mut bound = false;
     let mut reborn = false;
     let mut tries = 0;
     loop {
         let session = if take {
-            ensure()?
+            ensure().map_err(Failed::local)?
         } else {
-            session().ok_or(EIO)?
+            session().ok_or(Failed::local(EIO))?
         };
         let channel = Handle::<Channel>::borrowed(session);
         let reply = match rt::sys::send(&channel, request) {
@@ -393,17 +418,17 @@ fn call_with(request: &[u8], take: bool) -> Result<Answer, i32> {
                     reborn = true;
                     continue;
                 }
-                return Err(EIO);
+                return Err(Failed::local(EIO));
             }
             Err(error) => {
                 why!("request not sent to the session: {error:?}");
-                return Err(EIO);
+                return Err(Failed::local(EIO));
             }
         };
         let mut buffer = [0; MESSAGE_MAX];
         let bytes = reply.bytes(&mut buffer);
         let mut r = Reader::new(bytes);
-        let status = r.u32().map_err(|_| EIO)?;
+        let status = r.u32().map_err(|_| Failed::local(EIO))?;
         if status == 0 {
             let mut answer = Answer {
                 bytes: [0; MESSAGE_MAX],
@@ -417,20 +442,23 @@ fn call_with(request: &[u8], take: bool) -> Result<Answer, i32> {
         }
         if status == p::NOT_BOUND && !bound {
             bound = true;
-            bind(session)?;
+            bind(session).map_err(Failed::local)?;
             continue;
         }
         if status == busy_code() && tries < BUSY_TRIES {
             tries += 1;
-            pause()?;
+            pause().map_err(Failed::local)?;
             continue;
         }
         // The limit of the process's file size: the layer sends SIGXFSZ for it once the locks are
         // let go (`finish_file_size` of the call that asked).
         if status == p::FILE_SIZE_LIMIT {
-            return Err(crate::FILE_SIZE_REFUSAL);
+            return Err(Failed::local(crate::FILE_SIZE_REFUSAL));
         }
-        return Err(errno_of(status));
+        return Err(Failed {
+            errno: errno_of(status),
+            status,
+        });
     }
 }
 
@@ -773,18 +801,41 @@ pub fn close_description(handle: u32) {
     }
 }
 
-/// read of the description at its position: the bytes, 0 at the end of the file.
+/// read of the description at its position: the bytes, 0 at the end of the file. A read of more
+/// than one message (`MAX_READ`) goes in parts of a cell (`transfer`), the whole call atomic against
+/// the other calls on the file; a shorter one is one READ.
 pub fn read(handle: u32, out: &mut [u8]) -> Result<usize, i32> {
-    let count = out.len().min(p::MAX_READ) as u32;
+    if !pure::fits_one_message(out.len(), p::MAX_READ) {
+        return transfer(handle, None, &mut Reading(Dst::One(out)));
+    }
+    let count = out.len() as u32;
     let answer = ask(|w| p::read(handle, count, w))?;
     copy_bytes(&answer, out)
 }
 
-/// pread at `offset`, the position of the description untouched.
+/// pread at `offset`, the position of the description untouched; in parts as `read`.
 pub fn pread(handle: u32, offset: u64, out: &mut [u8]) -> Result<usize, i32> {
-    let count = out.len().min(p::MAX_READ) as u32;
+    if !pure::fits_one_message(out.len(), p::MAX_READ) {
+        return transfer(handle, Some(offset), &mut Reading(Dst::One(out)));
+    }
+    let count = out.len() as u32;
     let answer = ask(|w| p::pread(handle, count, offset, w))?;
     copy_bytes(&answer, out)
+}
+
+/// readv at the position of the description (`offset` None) or at `offset` (preadv): the bytes
+/// read into the buffers in order. One call to the service whatever the vector, atomic as `read`.
+pub fn readv(handle: u32, offset: Option<u64>, iov: &mut [&mut [u8]]) -> Result<usize, i32> {
+    let total = pure::total_len_mut(iov);
+    if !pure::fits_one_message(total, p::MAX_READ) {
+        return transfer(handle, offset, &mut Reading(Dst::Many(iov)));
+    }
+    let mut bytes = [0u8; p::MAX_READ];
+    let n = match offset {
+        None => read(handle, &mut bytes[..total])?,
+        Some(at) => pread(handle, at, &mut bytes[..total])?,
+    };
+    Ok(pure::scatter(iov, 0, &bytes[..n]))
 }
 
 /// The bytes after the count of a read reply.
@@ -832,13 +883,16 @@ pub fn fstat(handle: u32) -> Result<proto_fs::NodeInfo, i32> {
 
 // ---------------------------------------------------------------- writes
 
-/// write to the description at its position, in messages of the service's largest size: the bytes
-/// written. A message the service took short ends the write; a failure after some messages is
-/// their sum (the next call meets it again: ENOSPC, EFBIG), and the error of the first alone when
-/// none went (FILE_SIZE_REFUSAL is the layer's mark for SIGXFSZ). Each message is atomic against
-/// other writers of the file (and the end of an O_APPEND write is taken per message); a write of
-/// more than one message can have another writer's bytes between its messages.
+/// write to the description at its position: the bytes written. A write of up to one message is
+/// one WRITE; a larger one goes in parts of a cell (`transfer`), the whole call atomic against the
+/// other calls on the file, and the end of an O_APPEND file taken once for it. A part the service
+/// took short ends the write; a failure after some parts is their sum (the next call meets it
+/// again: ENOSPC, EFBIG), and the error of the first alone when none went (FILE_SIZE_REFUSAL is
+/// the layer's mark for SIGXFSZ).
 pub fn write(handle: u32, bytes: &[u8]) -> Result<usize, i32> {
+    if !pure::fits_one_message(bytes.len(), pure::WRITE_MAX) {
+        return transfer(handle, None, &mut Writing(Src::One(bytes)));
+    }
     let mut split = pure::Splitter::new(bytes.len(), pure::WRITE_MAX);
     while let Some(n) = split.next_len() {
         let at = split.at();
@@ -856,8 +910,11 @@ pub fn write(handle: u32, bytes: &[u8]) -> Result<usize, i32> {
     Ok(split.written())
 }
 
-/// pwrite at `offset`, the position of the description untouched, in messages as `write`.
+/// pwrite at `offset`, the position of the description untouched, in parts as `write`.
 pub fn pwrite(handle: u32, offset: u64, bytes: &[u8]) -> Result<usize, i32> {
+    if !pure::fits_one_message(bytes.len(), pure::PWRITE_MAX) {
+        return transfer(handle, Some(offset), &mut Writing(Src::One(bytes)));
+    }
     let mut split = pure::Splitter::new(bytes.len(), pure::PWRITE_MAX);
     while let Some(n) = split.next_len() {
         let at = split.at();
@@ -873,6 +930,351 @@ pub fn pwrite(handle: u32, offset: u64, bytes: &[u8]) -> Result<usize, i32> {
         }
     }
     Ok(split.written())
+}
+
+/// writev at the position of the description (`offset` None) or at `offset` (pwritev): all the
+/// buffers as one call, atomic as `write`.
+pub fn writev(handle: u32, offset: Option<u64>, iov: &[&[u8]]) -> Result<usize, i32> {
+    let total = pure::total_len(iov);
+    let one = match offset {
+        None => pure::WRITE_MAX,
+        Some(_) => pure::PWRITE_MAX,
+    };
+    if !pure::fits_one_message(total, one) {
+        return transfer(handle, offset, &mut Writing(Src::Many(iov)));
+    }
+    let mut bytes = [0u8; pure::WRITE_MAX];
+    let n = pure::gather(iov, 0, &mut bytes[..total]);
+    match offset {
+        None => write(handle, &bytes[..n]),
+        Some(at) => pwrite(handle, at, &bytes[..n]),
+    }
+}
+
+// ---------------------------------------------------------------- parts
+
+/// The bytes of a write: one buffer or a vector.
+enum Src<'a> {
+    One(&'a [u8]),
+    Many(&'a [&'a [u8]]),
+}
+
+/// The buffers of a read: one or a vector.
+enum Dst<'a, 'b> {
+    One(&'a mut [u8]),
+    Many(&'a mut [&'b mut [u8]]),
+}
+
+/// The side of a call that moves bytes between the program's buffers and the parts: a write
+/// copies out of its buffers into a cell or a message, a read copies out of a cell or a reply
+/// into them.
+trait Side {
+    /// Whether this is a write.
+    const WRITE: bool;
+    /// The bytes of the call.
+    fn total(&self) -> usize;
+    /// A write: the `n` bytes from `at` into the cell, before the part that carries them.
+    fn to_cell(&self, cell: &mut datawin::Cell, at: usize, n: usize);
+    /// A write: the `n` bytes from `at` into `out` for the message of an `INLINE` part.
+    fn to_message(&self, at: usize, out: &mut [u8]) -> usize;
+    /// A read: the bytes of a part from `at`, which the service filled in the cell.
+    fn store_from_cell(&mut self, cell: &datawin::Cell, at: usize, n: usize);
+    /// A read: the bytes of an `INLINE` part from `at`.
+    fn store_from_message(&mut self, at: usize, bytes: &[u8]);
+}
+
+struct Writing<'a>(Src<'a>);
+struct Reading<'a, 'b>(Dst<'a, 'b>);
+
+impl Side for Writing<'_> {
+    const WRITE: bool = true;
+
+    fn total(&self) -> usize {
+        match &self.0 {
+            Src::One(bytes) => bytes.len(),
+            Src::Many(iov) => pure::total_len(iov),
+        }
+    }
+
+    fn to_cell(&self, cell: &mut datawin::Cell, at: usize, n: usize) {
+        let out = cell.bytes_mut(n);
+        self.to_message(at, out);
+    }
+
+    fn to_message(&self, at: usize, out: &mut [u8]) -> usize {
+        match &self.0 {
+            Src::One(bytes) => {
+                out.copy_from_slice(&bytes[at..at + out.len()]);
+                out.len()
+            }
+            Src::Many(iov) => pure::gather(iov, at, out),
+        }
+    }
+
+    fn store_from_cell(&mut self, _cell: &datawin::Cell, _at: usize, _n: usize) {}
+
+    fn store_from_message(&mut self, _at: usize, _bytes: &[u8]) {}
+}
+
+impl Side for Reading<'_, '_> {
+    const WRITE: bool = false;
+
+    fn total(&self) -> usize {
+        match &self.0 {
+            Dst::One(out) => out.len(),
+            Dst::Many(iov) => pure::total_len_mut(iov),
+        }
+    }
+
+    fn to_cell(&self, _cell: &mut datawin::Cell, _at: usize, _n: usize) {}
+
+    fn to_message(&self, _at: usize, _out: &mut [u8]) -> usize {
+        0
+    }
+
+    fn store_from_cell(&mut self, cell: &datawin::Cell, at: usize, n: usize) {
+        self.store_from_message(at, cell.view(n));
+    }
+
+    fn store_from_message(&mut self, at: usize, bytes: &[u8]) {
+        match &mut self.0 {
+            Dst::One(out) => out[at..at + bytes.len()].copy_from_slice(bytes),
+            Dst::Many(iov) => {
+                pure::scatter(iov, at, bytes);
+            }
+        }
+    }
+}
+
+/// WINDOW: the window's object goes to the service for the session. One try, with the retries for
+/// a busy service that every call has.
+fn send_window(session: rt::abi::Handle) -> Result<(), i32> {
+    let mut w = Writer::new();
+    p::window(&mut w).map_err(|_| EIO)?;
+    let channel = Handle::<Channel>::borrowed(session);
+    let object = datawin::object();
+    let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
+    let mut tries = 0;
+    loop {
+        // A refusal consumes the outgoing handle: each send owns a fresh copy.
+        let copy = rt::sys::handle_duplicate(&object, rights).map_err(|_| EIO)?;
+        let reply = match rt::sys::send_handles(&channel, w.as_bytes(), [copy.erase()]) {
+            Ok(reply) => reply,
+            Err(refused) if refused.error == Error::Interrupted => continue,
+            Err(_) => return Err(EIO),
+        };
+        let mut buffer = [0; MESSAGE_MAX];
+        match Reader::new(reply.bytes(&mut buffer)).u32() {
+            Ok(0) => return Ok(()),
+            Ok(status) if status == busy_code() && tries < BUSY_TRIES => {
+                tries += 1;
+                pause()?;
+            }
+            Ok(status) => return Err(errno_of(status)),
+            Err(_) => return Err(EIO),
+        }
+    }
+}
+
+/// The window is registered with the service for `session`: sent now unless another thread did
+/// it, or is at it for too long. Whether it is.
+fn register(session: rt::abi::Handle) -> bool {
+    match datawin::claim(session.0) {
+        datawin::Claim::Registered => true,
+        datawin::Claim::Unavailable => false,
+        datawin::Claim::Mine => {
+            let accepted = send_window(session).is_ok();
+            datawin::done(session.0, accepted);
+            accepted
+        }
+    }
+}
+
+/// A free cell for a call of the session `session`, with the window made and registered for it on
+/// the way. None for a call inside a signal handler, a window that is refused or not yet there, a
+/// registration that failed, and when every cell is taken: the call then goes by messages.
+fn acquire_cell(session: rt::abi::Handle) -> Option<datawin::Cell> {
+    if datawin::in_handler() {
+        return None;
+    }
+    let base = datawin::base()?;
+    if datawin::registered() != session.0 && !register(session) {
+        return None;
+    }
+    datawin::take(base)
+}
+
+/// RELEASE of a lease, once and with no wait for an answer: the call that held it broke off.
+fn release_lease(session: u64, lease: u32) {
+    if session == 0 || lease == 0 {
+        return;
+    }
+    let mut w = Writer::new();
+    if p::release(lease, &mut w).is_err() {
+        return;
+    }
+    let channel = Handle::<Channel>::borrowed(rt::abi::Handle(session));
+    let _ = rt::sys::send(&channel, w.as_bytes());
+}
+
+/// A jump out of a handler to the frame `target` (posix_abi::shared::jump_mark): the calls of
+/// parts of this thread that it leaves give their cells back and their leases up.
+pub fn abandon_frames(target: entries::Frame) {
+    datawin::abandon(target, release_lease);
+}
+
+/// A call of more than one message on the description `handle`, in parts: at `offset` or at the
+/// position of the description. A cell if one is free, else messages; the lease the first part
+/// takes keeps the other calls on the file out until the last part (the call is one atomic
+/// step). The bytes done: the sum of the parts, a short count for an end of file, a limit or a
+/// lapsed lease, and an error only when no part went.
+#[inline(never)]
+fn transfer<S: Side>(handle: u32, offset: Option<u64>, side: &mut S) -> Result<usize, i32> {
+    let session = ensure()?;
+    let positional = offset.is_some();
+    let live = datawin::Live::enter(crate::change::frame());
+    let mut cell = acquire_cell(session);
+    if let (Some(live), Some(cell)) = (&live, &cell) {
+        live.hold_cell(cell);
+    }
+    let mut parts = pure::Parts::new(
+        side.total(),
+        pure::part_max(cell.is_some(), S::WRITE, positional),
+    );
+    let method = match (S::WRITE, positional) {
+        (false, false) => p::Method::ReadInto,
+        (false, true) => p::Method::PreadInto,
+        (true, false) => p::Method::WriteFrom,
+        (true, true) => p::Method::PwriteFrom,
+    };
+    let mut scratch = [0u8; p::INLINE_WRITE];
+    let mut retried = false;
+    let mut local_fault = false;
+    let outcome = loop {
+        let Some(plan) = parts.next_part() else {
+            break Ok(());
+        };
+        let part = p::Part {
+            handle,
+            count: plan.len as u32,
+            offset: offset.map_or(0, |at| at.saturating_add(plan.at as u64)),
+            cell: cell.as_ref().map_or(p::INLINE, datawin::Cell::index),
+            flags: plan.flags(),
+            lease: plan.lease,
+        };
+        let mut w = Writer::new();
+        let built = match (S::WRITE, cell.as_mut()) {
+            (true, Some(cell)) => {
+                side.to_cell(cell, plan.at, plan.len);
+                build_part(method, &part, &[], &mut w)
+            }
+            (true, None) => {
+                let n = side.to_message(plan.at, &mut scratch[..plan.len]);
+                build_part(method, &part, &scratch[..n], &mut w)
+            }
+            (false, _) => build_part(method, &part, &[], &mut w),
+        };
+        if built.is_err() {
+            break Err(EIO);
+        }
+        let answer = match call_status(w.as_bytes(), true) {
+            Ok(answer) => answer,
+            Err(failed) if failed.status == p::NO_WINDOW && cell.is_some() => {
+                // The service has no window for this session (it restarted): register again and
+                // send the part once more, then give the cell up and go by messages.
+                if let Some(current) = session_now() {
+                    datawin::forget_registration(current.0);
+                    if !retried {
+                        retried = true;
+                        datawin::count_retry();
+                        if register(current) {
+                            continue;
+                        }
+                    }
+                }
+                cell = None;
+                if let Some(live) = &live {
+                    live.drop_cell();
+                }
+                parts.set_max(pure::part_max(false, S::WRITE, positional));
+                continue;
+            }
+            Err(failed) => break Err(failed.errno),
+        };
+        let inline_read = !S::WRITE && cell.is_none();
+        let Ok(reply) = p::read_part_reply(answer.reader(), inline_read) else {
+            local_fault = true;
+            break Err(EIO);
+        };
+        let step = parts.took(
+            &plan,
+            pure::PartAnswer {
+                count: reply.count,
+                flags: reply.flags,
+                lease: reply.lease,
+            },
+        );
+        if step == pure::Step::Bad {
+            local_fault = true;
+            break Err(EIO);
+        }
+        if let Some(live) = &live {
+            live.set_lease(session_now().map_or(0, |s| s.0), parts.lease());
+        }
+        if reply.count > 0 {
+            match &cell {
+                Some(cell) if !S::WRITE => {
+                    side.store_from_cell(cell, plan.at, reply.count as usize)
+                }
+                None if !S::WRITE => side.store_from_message(plan.at, reply.bytes),
+                _ => {}
+            }
+        }
+        if reply.flags & p::LAPSED == 0 {
+            if cell.is_some() {
+                datawin::count_cell_part();
+            } else {
+                datawin::count_inline_part();
+            }
+        }
+        if step == pure::Step::Done {
+            break Ok(());
+        }
+    };
+    if local_fault {
+        // The reply broke the protocol: a lease the service may still hold goes back.
+        if let Some(lease) = parts.live_lease() {
+            release_lease(session_now().map_or(0, |s| s.0), lease);
+        }
+    }
+    if parts.lapsed() {
+        datawin::count_lapsed();
+    }
+    datawin::count_unleased(parts.unleased());
+    match outcome {
+        Ok(()) => Ok(parts.finish()),
+        Err(errno) => parts.failed(errno),
+    }
+}
+
+/// The session of the process now, if it has one.
+fn session_now() -> Option<rt::abi::Handle> {
+    session()
+}
+
+/// The request of one part: the header and fields, and for an `INLINE` write its bytes.
+fn build_part(
+    method: p::Method,
+    part: &p::Part,
+    bytes: &[u8],
+    w: &mut Writer,
+) -> Result<(), Status> {
+    match method {
+        p::Method::ReadInto => p::read_into(part, w),
+        p::Method::PreadInto => p::pread_into(part, w),
+        p::Method::WriteFrom => p::write_from(part, bytes, w),
+        _ => p::pwrite_from(part, bytes, w),
+    }
 }
 
 /// ftruncate of the description: the file is `size` bytes, grown with zeros.
