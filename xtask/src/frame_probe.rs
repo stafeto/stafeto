@@ -60,6 +60,8 @@ const C_IPC: u64 = 2_034;
 const REQUESTS: u64 = 10_000;
 const EVENTS: u64 = 1_875;
 const LIMIT: u64 = 10_000_000;
+/// The period of the clock in microseconds (60 Hz, as the service's default).
+const PERIOD_US: u64 = 16_667;
 /// The acceptance limit of the whole screen with no load: a frame with more bands than this
 /// does not fit a period (a decision of the design, which a test holds against the bound of the
 /// row and the service's own count of the bands of the screen).
@@ -444,6 +446,120 @@ fn loops(lines: &[String], phase: Phase) -> Option<u64> {
     )
 }
 
+/// A line the compositor told for a late frame: the phases in microseconds and the
+/// longest of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LateLine {
+    take_us: u64,
+    compose_us: u64,
+    device_us: u64,
+    frame_us: u64,
+    cause: String,
+}
+
+/// The late-frame lines the compositor printed for `phase`: the ones between the line of the
+/// phase before it and the line of this phase (STATS prints them just before the conductor
+/// prints the phase's counters).
+fn late_lines(lines: &[String], phase: Phase) -> Vec<LateLine> {
+    let prefix = format!("frame-load: phase {} ", phase.name());
+    let Some(end) = lines.iter().position(|l| l.starts_with(&prefix)) else {
+        return Vec::new();
+    };
+    let start = lines[..end]
+        .iter()
+        .rposition(|l| l.starts_with("frame-load: phase "))
+        .map_or(0, |i| i + 1);
+    lines[start..end]
+        .iter()
+        .filter(|l| l.starts_with("compositor: late frame"))
+        .filter_map(|l| {
+            Some(LateLine {
+                take_us: field(l, "take")?,
+                compose_us: field(l, "compose")?,
+                device_us: field(l, "device")?,
+                frame_us: field(l, "frame")?,
+                cause: l
+                    .split("(the longest: ")
+                    .nth(1)?
+                    .strip_suffix(')')?
+                    .to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// Whether the one late frame of a phase is excused: the wait for the emulated device is the
+/// host's (QEMU serves the display device on its main loop thread, so on a loaded host the
+/// wait counts the instructions that pass until that thread has run), and the rest of the
+/// frame is inside the analysis. Ok(false) is no late frame. Ok(true) holds only when the
+/// phase has the CPU load, the one late frame is told as the device's, take and compose are
+/// under the bound less the kernel path, the driver and a step, the periods skipped are the
+/// ones that frame covers, the window was late once at most and missed none, and no step of
+/// the display driver was longer than its term.
+fn host_late(
+    lines: &[String],
+    phase: Phase,
+    p: &Phased,
+    wlate: u64,
+    wmissed: u64,
+    bound: u64,
+) -> Result<bool, String> {
+    if p.late == 0 {
+        return Ok(false);
+    }
+    let no = |why: String| Err(format!("late {} skipped {} ({why})", p.late, p.skipped));
+    if !phase.loads().cpu {
+        return no("no excuse in a phase with no load".to_owned());
+    }
+    let told = late_lines(lines, phase);
+    let (1, [late]) = (p.late, told.as_slice()) else {
+        return no(format!(
+            "{} late frames and {} told: only one told frame is excused",
+            p.late,
+            told.len()
+        ));
+    };
+    if late.cause != "device" {
+        return no(format!("the longest phase is the {}'s", late.cause));
+    }
+    let limit = us(bound.saturating_sub(KERNEL + DRIVER + STEP));
+    if late.take_us + late.compose_us > limit {
+        return no(format!(
+            "take {} us and compose {} us over {limit} us of the bound",
+            late.take_us, late.compose_us
+        ));
+    }
+    let periods = (late.frame_us / PERIOD_US).saturating_sub(1);
+    if p.skipped > periods {
+        return no(format!(
+            "skipped {} over the {periods} the frame of {} us covers",
+            p.skipped, late.frame_us
+        ));
+    }
+    if wlate > 1 || wmissed != 0 {
+        return no(format!("the window late {wlate} missed {wmissed}"));
+    }
+    let driver = crate::longest_steps(lines, crate::comp_probe::DRIVER_TAG);
+    if let Some(row) = driver
+        .iter()
+        .find(|r| (r.0 == 6 || r.0 == 65) && r.1 > DRIVER)
+    {
+        return no(format!(
+            "a step of the display driver past {DRIVER} ticks: {row:?}"
+        ));
+    }
+    Ok(true)
+}
+
+/// The words of a phase's report for its late frame, when one is excused.
+fn excused_report(lines: &[String], phase: Phase) -> String {
+    let frame = late_lines(lines, phase).first().map_or(0, |l| l.frame_us);
+    format!(
+        "late 1 (the device's, {} ms: emulator main loop, excused)",
+        ms(frame)
+    )
+}
+
 fn ms(us: u64) -> String {
     format!("{}.{:02}", us / 1_000, us % 1_000 / 10)
 }
@@ -516,12 +632,19 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                 let bound = bound_ticks(row).ok_or_else(|| {
                     format!("{name}: the bound of the row {row:?} does not settle")
                 })?;
+                let mut late_said = format!("late {}", p.late);
                 if timed {
-                    if p.late != 0 || p.skipped != 0 {
-                        return fail(format!("late {} skipped {}", p.late, p.skipped));
-                    }
-                    if wlate != 0 || wmissed != 0 {
-                        return fail(format!("the window late {wlate} missed {wmissed}"));
+                    if host_late(lines, phase, &p, wlate, wmissed, bound)
+                        .map_err(|e| format!("{name}: {e}"))?
+                    {
+                        late_said = excused_report(lines, phase);
+                    } else {
+                        if p.skipped != 0 {
+                            return fail(format!("late {} skipped {}", p.late, p.skipped));
+                        }
+                        if wlate != 0 || wmissed != 0 {
+                            return fail(format!("the window late {wlate} missed {wmissed}"));
+                        }
                     }
                     if p.compose_max_us > us(bound) {
                         return fail(format!(
@@ -541,9 +664,8 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                     String::new()
                 };
                 said.push(format!(
-                    "frame-probe: {name}: {} frames, late {}, skipped {}, compose max {} ms (bound {} ms){hog}",
+                    "frame-probe: {name}: {} frames, {late_said}, skipped {}, compose max {} ms (bound {} ms){hog}",
                     p.frames,
-                    p.late,
                     p.skipped,
                     ms(p.compose_max_us),
                     ms(us(bound))
@@ -666,8 +788,14 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                 }
                 let bound = bound_ticks(Row::D)
                     .ok_or_else(|| "direct: the bound does not settle".to_owned())?;
+                let mut late_said = format!("late {}", p.late);
                 if timed {
-                    if p.late != 0 || p.skipped != 0 {
+                    // The window of the first revision has no record of its own.
+                    if host_late(lines, phase, &p, 0, 0, bound)
+                        .map_err(|e| format!("{name}: {e}"))?
+                    {
+                        late_said = excused_report(lines, phase);
+                    } else if p.skipped != 0 {
                         return fail(format!("late {} skipped {}", p.late, p.skipped));
                     }
                     if p.compose_max_us > us(bound) {
@@ -687,9 +815,8 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                     String::new()
                 };
                 said.push(format!(
-                    "frame-probe: direct: {} frames, all direct, late {}, skipped {}, compose max {} ms (bound {} ms){hog}",
+                    "frame-probe: direct: {} frames, all direct, {late_said}, skipped {}, compose max {} ms (bound {} ms){hog}",
                     p.frames,
-                    p.late,
                     p.skipped,
                     ms(p.compose_max_us),
                     ms(us(bound))
@@ -1283,6 +1410,151 @@ mod tests {
         );
         // Without the clock of the guest the count is not judged.
         assert!(verdict(&lines, false).is_ok());
+    }
+
+    const LATE_DEVICE: &str = "compositor: late frame period 7 take 38 us compose 413 us device 19000 us frame 19451 us (the longest: device)";
+
+    /// The lines of a good run with one late frame told in `phase`: the late line before the
+    /// phase's line, the count of late frames and of skipped periods in it.
+    fn with_late(phase: &str, told: &[&str], late: u32, skipped: u32) -> Vec<String> {
+        let mut lines = good();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with(&format!("frame-load: phase {phase} ")))
+            .unwrap();
+        lines[at] = lines[at]
+            .replace("late 0", &format!("late {late}"))
+            .replace("skipped 0", &format!("skipped {skipped}"));
+        for (i, l) in told.iter().enumerate() {
+            lines.insert(at + i, (*l).to_owned());
+        }
+        lines
+    }
+
+    #[test]
+    fn one_late_frame_that_waited_for_the_device_is_excused_in_a_loaded_phase() {
+        for phase in ["cpu", "files", "net", "direct"] {
+            let said = verdict(&with_late(phase, &[LATE_DEVICE], 1, 0), true).unwrap();
+            let line = said
+                .iter()
+                .find(|l| l.starts_with(&format!("frame-probe: {phase}: ")))
+                .unwrap();
+            assert!(
+                line.contains("late 1 (the device's, 19.45 ms: emulator main loop, excused)"),
+                "{line}"
+            );
+        }
+        // The window late once is allowed.
+        let mut lines = with_late("cpu", &[LATE_DEVICE], 1, 0);
+        replace_line(
+            &mut lines,
+            "frame-load: window cpu ",
+            "frame-load: window cpu id 1 interval 1 posts 240 taken 240 replaced 0 late 1 missed 0 late-max-us 2165",
+        );
+        assert!(verdict(&lines, true).is_ok());
+    }
+
+    #[test]
+    fn the_excuse_is_refused_when_one_of_its_conditions_fails() {
+        // The same frame in a phase with no load.
+        for phase in ["idle", "full"] {
+            let e = verdict(&with_late(phase, &[LATE_DEVICE], 1, 0), true).unwrap_err();
+            assert!(e.starts_with(&format!("{phase}: late 1")), "{e}");
+        }
+        let cases: [(Vec<String>, &str); 6] = [
+            // The cause is the compose.
+            (
+                with_late(
+                    "cpu",
+                    &[
+                        "compositor: late frame period 7 take 38 us compose 19000 us device 413 us frame 19451 us (the longest: compose)",
+                    ],
+                    1,
+                    0,
+                ),
+                "the longest phase is the compose's",
+            ),
+            // Two late frames.
+            (
+                with_late("cpu", &[LATE_DEVICE, LATE_DEVICE], 2, 0),
+                "2 late frames",
+            ),
+            // One late frame with no line.
+            (with_late("cpu", &[], 1, 0), "0 told"),
+            // Take and compose over the bound less the kernel path, the driver and a step.
+            (
+                with_late(
+                    "cpu",
+                    &[
+                        "compositor: late frame period 7 take 38 us compose 14000 us device 19000 us frame 33038 us (the longest: device)",
+                    ],
+                    1,
+                    0,
+                ),
+                "over 13733 us of the bound",
+            ),
+            // More periods skipped than the frame covers (19 451 us is one period, so none).
+            (
+                with_late("cpu", &[LATE_DEVICE], 1, 1),
+                "skipped 1 over the 0",
+            ),
+            // A step of the driver past its term.
+            (
+                {
+                    let mut l = with_late("cpu", &[LATE_DEVICE], 1, 0);
+                    l.insert(
+                        0,
+                        format!(
+                            "service step: {} kind 65 14000 ticks detail 0",
+                            crate::comp_probe::DRIVER_TAG
+                        ),
+                    );
+                    l
+                },
+                "a step of the display driver past 13596 ticks",
+            ),
+        ];
+        for (lines, why) in cases {
+            let e = verdict(&lines, true).unwrap_err();
+            assert!(
+                e.starts_with("cpu: late 1") || e.starts_with("cpu: late 2"),
+                "{e}"
+            );
+            assert!(e.contains(why), "{e}: wanted {why}");
+        }
+        // The window missed once.
+        let mut lines = with_late("cpu", &[LATE_DEVICE], 1, 0);
+        replace_line(
+            &mut lines,
+            "frame-load: window cpu ",
+            "frame-load: window cpu id 1 interval 1 posts 240 taken 239 replaced 0 late 1 missed 1 late-max-us 2165",
+        );
+        let e = verdict(&lines, true).unwrap_err();
+        assert!(e.contains("the window late 1 missed 1"), "{e}");
+    }
+
+    #[test]
+    fn the_late_lines_are_those_between_the_phase_before_and_the_phase() {
+        let mut lines = with_late("net", &[LATE_DEVICE], 1, 0);
+        let cpu = lines
+            .iter()
+            .position(|l| l.starts_with("frame-load: phase cpu "))
+            .unwrap();
+        lines.insert(cpu, LATE_DEVICE.replace("period 7", "period 9"));
+        assert_eq!(late_lines(&lines, Phase::Net).len(), 1);
+        assert_eq!(late_lines(&lines, Phase::Cpu).len(), 1);
+        assert_eq!(late_lines(&lines, Phase::Files).len(), 0);
+        let one = &late_lines(&lines, Phase::Net)[0];
+        assert_eq!(
+            (
+                one.take_us,
+                one.compose_us,
+                one.device_us,
+                one.frame_us,
+                one.cause.as_str()
+            ),
+            (38, 413, 19000, 19451, "device")
+        );
     }
 
     #[test]

@@ -2216,20 +2216,22 @@ impl Compositor {
         }
         let now = now_ns();
         // The phases of the late frames of the count, two a step at most (the
-        // step stays under its gate), for the report of the probe.
-        for _ in 0..2 {
-            let Some(late) = self.pacer.next_late() else {
-                break;
-            };
-            rt::println!(
-                "compositor: late frame period {} take {} us compose {} us device {} us frame {} us (the longest: {})",
-                late.k,
-                late.take_ns / 1_000,
-                late.compose_ns / 1_000,
-                late.device_ns / 1_000,
-                late.frame_ns() / 1_000,
-                late.cause()
-            );
+        // step stays under its gate), for the report of the probe. A RESET starts a count and tells nothing.
+        if !reset {
+            for _ in 0..2 {
+                let Some(late) = self.pacer.next_late() else {
+                    break;
+                };
+                rt::println!(
+                    "compositor: late frame period {} take {} us compose {} us device {} us frame {} us (the longest: {})",
+                    late.k,
+                    late.take_ns / 1_000,
+                    late.compose_ns / 1_000,
+                    late.device_ns / 1_000,
+                    late.frame_ns() / 1_000,
+                    late.cause()
+                );
+            }
         }
         let mut records = [WindowStats::default(); STATS_WINDOWS];
         let mut count = 0;
