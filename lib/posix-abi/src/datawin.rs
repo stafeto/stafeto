@@ -226,6 +226,8 @@ fn ask() -> Option<usize> {
     }
     match make() {
         Ok(base) => {
+            // From now on the layer notes the signal handlers (`handlers`).
+            crate::handlers::track();
             BOOK.reset(CELLS);
             STATE.store(base, Ordering::Release);
             Some(base)

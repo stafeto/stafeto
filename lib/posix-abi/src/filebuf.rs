@@ -132,7 +132,9 @@ fn cell_waiting(size: usize) -> Option<Cell> {
     if let Some(cell) = cell(size) {
         return Some(cell);
     }
-    if size > READ_PORTION || STATE.load(Ordering::Acquire) == REFUSED || crate::handlers::active()
+    if size > READ_PORTION
+        || STATE.load(Ordering::Acquire) == REFUSED
+        || rt::upcall::query().is_ok_and(|q| q.depth != 0)
     {
         return None;
     }

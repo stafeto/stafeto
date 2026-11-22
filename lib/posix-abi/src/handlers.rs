@@ -16,7 +16,7 @@
 //! the deeper levels counted, which sends the thread's large calls on `/data` by messages, never
 //! into a wrong state.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use entries::{Frame, nested};
 
 /// The frames a thread records.
@@ -51,8 +51,37 @@ fn row() -> &'static Row {
     }
 }
 
+/// Whether the layer notes handlers at all: set once the process makes a window for `/data`
+/// (`track`). A process that never used it pays one load and a branch for each handler (the path
+/// of a signal to a sleeping thread is measured by the rtbench rows S5, to the instruction).
+/// A handler that was entered before the flag went up is not noted (`enter` says so, and
+/// its `leave` is skipped), so the first large call on `/data` made inside such a handler
+/// does not know it runs in one.
+static TRACKING: AtomicBool = AtomicBool::new(false);
+
+/// The layer notes handlers from now on.
+#[cfg(feature = "data")]
+pub(crate) fn track() {
+    TRACKING.store(true, Ordering::Release);
+}
+
+/// The calling thread calls a handler: whether it was noted (the caller then calls `leave`).
+#[inline(always)]
+pub(crate) fn enter() -> bool {
+    if !TRACKING.load(Ordering::Relaxed) {
+        return false;
+    }
+    noted();
+    true
+}
+
+#[inline(never)]
+fn noted() {
+    enter_from(crate::change::frame());
+}
+
 /// The calling thread calls a handler from the frame `frame`.
-pub(crate) fn enter(frame: Frame) {
+fn enter_from(frame: Frame) {
     let row = row();
     // The frame first, then the depth: a signal that comes between the two reads the depth of the
     // handlers before this one and a frame no one reads yet. Only the thread itself writes its row.
@@ -70,7 +99,8 @@ pub(crate) fn leave() {
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
 }
 
-/// Whether the calling thread is inside a handler.
+/// Whether the calling thread is inside a handler that was noted.
+#[cfg(feature = "data")]
 pub(crate) fn active() -> bool {
     row().depth.load(Ordering::Relaxed) != 0
 }

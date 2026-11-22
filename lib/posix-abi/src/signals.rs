@@ -2312,9 +2312,11 @@ unsafe fn deliver_signal(
                     unsafe { upcall::enable() }.expect("nested signal entry");
                 }
                 marks::mark(4);
-                crate::handlers::enter(crate::change::frame());
+                let noted = crate::handlers::enter();
                 unsafe { callback(signal, &raw mut info, (&raw mut context).cast()) };
-                crate::handlers::leave();
+                if noted {
+                    crate::handlers::leave();
+                }
                 marks::report();
                 if entered {
                     upcall::mask().expect("signal handler mask restoration");
@@ -2339,9 +2341,11 @@ unsafe fn deliver_signal(
                     unsafe { upcall::enable() }.expect("nested signal entry");
                 }
                 marks::mark(4);
-                crate::handlers::enter(crate::change::frame());
+                let noted = crate::handlers::enter();
                 unsafe { callback(signal) };
-                crate::handlers::leave();
+                if noted {
+                    crate::handlers::leave();
+                }
                 marks::report();
                 if entered {
                     upcall::mask().expect("signal handler mask restoration");
