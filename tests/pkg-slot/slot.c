@@ -11,8 +11,10 @@
  * when the child has ended the parent's session still answers (a child that kept the parent's
  * session would close it); a spawned program has a session; the program a forked child execs
  * keeps it, and the parent's session lives after that child ends; a set-ID program, which the
- * loader starts with a real ID other than the effective one, has the service's own session, as the
- * loader verified it with the root of the service: the parent's genuine session passes, and a
+ * loader starts with a real ID other than the effective one, has a session of the service's own, as the
+ * loader verified it with the root of the service: the parent's genuine session is replaced by a
+ * new clone charged to the parent (the parent keeps the receipt and the group lock of its own
+ * session, which the program must not reach), and a
  * channel of the caller's own in the place (a caller that bypasses the layer, served here as a
  * forged service) is replaced by a new clone and gets no request, where a program that is not
  * set-ID takes the forged channel; a process that is not the superuser is refused INSTALL_BEGIN with NOT_ALLOWED
@@ -126,7 +128,7 @@ static int checks(void) {
     CHECK(run_file("/bin/pkg-slot-suid", "setid", &status) == 0);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     CHECK(ps_list() == 0);
-    printf("pkg-slot: a set-ID program has the session of the service, the parent's passing as it is\n");
+    printf("pkg-slot: a set-ID program has a session of the service of its own, a clone of the parent's\n");
 
     unsigned requests = 0;
     CHECK(forged_run("/bin/pkg-slot", "forged", &status, &requests) == 0);
@@ -225,10 +227,41 @@ static int price(void) {
     return 0;
 }
 
+/* The price of the extra request every start makes for the root of the package service (the
+ * loader's LoaderRoot): a spawn of a program that returns at once, with the session and without
+ * it, in turns, mean ns of the spawn and the wait. */
+static uint64_t spawns(int per) {
+    uint64_t from = ps_ns();
+    for (int i = 0; i < per; i++) {
+        int status = 0;
+        if (run("null", &status) != 0) return 0;
+    }
+    return (ps_ns() - from) / (uint64_t)per;
+}
+
+static int spawn_price(void) {
+    uint64_t with = 0, without = 0;
+    spawns(4);
+    for (int turn = 0; turn < 4; turn++) {
+        ps_hide(0);
+        uint64_t a = spawns(10);
+        ps_hide(1);
+        uint64_t b = spawns(10);
+        ps_hide(0);
+        CHECK(a != 0 && b != 0);
+        with += a;
+        without += b;
+    }
+    printf("pkg-slot: spawn with the session %llu ns, without it %llu ns\n",
+           (unsigned long long)(with / 4), (unsigned long long)(without / 4));
+    return 0;
+}
+
 static int forker(void) {
     CHECK(has_session() == 0);
     CHECK(checks() == 0);
     CHECK(price() == 0);
+    CHECK(spawn_price() == 0);
     return 0;
 }
 
@@ -243,6 +276,7 @@ static int first(void) {
 
 int main(int argc, char **argv) {
     int status;
+    if (argc > 1 && strcmp(argv[1], "null") == 0) return 0;
     if (argc > 1 && strcmp(argv[1], "spawned") == 0) return has_session();
     if (argc > 1 && strcmp(argv[1], "setid") == 0) return has_session();
     if (argc > 1 && strcmp(argv[1], "forged") == 0) return forged_role();

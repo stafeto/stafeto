@@ -1091,11 +1091,17 @@ process.
 grows by one handle, so every image and libc.so is built again). A process of an `init` record gets
 it by the name `pkgd` (`posix-crt`), a process that the loader starts takes the slot, and a set-ID
 program takes the service's own session: the loader sends the offered channel to the root of the
-service (VERIFY_SESSION, protocol version 2), which returns a live session of the service as it is and
-answers any other channel with a new CLONE, so a forged channel never receives a request or makes the
-program believe false answers. The root is the label `ROOT` of the service's channel, which `pkgd`
+service (VERIFY_SESSION, protocol version 2), which answers with a new CLONE: charged to the caller's
+own label when the channel is a live session of the service, to the root (64 at most) for any other
+channel, so a forged channel never receives a request or makes the program believe false answers, and a
+caller that keeps a copy of its session shares no receipt, group lock or buffer with the program. Any
+error of the verification (the root is not registered, the table of the service is full) leaves the
+slot empty, and the program runs with no package session. The root is the label `ROOT` of the service's channel, which `pkgd`
 registers with the process service (the notary mark `PKG`, root `ROOT_PKG`); a set-ID start while no root
-is registered runs with no package session. `fork` and a spawn give the child a CLONE of the session (one request, 68 µs under
+is registered runs with no package session. Every start that has a package session asks the process
+service for the root once more (LoaderRoot), also with no set-ID: a spawn of a program that returns at
+once takes 4.40 ms with the session and 4.26 ms without it under QEMU's emulation (about 125 µs, 3 %, the
+CLONE of the parent included). `fork` and a spawn give the child a CLONE of the session (one request, 68 µs under
 QEMU's emulation: 2.127 ms against 2.098 ms for the call of fork with and without it, 1.4 %), `exec`
 moves it. A process that is not the superuser's has the session and is `NOT_ALLOWED` for the methods
 that change the store (the service asks the process service, with the identity session the request

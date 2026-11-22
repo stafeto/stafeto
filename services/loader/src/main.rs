@@ -1119,7 +1119,12 @@ fn roots_before_ready(
     forget_dead_data(given);
     for (root, &(slot, which)) in roots.iter_mut().zip(&VERIFIED) {
         if given[slot as usize].is_some() && root.is_none() {
-            *root = loader_root(session, which)?;
+            *root = match loader_root(session, which) {
+                Ok(root) => root,
+                // The package session is optional: no root of it is no reason to cancel.
+                Err(_) if slot == Slot::Packages => None,
+                Err(why) => return Err(why),
+            };
         }
     }
     Ok(())
@@ -2383,10 +2388,15 @@ fn finish(
     if secure {
         for (root, &(slot, _)) in roots.iter().zip(&VERIFIED) {
             if let Some(offered) = given[slot as usize].take() {
-                // The package service has sent no root (it is not up yet, or its registration
-                // failed): the slot stays empty and the program runs with no package session,
-                // where a refusal would stop every set-ID program of the image.
-                if slot == Slot::Packages && root.is_none() {
+                // The package session is optional (posix-crt takes none): with no root (the
+                // service is not up yet, or its registration failed) and for any error of the
+                // verification (the service's table is full, the root is dead) the slot stays
+                // empty and the program runs with no package session, where a refusal would stop
+                // every set-ID program of the image.
+                if slot == Slot::Packages {
+                    given[slot as usize] = root
+                        .as_ref()
+                        .and_then(|root| verify_slot(slot, Some(root), offered).ok());
                     continue;
                 }
                 if slot == Slot::Data {

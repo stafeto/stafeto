@@ -15,8 +15,8 @@
 //! (Vouch). The packages of the boot image are read here, before the service registers.
 //!
 //! The service's root (proto_pkg::ROOT) goes to the process service with Register, for a loader
-//! to send VERIFY_SESSION for the Packages session of a set-ID program: the session comes back
-//! when it is a live session of the service, and a new clone replaces any other. A thread of
+//! to send VERIFY_SESSION for the Packages session of a set-ID program: a new clone replaces the
+//! offered channel, charged to its session when that is a live one of the service. A thread of
 //! its own makes the registration (rt::roots::keep): the connection to the process service
 //! waits in init until the process service has started, which the loop (and its heartbeat)
 //! must not do, and the thread tries again until it succeeds.
@@ -949,9 +949,12 @@ impl Pkgd {
         self.new_session(r, given)
     }
 
-    /// VERIFY_SESSION through the root: the offered channel comes back when it is a live
-    /// session of a client of the service; any other gets a new clone, and the offered channel is
-    /// let go of with no request sent through it. Every step is O(1).
+    /// VERIFY_SESSION through the root: the reply is always a new clone and the offered channel is
+    /// let go of with no request sent through it. For a live session of a client the clone is
+    /// charged to that client (`clones.give(OWN, label)`), so the program that gets it holds a
+    /// session of its own: the receipt, the group lock and the buffer of the session it was
+    /// offered stay with the caller, who may keep a copy of it (DUPLICATE). Any other channel gets
+    /// a clone of the root's, within `ROOT_CLONES`. Every step is O(1).
     fn verify_session(&mut self, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err() || r.handles.len() != 1 {
             return Answer::Status(Status::BadSize);
@@ -964,14 +967,13 @@ impl Pkgd {
             return Answer::Status(Status::BadSize);
         };
         let label = sys::copy_label(&self.channel, &offered).ok();
-        if session::genuine(&self.clones, label) {
-            if r.reply().u32(0).is_err() {
-                return Answer::Status(Status::BadSize);
-            }
-            return Answer::Reply([offered.erase()].into());
-        }
         drop(offered);
-        let given = self.clones.give_within(OWN, proto_pkg::ROOT, ROOT_CLONES);
+        let given = match label {
+            Some(label) if session::genuine(&self.clones, Some(label)) => {
+                self.clones.give(OWN, label)
+            }
+            _ => self.clones.give_within(OWN, proto_pkg::ROOT, ROOT_CLONES),
+        };
         self.new_session(r, given)
     }
 
@@ -1051,7 +1053,7 @@ impl Service<0> for Pkgd {
 
     fn request(&mut self, s: &mut Session<Sess, 0>, r: &mut Request<'_>) -> Answer {
         // VERIFY_SESSION goes through the root alone, and the root has no other request.
-        if (r.label() == proto_pkg::ROOT) != (r.method() == Method::VerifySession.number()) {
+        if !session::allowed(r.label(), r.method()) {
             return Answer::Status(Status::Kernel(Error::AccessDenied));
         }
         match Method::from_number(r.method()) {

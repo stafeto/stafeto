@@ -99,8 +99,8 @@ mod tests {
 
     #[test]
     fn only_a_marked_service_registers_a_root() {
-        // A voucher with no mark of a root (the file service has SET_ID,
-        // the package service nothing) registers none.
+        // A voucher with no mark of a root (the file service has SET_ID, the clock
+        // service nothing) registers none.
         for label in [NOTARY | 9, NOTARY | SET_ID | 9] {
             assert_eq!(registration(label, 1), Registration::Refused);
             assert_eq!(registration(label, 2), Registration::Refused);

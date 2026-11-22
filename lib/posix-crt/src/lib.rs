@@ -545,8 +545,8 @@ fn loaded_main() -> u64 {
     // checks the identity only through the process service. SAFETY: as above.
     unsafe { posix_abi::net::init(one(Slot::Net).map(Handle::from_raw)) };
     // The package session of a set-ID program is the service's, as the loader verified it with
-    // the service's root (the genuine one passes as it is, a forged one is replaced by a new
-    // session; the service checks the identity only through the process service), so `pkg`
+    // the service's root (each channel, the parent's genuine session too, is replaced by a new
+    // clone of its own; the service checks the identity only through the process service), so `pkg`
     // that doas or su started works. SAFETY: as above.
     unsafe { posix_abi::packages::init(one(Slot::Packages).map(Handle::from_raw)) };
     // The data session of a set-ID program is the service's, as the loader verified it with the

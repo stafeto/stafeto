@@ -35,9 +35,16 @@ pub fn genuine<const N: usize, const BITS: u32>(
     label & NOTARY == 0
 }
 
+/// Whether a request of `method` may come through the session `label`: VERIFY_SESSION through
+/// the root alone, and the root has no other request.
+pub fn allowed(label: u64, method: u16) -> bool {
+    (label == ROOT) == (method == proto_pkg::Method::VerifySession.number())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto_pkg::ROOT_CLONES;
 
     const CLONES: usize = 8;
 
@@ -81,12 +88,43 @@ mod tests {
         let clones = Clones::<CLONES>::new();
         assert!(!genuine(&clones, Some(ROOT)));
         assert!(!genuine(&clones, Some(1 << 62 | 7)));
-        // The root's clones are bounded: the 65th that one root asks for is refused.
-        let mut clones = Clones::<CLONES>::new();
+    }
+
+    /// The root gives `ROOT_CLONES` clones at most, and the ordinary clients still get theirs.
+    #[test]
+    fn the_roots_clones_are_bounded() {
+        let mut clones = Clones::<{ ROOT_CLONES + 8 }>::new();
         let mut got = 0;
-        while clones.give_within(OWN, ROOT, 3).is_ok() {
+        while clones.give_within(OWN, ROOT, ROOT_CLONES).is_ok() {
             got += 1;
+            assert!(got <= ROOT_CLONES + 1);
         }
-        assert_eq!(got, 3);
+        assert_eq!(got, ROOT_CLONES);
+        assert!(clones.give(OWN, 5).is_ok());
+    }
+
+    /// A clone for a genuine session is charged to the session's own label, so the root's full bucket does not touch it.
+    #[test]
+    fn a_genuine_session_gets_a_clone_charged_to_itself() {
+        let mut clones = Clones::<{ ROOT_CLONES + 8 }>::new();
+        while clones.give_within(OWN, ROOT, ROOT_CLONES).is_ok() {}
+        let mine = clones.give(OWN, 5).unwrap();
+        assert!(genuine(&clones, Some(mine)));
+        assert!(clones.give(OWN, mine).is_ok());
+    }
+
+    #[test]
+    fn the_root_takes_verify_session_alone() {
+        use proto_pkg::Method;
+        let verify = Method::VerifySession.number();
+        assert!(allowed(ROOT, verify));
+        assert!(!allowed(5, verify));
+        assert!(!allowed(OWN | 7, verify));
+        for m in Method::ALL {
+            if m != Method::VerifySession {
+                assert!(!allowed(ROOT, m.number()), "{m:?}");
+                assert!(allowed(5, m.number()), "{m:?}");
+            }
+        }
     }
 }

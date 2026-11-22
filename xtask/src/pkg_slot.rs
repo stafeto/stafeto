@@ -54,7 +54,7 @@ const LINES: [&str; 8] = [
     "pkg-slot: the start gave a session that answers a LIST and a CLONE",
     "pkg-slot: a forked child has a session of its own that answers, the parent's answers after the child ended",
     "pkg-slot: a spawned program has a session of its own",
-    "pkg-slot: a set-ID program has the session of the service, the parent's passing as it is",
+    "pkg-slot: a set-ID program has a session of the service of its own, a clone of the parent's",
     "pkg-slot: a set-ID program given a forged channel gets a new session of the service and the forgery gets no request",
     "pkg-slot: exec keeps the session, and the parent's answers after the program ended",
     "pkg-slot: INSTALL_BEGIN is NOT_ALLOWED for a process that is not the superuser, and taken from the superuser",
@@ -62,6 +62,24 @@ const LINES: [&str; 8] = [
 ];
 
 const PRICE: &str = "pkg-slot: fork with the session ";
+const SPAWN_PRICE: &str = "pkg-slot: spawn with the session ";
+
+/// The mean times in ns of a spawn with the session and without it, from the probe's line.
+pub fn spawn_price(lines: &[String]) -> Result<(u64, u64), String> {
+    let line = lines
+        .iter()
+        .find_map(|l| l.strip_prefix(SPAWN_PRICE))
+        .ok_or("no line of the price of the session in a spawn")?;
+    let (with, without) = line
+        .split_once(" ns, without it ")
+        .ok_or_else(|| format!("the spawn price line {line:?}"))?;
+    let number = |s: &str| {
+        s.trim_end_matches(" ns")
+            .parse::<u64>()
+            .map_err(|e| format!("{s:?}: {e}"))
+    };
+    Ok((number(with)?, number(without)?))
+}
 
 /// The mean times in ns of the call of fork with the session, without it and of a CLONE alone,
 /// from the probe's line.
@@ -105,8 +123,9 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     qemu::expect_marker(&output, "pkg-slot: ok")?;
     qemu::expect_stopped_on(&output, "init: pkg-slot ended: exit code 0, not restarted")?;
     let (with, without, clone) = price(&output.lines)?;
+    let (spawn_with, spawn_without) = spawn_price(&output.lines)?;
     println!(
-        "pkg-slot on {}: the session in fork, spawn and exec, the service's own session for a set-ID program, NOT_ALLOWED for a process that is not the superuser: ok; the call of fork {with} ns with the session, {without} ns without it, a CLONE alone {clone} ns",
+        "pkg-slot on {}: the session in fork, spawn and exec, the service's own session for a set-ID program, NOT_ALLOWED for a process that is not the superuser: ok; the call of fork {with} ns with the session, {without} ns without it, a CLONE alone {clone} ns; a spawn {spawn_with} ns with the session, {spawn_without} ns without it",
         machine.name
     );
     Ok(())
@@ -115,6 +134,13 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_spawn_price_is_read_from_its_line() {
+        let lines = vec![format!("{SPAWN_PRICE}5000 ns, without it 4000 ns")];
+        assert_eq!(spawn_price(&lines), Ok((5000, 4000)));
+        assert!(spawn_price(&[]).is_err());
+    }
 
     #[test]
     fn the_price_is_read_from_its_line() {
