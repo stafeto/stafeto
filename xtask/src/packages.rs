@@ -66,9 +66,10 @@ pub enum Group {
 /// base system, which is no package itself (pixman, linked into the
 /// composition service by `lib/pixman`), or into the programs of the system
 /// that are written in C++ (libcxx: libc++, libc++abi and libunwind, linked by
-/// tests/cxx-probe): their description, their notice and their pinned source
-/// are all they have.
-pub const SERVICE_LIBRARIES: &[&str] = &["pixman", "libcxx"];
+/// tests/cxx-probe) or draw with OpenGL ES (mesa: EGL and the softpipe driver,
+/// linked by apps/gles-cube): their description, their notice and their pinned
+/// source are all they have.
+pub const SERVICE_LIBRARIES: &[&str] = &["pixman", "libcxx", "mesa"];
 
 /// The packages that only build a program the image holds as a file of the system (a set-user-ID
 /// file, which a package file may not be): they have a program and no file of their own.
@@ -1259,7 +1260,7 @@ files = [
     #[test]
     fn the_descriptions_of_the_workspace_are_good() {
         let packages = load().unwrap();
-        assert_eq!(packages.len(), 30);
+        assert_eq!(packages.len(), 31);
         let get = |n: &str| packages.iter().find(|p| p.name == n).unwrap();
         // FreeType: the library of the text of stage G4, no file of its own.
         let freetype = get("freetype");
@@ -1280,6 +1281,15 @@ files = [
         );
         assert_eq!(libcxx.group(), Group::Game);
         assert!(libcxx.files.is_empty());
+        // Mesa: the programs that draw with EGL link it, no file of its own.
+        let mesa = get("mesa");
+        assert_eq!(
+            mesa.license,
+            "MIT AND Apache-2.0 AND BSL-1.0 AND BSD-2-Clause AND BSD-3-Clause AND HPND-sell-variant"
+        );
+        assert_eq!(mesa.group(), Group::Game);
+        assert_eq!(mesa.build_depends, ["libcxx"]);
+        assert!(mesa.files.is_empty());
         assert_eq!(get("busybox").group(), Group::Base);
         assert_eq!(get("nano").group(), Group::Addon);
         assert_eq!(get("f-stack").group(), Group::Fstack);

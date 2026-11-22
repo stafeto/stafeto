@@ -46,6 +46,7 @@ pub fn licence_text(name: &str) -> Result<Vec<u8>, String> {
         "f-stack" => read(target.join("f-stack/LICENSE")),
         "pixman" => read(target.join("pixman/COPYING")),
         "libcxx" => read(target.join("libcxx/LICENSE.TXT")),
+        "mesa" => read(target.join("mesa/NOTICES")),
         "freetype" => read(target.join("freetype/FTL.TXT")),
         "lvgl" => read(target.join("lvgl/LICENCE.txt")),
         "openssl" => read(target.join(format!("openssl/openssl-{}/LICENSE.txt", version(name)?))),

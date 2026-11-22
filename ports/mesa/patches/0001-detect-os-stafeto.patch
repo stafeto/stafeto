@@ -1,0 +1,93 @@
+stafeto is a POSIX system that is no Linux.
+SPDX-License-Identifier: MIT
+Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+Programs of stafeto are built for aarch64-linux-gnu, so the compiler defines
+__linux__ (the headers of the C library test it) and the build adds
+-D__stafeto__=1. detect_os.h makes that a POSIX system of its own,
+DETECT_OS_STAFETO, with DETECT_OS_LINUX off, so the files that use the Linux
+kernel's interfaces (epoll, eventfd, inotify, gettid, thread names, /proc)
+take their other branches. The direct tests of __linux__ in the files the
+softpipe build compiles (u_queue.c, u_process.c) become DETECT_OS_LINUX, and
+os_misc.c takes the sysconf branch for the page size and the memory.
+
+diff --git a/src/util/detect_os.h b/src/util/detect_os.h
+index 7403724..01de16d 100644
+--- a/src/util/detect_os.h
++++ b/src/util/detect_os.h
+@@ -15,7 +15,17 @@
+ #ifndef DETECT_OS_H
+ #define DETECT_OS_H
+ 
+-#if defined(__linux__)
++/*
++ * stafeto programs are built for aarch64-linux-gnu, so the compiler defines
++ * __linux__ (the headers of its C library test it), and the build adds
++ * -D__stafeto__=1. The system is a POSIX one that is no Linux: nothing of the
++ * Linux kernel's interfaces (futex, epoll, eventfd, inotify, gettid, thread
++ * names) is there.
++ */
++#if defined(__stafeto__)
++#define DETECT_OS_STAFETO 1
++#define DETECT_OS_POSIX 1
++#elif defined(__linux__)
+ #define DETECT_OS_LINUX 1
+ #define DETECT_OS_POSIX 1
+ #endif
+diff --git a/src/util/os_misc.c b/src/util/os_misc.c
+index ea73839..8de377d 100644
+--- a/src/util/os_misc.c
++++ b/src/util/os_misc.c
+@@ -60,7 +60,7 @@
+ #  include <unistd.h>
+ #  include <android/log.h>
+ #  include <sys/system_properties.h>
+-#elif DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM
++#elif DETECT_OS_LINUX || DETECT_OS_STAFETO || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM
+ #  include <unistd.h>
+ #elif DETECT_OS_OPENBSD || DETECT_OS_FREEBSD
+ #  include <sys/resource.h>
+diff --git a/src/util/u_process.c b/src/util/u_process.c
+index 6846acd..e0d0b79 100644
+--- a/src/util/u_process.c
++++ b/src/util/u_process.c
+@@ -56,7 +56,7 @@
+ 
+ #undef GET_PROGRAM_NAME_NOT_AVAILABLE
+ 
+-#if defined(__linux__) && defined(HAVE_PROGRAM_INVOCATION_NAME)
++#if DETECT_OS_LINUX && defined(HAVE_PROGRAM_INVOCATION_NAME)
+ static char *
+ __getProgramName()
+ {
+diff --git a/src/util/u_queue.c b/src/util/u_queue.c
+index 90a62a9..c209a92 100644
+--- a/src/util/u_queue.c
++++ b/src/util/u_queue.c
+@@ -35,7 +35,7 @@
+ #include "util/timespec.h"
+ #include "u_process.h"
+ 
+-#if defined(__linux__)
++#if DETECT_OS_LINUX
+ #include <sys/time.h>
+ #include <sys/resource.h>
+ #include <sys/syscall.h>
+@@ -255,7 +255,7 @@ util_queue_thread_func(void *input)
+                                        util_get_cpu_caps()->num_cpu_mask_bits);
+    }
+ 
+-#if defined(__linux__)
++#if DETECT_OS_LINUX
+    if (queue->flags & UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY) {
+       /* The nice() function can only set a maximum of 19. */
+       setpriority(PRIO_PROCESS, syscall(SYS_gettid), 19);
+@@ -344,7 +344,7 @@ util_queue_create_thread(struct util_queue *queue, unsigned index)
+    }
+ 
+    if (queue->flags & UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY) {
+-#if defined(__linux__) && defined(SCHED_BATCH)
++#if DETECT_OS_LINUX && defined(SCHED_BATCH)
+       struct sched_param sched_param = {0};
+ 
+       /* The nice() function can only set a maximum of 19.

@@ -1,0 +1,26 @@
+Mesa takes its C11 threads from the C library of stafeto.
+SPDX-License-Identifier: MIT
+Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+with_c11_threads is on only for Android; without it Mesa builds its own
+threads_posix.c, which defines mtx_init, cnd_init, thrd_create, call_once and
+tss_create, the names relibc's libc.a defines too, and a static link would
+have every one of them twice. The test is the macro __stafeto__ the cross
+file defines.
+
+diff --git a/meson.build b/meson.build
+index 59d30c8..769b844 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1750,6 +1750,11 @@ if cc.has_function('thrd_create', prefix: '#include <threads.h>')
+     # Current only Android's c11 <threads.h> are verified
+     pre_args += '-DHAVE_THRD_CREATE'
+     with_c11_threads = true
++  elif cc.get_define('__stafeto__') == '1'
++    # stafeto: the C library (relibc) has all of <threads.h>, and the sources
++    # of Mesa's own copy would define the same names a second time.
++    pre_args += '-DHAVE_THRD_CREATE'
++    with_c11_threads = true
+   endif
+ endif
+ 

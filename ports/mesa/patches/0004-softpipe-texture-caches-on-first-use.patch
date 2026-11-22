@@ -1,0 +1,83 @@
+softpipe makes the cache of a texture unit when a texture is bound to it.
+SPDX-License-Identifier: MIT
+Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+softpipe_create_context made all of its 768 texture tile caches (six shader
+stages, 128 units each, 256 KiB each) with calloc: 200 MiB. On a system that
+charges a process for memory at the mapping of a range, a context that binds
+one texture paid for all of them. The caches are now made by
+softpipe_set_sampler_views when a view is bound to a unit that has none, and
+a flush skips a unit without a cache.
+
+diff --git a/src/gallium/drivers/softpipe/sp_context.c b/src/gallium/drivers/softpipe/sp_context.c
+index f4e0b9f..b60b924 100644
+--- a/src/gallium/drivers/softpipe/sp_context.c
++++ b/src/gallium/drivers/softpipe/sp_context.c
+@@ -240,14 +240,11 @@ softpipe_create_context(struct pipe_screen *screen,
+       softpipe->cbuf_cache[i] = sp_create_tile_cache( &softpipe->pipe );
+    softpipe->zsbuf_cache = sp_create_tile_cache( &softpipe->pipe );
+ 
+-   /* Allocate texture caches */
+-   for (sh = 0; sh < ARRAY_SIZE(softpipe->tex_cache); sh++) {
+-      for (i = 0; i < ARRAY_SIZE(softpipe->tex_cache[0]); i++) {
+-         softpipe->tex_cache[sh][i] = sp_create_tex_tile_cache(&softpipe->pipe);
+-         if (!softpipe->tex_cache[sh][i])
+-            goto fail;
+-      }
+-   }
++   /* The caches of the texture units are made when a texture is bound to the
++    * unit (sp_state_sampler.c): there are 768 of them, 256 KiB each, and a
++    * system that charges memory at the mapping of a range pays 200 MiB for
++    * them even when no texture is ever bound.
++    */
+ 
+    softpipe->fs_machine = tgsi_exec_machine_create(MESA_SHADER_FRAGMENT);
+ 
+diff --git a/src/gallium/drivers/softpipe/sp_state_sampler.c b/src/gallium/drivers/softpipe/sp_state_sampler.c
+index 028d39a..e36550b 100644
+--- a/src/gallium/drivers/softpipe/sp_state_sampler.c
++++ b/src/gallium/drivers/softpipe/sp_state_sampler.c
+@@ -118,9 +118,16 @@ softpipe_set_sampler_views(struct pipe_context *pipe,
+          &softpipe->tgsi.sampler[shader]->sp_sview[start + i];
+       struct pipe_sampler_view **pview = &softpipe->sampler_views[shader][start + i];
+ 
++      struct softpipe_tex_tile_cache **cache = &softpipe->tex_cache[shader][start + i];
++
+       pipe_sampler_view_reference(pview, views[i]);
+-      sp_tex_tile_cache_set_sampler_view(softpipe->tex_cache[shader][start + i],
+-                                         views[i]);
++      /* The cache of a unit is made on its first texture. */
++      if (views[i] && !*cache)
++         *cache = sp_create_tex_tile_cache(&softpipe->pipe);
++      if (views[i] && !*cache)
++         pipe_sampler_view_reference(pview, NULL);
++      if (*cache)
++         sp_tex_tile_cache_set_sampler_view(*cache, *pview);
+       /*
+        * We don't really have variants, however some bits are different per shader,
+        * so just copy?
+@@ -139,8 +146,9 @@ softpipe_set_sampler_views(struct pipe_context *pipe,
+    for (; i < num + unbind_num_trailing_slots; i++) {
+       struct pipe_sampler_view **pview = &softpipe->sampler_views[shader][start + i];
+       pipe_sampler_view_reference(pview, NULL);
+-      sp_tex_tile_cache_set_sampler_view(softpipe->tex_cache[shader][start + i],
+-                                         NULL);
++      if (softpipe->tex_cache[shader][start + i])
++         sp_tex_tile_cache_set_sampler_view(softpipe->tex_cache[shader][start + i],
++                                            NULL);
+    }
+ 
+ 
+diff --git a/src/gallium/drivers/softpipe/sp_tex_tile_cache.c b/src/gallium/drivers/softpipe/sp_tex_tile_cache.c
+index 4bc8e3e..d88bb92 100644
+--- a/src/gallium/drivers/softpipe/sp_tex_tile_cache.c
++++ b/src/gallium/drivers/softpipe/sp_tex_tile_cache.c
+@@ -167,7 +167,7 @@ sp_flush_tex_tile_cache(struct softpipe_tex_tile_cache *tc)
+ {
+    int pos;
+ 
+-   if (tc->texture) {
++   if (tc && tc->texture) {
+       /* caching a texture, mark all entries as empty */
+       for (pos = 0; pos < ARRAY_SIZE(tc->entries); pos++) {
+          tc->entries[pos].addr.bits.invalid = 1;
