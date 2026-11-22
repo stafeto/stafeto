@@ -1918,19 +1918,38 @@ static int mix_writer(unsigned salt, unsigned count) {
     return close(fd) == 0 ? 0 : 3;
 }
 
-/* Two processes write 1 MiB of their pattern at offset 0 of one file and the third reads it: every
- * read is the first pattern, the pattern of the one writer or of the other, whole. */
-static int mix_body(unsigned writes, unsigned reads) {
+/* The writer of the single-writer form: 1 MiB of the pattern of A, then of B, at offset 0, `count`
+ * times, by messages (no window): its parts are small, so the reader's parts of 128 KiB meet it at
+ * every position of the file. */
+static int mix_alternating(unsigned count) {
+    stafeto_probe_data_ban_window();
+    int fd = open("/data/mix", O_WRONLY);
+    if (fd < 0) return 1;
+    for (unsigned i = 0; i < count; i++) {
+        fill_salt(big_buf, MIB, 21u + (i & 1u));
+        if (pwrite(fd, big_buf, MIB, 0) != (ssize_t)MIB) return 2;
+    }
+    return close(fd) == 0 ? 0 : 3;
+}
+
+/* `writers` processes write 1 MiB of their pattern at offset 0 of one file and one reads it: every
+ * read is the first pattern, the pattern of the one writer or of the other, whole. Writers and
+ * reader that take their turns at the service one part each stay in step, and the reader then finds
+ * one writer's pattern in every part of the file whatever the calls do to each other (a break of the
+ * leases did not show). The form with one writer that sends small parts and changes its pattern at
+ * each call meets the parts of the reader at every position and sees a mix of two patterns at once
+ * when the calls are not atomic to each other. */
+static int mix_body(unsigned writers, unsigned writes, unsigned reads) {
     atomic_start();
     int fd = open("/data/mix", O_RDWR | O_CREAT | O_EXCL, 0644);
     DATA_CHECK(fd >= 0);
     fill_salt(big_buf, MIB, 20);
     DATA_CHECK(pwrite(fd, big_buf, MIB, 0) == (ssize_t)MIB);
     pid_t pids[2];
-    for (int k = 0; k < 2; k++) {
+    for (unsigned k = 0; k < writers; k++) {
         pids[k] = fork();
         DATA_CHECK(pids[k] >= 0);
-        if (pids[k] == 0) _exit(mix_writer(21u + (unsigned)k, writes));
+        if (pids[k] == 0) _exit(writers == 1 ? mix_alternating(writes) : mix_writer(21u + k, writes));
     }
     unsigned long seen[3] = {0, 0, 0};
     for (unsigned i = 0; i < reads; i++) {
@@ -1943,7 +1962,7 @@ static int mix_body(unsigned writes, unsigned reads) {
         }
         seen[which]++;
     }
-    DATA_CHECK(wait_ok(pids[0]) == 0 && wait_ok(pids[1]) == 0);
+    for (unsigned k = 0; k < writers; k++) DATA_CHECK(wait_ok(pids[k]) == 0);
     printf("posix-data: mix: %lu reads saw the first pattern, %lu the pattern of A, %lu the pattern of B\n", seen[0],
            seen[1], seen[2]);
     DATA_CHECK(close(fd) == 0 && unlink("/data/mix") == 0);
@@ -2044,8 +2063,12 @@ static int inline_child(int (*body)(void)) {
     return wait_ok(pid);
 }
 
-static int mix_whole_scaled(void) { return mix_body(200 / atomic_less, 400 / atomic_less); }
-static int mix_whole_inline(void) { return mix_body(6, 12); }
+static int mix_whole_scaled(void) {
+    /* The form that a break of the leases shows in at once, first: its reads fail the check. */
+    int single = mix_body(1, 6, 12);
+    return single != 0 ? single : mix_body(2, 200 / atomic_less, 400 / atomic_less);
+}
+static int mix_whole_inline(void) { return mix_body(2, 6, 12); }
 static int append_inline_body(void) { return append_body(3); }
 
 static int check_mix(void) { return mix_whole_scaled(); }
