@@ -78,7 +78,8 @@ pub const BAND_ROWS: u32 = 16;
 /// model of the work is over the measure (the prices and the terms carry the margin
 /// of 15 %), and the real operations of eight windows came to 1.08 of the model's
 /// before the terms were set from the real bands: at 14 000 the band of eight layers
-/// is 45 points of a line and its step is expected near 15 500.
+/// is 43 points of a line (45 before the call of the black was raised to its measure of
+/// 264 ticks) and its step is expected near 15 500.
 pub const BAND_TICKS: u32 = 14_000;
 
 /// The gate of a band: 0.8 of term B, the most one step of a portion may take
@@ -200,7 +201,7 @@ const fn price(
 /// has apart from its general path; each has the miss
 /// the calibration of the lookup measured for its kind (`measures::LOOKUPS`).
 pub const PRICES: [Price; 24] = [
-    price("black", 209, 2_400, false, 38, false, LOOKUP_MISS_MEASURED),
+    price("black", 264, 2_400, false, 38, false, LOOKUP_MISS_MEASURED),
     price("copy", 780, 5_480, false, 138, false, LOOKUP_MISS_MEASURED),
     price("over", 785, 18_981, false, 427, false, LOOKUP_MISS_MEASURED),
     price(
@@ -361,6 +362,17 @@ pub fn kind_model_ticks(kind: &str, w: u32, h: u32) -> Option<u64> {
         .iter()
         .find(|p| p.kind == kind)
         .map(|p| model_ticks(*p, w, h))
+}
+
+/// What the model charges a call of the calibration's kind `kind` when pixman's cache of
+/// paths has lost its key, ticks (the constant with the margin): the miss of its row of
+/// `PRICES`, or for a kind of two steps the misses of the product and of the stretch.
+/// None for a kind with no price.
+pub fn kind_miss_ticks(kind: &str) -> Option<u32> {
+    if let Some((_, class)) = TWO_STEP_KINDS.iter().find(|(k, _)| *k == kind) {
+        return Some(PRICES[elements::Class::MaskAlpha.row()].miss + PRICES[class.row()].miss);
+    }
+    PRICES.iter().find(|p| p.kind == kind).map(|p| p.miss)
 }
 
 /// What every layer costs a band beyond its operation (ticks, for each window
@@ -4618,10 +4630,10 @@ mod tests {
         };
         let (w8, h8) = width_of(8);
         assert_eq!(h8, 1, "eight layers make a part of a line");
-        // By the terms measured on the real bands and 14 000 ticks eight layers get 45
+        // By the terms measured on the real bands and 14 000 ticks eight layers get 43
         // points of a line (a frame of the 320 by 200 windows is 8 bands a line,
         // 1 600 in all; 151 points and 600 bands before the terms).
-        assert_eq!(w8, 45);
+        assert_eq!(w8, 43);
         assert_eq!(320u32.div_ceil(w8) * 200, 1_600);
         let (w4, _) = width_of(4);
         assert!(w8 < w4);
@@ -4776,6 +4788,12 @@ mod tests {
                 p.kind,
                 model(p, w, h)
             );
+        }
+        // The black of one row, the greatest of the calibration's shapes of the call
+        // (the measure of the call was 280 ticks at 1 by 1 and 311 at 64 by 1 when the
+        // comp-probe judged the constants): the model is above both, margin or none.
+        for (w, greatest) in [(1u32, 280u64), (64, 311)] {
+            assert!(model(FILL, w, 1) >= greatest, "black {w}x1");
         }
         // The kinds of the elements' operations: every shape the calibration
         // measured is under the model with the constants, by the margin.
