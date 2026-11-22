@@ -391,6 +391,40 @@ impl Failed {
 
 /// `call_with`, with the status of a failed reply kept (a part needs NO_WINDOW).
 fn call_status(request: &[u8], take: bool) -> Result<Answer, Failed> {
+    call_held(request, take, None)
+}
+
+/// Ends the deferral of `call_held` and clears the record's mark of a part sent: no lease of an
+/// answer is waiting to be recorded.
+fn release_held(
+    held: &mut Option<(
+        &mut Option<rt::upcall::DeferredEntry>,
+        Option<&datawin::Live>,
+    )>,
+) {
+    if let Some((held, live)) = held.as_mut() {
+        if let Some(live) = live {
+            live.unsent();
+        }
+        **held = None;
+    }
+}
+
+/// `call_status` for a part of a large call. With `held`, the entries of signal handlers are
+/// deferred from the send to the answer and stay deferred in `held` after an answer that
+/// succeeded: a handler that jumps out then runs only once the caller has recorded the lease of
+/// the answer and dropped `held` (a signal that came while the layer waited for the reply would
+/// otherwise run its handler on the return from the send, before the lease is recorded, and the
+/// jump would leave the lease to run out on its timer). A send that a signal interrupts drops
+/// the deferral first, so that the handler runs, and goes on with a new one.
+fn call_held(
+    request: &[u8],
+    take: bool,
+    mut held: Option<(
+        &mut Option<rt::upcall::DeferredEntry>,
+        Option<&datawin::Live>,
+    )>,
+) -> Result<Answer, Failed> {
     let mut bound = false;
     let mut reborn = false;
     let mut tries = 0;
@@ -401,10 +435,21 @@ fn call_status(request: &[u8], take: bool) -> Result<Answer, Failed> {
             session().ok_or(Failed::local(EIO))?
         };
         let channel = Handle::<Channel>::borrowed(session);
+        if let Some((held, live)) = held.as_mut() {
+            **held = rt::upcall::defer_entries().ok();
+            if let Some(live) = live {
+                live.sending();
+            }
+        }
         let reply = match rt::sys::send(&channel, request) {
             Ok(reply) => reply,
-            Err(Error::Interrupted) => continue,
+            Err(Error::Interrupted) => {
+                // The kernel took the request back: no lease came of it.
+                release_held(&mut held);
+                continue;
+            }
             Err(Error::PeerClosed) => {
+                release_held(&mut held);
                 why!("the session closed: the service went");
                 forget(session);
                 // A path call goes on at once with a session of the new instance; a call on a
@@ -416,6 +461,7 @@ fn call_status(request: &[u8], take: bool) -> Result<Answer, Failed> {
                 return Err(Failed::local(EIO));
             }
             Err(error) => {
+                release_held(&mut held);
                 why!("request not sent to the session: {error:?}");
                 return Err(Failed::local(EIO));
             }
@@ -432,6 +478,7 @@ fn call_status(request: &[u8], take: bool) -> Result<Answer, Failed> {
             answer.bytes[..bytes.len() - 4].copy_from_slice(&bytes[4..]);
             return Ok(answer);
         }
+        release_held(&mut held);
         if status != 0 {
             why!("call answered with status {status}");
         }
@@ -1228,7 +1275,8 @@ fn transfer<S: Side>(handle: u32, offset: Option<u64>, side: &mut S) -> Result<(
         if built.is_err() {
             break Err(EIO);
         }
-        let answer = match call_status(w.as_bytes(), true) {
+        let mut held = None;
+        let answer = match call_held(w.as_bytes(), true, Some((&mut held, live.as_ref()))) {
             Ok(answer) => answer,
             Err(failed) if failed.status == p::NO_WINDOW && cell.is_some() => {
                 // The service has no window for this session (it restarted): register again and
@@ -1270,6 +1318,8 @@ fn transfer<S: Side>(handle: u32, offset: Option<u64>, side: &mut S) -> Result<(
         if let Some(live) = &live {
             live.set_lease(session_now().map_or(0, |s| s.0), parts.lease());
         }
+        // A handler that was held back since the send runs here, with the lease on record.
+        drop(held);
         if reply.count > 0 && live.as_ref().is_some_and(datawin::Live::forked) {
             // A fork inside a handler since the reply: the cell is not the child's to read.
             break Err(EIO);

@@ -35,10 +35,13 @@
 //!   (`relibc::exit_thread`). A deferred cancellation acts only at the C boundary after the call
 //!   has returned and dropped its cell, and the waits inside the calls are no points of
 //!   cancellation (`sleep::pause`).
-//! * A lease of a part belongs to the record only once its reply came (`Live::set_lease`): a
-//!   handler that jumps out between the reply and that store leaves the lease to run out on its
-//!   timer (`LEASE_GAP`, 1 s), and so does a jump in the few instructions between taking a cell
-//!   and recording it (the cell stays lost to the process until `exec`).
+//! * A lease of a part belongs to the record only once its reply came (`Live::set_lease`). The
+//!   entries of signal handlers are deferred from the send of a part to that record
+//!   (`data::call_held`): a signal that came while the layer waited for the reply would otherwise
+//!   run its handler on the return from the send, and a jump out of it would leave the lease to
+//!   run out on its timer (`LEASE_GAP`, 1 s; `probe_leases_unrecorded` counts such jumps). A jump
+//!   in the few instructions between taking a cell and recording it still loses the cell to the
+//!   process until `exec`.
 //! * A large call from a signal handler on a file whose lease the interrupted call holds waits for
 //!   that lease (up to `LEASE_CLIENT_MAX`, 1 s, when it is waited for) and the interrupted call
 //!   returns short with the lapse (`LAPSED`); the handler's call goes by messages (no cell).
@@ -74,6 +77,16 @@ static RETRIES: AtomicU64 = AtomicU64::new(0);
 
 /// The RELEASEs of leases that were not sent or got no answer.
 static RELEASES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// The calls a jump or an exit ended after a part was sent and before the lease of its answer was
+/// recorded (the lease then runs out on its timer; the entries deferred around the send of a part
+/// keep this at 0).
+static LEASES_UNRECORDED: AtomicU64 = AtomicU64::new(0);
+
+/// How many calls were ended with a part sent and its lease not yet recorded.
+pub fn probe_leases_unrecorded() -> u64 {
+    LEASES_UNRECORDED.load(Ordering::Relaxed)
+}
 
 /// How many RELEASEs of leases failed (the lease then runs out on its timer).
 pub fn probe_releases_dropped() -> u64 {
@@ -391,6 +404,9 @@ struct Slot {
     lease: AtomicU32,
     /// The session the lease belongs to (its raw handle).
     session: AtomicU64,
+    /// 1 from the send of a part to the record of its lease (`set_lease`): a jump that ends the
+    /// call in between does not know the lease the answer brought.
+    awaiting: AtomicU32,
 }
 
 impl Slot {
@@ -401,6 +417,7 @@ impl Slot {
             alternate: AtomicU32::new(0),
             lease: AtomicU32::new(0),
             session: AtomicU64::new(0),
+            awaiting: AtomicU32::new(0),
         }
     }
 }
@@ -433,10 +450,21 @@ impl Live {
                 slot.alternate.store(u32::from(frame.z), Ordering::Relaxed);
                 slot.lease.store(0, Ordering::Relaxed);
                 slot.session.store(0, Ordering::Relaxed);
+                slot.awaiting.store(0, Ordering::Relaxed);
                 return Some(Live { index, generation });
             }
         }
         None
+    }
+
+    /// A part is about to be sent: its answer brings a lease that `set_lease` records.
+    pub(crate) fn sending(&self) {
+        LIVE[self.index].awaiting.store(1, Ordering::Release);
+    }
+
+    /// The part sent got no answer that carries a lease (the request was taken back, or failed).
+    pub(crate) fn unsent(&self) {
+        LIVE[self.index].awaiting.store(0, Ordering::Release);
     }
 
     /// The lease the next part carries, for the session `session` (0 and 0 for none).
@@ -444,6 +472,7 @@ impl Live {
         let slot = &LIVE[self.index];
         slot.session.store(session, Ordering::Relaxed);
         slot.lease.store(lease, Ordering::Release);
+        slot.awaiting.store(0, Ordering::Release);
     }
 
     /// Whether a fork happened since the call began: its cell and record are the parent's.
@@ -465,6 +494,9 @@ impl Drop for Live {
 fn end(slot: usize, release: &impl Fn(u64, u32)) {
     let record = &LIVE[slot];
     let lease = record.lease.swap(0, Ordering::AcqRel);
+    if lease == 0 && record.awaiting.swap(0, Ordering::AcqRel) != 0 {
+        LEASES_UNRECORDED.fetch_add(1, Ordering::Relaxed);
+    }
     let session = record.session.load(Ordering::Relaxed);
     BOOK.release(slot);
     record.owner.store(0, Ordering::Release);

@@ -938,14 +938,15 @@ pub extern "C" fn stafeto_probe_file_reads() -> u64 {
     posix_abi::probe_file_reads()
 }
 
-/// The counters of the large calls on `/data` into `out[0..10]`: the parts that went through a
+/// The counters of the large calls on `/data` into `out[0..11]`: the parts that went through a
 /// cell, the parts by messages, the calls cut short by a lapsed lease, the parts run without a
 /// lease, the parts sent again after NO_WINDOW, the RELEASEs that failed, the free cells of the
 /// window, the calls of the calling thread that hold a record, whether the window is mapped (0 or
-/// 1) and the mappings of its object now (posix_abi::probe_data_*).
+/// 1), the mappings of its object now, and the calls a jump or an exit ended with a part sent and
+/// its lease not yet recorded (posix_abi::probe_data_*).
 ///
 /// # Safety
-/// `out` is writable for ten words.
+/// `out` is writable for eleven words.
 #[cfg(feature = "data")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_probe_data(out: *mut u64) {
@@ -960,6 +961,7 @@ pub unsafe extern "C" fn stafeto_probe_data(out: *mut u64) {
         u64::from(posix_abi::probe_data_live_calls()),
         u64::from(posix_abi::probe_data_window_ready()),
         posix_abi::probe_data_window_mappings(),
+        posix_abi::probe_data_leases_unrecorded(),
     ];
     for (i, word) in words.into_iter().enumerate() {
         // SAFETY: the caller's contract.

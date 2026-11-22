@@ -1703,7 +1703,7 @@ extern void stafeto_probe_data(unsigned long long *out);
 extern void stafeto_probe_data_ban_window(void);
 
 struct dcount {
-    unsigned long long cell, inl, lapsed, unleased, retries, dropped, free_cells, live, ready, mappings;
+    unsigned long long cell, inl, lapsed, unleased, retries, dropped, free_cells, live, ready, mappings, unrecorded;
 };
 
 static struct dcount dcounts(void) {
@@ -2243,15 +2243,18 @@ static void *jump_thread(void *arg) {
     pthread_join(jump_kick, NULL);
     h_mode = 0;
     struct dcount c = dcounts();
-    printf("posix-data: after the jump: %llu calls were live in the handler, %llu now, %llu free cells\n", h_live, c.live,
-           c.free_cells);
+    printf("posix-data: after the jump: %llu calls were live in the handler, %llu now, %llu free cells, %llu leases unrecorded\n",
+           h_live, c.live, c.free_cells, c.unrecorded);
+    if (c.unrecorded != 0) return (void *)12;
     if (h_live < 1) return (void *)3;
     if (c.live != 0 || c.free_cells != 2) return (void *)4;
     /* The lease went back with RELEASE at once (no timer ran it out), so another call on the file does not wait. */
     struct stat st;
     unsigned long long t = now_ms();
     if (stat("/data/jump", &st) != 0) return (void *)5;
-    if (now_ms() - t > 500) return (void *)6;
+    unsigned long long waited = now_ms() - t;
+    if (waited > 500) printf("posix-data: the stat after the jump waited %llu ms\n", waited);
+    if (waited > 500) return (void *)6;
     /* The thread has jumped out of a handler and still takes a cell in its next large call. */
     unsigned long long cell = c.cell, inl = c.inl;
     if (pwrite(fd, big_buf, MIB, 0) != (ssize_t)MIB) return (void *)9;
@@ -2298,12 +2301,15 @@ static int check_exit_body(void) {
     /* pthread_exit(NULL) from the handler: the result is NULL, and the handler saw a live call. */
     DATA_CHECK(result == NULL && h_live >= 1);
     struct dcount c = dcounts();
-    printf("posix-data: after the exit of the thread: %llu free cells, %llu RELEASEs lost\n", c.free_cells, c.dropped);
-    DATA_CHECK(c.free_cells == 2 && c.dropped == 0);
+    printf("posix-data: after the exit of the thread: %llu free cells, %llu RELEASEs lost, %llu leases unrecorded\n",
+           c.free_cells, c.dropped, c.unrecorded);
+    DATA_CHECK(c.free_cells == 2 && c.dropped == 0 && c.unrecorded == 0);
     struct stat st;
     unsigned long long t0 = now_ms();
     DATA_CHECK(stat("/data/gone", &st) == 0);
-    DATA_CHECK(now_ms() - t0 <= 500);
+    unsigned long long waited = now_ms() - t0;
+    if (waited > 500) printf("posix-data: the stat after the exit waited %llu ms\n", waited);
+    DATA_CHECK(waited <= 500);
     DATA_CHECK(unlink("/data/gone") == 0);
     return 0;
 }
