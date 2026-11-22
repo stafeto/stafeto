@@ -871,14 +871,17 @@ pub const INFO_KERNEL_STATS: u64 = 4;
 pub const INFO_MEMORY: u64 = 5;
 /// THREAD_STATE takes a thread handle, with no right needed, and returns
 /// `ThreadInfo::to_words` in x1-x4 and in x5 the counter ticks the thread
-/// has run, the stint it is in now included (idle time and cleanup are
-/// nobody's), and in x6 the part of them it spent in the kernel, from each
-/// entry from EL0 to the decision that sends a thread back (its system
-/// time; the rest is its user time), and in x7 the times a higher level
-/// (or the cleanup queue) took the thread off the CPU while it was ready:
-/// not a block, a yield or the end of a quantum (the count wraps at 2^16).
-/// Each preemption adds the exception entry, the handler and the way back
-/// to the ticks of x5.
+/// has run, the stint it is in now included. A stint begins when the thread
+/// returns to EL0 and ends when the scheduler takes the thread off the CPU
+/// or an entry for an interrupt begins (the stint begins again at the next
+/// return to EL0): idle time, cleanup, switches and the entries for
+/// interrupts are nobody's. In x6 comes the part of x5 the thread spent in
+/// the kernel, in its own calls and faults (its system time; the rest is
+/// its user time), and in x7 the times the kernel took the thread off the
+/// CPU while it was ready: a higher level or the cleanup queue took it, or
+/// it lost its level with its budget gone; not a block, a yield or the end
+/// of a quantum (the count wraps at 2^16). A preemption adds the saving and
+/// the restoring of the registers to the ticks of x5, and no more.
 pub const INFO_THREAD_STATE: u64 = 6;
 /// CHANNEL takes a channel handle, a labelled copy too, with no right
 /// needed, and returns `ChannelInfo::to_words` in x1-x4.

@@ -896,6 +896,26 @@ pub fn hand_off(
     Some(Some(r))
 }
 
+/// The CPU enters the kernel for an interrupt, at `now`: the running
+/// thread's stint ends here and begins again when it returns to EL0
+/// (`stint_starts`, spec 8). O(1); a second call in the same visit changes
+/// nothing.
+#[inline(never)]
+pub fn interrupt_entered(now: u64) {
+    let mut g = local().sched.lock();
+    // SAFETY: the scheduler's threads are alive.
+    unsafe { g.s.interrupt_entered(now) };
+}
+
+/// The thread `next` returns to EL0 at `now`: its stint begins, if it
+/// waited for this (`Node::stint_pending`).
+#[inline(always)]
+pub fn stint_starts(next: NonNull<Thread>, now: u64) {
+    let mut g = local().sched.lock();
+    // SAFETY: `next` is alive and the CPU's running thread.
+    unsafe { g.s.stint_starts(next, now) };
+}
+
 /// The timer's interrupt, before its EOI: the timer goes off, since its
 /// line is level-triggered and must be quiet by the EOI, and a round-robin
 /// thread whose quantum is over goes to the tail of its level; an

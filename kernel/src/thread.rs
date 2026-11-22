@@ -1355,6 +1355,10 @@ pub fn run(next: NonNull<Thread>) -> ! {
         crate::local::local()
             .place
             .runs(thread.priority(), now, prev != Some(next));
+        // A stint that waited for this begins here (spec 8).
+        if thread.sched.stint_pending() {
+            sched::stint_starts(next, now);
+        }
         user_resumes(thread, now);
         user::enter(next.as_ptr().cast())
     }

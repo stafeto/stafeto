@@ -93,7 +93,8 @@ extern "C" fn handle_user_exception(regs: *mut UserRegs, index: u64) -> ! {
             None => user_fault(thread, syndrome),
         },
         // PSTATE masks it now, and ISR_EL1 shows it to sched::resume.
-        VECTOR_EL0_IRQ => {}
+        // The thread's stint ends at the entry (spec 8).
+        VECTOR_EL0_IRQ => crate::sched::interrupt_entered(now),
         // Not the program's fault: PSTATE masks SErrors inside the kernel,
         // so one the kernel caused arrives at EL0 as well; FIQs never reach
         // EL1.
