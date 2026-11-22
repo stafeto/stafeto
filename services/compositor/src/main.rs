@@ -2215,6 +2215,21 @@ impl Compositor {
             return Answer::Status(proto_comp::code(proto_comp::NOT_ALLOWED));
         }
         let now = now_ns();
+        // The phases of the first late frame of the count not told yet, one a
+        // step (a line costs about 7 000 ticks, and the step stays under its
+        // gate), for the report of the probe. A RESET starts a count and tells
+        // nothing.
+        if !reset && let Some(late) = self.pacer.next_late() {
+            rt::println!(
+                "compositor: late frame period {} take {} us compose {} us device {} us frame {} us (the longest: {})",
+                late.k,
+                late.take_ns / 1_000,
+                late.compose_ns / 1_000,
+                late.device_ns / 1_000,
+                late.frame_ns() / 1_000,
+                late.cause()
+            );
+        }
         let mut records = [WindowStats::default(); STATS_WINDOWS];
         let mut count = 0;
         for i in 0..MAX_WINDOWS {
