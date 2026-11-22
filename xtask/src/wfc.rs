@@ -9,9 +9,9 @@
 //! 160 by 100, each a fixed pattern), draws a mask of A8 of its own, finds the
 //! windows by `wfcNextStreamSTAFETO`, and shows two scenes of three elements,
 //! A and B: elements of one to one scale, quarter turns, the filters none and
-//! faster, a global alpha and a mask. A stretch, a flip and the bilinear filter
-//! are left out while the service's price model makes a frame of them take
-//! seconds; they come back with the change of that model.
+//! faster, a stretch (A), a flip (B), a global alpha and a mask. A scene D of
+//! the bilinear filter (a stretch up, a stretch down of a flipped window, a
+//! quarter turn with a global alpha) is committed once after the active phase.
 //!
 //! The expected frames are the host's (`tools/wfc-ref`): the scenes built
 //! through the crate `wfc` with the demo's calls and drawn point by point from
@@ -131,12 +131,14 @@ const COMMITS: usize = 100;
 const COMMIT: &str = "wfc-demo: commit ";
 const AUTO_BEGIN: &str = "wfc-demo: auto begin";
 const AUTO_END: &str = "wfc-demo: auto end";
+const SCENE_D: &str = "wfc-demo: scene D committed";
+const SCENE_D_TIME: &str = "wfc-demo: scene D frame time, milliseconds: ";
 const SCENE_C: &str = "wfc-demo: scene C committed";
 const ENDED: &str = concat!("init: wfc-demo ended: exit code 0,", " not restarted");
 const ENDS: &str = "init: wfc-demo ended: ";
 
 /// The lines of the demo, each a check that passed.
-const LINES: [&str; 12] = [
+const LINES: [&str; 13] = [
     "wfc-demo: the calls before a device are refused as the specification says",
     "wfc-demo: the device is made, described, and a second one has its own state",
     "wfc-demo: the context is made, a second one is in use, its attributes are as the specification says",
@@ -148,6 +150,7 @@ const LINES: [&str; 12] = [
     "wfc-demo: the device is destroyed and its handles are gone",
     AUTO_BEGIN,
     AUTO_END,
+    SCENE_D,
     SCENE_C,
 ];
 
@@ -194,6 +197,8 @@ pub struct Shot {
 pub struct Seen {
     pub shots: Vec<Shot>,
     pub auto: Vec<u32>,
+    /// The screenshot of scene D (the bilinear filter, committed once).
+    pub bilinear: u32,
     /// The screenshot of scene C (the window of the first revision, shown
     /// straight from its buffer).
     pub direct: u32,
@@ -209,6 +214,10 @@ fn direct_crc() -> u32 {
 }
 
 fn take(monitor: &mut Monitor, scratch: &Scratch) -> Result<u32, String> {
+    Ok(take_picture(monitor, scratch)?.crc32())
+}
+
+fn take_picture(monitor: &mut Monitor, scratch: &Scratch) -> Result<crate::monitor::Ppm, String> {
     let picture = monitor.screendump(&scratch.picture())?;
     if (picture.width, picture.height) != (WIDTH, HEIGHT) {
         return Err(format!(
@@ -216,12 +225,43 @@ fn take(monitor: &mut Monitor, scratch: &Scratch) -> Result<u32, String> {
             picture.width, picture.height
         ));
     }
-    Ok(picture.crc32())
+    Ok(picture)
+}
+
+/// Where a screenshot differs from the host's frame of `scene`: the number of
+/// points, the box around them and the first of them with both colours (0xRRGGBB).
+fn where_it_differs(picture: &crate::monitor::Ppm, scene: usize) -> String {
+    let frame = wfc_ref::frame(scene);
+    let mut count = 0usize;
+    let mut bounds = (usize::MAX, usize::MAX, 0usize, 0usize);
+    let mut first = None;
+    for (i, want) in frame.iter().enumerate() {
+        let got = &picture.rgb[3 * i..3 * i + 3];
+        let got = u32::from(got[0]) << 16 | u32::from(got[1]) << 8 | u32::from(got[2]);
+        if got != *want {
+            let (x, y) = (i % WIDTH, i / WIDTH);
+            count += 1;
+            bounds = (
+                bounds.0.min(x),
+                bounds.1.min(y),
+                bounds.2.max(x),
+                bounds.3.max(y),
+            );
+            first.get_or_insert((x, y, got, *want));
+        }
+    }
+    match first {
+        None => "no point differs".to_owned(),
+        Some((x, y, got, want)) => format!(
+            "{count} points differ, in the box x {}..{} y {}..{}; the first at ({x}, {y}): screen {got:06x}, host {want:06x}",
+            bounds.0, bounds.2, bounds.1, bounds.3
+        ),
+    }
 }
 
 /// Follows the run: the screenshot after each commit's line against the host's
 /// CRC for its scene, the shots of the active context, then the end of the demo.
-fn drive(run: &mut Run, scratch: &Scratch, host: [u32; 2]) -> Result<Seen, String> {
+fn drive(run: &mut Run, scratch: &Scratch, host: [u32; 3]) -> Result<Seen, String> {
     const WITHIN: Duration = Duration::from_secs(240);
     let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
     let mut shots = Vec::with_capacity(COMMITS);
@@ -236,9 +276,19 @@ fn drive(run: &mut Run, scratch: &Scratch, host: [u32; 2]) -> Result<Seen, Strin
             return Err(failed);
         }
         let scene = commit_scene(&line, k)?;
+        let picture = take_picture(&mut monitor, scratch)?;
+        if picture.crc32() != host[scene] {
+            return Err(format!(
+                "commit {k} (scene {}): QEMU's screenshot is {:08x}, the host's frame is {:08x}: {}",
+                b"AB"[scene] as char,
+                picture.crc32(),
+                host[scene],
+                where_it_differs(&picture, scene)
+            ));
+        }
         shots.push(Shot {
             scene,
-            screen: take(&mut monitor, scratch)?,
+            screen: picture.crc32(),
             host: host[scene],
         });
     }
@@ -268,6 +318,20 @@ fn drive(run: &mut Run, scratch: &Scratch, host: [u32; 2]) -> Result<Seen, Strin
             Err(e) => return Err(e),
         }
     };
+    let line = run.expect_line(SCENE_D, |l| l == SCENE_D || failure(l).is_some(), WITHIN)?;
+    if let Some(failed) = failure(&line) {
+        return Err(failed);
+    }
+    let picture = take_picture(&mut monitor, scratch)?;
+    if picture.crc32() != host[2] {
+        return Err(format!(
+            "scene D (the bilinear filter): QEMU's screenshot is {:08x}, the host's frame is {:08x}: {}",
+            picture.crc32(),
+            host[2],
+            where_it_differs(&picture, 2)
+        ));
+    }
+    let bilinear = picture.crc32();
     let line = run.expect_line(SCENE_C, |l| l == SCENE_C || failure(l).is_some(), WITHIN)?;
     if let Some(failed) = failure(&line) {
         return Err(failed);
@@ -280,6 +344,7 @@ fn drive(run: &mut Run, scratch: &Scratch, host: [u32; 2]) -> Result<Seen, Strin
     Ok(Seen {
         shots,
         auto,
+        bilinear,
         direct,
         scanouts_before_c,
     })
@@ -424,7 +489,7 @@ fn commit_lines(lines: &[String]) -> Result<(), String> {
 /// after a commit is the host's CRC for its scene (a frame of elements of both
 /// scenes is neither), and each screenshot of the active context is the CRC of A
 /// or of B.
-pub fn verdict(lines: &[String], seen: &Seen, host: [u32; 2]) -> Result<(), String> {
+pub fn verdict(lines: &[String], seen: &Seen, host: [u32; 3]) -> Result<(), String> {
     if let Some(failed) = lines.iter().find_map(|l| failure(l)) {
         return Err(failed);
     }
@@ -435,10 +500,10 @@ pub fn verdict(lines: &[String], seen: &Seen, host: [u32; 2]) -> Result<(), Stri
         }
     }
     commit_lines(lines)?;
-    if host[0] == host[1] {
+    if host[0] == host[1] || host[0] == host[2] || host[1] == host[2] {
         return Err(format!(
-            "the host's frames of scenes A and B are the same ({:08x})",
-            host[0]
+            "the host's frames of scenes A, B and D are not three pictures ({:08x}, {:08x}, {:08x})",
+            host[0], host[1], host[2]
         ));
     }
     if seen.shots.len() != COMMITS {
@@ -488,13 +553,20 @@ pub fn verdict(lines: &[String], seen: &Seen, host: [u32; 2]) -> Result<(), Stri
         .auto
         .iter()
         .enumerate()
-        .find(|(_, c)| !host.contains(c))
+        .find(|(_, c)| !host[..2].contains(c))
     {
         return Err(format!(
             "screenshot {i} of the active context is {c:08x}, neither scene A's {:08x} nor B's {:08x}",
             host[0], host[1]
         ));
     }
+    if seen.bilinear != host[2] {
+        return Err(format!(
+            "scene D (the bilinear filter): QEMU's screenshot is {:08x}, the host's frame is {:08x}",
+            seen.bilinear, host[2]
+        ));
+    }
+    scene_d_time(lines)?;
     counters_verdict(&counters_of(lines)?)?;
     if seen.direct != direct_crc() {
         return Err(format!(
@@ -504,6 +576,44 @@ pub fn verdict(lines: &[String], seen: &Seen, host: [u32; 2]) -> Result<(), Stri
         ));
     }
     Ok(())
+}
+
+/// The milliseconds the demo printed for the frame of scene D (commit and compose):
+/// the line is there once with two numbers.
+pub fn scene_d_time(lines: &[String]) -> Result<(u64, u64), String> {
+    let mut mine = lines.iter().filter(|l| l.starts_with(SCENE_D_TIME));
+    let line = mine
+        .next()
+        .ok_or_else(|| format!("no line {SCENE_D_TIME:?}"))?;
+    if mine.next().is_some() {
+        return Err(format!("two lines {SCENE_D_TIME:?}"));
+    }
+    let words: Vec<&str> = line[SCENE_D_TIME.len()..].split_whitespace().collect();
+    match words.as_slice() {
+        ["commit", c, "compose", m] => {
+            let number = |w: &str| {
+                w.trim_end_matches(',')
+                    .parse::<u64>()
+                    .map_err(|e| format!("{line:?}: {e}"))
+            };
+            Ok((number(c)?, number(m)?))
+        }
+        _ => Err(format!("{line:?}: commit and compose times expected")),
+    }
+}
+
+/// The frame times the demo printed, for a report line: the first commits of
+/// scenes A and B and the commit of scene D, milliseconds.
+pub fn frame_times(lines: &[String], machine: &str) -> Result<String, String> {
+    let (commit, compose) = scene_d_time(lines)?;
+    let took: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("wfc-demo: took, milliseconds: "))
+        .collect();
+    Ok(format!(
+        "wfc-probe on {machine}: frame time, milliseconds: scene D (bilinear) commit {commit} compose {compose}; first commits of A and B: {}",
+        took.join(" | ")
+    ))
 }
 
 /// The trace of the device against what the demo did: the screen went to the pool
@@ -564,10 +674,11 @@ pub fn probe(machine: &qemu::Machine, with_steps: bool) -> Result<(), String> {
     .map_err(who)?;
     let c = counters_of(&outcome.lines).map_err(who)?;
     println!(
-        "wfc-probe on {}: scene A is {:08x} and scene B {:08x} (the host's frames from the same calls, drawn point by point); {COMMITS} commits in turn, each composed on request, matched QEMU's screenshot; {} screenshots of the active context while the scene changed {COMMITS} times were each A or B (both came up, {} changes between them); scene C, the window of the first revision, matched the producer's gradient and the scanout went to the pool (resource 2) after the active phase; the service's counters: frames {} then {} then {} (commits, active phase), bands {} then {} then {}, frames shown straight {} under A and B and {} after C with {} bands in it, failed {}, late {} and capped {} (of the frames and periods since the start); the calls, the errors, the streams, the sources, the mask, the child and the destroy: ok",
+        "wfc-probe on {}: scene A is {:08x}, scene B {:08x} and scene D (the bilinear filter, one commit) {:08x} (the host's frames from the same calls, drawn point by point); {COMMITS} commits in turn, each composed on request, matched QEMU's screenshot; {} screenshots of the active context while the scene changed {COMMITS} times were each A or B (both came up, {} changes between them); scene C, the window of the first revision, matched the producer's gradient and the scanout went to the pool (resource 2) after the active phase; the service's counters: frames {} then {} then {} (commits, active phase), bands {} then {} then {}, frames shown straight {} under A and B and {} after C with {} bands in it, failed {}, late {} and capped {} (of the frames and periods since the start); the calls, the errors, the streams, the sources, the mask, the child and the destroy: ok",
         machine.name,
         host[0],
         host[1],
+        host[2],
         seen.auto.len(),
         seen.auto.windows(2).filter(|w| w[0] != w[1]).count(),
         c[0].frames,
@@ -582,6 +693,10 @@ pub fn probe(machine: &qemu::Machine, with_steps: bool) -> Result<(), String> {
         c[4].failed,
         c[4].late,
         c[4].capped
+    );
+    println!(
+        "{}",
+        frame_times(&outcome.lines, machine.name).map_err(who)?
     );
     if with_steps && !machine.is_hvf() {
         steps(machine)?;
@@ -675,6 +790,8 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
     qemu::expect_marker(&output, "wfc-demo: ok")?;
     commit_lines(&output.lines).map_err(|e| format!("wfc-probe under -icount: {e}"))?;
     let (comp, driver) = steps_verdict(&output.lines)?;
+    scene_d_time(&output.lines).map_err(|e| format!("wfc-probe under -icount: {e}"))?;
+    println!("{}", frame_times(&output.lines, "-icount")?);
     println!(
         "{}",
         crate::frame_probe::check_waits(&output.lines, init::table::wfc::STEPS_TABLE, "wfc-probe")?
@@ -701,12 +818,13 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn host() -> [u32; 2] {
-        [0x1111_1111, 0x2222_2222]
+    fn host() -> [u32; 3] {
+        [0x1111_1111, 0x2222_2222, 0x5555_5555]
     }
 
     fn good_lines() -> Vec<String> {
         let mut lines: Vec<String> = LINES.iter().map(|l| (*l).to_owned()).collect();
+        lines.push(format!("{SCENE_D_TIME}commit 3, compose 120"));
         for k in 0..COMMITS {
             lines.push(format!("{COMMIT}{k} scene {}", b"AB"[k % 2] as char));
         }
@@ -754,6 +872,7 @@ mod tests {
                 })
                 .collect(),
             auto: vec![h[1], h[0], h[1], h[1], h[0]],
+            bilinear: h[2],
             direct: direct_crc(),
             scanouts_before_c: 2,
         }
@@ -914,13 +1033,30 @@ mod tests {
     }
 
     #[test]
+    fn scene_d_must_be_the_hosts_frame_and_have_a_time() {
+        let mut seen = good_seen();
+        seen.bilinear ^= 1;
+        let e = verdict(&good_lines(), &seen, host()).unwrap_err();
+        assert!(e.contains("scene D"), "{e}");
+        let mut lines = good_lines();
+        lines.retain(|l| !l.starts_with(SCENE_D_TIME));
+        assert!(verdict(&lines, &good_seen(), host()).is_err());
+        assert_eq!(scene_d_time(&good_lines()), Ok((3, 120)));
+        let mut lines = good_lines();
+        lines.push(format!("{SCENE_D_TIME}commit 1, compose 2"));
+        assert!(scene_d_time(&lines).is_err());
+    }
+
+    #[test]
     fn equal_host_frames_fail() {
-        assert!(verdict(&good_lines(), &good_seen(), [5, 5]).is_err());
+        assert!(verdict(&good_lines(), &good_seen(), [5, 5, 6]).is_err());
     }
 
     #[test]
     fn the_hosts_two_frames_differ() {
-        let [a, b] = wfc_ref::crcs();
+        let [a, b, d] = wfc_ref::crcs();
         assert_ne!(a, b);
+        assert_ne!(a, d);
+        assert_ne!(b, d);
     }
 }
