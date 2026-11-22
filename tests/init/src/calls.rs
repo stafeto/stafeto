@@ -13,7 +13,7 @@ use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 44] = [
+pub(crate) const TESTS: [Test; 45] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -141,6 +141,10 @@ pub(crate) const TESTS: [Test; 44] = [
     (
         "a_preemption_is_counted_and_costed",
         a_preemption_is_counted_and_costed,
+    ),
+    (
+        "a_budget_overrun_adds_no_entry_time_to_the_thread",
+        a_budget_overrun_adds_no_entry_time_to_the_thread,
     ),
 ];
 
@@ -2330,6 +2334,8 @@ static HELPER_DONE: AtomicU64 = AtomicU64::new(0);
 /// How long `a_preemption_is_counted_and_costed` waits after a burn with no preemption for
 /// the first one: the host's delay of an interrupt it delivers late.
 const LATE_PREEMPT_NS: u64 = 1_000_000_000;
+/// The `c_sw` of the last `a_preemption_is_counted_and_costed` under -icount.
+static C_SW: AtomicU64 = AtomicU64::new(0);
 /// The period of the helper's timer, in nanoseconds.
 static HELPER_PERIOD_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -2458,6 +2464,7 @@ fn a_preemption_is_counted_and_costed() -> Outcome {
     }
     if under_icount() && count > 0 {
         let c_sw = charged.saturating_sub(pure) / count;
+        C_SW.store(c_sw, Relaxed);
         println!(
             "preempt charge ticks: same-process one-cpu lower bound c_sw={c_sw} count={count} pure={pure} charged={charged}"
         );
@@ -2605,4 +2612,145 @@ fn process_control_checks_its_arguments() -> Outcome {
     close(weak)?;
     close(p)?;
     result
+}
+
+/// The turns of the loop of `overrun_worker`: about 12 500 ticks under -icount.
+const OVERRUN_SPINS: u32 = 6_000;
+/// The handle of the worker, and the two budgets it works under (raw values).
+static OVERRUN_HANDLES: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// Per run of the loop: the counter ticks it took, the time x5 grew by and the
+/// count x7 grew by; then 1 when the rebind failed.
+static OVERRUN_READ: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// The loop of the worker, twice: the second time under the budget of 50 us,
+/// which runs out inside the loop. Each time it reads its own time (x5), its
+/// count (x7) and the counter before and after.
+extern "C" fn overrun_worker(_: u64) -> ! {
+    let me = Handle::<Thread>::borrowed(abi::Handle(OVERRUN_HANDLES[0].load(Relaxed)));
+    for run in 0..2 {
+        if run == 1 {
+            let old = Handle::<rt::handle::Budget>::borrowed(abi::Handle(
+                OVERRUN_HANDLES[1].load(Relaxed),
+            ));
+            let new = Handle::<rt::handle::Budget>::borrowed(abi::Handle(
+                OVERRUN_HANDLES[2].load(Relaxed),
+            ));
+            if sys::thread_rebind_budget(&me, &new, &old).is_err() {
+                OVERRUN_READ[6].store(1, Relaxed);
+            }
+        }
+        let Ok((ran, preempts)) = sys::thread_ran_preempts(&me) else {
+            OVERRUN_READ[6].store(1, Relaxed);
+            break;
+        };
+        let began = time::now();
+        for i in 0..OVERRUN_SPINS {
+            core::hint::black_box(i);
+        }
+        let wall = time::now() - began;
+        let Ok((ran_after, preempts_after)) = sys::thread_ran_preempts(&me) else {
+            OVERRUN_READ[6].store(1, Relaxed);
+            break;
+        };
+        OVERRUN_READ[run * 3].store(wall, Relaxed);
+        OVERRUN_READ[run * 3 + 1].store(ran_after - ran, Relaxed);
+        OVERRUN_READ[run * 3 + 2].store(preempts_after - preempts, Relaxed);
+    }
+    sys::thread_exit()
+}
+
+/// The helper above the worker: it waits for the notification of the overrun
+/// of the worker's budget, takes it and ends.
+extern "C" fn overrun_helper(channel: u64) -> ! {
+    let _ = receive_x0_to_x11(abi::Handle(channel), 0, 0, 0);
+    HELPER_DONE.store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// A budget that runs out in the middle of a loop of EL0 costs the thread
+/// no time for the entries it caused (spec 8, stafeto#498). The worker, at 40
+/// with a budget and a place for its notifications, runs one loop under a
+/// budget of 1 ms for each 5 ms, and one under 50 us, which runs out inside
+/// the loop: the timer enters the kernel, the budget falls to its low level,
+/// the event posts the overrun to the helper at 50, which runs and waits, and
+/// the worker goes on. The time of the second loop is above the first by at
+/// most the two entries of `c_sw` each (the saves and restores of the
+/// registers), the wall time by at least 1 000 ticks (the episode took place),
+/// the overrun count of the second budget is 1 and x7 grew by 1, and the
+/// time grew by no more than an eighth of the wall time. Under -icount
+/// on one CPU; elsewhere the numbers mean little and the test checks only that
+/// the calls work. Prints `overrun charge ticks:` under -icount.
+fn a_budget_overrun_adds_no_entry_time_to_the_thread() -> Outcome {
+    reset_marks();
+    HELPER_DONE.store(0, Relaxed);
+    for m in &OVERRUN_READ {
+        m.store(0, Relaxed);
+    }
+    let c = channel(QUIET)?;
+    let notice = copy(&c, Rights::NOTIFY)?;
+    let first = sys::budget_create_with_notice(&resource(), 0, 1_000_000, 5_000_000, 32, &notice)
+        .map_err(|_| "budget_create failed")?;
+    let second = sys::budget_create_with_notice(&resource(), 0, 50_000, 5_000_000, 32, &notice)
+        .map_err(|_| "budget_create failed")?;
+    let helper = spawn(1, overrun_helper, c.raw().0, 50, Policy::Fifo)?;
+    let worker = thread(0, overrun_worker, 0, 40, Policy::Fifo)?;
+    OVERRUN_HANDLES[0].store(worker.raw().0, Relaxed);
+    OVERRUN_HANDLES[1].store(first.raw().0, Relaxed);
+    OVERRUN_HANDLES[2].store(second.raw().0, Relaxed);
+    sys::thread_bind_budget(&worker, &first).map_err(|_| "thread_bind_budget failed")?;
+    // The worker runs at once, above init, and ends.
+    sys::thread_start(&worker).map_err(|_| "thread_start failed")?;
+    let overruns = sys::budget_info(&second).map(|i| i.overruns);
+    let overruns_first = sys::budget_info(&first).map(|i| i.overruns);
+    // Whatever happened, the helper ends.
+    if HELPER_DONE.load(Relaxed) == 0 {
+        sys::notify(&notice, 1).map_err(|_| "notify failed")?;
+        let_run()?;
+    }
+    close(helper)?;
+    close(worker)?;
+    close(first)?;
+    close(second)?;
+    close(notice)?;
+    close(c)?;
+    check(
+        OVERRUN_READ[6].load(Relaxed) == 0,
+        "the worker could not rebind its budget or read its time",
+    )?;
+    let read = |i: usize| OVERRUN_READ[i].load(Relaxed);
+    let (wall1, ran1, p1, wall2, ran2, p2) = (read(0), read(1), read(2), read(3), read(4), read(5));
+    check(ran1 > 0 && ran2 > 0, "the worker's loops took no time")?;
+    if !under_icount() || sys::cpu_info(0).map_err(|_| "CPU info failed")?.cpus != 1 {
+        return Ok(());
+    }
+    let wall = wall2.saturating_sub(wall1);
+    let ran = ran2.saturating_sub(ran1);
+    let preempts = p2.wrapping_sub(p1);
+    println!("overrun charge ticks: wall={wall} ran={ran} preempts={preempts}");
+    check(
+        overruns == Ok(1) && overruns_first == Ok(0),
+        "the second budget did not run out exactly once, or the first did",
+    )?;
+    check(
+        wall >= 1_000,
+        "the loop with the overrun was not longer on the wall",
+    )?;
+    check(
+        p1 == 0 && preempts == 1,
+        "the overrun was not counted as one preemption",
+    )?;
+    let c_sw = C_SW.load(Relaxed);
+    check(
+        ran2 <= ran1 + 2 * c_sw,
+        "the entries of the overrun were charged to the thread",
+    )?;
+    // A kernel that charges the entries counts them in `c_sw` too (the entry
+    // of the timer and the way back), so the bound above lets some of them
+    // by: the share of the thread's time in the episode is at most an
+    // eighth of the episode's wall time, which the registers' save and
+    // restore take and the entries of the kernel do not.
+    check(
+        ran <= wall / 8,
+        "more than an eighth of the overrun's time was charged to the thread",
+    )
 }

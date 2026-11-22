@@ -1563,7 +1563,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 276;
+const INIT_TESTS: u32 = 277;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1789,6 +1789,10 @@ enum Variant {
     /// (`BudgetOverrunSilentTest`), the test of the place.
     BudgetOverrunSilent,
     BudgetOverrunSilentTest,
+    /// A stint that begins at the decision and runs through the entries for
+    /// interrupts (`break-stint-visit`): the test init's overrun test must
+    /// catch it (`budget-breaks`).
+    StintVisitBreak,
     /// An unbind that leaves the thread at the level its budget gave it
     /// (`break-budget-unbind-keeps`): the kernel tests of the unbind must
     /// catch it.
@@ -1847,7 +1851,7 @@ enum Variant {
 }
 
 impl Variant {
-    const ALL: [Variant; 80] = [
+    const ALL: [Variant; 81] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1910,6 +1914,7 @@ impl Variant {
         Variant::ReplyReceiveSplitTest,
         Variant::BudgetOverrunSilent,
         Variant::BudgetOverrunSilentTest,
+        Variant::StintVisitBreak,
         Variant::BudgetUnbindKeepsTest,
         Variant::NoticeHolderKeepsTest,
         Variant::ReplyReceiveCopyTest,
@@ -1998,6 +2003,7 @@ impl Variant {
             Variant::ReplyReceiveSplitTest => Some("ktest,break-reply-receive-split"),
             Variant::BudgetOverrunSilent => Some("break-budget-overrun-silent"),
             Variant::BudgetOverrunSilentTest => Some("ktest,break-budget-overrun-silent"),
+            Variant::StintVisitBreak => Some("break-stint-visit"),
             Variant::BudgetUnbindKeepsTest => Some("ktest,break-budget-unbind-keeps"),
             Variant::NoticeHolderKeepsTest => Some("ktest,break-notice-holder-keeps"),
             Variant::ReplyReceiveCopyTest => Some("ktest,break-reply-receive-copy"),
@@ -2104,6 +2110,7 @@ impl Variant {
             Variant::ReplyReceiveSplitTest => "stafeto-ktest-reply-receive-split",
             Variant::BudgetOverrunSilent => "stafeto-budget-overrun-silent",
             Variant::BudgetOverrunSilentTest => "stafeto-ktest-budget-overrun-silent",
+            Variant::StintVisitBreak => "stafeto-stint-visit-break",
             Variant::BudgetUnbindKeepsTest => "stafeto-ktest-budget-unbind-keeps",
             Variant::NoticeHolderKeepsTest => "stafeto-ktest-notice-holder-keeps",
             Variant::ReplyReceiveCopyTest => "stafeto-ktest-reply-receive-copy",
@@ -2650,6 +2657,7 @@ fn main() {
         Some("budget-hog") => budget_hog::run(&args[1..]),
         Some("service-budget") => service_budget::run(&args[1..]),
         Some("budget-breaks") => budget_hog::breaks(),
+        Some("stint-visit-break") => budget_hog::stint_visit_break(),
         Some("budget-break-unbound") => budget_hog::unbound_break(),
         Some("budget-journal") => budget_journal::run(&args[1..]),
         Some("log-quiet") => log_quiet::run(&args[1..]),
