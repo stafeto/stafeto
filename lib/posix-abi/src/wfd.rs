@@ -477,11 +477,17 @@ fn block_until(until: u64, ready: impl Fn() -> bool) -> Result<(), Ended> {
 }
 
 /// Runs `wait` again each time a signal ended it (its handler has run by
-/// then), as a call restarted under SA_RESTART. The wait's own bound ends the
-/// loop.
-fn wait_restarting(mut wait: impl FnMut() -> Result<(), Ended>) -> Result<(), Ended> {
+/// then), as a call restarted under SA_RESTART. The time `until` bounds the
+/// loop: once `now()` has reached it before a restart, the answer is
+/// `Timeout`, however many signals come.
+fn wait_restarting(
+    until: u64,
+    now: impl Fn() -> u64,
+    mut wait: impl FnMut() -> Result<(), Ended>,
+) -> Result<(), Ended> {
     loop {
         match wait() {
+            Err(Ended::Signal) if now() >= until => return Err(Ended::Timeout),
             Err(Ended::Signal) => {}
             other => return other,
         }
@@ -512,7 +518,8 @@ fn send(plan: &Commit) -> Result<(), i32> {
         drain();
         let until = crate::wait::now().saturating_add(FRAME_WAIT_NS);
         let ready = || with(|w| !w.frame_pending()).unwrap_or(true);
-        wait_restarting(|| block_until(until, ready)).map_err(|_| ERROR_BUSY)?;
+        wait_restarting(until, crate::wait::now, || block_until(until, ready))
+            .map_err(|_| ERROR_BUSY)?;
     }
     if FLAGS.load(Ordering::Acquire) & proto_gpu::CLEAN_BEFORE_FLUSH != 0 {
         clean(&layers);
@@ -677,18 +684,23 @@ pub(crate) fn release_for_exec() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
 
     #[test]
     fn a_signal_in_the_wait_runs_the_wait_again() {
         let mut calls = 0;
-        let got = wait_restarting(|| {
-            calls += 1;
-            if calls < 3 {
-                Err(Ended::Signal)
-            } else {
-                Ok(())
-            }
-        });
+        let got = wait_restarting(
+            100,
+            || 0,
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(Ended::Signal)
+                } else {
+                    Ok(())
+                }
+            },
+        );
         assert_eq!(got, Ok(()));
         assert_eq!(calls, 3);
     }
@@ -696,12 +708,36 @@ mod tests {
     #[test]
     fn a_timeout_or_a_failure_ends_the_wait() {
         let mut calls = 0;
-        let got = wait_restarting(|| {
-            calls += 1;
-            Err(Ended::Timeout)
-        });
+        let got = wait_restarting(
+            100,
+            || 0,
+            || {
+                calls += 1;
+                Err(Ended::Timeout)
+            },
+        );
         assert_eq!(got, Err(Ended::Timeout));
         assert_eq!(calls, 1);
-        assert_eq!(wait_restarting(|| Err(Ended::Failed)), Err(Ended::Failed));
+        assert_eq!(
+            wait_restarting(100, || 0, || Err(Ended::Failed)),
+            Err(Ended::Failed)
+        );
+    }
+
+    #[test]
+    fn signals_without_end_stop_at_the_bound() {
+        let clock = Cell::new(0u64);
+        let mut calls = 0;
+        let got = wait_restarting(
+            10,
+            || clock.get(),
+            || {
+                calls += 1;
+                clock.set(clock.get() + 1);
+                Err(Ended::Signal)
+            },
+        );
+        assert_eq!(got, Err(Ended::Timeout));
+        assert_eq!(calls, 10);
     }
 }

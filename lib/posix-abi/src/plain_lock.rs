@@ -1,5 +1,6 @@
 //! A plain futex mutex for a long section of a layer (the devices of OpenWF
-//! Composition and Display).
+//! Composition and Display). It has no priority inheritance, and it must not be
+//! taken from a signal handler (the thread that holds it would wait for itself).
 
 use crate::constants::*;
 use core::sync::atomic::{AtomicU32, Ordering};

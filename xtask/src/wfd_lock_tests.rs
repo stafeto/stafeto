@@ -26,7 +26,9 @@ fn the_wait_for_the_last_frame_runs_again_after_a_signal() {
     let text = wfd();
     let send = text.split("fn send(").nth(1).unwrap();
     let send = send.split("\nfn clean(").next().unwrap();
-    assert!(send.contains("wait_restarting(|| block_until(until, ready))"));
+    assert!(
+        send.contains("wait_restarting(until, crate::wait::now, || block_until(until, ready))")
+    );
     assert!(!send.contains("\n        block_until("));
 }
 
