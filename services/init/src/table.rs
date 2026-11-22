@@ -1556,6 +1556,7 @@ pub mod entropy;
 pub mod focus;
 pub mod frame;
 pub mod fstack;
+pub mod gles;
 pub mod gpu;
 pub mod input;
 #[cfg(feature = "table-budget-journal")]
@@ -1596,6 +1597,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-relibc") as usize
     + cfg!(feature = "table-relibc-threads") as usize
     + cfg!(feature = "table-cxx-probe") as usize
+    + cfg!(feature = "table-gles-pbuffer") as usize
     + cfg!(feature = "table-posix-procs") as usize
     + cfg!(feature = "table-posix-lock-ring") as usize
     + cfg!(feature = "table-posix-shares") as usize
@@ -1708,6 +1710,7 @@ const _: () = assert!(
     feature = "table-relibc",
     feature = "table-relibc-threads",
     feature = "table-cxx-probe",
+    feature = "table-gles-pbuffer",
     feature = "table-posix-procs",
     feature = "table-posix-lock-ring",
     feature = "table-posix-shares",
@@ -1827,6 +1830,8 @@ pub const TABLE: &[Record] = ramfs::POSIX_STEPS_TABLE;
 pub const TABLE: &[Record] = ramfs::RELIBC_THREADS_TABLE;
 #[cfg(feature = "table-cxx-probe")]
 pub const TABLE: &[Record] = ramfs::CXX_PROBE_TABLE;
+#[cfg(feature = "table-gles-pbuffer")]
+pub const TABLE: &[Record] = gles::PBUFFER_TABLE;
 #[cfg(feature = "table-os-test")]
 pub const TABLE: &[Record] = ramfs::OS_TEST_TABLE;
 #[cfg(feature = "table-os-test-data")]
@@ -4354,6 +4359,7 @@ mod tests {
             window::TABLE,
             wfc::TABLE,
             wfc::STEPS_TABLE,
+            gles::PBUFFER_TABLE,
             wfd::TABLE,
             wfd::STEPS_TABLE,
             ramfs::DISPLAY_TABLE,
@@ -4370,6 +4376,7 @@ mod tests {
                     "relibc-hello",
                     "relibc-threads",
                     "cxx-probe",
+                    "gles-cube",
                     "os-test-run",
                     "rtbench-posix",
                     "posix-random",

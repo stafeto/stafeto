@@ -2583,6 +2583,15 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        "boot-gles-pbuffer.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/gles-cube", 0o755, ROOT, "gles-cube"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
         "boot-posix-window.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -3709,6 +3718,7 @@ mod tests {
             "boot-data-posix-steps.img",
             "boot-posix-window.img",
             "boot-cxx-probe.img",
+            "boot-gles-pbuffer.img",
             "boot-wfc.img",
             "boot-wfc-steps.img",
             "boot-wfd.img",

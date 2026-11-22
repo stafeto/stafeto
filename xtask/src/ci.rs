@@ -171,6 +171,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("relibc-hello", 23),
     ("relibc-threads", 23),
     ("cxx-probe", 20),
+    ("gles-pbuffer", 40),
     ("posix-files", 29),
     ("posix-files steps", 31),
     ("posix-procs", 69),
