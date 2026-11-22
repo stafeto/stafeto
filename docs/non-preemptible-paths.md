@@ -816,6 +816,18 @@ statistics of `process-steps` count the methods from 64 on in the kind 63; the d
 row says whether the longest step was a read through an object. The checks of the arguments are
 `ramfs::read_portion_valid`, with a host test.
 
+### The data service's parts of a large call
+
+A call of more than one message on `/data` runs in parts of up to 64 KiB through a cell of the session's window (`docs/data.md`). The service's request loop only copies the header and queues the job for each part, as it does for READ and WRITE; the bytes move in the worker thread (level 30, budget `work`), which maps one cell of 16 pages for the job and unmaps it at the end. Three bounds are judged by `cargo xtask data-steps` (`xtask/src/data_posix.rs`, `xtask/src/data_probe.rs`):
+
+| What | Bound | Where it comes from |
+|---|---|---|
+| a step of the loop for a part, WINDOW or OPEN_NUMBERED | 6,000 ticks (`PART_STEP_MAX`), inside 0.9 of term B | the header copy and the queueing of one job |
+| a step of the loop for a write part with its data in the message (WRITE_FROM, PWRITE_FROM with the flag INLINE) | 8,048 ticks (6,000 + 2 * `MESSAGE_MAX`, `INLINE_PART_STEP_MAX`) | the loop copies the whole message of 1,024 bytes twice, the receive into its buffer and the queue into the job, at about half a tick a byte each |
+| `mem_map` and `mem_unmap` of a cell of 16 pages, one chunk of the kernel's call | 12,000 ticks (`CELL_QUIET_MAX`), term B 20,410 stays the hard bound | judged over the calls of the worker in which no step of the loop started or ended, since a step that preempts the call adds its own ticks to the wall time of the call |
+
+The cell map is judged over the calls that have no loop step inside because under `-icount` the worker's call and a step of the loop run on one CPU, and a preemption by a step of the loop counts into the call's ticks. The wall maximum and the histograms of all calls are printed before the verdict. A cell is one chunk of `mem_map` and `mem_unmap` (16 pages, `maps::PORTION`), so the kernel rows `map` and `unmap` above bound it. The worker, at level 30, delays no thread above it by the length of its stretch (the service shares no lock with them); on CPU 1 its budget `work` limits its share to 30 %, and the run on two CPUs prints the share of the worker in the span of the parts. A wait of a client for a file under a lease is a matter of the jobs' order and is bounded in `docs/data.md`.
+
 ### The entropy service
 
 It runs at level 36, below the services at 40, and its CLONE walks the
