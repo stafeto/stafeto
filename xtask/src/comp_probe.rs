@@ -693,6 +693,182 @@ pub fn shape_costs(lines: &[String], tag: &str) -> Vec<ShapeCost> {
     out
 }
 
+/// The widest row of the screen: no band is wider.
+const SCREEN_WIDTH: u32 = 640;
+
+/// The line `service lookup: T KIND inside I least L greatest G`: what a call of a kind
+/// pays when pixman's cache of paths has lost its key, at one of the two variants of the
+/// flags (the line `service lookup: T greatest G` that sums the run up is no kind's).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LookupCost {
+    pub kind: String,
+    pub inside: bool,
+    pub greatest: u64,
+}
+
+impl LookupCost {
+    fn parse(line: &str, tag: &str) -> Option<LookupCost> {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let [
+            "service",
+            "lookup:",
+            t,
+            kind,
+            "inside",
+            i,
+            "least",
+            _,
+            "greatest",
+            g,
+        ] = w.as_slice()
+        else {
+            return None;
+        };
+        if *t != tag {
+            return None;
+        }
+        Some(LookupCost {
+            kind: (*kind).to_owned(),
+            inside: *i == "1",
+            greatest: g.parse().ok()?,
+        })
+    }
+}
+
+/// The lookups of the service `tag`, the last line of each kind and variant.
+pub fn lookup_costs(lines: &[String], tag: &str) -> Vec<LookupCost> {
+    let mut out: Vec<LookupCost> = Vec::new();
+    for c in lines.iter().filter_map(|l| LookupCost::parse(l, tag)) {
+        match out
+            .iter_mut()
+            .find(|o| (&o.kind, o.inside) == (&c.kind, c.inside))
+        {
+            Some(old) => *old = c,
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+/// What the judgement of the prices found: how many measures it held against the model, and
+/// the kinds whose rows a band may stretch past the widths measured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PriceJudgement {
+    pub shapes: usize,
+    pub lookups: usize,
+    pub kinds: usize,
+    /// (kind, the widest shape measured, the widest row a band is sized to): the kinds
+    /// whose band reaches past the measures, where the price is the model's line extended.
+    pub extended: Vec<(String, u32, u32)>,
+}
+
+/// The widest row of one operation of `kind` a band is sized to, points: the lines of a
+/// band are as wide as the damage (at most the screen), and one row of an element costs
+/// its row and points, so the row that BAND_TICKS leaves after the calls of the layer
+/// is as wide as the budget allows. None for a kind with no price.
+pub fn widest_band_row(kind: &str) -> Option<u32> {
+    let p = compositor::PRICES.iter().find(|p| p.kind == kind)?;
+    let calls = u64::from(p.call) + u64::from(compositor::LAYER) + u64::from(p.miss);
+    let budget = u64::from(compositor::BAND_TICKS)
+        .saturating_sub(u64::from(compositor::BAND_FIXED) + calls)
+        * 100;
+    let room = budget.saturating_sub(u64::from(p.row));
+    Some(
+        room.checked_div(u64::from(p.point))
+            .map_or(SCREEN_WIDTH, |w| w.min(u64::from(SCREEN_WIDTH)) as u32),
+    )
+}
+
+/// Judges the shapes and the lookups of the calibration of the service against the price
+/// model (`compositor::kind_model_ticks`, `kind_miss_ticks`: the constants with the margin).
+/// A measure above its price fails the run: the model must err only high. The kinds of the
+/// bands of layers (`layers1` to `layers9`) are judged by their own term and are left out; a
+/// kind with no price fails, and so does a run with no line of the calibration. The prices
+/// are fitted over widths measured up to the widest shape; a band may be wider (see
+/// `PriceJudgement::extended`), and there the price is the model's straight line extended,
+/// which no measure holds.
+pub fn price_verdict(lines: &[String], tag: &str) -> Result<PriceJudgement, String> {
+    let shapes: Vec<ShapeCost> = shape_costs(lines, tag)
+        .into_iter()
+        .filter(|c| !c.kind.starts_with("layers"))
+        .collect();
+    let lookups = lookup_costs(lines, tag);
+    if shapes.is_empty() || lookups.is_empty() {
+        return Err(format!(
+            "the calibration told {} shapes and {} lookups of the compositor: a run without the calibrate feature",
+            shapes.len(),
+            lookups.len()
+        ));
+    }
+    let mut above = Vec::new();
+    for c in &shapes {
+        let model = compositor::kind_model_ticks(&c.kind, c.w, c.h)
+            .ok_or_else(|| format!("the shape of {} {}x{} has no price", c.kind, c.w, c.h))?;
+        if c.greatest > model {
+            above.push(format!(
+                "{} {}x{}: measured {} over the price {model}",
+                c.kind, c.w, c.h, c.greatest
+            ));
+        }
+    }
+    for c in &lookups {
+        let miss = compositor::kind_miss_ticks(&c.kind)
+            .ok_or_else(|| format!("the lookup of {} has no price", c.kind))?;
+        if c.greatest > u64::from(miss) {
+            above.push(format!(
+                "{} lookup (inside {}): measured {} over the price {miss}",
+                c.kind,
+                u8::from(c.inside),
+                c.greatest
+            ));
+        }
+    }
+    if !above.is_empty() {
+        return Err(format!(
+            "the compositor's measures above the price model: {}",
+            above.join("; ")
+        ));
+    }
+    let mut kinds: Vec<&str> = shapes.iter().map(|c| c.kind.as_str()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    let extended = kinds
+        .iter()
+        .filter_map(|k| {
+            let widest = shapes.iter().filter(|c| c.kind == *k).map(|c| c.w).max()?;
+            let band = widest_band_row(k)?;
+            (band > widest).then(|| ((*k).to_owned(), widest, band))
+        })
+        .collect();
+    Ok(PriceJudgement {
+        shapes: shapes.len(),
+        lookups: lookups.len(),
+        kinds: kinds.len(),
+        extended,
+    })
+}
+
+/// The judgement for the report, with the extension said as it is: the widths no measure holds.
+pub fn price_text(j: &PriceJudgement) -> String {
+    let extended = if j.extended.is_empty() {
+        "every band row is as wide as a measure".to_owned()
+    } else {
+        format!(
+            "{} kinds have bands wider than their widest measure, where the price is the model's line extended and no measure holds it ({})",
+            j.extended.len(),
+            j.extended
+                .iter()
+                .map(|(k, m, b)| format!("{k}: measured to {m}, band to {b}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "the price model holds above {} shapes of {} kinds and {} lookups; {extended}",
+        j.shapes, j.kinds, j.lookups
+    )
+}
+
 /// The upper fit of a kind over the greatest ticks of its shapes
 /// (`compositor::fit`): the call in ticks, the row and the point in hundredths
 /// of a tick, with the greatest overstatement of a shape.
@@ -1300,6 +1476,9 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         return Err(format!("comp-probe under -icount: {failed}"));
     }
     let (comp, driver) = steps_verdict(&output.lines)?;
+    let judged = price_verdict(&output.lines, COMP_TAG)
+        .map_err(|e| format!("comp-probe on {}: {e}", machine.name))?;
+    println!("comp-probe on {}: {}", machine.name, price_text(&judged));
     let most = frames_verdict(&output.lines)?;
     println!(
         "comp-probe on {}: the frames of the scenes took {most} steps at most (limit {FRAME_STEPS_MAX}): {}",
@@ -1629,7 +1808,7 @@ mod tests {
             "20 large operations: least 1.60 at 6144 points, net of the call 1.47, greatest 3.52"
         ));
         assert!(text.contains(
-            "black (table: call 209 constant 241, row 24.00 constant 27.60, point 0.38 constant 0.44;"
+            "black (table: call 264 constant 304, row 24.00 constant 27.60, point 0.38 constant 0.44;"
         ));
     }
 
@@ -1759,6 +1938,109 @@ mod tests {
         assert!(text.contains("eight windows with an alpha"));
         // Shapes that are missing are said so, and no price is made up.
         assert!(fit_text(&shapes[..2]).contains("no fit"));
+    }
+
+    /// The lines of a calibration that sit on the price model with the given slack: a shape of
+    /// each kind at two widths, and a lookup of each kind at both variants.
+    fn calibration_lines(shape_extra: u64, miss_extra: u64) -> Vec<String> {
+        let mut lines = Vec::new();
+        for kind in [
+            "copy",
+            "fast-nearest-copy",
+            "scale-bilinear-mask-alpha",
+            "mask-alpha",
+        ] {
+            for (w, h) in [(8u32, 8u32), (152, 8)] {
+                let ticks = compositor::kind_model_ticks(kind, w, h).unwrap() + shape_extra;
+                lines.push(format!(
+                    "service shape: 17 {kind} {w} {h} least {} greatest {ticks} n 2",
+                    ticks - 1
+                ));
+            }
+            let miss = u64::from(compositor::kind_miss_ticks(kind).unwrap()) + miss_extra;
+            for inside in [0, 1] {
+                lines.push(format!(
+                    "service lookup: 17 {kind} inside {inside} least 1 greatest {miss}"
+                ));
+            }
+        }
+        lines.push("service lookup: 17 greatest 5000".to_owned());
+        lines.push("service shape: 17 layers4 45 1 least 1 greatest 9999999 n 2".to_owned());
+        lines.push("service shape: 12 copy 8 8 least 1 greatest 9999999 n 2".to_owned());
+        lines
+    }
+
+    #[test]
+    fn measures_at_the_price_model_pass_and_the_kinds_of_layers_are_left_out() {
+        let j = price_verdict(&calibration_lines(0, 0), COMP_TAG).unwrap();
+        assert_eq!((j.shapes, j.lookups, j.kinds), (8, 8, 4));
+        let lookups = lookup_costs(&calibration_lines(0, 0), COMP_TAG);
+        assert_eq!(lookups.len(), 8);
+        assert!(lookups.iter().all(|l| l.kind != "greatest"));
+    }
+
+    #[test]
+    fn a_shape_or_a_lookup_above_its_price_fails_and_is_named() {
+        let e = price_verdict(&calibration_lines(1, 0), COMP_TAG).unwrap_err();
+        assert!(e.contains("above the price model"), "{e}");
+        assert!(e.contains("fast-nearest-copy 152x8: measured"), "{e}");
+        assert!(e.contains("scale-bilinear-mask-alpha 8x8"), "{e}");
+        let e = price_verdict(&calibration_lines(0, 1), COMP_TAG).unwrap_err();
+        assert!(e.contains("mask-alpha lookup (inside 1): measured"), "{e}");
+        // A kind the table does not price is no measure to ignore.
+        let lines = vec![
+            "service shape: 17 no-such-kind 8 8 least 1 greatest 2 n 2".to_owned(),
+            "service lookup: 17 copy inside 0 least 1 greatest 1".to_owned(),
+        ];
+        assert!(
+            price_verdict(&lines, COMP_TAG)
+                .unwrap_err()
+                .contains("no-such-kind")
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_calibration_lines_fails() {
+        let e = price_verdict(&["comp-probe: ok".to_owned()], COMP_TAG).unwrap_err();
+        assert!(e.contains("0 shapes and 0 lookups"), "{e}");
+        // Shapes with no lookups are as incomplete.
+        let lines = calibration_lines(0, 0);
+        let shapes: Vec<String> = lines
+            .into_iter()
+            .filter(|l| l.starts_with("service shape"))
+            .collect();
+        assert!(price_verdict(&shapes, COMP_TAG).is_err());
+    }
+
+    /// The bands wider than the widths measured are told, with the width the band is sized to.
+    #[test]
+    fn the_bands_past_the_widths_measured_are_told_as_an_extension() {
+        let j = price_verdict(&calibration_lines(0, 0), COMP_TAG).unwrap();
+        // The plain kinds in this fixture are measured to 152 only.
+        let near = |k: &str| j.extended.iter().find(|e| e.0 == k).cloned();
+        assert_eq!(near("copy").map(|e| (e.1, e.2)), Some((152, 640)));
+        let wide = widest_band_row("fast-nearest-copy").unwrap();
+        assert!(wide > 152 && wide <= 640, "{wide}");
+        assert_eq!(
+            near("fast-nearest-copy"),
+            Some(("fast-nearest-copy".to_owned(), 152, wide))
+        );
+        let text = price_text(&j);
+        assert!(
+            text.contains("copy: measured to 152, band to 640"),
+            "{text}"
+        );
+        assert!(text.contains("no measure holds it"), "{text}");
+        assert!(
+            price_text(&PriceJudgement {
+                shapes: 1,
+                lookups: 1,
+                kinds: 1,
+                extended: Vec::new()
+            })
+            .contains("every band row is as wide as a measure")
+        );
+        assert_eq!(widest_band_row("no-such-kind"), None);
     }
 
     #[test]
