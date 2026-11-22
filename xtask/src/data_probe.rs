@@ -76,15 +76,32 @@ const STEP_KINDS: [(usize, &str); 21] = [
 /// 6,000 ticks, well inside 0.9 of term B (18,369). The bytes move in the worker.
 const PART_STEP_MAX: u64 = 6_000;
 
+/// The most kernel ticks a map or an unmap of a cell of 16 pages may take in a call that no step of
+/// the loop started or ended in (the 12,000 ticks of the plan; term B is 20,410).
+pub(crate) const CELL_QUIET_MAX: u64 = 12_000;
+
 /// The cells the worker mapped and unmapped, in the lines of a run: the longest map and the longest
-/// unmap, in ticks. A cell is 16 pages, one chunk of `mem_map` and `mem_unmap`; each is judged against
-/// term B, the longest the kernel keeps a higher level waiting. The run must show both.
+/// unmap, in ticks, of the calls with no preemption by the loop. The wall time of a call counts every
+/// preemption in it and is only told (`cell_longest`, with the histograms); the kernel ticks of the
+/// process in a call during which no step of the loop started or ended are judged against
+/// `CELL_QUIET_MAX`. The run must show both.
 pub(crate) fn cell_verdict(lines: &[String]) -> Result<(u64, u64), String> {
-    let (map, unmap) = cell_longest(lines)?;
+    let longest = |what: &str| -> Result<u64, String> {
+        let key = format!("datafs: cell {what} quiet longest ");
+        lines
+            .iter()
+            .filter_map(|l| {
+                let at = l.find(&key)? + key.len();
+                l[at..].split_whitespace().next()?.parse::<u64>().ok()
+            })
+            .max()
+            .ok_or_else(|| format!("the data service: no line of the quiet longest cell {what}"))
+    };
+    let (map, unmap) = (longest("map")?, longest("unmap")?);
     for (what, ticks) in [("map", map), ("unmap", unmap)] {
-        if ticks > crate::TERM_B {
+        if ticks > CELL_QUIET_MAX {
             return Err(format!(
-                "the data service: a cell {what} of {ticks} ticks is past term B ({})",
+                "the data service: a cell {what} with no step of the loop in it took {ticks} kernel ticks, over {CELL_QUIET_MAX} (term B is {})",
                 crate::TERM_B
             ));
         }

@@ -735,6 +735,12 @@ mod steps {
     /// power of two of the steps done (`table_steps`; 0 while it is off), and the steps done.
     static TABLE_FROM: AtomicU64 = AtomicU64::new(0);
     static DONE: AtomicU64 = AtomicU64::new(0);
+    /// The starts and ends of the steps of every loop of the process.
+    static LOOP_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn loop_events() -> u64 {
+        LOOP_EVENTS.load(Ordering::Relaxed)
+    }
     /// The place the table in progress goes on from, over the pairs of all kinds (`TABLE_END` when
     /// no table is in progress).
     static CURSOR: AtomicUsize = AtomicUsize::new(TABLE_END);
@@ -886,6 +892,7 @@ mod steps {
     /// Starts the count of a step: what an earlier send of the loop
     /// (between steps) waited does not belong to it.
     pub fn restart() {
+        LOOP_EVENTS.fetch_add(1, Ordering::Relaxed);
         let Some(slot) = claim() else { return };
         let (ran, preempts) = own_state(slot);
         slot.ran_begin.store(ran, Ordering::Relaxed);
@@ -925,6 +932,7 @@ mod steps {
     }
 
     pub fn end(began: u64, kind: usize) -> super::StepSample {
+        LOOP_EVENTS.fetch_add(1, Ordering::Relaxed);
         let whole = super::time::now().saturating_sub(began);
         let Some(slot) = mine() else {
             // A loop that never restarted (no place was free): no accounting for it.
@@ -1029,6 +1037,9 @@ mod steps {
     pub fn after(_: fn()) {}
     pub fn table(_: u64) {}
     pub fn stopping() {}
+    pub fn loop_events() -> u64 {
+        0
+    }
 }
 
 /// Makes the loop of this service print each new longest step (feature
@@ -1131,6 +1142,13 @@ pub(crate) fn preempted(ticks: u64) {
 #[cfg(feature = "step-stats")]
 pub(crate) fn divided() {
     steps::divided();
+}
+
+/// How many times a step of a loop of this process began or ended (feature `step-stats`; 0
+/// without it): a measure that sees the same number before and after has run with no step of
+/// the loop starting or ending in between.
+pub fn loop_events() -> u64 {
+    steps::loop_events()
 }
 
 /// Counts the notification step in progress apart from the others (feature

@@ -111,16 +111,65 @@ pub fn acceptable(process: &Handle<Process>, memory: &Handle<Memory>) -> bool {
 fn longest(
     (slot, calls, buckets): (&AtomicU64, &AtomicU64, &Buckets),
     what: &str,
-    from: u64,
+    from: Began,
     (pages, access): (u64, &str),
+    process: &Handle<Process>,
 ) {
     let nth = calls.fetch_add(1, Relaxed) + 1;
-    let took = rt::time::now().saturating_sub(from);
+    let took = rt::time::now().saturating_sub(from.at);
+    // The wall time of a call counts a preemption (by the loop or by a higher level) in it. A call
+    // that no step of the loop started or ended in, judged by the kernel ticks of the process,
+    // is the call with no preemption by the loop; its figure is the one the probe judges.
+    let kernel = sys::process_times(process).map_or(0, |t| t.1);
+    if from.events == rt::service::loop_events() && from.kernel != 0 && kernel != 0 {
+        quiet(what, kernel.saturating_sub(from.kernel), nth);
+    }
     buckets.note(took);
     if took > slot.load(Relaxed) {
         slot.store(took, Relaxed);
         rt::println!(
             "datafs: cell {what} longest {took} ticks (pages {pages}, call {nth}, access {access})"
+        );
+    }
+}
+
+/// What a call of `map` or `unmap` starts from: the clock, the loop's steps and the kernel ticks of
+/// the process.
+#[cfg(feature = "steps")]
+struct Began {
+    at: u64,
+    events: u64,
+    kernel: u64,
+}
+
+#[cfg(feature = "steps")]
+impl Began {
+    fn now(process: &Handle<Process>) -> Began {
+        let events = rt::service::loop_events();
+        let kernel = sys::process_times(process).map_or(0, |t| t.1);
+        Began {
+            at: rt::time::now(),
+            events,
+            kernel,
+        }
+    }
+}
+
+#[cfg(feature = "steps")]
+static QUIET_LONGEST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(feature = "steps")]
+static QUIET_CALLS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A call with no step of the loop in it took `ticks` of kernel time of the process: a longer one
+/// than before says so, `datafs: cell map quiet longest N ticks (quiet calls Q, call N-th)`.
+#[cfg(feature = "steps")]
+fn quiet(what: &str, ticks: u64, nth: u64) {
+    let at = usize::from(what == "unmap");
+    let calls = QUIET_CALLS[at].fetch_add(1, Relaxed) + 1;
+    if ticks > QUIET_LONGEST[at].load(Relaxed) {
+        QUIET_LONGEST[at].store(ticks, Relaxed);
+        rt::println!(
+            "datafs: cell {what} quiet longest {ticks} ticks (quiet calls {calls}, call {nth})"
         );
     }
 }
@@ -219,7 +268,7 @@ pub fn map(
         }
     }
     #[cfg(feature = "steps")]
-    let from = rt::time::now();
+    let from = Began::now(process);
     sys::mem_map(
         process,
         window,
@@ -237,6 +286,7 @@ pub fn map(
             len as u64 / PAGE as u64,
             if reading_file { "rw" } else { "r" },
         ),
+        process,
     );
     Ok(len as u64)
 }
@@ -249,7 +299,7 @@ pub fn unmap(process: &Handle<Process>, len: u64) {
         return;
     }
     #[cfg(feature = "steps")]
-    let from = rt::time::now();
+    let from = Began::now(process);
     // SAFETY: the job that used the cell is over; the slices it made are gone.
     if unsafe { sys::mem_unmap(process, WINDOW_AT, len) }.is_err() {
         rt::println!("datafs: a cell of a window did not unmap");
@@ -260,5 +310,6 @@ pub fn unmap(process: &Handle<Process>, len: u64) {
         "unmap",
         from,
         (len / PAGE as u64, "-"),
+        process,
     );
 }

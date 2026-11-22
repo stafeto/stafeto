@@ -1791,6 +1791,7 @@ struct fast_result {
  * bytes and compared. Only the time of the calls of write, fsync, close and read counts. */
 static int fast_dd(const char *path, unsigned long mib, unsigned long bs, int marks, struct fast_result *out) {
     memset(out, 0, sizeof *out);
+    if (marks) printf("posix-data: fast mark begin write\n");
     int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
     DATA_CHECK(fd >= 0);
     struct dcount c0 = dcounts();
