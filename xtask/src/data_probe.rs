@@ -47,7 +47,7 @@ const DATAFS_TAG: &str = "17";
 /// The kinds of the loop that the probe's two runs use: the methods of proto_data that the series
 /// and the check send (the worker thread does the disk's work, so these steps are the queue's), the notices
 /// with the heartbeat (64) and the notification the service marks as its own (65, the worker's DONE).
-const STEP_KINDS: [(usize, &str); 15] = [
+const STEP_KINDS: [(usize, &str); 20] = [
     (1, "Open"),
     (2, "Close"),
     (3, "Read"),
@@ -61,9 +61,86 @@ const STEP_KINDS: [(usize, &str); 15] = [
     (19, "Clone"),
     (25, "Bind"),
     (26, "Chmod"),
+    (36, "Window"),
+    (37, "ReadInto"),
+    (38, "PreadInto"),
+    (39, "WriteFrom"),
+    (42, "OpenNumbered"),
     (64, "the notices and the heartbeat"),
     (65, "the service's own step"),
 ];
+
+/// The longest step of the loop for a method of version 4 (a part, WINDOW, OPEN_NUMBERED): the loop
+/// copies the header and queues the job, as it does for READ and WRITE, so the goal is that of those,
+/// 6,000 ticks, well inside 0.9 of term B (18,369). The bytes move in the worker.
+const PART_STEP_MAX: u64 = 6_000;
+
+/// The cells the worker mapped and unmapped, in the lines of a run: the longest map and the longest
+/// unmap, in ticks. A cell is 16 pages, one chunk of `mem_map` and `mem_unmap`; each is judged against
+/// term B, the longest the kernel keeps a higher level waiting. The run must show both.
+fn cell_verdict(lines: &[String]) -> Result<(u64, u64), String> {
+    let longest = |what: &str| -> Result<u64, String> {
+        let key = format!("datafs: cell {what} longest ");
+        lines
+            .iter()
+            .filter_map(|l| {
+                let at = l.find(&key)? + key.len();
+                l[at..].split_whitespace().next()?.parse::<u64>().ok()
+            })
+            .max()
+            .ok_or_else(|| format!("the data service: no line of the longest cell {what}"))
+    };
+    let (map, unmap) = (longest("map")?, longest("unmap")?);
+    for (what, ticks) in [("map", map), ("unmap", unmap)] {
+        if ticks > crate::TERM_B {
+            return Err(format!(
+                "the data service: a cell {what} of {ticks} ticks is past term B ({})",
+                crate::TERM_B
+            ));
+        }
+    }
+    Ok((map, unmap))
+}
+
+/// The longest the worker computes between two waits for the disk (or from the pick-up of a job to
+/// its first wait, or from the last wait to its end), in ticks: the portion of the data service, the
+/// copy of one block of 4 KiB with the logic of littlefs around it. The worker stands below the
+/// services and keeps no higher level waiting, but on a table of one CPU with no budget it is the
+/// length of a stretch the programs below it wait.
+const WORKER_STRETCH_MAX: u64 = 16_328;
+
+/// The stretches of the worker in the lines of a run (`datafs: worker computes longest <method>
+/// <ticks> ticks`): the longest of each method, in the order they came. The run must show the parts
+/// it made. The ticks are wall time of the stretch: a preemption by the loop or a client, and the
+/// computing the volume needs (a creation, a first allocation), count in it, so the figure is an
+/// upper bound that is reported and not yet a gate (`WORKER_STRETCH_MAX` is the goal).
+fn worker_verdict(lines: &[String]) -> Result<Vec<(String, u64)>, String> {
+    let key = "datafs: worker computes longest ";
+    let mut longest: Vec<(String, u64)> = Vec::new();
+    for l in lines {
+        let Some(at) = l.find(key) else { continue };
+        let mut words = l[at + key.len()..].split_whitespace();
+        let (Some(method), Some(ticks)) = (words.next(), words.next()) else {
+            continue;
+        };
+        let Ok(ticks) = ticks.parse::<u64>() else {
+            continue;
+        };
+        match longest.iter_mut().find(|(m, _)| m == method) {
+            Some(known) if known.1 < ticks => known.1 = ticks,
+            Some(_) => {}
+            None => longest.push((method.to_owned(), ticks)),
+        }
+    }
+    for method in ["WriteFrom", "ReadInto", "PreadInto"] {
+        if !longest.iter().any(|(m, _)| m == method) {
+            return Err(format!(
+                "the data service: no stretch of the worker for {method}"
+            ));
+        }
+    }
+    Ok(longest)
+}
 
 /// The steps of the loop in the lines of the two runs: every kind the probe used came, and no step
 /// is past 0.9 of term B (spec 3, section 6), the bound the other services' probes use.
@@ -85,6 +162,14 @@ fn steps_verdict(
         if !rows.iter().any(|(k, ..)| *k == kind) {
             return Err(format!("the data service: no step {name}: {rows:?}"));
         }
+    }
+    if let Some(row) = rows
+        .iter()
+        .find(|r| (36..=42).contains(&r.0) && r.1 > PART_STEP_MAX)
+    {
+        return Err(format!(
+            "the data service: a step of a method of version 4 past {PART_STEP_MAX} ticks: {row:?}"
+        ));
     }
     if let Some(row) = rows.iter().find(|r| r.1 > blk_probe::STEP_MAX) {
         return Err(format!(
@@ -410,6 +495,9 @@ pub fn probe() -> Result<(), String> {
     // with no mark and no BIND (NOT_BOUND) and of a BIND with a copy that is no identity session.
     wanted.push("data-probe: v3 stat 0644 0:0 ino ok".into());
     wanted.push("data-probe: unbound session refused ok".into());
+    // The version 4 series: a window, parts of a cell written and read back, an INLINE part, a part
+    // with no window refused (NO_WINDOW), and a file made with OPEN_NUMBERED.
+    wanted.push("data-probe: window parts ok (4 parts of a cell, inline, numbered)".into());
     wanted.push("data-probe: finished".into());
     need(&lines, &wanted, "writing")?;
     if datafs_line(&lines, "partition table written, data volume formatted").is_none() {
@@ -448,6 +536,23 @@ pub fn probe() -> Result<(), String> {
     );
     let rows = steps_verdict(&written, &lines)?;
     println!("data-probe: steps of the request loop (kind, ticks, whole step): {rows:?}");
+    let stretches = worker_verdict(&written)?;
+    println!(
+        "data-probe: the worker's longest stretch between waits for the disk, in ticks, wall time with the preemptions: {stretches:?}; goal {WORKER_STRETCH_MAX}, {}",
+        if stretches
+            .iter()
+            .any(|(m, t)| m.ends_with("Into") | m.ends_with("From") && *t > WORKER_STRETCH_MAX)
+        {
+            "over it for some part (a report that gates nothing yet)"
+        } else {
+            "met"
+        }
+    );
+    let (map, unmap) = cell_verdict(&written)?;
+    println!(
+        "data-probe: a cell of 16 pages maps in {map} ticks and unmaps in {unmap}, against term B {}: ok",
+        crate::TERM_B
+    );
     println!(
         "data-probe: a table with store and data, littlefs formatted, 12 steps of files made, synced, renamed and removed, the same tree after a new start of QEMU: ok"
     );

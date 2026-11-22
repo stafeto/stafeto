@@ -483,7 +483,9 @@ pub const DATAFS: Record = Record {
     priority: 36,
     ceiling: 36,
     quota: 512 * PAGE,
-    handle_limit: 128,
+    // The sessions' handles, and up to 64 windows the sessions gave (one handle each, until the
+    // session goes), a cell of which the worker maps for one job.
+    handle_limit: 192,
     restart: Restart::Always,
     console: true,
     log: false,
@@ -525,7 +527,8 @@ pub const DATA_PROBE: Record = Record {
     kind: Kind::Client,
     priority: 30,
     ceiling: 30,
-    quota: 64 * PAGE,
+    // The window of the version 4 series (32 pages) beside the probe's own.
+    quota: 112 * PAGE,
     handle_limit: 32,
     restart: Restart::Never,
     console: true,

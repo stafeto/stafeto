@@ -15,6 +15,7 @@
 mod clock;
 mod identity;
 mod shared;
+mod window;
 mod worker;
 
 use abi::{Rights, Source};
@@ -23,7 +24,7 @@ use datafs::admit::{self, Adopt, Fifo, Forgotten, Held, Wait};
 use proto_data::{METHODS as DATA_METHODS, Method, VERSION};
 use proto_init::ServiceArgs;
 use proto_wire::Status;
-use rt::handle::{Any, Channel, Outgoing, Process};
+use rt::handle::{Any, Channel, Memory, Outgoing, Process};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
 use rt::{Handle, sys};
 use shared::*;
@@ -461,6 +462,32 @@ impl Datafs {
         Answer::Deferred
     }
 
+    /// WINDOW: the one handle of the request is a memory object. The root channel has no window.
+    /// The handle goes to the worker in the job's `aux` (raw), which keeps it or closes it; a
+    /// request that finds no job free is busy and the handle stays with the request.
+    fn window(&mut self, r: &mut Request<'_>, owner: u64) -> Answer {
+        if proto_data::is_root(owner) {
+            return Answer::Status(proto_data::code(proto_data::IS_ROOT));
+        }
+        if r.handles.len() != 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        let Some(i) = self.job_for(owner) else {
+            return Answer::Status(busy());
+        };
+        let Ok(memory) = r.handles.take::<Memory>(0) else {
+            return Answer::Status(Status::Kernel(abi::Error::WrongType));
+        };
+        let Some(pending) = r.defer() else {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        };
+        self.pending[i] = Some(pending);
+        self.outgoing[i] = None;
+        self.carried[i] = None;
+        self.queue(i, REQUEST, owner, memory.into_raw().0, r.bytes());
+        Answer::Deferred
+    }
+
     /// BIND, SESSION and VERIFY_SESSION: the one handle of the request. For BIND it is the caller's
     /// identity session (kept for the job); for SESSION it is that too, and the reply carries a new
     /// session of the service (a label of its own and a copy of the channel); for VERIFY_SESSION it
@@ -656,6 +683,11 @@ impl Service<0> for Datafs {
             return self.verify_session(r);
         }
         let owner = r.label();
+        // WINDOW brings the memory object of the session's cells. It goes to the worker, which owns
+        // it from here (it keeps it or closes it), in the `aux` of the job.
+        if Method::from_number(r.method()) == Some(Method::Window) {
+            return self.window(r, owner);
+        }
         let job = self.job_for(owner);
         // Every SESSION arrives with the one root label and shares its jobs: over the share the
         // request waits its turn, and busy answers only a full queue.

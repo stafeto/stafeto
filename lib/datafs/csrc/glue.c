@@ -235,11 +235,25 @@ void datafs_window_state(const struct datafs *d, uint32_t *out)
 // that is the free count of the volume as of the last walk, less what has been given out since.
 int64_t datafs_window_free(const struct datafs *d)
 {
+    // A write asks for this count (the room it may take), so it counts a word of 32 bits at a time:
+    // a bit at a time cost a loop of a million rounds for a volume of 4 GiB at each part of a write.
+    const uint8_t *buffer = d->lfs.lookahead.buffer;
+    lfs_block_t i = d->lfs.lookahead.next;
+    const lfs_block_t size = d->lfs.lookahead.size;
     int64_t free_blocks = 0;
-    for (lfs_block_t i = d->lfs.lookahead.next; i < d->lfs.lookahead.size; i++) {
-        if (!(d->lfs.lookahead.buffer[i / 8] & (1U << (i % 8)))) {
-            free_blocks++;
-        }
+    while (i < size && (i % 32u) != 0) {
+        free_blocks += !(buffer[i / 8] & (1U << (i % 8)));
+        i++;
+    }
+    while (i + 32u <= size) {
+        uint32_t word = (uint32_t)buffer[i / 8] | ((uint32_t)buffer[i / 8 + 1] << 8) |
+                        ((uint32_t)buffer[i / 8 + 2] << 16) | ((uint32_t)buffer[i / 8 + 3] << 24);
+        free_blocks += 32 - (int64_t)lfs_popc(word);
+        i += 32u;
+    }
+    while (i < size) {
+        free_blocks += !(buffer[i / 8] & (1U << (i % 8)));
+        i++;
     }
     return free_blocks;
 }
