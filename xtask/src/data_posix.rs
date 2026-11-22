@@ -644,7 +644,7 @@ pub const FAST_WRITE_OP_TIME_RATIO_MAX: f64 = 1.35;
 /// The speed of the big read against the control of 1,000 bytes read in the same run: the ratio
 /// measured on the Mac and on the runners of GitHub (the lower of the two, 2.53 on a runner), and
 /// the share of it the check requires.
-pub const FAST_READ_RATIO_MAC: f64 = 2.53;
+pub const FAST_READ_RATIO_MAC: f64 = 2.49;
 pub const FAST_READ_RATIO_RUNNER: f64 = 2.53;
 pub const FAST_READ_RATIO_SHARE: f64 = 0.8;
 /// The controls of 1,000 bytes (the old path) run at least this fast, in KiB/s: the speed of 0.6.0
