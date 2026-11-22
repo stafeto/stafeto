@@ -50,7 +50,7 @@
 //! * The state and the cells are atomic words; no lock of the layer is held over a request. The
 //!   object is made and mapped under the lock of the heap alone.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use entries::{Frame, nested};
 use posix_fs::data::CellBook;
 use proto_data::{CELL_BYTES, CELLS, WINDOW_BYTES};
@@ -142,6 +142,10 @@ static STATE: AtomicUsize = AtomicUsize::new(ABSENT);
 static OBJECT: AtomicU64 = AtomicU64::new(0);
 /// The cells and the cell each record of `LIVE` holds.
 static BOOK: CellBook<LIVE_SLOTS> = CellBook::new();
+/// Whether the process ever began a call of parts or made a window. A process that did not has
+/// nothing for a fork, a jump or the end of a thread to give up, and those paths return at once
+/// (they are measured to the instruction by the guards of the service steps and of `rtbench`).
+static USED: AtomicBool = AtomicBool::new(false);
 /// Counts the forks of the process: a value a call noted before a fork differs in the child.
 static GENERATION: AtomicU32 = AtomicU32::new(0);
 /// The session (its raw handle) the service holds the window for, 0 for none. A session parked
@@ -200,6 +204,12 @@ impl Drop for Cell {
             BOOK.release(self.slot);
         }
     }
+}
+
+/// Whether the process ever used the parts (see `USED`).
+#[inline(always)]
+pub(crate) fn used() -> bool {
+    USED.load(Ordering::Relaxed)
 }
 
 /// The forks of this process so far, as the call that notes it before a fork can compare.
@@ -360,6 +370,9 @@ pub(crate) fn take(base: usize, live: &Live) -> Option<Cell> {
 /// A forked child: no window, no cell, no call under way; the calls of the parent's frames that
 /// it returns into find the generation changed.
 pub(crate) fn after_fork() {
+    if !used() {
+        return;
+    }
     GENERATION.fetch_add(1, Ordering::AcqRel);
     STATE.store(ABSENT, Ordering::Release);
     BOOK.reset(0);
@@ -421,6 +434,7 @@ pub(crate) struct Live {
 impl Live {
     /// Records a call of the frame `frame` on the thread. None when no slot is free.
     pub(crate) fn enter(frame: Frame) -> Option<Live> {
+        USED.store(true, Ordering::Relaxed);
         let me = owner();
         let generation = generation();
         for (index, slot) in LIVE.iter().enumerate() {
@@ -477,6 +491,9 @@ fn end(slot: usize, release: &impl Fn(u64, u32)) {
 /// below it is over. Its cell goes back, and `release` is called for the lease it held. A WINDOW
 /// the thread was sending goes with it.
 pub(crate) fn abandon(target: Frame, release: impl Fn(u64, u32)) {
+    if !used() {
+        return;
+    }
     let me = owner();
     let _ = REGISTERING.compare_exchange(me, 0, Ordering::AcqRel, Ordering::Acquire);
     for (index, slot) in LIVE.iter().enumerate() {
@@ -495,6 +512,9 @@ pub(crate) fn abandon(target: Frame, release: impl Fn(u64, u32)) {
 
 /// The calling thread ends: all its calls under way are over.
 pub(crate) fn abandon_thread(release: impl Fn(u64, u32)) {
+    if !used() {
+        return;
+    }
     let me = owner();
     let _ = REGISTERING.compare_exchange(me, 0, Ordering::AcqRel, Ordering::Acquire);
     for (index, slot) in LIVE.iter().enumerate() {
@@ -509,6 +529,11 @@ pub(crate) fn in_handler() -> bool {
     // The layer's own count: the kernel's depth stays above zero for good after a long jump out of
     // a handler.
     crate::handlers::active()
+}
+
+/// Whether a window is mapped.
+pub(crate) fn ready() -> bool {
+    STATE.load(Ordering::Relaxed) > REFUSED
 }
 
 /// Whether a window is mapped (for the probes and tests of the layer).

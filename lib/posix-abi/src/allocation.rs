@@ -369,7 +369,16 @@ pub unsafe fn after_fork(
     let display = state.map.display_piece();
     let network = state.map.kind_piece(posix_map::Kind::NetBuffer);
     let files = state.map.kind_piece(posix_map::Kind::FileBuffer);
-    let data_window = state.map.kind_piece(posix_map::Kind::DataWindow);
+    // The window of `/data`, when the parent made one (a scan of the map costs instructions that a
+    // process without one has no use for).
+    #[cfg(feature = "data")]
+    let data_window = if crate::datawin::ready() {
+        state.map.kind_piece(posix_map::Kind::DataWindow)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "data"))]
+    let data_window: Option<(usize, usize)> = None;
     // The arena of the file cache: up to eight pieces (filecache::PIECES_MAX).
     let mut cache = [(0usize, 0usize); 8];
     for (slot, piece) in cache

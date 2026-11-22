@@ -107,6 +107,10 @@ pub(crate) fn active() -> bool {
 
 /// A long jump to the frame `target`: the handlers whose frames lie inside it are left.
 pub(crate) fn trim(target: Frame) {
+    // No handler was noted before the first window: nothing to take off.
+    if !TRACKING.load(Ordering::Relaxed) {
+        return;
+    }
     let row = row();
     loop {
         let mut depth = row.depth.load(Ordering::Relaxed) as usize;
@@ -140,5 +144,8 @@ pub(crate) fn trim(target: Frame) {
 
 /// A reused place has no handlers.
 pub(crate) fn reset(place: u64) {
+    if !TRACKING.load(Ordering::Relaxed) {
+        return;
+    }
     ROWS[place as usize].depth.store(0, Ordering::Relaxed);
 }
