@@ -64,9 +64,11 @@ pub enum Group {
 
 /// The packages that install nothing and are linked into a service of the
 /// base system, which is no package itself (pixman, linked into the
-/// composition service by `lib/pixman`): their description, their notice and
-/// their pinned source are all they have.
-pub const SERVICE_LIBRARIES: &[&str] = &["pixman"];
+/// composition service by `lib/pixman`), or into the programs of the system
+/// that are written in C++ (libcxx: libc++, libc++abi and libunwind, linked by
+/// tests/cxx-probe): their description, their notice and their pinned source
+/// are all they have.
+pub const SERVICE_LIBRARIES: &[&str] = &["pixman", "libcxx"];
 
 /// The packages that only build a program the image holds as a file of the system (a set-user-ID
 /// file, which a package file may not be): they have a program and no file of their own.
@@ -1257,7 +1259,7 @@ files = [
     #[test]
     fn the_descriptions_of_the_workspace_are_good() {
         let packages = load().unwrap();
-        assert_eq!(packages.len(), 29);
+        assert_eq!(packages.len(), 30);
         let get = |n: &str| packages.iter().find(|p| p.name == n).unwrap();
         // FreeType: the library of the text of stage G4, no file of its own.
         let freetype = get("freetype");
@@ -1270,6 +1272,11 @@ files = [
         assert_eq!(lvgl.license, "MIT AND OFL-1.1");
         assert_eq!(lvgl.build_depends, ["freetype"]);
         assert_eq!(lvgl.needs, ["display", "input"]);
+        // libc++ and its runtime: the C++ programs link them, no file of its own.
+        let libcxx = get("libcxx");
+        assert_eq!(libcxx.license, "Apache-2.0 WITH LLVM-exception");
+        assert_eq!(libcxx.group(), Group::Game);
+        assert!(libcxx.files.is_empty());
         assert_eq!(get("busybox").group(), Group::Base);
         assert_eq!(get("nano").group(), Group::Addon);
         assert_eq!(get("f-stack").group(), Group::Fstack);

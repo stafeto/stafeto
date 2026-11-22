@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# libc++, libc++abi and libunwind of the LLVM project: the C++ standard
+# library, its runtime (exceptions, run-time type information, the guards of
+# static locals, the destructors of thread-local objects) and the stack
+# unwinder, which C++ programs link statically. The package installs no file of its
+# own: tools/build-libcxx.py compiles the three libraries from the pinned
+# source archive of the release (the libraries and the headers go to
+# target/libcxx/) against the sysroot of relibc, and the programs that are
+# written in C++ link them. The archive is the release asset
+# llvm-project-23.1.6.src.tar.xz of tag llvmorg-23.1.6 (commit
+# 5b10d2d74929eae78912771222c9855af97496f4); the SHA-256 is the digest GitHub
+# publishes for the asset. The licence is Apache-2.0 with the LLVM exception:
+# the exception lifts the notice duties for the object code of a program that
+# links the libraries.
+# Format: docs/packages.md.
+
+name = "libcxx"
+version = "23.1.6"
+kind = "optional"
+image = "games"
+release = "1"
+summary = "LLVM libc++, libc++abi and libunwind, linked into programs written in C++"
+url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.6/llvm-project-23.1.6.src.tar.xz"
+sha256 = "d3b86ab29cfb4445a6652e5c2642ccc75e04e38084dde3701d323320f35a31da"
+license = "Apache-2.0 WITH LLVM-exception"
+license_file = "libcxx/LICENSE.TXT"
+build = "tools/build-libcxx.py"
+files = []

@@ -2192,6 +2192,8 @@ commands:
   posix-shared verify cross-thread Rust POSIX file and directory state
   relibc    build relibc for stafeto from the fork at its pinned commit
             (tools/build-relibc.py) into target/relibc/sysroot
+  libcxx    build libc++, libc++abi and libunwind for stafeto against relibc
+            (tools/build-libcxx.py) into target/libcxx
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
   sporadic-probe SCHED_SPORADIC in 0.5.0 through relibc and the layer: refused for root and for a user
@@ -2690,6 +2692,7 @@ fn main() {
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
         Some("relibc") => relibc(),
+        Some("libcxx") => libcxx(),
         Some("os-test") => match &args[1..] {
             [flag, rest @ ..] if flag == "--full-basic" => {
                 jobs::parse_jobs("os-test --full-basic", rest).and_then(ostest::run_full_basic)
@@ -5388,6 +5391,7 @@ fn bash_terms() -> Result<(Vec<u8>, String), String> {
 /// The builds of relibc and of BusyBox of this run of xtask: one is
 /// enough for every check that takes them.
 static RELIBC_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
+static LIBCXX_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static LIBC_SO_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static DYNAMIC_BUILT: Mutex<Vec<(String, ())>> = Mutex::new(Vec::new());
 static BUSYBOX_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
@@ -5398,6 +5402,15 @@ static PACKAGE_SCRIPTS_BUILT: Mutex<Vec<(String, ())>> = Mutex::new(Vec::new());
 /// relibc built, once in a run of xtask.
 fn relibc() -> Result<(), String> {
     once(&RELIBC_BUILT, (), build_relibc)
+}
+
+/// libc++, libc++abi and libunwind built (tools/build-libcxx.py), once in a
+/// run of xtask, after relibc: they are compiled against its sysroot.
+fn libcxx() -> Result<(), String> {
+    once(&LIBCXX_BUILT, (), || {
+        relibc()?;
+        run_cmd(&mut build_script(root().join("tools/build-libcxx.py")))
+    })
 }
 
 /// libc.so and the programs of its probe built (tools/build-libc-so.py,
@@ -11412,6 +11425,7 @@ fn host_tests() -> Result<(), String> {
         "tools/test_os_test_headers.py",
         "tools/test_ca_bundle.py",
         "tools/test_build_freetype.py",
+        "tools/test_build_libcxx.py",
         "tools/test_build_lvgl.py",
         "tools/test_lvgl_port.py",
         "tools/test_build_libc_so.py",
