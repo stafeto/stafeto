@@ -79,6 +79,7 @@ cargo xtask help         # every command
 | [docs/wcet.md](docs/wcet.md) | the worst-case timing tools |
 | [docs/non-preemptible-paths.md](docs/non-preemptible-paths.md) | bounded kernel paths and their costs |
 | [docs/posix-coverage.md](docs/posix-coverage.md) | POSIX coverage and the conformance work left |
+| [docs/openwf.md](docs/openwf.md) | OpenWF Composition and Display for C programs: what is implemented, how to run the demo, the differences and the real-time properties |
 | [docs/packages.md](docs/packages.md) | how third-party programs are packaged |
 | [docs/release.md](docs/release.md) | versions and how a release is made |
 | [docs/debugging.md](docs/debugging.md) | debugging hangs and crashes |
