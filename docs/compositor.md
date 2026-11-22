@@ -485,9 +485,10 @@ run, and `cap_us` is the value of the model: the cap's bands at their gate, at 1
 tick (the counter of a run under -icount, 62.5 MHz). On HVF and on a board `cap_us`
 does not match the wall.
 
-Each STATS tells the phases of the late frames of the count that it has not told yet, two at
-most, from the first four late frames of the count, one line each to the console (a STATS with
-RESET tells none, so the lines of a phase come just before the counters the conductor prints):
+Each STATS tells the phases of the first late frame of the count that it has not told yet (of the
+first four kept), as one line on the console (a line is about 7 000 ticks of the step, so one is
+told a step; a STATS with RESET tells none, so the line of a phase comes just before the counters
+the conductor prints):
 `compositor: late frame period K take A us compose B us device C us frame D us (the longest: P)`.
 The take is the delay of the taking after the start of the period, the compose the time from the
 taking to the commit, the device the time from the commit to FRAME_SHOWN, and the three add up to
