@@ -2208,6 +2208,9 @@ commands:
             by address, iostreams, locales, static constructors and terminate
   mesa      build Mesa's EGL and OpenGL ES on the softpipe driver for stafeto against
             relibc and libc++ (tools/build-mesa.py) into target/mesa
+  mesa-reference build the same Mesa for Linux and run the cube on it, then compare its ten CRCs
+            with the ones gles-pbuffer expects (tools/build-mesa-reference.py; arm64 Linux only,
+            as on the runners of probe.yml)
   gles-pbuffer run a cube on Mesa's softpipe in QEMU, with no compositor: ten frames
             drawn into a pbuffer, read back, and their CRCs
   relibc-hello run the first C program on relibc over the Rust POSIX layer
@@ -2714,6 +2717,7 @@ fn main() {
         Some("libcxx") => libcxx(),
         Some("cxx-probe") => cxx_probe::probe(&qemu::VIRT),
         Some("mesa") => mesa(),
+        Some("mesa-reference") => mesa_reference(),
         Some("gles-pbuffer") => gles_pbuffer::probe(&qemu::VIRT_1G),
         Some("os-test") => match &args[1..] {
             [flag, rest @ ..] if flag == "--full-basic" => {
@@ -5465,6 +5469,22 @@ fn mesa() -> Result<(), String> {
         libcxx()?;
         run_cmd(&mut build_script(root().join("tools/build-mesa.py")))
     })
+}
+
+/// The Linux reference of the cube (tools/build-mesa-reference.py): Mesa built
+/// for the machine and the cube run on it, whose CRCs are printed and compared
+/// with the pinned ones of `gles-pbuffer`. It runs on an arm64 Linux machine
+/// only (a runner of probe.yml); another host is refused.
+fn mesa_reference() -> Result<(), String> {
+    if !(cfg!(target_os = "linux") && cfg!(target_arch = "aarch64")) {
+        return Err(
+            "mesa-reference runs on arm64 Linux only (probe.yml: command=mesa-reference)"
+                .to_owned(),
+        );
+    }
+    run_cmd(&mut build_script(
+        root().join("tools/build-mesa-reference.py"),
+    ))
 }
 
 /// libc.so and the programs of its probe built (tools/build-libc-so.py,

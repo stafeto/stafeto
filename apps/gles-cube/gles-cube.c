@@ -61,21 +61,30 @@ static const char VERTEX_SHADER[] =
 	"attribute vec3 colour;\n"
 	"varying vec3 v_normal;\n"
 	"varying vec3 v_colour;\n"
+	"varying vec2 v_uv;\n"
+	"varying float v_textured;\n"
 	"void main() {\n"
 	"  gl_Position = mvp * vec4(position, 1.0);\n"
 	"  v_normal = rot * normal;\n"
 	"  v_colour = colour;\n"
+	"  v_uv = position.xy * 0.5 + 0.5;\n"
+	"  v_textured = normal.z > 0.5 ? 1.0 : 0.0;\n"
 	"}\n";
 
-/* The fragment shader: a directional light and an ambient term. */
+/* The fragment shader: a directional light and an ambient term; the +Z face
+ * takes its colour from a 2 x 2 texture. */
 static const char FRAGMENT_SHADER[] =
 	"precision mediump float;\n"
+	"uniform sampler2D tex;\n"
 	"varying vec3 v_normal;\n"
 	"varying vec3 v_colour;\n"
+	"varying vec2 v_uv;\n"
+	"varying float v_textured;\n"
 	"void main() {\n"
 	"  vec3 light = vec3(0.502519, 0.703526, 0.502519);\n"
 	"  float d = max(dot(normalize(v_normal), light), 0.0);\n"
-	"  gl_FragColor = vec4(v_colour * (0.25 + 0.75 * d), 1.0);\n"
+	"  vec3 base = mix(v_colour, texture2D(tex, v_uv).rgb, v_textured);\n"
+	"  gl_FragColor = vec4(base * (0.25 + 0.75 * d), 1.0);\n"
 	"}\n";
 
 /* Six faces of four vertices: position, normal, colour. */
@@ -244,7 +253,7 @@ int main(int argc, char **argv)
 	crc_init();
 
 	/* The software path of Mesa: there is no device to find. */
-	setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+	CHECK(setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1) == 0);
 	EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
 	CHECK(display != EGL_NO_DISPLAY);
 	EGLint major = 0, minor = 0;
@@ -289,6 +298,23 @@ int main(int argc, char **argv)
 	GLint mvp_at = glGetUniformLocation(program, "mvp");
 	GLint rot_at = glGetUniformLocation(program, "rot");
 	CHECK(mvp_at >= 0 && rot_at >= 0);
+	/* The texture of the +Z face: 2 x 2 texels (red, green, blue, white), so
+	 * softpipe makes the cache of the first texture unit. */
+	static const uint8_t TEXELS[16] = {255, 0, 0, 255, 0, 255, 0, 255,
+					   0, 0, 255, 255, 255, 255, 255, 255};
+	GLuint texture = 0;
+	glGenTextures(1, &texture);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, texture);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 2, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, TEXELS);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	GLint tex_at = glGetUniformLocation(program, "tex");
+	CHECK(tex_at >= 0);
+	glUniform1i(tex_at, 0);
 
 	GLuint buffers[2];
 	glGenBuffers(2, buffers);

@@ -61,9 +61,9 @@ pub const FRAMES: usize = 10;
 /// after two agreeing runs on different machines and a comparison with the
 /// Linux build of the same Mesa (docs/egl.md).
 pub const EXPECTED_CRCS: Option<[u32; FRAMES]> = Some([
-    0x48d4_9825,
-    0x32cf_60ea,
-    0xa7e8_6f56,
+    0x5e4a_1ff8,
+    0xd6f0_240f,
+    0xa9a4_73d5,
     0xf08d_b9a3,
     0xe83b_3f52,
     0x7b80_a167,
