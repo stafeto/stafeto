@@ -11,13 +11,19 @@
  * when the child has ended the parent's session still answers (a child that kept the parent's
  * session would close it); a spawned program has a session; the program a forked child execs
  * keeps it, and the parent's session lives after that child ends; a set-ID program, which the
- * loader starts with a real ID other than the effective one, has none, whatever its caller put in
- * the place; a process that is not the superuser is refused INSTALL_BEGIN with NOT_ALLOWED
+ * loader starts with a real ID other than the effective one, has a session of the service's own, as the
+ * loader verified it with the root of the service: the parent's genuine session is replaced by a
+ * new clone charged to the parent (the parent keeps the receipt and the group lock of its own
+ * session, which the program must not reach), and a
+ * channel of the caller's own in the place (a caller that bypasses the layer, served here as a
+ * forged service) is replaced by a new clone and gets no request, where a program that is not
+ * set-ID takes the forged channel; a process that is not the superuser is refused INSTALL_BEGIN with NOT_ALLOWED
  * (1201) and the superuser is not. At the end the price of the session in a fork is measured: the
  * time of fork() with and without it, in turns.
  */
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -35,6 +41,9 @@ extern int ps_clone_ok(void);
 extern int ps_buffer(int mode);
 extern void ps_hide(int hide);
 extern uint64_t ps_ns(void);
+extern int stafeto_probe_loader_start(unsigned mode);
+extern unsigned stafeto_probe_loader_listen(void);
+extern unsigned stafeto_probe_loader_stop(void);
 
 #define NOT_ALLOWED 1201
 #define BUSY 1217
@@ -60,10 +69,34 @@ static int run(const char *role, int *status) {
     return run_file("/bin/pkg-slot", role, status);
 }
 
-/* A set-ID program has no session, whatever its caller put in the place. */
-static int no_session(void) {
-    CHECK(ps_session() == 0);
-    CHECK(ps_clone_ok() != 0);
+/* The requests a forged package service got (the listener's return). */
+static void *forged_listener(void *unused) {
+    (void)unused;
+    return (void *)(unsigned long)stafeto_probe_loader_listen();
+}
+
+/* Starts `path` in the role `role` with a channel of the probe's own in the Packages place (mode
+ * 8), served here as a forged service. Its exit status goes to `*status`, the requests the forged
+ * service got to `*requests`. */
+static int forged_run(const char *path, const char *role, int *status, unsigned *requests) {
+    pthread_t listener;
+    void *count = NULL;
+    char *argv[] = {"pkg-slot", (char *)role, NULL};
+    pid_t pid = 0;
+    CHECK(stafeto_probe_loader_start(8) == 0);
+    CHECK(pthread_create(&listener, NULL, forged_listener, NULL) == 0);
+    CHECK(posix_spawn(&pid, path, NULL, NULL, argv, environ) == 0);
+    CHECK(waitpid(pid, status, 0) == pid);
+    CHECK(stafeto_probe_loader_stop() == 0);
+    CHECK(pthread_join(listener, &count) == 0);
+    *requests = (unsigned)(unsigned long)count;
+    return 0;
+}
+
+/* The role `forged`: a program that is not set-ID has the forged channel in the place, which
+ * answers nothing a LIST needs. */
+static int forged_role(void) {
+    CHECK(ps_session() == 1);
     CHECK(ps_list() != 0);
     return 0;
 }
@@ -95,7 +128,17 @@ static int checks(void) {
     CHECK(run_file("/bin/pkg-slot-suid", "setid", &status) == 0);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     CHECK(ps_list() == 0);
-    printf("pkg-slot: a set-ID program gets no session\n");
+    printf("pkg-slot: a set-ID program has a session of the service of its own, a clone of the parent's\n");
+
+    unsigned requests = 0;
+    CHECK(forged_run("/bin/pkg-slot", "forged", &status, &requests) == 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(requests != 0);
+    CHECK(forged_run("/bin/pkg-slot-suid", "setid", &status, &requests) == 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(requests == 0);
+    CHECK(ps_list() == 0);
+    printf("pkg-slot: a set-ID program given a forged channel gets a new session of the service and the forgery gets no request\n");
 
     pid = fork();
     CHECK(pid >= 0);
@@ -184,10 +227,41 @@ static int price(void) {
     return 0;
 }
 
+/* The price of the extra request every start makes for the root of the package service (the
+ * loader's LoaderRoot): a spawn of a program that returns at once, with the session and without
+ * it, in turns, mean ns of the spawn and the wait. */
+static uint64_t spawns(int per) {
+    uint64_t from = ps_ns();
+    for (int i = 0; i < per; i++) {
+        int status = 0;
+        if (run("null", &status) != 0) return 0;
+    }
+    return (ps_ns() - from) / (uint64_t)per;
+}
+
+static int spawn_price(void) {
+    uint64_t with = 0, without = 0;
+    spawns(4);
+    for (int turn = 0; turn < 4; turn++) {
+        ps_hide(0);
+        uint64_t a = spawns(10);
+        ps_hide(1);
+        uint64_t b = spawns(10);
+        ps_hide(0);
+        CHECK(a != 0 && b != 0);
+        with += a;
+        without += b;
+    }
+    printf("pkg-slot: spawn with the session %llu ns, without it %llu ns\n",
+           (unsigned long long)(with / 4), (unsigned long long)(without / 4));
+    return 0;
+}
+
 static int forker(void) {
     CHECK(has_session() == 0);
     CHECK(checks() == 0);
     CHECK(price() == 0);
+    CHECK(spawn_price() == 0);
     return 0;
 }
 
@@ -202,8 +276,10 @@ static int first(void) {
 
 int main(int argc, char **argv) {
     int status;
+    if (argc > 1 && strcmp(argv[1], "null") == 0) return 0;
     if (argc > 1 && strcmp(argv[1], "spawned") == 0) return has_session();
-    if (argc > 1 && strcmp(argv[1], "setid") == 0) return no_session();
+    if (argc > 1 && strcmp(argv[1], "setid") == 0) return has_session();
+    if (argc > 1 && strcmp(argv[1], "forged") == 0) return forged_role();
     if (argc > 1 && strcmp(argv[1], "execd") == 0) return has_session();
     status = argc > 1 && strcmp(argv[1], "fork") == 0 ? forker() : first();
     if (status == 0 && argc == 1) printf("pkg-slot: ok\n");

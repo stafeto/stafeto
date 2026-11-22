@@ -99,8 +99,8 @@ mod tests {
 
     #[test]
     fn only_a_marked_service_registers_a_root() {
-        // A voucher with no mark of a root (the file service has SET_ID,
-        // the package service nothing) registers none.
+        // A voucher with no mark of a root (the file service has SET_ID, the clock
+        // service nothing) registers none.
         for label in [NOTARY | 9, NOTARY | SET_ID | 9] {
             assert_eq!(registration(label, 1), Registration::Refused);
             assert_eq!(registration(label, 2), Registration::Refused);
@@ -118,6 +118,7 @@ mod tests {
             (NET, 2),
             (ENTROPY, 3),
             (proto_process::DATAFS, 4),
+            (proto_process::PKG, 5),
         ] {
             assert_eq!(
                 registration(NOTARY | mark | 4, 1),
@@ -154,6 +155,12 @@ mod tests {
             }
         }
         assert_eq!(roots.taken(proto_process::ROOT_NET), Err(PERMISSION));
+        // The package service's root goes to the loaders alone, registered or not.
+        assert_eq!(roots.taken(proto_process::ROOT_PKG), Err(PERMISSION));
+        assert_eq!(
+            Roots::<u32>::new().taken(proto_process::ROOT_PKG),
+            Err(PERMISSION)
+        );
         assert_eq!(roots.taken(ROOTS as u32), Err(PERMISSION));
         // The data service has not registered: UNREGISTERED and no root.
         let empty = Roots::<u32>::new();

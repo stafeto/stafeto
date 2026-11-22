@@ -51,6 +51,7 @@ proto-data = { path = "../../proto/data" }
 proto-entropy = { path = "../../proto/entropy" }
 proto-fs = { path = "../../proto/fs" }
 proto-net = { path = "../../proto/net" }
+proto-pkg = { path = "../../proto/pkg" }
 proto-pipe = { path = "../../proto/pipe" }
 proto-loader = { path = "../../proto/loader" }
 proto-process = { path = "../../proto/process" }

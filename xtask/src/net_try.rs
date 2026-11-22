@@ -90,21 +90,13 @@ static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 const PLACEHOLDER_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA placeholder";
 
-/// What the stand-in of `ec2-key` runs besides: the package manager as root, in the background,
-/// once the network has its address. The shell of a session over SSH cannot do it: `doas` is a
-/// set-user-ID program, a set-ID program takes no package session from its caller (a forged one
-/// would be believed by a root `pkg`), so a root `pkg` started through `doas` finds no service.
-/// The boot script's shell holds the session. The probe reads what these wrote.
-const PKG_AT_BOOT: &str = "(while [ ! -s /etc/resolv.conf ]; do sleep 1; done; \
-pkg update >/tmp/pkg-update 2>&1; pkg search compress >/tmp/pkg-search 2>&1; : >/tmp/pkg-done) &\n";
-
 /// The script that stands for `ec2-key` in the image of the run: it writes the key of the run as
 /// the metadata of an instance would give it.
 pub fn key_script() -> &'static [u8] {
     static SCRIPT: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
     SCRIPT.get_or_init(|| {
         let key = KEY.get().map_or(PLACEHOLDER_KEY, String::as_str);
-        let text = crate::net_ssh::key_script_text(key, PKG_AT_BOOT);
+        let text = crate::net_ssh::key_script_text(key, "");
         Box::leak(text.into_bytes().into_boxed_slice())
     })
 }
@@ -860,23 +852,19 @@ fn run_probe(machine: &'static qemu::Machine, persist_only: bool) -> Result<(), 
         );
 
         // 4. The package manager against the mirror of the probe.
-        // As root, from the boot script (see PKG_AT_BOOT); a root `pkg` through `doas` has no
-        // package service, and as `user` it is refused.
-        guest_ok(
-            &client,
-            &good,
-            "while [ ! -f /tmp/pkg-done ]; do sleep 2; done",
-            PKG_WITHIN,
-        )?;
-        let updated = guest_ok(&client, &good, "cat /tmp/pkg-update", SSH_WITHIN)?;
+        // As root through `doas` over SSH: the loader verifies the package session of the
+        // set-user-ID `doas` and of the `pkg` it starts.
+        let updated = guest_ok(&client, &good, "pkg update 2>&1", PKG_WITHIN)?;
         if !updated.contains("serial 2") {
             return Err(format!("pkg update said {updated:?}, wanted serial 2"));
         }
-        let found = guest_ok(&client, &good, "cat /tmp/pkg-search", SSH_WITHIN)?;
+        let found = guest_ok(&client, &good, "pkg search compress 2>&1", SSH_WITHIN)?;
         if !found.contains("ncompress") {
             return Err(format!("pkg search compress said {found:?}"));
         }
-        println!("net-try: pkg update (serial 2) and pkg search compress find ncompress");
+        println!(
+            "net-try: doas pkg update (serial 2) and doas pkg search compress find ncompress over SSH"
+        );
 
         // 5. The processes.
         let names = guest_ok(
