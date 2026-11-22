@@ -175,7 +175,8 @@
 //!    A session that is unbound (a CLONE session before its first BIND, or one whose binding
 //!    lapsed) answers NOT_BOUND to every request except BIND, CLOSE, CLONE, CLONE_MORE and the
 //!    requests that only read or hand on a description it holds: READ, PREAD, SEEK, FSTAT,
-//!    READDIR, REWIND, WHERE, GET_FLAGS, EXPORT and ADOPT. WRITE, PWRITE, TRUNCATE, FSYNC,
+//!    READDIR, REWIND, WHERE, GET_FLAGS, EXPORT, ADOPT, WINDOW, READ_INTO, PREAD_INTO and RELEASE.
+//!    WRITE, PWRITE, WRITE_FROM, PWRITE_FROM, OPEN_NUMBERED, TRUNCATE, FSYNC,
 //!    SET_FLAGS, FCHMOD, FCHOWN and FUTIMENS need a binding, as does every request that names a
 //!    path. A session made by CLONE inherits neither the mark nor the identity: the child binds its
 //!    own session.
@@ -357,7 +358,8 @@
 //! MAP_WRITE of exactly `WINDOW_BYTES`, else INVALID. The service never reads a field of the
 //! protocol from a cell: the client may change a cell while a job runs, which spoils only its own
 //! bytes. A part that names a cell in a session with no window is NO_WINDOW; the layer then sends
-//! WINDOW and the part again. WINDOW is open to a session that is not bound (it reads inherited
+//! WINDOW and the part again. NO_WINDOW touches neither the file nor a lease. WINDOW, READ_INTO,
+//! PREAD_INTO and RELEASE are open to a session that is not bound (it reads inherited
 //! descriptions), WRITE_FROM and PWRITE_FROM need a binding as WRITE and PWRITE do, every new
 //! method on the root channel is IS_ROOT, and the new methods check the access bits of the
 //! description as READ, PREAD, WRITE and PWRITE do (BAD_HANDLE).
@@ -373,46 +375,55 @@
 //! `flags` of a request is `MORE` (1: more parts of this call follow) or 0; any other bit is INVALID.
 //! `lease` is 0 with `MORE` on the first part (take a lease on the file: the answer carries its
 //! number), the number the answer gave on a later part, and 0 without `MORE` for a call of one
-//! part; the answer to the last part carries 0. While a lease on a file is held, the jobs of other
+//! part; the answer to the last part carries 0. A lease number is not 0 and carries a generation
+//! counter (and the epoch of the instance, as a handle does), so that a number that ended is not
+//! taken for a later lease: a part that carries the number of a lease of this instance that has
+//! ended or run out is answered with `LAPSED`, and a number the service never gave is BAD_HANDLE. While a lease on a file is held, the jobs of other
 //! calls on the same file wait for the end of the call: a write lease is exclusive, a read lease
 //! lets other reads go, so one call of any size is atomic to the others (POSIX.1-2024 XSH 2.9.7
 //! lists `read`, `write`, `pread`, `pwrite`, `readv`, `writev`, `ftruncate` and `fstat` as atomic
 //! with respect to each other on a file of the hierarchy, and `write` says each write is atomic).
 //! The answer's `flags` are `LAPSED` (1: the lease ran out before this part, which then ran
 //! without one, so the call was not atomic) and `UNLEASED` (2: no lease was given, because a limit
-//! was reached; the part ran as a call of its own). Any other bit is BAD_SIZE in a reply. A lease
+//! was reached; the part ran as a call of its own, and the lease it carries in the answer is 0).
+//! Any other bit is BAD_SIZE in a reply, and so is `UNLEASED` with a lease number. A part that
+//! comes after `LAPSED` goes as a separate call (with `APPEND` it takes the end of the file again).
+//! A lease
 //! ends when the last part is answered, at RELEASE, when the session goes, or when the service
 //! lets it run out (a policy of the service, `LEASE_GAP` of 1 second between two parts). RELEASE
 //! with a lease that is not the session's is BAD_HANDLE, one of an earlier instance STALE. The
 //! limits `LEASES_PER_SESSION` (4) and `LEASES` (64) are minimums the service guarantees. A part
 //! that is stopped by a limit (file size, `FILE_MAX`, free space) answers the count it did and
 //! ends the lease (rule 13). With `APPEND` the first part takes the end of the file and the next
-//! ones follow it; the synchronisation of `SYNC` runs after the last part.
+//! ones follow it; the synchronisation of `SYNC` runs after the part that ended the call (the last
+//! one, or the one a limit of rule 13 stopped).
 //!
 //! OPEN_NUMBERED is OPEN with the number of the file chosen by the caller, for a native client
 //! (label `SERVICE`) such as the layered file service; any other session is PERMISSION. `ino` has
-//! bit 62 (`INO_NUMBERED`) set and bit 63 clear, else INVALID; CREATE without EXCLUSIVE is INVALID
-//! (the number goes only to a new file). The reply is that of OPEN.
+//! bit 62 (`INO_NUMBERED`) set and bit 63 clear, else INVALID; the flags must include CREATE and
+//! EXCLUSIVE, else INVALID (the number goes only to a new file, and means nothing for an existing
+//! one). The reply is that of OPEN.
 //!
 //! # Where the standard was checked
 //!
-//! Against the pages of POSIX.1-2024 (https://pubs.opengroup.org/onlinepubs/9799919799/functions/):
-//! `write()`: "the file offset shall be set to the end of the file prior to each write" and "no
-//! intervening file modification operation shall occur between changing the file offset and the
-//! write operation" with `O_APPEND`; "each write is atomic" for regular files, referring to XSH 2.9.7;
-//! a write of a regular file that has room for only some bytes writes those and the next write of a
-//! non-zero number fails; with the file size limit a SIGXFSZ for the thread and EFBIG when no byte
-//! could be written. `pwrite()`: it writes at the given position and does not change the file
-//! offset "regardless of whether O_APPEND is set", so a PWRITE of this service writes at its
-//! offset whatever the flag says (Linux appends, from memory: not checked here). `read()`: at or
-//! after the end of the file the result is 0; its rationale says I/O is intended to be atomic to
-//! ordinary files and pipes, and its page does not refer to 2.9.7 as `write()` does. XSH 2.9.7 is
-//! titled "Thread Interactions with File Operations" (the plan called it "...Regular File
-//! Operations"); its second list, for functions on open file descriptors of files in the
-//! hierarchy, names close, dup2, dup3, fcntl, fstat, fstatat, ftruncate, futimens, lseek, open,
-//! openat, pread, read, readv, pwrite, write and writev. The page text was read through a summarising fetch, so the
-//! wording above is as it was reported and is to be compared with the page by the reviewer. Not
-//! checked: that Linux (ext4) lets a reader see a write half done.
+//! Against POSIX.1-2024 (https://pubs.opengroup.org/onlinepubs/9799919799/). The binding source of
+//! the atomicity is XSH 2.9.7, "Thread Interactions with File Operations": for threads, and except
+//! where specified otherwise, its second list (the functions that act on open file descriptors of
+//! files in the file hierarchy) says each of close, dup2, dup3, fcntl, fstat, fstatat, ftruncate,
+//! futimens, lseek, open, openat, pread, read, readv, pwrite, write and writev is atomic with
+//! respect to the others: if two threads each call one of them, each call sees all of the effects
+//! of the other or none. `write()`, in its description, with `O_APPEND`: "the file offset shall be
+//! set to the end of the file prior to each write" and "no intervening file modification operation
+//! shall occur between changing the file offset and the write operation"; a write with room for
+//! only some bytes writes those, and the next write of a non-zero number fails; a request past the
+//! file size limit raises SIGXFSZ for the thread, and EFBIG is for a write that had no room for
+//! any byte. The rationale of `write()` adds that each write is atomic. `pwrite()` writes at the
+//! given position and "does not change the file offset (regardless of whether O_APPEND is set)", so
+//! PWRITE and PWRITE_FROM write at their offset whatever the flag says; the Linux page pwrite(2)
+//! says in BUGS that with O_APPEND a Linux `pwrite()` appends regardless of the offset, which this
+//! service does not copy. `read()` returns 0 at or after the end of the file; its page has no
+//! reference to 2.9.7, and its rationale says I/O is intended to be atomic to ordinary files and
+//! pipes and FIFOs. The plan's "regular file" in the title of 2.9.7 is the page's "file".
 //!
 //! # Statuses and errno
 //!
@@ -1203,7 +1214,8 @@ pub fn read_release(mut body: Reader<'_>) -> Result<u32, Status> {
 }
 
 /// OPEN_NUMBERED: `(flags, mode, ino, path)`. INVALID for what OPEN refuses, for an `ino` without
-/// `INO_NUMBERED` or with `INO_PATH`, and for CREATE without EXCLUSIVE.
+/// `INO_NUMBERED` or with `INO_PATH`, and for flags without both CREATE and EXCLUSIVE (the number
+/// goes to a new file only).
 pub fn read_open_numbered<'a>(mut body: Reader<'a>) -> Result<(u32, u32, u64, &'a [u8]), Status> {
     let flags = body.u32()?;
     let mode = body.u32()?;
@@ -1218,7 +1230,7 @@ pub fn read_open_numbered<'a>(mut body: Reader<'a>) -> Result<(u32, u32, u64, &'
     if ino & INO_NUMBERED == 0 || ino & INO_PATH != 0 {
         return Err(code(INVALID));
     }
-    if flags & CREATE != 0 && flags & EXCLUSIVE == 0 {
+    if flags & CREATE == 0 || flags & EXCLUSIVE == 0 {
         return Err(code(INVALID));
     }
     Ok((flags, mode, ino, path))
@@ -1250,7 +1262,8 @@ pub fn write_part_reply(
 
 /// Reads the reply to a part of the kind that `inline_read` says (an `INLINE` read has bytes, any
 /// other part has none). BAD_SIZE for a flag that is not `LAPSED` or `UNLEASED`, for a count that is
-/// not the number of bytes of an `INLINE` read, and for bytes left over.
+/// not the number of bytes of an `INLINE` read, for `UNLEASED` with a lease number, and for bytes
+/// left over. A client also checks that the count is at most the part's own (it knows the part).
 pub fn read_part_reply<'a>(
     mut body: Reader<'a>,
     inline_read: bool,
@@ -1264,7 +1277,10 @@ pub fn read_part_reply<'a>(
         &[]
     };
     body.finish()?;
-    if flags & !(LAPSED | UNLEASED) != 0 || (inline_read && bytes.len() != count as usize) {
+    if flags & !(LAPSED | UNLEASED) != 0
+        || (flags & UNLEASED != 0 && lease != 0)
+        || (inline_read && bytes.len() != count as usize)
+    {
         return Err(Status::BadSize);
     }
     Ok(PartReply {
@@ -2339,10 +2355,10 @@ mod tests {
     #[test]
     fn the_reply_to_a_part_round_trips() {
         let mut w = Writer::new();
-        write_part_reply(7, LAPSED | UNLEASED, 3, &[], &mut w).unwrap();
-        assert_eq!(w.as_bytes(), [7, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0]);
+        write_part_reply(7, LAPSED, 3, &[], &mut w).unwrap();
+        assert_eq!(w.as_bytes(), [7, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0]);
         let r = read_part_reply(Reader::new(w.as_bytes()), false).unwrap();
-        assert_eq!((r.count, r.flags, r.lease, r.bytes.len()), (7, 3, 3, 0));
+        assert_eq!((r.count, r.flags, r.lease, r.bytes.len()), (7, 1, 3, 0));
         let mut w = Writer::new();
         write_part_reply(2, 0, 0, b"hi", &mut w).unwrap();
         let r = read_part_reply(Reader::new(w.as_bytes()), true).unwrap();
@@ -2384,26 +2400,42 @@ mod tests {
             w.as_bytes()[HEADER_LEN..].to_vec()
         };
         let good = INO_NUMBERED | 41;
+        let new_file = WRITE | CREATE | EXCLUSIVE;
         assert_eq!(
-            read_open_numbered(Reader::new(&make(READ, 0, good))),
-            Ok((READ, 0, good, &b"/n"[..]))
-        );
-        assert!(
-            read_open_numbered(Reader::new(&make(WRITE | CREATE | EXCLUSIVE, 0o600, good))).is_ok()
+            read_open_numbered(Reader::new(&make(new_file, 0o600, good))),
+            Ok((new_file, 0o600, good, &b"/n"[..]))
         );
         let invalid = Err(code(INVALID));
         for bad in [
-            make(READ, 0, 41),                           // no bit 62
-            make(READ, 0, INO_NUMBERED | INO_PATH | 41), // bit 63
-            make(READ, 0, INO_PATH),                     // a number of a path
-            make(WRITE | CREATE, 0o600, good),           // CREATE without EXCLUSIVE
-            make(READ | 0x4000, 0, good),                // an unknown flag
-            make(READ, 0o10000, good),                   // a bit outside the mode
-            make(0, 0, good),                            // no access and not DIRECTORY
+            make(new_file, 0, 41),                           // no bit 62
+            make(new_file, 0, INO_NUMBERED | INO_PATH | 41), // bit 63
+            make(new_file, 0, INO_PATH),                     // a number of a path
+            make(WRITE | CREATE, 0o600, good),               // CREATE without EXCLUSIVE
+            make(READ, 0, good),                             // no CREATE: the number is undefined
+            make(WRITE | EXCLUSIVE, 0, good),                // EXCLUSIVE without CREATE
+            make(DIRECTORY, 0, good),                        // no CREATE
+            make(new_file | 0x4000, 0, good),                // an unknown flag
+            make(new_file, 0o10000, good),                   // a bit outside the mode
+            make(CREATE | EXCLUSIVE, 0, good),               // no access and not DIRECTORY
         ] {
             assert_eq!(read_open_numbered(Reader::new(&bad)).map(|_| ()), invalid);
         }
-        assert!(read_open_numbered(Reader::new(&make(DIRECTORY, 0, good))).is_ok());
+    }
+
+    #[test]
+    fn unleased_has_no_lease_number() {
+        let mut w = Writer::new();
+        write_part_reply(1, UNLEASED, 5, &[], &mut w).unwrap();
+        assert_eq!(
+            read_part_reply(Reader::new(w.as_bytes()), false),
+            Err(Status::BadSize)
+        );
+        let mut w = Writer::new();
+        write_part_reply(1, UNLEASED, 0, &[], &mut w).unwrap();
+        assert!(read_part_reply(Reader::new(w.as_bytes()), false).is_ok());
+        let mut w = Writer::new();
+        write_part_reply(1, LAPSED, 5, &[], &mut w).unwrap();
+        assert!(read_part_reply(Reader::new(w.as_bytes()), false).is_ok());
     }
 
     #[test]
