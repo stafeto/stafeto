@@ -16,9 +16,11 @@ meson is told never to download anything itself. The Mesa tree is unpacked to
 target/mesa/src, the patches of ports/mesa/patches are applied in order, and
 meson and ninja build it.
 meson, ninja, flex and bison come from the host (Homebrew), and the Python
-that runs Mesa's generators needs Mako, MarkupSafe and PyYAML: the Python of
-the host when it has them, otherwise a venv in target/mesa/venv with the
-pinned versions below.
+that runs Mesa's generators needs Mako, MarkupSafe and PyYAML: a venv in
+target/mesa/venv, made with `pip install --require-hashes --no-deps
+--only-binary :all:` from tools/mesa-requirements.txt (the hashes of the wheels
+of Mako, MarkupSafe, PyYAML and packaging), and from
+tools/mesa-requirements-meson.txt when the host's meson is older than 1.5.
 
 What the build is (the decisions that belong to stafeto, plan G8 section 4):
 
@@ -30,7 +32,9 @@ What the build is (the decisions that belong to stafeto, plan G8 section 4):
     others replace the direct tests of `__linux__` of the files the build
     compiles by DETECT_OS_LINUX;
   - Mesa takes its C11 threads from relibc (`with_c11_threads`), and its
-    futex path is off because the sysroot has no <linux/futex.h>;
+    futex path is off by decision (util/futex.h tests DETECT_OS_STAFETO; the
+    sysroot has no <linux/futex.h> either): Mesa waits on the C library's
+    mutexes and condition variables;
   - the drivers: softpipe only, no LLVM, no desktop OpenGL (`opengl=false`:
     with it on, libGL and libGLESv2 hold the same names and the link of a
     program fails with duplicates), no GLX, no GBM, no platforms (the platform
@@ -44,8 +48,11 @@ What the build is (the decisions that belong to stafeto, plan G8 section 4):
 
 meson probes the C library by linking small programs; the sysroot's libc.a
 needs the layer under it, so those probes link a stub archive generated here
-from the names of libc.a and libm.a (what the probes find is what relibc
-exports).
+from the names of libc.a and libm.a: what the probes find is what relibc
+exports, and a name that relibc exports but the layer answers with ENOSYS (or
+a thread that is not the caller's with ENOTSUP) still counts as found:
+pthread_setaffinity_np, flock, posix_fallocate and dladdr are such names, and
+Mesa handles their errors.
 
 The result is target/mesa/: include/ (EGL, GLES2, GLES3, KHR), lib/libmesa.a,
 NOTICES (the licence texts of the files the library holds and the headers of
@@ -55,6 +62,7 @@ file of meson and exits."""
 
 from hashlib import sha256
 from pathlib import Path
+import json
 import os
 import re
 import shutil
@@ -80,11 +88,12 @@ CACHE = ROOT / "target" / "mesa-src"
 RELIBC = ROOT / "target" / "relibc" / "sysroot"
 LIBCXX = ROOT / "target" / "libcxx"
 PORT = ROOT / "ports" / "mesa"
-# Python packages the generators of Mesa import, with the versions the build
-# was made with.
-PYTHON_PACKAGES = ["Mako==1.4.3", "MarkupSafe==3.0.4", "PyYAML==6.0.4", "packaging==26.3"]
+# The Python packages the generators of Mesa import, and meson for a host
+# whose own is older than MESON_MINIMUM: requirements files with the hashes of
+# the wheels (the versions are in them and in the stamp).
+REQUIREMENTS = ROOT / "tools" / "mesa-requirements.txt"
+REQUIREMENTS_MESON = ROOT / "tools" / "mesa-requirements-meson.txt"
 MESON_MINIMUM = (1, 5, 0)
-MESON_VERSION = "1.12.1"
 # The options of the build, in the form meson takes them (meson.options of
 # Mesa 26.3.1).
 OPTIONS = {
@@ -179,6 +188,14 @@ ARCHIVES = [
     "src/util/libxmlconfig.a",
     f"subprojects/libdrm-{LIBDRM_VERSION}/libdrm.a",
 ]
+# The other static libraries the build tree holds, which the archive leaves
+# out on purpose: libgallium holds the objects of libdri (link_whole). Any other
+# library the build makes is a refusal. libglapi_bridge.a is the entry points
+# of desktop OpenGL, which define the names of libGLESv2 a second time: it is
+# in the tree whatever the options say and is not built unless something asks
+# for it, so it is named here, and the options that would ask are checked as
+# meson configured them (configured_differences).
+EXCLUDED = {"libdri.a", "libglapi_bridge.a"}
 # What of the tree is copied to `include/`.
 HEADER_DIRS = ["EGL", "GLES2", "GLES3", "KHR"]
 # The licence texts of Mesa's tree that the library holds (licenses/): the
@@ -202,6 +219,14 @@ NOTICE_FILES = [
     ("OpenGL ES 3.0 platform header of Khronos, Apache-2.0", "include/GLES3/gl3platform.h"),
     ("Khronos platform header, MIT", "include/KHR/khrplatform.h"),
     ("libdrm, MIT", "libdrm/xf86drm.c"),
+]
+# Public-domain parts of files that are otherwise MIT: the file, the start of
+# the passage and what ends it.
+PUBLIC_DOMAIN = [
+    ("rand_xorshift128plus of Sebastiano Vigna, public domain", "src/util/rand_xor.c",
+     "/* Super fast random number generator."),
+    ("divide_by_constants_codegen_reference of ridiculous_fish, public domain",
+     "src/util/fast_idiv_by_const.c", "/* Imported from:"),
 ]
 # Names the library may leave undefined besides the C library's and the C++
 # runtime's: none.
@@ -335,6 +360,45 @@ def strong_duplicates(listing: str) -> dict[str, list[str]]:
     return {name: found for name, found in members.items() if len(found) > 1}
 
 
+def meson_value(value) -> str:
+    """An option of `meson introspect --buildoptions` in the form of the
+    command line: booleans in lower case, arrays joined by commas."""
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, list):
+        return ",".join(map(str, value))
+    return str(value)
+
+
+def configured_differences(buildoptions: list[dict], required: dict = REQUIRED) -> list[str]:
+    """The required options whose value in the configured build tree is not
+    the required one (the options as meson holds them, not as this script
+    meant to pass them)."""
+    held = {o["name"]: meson_value(o["value"]) for o in buildoptions if "subproject" not in o}
+    return [f"{k}={held.get(k)!r} (required {v!r})" for k, v in required.items()
+            if held.get(k) != v]
+
+
+def strong_names(listing: str) -> set[str]:
+    """The names defined with a strong symbol in the output of
+    `llvm-nm --format=posix --defined-only --extern-only`."""
+    names = set()
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and not line.endswith(":") and fields[1] not in ("W", "V", "w", "v", "U", "u"):
+            names.add(fields[0])
+    return names
+
+
+def unlisted_archives(found: list[str]) -> list[str]:
+    """The static libraries of the build tree (paths below the build
+    directory, those of subprojects left out) that neither ARCHIVES nor
+    EXCLUDED names: a library the options added, whose names the archive
+    would lack or hold twice."""
+    listed = set(ARCHIVES)
+    return sorted(f for f in found if f not in listed and Path(f).name not in EXCLUDED)
+
+
 def check_options(options: dict = OPTIONS) -> None:
     """The settings the archive depends on: with desktop OpenGL on, the tree
     also builds libglapi_bridge.a (the entry points of libGL), which defines
@@ -351,9 +415,16 @@ def strays(undefined: set[str], known: set[str]) -> list[str]:
     return sorted(undefined - known - UNDEFINED_OK)
 
 
-def stamp_text(script: bytes, port: bytes, relibc_stamp: str, libcxx_stamp: str) -> str:
+def requirements_digest() -> str:
+    """The digest of the requirements files: the versions of the Python
+    packages and of meson the build runs with are in the stamp through it."""
+    return sha256(REQUIREMENTS.read_bytes() + REQUIREMENTS_MESON.read_bytes()).hexdigest()
+
+
+def stamp_text(script: bytes, port: bytes, relibc_stamp: str, libcxx_stamp: str,
+               requirements: str = "") -> str:
     return (f"{VERSION} {SHA256} {LIBDRM_VERSION} {LIBDRM_SHA256} {sha256(script).hexdigest()} "
-            f"{sha256(port).hexdigest()} {relibc_stamp} {libcxx_stamp}\n")
+            f"{sha256(port).hexdigest()} {relibc_stamp} {libcxx_stamp} {requirements}\n")
 
 
 def port_bytes(port: Path = PORT) -> bytes:
@@ -372,7 +443,7 @@ def fetch(url: str, digest: str, name: str) -> Path:
     archive = CACHE / name
     if not archive.exists() or sha256(archive.read_bytes()).hexdigest() != digest:
         part = archive.with_suffix(archive.suffix + ".part")
-        with urlopen(url) as response, part.open("wb") as out:
+        with urlopen(url, timeout=120) as response, part.open("wb") as out:
             shutil.copyfileobj(response, out)
         if sha256(part.read_bytes()).hexdigest() != digest:
             part.unlink()
@@ -401,39 +472,35 @@ def apply_patches(source: Path, log: Path, port: Path = PORT) -> None:
         run(log, "patch", "-p1", "-N", "--no-backup-if-mismatch", "-s", "-i", patch, cwd=source)
 
 
-def ensure_venv(packages: list[str], log: Path) -> Path:
-    """The bin directory of the venv in target/mesa/venv with exactly these
-    packages (made again when the list differs from the one it was made for)."""
+def ensure_venv(files: list[Path], log: Path) -> Path:
+    """The bin directory of the venv in target/mesa/venv with exactly what
+    the requirements files name, installed by their hashes (made again when
+    the files differ from the ones it was made for)."""
     venv = WORK / "venv"
-    record = venv / "packages.txt"
-    wanted = "\n".join(packages) + "\n"
+    record = venv / "requirements.sha256"
+    wanted = "\n".join(sha256(f.read_bytes()).hexdigest() for f in files) + "\n"
     if not record.exists() or record.read_text() != wanted:
         shutil.rmtree(venv, ignore_errors=True)
         run(log, sys.executable, "-m", "venv", venv)
-        run(log, venv / "bin" / "python3", "-m", "pip", "install", "--quiet",
-            "--only-binary", ":all:", *packages)
+        arguments = [arg for f in files for arg in ("-r", f)]
+        run(log, venv / "bin" / "python3", "-m", "pip", "install", "--quiet", "--require-hashes",
+            "--no-deps", "--only-binary", ":all:", *arguments)
         record.write_text(wanted)
     return venv / "bin"
 
 
 def host_tools(log: Path) -> tuple[Path, list[Path]]:
     """The meson to run and the directories for the front of the PATH. The
-    host's meson serves when it is new enough, and the host's Python when it
-    imports what the generators need; otherwise a venv holds the pinned
-    versions (meson.build wants meson 1.5, and Ubuntu 24.04 has 1.3)."""
+    Python packages always come from the venv, so the versions that built the
+    archive are the pinned ones; the host's meson serves when it is new
+    enough (meson.build wants 1.5, and Ubuntu 24.04 has 1.3), otherwise the
+    venv carries the pinned meson."""
     found = shutil.which("meson")
     meson_ok = False
     if found:
         text = subprocess.run([found, "--version"], capture_output=True, text=True).stdout
         meson_ok = version_tuple(text) >= MESON_MINIMUM
-    python = shutil.which("python3")
-    python_ok = bool(python) and subprocess.run(
-        [python, "-c", "import mako, yaml, markupsafe, packaging"],
-        capture_output=True).returncode == 0
-    if meson_ok and python_ok:
-        return Path(found), [Path(python).parent]
-    packages = PYTHON_PACKAGES + ([] if meson_ok else [f"meson=={MESON_VERSION}"])
-    venv = ensure_venv(packages, log)
+    venv = ensure_venv([REQUIREMENTS] + ([] if meson_ok else [REQUIREMENTS_MESON]), log)
     return (Path(found) if meson_ok else venv / "meson"), [venv]
 
 
@@ -488,6 +555,10 @@ def notices(source: Path, libdrm: Path) -> str:
         base = libdrm if path.startswith("libdrm/") else source
         file = base / path.removeprefix("libdrm/")
         parts.append((f"{title} ({path})", leading_comment(file.read_text(errors="replace"))))
+    for title, path, start in PUBLIC_DOMAIN:
+        text = (source / path).read_text(errors="replace")
+        begin = text.index(start)
+        parts.append((f"{title} ({path})", text[begin: text.index("*/", begin) + 2]))
     return "\n\n".join(f"==== {title} ====\n\n{text}\n" for title, text in parts)
 
 
@@ -495,7 +566,7 @@ def main() -> None:
     script = Path(__file__).read_bytes()
     relibc_stamp = stamp_of(ROOT / "target" / "relibc" / "stamp", "relibc", "cargo xtask relibc")
     libcxx_stamp = stamp_of(LIBCXX / "stamp", "libc++", "cargo xtask libcxx")
-    text = stamp_text(script, port_bytes(), relibc_stamp, libcxx_stamp)
+    text = stamp_text(script, port_bytes(), relibc_stamp, libcxx_stamp, requirements_digest())
     arguments = sys.argv[1:]
     if "--check" in arguments:
         print(text, end="")
@@ -552,7 +623,22 @@ def main() -> None:
     build = WORK / "build"
     run(log, meson, "setup", build, source, "--cross-file", cross, *meson_options(),
         cwd=WORK, env=env)
+    # The default targets too (the libraries the options add are among them),
+    # then the ones the archive is made of.
+    options = json.loads(subprocess.run([str(meson), "introspect", "--buildoptions", str(build)],
+                                        capture_output=True, text=True, check=True, env=env).stdout)
+    different = configured_differences(options)
+    if different:
+        raise SystemExit("meson configured the build with other options than the required: "
+                         + ", ".join(different))
+    run(log, ninja, "-C", build, cwd=WORK, env=env)
     run(log, ninja, "-C", build, *ARCHIVES, cwd=WORK, env=env)
+    found = sorted(str(p.relative_to(build)) for p in build.rglob("*.a")
+                   if p.relative_to(build).parts[0] != "subprojects")
+    extra = unlisted_archives(found)
+    if extra:
+        raise SystemExit("the build made static libraries the archive does not account for "
+                         "(ARCHIVES, EXCLUDED): " + " ".join(extra))
     (WORK / "lib").mkdir()
     merge_archives(ar, build, library, log)
     include = WORK / "include"
@@ -568,6 +654,23 @@ def main() -> None:
     if twice:
         raise SystemExit("names the archive defines more than once: "
                          + " ".join(f"{n} ({len(m)})" for n, m in sorted(twice.items())[:20]))
+    # No strong name of the archive is one of the C library's or the C++
+    # runtime's (Mesa's own threads, dropped by patch 0003, would be).
+    mine = strong_names(subprocess.run(
+        [str(nm), "--format=posix", "--defined-only", "--extern-only", str(library)],
+        capture_output=True, text=True, check=True).stdout)
+    shared: dict[str, set[str]] = {}
+    for other in (RELIBC / "lib" / "libc.a", RELIBC / "lib" / "libm.a",
+                  *(LIBCXX / "lib" / n for n in ("libc++.a", "libc++abi.a", "libunwind.a"))):
+        theirs = strong_names(subprocess.run(
+            [str(nm), "--format=posix", "--defined-only", "--extern-only", str(other)],
+            capture_output=True, text=True, check=True).stdout)
+        for name in mine & theirs:
+            shared.setdefault(name, set()).add(other.name)
+    if shared:
+        raise SystemExit("names the archive defines that the C library or the C++ runtime defines "
+                         "too: " + " ".join(f"{n} ({', '.join(sorted(o))})"
+                                            for n, o in sorted(shared.items())[:20]))
     listing = subprocess.run([str(nm), "--format=posix", str(library)], capture_output=True,
                              text=True, check=True).stdout
     defined, undefined = parse_nm(listing)

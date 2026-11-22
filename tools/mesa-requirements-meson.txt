@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# meson 1.12.1, for a host whose meson is older than the 1.5 Mesa needs (Ubuntu 24.04 has 1.3).
+# tools/build-mesa.py installs them with `pip install --require-hashes --no-deps
+# --only-binary :all: -r <this file>`. The hashes are those of the wheels of the
+# releases on PyPI (https://pypi.org/pypi/<name>/<version>/json): the pure Python
+# wheel where there is one, else the wheels of CPython 3.9 to 3.15 for macOS on
+# arm64 and for Linux (manylinux) on aarch64 and x86_64, which are the hosts that
+# build for stafeto (a Mac, and the Ubuntu 24.04 runners of GitHub with CPython 3.12).
+meson==1.12.1 \
+    --hash=sha256:930bc7542cbd9f57009e182fd014eba48cf1a0180a7b9006d2d32d8f168d8b02

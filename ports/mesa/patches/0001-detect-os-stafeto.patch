@@ -7,15 +7,16 @@ __linux__ (the headers of the C library test it) and the build adds
 -D__stafeto__=1. detect_os.h makes that a POSIX system of its own,
 DETECT_OS_STAFETO, with DETECT_OS_LINUX off, so the files that use the Linux
 kernel's interfaces (epoll, eventfd, inotify, gettid, thread names, /proc)
-take their other branches. The direct tests of __linux__ in the files the
-softpipe build compiles (u_queue.c, u_process.c) become DETECT_OS_LINUX, and
+take their other branches, and util/futex.h turns its futex path off for it by
+decision (the sysroot has no <linux/futex.h> either). The direct tests of
+__linux__ in the files the softpipe build compiles (u_queue.c, u_process.c) become DETECT_OS_LINUX, and
 os_misc.c takes the sysconf branch for the page size and the memory.
 
 diff --git a/src/util/detect_os.h b/src/util/detect_os.h
-index 7403724..01de16d 100644
+index 74037240..f16b4a5b 100644
 --- a/src/util/detect_os.h
 +++ b/src/util/detect_os.h
-@@ -15,7 +15,17 @@
+@@ -15,7 +15,19 @@
  #ifndef DETECT_OS_H
  #define DETECT_OS_H
  
@@ -24,8 +25,10 @@ index 7403724..01de16d 100644
 + * stafeto programs are built for aarch64-linux-gnu, so the compiler defines
 + * __linux__ (the headers of its C library test it), and the build adds
 + * -D__stafeto__=1. The system is a POSIX one that is no Linux: nothing of the
-+ * Linux kernel's interfaces (futex, epoll, eventfd, inotify, gettid, thread
-+ * names) is there.
++ * Linux kernel's interfaces (epoll, eventfd, inotify, gettid, thread names)
++ * is there, and the futex path of util/futex.h is off by decision (futex.h
++ * tests DETECT_OS_STAFETO), so Mesa waits on the C library's mutexes and
++ * condition variables.
 + */
 +#if defined(__stafeto__)
 +#define DETECT_OS_STAFETO 1
@@ -34,8 +37,26 @@ index 7403724..01de16d 100644
  #define DETECT_OS_LINUX 1
  #define DETECT_OS_POSIX 1
  #endif
+diff --git a/src/util/futex.h b/src/util/futex.h
+index b7ce0884..2bb61611 100644
+--- a/src/util/futex.h
++++ b/src/util/futex.h
+@@ -24,10 +24,12 @@
+ #ifndef UTIL_FUTEX_H
+ #define UTIL_FUTEX_H
+ 
++#include "util/detect_os.h"
++
+ #if THREAD_SANITIZER
+ #define UTIL_FUTEX_SUPPORTED 0
+ #else
+-#if defined(HAVE_LINUX_FUTEX_H) && defined(__linux__)
++#if defined(HAVE_LINUX_FUTEX_H) && defined(__linux__) && !DETECT_OS_STAFETO
+ #define UTIL_FUTEX_SUPPORTED 1
+ #elif defined(__FreeBSD__)
+ #define UTIL_FUTEX_SUPPORTED 1
 diff --git a/src/util/os_misc.c b/src/util/os_misc.c
-index ea73839..8de377d 100644
+index ea738396..8de377d1 100644
 --- a/src/util/os_misc.c
 +++ b/src/util/os_misc.c
 @@ -60,7 +60,7 @@
@@ -48,7 +69,7 @@ index ea73839..8de377d 100644
  #elif DETECT_OS_OPENBSD || DETECT_OS_FREEBSD
  #  include <sys/resource.h>
 diff --git a/src/util/u_process.c b/src/util/u_process.c
-index 6846acd..e0d0b79 100644
+index 6846acd2..e0d0b79b 100644
 --- a/src/util/u_process.c
 +++ b/src/util/u_process.c
 @@ -56,7 +56,7 @@
@@ -61,7 +82,7 @@ index 6846acd..e0d0b79 100644
  __getProgramName()
  {
 diff --git a/src/util/u_queue.c b/src/util/u_queue.c
-index 90a62a9..c209a92 100644
+index 90a62a9e..c209a92a 100644
 --- a/src/util/u_queue.c
 +++ b/src/util/u_queue.c
 @@ -35,7 +35,7 @@

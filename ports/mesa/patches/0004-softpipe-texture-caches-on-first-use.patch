@@ -3,14 +3,15 @@ SPDX-License-Identifier: MIT
 Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 softpipe_create_context made all of its 768 texture tile caches (six shader
-stages, 128 units each, 256 KiB each) with calloc: 200 MiB. On a system that
+stages, 128 units each, 256 KiB each) with calloc: 192 MiB. On a system that
 charges a process for memory at the mapping of a range, a context that binds
 one texture paid for all of them. The caches are now made by
 softpipe_set_sampler_views when a view is bound to a unit that has none, and
-a flush skips a unit without a cache.
+a flush skips a unit without a cache. A failed allocation is logged
+(mesa_loge) and the view is not bound.
 
 diff --git a/src/gallium/drivers/softpipe/sp_context.c b/src/gallium/drivers/softpipe/sp_context.c
-index f4e0b9f..b60b924 100644
+index f4e0b9f5..29143ece 100644
 --- a/src/gallium/drivers/softpipe/sp_context.c
 +++ b/src/gallium/drivers/softpipe/sp_context.c
 @@ -240,14 +240,11 @@ softpipe_create_context(struct pipe_screen *screen,
@@ -27,17 +28,25 @@ index f4e0b9f..b60b924 100644
 -   }
 +   /* The caches of the texture units are made when a texture is bound to the
 +    * unit (sp_state_sampler.c): there are 768 of them, 256 KiB each, and a
-+    * system that charges memory at the mapping of a range pays 200 MiB for
++    * system that charges memory at the mapping of a range pays 192 MiB for
 +    * them even when no texture is ever bound.
 +    */
  
     softpipe->fs_machine = tgsi_exec_machine_create(MESA_SHADER_FRAGMENT);
  
 diff --git a/src/gallium/drivers/softpipe/sp_state_sampler.c b/src/gallium/drivers/softpipe/sp_state_sampler.c
-index 028d39a..e36550b 100644
+index 028d39a8..bfd0dc62 100644
 --- a/src/gallium/drivers/softpipe/sp_state_sampler.c
 +++ b/src/gallium/drivers/softpipe/sp_state_sampler.c
-@@ -118,9 +118,16 @@ softpipe_set_sampler_views(struct pipe_context *pipe,
+@@ -30,6 +30,7 @@
+  */
+ 
+ #include "util/u_memory.h"
++#include "util/log.h"
+ #include "util/u_inlines.h"
+ #include "util/format/u_format.h"
+ 
+@@ -118,9 +119,18 @@ softpipe_set_sampler_views(struct pipe_context *pipe,
           &softpipe->tgsi.sampler[shader]->sp_sview[start + i];
        struct pipe_sampler_view **pview = &softpipe->sampler_views[shader][start + i];
  
@@ -49,14 +58,16 @@ index 028d39a..e36550b 100644
 +      /* The cache of a unit is made on its first texture. */
 +      if (views[i] && !*cache)
 +         *cache = sp_create_tex_tile_cache(&softpipe->pipe);
-+      if (views[i] && !*cache)
++      if (views[i] && !*cache) {
++         mesa_loge("softpipe: no memory for the texture cache of unit %u", start + i);
 +         pipe_sampler_view_reference(pview, NULL);
++      }
 +      if (*cache)
 +         sp_tex_tile_cache_set_sampler_view(*cache, *pview);
        /*
         * We don't really have variants, however some bits are different per shader,
         * so just copy?
-@@ -139,8 +146,9 @@ softpipe_set_sampler_views(struct pipe_context *pipe,
+@@ -139,8 +149,9 @@ softpipe_set_sampler_views(struct pipe_context *pipe,
     for (; i < num + unbind_num_trailing_slots; i++) {
        struct pipe_sampler_view **pview = &softpipe->sampler_views[shader][start + i];
        pipe_sampler_view_reference(pview, NULL);
@@ -69,7 +80,7 @@ index 028d39a..e36550b 100644
  
  
 diff --git a/src/gallium/drivers/softpipe/sp_tex_tile_cache.c b/src/gallium/drivers/softpipe/sp_tex_tile_cache.c
-index 4bc8e3e..d88bb92 100644
+index 4bc8e3e4..d88bb92c 100644
 --- a/src/gallium/drivers/softpipe/sp_tex_tile_cache.c
 +++ b/src/gallium/drivers/softpipe/sp_tex_tile_cache.c
 @@ -167,7 +167,7 @@ sp_flush_tex_tile_cache(struct softpipe_tex_tile_cache *tc)

@@ -1285,7 +1285,7 @@ files = [
         let mesa = get("mesa");
         assert_eq!(
             mesa.license,
-            "MIT AND Apache-2.0 AND BSL-1.0 AND BSD-2-Clause AND BSD-3-Clause AND HPND-sell-variant"
+            "MIT AND Apache-2.0 AND BSL-1.0 AND BSD-2-Clause AND BSD-3-Clause AND HPND-sell-variant AND LicenseRef-public-domain"
         );
         assert_eq!(mesa.group(), Group::Game);
         assert_eq!(mesa.build_depends, ["libcxx"]);

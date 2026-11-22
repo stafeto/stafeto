@@ -50,7 +50,7 @@ class PackageTests(unittest.TestCase):
     def test_the_licences_are_those_of_the_files_the_archive_holds(self):
         licence = builder.PACKAGE["license"].split(" AND ")
         for name in ("MIT", "Apache-2.0", "BSL-1.0", "BSD-2-Clause", "BSD-3-Clause",
-                     "HPND-sell-variant"):
+                     "HPND-sell-variant", "LicenseRef-public-domain"):
             self.assertIn(name, licence)
         # The GPL files of Mesa's tree belong to code the build leaves out.
         self.assertFalse([n for n in licence if "GPL" in n])
@@ -177,7 +177,7 @@ class PatchTests(unittest.TestCase):
                    for p in self.PATCHES}
         self.assertEqual(
             touched["0001-detect-os-stafeto.patch"],
-            ["src/util/detect_os.h", "src/util/os_misc.c", "src/util/u_process.c",
+            ["src/util/detect_os.h", "src/util/futex.h", "src/util/os_misc.c", "src/util/u_process.c",
              "src/util/u_queue.c"])
         self.assertEqual(
             touched["0002-static-targets.patch"],
@@ -349,6 +349,109 @@ class SymbolTests(unittest.TestCase):
         self.assertEqual(builder.strays(undefined, known - {"strtold_l"}), ["strtold_l"])
 
 
+BUILDOPTIONS = [
+    {"name": "opengl", "value": False},
+    {"name": "gles2", "value": "enabled"},
+    {"name": "platforms", "value": []},
+    {"name": "gallium-drivers", "value": ["softpipe"]},
+    {"name": "opengl", "value": True, "subproject": "libdrm"},
+]
+
+
+class ConfiguredTests(unittest.TestCase):
+    REQUIRED = {"opengl": "false", "gles2": "enabled", "platforms": "", "gallium-drivers": "softpipe"}
+
+    def test_the_options_as_meson_holds_them_are_compared(self):
+        self.assertEqual(builder.configured_differences(BUILDOPTIONS, self.REQUIRED), [])
+
+    def test_opengl_on_in_the_configured_tree_is_reported_whatever_the_script_passed(self):
+        # The planted fault: the guard of the script bypassed, opengl left on.
+        on = [{**o, "value": True} if o["name"] == "opengl" and "subproject" not in o else o
+              for o in BUILDOPTIONS]
+        found = builder.configured_differences(on, self.REQUIRED)
+        self.assertEqual(len(found), 1)
+        self.assertIn("opengl='true'", found[0])
+
+    def test_an_option_meson_does_not_know_is_reported(self):
+        self.assertEqual(len(builder.configured_differences(BUILDOPTIONS[:1], self.REQUIRED)), 3)
+
+    def test_the_values_are_those_of_the_command_line(self):
+        self.assertEqual(builder.meson_value(True), "true")
+        self.assertEqual(builder.meson_value([]), "")
+        self.assertEqual(builder.meson_value(["a", "b"]), "a,b")
+
+
+class UnlistedTests(unittest.TestCase):
+    TREE = list(builder.ARCHIVES) + ["src/gallium/frontends/dri/libdri.a",
+                                     "src/mesa/glapi/glapi/libglapi_bridge.a"]
+
+    def test_the_listed_and_the_excluded_libraries_are_accounted_for(self):
+        self.assertEqual(builder.unlisted_archives(self.TREE), [])
+
+    def test_another_library_is_reported(self):
+        self.assertEqual(builder.unlisted_archives(self.TREE + ["src/mesa/libglx_extra.a"]),
+                         ["src/mesa/libglx_extra.a"])
+
+    def test_the_excluded_are_the_two_the_archive_leaves_out_on_purpose(self):
+        self.assertEqual(builder.EXCLUDED, {"libdri.a", "libglapi_bridge.a"})
+
+
+class SharedNameTests(unittest.TestCase):
+    MESA = """libmesa.a[a.o]:
+mtx_init T 0 8
+eglGetDisplay T 8 8
+inline_fn W 0 4
+"""
+    LIBC = """x.o:
+mtx_init T 0 8
+malloc T 8 8
+inline_fn W 0 4
+"""
+
+    def test_strong_names_leave_out_the_weak_and_the_undefined(self):
+        self.assertEqual(builder.strong_names(self.MESA + "free U\n"), {"mtx_init", "eglGetDisplay"})
+
+    def test_a_name_both_define_is_found(self):
+        # The planted fault: patch 0003 dropped, Mesa's threads_posix.c in the archive.
+        both = builder.strong_names(self.MESA) & builder.strong_names(self.LIBC)
+        self.assertEqual(both, {"mtx_init"})
+
+    def test_the_patch_that_prevents_it_is_in_the_list(self):
+        self.assertIn("0003-c11-threads-from-the-c-library.patch",
+                      [p.name for p in builder.patches()])
+
+
+class RequirementsTests(unittest.TestCase):
+    def read(self, path):
+        return path.read_text()
+
+    def test_every_package_is_pinned_with_hashes(self):
+        text = self.read(builder.REQUIREMENTS)
+        for name, version in (("mako", "1.4.3"), ("markupsafe", "3.0.4"), ("pyyaml", "6.0.4"),
+                              ("packaging", "26.3")):
+            self.assertRegex(text, rf"(?m)^{name}=={re.escape(version)} \\$")
+        for line in text.splitlines():
+            if line.startswith("    --hash="):
+                self.assertRegex(line, r"^    --hash=sha256:[0-9a-f]{64}( \\)?$")
+        pins = re.findall(r"(?m)^\w+==", text)
+        self.assertEqual(len(pins), 4)
+
+    def test_the_platform_wheels_cover_the_hosts(self):
+        # MarkupSafe and PyYAML: macOS arm64 and Linux aarch64 wheels of CPython 3.12 and 3.15.
+        text = self.read(builder.REQUIREMENTS)
+        self.assertGreater(text.count("--hash=sha256:"), 30)
+
+    def test_meson_is_pinned_apart(self):
+        text = self.read(builder.REQUIREMENTS_MESON)
+        self.assertRegex(text, r"(?m)^meson==1\.12\.1 \\$")
+        self.assertEqual(text.count("--hash=sha256:"), 1)
+
+    def test_the_stamp_holds_the_digest_of_the_files(self):
+        self.assertRegex(builder.requirements_digest(), r"^[0-9a-f]{64}$")
+        a = builder.stamp_text(b"s", b"p", "r", "l", "one")
+        self.assertNotEqual(a, builder.stamp_text(b"s", b"p", "r", "l", "two"))
+
+
 class NoticeTests(unittest.TestCase):
     def test_the_leading_comment_is_the_first_block(self):
         self.assertEqual(builder.leading_comment("/* a\n * b */\nint x;\n/* c */"), "/* a\n * b */")
@@ -379,12 +482,19 @@ class NoticeTests(unittest.TestCase):
                 file = base / path.removeprefix("libdrm/")
                 file.parent.mkdir(parents=True, exist_ok=True)
                 file.write_text(f"/* licence heading of {path} */\nint x;\n")
+            for _, path, start in builder.PUBLIC_DOMAIN:
+                file = source / path
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text(f"int y;\n{start}\n * belongs to the public domain.\n */\nint z;\n")
             text = builder.notices(source, libdrm)
         self.assertIn("License and Copyright", text)
         self.assertIn("text of Apache-2.0", text)
         self.assertIn("licence heading of src/util/softfloat.c", text)
         self.assertIn("licence heading of libdrm/xf86drm.c", text)
         self.assertNotIn("int x;", text)
+        self.assertIn("belongs to the public domain.", text)
+        self.assertIn("rand_xorshift128plus of Sebastiano Vigna", text)
+        self.assertNotIn("int z;", text)
 
 
 class ArchiveTests(unittest.TestCase):
@@ -475,7 +585,6 @@ class ReferenceTests(unittest.TestCase):
 class VersionTests(unittest.TestCase):
     def test_the_minimum_of_meson_is_the_one_of_mesa(self):
         self.assertEqual(builder.MESON_MINIMUM, (1, 5, 0))
-        self.assertGreaterEqual(builder.version_tuple(builder.MESON_VERSION), builder.MESON_MINIMUM)
         self.assertLess(builder.version_tuple("1.4.2"), builder.MESON_MINIMUM)
         self.assertGreaterEqual(builder.version_tuple("1.12.1\n"), builder.MESON_MINIMUM)
 
