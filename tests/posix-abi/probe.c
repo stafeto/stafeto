@@ -886,6 +886,17 @@ static void note(const char *text, long long value) {
  * pair; a stall spoils some. */
 #define SPLIT_PAIRS 12
 
+/* A loop of calls that enter the kernel and return to the same thread with
+ * no switch: clock_gettime of the CPU-time clock of the thread is one
+ * kernel call (THREAD_STATE) that neither blocks nor reschedules. Its whole
+ * way in the kernel is the thread's system time. A sched_yield ends the
+ * stint where the scheduler decides, and the switch after it is the
+ * system's: a loop of yields shows too little to hold to the bounds. */
+static void thread_clock_call(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+}
+
 static int cpu_split(void) {
     long long thread0 = stafeto_cpu_system_ns(1);
     long long thread2 = 0, system2 = 0, call_system = 0;
@@ -910,7 +921,7 @@ static int cpu_split(void) {
          * that: the loop of calls shows only that the system time grows with
          * the calls, per nanosecond that each loop ran. */
         began = monotonic_ns();
-        while (monotonic_ns() - began < 20000000LL) sched_yield();
+        while (monotonic_ns() - began < 20000000LL) thread_clock_call();
         calls_elapsed = monotonic_ns() - began;
         /* The thread first: the window of the process holds the window of
          * the thread, as in usage_split. */
@@ -955,7 +966,7 @@ static long long spin_user(long long nanoseconds) {
 
 static long long spin_calls(long long nanoseconds) {
     long long began = monotonic_ns();
-    while (monotonic_ns() - began < nanoseconds) sched_yield();
+    while (monotonic_ns() - began < nanoseconds) thread_clock_call();
     return monotonic_ns() - began;
 }
 
