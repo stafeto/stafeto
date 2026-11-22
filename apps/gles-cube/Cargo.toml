@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "MIT"
-description = "The cube of stafeto: a C program on EGL 1.5 and OpenGL ES 2.0 that Mesa's softpipe driver runs on the processor; with --pbuffer it draws ten frames into a surface with no window and prints the CRC of each frame read back"
+description = "The cube of stafeto: a C program on EGL 1.5 and OpenGL ES 2.0 that Mesa's softpipe driver runs on the processor; with --pbuffer it draws ten frames into a surface with no window and prints the CRC of each frame read back, with --window it draws into a window of the composition service"
 build = "build.rs"
 
 [[bin]]
@@ -14,4 +14,4 @@ test = false
 bench = false
 
 [dependencies]
-posix-crt = { path = "../../lib/posix-crt" }
+posix-crt = { path = "../../lib/posix-crt", features = ["window"] }

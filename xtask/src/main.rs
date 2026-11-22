@@ -77,6 +77,7 @@ mod frame_probe;
 mod fstack_device;
 mod fstack_probe;
 mod gles_pbuffer;
+mod gles_window;
 mod gpu_probe;
 mod guards;
 mod htop_dialog;
@@ -2213,6 +2214,10 @@ commands:
             as on the runners of probe.yml)
   gles-pbuffer run a cube on Mesa's softpipe in QEMU, with no compositor: ten frames
             drawn into a pbuffer, read back, and their CRCs
+  gles-window run the cube in a window of the composition service in QEMU: the API checks of the
+            platform of EGL (the format, the handles, a second surface, a swap in a forked child,
+            two threads), six frames swapped into a window of 160 by 160, QEMU's screenshot
+            compared with the CRC the program prints at two of them
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
   sporadic-probe SCHED_SPORADIC in 0.5.0 through relibc and the layer: refused for root and for a user
@@ -2719,6 +2724,7 @@ fn main() {
         Some("mesa") => mesa(),
         Some("mesa-reference") => mesa_reference(),
         Some("gles-pbuffer") => gles_pbuffer::probe(&qemu::VIRT_1G),
+        Some("gles-window") => gles_window::probe(&qemu::VIRT_1G),
         Some("os-test") => match &args[1..] {
             [flag, rest @ ..] if flag == "--full-basic" => {
                 jobs::parse_jobs("os-test --full-basic", rest).and_then(ostest::run_full_basic)
@@ -17890,6 +17896,7 @@ mod entropy_in_images_tests {
             ("posix_window::PROGRAMS", &crate::posix_window::PROGRAMS),
             ("cxx_probe::PROGRAMS", &crate::cxx_probe::PROGRAMS),
             ("gles_pbuffer::PROGRAMS", &crate::gles_pbuffer::PROGRAMS),
+            ("gles_window::PROGRAMS", &crate::gles_window::PROGRAMS),
             ("wfd::PROGRAMS", &crate::wfd::PROGRAMS),
             ("wfd::STEPS_PROGRAMS", &crate::wfd::STEPS_PROGRAMS),
             ("store_probe::PROGRAMS", &crate::store_probe::PROGRAMS),

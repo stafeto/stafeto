@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Compiles gles-cube.c with the headers of Khronos that tools/build-mesa.py
-//! copies to target/mesa/include and relibc's headers, and links the archive
+//! Compiles gles-cube.c (with gles-window.h, the window mode) with the headers
+//! of Khronos that tools/build-mesa.py copies to target/mesa/include,
+//! <stafeto/window.h> and relibc's headers, and links the archive
 //! of Mesa (target/mesa/lib/libmesa.a, `cargo xtask mesa`), the libc++,
 //! libc++abi and libunwind its GLSL compiler needs (target/libcxx, `cargo xtask
 //! libcxx`) and relibc's libm.a and libc.a (the sysroot tools/build-relibc.py
@@ -19,6 +20,8 @@ fn run(cmd: &mut Command) {
 
 fn main() {
     println!("cargo:rerun-if-changed=gles-cube.c");
+    println!("cargo:rerun-if-changed=gles-window.h");
+    println!("cargo:rerun-if-changed=../../lib/posix-crt/window/stafeto/window.h");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_LIBCXX_DIR");
     println!("cargo:rerun-if-env-changed=STAFETO_MESA_DIR");
@@ -88,12 +91,17 @@ fn main() {
             "-Wall",
             "-Wextra",
             "-Werror",
+            // The window mode (gles-window.h): the surface of EGL on a window of
+            // the composition service.
+            "-DSTAFETO_WINDOW",
             "-isystem",
         ])
         .arg(sysroot.join("include"))
-        // The headers of Khronos lie outside the sysroot.
+        // The headers of Khronos lie outside the sysroot, <stafeto/window.h> too.
         .arg("-isystem")
         .arg(mesa.join("include"))
+        .arg("-isystem")
+        .arg(manifest.join("../../lib/posix-crt/window"))
         .args(["-c", "gles-cube.c", "-o"])
         .arg(out.join("gles-cube.o")));
     run(Command::new(tools.join("llvm-ar"))
@@ -104,6 +112,9 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", mesa_lib.display());
     println!("cargo:rustc-link-search=native={}", cxx_lib.display());
     println!("cargo:rustc-link-search=native={}", lib.display());
+    // The copy of the program that a spawn starts (--window) has the stack its
+    // file asks for: the compiler of GLSL recurses deeper than 64 KiB.
+    println!("cargo:rustc-link-arg-bins=-zstack-size=1048576");
     println!("cargo:rustc-link-lib=static=glescube");
     println!("cargo:rustc-link-lib=static=mesa");
     println!("cargo:rustc-link-lib=static=c++");

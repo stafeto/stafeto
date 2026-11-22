@@ -17,7 +17,7 @@ use std::time::Duration;
 
 /// The stack of the cube's main thread: the GLSL compiler and NIR recurse
 /// deeper than a C program of the probes does.
-const CUBE_STACK_SIZE: u32 = 1024 * 1024;
+pub(crate) const CUBE_STACK_SIZE: u32 = 1024 * 1024;
 
 /// The probe's image: the services of the POSIX process probe, with the cube
 /// as its probe program.
@@ -74,7 +74,7 @@ pub const EXPECTED_CRCS: Option<[u32; FRAMES]> = Some([
 ]);
 
 /// One frame line of the program: its number, CRC and byte sum.
-fn frame_line(line: &str) -> Option<(usize, u32, u64)> {
+pub(crate) fn frame_line(line: &str) -> Option<(usize, u32, u64)> {
     let mut words = line.split(' ');
     if words.next()? != "frame" {
         return None;
