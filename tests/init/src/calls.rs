@@ -1159,24 +1159,41 @@ fn loops_split_the_time() -> Result<bool, &'static str> {
         spin_kernel < spin_user / 8,
         "a loop at EL0 with no call grew the kernel time",
     )?;
+    // A call that keeps the thread on the CPU: its whole way in the kernel,
+    // from the entry to the return to EL0, is the thread's own time (x6).
     let call_elapsed = until_elapsed(four_ms, 256, || {
-        let _ = sys::yield_now();
+        let _ = sys::thread_times(&me());
     });
     let (_, kernel2) = user_and_kernel()?;
     let call_kernel = kernel2.saturating_sub(kernel1);
+    // A `yield` is a decision: the thread's stint ends where the scheduler
+    // takes it off the CPU, and the way from there to its return to EL0, the
+    // switch, is the system's (spec 8), so a loop of yields grows the kernel
+    // time by the entry and the call and by no more.
+    let yield_elapsed = until_elapsed(four_ms, 256, || {
+        let _ = sys::yield_now();
+    });
+    let (_, kernel3) = user_and_kernel()?;
+    let yield_kernel = kernel3.saturating_sub(kernel2);
     // A call's entry and return count as the program's own time: the stamps
     // lie inside the kernel's path, and on a slow host (TCG without
     // -icount) the exception entry and return are most of it. What the
-    // loop of calls shows is that the kernel time grows with the calls.
+    // loops of calls show is that the kernel time grows with the calls.
     // The loops are compared by the kernel time per tick of the counter
     // they ran (a loop of calls overshoots its 4 ms by up to a batch, more
-    // on a slow host): the share of the loop of calls is above 1/16, and 50
-    // times the share of the loop with no call.
+    // on a slow host): the share of the loop of calls that stay on the CPU
+    // is above 1/16, and 50 times the share of the loop with no call; the
+    // share of the loop of yields is above 50 times that of the loop with no
+    // call (the switch is the system's, so no bound by 1/16 holds for it).
     let (spin_share, call_share) = (spin_kernel * call_elapsed, call_kernel * spin_elapsed);
-    let grew = call_kernel * 16 > call_elapsed && call_share > 50 * spin_share;
+    let yield_share = yield_kernel * spin_elapsed;
+    let spin_share_y = spin_kernel * yield_elapsed;
+    let grew = call_kernel * 16 > call_elapsed
+        && call_share > 50 * spin_share
+        && yield_share > 50 * spin_share_y;
     if !grew {
         println!(
-            "cpu_time: the loop at EL0 grew user {spin_user} and kernel {spin_kernel} in {spin_elapsed} ticks, the loop of calls kernel {call_kernel} in {call_elapsed} ticks (4 ms are {four_ms} ticks)"
+            "cpu_time: the loop at EL0 grew user {spin_user} and kernel {spin_kernel} in {spin_elapsed} ticks, the loop of calls kernel {call_kernel} in {call_elapsed} ticks, the loop of yields kernel {yield_kernel} in {yield_elapsed} ticks (4 ms are {four_ms} ticks)"
         );
     }
     Ok(grew)
