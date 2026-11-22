@@ -193,6 +193,37 @@ start to its end (the pointers and the block of data), the same for calls of 4 K
   with it. A wrong bound of the search (`index + 1 >= target` for the forgetting of the wayposts
   behind the target) was checked by hand and fails every test of `tests_ctz.rs`.
 
+## A change to the write of a block: no read back, the block stays in the read cache
+
+One more change, to `lfs_bd_flush`, which writes nothing different to the disk. After a program of
+a block of data the release reads the block back and compares it with what it wrote (the
+`validate` argument), which costs one read of the block for each block written, and drops the read
+cache, so the next read of a pointer of the skip list of the file reads a block again. The reads
+of the device for each block of a file of 1 MiB written in calls of 64 KiB (`write_cost` in
+`lib/datafs/src/tests_ctz.rs`, 257 blocks): 388 reads with the release's read back (1.51 for each
+block, and 258 programs) and 131 reads with the change (0.51 for each block, the same 258 programs).
+
+- `struct lfs_config` has one more field at its end, after `ctz_hints`, `trust_prog`: nonzero says
+  that the device reports every failed program (a disk with a status for each write, never raw
+  flash). Zero (the default of a zeroed configuration) is the release. The data service sets 1
+  (`datafs_setup` in `lib/datafs/csrc/glue.c`): its disk answers every write with a status.
+- With `trust_prog` nonzero `lfs_bd_flush` does not read the block back. It copies what it
+  programmed into the read cache and marks the cache as holding that range of the block, so the
+  next read of the block is a hit. Without the copy the pointers of the skip list at the head of
+  the block that was just written miss the cache and the reads of a write go from 0.5 to 1.0 for
+  each block.
+- The metadata commits do not use `validate` here (the pair's commit has its own read back of the
+  CRC, `lfs_dir_commitcrc`), and it stays.
+- The disk is the same with or without the change, byte for byte, and a cut of the power at every sector of
+  a large write leaves the same medium and the same reads (`tests_ctz.rs`:
+  `random_operations_leave_the_same_disk_with_and_without_trust_prog` and
+  `a_cut_at_every_sector_of_a_large_write_reads_the_same_with_and_without_trust_prog`). A failed
+  program still reaches littlefs as an error from the device, so a write that the disk refuses is
+  not taken for a success.
+- The build feature `break-datafs-trust-prog` of `lib/datafs` defines `LFS_TRUST_PROG_NO_COPY`,
+  which marks the read cache as holding the block without copying the bytes into it (for the host
+  tests only), and `cargo xtask datafs-breaks` checks that the host tests fail with it.
+
 ## A known defect of the release that the service works around
 
 With `inline_max = -1` (no inlined files) littlefs 2.11.3, with or without this change, loses a write at the start or in the middle of an existing inline file (a file that an earlier configuration kept inside the pair of its directory): moving the file out (`lfs_file_outline`, `lfs_file_relocate`) copies only the bytes before the write position, flushing the rest then fails, and the close answers `LFS_ERR_CORRUPT`; the write is lost and the old bytes stay. Appending, `O_TRUNC` and truncating down work. The service moves every inline file out before a write can meet this: open for writing, seek to the end and write no byte (one commit, the whole file moves), by the conversion job after the mount and, for a file the job has not reached, at the first open of the path for writing or truncation. The test that reproduces the defect is `without_the_move_out_a_write_in_the_middle_of_an_old_inline_file_is_lost` in `lib/datafs/src/tests_perm.rs`: it fails when a release stops losing the write, and then the move-out can go. The release's own message about it is not sent yet.
@@ -210,8 +241,8 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 0cb4ff1daf5fdc1359c6a6ee3116092f08fc100c9d58b1b77ab17bfd801f856d  LICENSE.md
 6dd74dfc58ac93589f8e002bb73c0830a59206912cfe8c951c07eb2bd5fccad0  SPEC.md
 2a8b3459d74b9fa8bdd947738522c46331739405b1fc3d70f057f636a1dea768  DESIGN.md
-14cc5c8a89ace91082f3d4dc6b482f78a8128bbb5779e8d1245d9663b26dcc57  lfs.c (with the change)
-77523060a609e674c8f98f1860a87977de38157caa828d22b297e8dfa5dc2051  lfs.h (with the change)
+0824ef223095626faa4128c0f67f2047f84a817de419b6f83acb8dfd98974a2d  lfs.c (with the change)
+948e4ede5fade53c73b5ad9867bd32aa613f2ad97ef26846e67499139675b1ab  lfs.h (with the change)
 ```
 
 `tools/check-littlefs.py` (run by `cargo xtask ci` as "littlefs sources") fails when a file of the
@@ -250,6 +281,6 @@ change, or when `stafeto-changes.patch` applied backwards to them does not give 
 4. Run `cargo test -p datafs`: `tests_entry_attr.rs` compares the attribute of every entry of
    a directory with `lfs_getattr` by path, across several metadata pairs, and
    `tests_scale.rs` compares the disk after the repair of orphans with and without the table, and
-   `tests_ctz.rs` compares the reads with and without the wayposts and counts the reads for each block.
+   `tests_ctz.rs` compares the reads with and without the wayposts and counts the reads for each block, and the disk and the reads with and without `trust_prog`.
 5. When a release has the same functions, delete the change: remove the patch, this file, the use
-   of the four functions, the table of the repair and the wayposts in `lib/datafs/csrc/glue.c` and `lib/datafs/src/fs.rs`, and the check.
+   of the four functions, the table of the repair, the wayposts and `trust_prog` in `lib/datafs/csrc/glue.c` and `lib/datafs/src/fs.rs`, and the check.

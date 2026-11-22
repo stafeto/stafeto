@@ -186,7 +186,16 @@ static int lfs_bd_flush(lfs_t *lfs,
             return err;
         }
 
-        if (validate) {
+        if (validate && lfs->cfg->trust_prog) {
+            // the device took the program: the cache holds what the block now holds
+            // (LFS_TRUST_PROG_NO_COPY is for the host tests of the guard only)
+#ifndef LFS_TRUST_PROG_NO_COPY
+            memcpy(rcache->buffer, pcache->buffer, diff);
+#endif
+            rcache->block = pcache->block;
+            rcache->off = pcache->off;
+            rcache->size = diff;
+        } else if (validate) {
             // check data on disk
             lfs_cache_drop(lfs, rcache);
             int res = lfs_bd_cmp(lfs,

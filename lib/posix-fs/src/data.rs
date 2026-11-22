@@ -629,6 +629,12 @@ impl Parts {
         self.lease
     }
 
+    /// The lease the next part carries is let go with no RELEASE: it belongs to the call of the
+    /// parent of a fork (the child goes on by messages with no lease).
+    pub fn forget_lease(&mut self) {
+        self.lease = 0;
+    }
+
     /// Whether a reply said `LAPSED`: the call is short because its lease ran out.
     pub const fn lapsed(&self) -> bool {
         self.lapsed
@@ -1303,6 +1309,18 @@ mod tests {
         assert_eq!(parts.finish(), total);
         assert_eq!(parts.live_lease(), None);
         assert!(!parts.lapsed());
+    }
+
+    #[test]
+    fn a_forked_child_forgets_the_lease_of_the_parent() {
+        let mut parts = Parts::new(3 * p::CELL_BYTES, p::CELL_BYTES);
+        let plan = parts.next_part().unwrap();
+        assert_eq!(parts.took(&plan, ans(p::CELL_BYTES, 0, 7)), Step::Next);
+        assert_eq!(parts.lease(), 7);
+        parts.forget_lease();
+        assert_eq!(parts.lease(), 0);
+        assert_eq!(parts.live_lease(), None);
+        assert_eq!(parts.next_part().unwrap().lease, 0);
     }
 
     #[test]

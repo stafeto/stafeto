@@ -43,7 +43,7 @@ const ENDS: &str = "init: data-probe ended: ";
 const ENDED: &str = "init: data-probe ended: exit code 0, not restarted";
 const POINTS: u64 = 12;
 /// The tag of the service's lines of steps (rt::service::report_steps).
-const DATAFS_TAG: &str = "17";
+pub(crate) const DATAFS_TAG: &str = "17";
 /// The kinds of the loop that the probe's two runs use: the methods of proto_data that the series
 /// and the check send (the worker thread does the disk's work, so these steps are the queue's), the notices
 /// with the heartbeat (64) and the notification the service marks as its own (65, the worker's DONE).
@@ -76,10 +76,41 @@ const STEP_KINDS: [(usize, &str); 21] = [
 /// 6,000 ticks, well inside 0.9 of term B (18,369). The bytes move in the worker.
 const PART_STEP_MAX: u64 = 6_000;
 
+/// The most kernel ticks a map or an unmap of a cell of 16 pages may take in a call that no step of
+/// the loop started or ended in (the 12,000 ticks of the plan; term B is 20,410).
+pub(crate) const CELL_QUIET_MAX: u64 = 12_000;
+
 /// The cells the worker mapped and unmapped, in the lines of a run: the longest map and the longest
-/// unmap, in ticks. A cell is 16 pages, one chunk of `mem_map` and `mem_unmap`; each is judged against
-/// term B, the longest the kernel keeps a higher level waiting. The run must show both.
-fn cell_verdict(lines: &[String]) -> Result<(u64, u64), String> {
+/// unmap, in ticks, of the calls with no preemption by the loop. The wall time of a call counts every
+/// preemption in it and is only told (`cell_longest`, with the histograms); the kernel ticks of the
+/// process in a call during which no step of the loop started or ended are judged against
+/// `CELL_QUIET_MAX`. The run must show both.
+pub(crate) fn cell_verdict(lines: &[String]) -> Result<(u64, u64), String> {
+    let longest = |what: &str| -> Result<u64, String> {
+        let key = format!("datafs: cell {what} quiet longest ");
+        lines
+            .iter()
+            .filter_map(|l| {
+                let at = l.find(&key)? + key.len();
+                l[at..].split_whitespace().next()?.parse::<u64>().ok()
+            })
+            .max()
+            .ok_or_else(|| format!("the data service: no line of the quiet longest cell {what}"))
+    };
+    let (map, unmap) = (longest("map")?, longest("unmap")?);
+    for (what, ticks) in [("map", map), ("unmap", unmap)] {
+        if ticks > CELL_QUIET_MAX {
+            return Err(format!(
+                "the data service: a cell {what} with no step of the loop in it took {ticks} kernel ticks, over {CELL_QUIET_MAX} (term B is {})",
+                crate::TERM_B
+            ));
+        }
+    }
+    Ok((map, unmap))
+}
+
+/// The longest map and the longest unmap of a cell in the lines of a run (no judgement).
+pub(crate) fn cell_longest(lines: &[String]) -> Result<(u64, u64), String> {
     let longest = |what: &str| -> Result<u64, String> {
         let key = format!("datafs: cell {what} longest ");
         lines
@@ -91,16 +122,7 @@ fn cell_verdict(lines: &[String]) -> Result<(u64, u64), String> {
             .max()
             .ok_or_else(|| format!("the data service: no line of the longest cell {what}"))
     };
-    let (map, unmap) = (longest("map")?, longest("unmap")?);
-    for (what, ticks) in [("map", map), ("unmap", unmap)] {
-        if ticks > crate::TERM_B {
-            return Err(format!(
-                "the data service: a cell {what} of {ticks} ticks is past term B ({})",
-                crate::TERM_B
-            ));
-        }
-    }
-    Ok((map, unmap))
+    Ok((longest("map")?, longest("unmap")?))
 }
 
 /// The portion of the data service in ticks: the copy of one block of 4 KiB with the logic of
@@ -115,7 +137,7 @@ const WORKER_STRETCH_MAX: u64 = 16_328;
 /// it made. The ticks are wall time of the stretch: a preemption by the loop or a client, and the
 /// computing the volume needs (a creation, a first allocation), count in it, so the figure is an
 /// upper bound that is reported and not yet a gate (`WORKER_STRETCH_MAX` is the goal).
-fn worker_verdict(lines: &[String]) -> Result<Vec<(String, u64)>, String> {
+pub(crate) fn worker_verdict(lines: &[String]) -> Result<Vec<(String, u64)>, String> {
     let key = "datafs: worker wall stretch ";
     let mut longest: Vec<(String, u64)> = Vec::new();
     for l in lines {

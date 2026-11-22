@@ -58,6 +58,9 @@ extern char **environ;
         }                                                                                    \
     } while (0)
 
+/* The one big buffer of the probe: the blocks of the throughput role and of the roles of the large calls. */
+static unsigned char big_buf[1024UL * 1024UL];
+
 static unsigned char pattern_at(unsigned salt, unsigned long i) {
     return (unsigned char)((i % 251u) + salt);
 }
@@ -1625,7 +1628,7 @@ static void dd_name(int index, char *name, size_t size) {
 }
 
 static int dd_there_and_back(void) {
-    static unsigned char block[DD_BLOCK];
+    unsigned char *block = big_buf;
     char name[40];
     unsigned long long began = now_ms();
     for (int i = 0; i < DD_FILES; i++) {
@@ -1674,6 +1677,1021 @@ static int throughput_run(void) {
         return 20;
     }
     printf("posix-data: throughput checks passed\n");
+    return 0;
+}
+
+/* ---- the probes of the large calls: data-fast, data-atomic and the run of the steps ---- */
+
+#include <pthread.h>
+#include <setjmp.h>
+
+#define MIB (1024UL * 1024UL)
+#define CELL_BYTES_C (64UL * 1024UL)
+
+/* The probe is a process of 800 pages (3.2 MiB) with the image (about 500 pages), the window of 32
+ * pages and the stacks, and a program started by posix_spawn needs the same again, so the probe
+ * has one buffer of 1 MiB (`big_buf`, near the top of this file, shared by the roles) and a call
+ * of the probe is at most 1 MiB (16 parts of 64 KiB); what it wrote is checked from the pattern in
+ * pieces of 64 KiB. */
+static unsigned char back_buf[CELL_BYTES_C];
+
+/* The counters of the layer for the probes (posix-platform): the parts through a cell and by
+ * messages, the calls cut short by a lapsed lease, the parts without a lease, the parts sent again
+ * after NO_WINDOW, the RELEASEs that failed, the free cells, the records of calls of the calling
+ * thread, whether the window is mapped, and the mappings of its object. */
+extern void stafeto_probe_data(unsigned long long *out);
+extern void stafeto_probe_data_ban_window(void);
+
+struct dcount {
+    unsigned long long cell, inl, lapsed, unleased, retries, dropped, free_cells, live, ready, mappings, unrecorded;
+};
+
+static struct dcount dcounts(void) {
+    struct dcount c;
+    stafeto_probe_data((unsigned long long *)&c);
+    return c;
+}
+
+static unsigned long long now_us(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000000ULL + (unsigned long long)t.tv_nsec / 1000ULL;
+}
+
+/* The limit on the size of a file is 8 MiB by default; the superuser lifts it. */
+static int raise_fsize(void) {
+    struct rlimit infinite = {RLIM_INFINITY, RLIM_INFINITY};
+    return setrlimit(RLIMIT_FSIZE, &infinite) == 0;
+}
+
+/* Fills buf[0..n) with the bytes of the pattern of `salt` as they are in a file at `offset` (byte i
+ * is (i % 251) + salt), and checks a buffer against it, with no division in the loop. */
+static void fill_salt_at(unsigned char *buf, unsigned long n, unsigned salt, unsigned long offset) {
+    unsigned v = (unsigned)(offset % 251u);
+    for (unsigned long i = 0; i < n; i++) {
+        buf[i] = (unsigned char)(v + salt);
+        if (++v == 251u) v = 0;
+    }
+}
+
+static int is_salt_at(const unsigned char *buf, unsigned long n, unsigned salt, unsigned long offset) {
+    unsigned v = (unsigned)(offset % 251u);
+    for (unsigned long i = 0; i < n; i++) {
+        if (buf[i] != (unsigned char)(v + salt)) return 0;
+        if (++v == 251u) v = 0;
+    }
+    return 1;
+}
+
+static void fill_salt(unsigned char *buf, unsigned long n, unsigned salt) { fill_salt_at(buf, n, salt, 0); }
+static int is_salt(const unsigned char *buf, unsigned long n, unsigned salt) { return is_salt_at(buf, n, salt, 0); }
+
+/* The first `n` bytes of the file `fd` are the pattern of `salt`: read in pieces of 64 KiB. */
+static int file_has_salt(int fd, unsigned long n, unsigned salt) {
+    for (unsigned long at = 0; at < n; at += CELL_BYTES_C) {
+        unsigned long k = n - at < CELL_BYTES_C ? n - at : CELL_BYTES_C;
+        if (pread(fd, back_buf, k, (off_t)at) != (ssize_t)k) return 0;
+        if (!is_salt_at(back_buf, k, salt, at)) return 0;
+    }
+    return 1;
+}
+
+/* ---- data-fast: 64 MiB written and read back through the large path, and the controls ---- */
+
+#define FAST_MIB 64UL
+#define FAST_CONTROL_MIB 4UL
+
+/* Byte `i` of block `block` of 1 MiB of the stream: a fixed mix of the position, with the number of
+ * the block and of the 4 KiB at the start of each 4 KiB, so that a block in the wrong place is caught. */
+static unsigned char fast_byte(unsigned long i, unsigned long block) {
+    unsigned long j = i & 4095UL;
+    if (j < 8) {
+        uint64_t stamp = block * 256 + (i >> 12);
+        return (unsigned char)(stamp >> (8 * j));
+    }
+    return (unsigned char)(i * 31u + (i >> 8) * 17u + 7u);
+}
+
+static void fast_fill(unsigned char *buf, unsigned long block) {
+    for (unsigned long i = 0; i < MIB; i++) buf[i] = fast_byte(i, block);
+}
+
+static int fast_differs(const unsigned char *buf, unsigned long block) {
+    for (unsigned long i = 0; i < MIB; i++)
+        if (buf[i] != fast_byte(i, block)) return 1;
+    return 0;
+}
+
+struct fast_result {
+    unsigned long long write_us, read_us, write_cell, write_inline, read_cell, read_inline, calls;
+    unsigned long mismatches;
+};
+
+/* `mib` MiB written in calls of `bs` bytes to the file `path`, synced, read back in calls of `bs`
+ * bytes and compared. Only the time of the calls of write, fsync, close and read counts. */
+static int fast_dd(const char *path, unsigned long mib, unsigned long bs, int marks, struct fast_result *out) {
+    memset(out, 0, sizeof *out);
+    if (marks) printf("posix-data: fast mark begin write\n");
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    struct dcount c0 = dcounts();
+    for (unsigned long block = 0; block < mib; block++) {
+        fast_fill(big_buf, block);
+        for (unsigned long at = 0; at < MIB; at += bs) {
+            unsigned long n = MIB - at < bs ? MIB - at : bs;
+            unsigned long long t = now_us();
+            ssize_t w = write(fd, big_buf + at, n);
+            out->write_us += now_us() - t;
+            out->calls++;
+            DATA_CHECK(w == (ssize_t)n);
+        }
+    }
+    unsigned long long t = now_us();
+    DATA_CHECK(fsync(fd) == 0 && close(fd) == 0);
+    out->write_us += now_us() - t;
+    struct dcount c1 = dcounts();
+    out->write_cell = c1.cell - c0.cell;
+    out->write_inline = c1.inl - c0.inl;
+    struct stat st;
+    DATA_CHECK(stat(path, &st) == 0 && (unsigned long)st.st_size == mib * MIB);
+    if (marks) {
+        pause_ms(300);
+        printf("posix-data: fast mark begin read\n");
+    }
+    fd = open(path, O_RDONLY);
+    DATA_CHECK(fd >= 0);
+    c0 = dcounts();
+    for (unsigned long block = 0; block < mib; block++) {
+        for (unsigned long at = 0; at < MIB; at += bs) {
+            unsigned long n = MIB - at < bs ? MIB - at : bs;
+            t = now_us();
+            ssize_t r = read(fd, big_buf + at, n);
+            out->read_us += now_us() - t;
+            DATA_CHECK(r == (ssize_t)n);
+        }
+        if (fast_differs(big_buf, block)) out->mismatches++;
+    }
+    t = now_us();
+    DATA_CHECK(close(fd) == 0);
+    out->read_us += now_us() - t;
+    c1 = dcounts();
+    out->read_cell = c1.cell - c0.cell;
+    out->read_inline = c1.inl - c0.inl;
+    if (marks) {
+        printf("posix-data: fast mark end read\n");
+        pause_ms(300);
+    }
+    DATA_CHECK(unlink(path) == 0);
+    return 0;
+}
+
+static void fast_say(const char *tag, unsigned long mib, unsigned long bs, const struct fast_result *r) {
+    unsigned long long kib = mib * 1024ULL;
+    printf("posix-data: fast %s write %lu MiB bs %lu in %llu ms: %llu KiB/s, %llu cell parts, %llu inline parts, %llu calls\n",
+           tag, mib, bs, r->write_us / 1000, r->write_us ? kib * 1000000ULL / r->write_us : 0ULL, r->write_cell,
+           r->write_inline, r->calls);
+    printf("posix-data: fast %s read %lu MiB bs %lu in %llu ms: %llu KiB/s, %llu cell parts, %llu inline parts, %lu mismatches\n",
+           tag, mib, bs, r->read_us / 1000, r->read_us ? kib * 1000000ULL / r->read_us : 0ULL, r->read_cell,
+           r->read_inline, r->mismatches);
+}
+
+static int fast_large(void) {
+    DATA_CHECK(raise_fsize());
+    struct fast_result r;
+    pause_ms(300);
+    int bad = fast_dd("/data/fast-big", FAST_MIB, MIB, 1, &r);
+    if (bad != 0) return bad;
+    fast_say("big", FAST_MIB, MIB, &r);
+    DATA_CHECK(r.mismatches == 0);
+    return 0;
+}
+
+static int fast_control(unsigned long bs) {
+    struct fast_result r;
+    char tag[16];
+    snprintf(tag, sizeof tag, "bs%lu", bs);
+    int bad = fast_dd("/data/fast-control", FAST_CONTROL_MIB, bs, 0, &r);
+    if (bad != 0) return bad;
+    fast_say(tag, FAST_CONTROL_MIB, bs, &r);
+    DATA_CHECK(r.mismatches == 0);
+    return 0;
+}
+
+static int fast_control_4096(void) { return fast_control(4096); }
+static int fast_control_1000(void) { return fast_control(1000); }
+
+static int fast_run(void) {
+    if (getuid() != 0) {
+        printf("posix-data: the probe is not user 0\n");
+        return 20;
+    }
+    run_check("dd 64 MiB through the window", fast_large);
+    run_check("dd bs 4096 control", fast_control_4096);
+    run_check("dd bs 1000 control", fast_control_1000);
+    if (failures != 0) {
+        printf("posix-data: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("posix-data: fast checks passed\n");
+    return 0;
+}
+
+/* ---- data-atomic ---- */
+
+/* 1 for the full probe; the run of the steps does each loop 10 times less often. */
+static unsigned atomic_less = 1;
+/* The processes of the probe go by messages: set in the process that runs a check for the path
+ * without the window, and inherited by its children. */
+static int atomic_ban;
+
+static void atomic_start(void) {
+    if (atomic_ban) stafeto_probe_data_ban_window();
+}
+
+/* A writer of the first check: 1 MiB of its pattern at offset 0, `count` times. */
+static int mix_writer(unsigned salt, unsigned count) {
+    atomic_start();
+    int fd = open("/data/mix", O_WRONLY);
+    if (fd < 0) return 1;
+    fill_salt(big_buf, MIB, salt);
+    for (unsigned i = 0; i < count; i++)
+        if (pwrite(fd, big_buf, MIB, 0) != (ssize_t)MIB) return 2;
+    return close(fd) == 0 ? 0 : 3;
+}
+
+/* The writer of the single-writer form: 1 MiB of the pattern of A, then of B, at offset 0, `count`
+ * times, by messages (no window): its parts are small, so the reader's parts of 128 KiB meet it at
+ * every position of the file. */
+static int mix_alternating(unsigned count) {
+    stafeto_probe_data_ban_window();
+    int fd = open("/data/mix", O_WRONLY);
+    if (fd < 0) return 1;
+    for (unsigned i = 0; i < count; i++) {
+        fill_salt(big_buf, MIB, 21u + (i & 1u));
+        if (pwrite(fd, big_buf, MIB, 0) != (ssize_t)MIB) return 2;
+    }
+    return close(fd) == 0 ? 0 : 3;
+}
+
+/* `writers` processes write 1 MiB of their pattern at offset 0 of one file and one reads it: every
+ * read is the first pattern, the pattern of the one writer or of the other, whole. Writers and
+ * reader that take their turns at the service one part each stay in step, and the reader then finds
+ * one writer's pattern in every part of the file whatever the calls do to each other (a break of the
+ * leases did not show). The form with one writer that sends small parts and changes its pattern at
+ * each call meets the parts of the reader at every position and sees a mix of two patterns at once
+ * when the calls are not atomic to each other. */
+static int mix_body(unsigned writers, unsigned writes, unsigned reads) {
+    atomic_start();
+    int fd = open("/data/mix", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    fill_salt(big_buf, MIB, 20);
+    DATA_CHECK(pwrite(fd, big_buf, MIB, 0) == (ssize_t)MIB);
+    pid_t pids[2];
+    for (unsigned k = 0; k < writers; k++) {
+        pids[k] = fork();
+        DATA_CHECK(pids[k] >= 0);
+        if (pids[k] == 0) _exit(writers == 1 ? mix_alternating(writes) : mix_writer(21u + k, writes));
+    }
+    unsigned long seen[3] = {0, 0, 0};
+    for (unsigned i = 0; i < reads; i++) {
+        DATA_CHECK(pread(fd, big_buf, MIB, 0) == (ssize_t)MIB);
+        int salt = big_buf[0];
+        int which = salt == 20 ? 0 : salt == 21 ? 1 : salt == 22 ? 2 : -1;
+        if (which < 0 || !is_salt(big_buf, MIB, (unsigned)salt)) {
+            printf("posix-data: a read of 1 MiB is mixed: first byte %d, read %u\n", salt, i);
+            return 20;
+        }
+        seen[which]++;
+    }
+    for (unsigned k = 0; k < writers; k++) DATA_CHECK(wait_ok(pids[k]) == 0);
+    printf("posix-data: mix: %lu reads saw the first pattern, %lu the pattern of A, %lu the pattern of B\n", seen[0],
+           seen[1], seen[2]);
+    /* The single-writer form judges nothing unless the reads overlapped the writes. */
+    if (writers == 1 && seen[1] + seen[2] == 0) {
+        printf("posix-data: mix: no read overlapped the writes\n");
+        return 22;
+    }
+    DATA_CHECK(close(fd) == 0 && unlink("/data/mix") == 0);
+    return 0;
+}
+
+#define APPEND_REC (200UL * 1024UL)
+
+/* The record `n` of the writer `letter`: the letter, the number in four digits and a dash, then
+ * bytes that depend on both. */
+static void make_record(unsigned char *rec, char letter, unsigned n) {
+    unsigned v = 6;
+    for (unsigned long i = 6; i < APPEND_REC; i++) {
+        rec[i] = (unsigned char)(letter + n * 7u + v);
+        if (++v == 251u) v = 0;
+    }
+    rec[0] = (unsigned char)letter;
+    for (int k = 4; k >= 1; k--) {
+        rec[k] = (unsigned char)('0' + (n % 10u));
+        n /= 10u;
+    }
+    rec[5] = '-';
+}
+
+static int is_record(const unsigned char *rec, char letter, unsigned n) {
+    unsigned v = 6;
+    for (unsigned long i = 6; i < APPEND_REC; i++) {
+        if (rec[i] != (unsigned char)(letter + n * 7u + v)) return 0;
+        if (++v == 251u) v = 0;
+    }
+    return 1;
+}
+
+static int append_writer(char letter, unsigned count) {
+    atomic_start();
+    int fd = open("/data/app", O_WRONLY | O_APPEND);
+    if (fd < 0) return 1;
+    for (unsigned n = 0; n < count; n++) {
+        make_record(big_buf, letter, n);
+        if (write(fd, big_buf, APPEND_REC) != (ssize_t)APPEND_REC) return 2;
+    }
+    return close(fd) == 0 ? 0 : 3;
+}
+
+/* Two processes append records of 200 KiB: the file is whole records, each once. */
+static int append_body(unsigned records) {
+    atomic_start();
+    int fd = open("/data/app", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && close(fd) == 0);
+    pid_t pids[2];
+    for (int k = 0; k < 2; k++) {
+        pids[k] = fork();
+        DATA_CHECK(pids[k] >= 0);
+        if (pids[k] == 0) _exit(append_writer((char)('A' + k), records));
+    }
+    DATA_CHECK(wait_ok(pids[0]) == 0 && wait_ok(pids[1]) == 0);
+    struct stat st;
+    DATA_CHECK(stat("/data/app", &st) == 0 && (unsigned long)st.st_size == 2UL * records * APPEND_REC);
+    fd = open("/data/app", O_RDONLY);
+    DATA_CHECK(fd >= 0);
+    static unsigned char seen[2 * 128];
+    DATA_CHECK(2 * records <= sizeof seen);
+    memset(seen, 0, sizeof seen);
+    for (unsigned k = 0; k < 2 * records; k++) {
+        DATA_CHECK(read_up_to(fd, big_buf, APPEND_REC) == (long)APPEND_REC);
+        unsigned n = 0;
+        for (int d = 1; d <= 4; d++) n = n * 10u + (unsigned)(big_buf[d] - '0');
+        if ((big_buf[0] != 'A' && big_buf[0] != 'B') || big_buf[5] != '-' || n >= records ||
+            !is_record(big_buf, (char)big_buf[0], n)) {
+            printf("posix-data: record %u is cut or mixed: %c %u\n", k, big_buf[0], n);
+            return 20;
+        }
+        unsigned slot = (unsigned)(big_buf[0] == 'B') * records + n;
+        DATA_CHECK(!seen[slot]);
+        seen[slot] = 1;
+    }
+    DATA_CHECK(close(fd) == 0 && unlink("/data/app") == 0);
+    return 0;
+}
+
+/* Runs `body` in a child that goes by messages, and judges what the child's counters say. */
+static int inline_child(int (*body)(void)) {
+    pid_t pid = fork();
+    DATA_CHECK(pid >= 0);
+    if (pid == 0) {
+        atomic_ban = 1;
+        atomic_start();
+        struct dcount c0 = dcounts();
+        int bad = body();
+        struct dcount c = dcounts();
+        if (bad == 0 && (c.cell != c0.cell || c.inl == c0.inl)) {
+            printf("posix-data: the window was used (%llu cell parts, %llu inline parts)\n", c.cell - c0.cell,
+                   c.inl - c0.inl);
+            bad = 21;
+        }
+        _exit(bad == 0 ? 0 : 1);
+    }
+    return wait_ok(pid);
+}
+
+static int mix_whole_scaled(void) {
+    /* The form that a break of the leases shows in at once, first: its reads fail the check. */
+    int single = mix_body(1, 6, 12);
+    return single != 0 ? single : mix_body(2, 200 / atomic_less, 400 / atomic_less);
+}
+static int mix_whole_inline(void) { return mix_body(2, 6, 12); }
+static int append_inline_body(void) { return append_body(3); }
+
+static int check_mix(void) { return mix_whole_scaled(); }
+
+static int check_unmapped(void) {
+    struct dcount c = dcounts();
+    printf("posix-data: window ready %llu, mappings of its object %llu, free cells %llu\n", c.ready, c.mappings, c.free_cells);
+    DATA_CHECK(c.ready == 1 && c.mappings == 1 && c.free_cells == 2);
+    return 0;
+}
+
+static int check_append(void) { return append_body(100 / atomic_less); }
+
+static int check_inline(void) {
+    DATA_CHECK(inline_child(mix_whole_inline) == 0);
+    DATA_CHECK(inline_child(append_inline_body) == 0);
+    return 0;
+}
+
+/* ---- the lease: a writer stopped between the parts of a call ---- */
+
+/* Writes 1 MiB again and again at offset 0 until a call comes back short: the lease lapsed. */
+static int lapse_writer(void) {
+    int fd = open("/data/lapse", O_WRONLY);
+    if (fd < 0) return 1;
+    fill_salt(big_buf, MIB, 42);
+    unsigned long long lapsed0 = dcounts().lapsed;
+    for (int i = 0; i < 6000; i++) {
+        ssize_t r = pwrite(fd, big_buf, MIB, 0);
+        if (r == (ssize_t)MIB) continue;
+        unsigned long long lapsed = dcounts().lapsed - lapsed0;
+        printf("posix-data: the stopped writer: a call returned %ld of 1 MiB, lapsed calls %llu\n", (long)r, lapsed);
+        if (r < 0 || (unsigned long)r % CELL_BYTES_C != 0) return 3;
+        return lapsed >= 1 ? 0 : 4;
+    }
+    return 2;
+}
+
+static int check_lapse(void) {
+    int fd = open("/data/lapse", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    pid_t pid = fork();
+    DATA_CHECK(pid >= 0);
+    if (pid == 0) _exit(lapse_writer());
+    /* A stop between two calls leaves no lease: the read is quick, and the stop is tried again. */
+    unsigned long long waited = 0;
+    int attempts = 0;
+    while (attempts < 40 && waited < 800) {
+        pause_ms(30 + (unsigned)(attempts * 13 % 47));
+        DATA_CHECK(kill(pid, SIGSTOP) == 0);
+        unsigned long long t0 = now_ms();
+        char b;
+        DATA_CHECK(pread(fd, &b, 1, 0) >= 0);
+        waited = now_ms() - t0;
+        DATA_CHECK(kill(pid, SIGCONT) == 0);
+        attempts++;
+    }
+    printf("posix-data: a read of the file of a stopped writer answered after %llu ms (attempt %d)\n", waited, attempts);
+    if (waited < 800) kill(pid, SIGKILL);
+    DATA_CHECK(wait_ok(pid) == 0 || waited < 800);
+    DATA_CHECK(waited >= 800 && waited <= 2500);
+    DATA_CHECK(close(fd) == 0 && unlink("/data/lapse") == 0);
+    return 0;
+}
+
+/* The checks with signals, threads and forks run in a process of their own, on a thread with a
+ * stack of 128 KiB (the main thread's is 64 KiB, and a handler that calls the layer runs on it
+ * above the frames of the call it interrupted): a fault ends only that process, and the check says
+ * which signal did it. Its window is its own. */
+static int (*thread_body)(void);
+
+static void *thread_main(void *arg) {
+    (void)arg;
+    return (void *)(intptr_t)thread_body();
+}
+
+static int on_big_stack(int (*body)(void)) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0 || pthread_attr_setstacksize(&attr, 128 * 1024) != 0) return 20;
+    thread_body = body;
+    pthread_t t;
+    void *result = (void *)99;
+    if (pthread_create(&t, &attr, thread_main, NULL) != 0) return 21;
+    if (pthread_join(t, &result) != 0) return 22;
+    return (int)(intptr_t)result;
+}
+
+static int isolated(int (*body)(void)) {
+    pid_t pid = fork();
+    DATA_CHECK(pid >= 0);
+    if (pid == 0) _exit(on_big_stack(body) == 0 ? 0 : 30);
+    return wait_ok(pid);
+}
+
+/* ---- signals in the middle of a large call ---- */
+
+static sigjmp_buf h_jump;
+static volatile int h_mode, h_fired, h_stop;
+static volatile unsigned long long h_live, h_cell0, h_ms;
+static volatile ssize_t h_wrote;
+static volatile int h_child, h_fd;
+static volatile pid_t h_pid;
+
+/* The handler acts once, in the first call it finds under way (a signal between two calls waits for
+ * the next one): a long jump, the end of the thread, a write to the file the call writes, or a fork. */
+static void on_usr1(int sig) {
+    (void)sig;
+    if (h_fired) return;
+    struct dcount c = dcounts();
+    if (c.live == 0) return;
+    h_live = c.live;
+    h_fired = 1;
+    if (h_mode == 1) siglongjmp(h_jump, 1);
+    if (h_mode == 2) pthread_exit(NULL);
+    if (h_mode == 3) {
+        unsigned char small[1000];
+        fill_salt(small, sizeof small, 41);
+        unsigned long long t = now_ms();
+        h_wrote = pwrite(h_fd, small, sizeof small, (off_t)(2 * MIB));
+        h_ms = now_ms() - t;
+        return;
+    }
+    if (h_mode == 4) {
+        h_cell0 = c.cell;
+        pid_t pid = fork();
+        if (pid == 0) {
+            h_child = 1;
+            return;
+        }
+        h_pid = pid;
+    }
+}
+
+/* Sends the signal to `*arg` every 12 ms until the handler has acted. */
+static void *kicker(void *arg) {
+    pthread_t target = *(pthread_t *)arg;
+    while (!h_fired && !h_stop) {
+        pause_ms(12);
+        if (!h_fired && !h_stop) pthread_kill(target, SIGUSR1);
+    }
+    return NULL;
+}
+
+static int arm_signal(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_usr1;
+    sigemptyset(&sa.sa_mask);
+    h_fired = 0;
+    h_stop = 0;
+    return sigaction(SIGUSR1, &sa, NULL);
+}
+
+/* The thread that sends the signal of a jump (global: a long jump does not keep locals). */
+static pthread_t jump_kick;
+
+/* A thread that leaves a large call by a long jump out of a handler. */
+static void *jump_thread(void *arg) {
+    (void)arg;
+    int fd = open("/data/jump", O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return (void *)1;
+    fill_salt(big_buf, MIB, 31);
+    pthread_t me = pthread_self();
+    h_mode = 1;
+    h_live = 0;
+    if (sigsetjmp(h_jump, 1) == 0) {
+        if (pthread_create(&jump_kick, NULL, kicker, &me) != 0) return (void *)7;
+        for (int i = 0; i < 4000; i++)
+            if (pwrite(fd, big_buf, MIB, 0) != (ssize_t)MIB) return (void *)2;
+        return (void *)8; /* the signal never came */
+    }
+    pthread_join(jump_kick, NULL);
+    h_mode = 0;
+    struct dcount c = dcounts();
+    printf("posix-data: after the jump: %llu calls were live in the handler, %llu now, %llu free cells, %llu leases unrecorded\n",
+           h_live, c.live, c.free_cells, c.unrecorded);
+    if (c.unrecorded != 0) return (void *)12;
+    if (h_live < 1) return (void *)3;
+    if (c.live != 0 || c.free_cells != 2) return (void *)4;
+    /* The lease went back with RELEASE at once (no timer ran it out), so another call on the file does not wait. */
+    struct stat st;
+    unsigned long long t = now_ms();
+    if (stat("/data/jump", &st) != 0) return (void *)5;
+    unsigned long long waited = now_ms() - t;
+    if (waited > 500) printf("posix-data: the stat after the jump waited %llu ms\n", waited);
+    if (waited > 500) return (void *)6;
+    /* The thread has jumped out of a handler and still takes a cell in its next large call. */
+    unsigned long long cell = c.cell, inl = c.inl;
+    if (pwrite(fd, big_buf, MIB, 0) != (ssize_t)MIB) return (void *)9;
+    c = dcounts();
+    printf("posix-data: the next large call took %llu cell parts and %llu inline parts\n", c.cell - cell, c.inl - inl);
+    if (c.cell <= cell || c.inl != inl) return (void *)10;
+    if (close(fd) != 0) return (void *)11;
+    return NULL;
+}
+
+static int check_jump_body(void) {
+    DATA_CHECK(arm_signal() == 0);
+    pthread_t t;
+    void *result = (void *)99;
+    DATA_CHECK(pthread_create(&t, NULL, jump_thread, NULL) == 0);
+    DATA_CHECK(pthread_join(t, &result) == 0);
+    if (result != NULL) printf("posix-data: the thread of the jump ended with %ld\n", (long)(uintptr_t)result);
+    DATA_CHECK(result == NULL);
+    DATA_CHECK(unlink("/data/jump") == 0);
+    return 0;
+}
+
+/* A thread that ends in a handler that interrupted a large call. */
+static void *exit_thread(void *arg) {
+    (void)arg;
+    int fd = open("/data/gone", O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return (void *)1;
+    fill_salt(big_buf, MIB, 32);
+    pthread_t me = pthread_self(), kick;
+    h_mode = 2;
+    if (pthread_create(&kick, NULL, kicker, &me) != 0) return (void *)2;
+    for (int i = 0; i < 4000; i++)
+        if (pwrite(fd, big_buf, MIB, 0) != (ssize_t)MIB) return (void *)3;
+    return (void *)4; /* the signal never came */
+}
+
+static int check_exit_body(void) {
+    DATA_CHECK(arm_signal() == 0);
+    pthread_t t;
+    void *result = (void *)99;
+    DATA_CHECK(pthread_create(&t, NULL, exit_thread, NULL) == 0);
+    DATA_CHECK(pthread_join(t, &result) == 0);
+    h_mode = 0;
+    /* pthread_exit(NULL) from the handler: the result is NULL, and the handler saw a live call. */
+    DATA_CHECK(result == NULL && h_live >= 1);
+    struct dcount c = dcounts();
+    printf("posix-data: after the exit of the thread: %llu free cells, %llu RELEASEs lost, %llu leases unrecorded\n",
+           c.free_cells, c.dropped, c.unrecorded);
+    DATA_CHECK(c.free_cells == 2 && c.dropped == 0 && c.unrecorded == 0);
+    struct stat st;
+    unsigned long long t0 = now_ms();
+    DATA_CHECK(stat("/data/gone", &st) == 0);
+    unsigned long long waited = now_ms() - t0;
+    if (waited > 500) printf("posix-data: the stat after the exit waited %llu ms\n", waited);
+    DATA_CHECK(waited <= 500);
+    DATA_CHECK(unlink("/data/gone") == 0);
+    return 0;
+}
+
+/* The handler writes to the file the interrupted call is writing: it waits for the lease, which
+ * lapses; the handler's write is done and nothing hangs, and the call that was interrupted comes back
+ * with the parts it had done. */
+static int check_handler_write_body(void) {
+    DATA_CHECK(arm_signal() == 0);
+    int fd = open("/data/hw", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    printf("posix-data: hw: file made\n");
+    DATA_CHECK(ftruncate(fd, (off_t)(3 * MIB)) == 0);
+    printf("posix-data: hw: file grown\n");
+    fill_salt(big_buf, MIB, 40);
+    h_fd = fd;
+    h_mode = 3;
+    h_wrote = -2;
+    h_live = 0;
+    pthread_t me = pthread_self(), kick;
+    DATA_CHECK(pthread_create(&kick, NULL, kicker, &me) == 0);
+    ssize_t r = -3;
+    printf("posix-data: hw: writing\n");
+    for (int i = 0; i < 4000 && !h_fired; i++) r = pwrite(fd, big_buf, MIB, 0);
+    printf("posix-data: hw: the handler has run\n");
+    h_stop = 1;
+    pthread_join(kick, NULL);
+    h_mode = 0;
+    printf("posix-data: the call returned %ld of %lu; the handler (live %llu) wrote %ld after %llu ms\n", (long)r, MIB,
+           h_live, (long)h_wrote, h_ms);
+    DATA_CHECK(h_live >= 1 && h_wrote == 1000 && h_ms < 4000);
+    DATA_CHECK(r >= 0 && (r == (ssize_t)MIB || ((unsigned long)r % CELL_BYTES_C == 0)));
+    /* What the call wrote is its pattern (this call and the calls before it), and the handler's bytes
+     * are at 2 MiB. */
+    DATA_CHECK(file_has_salt(fd, (unsigned long)r, 40));
+    unsigned char small[1000], mine[1000];
+    fill_salt(mine, sizeof mine, 41);
+    DATA_CHECK(pread(fd, small, sizeof small, (off_t)(2 * MIB)) == 1000 && memcmp(small, mine, 1000) == 0);
+    struct dcount c = dcounts();
+    DATA_CHECK(c.free_cells == 2 && c.live == 0);
+    DATA_CHECK(close(fd) == 0 && unlink("/data/hw") == 0);
+    return 0;
+}
+
+/* A fork inside a handler that interrupts a large call: the child returns from the handler into
+ * the call, which goes on by messages and touches no cell of the parent. */
+static int check_fork_in_handler_body(void) {
+    DATA_CHECK(arm_signal() == 0);
+    int fd = open("/data/fh", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    fill_salt(big_buf, MIB, 33);
+    h_mode = 4;
+    h_child = 0;
+    h_pid = 0;
+    h_live = 0;
+    pthread_t me = pthread_self(), kick;
+    DATA_CHECK(pthread_create(&kick, NULL, kicker, &me) == 0);
+    ssize_t r = -3;
+    for (int i = 0; i < 4000 && h_pid == 0 && !h_child; i++) r = pwrite(fd, big_buf, MIB, 0);
+    if (h_child) {
+        /* The child: the call it returned into ended; it took no cell after the fork. */
+        struct dcount c = dcounts();
+        printf("posix-data: the child's call returned %ld; cell parts %llu before the fork, %llu after\n", (long)r,
+               h_cell0, c.cell);
+        _exit(c.cell == h_cell0 ? 0 : 1);
+    }
+    h_stop = 1;
+    pthread_join(kick, NULL);
+    h_mode = 0;
+    DATA_CHECK(h_pid > 0);
+    DATA_CHECK(wait_ok(h_pid) == 0);
+    DATA_CHECK(r == (ssize_t)MIB);
+    struct dcount c = dcounts();
+    DATA_CHECK(c.free_cells == 2 && c.live == 0);
+    DATA_CHECK(file_has_salt(fd, MIB, 33));
+    DATA_CHECK(close(fd) == 0 && unlink("/data/fh") == 0);
+    return 0;
+}
+
+/* ---- fork in another thread's call, and a descriptor passed with SCM_RIGHTS ---- */
+
+static void *fork_writer(void *arg) {
+    int fd = *(int *)arg;
+    fill_salt(big_buf, MIB, 34);
+    for (int i = 0; i < 30; i++)
+        if (pwrite(fd, big_buf, MIB, 0) != (ssize_t)MIB) return (void *)2;
+    return NULL;
+}
+
+/* The child of the fork: its own large write and read-back through its own window. */
+static int fork_child_body(void) {
+    fill_salt(big_buf, MIB, 35);
+    int fd = open("/data/fork-child", O_RDWR | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) return 2;
+    struct dcount c0 = dcounts();
+    if (write(fd, big_buf, MIB) != (ssize_t)MIB) return 3;
+    if (!file_has_salt(fd, MIB, 35)) return 4;
+    struct dcount c1 = dcounts();
+    if (c1.cell <= c0.cell || c1.ready != 1) return 5;
+    return close(fd) == 0 ? 0 : 6;
+}
+
+static int send_fd(int sock, int fd) {
+    char data = 'x';
+    char control[CMSG_SPACE(sizeof(int))];
+    struct iovec iov = {&data, 1};
+    struct msghdr msg;
+    memset(&msg, 0, sizeof msg);
+    memset(control, 0, sizeof control);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof control;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &fd, sizeof fd);
+    return sendmsg(sock, &msg, 0) == 1 ? 0 : -1;
+}
+
+static int recv_fd(int sock) {
+    char data;
+    char control[CMSG_SPACE(sizeof(int))];
+    struct iovec iov = {&data, 1};
+    struct msghdr msg;
+    memset(&msg, 0, sizeof msg);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof control;
+    if (recvmsg(sock, &msg, 0) != 1) return -1;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    if (c == NULL || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) return -1;
+    int fd;
+    memcpy(&fd, CMSG_DATA(c), sizeof fd);
+    return fd;
+}
+
+/* The receiver of the descriptor writes 1 MiB through it in one large call. */
+static int scm_receiver(int sock) {
+    int fd = recv_fd(sock);
+    if (fd < 0) return 1;
+    fill_salt(big_buf, MIB, 36);
+    struct dcount c0 = dcounts();
+    if (pwrite(fd, big_buf, MIB, 0) != (ssize_t)MIB) return 3;
+    struct dcount c1 = dcounts();
+    return c1.cell > c0.cell ? 0 : 4;
+}
+
+static int check_fork_and_scm_body(void) {
+    int fd = open("/data/fork-big", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    pthread_t t;
+    DATA_CHECK(pthread_create(&t, NULL, fork_writer, &fd) == 0);
+    pause_ms(60);
+    pid_t pid = fork();
+    DATA_CHECK(pid >= 0);
+    if (pid == 0) _exit(fork_child_body());
+    void *result = (void *)99;
+    DATA_CHECK(pthread_join(t, &result) == 0 && result == NULL);
+    DATA_CHECK(wait_ok(pid) == 0);
+    int child = open("/data/fork-child", O_RDONLY);
+    DATA_CHECK(child >= 0 && file_has_salt(child, MIB, 35));
+    DATA_CHECK(close(child) == 0 && unlink("/data/fork-child") == 0);
+    DATA_CHECK(file_has_salt(fd, MIB, 34));
+    /* The descriptor goes to another process, which writes through its own window. */
+    int pair[2];
+    DATA_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    pid = fork();
+    DATA_CHECK(pid >= 0);
+    if (pid == 0) {
+        close(pair[0]);
+        _exit(scm_receiver(pair[1]));
+    }
+    close(pair[1]);
+    DATA_CHECK(send_fd(pair[0], fd) == 0);
+    DATA_CHECK(wait_ok(pid) == 0);
+    DATA_CHECK(close(pair[0]) == 0);
+    DATA_CHECK(file_has_salt(fd, MIB, 36));
+    DATA_CHECK(close(fd) == 0 && unlink("/data/fork-big") == 0);
+    return 0;
+}
+
+/* ---- the pages of the window go back with the process ---- */
+
+/* The pool of pages the process service has left, in kB (the line MemFree of /proc/meminfo; the
+ * image has no /proc, so the layer is asked as that file is made), 0 when it cannot be asked. */
+extern unsigned long long stafeto_probe_pool_free(void);
+
+static long pool_free_kb(void) { return (long)(stafeto_probe_pool_free() >> 10); }
+
+/* The program that makes a window and ends: one large write. */
+static int window_child(void) {
+    fill_salt(big_buf, MIB, 37);
+    int fd = open("/data/wc", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return 2;
+    if (write(fd, big_buf, MIB) != (ssize_t)MIB) return 3;
+    struct dcount c = dcounts();
+    return c.ready == 1 && c.cell > 0 ? 0 : 4;
+}
+
+static int check_pages_come_back(void) {
+    long before = pool_free_kb();
+    if (before <= 0) printf("posix-data: the process service did not say its free pages\n");
+    DATA_CHECK(before > 0);
+    char *argv[] = {"posix-data", "window-child", NULL};
+    pid_t pid = 0;
+    DATA_CHECK(posix_spawn(&pid, "/bin/posix-data", NULL, NULL, argv, environ) == 0);
+    DATA_CHECK(wait_ok(pid) == 0);
+    long after = 0;
+    for (int i = 0; i < 50; i++) {
+        after = pool_free_kb();
+        if (after >= before - 32) break;
+        pause_ms(100);
+    }
+    printf("posix-data: free pages before %ld kB, after the process with a window ended %ld kB\n", before, after);
+    DATA_CHECK(after >= before - 32);
+    DATA_CHECK(unlink("/data/wc") == 0);
+    return 0;
+}
+
+/* ---- the service restarts in the middle of a long write ---- */
+
+static volatile long long rs_total, rs_last;
+static volatile int rs_errno;
+
+static void *restart_writer(void *arg) {
+    int fd = *(int *)arg;
+    fill_salt(big_buf, MIB, 38);
+    for (int i = 0; i < 64; i++) {
+        errno = 0;
+        ssize_t r = write(fd, big_buf, MIB);
+        rs_last = r;
+        rs_errno = errno;
+        if (r > 0) rs_total += r;
+        if (r != (ssize_t)MIB) break;
+    }
+    return NULL;
+}
+
+static int check_restart_body(void) {
+    int fd = open("/data/rs", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    pthread_t t;
+    DATA_CHECK(pthread_create(&t, NULL, restart_writer, &fd) == 0);
+    pause_ms(150);
+    int dead = open("/data/.die", O_RDONLY);
+    if (dead >= 0) {
+        printf("posix-data: the service did not end\n");
+        return 20;
+    }
+    DATA_CHECK(pthread_join(t, NULL) == 0);
+    printf("posix-data: the long write ended after %lld bytes: last result %lld, errno %d\n", rs_total, rs_last, rs_errno);
+    DATA_CHECK(rs_total < (long long)(64 * MIB));
+    DATA_CHECK((rs_last == -1 && rs_errno == EIO) || rs_last >= 0);
+    /* The new instance takes a few seconds. */
+    struct stat st;
+    int up = 0;
+    for (int i = 0; i < 120 && !up; i++) {
+        pause_ms(500);
+        up = stat("/data/pub", &st) == 0;
+    }
+    DATA_CHECK(up);
+    struct dcount c0 = dcounts();
+    fill_salt(big_buf, MIB, 39);
+    int fd2 = open("/data/rs2", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd2 >= 0);
+    DATA_CHECK(write(fd2, big_buf, MIB) == (ssize_t)MIB);
+    DATA_CHECK(file_has_salt(fd2, MIB, 39));
+    DATA_CHECK(close(fd2) == 0);
+    struct dcount c1 = dcounts();
+    printf("posix-data: after the restart: %llu cell parts, %llu window retries, %llu mappings of the window\n",
+           c1.cell - c0.cell, c1.retries - c0.retries, c1.mappings);
+    DATA_CHECK(c1.cell > c0.cell && c1.retries - c0.retries <= 1 && c1.mappings == 1);
+    return 0;
+}
+
+static int check_jump(void) { return isolated(check_jump_body); }
+static int check_exit(void) { return isolated(check_exit_body); }
+static int check_handler_write(void) { return isolated(check_handler_write_body); }
+static int check_fork_in_handler(void) { return isolated(check_fork_in_handler_body); }
+static int check_fork_and_scm(void) { return isolated(check_fork_and_scm_body); }
+static int check_restart(void) { return isolated(check_restart_body); }
+
+/* ---- the roles ---- */
+
+static int atomic_run(void) {
+    if (getuid() != 0) {
+        printf("posix-data: the probe is not user 0\n");
+        return 20;
+    }
+    if (!raise_fsize()) {
+        printf("posix-data: the limit on the size of a file could not be lifted\n");
+        return 20;
+    }
+    run_check("1 MiB writes and reads never mix", check_mix);
+    run_check("the service keeps no cell mapped", check_unmapped);
+    run_check("O_APPEND 200 KiB records whole", check_append);
+    run_check("inline parts atomic", check_inline);
+    run_check("lease lapses after 1 s", check_lapse);
+    run_check("siglongjmp out of a handler returns the cell", check_jump);
+    run_check("thread exit mid-call returns the cell", check_exit);
+    run_check("handler write during a long write", check_handler_write);
+    run_check("fork in a handler whose child returns", check_fork_in_handler);
+    run_check("fork and scm_rights with windows", check_fork_and_scm);
+    run_check("window pages come back", check_pages_come_back);
+    run_check("restart during a long write", check_restart);
+    if (failures != 0) {
+        printf("posix-data: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("posix-data: atomic checks passed\n");
+    return 0;
+}
+
+/* The run of the steps (the service built with the steps and the counts, under -icount on one CPU
+ * or in real time on two): the 64 MiB of data-fast with another process that asks for the state of
+ * another file all the time, then the checks of data-atomic that do not depend on the time (a lease
+ * lasts a second, and an instruction costs 16 ns under -icount, so the others are for the run in real
+ * time), with their loops ten times shorter. */
+static int stat_child(int fd) {
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    unsigned long long worst = 0, calls = 0;
+    struct stat st;
+    for (;;) {
+        char c;
+        if (read(fd, &c, 1) == 0) break;
+        unsigned long long t = now_us();
+        if (stat("/data/pub", &st) != 0) return 1;
+        unsigned long long dt = now_us() - t;
+        if (dt > worst) worst = dt;
+        calls++;
+        pause_ms(3);
+    }
+    printf("posix-data: stat of another file during the write: %llu calls, longest %llu us\n", calls, worst);
+    return 0;
+}
+
+static int steps_large(void) {
+    int pipefd[2];
+    DATA_CHECK(pipe(pipefd) == 0);
+    pid_t pid = fork();
+    DATA_CHECK(pid >= 0);
+    if (pid == 0) {
+        close(pipefd[1]);
+        _exit(stat_child(pipefd[0]));
+    }
+    close(pipefd[0]);
+    int bad = fast_large();
+    close(pipefd[1]);
+    DATA_CHECK(wait_ok(pid) == 0);
+    return bad;
+}
+
+static int steps_run(void) {
+    if (getuid() != 0) {
+        printf("posix-data: the probe is not user 0\n");
+        return 20;
+    }
+    if (!raise_fsize()) {
+        printf("posix-data: the limit on the size of a file could not be lifted\n");
+        return 20;
+    }
+    atomic_less = 10;
+    run_check("dd 64 MiB with a stat of another file", steps_large);
+    run_check("1 MiB writes and reads never mix", check_mix);
+    run_check("the service keeps no cell mapped", check_unmapped);
+    run_check("O_APPEND 200 KiB records whole", check_append);
+    run_check("fork and scm_rights with windows", check_fork_and_scm);
+    run_check("window pages come back", check_pages_come_back);
+    if (failures != 0) {
+        printf("posix-data: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("posix-data: steps checks passed\n");
     return 0;
 }
 
@@ -1783,6 +2801,10 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "write-run") == 0) return write_run();
     if (argc > 1 && strcmp(argv[1], "cap-run") == 0) return cap_run();
     if (argc > 1 && strcmp(argv[1], "throughput-run") == 0) return throughput_run();
+    if (argc > 1 && strcmp(argv[1], "fast-run") == 0) return fast_run();
+    if (argc > 1 && strcmp(argv[1], "atomic-run") == 0) return atomic_run();
+    if (argc > 1 && strcmp(argv[1], "steps-run") == 0) return steps_run();
+    if (argc > 1 && strcmp(argv[1], "window-child") == 0) return window_child();
     if (argc > 1 && strcmp(argv[1], "restart-run") == 0) return restart_run();
     if (argc > 1 && strcmp(argv[1], "crash-run") == 0) return crash_run();
     if (argc > 1 && strcmp(argv[1], "verify-run") == 0) return verify_run();

@@ -314,6 +314,12 @@ struct lfs_config {
     // configuration) leaves the release's walk. The disk is the same with or
     // without the wayposts, and the file structure has the room either way.
     lfs_size_t ctz_hints;
+
+    // stafeto: nonzero: the device reports every failed program (a disk with a
+    // status for each write, never raw flash). A program is not read back and
+    // compared, and the block it wrote stays in the read cache. Zero is the
+    // release.
+    lfs_size_t trust_prog;
 };
 
 // File info structure

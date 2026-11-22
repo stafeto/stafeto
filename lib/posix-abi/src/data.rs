@@ -383,6 +383,10 @@ struct Failed {
     status: u32,
 }
 
+/// The marker in `Failed::status` of a part that a fork inside a handler cut short: the send was
+/// interrupted and the call now runs in the child (no such status comes from a service).
+const FORKED_MARK: u32 = u32::MAX;
+
 impl Failed {
     const fn local(errno: i32) -> Failed {
         Failed { errno, status: 0 }
@@ -391,6 +395,40 @@ impl Failed {
 
 /// `call_with`, with the status of a failed reply kept (a part needs NO_WINDOW).
 fn call_status(request: &[u8], take: bool) -> Result<Answer, Failed> {
+    call_held(request, take, None)
+}
+
+/// Ends the deferral of `call_held` and clears the record's mark of a part sent: no lease of an
+/// answer is waiting to be recorded.
+fn release_held(
+    held: &mut Option<(
+        &mut Option<rt::upcall::DeferredEntry>,
+        Option<&datawin::Live>,
+    )>,
+) {
+    if let Some((held, live)) = held.as_mut() {
+        if let Some(live) = live {
+            live.unsent();
+        }
+        **held = None;
+    }
+}
+
+/// `call_status` for a part of a large call. With `held`, the entries of signal handlers are
+/// deferred from the send to the answer and stay deferred in `held` after an answer that
+/// succeeded: a handler that jumps out then runs only once the caller has recorded the lease of
+/// the answer and dropped `held` (a signal that came while the layer waited for the reply would
+/// otherwise run its handler on the return from the send, before the lease is recorded, and the
+/// jump would leave the lease to run out on its timer). A send that a signal interrupts drops
+/// the deferral first, so that the handler runs, and goes on with a new one.
+fn call_held(
+    request: &[u8],
+    take: bool,
+    mut held: Option<(
+        &mut Option<rt::upcall::DeferredEntry>,
+        Option<&datawin::Live>,
+    )>,
+) -> Result<Answer, Failed> {
     let mut bound = false;
     let mut reborn = false;
     let mut tries = 0;
@@ -401,10 +439,33 @@ fn call_status(request: &[u8], take: bool) -> Result<Answer, Failed> {
             session().ok_or(Failed::local(EIO))?
         };
         let channel = Handle::<Channel>::borrowed(session);
+        if let Some((held, live)) = held.as_mut() {
+            // `transfer` never runs with an outer deferral held (`rt::fs::send_on_with` guards its
+            // own use with `!entries_deferred()`), so the deferral is always granted here.
+            **held = Some(rt::upcall::defer_entries().expect("data part entry deferral"));
+            if let Some(live) = live {
+                live.sending();
+            }
+        }
         let reply = match rt::sys::send(&channel, request) {
             Ok(reply) => reply,
-            Err(Error::Interrupted) => continue,
+            Err(Error::Interrupted) => {
+                // The kernel took the request back: no lease came of it.
+                release_held(&mut held);
+                if held
+                    .as_ref()
+                    .is_some_and(|(_, live)| live.is_some_and(datawin::Live::forked))
+                {
+                    // A handler that ran now forked: the lease and the cell are the parent's.
+                    return Err(Failed {
+                        errno: EIO,
+                        status: FORKED_MARK,
+                    });
+                }
+                continue;
+            }
             Err(Error::PeerClosed) => {
+                release_held(&mut held);
                 why!("the session closed: the service went");
                 forget(session);
                 // A path call goes on at once with a session of the new instance; a call on a
@@ -416,6 +477,7 @@ fn call_status(request: &[u8], take: bool) -> Result<Answer, Failed> {
                 return Err(Failed::local(EIO));
             }
             Err(error) => {
+                release_held(&mut held);
                 why!("request not sent to the session: {error:?}");
                 return Err(Failed::local(EIO));
             }
@@ -423,7 +485,12 @@ fn call_status(request: &[u8], take: bool) -> Result<Answer, Failed> {
         let mut buffer = [0; MESSAGE_MAX];
         let bytes = reply.bytes(&mut buffer);
         let mut r = Reader::new(bytes);
-        let status = r.u32().map_err(|_| Failed::local(EIO))?;
+        let Ok(status) = r.u32() else {
+            if let Some((_, Some(live))) = held.as_ref() {
+                live.unsent();
+            }
+            return Err(Failed::local(EIO));
+        };
         if status == 0 {
             let mut answer = Answer {
                 bytes: [0; MESSAGE_MAX],
@@ -432,6 +499,7 @@ fn call_status(request: &[u8], take: bool) -> Result<Answer, Failed> {
             answer.bytes[..bytes.len() - 4].copy_from_slice(&bytes[4..]);
             return Ok(answer);
         }
+        release_held(&mut held);
         if status != 0 {
             why!("call answered with status {status}");
         }
@@ -1228,7 +1296,8 @@ fn transfer<S: Side>(handle: u32, offset: Option<u64>, side: &mut S) -> Result<(
         if built.is_err() {
             break Err(EIO);
         }
-        let answer = match call_status(w.as_bytes(), true) {
+        let mut held = None;
+        let answer = match call_held(w.as_bytes(), true, Some((&mut held, live.as_ref()))) {
             Ok(answer) => answer,
             Err(failed) if failed.status == p::NO_WINDOW && cell.is_some() => {
                 // The service has no window for this session (it restarted): register again and
@@ -1248,10 +1317,21 @@ fn transfer<S: Side>(handle: u32, offset: Option<u64>, side: &mut S) -> Result<(
                 parts.set_max(pure::part_max(false, S::WRITE, positional));
                 continue;
             }
+            Err(failed) if failed.status == FORKED_MARK => {
+                // The child of a fork: the lease belongs to the parent's call. The loop top
+                // drops the cell and the record.
+                parts.forget_lease();
+                continue;
+            }
             Err(failed) => break Err(failed.errno),
         };
         let inline_read = !S::WRITE && cell.is_none();
         let Ok(reply) = p::read_part_reply(answer.reader(), inline_read) else {
+            // The answer carries no lease that could be recorded; the deferral ends with
+            // this pass of the loop, before the RELEASE below goes out.
+            if let Some(live) = &live {
+                live.unsent();
+            }
             local_fault = true;
             break Err(EIO);
         };
@@ -1264,12 +1344,19 @@ fn transfer<S: Side>(handle: u32, offset: Option<u64>, side: &mut S) -> Result<(
             },
         );
         if step == pure::Step::Bad {
+            // The lease the service may hold (`parts.lease()`) goes on record for a jump, and
+            // the deferral ends with this pass of the loop, before the RELEASE below goes out.
+            if let Some(live) = &live {
+                live.set_lease(session_now().map_or(0, |s| s.0), parts.lease());
+            }
             local_fault = true;
             break Err(EIO);
         }
         if let Some(live) = &live {
             live.set_lease(session_now().map_or(0, |s| s.0), parts.lease());
         }
+        // A handler that was held back since the send runs here, with the lease on record.
+        drop(held);
         if reply.count > 0 && live.as_ref().is_some_and(datawin::Live::forked) {
             // A fork inside a handler since the reply: the cell is not the child's to read.
             break Err(EIO);
@@ -1298,6 +1385,9 @@ fn transfer<S: Side>(handle: u32, offset: Option<u64>, side: &mut S) -> Result<(
         // The reply broke the protocol: a lease the service may still hold goes back.
         if let Some(lease) = parts.live_lease() {
             release_lease(session_now().map_or(0, |s| s.0), lease);
+            if let Some(live) = &live {
+                live.set_lease(0, 0);
+            }
         }
     }
     if parts.lapsed() {

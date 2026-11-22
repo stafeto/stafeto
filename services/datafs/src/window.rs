@@ -7,6 +7,8 @@
 //! unmaps it when the job is done: 64 sessions with windows would otherwise hold 64 of the 128
 //! mappings of the service and the page tables of 8 MiB of other processes' memory.
 
+#[cfg(feature = "steps")]
+use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use datafs::server::SESSIONS;
 use proto_data::{CELL_BYTES, WINDOW_BYTES};
 use rt::abi::Access;
@@ -102,14 +104,128 @@ pub fn acceptable(process: &Handle<Process>, memory: &Handle<Memory>) -> bool {
 /// The longest map and unmap of a cell so far, in ticks, under the feature `steps`: a longer one
 /// says so, `datafs: cell map longest N ticks` and `datafs: cell unmap longest N ticks`, which the
 /// probe of the service judges against term B (a cell is 16 pages, one chunk of the kernel's
-/// `mem_map` and `mem_unmap`).
+/// `mem_map` and `mem_unmap`). The rest of the line says what the call was (`pages P, N-th, access
+/// A`), so that a long one can be told from the usual ones (the first map of a run builds the
+/// page-table pages of the mapping).
 #[cfg(feature = "steps")]
-fn longest(slot: &core::sync::atomic::AtomicU64, what: &str, from: u64) {
-    use core::sync::atomic::Ordering::Relaxed;
-    let took = rt::time::now().saturating_sub(from);
+fn longest(
+    (slot, calls, buckets): (&AtomicU64, &AtomicU64, &Buckets),
+    what: &str,
+    from: Began,
+    (pages, access): (u64, &str),
+    process: &Handle<Process>,
+) {
+    let nth = calls.fetch_add(1, Relaxed) + 1;
+    let took = rt::time::now().saturating_sub(from.at);
+    // The wall time of a call counts a preemption (by the loop or by a higher level) in it. A call
+    // that no step of the loop started or ended in, judged by the kernel ticks of the process,
+    // is the call with no preemption by the loop; its figure is the one the probe judges.
+    let kernel = sys::process_times(process).map_or(0, |t| t.1);
+    if from.events == rt::service::loop_events() && from.kernel != 0 && kernel != 0 {
+        quiet(what, kernel.saturating_sub(from.kernel), nth);
+    }
+    buckets.note(took);
     if took > slot.load(Relaxed) {
         slot.store(took, Relaxed);
-        rt::println!("datafs: cell {what} longest {took} ticks");
+        rt::println!(
+            "datafs: cell {what} longest {took} ticks (pages {pages}, call {nth}, access {access})"
+        );
+    }
+}
+
+/// What a call of `map` or `unmap` starts from: the clock, the loop's steps and the kernel ticks of
+/// the process.
+#[cfg(feature = "steps")]
+struct Began {
+    at: u64,
+    events: u64,
+    kernel: u64,
+}
+
+#[cfg(feature = "steps")]
+impl Began {
+    fn now(process: &Handle<Process>) -> Began {
+        let events = rt::service::loop_events();
+        let kernel = sys::process_times(process).map_or(0, |t| t.1);
+        Began {
+            at: rt::time::now(),
+            events,
+            kernel,
+        }
+    }
+}
+
+#[cfg(feature = "steps")]
+static QUIET_LONGEST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(feature = "steps")]
+static QUIET_CALLS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A call with no step of the loop in it took `ticks` of kernel time of the process: a longer one
+/// than before says so, `datafs: cell map quiet longest N ticks (quiet calls Q, call N-th)`.
+#[cfg(feature = "steps")]
+fn quiet(what: &str, ticks: u64, nth: u64) {
+    let at = usize::from(what == "unmap");
+    let calls = QUIET_CALLS[at].fetch_add(1, Relaxed) + 1;
+    if ticks > QUIET_LONGEST[at].load(Relaxed) {
+        QUIET_LONGEST[at].store(ticks, Relaxed);
+        rt::println!(
+            "datafs: cell {what} quiet longest {ticks} ticks (quiet calls {calls}, call {nth})"
+        );
+    }
+}
+
+/// How many calls took each length, in ticks: up to 4,500, 6,000, 8,000, 12,000, 16,000, 20,410 (term
+/// B) and longer. The longest call alone cannot say whether a long one is usual: the histogram does.
+#[cfg(feature = "steps")]
+pub struct Buckets([AtomicU64; 7]);
+
+#[cfg(feature = "steps")]
+const BUCKET_UPTO: [u64; 6] = [4_500, 6_000, 8_000, 12_000, 16_000, 20_410];
+
+#[cfg(feature = "steps")]
+impl Buckets {
+    const fn new() -> Buckets {
+        Buckets([const { AtomicU64::new(0) }; 7])
+    }
+
+    fn note(&self, ticks: u64) {
+        let at = BUCKET_UPTO
+            .iter()
+            .position(|&limit| ticks <= limit)
+            .unwrap_or(BUCKET_UPTO.len());
+        self.0[at].fetch_add(1, Relaxed);
+    }
+}
+
+#[cfg(feature = "steps")]
+static MAP_TICKS: Buckets = Buckets::new();
+#[cfg(feature = "steps")]
+static UNMAP_TICKS: Buckets = Buckets::new();
+
+/// The histograms of the maps and unmaps that changed since the last report: `datafs: cell map ticks
+/// <=4500 N <=6000 N ... <=20410 N more N`.
+#[cfg(feature = "steps")]
+pub fn report() {
+    static SAID: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    for (i, (what, buckets)) in [("map", &MAP_TICKS), ("unmap", &UNMAP_TICKS)]
+        .into_iter()
+        .enumerate()
+    {
+        let total: u64 = buckets.0.iter().map(|b| b.load(Relaxed)).sum();
+        if total == 0 || SAID[i].swap(total, Relaxed) == total {
+            continue;
+        }
+        let n = |at: usize| buckets.0[at].load(Relaxed);
+        rt::println!(
+            "datafs: cell {what} ticks <=4500 {} <=6000 {} <=8000 {} <=12000 {} <=16000 {} <=20410 {} more {}",
+            n(0),
+            n(1),
+            n(2),
+            n(3),
+            n(4),
+            n(5),
+            n(6)
+        );
     }
 }
 
@@ -117,6 +233,15 @@ fn longest(slot: &core::sync::atomic::AtomicU64, what: &str, from: u64) {
 static LONGEST_MAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "steps")]
 static LONGEST_UNMAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "steps")]
+static MAPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "steps")]
+static UNMAPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The deliberate break `break-datafs-cell-kept`: the length of the cell the last job left mapped
+/// (0 for none), which the next map unmaps first.
+#[cfg(feature = "break-datafs-cell-kept")]
+static KEPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Maps the first `count` bytes of cell `cell` (rounded up to pages) at `WINDOW_AT`: read only when
 /// the job writes the file, read-write when it reads the file. The bytes mapped, for `unmap`.
@@ -134,8 +259,16 @@ pub fn map(
     } else {
         Access::Read
     };
+    #[cfg(feature = "break-datafs-cell-kept")]
+    {
+        let kept = KEPT.swap(0, core::sync::atomic::Ordering::Relaxed);
+        if kept != 0 {
+            // SAFETY: the job that left the cell mapped is over.
+            let _ = unsafe { sys::mem_unmap(process, WINDOW_AT, kept) };
+        }
+    }
     #[cfg(feature = "steps")]
-    let from = rt::time::now();
+    let from = Began::now(process);
     sys::mem_map(
         process,
         window,
@@ -145,18 +278,38 @@ pub fn map(
         access,
     )?;
     #[cfg(feature = "steps")]
-    longest(&LONGEST_MAP, "map", from);
+    longest(
+        (&LONGEST_MAP, &MAPS, &MAP_TICKS),
+        "map",
+        from,
+        (
+            len as u64 / PAGE as u64,
+            if reading_file { "rw" } else { "r" },
+        ),
+        process,
+    );
     Ok(len as u64)
 }
 
 /// Unmaps what `map` mapped.
 pub fn unmap(process: &Handle<Process>, len: u64) {
+    #[cfg(feature = "break-datafs-cell-kept")]
+    if cfg!(feature = "break-datafs-cell-kept") {
+        KEPT.store(len, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     #[cfg(feature = "steps")]
-    let from = rt::time::now();
+    let from = Began::now(process);
     // SAFETY: the job that used the cell is over; the slices it made are gone.
     if unsafe { sys::mem_unmap(process, WINDOW_AT, len) }.is_err() {
         rt::println!("datafs: a cell of a window did not unmap");
     }
     #[cfg(feature = "steps")]
-    longest(&LONGEST_UNMAP, "unmap", from);
+    longest(
+        (&LONGEST_UNMAP, &UNMAPS, &UNMAP_TICKS),
+        "unmap",
+        from,
+        (len / PAGE as u64, "-"),
+        process,
+    );
 }

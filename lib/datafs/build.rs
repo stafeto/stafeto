@@ -54,6 +54,10 @@ fn main() {
         build.define("LFS_CTZ_HINTS_NO_DROP", None);
     }
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BREAK_DATAFS_CTZ_HINTS");
+    if env::var_os("CARGO_FEATURE_BREAK_DATAFS_TRUST_PROG").is_some() {
+        build.define("LFS_TRUST_PROG_NO_COPY", None);
+    }
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BREAK_DATAFS_TRUST_PROG");
     build
         .file(lfs.join("lfs.c"))
         .file(lfs.join("lfs_util.c"))

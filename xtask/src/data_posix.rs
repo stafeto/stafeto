@@ -64,6 +64,12 @@ const fn programs(datafs: &'static [&'static str]) -> [ImageProgram; 11] {
 }
 
 pub const PROGRAMS: [ImageProgram; 11] = programs(&[]);
+/// The service that counts the reads of the disk (`data-fast`).
+const PROGRAMS_FAST: [ImageProgram; 11] = programs(&["count"]);
+/// The service that ends on a request, for the restart of `data-atomic`.
+const PROGRAMS_ATOMIC: [ImageProgram; 11] = programs(&["probe-restart"]);
+/// The service with the steps and the counts (`data-steps`).
+const PROGRAMS_STEPS: [ImageProgram; 11] = programs(&["steps"]);
 const PROGRAMS_CRASH: [ImageProgram; 11] = programs(&["crash"]);
 /// The service that ends when it is asked to open `.die` (the restart probe).
 const PROGRAMS_RESTART: [ImageProgram; 11] = programs(&["probe-restart"]);
@@ -86,6 +92,15 @@ pub enum Mode {
     /// 64 MiB written onto /data and read back, with the throughput printed (no bound): a volume
     /// of 127 MiB.
     Throughput,
+    /// `data-fast`: 64 MiB written and read back through the window of the large calls, judged
+    /// against the bounds of the plan (`fast_verdict`), with the controls of 4,096 and 1,000 bytes.
+    Fast,
+    /// `data-atomic`: the atomicity of the large calls, the lease, the signals in the middle of a
+    /// call, `fork`, SCM_RIGHTS, the pages of the window, and a restart of the service mid-call.
+    Atomic,
+    /// `data-steps`: the service built with the steps and the counts, under `-icount`: the 64 MiB
+    /// of `Fast` with a stat of another file beside it, and the checks of `Atomic` with shorter loops.
+    Steps,
 }
 
 impl Mode {
@@ -98,6 +113,9 @@ impl Mode {
             Mode::Full => "full-run",
             Mode::Restart => "restart-run",
             Mode::Throughput => "throughput-run",
+            Mode::Fast => "fast-run",
+            Mode::Atomic => "atomic-run",
+            Mode::Steps => "steps-run",
         }
     }
 
@@ -109,6 +127,9 @@ impl Mode {
             Mode::Full => "boot-data-posix-full.img",
             Mode::Restart => "boot-data-posix-restart.img",
             Mode::Throughput => "boot-data-posix-throughput.img",
+            Mode::Fast => "boot-data-posix-fast.img",
+            Mode::Atomic => "boot-data-posix-atomic.img",
+            Mode::Steps => "boot-data-posix-steps.img",
         }
     }
 
@@ -127,6 +148,13 @@ impl Mode {
                 "current directory reopened",
             ],
             Mode::Throughput => &["dd 64 MiB there and back"],
+            Mode::Fast => &[
+                "dd 64 MiB through the window",
+                "dd bs 4096 control",
+                "dd bs 1000 control",
+            ],
+            Mode::Atomic => &ATOMIC_CHECKS,
+            Mode::Steps => &STEPS_CHECKS,
         }
     }
 
@@ -138,6 +166,9 @@ impl Mode {
             Mode::Full => "posix-data: full checks passed",
             Mode::Restart => "posix-data: restart checks passed",
             Mode::Throughput => "posix-data: throughput checks passed",
+            Mode::Fast => "posix-data: fast checks passed",
+            Mode::Atomic => "posix-data: atomic checks passed",
+            Mode::Steps => "posix-data: steps checks passed",
         }
     }
 
@@ -151,9 +182,39 @@ impl Mode {
             Mode::Full => 20 * 60,
             Mode::Restart => 10 * 60,
             Mode::Throughput => 30 * 60,
+            Mode::Fast => 30 * 60,
+            Mode::Atomic => 15 * 60,
+            Mode::Steps => 60 * 60,
         })
     }
 }
+
+/// The checks of the atomic role, in the order the probe runs them.
+pub const ATOMIC_CHECKS: [&str; 12] = [
+    "1 MiB writes and reads never mix",
+    "the service keeps no cell mapped",
+    "O_APPEND 200 KiB records whole",
+    "inline parts atomic",
+    "lease lapses after 1 s",
+    "siglongjmp out of a handler returns the cell",
+    "thread exit mid-call returns the cell",
+    "handler write during a long write",
+    "fork in a handler whose child returns",
+    "fork and scm_rights with windows",
+    "window pages come back",
+    "restart during a long write",
+];
+
+/// The checks of the steps role: the large write with a stat beside it, then the atomic checks that
+/// do not depend on the time (a lease lasts a second, an instruction costs 16 ns under `-icount`).
+pub const STEPS_CHECKS: [&str; 6] = [
+    "dd 64 MiB with a stat of another file",
+    "1 MiB writes and reads never mix",
+    "the service keeps no cell mapped",
+    "O_APPEND 200 KiB records whole",
+    "fork and scm_rights with windows",
+    "window pages come back",
+];
 
 /// The checks of the read role.
 pub const READ_CHECKS: [&str; 28] = [
@@ -343,7 +404,8 @@ const THROUGHPUT_DISK_BYTES: u64 = 256 << 20;
 const ENDS: &str = "init: posix-data ended: ";
 const ENDED: &str = "init: posix-data ended: exit code 0, not restarted";
 
-/// `cargo xtask data-posix [write|cap|full|restart|throughput|crash [N]]`.
+/// `cargo xtask data-posix [write|cap|full|restart|throughput|fast|atomic|steps|crash [N]]`, and
+/// `atomic-break FEATURE`.
 pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
     match args.first().map(String::as_str) {
         None => probe(Mode::Read, machine),
@@ -352,6 +414,12 @@ pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
         Some("full") if args.len() == 1 => probe(Mode::Full, machine),
         Some("restart") if args.len() == 1 => probe(Mode::Restart, machine),
         Some("throughput") if args.len() == 1 => probe(Mode::Throughput, machine),
+        Some("fast") if args.len() == 1 => probe(Mode::Fast, machine),
+        Some("atomic") if args.len() == 1 => probe(Mode::Atomic, machine),
+        Some("steps") if args.len() == 1 => steps(machine),
+        Some("steps-icount") if args.len() == 1 => steps_icount(machine),
+        Some("steps-budget") if args.len() == 1 => steps_budget(machine),
+        Some("atomic-break") if args.len() == 2 => atomic_break(&args[1], machine),
         Some("crash") => crash(&args[1..], machine),
         Some(other) => Err(format!(
             "data-posix [write|cap|full]: unknown argument {other}"
@@ -359,19 +427,56 @@ pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
     }
 }
 
-/// One mode: the image with the role of the mode, a volume made offline, QEMU until the probe ends,
-/// and the lines read.
-pub fn probe(mode: Mode, machine: &qemu::Machine) -> Result<(), String> {
+/// How a boot differs from the plain one: the CPUs (0 for the machine's own), the clock that follows
+/// the instructions, and a deliberate break of the service (a feature of `datafsd`).
+#[derive(Clone, Copy, Default)]
+pub struct Boot {
+    pub cpus: usize,
+    pub icount: bool,
+}
+
+/// The programs of the image of `mode`, with the break `brk` in the service when there is one.
+fn programs_of(mode: Mode, breaks: &[&'static str]) -> Vec<ImageProgram> {
+    let base: &[ImageProgram] = match mode {
+        Mode::Restart => &PROGRAMS_RESTART,
+        Mode::Fast => &PROGRAMS_FAST,
+        Mode::Atomic => &PROGRAMS_ATOMIC,
+        Mode::Steps => &PROGRAMS_STEPS,
+        _ => &PROGRAMS,
+    };
+    let mut programs = base.to_vec();
+    if !breaks.is_empty() {
+        let at = programs
+            .iter()
+            .position(|p| p.0 == "datafsd")
+            .expect("the image has the data service");
+        let mut features: Vec<&'static str> = programs[at].3.to_vec();
+        features.extend_from_slice(breaks);
+        programs[at].3 = Box::leak(features.into_boxed_slice());
+    }
+    programs
+}
+
+/// The boot of one mode: the image with the role of the mode, a volume made offline, QEMU until the
+/// probe ends; the lines and the seconds it took.
+fn boot(mode: Mode, machine: &qemu::Machine, how: Boot) -> Result<(qemu::Outcome, u64), String> {
+    boot_with(mode, machine, how, &[], None)
+}
+
+/// `boot` with deliberate breaks (features of `datafsd`) in the service.
+fn boot_with(
+    mode: Mode,
+    machine: &qemu::Machine,
+    how: Boot,
+    breaks: &[&'static str],
+    stop_on: Option<(&[String], std::time::Duration)>,
+) -> Result<(qemu::Outcome, u64), String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
-    let programs: &[ImageProgram] = if mode == Mode::Restart {
-        &PROGRAMS_RESTART
-    } else {
-        &PROGRAMS
-    };
+    let programs = programs_of(mode, breaks);
     let image = write_boot_image_files(
         mode.image(),
-        programs,
+        &programs,
         BOOT_PROFILE,
         &[("STAFETO_DATA_POSIX_MODE", mode.role())],
         Vec::new(),
@@ -381,9 +486,13 @@ pub fn probe(mode: Mode, machine: &qemu::Machine) -> Result<(), String> {
         std::process::id(),
         mode.role()
     )));
+    let big = matches!(
+        mode,
+        Mode::Throughput | Mode::Fast | Mode::Atomic | Mode::Steps
+    );
     crate::data_image::make_posix_volume(
         &disk.0,
-        if mode == Mode::Throughput {
+        if big {
             THROUGHPUT_DISK_BYTES
         } else {
             DISK_BYTES
@@ -391,21 +500,628 @@ pub fn probe(mode: Mode, machine: &qemu::Machine) -> Result<(), String> {
     )?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::store(&disk.0, None));
+    if how.cpus > 0 {
+        cmd.args(["-smp", &how.cpus.to_string()]);
+    }
+    if how.icount {
+        cmd.args(["-icount", "shift=4,sleep=on"]);
+    }
     let started = std::time::Instant::now();
-    let output = run_until(cmd, mode.limit(), Some(ENDS), &kernel.elf)?;
+    let output = match stop_on {
+        // The lines that end the run once all of them are on the console: the guest is stopped then.
+        Some((markers, limit)) => {
+            let markers: Vec<&str> = markers.iter().map(String::as_str).collect();
+            crate::run_until_all(cmd, limit, &markers, &kernel.elf)?
+        }
+        None => run_until(cmd, mode.limit(), Some(ENDS), &kernel.elf)?,
+    };
+    Ok((output, started.elapsed().as_secs()))
+}
+
+/// One mode: the image with the role of the mode, a volume made offline, QEMU until the probe ends,
+/// and the lines read.
+pub fn probe(mode: Mode, machine: &qemu::Machine) -> Result<(), String> {
+    run(mode, machine, Boot::default())
+}
+
+fn run(mode: Mode, machine: &qemu::Machine, how: Boot) -> Result<(), String> {
+    let (output, seconds) = boot(mode, machine, how)?;
     read_lines(&output.lines, mode)?;
-    if mode == Mode::Restart {
+    if matches!(mode, Mode::Restart | Mode::Atomic) {
         restarted(&output.lines)?;
     }
+    let report = match mode {
+        Mode::Fast => Some(fast_verdict(&output.lines)?),
+        Mode::Steps => Some(steps_verdict(&output.lines, how.cpus)?),
+        _ => None,
+    };
     qemu::expect_stopped_on(&output, ENDED)?;
+    if let Some(report) = report {
+        println!("{report}");
+    }
     println!(
         "data-posix {:?} on {}: {} checks of /data in the POSIX layer over the data file service in {} s: ok",
         mode,
         machine.name,
         mode.checks().len(),
-        started.elapsed().as_secs()
+        seconds
     );
     Ok(())
+}
+
+/// `data-steps`: the steps of the service under `-icount` on one CPU (`steps_icount`), then the CPU
+/// time of the worker's parts in real time on two CPUs, where the table gives the worker the budget
+/// `work` (`steps_budget`).
+pub fn steps(machine: &qemu::Machine) -> Result<(), String> {
+    steps_icount(machine)?;
+    steps_budget(machine)
+}
+
+/// The steps of the loop, the map and unmap of a cell, and the stat of another file, under `-icount`
+/// on one CPU: the instruction count is the clock, so the figures repeat.
+pub fn steps_icount(machine: &qemu::Machine) -> Result<(), String> {
+    run(
+        Mode::Steps,
+        machine,
+        Boot {
+            cpus: 1,
+            icount: true,
+        },
+    )
+}
+
+/// The CPU time of the parts by the budget `work`, in real time on two CPUs.
+pub fn steps_budget(machine: &qemu::Machine) -> Result<(), String> {
+    run(
+        Mode::Steps,
+        machine,
+        Boot {
+            cpus: 2,
+            icount: false,
+        },
+    )
+}
+
+/// The deliberate breaks of the service that `data-atomic` must catch, and the check each fails.
+pub const BREAKS: [(&str, &str); 3] = [
+    (
+        "break-datafs-lease-hold",
+        "1 MiB writes and reads never mix",
+    ),
+    ("break-datafs-append-end", "O_APPEND 200 KiB records whole"),
+    ("break-datafs-cell-kept", "the service keeps no cell mapped"),
+];
+
+/// The longest an atomic-break run lasts: a break is caught within minutes, and a run that is not
+/// caught by then is a failure that names what was missing.
+const ATOMIC_BREAK_LIMIT: std::time::Duration = std::time::Duration::from_secs(8 * 60);
+
+/// `cargo xtask data-posix atomic-break FEATURE[,FEATURE]`: the atomic probe on a service with the
+/// breaks (the features that do not spoil each other's check go in one boot); it passes when the check
+/// of each break FAILED.
+pub fn atomic_break(features: &str, machine: &qemu::Machine) -> Result<(), String> {
+    let mut chosen: Vec<(&'static str, &'static str)> = Vec::new();
+    for name in features.split(',') {
+        let Some(&entry) = BREAKS.iter().find(|b| b.0 == name) else {
+            return Err(format!(
+                "data-posix atomic-break: {name} is not one of {:?}",
+                BREAKS.map(|b| b.0)
+            ));
+        };
+        chosen.push(entry);
+    }
+    // The run ends as soon as every expected line of a failed check is on the console, and a run that
+    // ends or times out before that fails with the lines still missing.
+    let wanted: Vec<String> = chosen
+        .iter()
+        .map(|(_, check)| format!("{PREFIX}{check} FAILED"))
+        .collect();
+    let (output, seconds) = boot_with(
+        Mode::Atomic,
+        machine,
+        Boot::default(),
+        &chosen.iter().map(|b| b.0).collect::<Vec<_>>(),
+        Some((&wanted, ATOMIC_BREAK_LIMIT)),
+    )?;
+    if !output.stopped_on_marker {
+        let missing: Vec<&String> = wanted
+            .iter()
+            .filter(|w| !output.lines.iter().any(|l| l.contains(w.as_str())))
+            .collect();
+        let how = if output.timed_out {
+            format!("timed out after {} s", ATOMIC_BREAK_LIMIT.as_secs())
+        } else {
+            "ended".to_owned()
+        };
+        return Err(format!(
+            "data-posix atomic-break: the run {how} in {seconds} s before the failed checks showed; missing: {missing:?}"
+        ));
+    }
+    let failed: Vec<&str> = output
+        .lines
+        .iter()
+        .filter_map(|l| l.find(PREFIX).map(|at| &l[at..]))
+        .filter(|l| l.ends_with(" FAILED"))
+        .collect();
+    for (feature, check) in &chosen {
+        let want = format!("{PREFIX}{check} FAILED");
+        if !failed.iter().any(|l| **l == *want) {
+            return Err(format!(
+                "data-posix atomic-break: {feature} did not fail {check:?}; the checks that failed: {failed:?}"
+            ));
+        }
+        println!("data-posix atomic-break: {feature} is caught by {check:?}");
+    }
+    println!("data-posix atomic-break: all that failed: {failed:?} (in {seconds} s)");
+    Ok(())
+}
+
+// ---------------------------------------------------------------- the verdicts
+
+/// The times of 64 MiB on the Mac under QEMU, in milliseconds: the figures of the plan, printed in the
+/// report line and judged by nothing (the bounds below hold on any host).
+pub const FAST_WRITE_MS_REFERENCE: u64 = 6_000;
+pub const FAST_READ_MS_REFERENCE: u64 = 8_000;
+/// The blocks of the 64 MiB file.
+const FAST_BLOCKS: u64 = 64 * 1024 * 1024 / 4096;
+/// The write phase writes at most one block of the disk for each block of the file and 64 more
+/// (the tree and the log), and reads at most this many for each block (the pointers of the ctz skip
+/// list, 0.5, with 0.1 of margin): littlefs does not read a program back (`trust_prog`) and keeps the
+/// block it wrote in the read cache.
+pub const FAST_WRITE_DISK_WRITES_MAX: u64 = FAST_BLOCKS + 64;
+pub const FAST_WRITE_DISK_READS_PER_BLOCK_MAX: f64 = 0.6;
+/// The reads of the disk for each block of 4 KiB of the file in the read, at most.
+pub const FAST_READS_PER_BLOCK_MAX: f64 = 2.05;
+/// The time of one disk operation in the write phase (reads and writes of the disk) is at most this
+/// many times the time of one in the read phase of the same run.
+pub const FAST_WRITE_OP_TIME_RATIO_MAX: f64 = 1.35;
+/// The speed of the big read against the control of 1,000 bytes read in the same run: the ratio
+/// measured on the Mac and on the runners of GitHub (the lower of the two, 2.53 on a runner), and
+/// the share of it the check requires.
+pub const FAST_READ_RATIO_MAC: f64 = 2.49;
+pub const FAST_READ_RATIO_RUNNER: f64 = 2.53;
+pub const FAST_READ_RATIO_SHARE: f64 = 0.8;
+/// The controls of 1,000 bytes (the old path) run at least this fast, in KiB/s: the speed of 0.6.0
+/// was 2,106 (write) and 1,352 (read) on 64 MiB.
+const FAST_CONTROL_KIB_MIN: u64 = 500;
+
+/// The digits that follow the first `key` in `line`.
+fn number_after(line: &str, key: &str) -> Option<u64> {
+    let rest = &line[line.find(key)? + key.len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// The digits that end the text before the first `key` in `line`.
+fn number_before(line: &str, key: &str) -> Option<u64> {
+    let head = &line[..line.find(key)?];
+    let digits: String = head
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    digits.parse().ok()
+}
+
+/// What a line `posix-data: fast TAG write|read ...` tells.
+#[derive(Debug, PartialEq, Eq)]
+struct Phase {
+    ms: u64,
+    kib_s: u64,
+    cell: u64,
+    inline: u64,
+    /// The calls of a write, the mismatches of a read.
+    last: u64,
+}
+
+fn phase(lines: &[String], tag: &str, what: &str) -> Result<Phase, String> {
+    let key = format!("posix-data: fast {tag} {what} ");
+    let line = lines
+        .iter()
+        .find(|l| l.contains(&key))
+        .ok_or_else(|| format!("data-fast: no line {key:?}"))?;
+    let read = || -> Option<Phase> {
+        Some(Phase {
+            ms: number_after(line, " in ")?,
+            kib_s: number_after(line, " ms: ")?,
+            cell: number_before(line, " cell parts")?,
+            inline: number_before(line, " inline parts")?,
+            last: if what == "write" {
+                number_before(line, " calls")?
+            } else {
+                number_before(line, " mismatches")?
+            },
+        })
+    };
+    read().ok_or_else(|| format!("data-fast: the line is not read: {line:?}"))
+}
+
+/// The counters of the disk the service said (`datafs: disk reads R writes W`): the last pair said
+/// before each of the marks `begin write`, `begin read` and the first one after `end read` (the
+/// service says its counters after 100 ms of quiet, and the probe waits 300 ms at each mark).
+#[derive(Debug, PartialEq, Eq)]
+struct DiskOps {
+    write_reads: u64,
+    write_writes: u64,
+    read_reads: u64,
+}
+
+fn disk_ops(lines: &[String]) -> Result<DiskOps, String> {
+    let pair = |l: &str| {
+        Some((
+            number_after(l, "datafs: disk reads ")?,
+            number_after(l, " writes ")?,
+        ))
+    };
+    type Pair = Option<(u64, u64)>;
+    let (mut last, mut begin_write, mut begin_read, mut ended): (Pair, Pair, Pair, bool) =
+        (None, None, None, false);
+    for l in lines {
+        if l.contains("posix-data: fast mark begin write") {
+            begin_write = last;
+        } else if l.contains("posix-data: fast mark begin read") {
+            begin_read = last;
+        } else if l.contains("posix-data: fast mark end read") {
+            ended = true;
+        } else if let Some(now) = pair(l) {
+            if ended {
+                let (w0, r0) = (
+                    begin_write.ok_or("data-fast: no counter of the disk before the write")?,
+                    begin_read.ok_or("data-fast: no counter of the disk before the read")?,
+                );
+                let back = || "data-fast: the counter of the disk went back".to_owned();
+                return Ok(DiskOps {
+                    write_reads: r0.0.checked_sub(w0.0).ok_or_else(back)?,
+                    write_writes: r0.1.checked_sub(w0.1).ok_or_else(back)?,
+                    read_reads: now.0.checked_sub(r0.0).ok_or_else(back)?,
+                });
+            }
+            last = Some(now);
+        }
+    }
+    Err("data-fast: the service said no counter of the disk after the read (is it built with `count`?)".into())
+}
+
+/// The verdict of `data-fast` on the lines: the bounds of the plan (section 7.1) and the controls.
+/// The report: the times, the parts and the reads of the disk for each block.
+pub fn fast_verdict(lines: &[String]) -> Result<String, String> {
+    let write = phase(lines, "big", "write")?;
+    let read = phase(lines, "big", "read")?;
+    let parts = 64 * 1024 * 1024 / (64 * 1024);
+    if write.cell < parts || write.inline != 0 || read.cell < parts || read.inline != 0 {
+        return Err(format!(
+            "data-fast: 64 MiB went in {} cell parts and {} inline parts (write), {} and {} (read), {parts} cell parts of 64 KiB expected",
+            write.cell, write.inline, read.cell, read.inline
+        ));
+    }
+    if read.last != 0 {
+        return Err(format!(
+            "data-fast: {} blocks of 1 MiB read back differ from what was written",
+            read.last
+        ));
+    }
+    let ops = disk_ops(lines)?;
+    let per_block = ops.read_reads as f64 / FAST_BLOCKS as f64;
+    if per_block > FAST_READS_PER_BLOCK_MAX {
+        return Err(format!(
+            "data-fast: {} reads of the disk for {FAST_BLOCKS} blocks, {per_block:.2} for each, over {FAST_READS_PER_BLOCK_MAX} in the read",
+            ops.read_reads
+        ));
+    }
+    let write_reads_max = (FAST_WRITE_DISK_READS_PER_BLOCK_MAX * FAST_BLOCKS as f64) as u64;
+    if ops.write_writes > FAST_WRITE_DISK_WRITES_MAX || ops.write_reads > write_reads_max {
+        return Err(format!(
+            "data-fast: the write made {} writes (at most {FAST_WRITE_DISK_WRITES_MAX}) and {} reads (at most {write_reads_max}) of the disk",
+            ops.write_writes, ops.write_reads
+        ));
+    }
+    let write_ops = ops.write_reads + ops.write_writes;
+    let (write_op_us, read_op_us) = (
+        write.ms as f64 * 1000.0 / write_ops.max(1) as f64,
+        read.ms as f64 * 1000.0 / ops.read_reads.max(1) as f64,
+    );
+    let op_ratio = write_op_us / read_op_us;
+    if op_ratio > FAST_WRITE_OP_TIME_RATIO_MAX {
+        return Err(format!(
+            "data-fast: a disk operation of the write phase took {write_op_us:.1} us ({write_ops} in {} ms) and one of the read phase {read_op_us:.1} us ({} in {} ms), {op_ratio:.2} times, over {FAST_WRITE_OP_TIME_RATIO_MAX}",
+            write.ms, ops.read_reads, read.ms
+        ));
+    }
+    // The control of 4,096 bytes: a call of one part through a cell; of 1,000: the old path, by
+    // messages, at the speed of the release before.
+    let (w4, r4) = (
+        phase(lines, "bs4096", "write")?,
+        phase(lines, "bs4096", "read")?,
+    );
+    let (w1, r1) = (
+        phase(lines, "bs1000", "write")?,
+        phase(lines, "bs1000", "read")?,
+    );
+    let calls4 = 4 * 1024 * 1024 / 4096;
+    if w4.cell != calls4 || w4.inline != 0 || r4.cell != calls4 || r4.inline != 0 {
+        return Err(format!(
+            "data-fast: bs 4096 went in {}+{} parts (write cell+inline) and {}+{} (read), {calls4} cell parts expected",
+            w4.cell, w4.inline, r4.cell, r4.inline
+        ));
+    }
+    if w1.cell + w1.inline + r1.cell + r1.inline != 0 {
+        return Err(format!(
+            "data-fast: bs 1000 is one message a call and made {} parts",
+            w1.cell + w1.inline + r1.cell + r1.inline
+        ));
+    }
+    if r4.last != 0 || r1.last != 0 {
+        return Err("data-fast: a control read back other bytes than it wrote".into());
+    }
+    for (what, kib) in [("write", w1.kib_s), ("read", r1.kib_s)] {
+        if kib < FAST_CONTROL_KIB_MIN {
+            return Err(format!(
+                "data-fast: the control of 1,000 bytes {what} ran at {kib} KiB/s, under {FAST_CONTROL_KIB_MIN}"
+            ));
+        }
+    }
+    let share = FAST_READ_RATIO_SHARE * FAST_READ_RATIO_MAC.min(FAST_READ_RATIO_RUNNER);
+    let ratio = read.kib_s as f64 / r1.kib_s.max(1) as f64;
+    if ratio < share {
+        return Err(format!(
+            "data-fast: the read of 64 MiB ran at {} KiB/s, {ratio:.2} times the control of 1,000 bytes ({} KiB/s), under {share:.2}",
+            read.kib_s, r1.kib_s
+        ));
+    }
+    Ok(format!(
+        "data-fast: write 64 MiB {} ms ({} KiB/s, Mac reference {FAST_WRITE_MS_REFERENCE}), read {} ms ({} KiB/s, Mac reference {FAST_READ_MS_REFERENCE}); the write made {} disk writes and {} reads ({write_op_us:.1} us an operation), the read {} reads = {per_block:.2} for each of {FAST_BLOCKS} blocks ({read_op_us:.1} us an operation, the write phase {op_ratio:.2} times, bound {FAST_WRITE_OP_TIME_RATIO_MAX}); the big read is {ratio:.2} times the control of 1,000 bytes (bound {share:.2}); controls 4 MiB: bs 4096 write {} read {} KiB/s, bs 1000 write {} read {} KiB/s",
+        write.ms,
+        write.kib_s,
+        read.ms,
+        read.kib_s,
+        ops.write_writes,
+        ops.write_reads,
+        ops.read_reads,
+        w4.kib_s,
+        r4.kib_s,
+        w1.kib_s,
+        r1.kib_s
+    ))
+}
+
+/// Under `-icount` on one CPU the worker's own time for a part of 64 KiB, the mean over the pass of
+/// 64 MiB, at most this many microseconds: 31.5 ms for a write part (a block of 4 KiB written costs
+/// the copy, the program and the walk of the skip list of littlefs) and 3.8 ms for a read part.
+pub const PART_OWN_WRITE_MEAN_MAX_US: u64 = 31_500;
+pub const PART_OWN_READ_MEAN_MAX_US: u64 = 3_800;
+/// On two CPUs in real time the share of the worker's CPU time in the span of the parts, at most, in
+/// percent.
+pub const WORKER_SHARE_MAX_PERCENT: u64 = 30;
+/// The service's step of a part, in ticks, the most (the goal of READ and WRITE).
+const PART_STEP_MAX: u64 = 6_000;
+/// The step of a write part that carries its data in the message (kinds 39 WriteFrom and 40
+/// PwriteFrom, a call with no cell), in ticks, the most: the loop copies the whole message twice in
+/// the step (the receive into the loop's buffer and the queue into the job), at about half a tick a
+/// byte each, and the same again is margin.
+const INLINE_PART_STEP_MAX: u64 = PART_STEP_MAX + 2 * abi::MESSAGE_MAX as u64;
+
+/// The bound of a step of the parts method `kind`: the write parts that may carry their data in the
+/// message have their own.
+fn part_step_max(kind: usize) -> u64 {
+    match kind {
+        39 | 40 => INLINE_PART_STEP_MAX,
+        _ => PART_STEP_MAX,
+    }
+}
+
+/// What a line `datafs: parts write|read n N cpu mean M us max X us total T us own mean M us max X us
+/// span S us` tells (all in microseconds).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Parts {
+    pub n: u64,
+    pub cpu_mean: u64,
+    pub cpu_max: u64,
+    pub cpu_total: u64,
+    pub own_mean: u64,
+    pub own_max: u64,
+    pub span: u64,
+}
+
+/// The parts of a 64 MiB pass (`PASS_PARTS` of 64 KiB).
+const PASS_PARTS: u64 = 1024;
+
+/// The first line of the service about the parts of the direction `what` (`write` or `read`) that
+/// counts a whole pass of 64 MiB: the totals are cumulative, and the pass of `data-fast` is the first
+/// work of the run, so this line is its own (the figures of the later checks are not in it).
+pub fn parts_line(lines: &[String], what: &str) -> Option<Parts> {
+    let key = format!("datafs: parts {what} ");
+    lines.iter().filter(|l| l.contains(&key)).find_map(|line| {
+        let words: Vec<&str> = line[line.find(&key)? + key.len()..]
+            .split_whitespace()
+            .collect();
+        let at = |i: usize| -> Option<u64> { words.get(i)?.parse().ok() };
+        // n N cpu mean M us max X us total T us own mean M us max X us span S us
+        let parts = Parts {
+            n: at(1)?,
+            cpu_mean: at(4)?,
+            cpu_max: at(7)?,
+            cpu_total: at(10)?,
+            own_mean: at(14)?,
+            own_max: at(17)?,
+            span: at(20)?,
+        };
+        (parts.n >= PASS_PARTS).then_some(parts)
+    })
+}
+
+/// The longest job of any method the service told (`datafs: job <method> longest N us`), in us.
+fn longest_job_us(lines: &[String]) -> u64 {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let at = l.find("datafs: job ")?;
+            number_after(&l[at..], " longest ")
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The verdict of `data-steps` on the lines of a run on `cpus` CPUs: one CPU is the run under `-icount`,
+/// two CPUs the run in real time. On one CPU under `-icount` the steps count: the loop's steps (0.9 B, a
+/// method of the parts 6,000 ticks) and the map and unmap of a cell (B) are judged, and the worker's own
+/// time for a part is told (an instruction is 16 ns there). On two CPUs the figures of the steps are told
+/// and judged by nothing (the instruction count of two CPUs is not one clock: the unmap of a cell waits
+/// for the other CPU); there the worker has the budget `work`, and the CPU time of a part of 64 KiB (the share of the
+/// worker at most 30 %) comes from it. A stat of another file during the write is judged
+/// against four jobs on both. The report: the figures.
+pub fn steps_verdict(lines: &[String], cpus: usize) -> Result<String, String> {
+    let rows = crate::step_line::longest(lines, crate::data_probe::DATAFS_TAG);
+    for kind in [37, 39] {
+        if !rows.iter().any(|r| r.0 == kind) {
+            return Err(format!(
+                "data-steps: no step of the method {kind}: {rows:?}"
+            ));
+        }
+    }
+    let histogram = |what: &str| {
+        let key = format!("datafs: cell {what} ticks ");
+        lines
+            .iter()
+            .rev()
+            .find_map(|l| l.find(&key).map(|at| l[at + key.len()..].to_owned()))
+            .unwrap_or_default()
+    };
+    let (map, unmap) = if cpus == 1 {
+        crate::step_line::within_b(
+            lines,
+            crate::data_probe::DATAFS_TAG,
+            crate::step_line::Kinds::All,
+        )?;
+        if let Some(row) = rows.iter().find(|r| r.1 > crate::blk_probe::STEP_MAX) {
+            return Err(format!(
+                "data-steps: a step past 0.9 of term B ({}): {row:?}",
+                crate::blk_probe::STEP_MAX
+            ));
+        }
+        if let Some(row) = rows
+            .iter()
+            .find(|r| (36..=42).contains(&r.0) && r.1 > part_step_max(r.0))
+        {
+            return Err(format!(
+                "data-steps: a step of a method of the parts past {} ticks: {row:?}",
+                part_step_max(row.0)
+            ));
+        }
+        let wall = crate::data_probe::cell_longest(lines)?;
+        // The wall time and the histograms come first: the judged figure follows them.
+        println!(
+            "data-steps: cell map and unmap by wall time (preemptions included, told only): longest {wall:?}; calls of a cell map by length [{}], unmap [{}] (the bounds of the buckets are 4500, 6000, 8000, 12000, 16000, 20410 ticks)",
+            histogram("map"),
+            histogram("unmap")
+        );
+        crate::data_probe::cell_verdict(lines)?
+    } else {
+        crate::data_probe::cell_longest(lines)?
+    };
+    let stretches = crate::data_probe::worker_verdict(lines)?;
+    let mut report = format!(
+        "data-steps on {cpus} CPUs{}: steps of the loop (kind, judged ticks, detail) {rows:?}; the longest map of a cell {map} ticks, unmap {unmap} ({}; the bound is {}, term B {}); calls of a cell map by wall length [{}], unmap [{}]; worker wall stretches {stretches:?}",
+        if cpus == 1 {
+            " under -icount"
+        } else {
+            " in real time (the steps are only told)"
+        },
+        if cpus == 1 {
+            "kernel ticks of the calls with no step of the loop in them"
+        } else {
+            "wall time, told only"
+        },
+        crate::data_probe::CELL_QUIET_MAX,
+        crate::TERM_B,
+        histogram("map"),
+        histogram("unmap")
+    );
+    for what in ["write", "read"] {
+        let parts = parts_line(lines, what)
+            .ok_or_else(|| format!("data-steps: no line of the parts {what} of the worker"))?;
+        report.push_str(&format!(
+            "; parts {what}: {} of 64 KiB, own mean {} us max {} us (wall less the disk, preemptions included{})",
+            parts.n,
+            parts.own_mean,
+            parts.own_max,
+            if cpus == 1 {
+                format!(
+                    "; at 16 ns an instruction that is about {} instructions on average",
+                    parts.own_mean * 1000 / 16
+                )
+            } else {
+                String::new()
+            }
+        ));
+        if cpus == 1 {
+            let max = if what == "write" {
+                PART_OWN_WRITE_MEAN_MAX_US
+            } else {
+                PART_OWN_READ_MEAN_MAX_US
+            };
+            if parts.own_mean > max {
+                return Err(format!(
+                    "data-steps: a part of 64 KiB ({what}) took {} us of the worker's own time on average under -icount on one CPU, over {max} us; the longest {} us",
+                    parts.own_mean, parts.own_max
+                ));
+            }
+        } else {
+            if parts.cpu_total == 0 {
+                return Err(format!(
+                    "data-steps: the budget of the worker counted no CPU time for the parts {what}"
+                ));
+            }
+            let share_tenths = parts.cpu_total * 1000 / parts.span.max(1);
+            if parts.cpu_total * 100 > WORKER_SHARE_MAX_PERCENT * parts.span.max(1) {
+                return Err(format!(
+                    "data-steps: the worker's share while the parts {what} ran was {}.{} % ({} us of {} us), over {WORKER_SHARE_MAX_PERCENT} %",
+                    share_tenths / 10,
+                    share_tenths % 10,
+                    parts.cpu_total,
+                    parts.span
+                ));
+            }
+            report.push_str(&format!(
+                ", the worker's share while the parts ran {}.{} % ({} us of {} us, bound {WORKER_SHARE_MAX_PERCENT} %); CPU by the budget `work`, told only: mean {} us a part of 64 KiB, {} us a call of 1 MiB (16 parts), max {} us a part",
+                share_tenths / 10,
+                share_tenths % 10,
+                parts.cpu_total,
+                parts.span,
+                parts.cpu_mean,
+                parts.cpu_mean * 16,
+                parts.cpu_max
+            ));
+        }
+    }
+    // The loop's own budget (100 us in each 10 ms) overruns in real time about once a part: the
+    // steps of the loop are judged under -icount only.
+    report.push_str(if cpus == 1 {
+        "; the steps of the loop are judged here (under -icount)"
+    } else {
+        "; the steps of the loop are not judged in real time: its budget of 100 us in each 10 ms overruns about once a part, and they are judged under -icount only"
+    });
+    let stat_line = lines
+        .iter()
+        .find(|l| l.contains("posix-data: stat of another file during the write: "))
+        .ok_or("data-steps: no line of the stat beside the write")?;
+    let (calls, longest) = (
+        number_after(stat_line, "write: ").unwrap_or(0),
+        number_after(stat_line, "longest ").unwrap_or(u64::MAX),
+    );
+    let job = longest_job_us(lines);
+    let bound = 4 * job + 5_000;
+    if calls == 0 || longest > bound {
+        return Err(format!(
+            "data-steps: a stat of another file during the write took {longest} us over {calls} calls, over four jobs ({job} us the longest) and 5 ms = {bound} us"
+        ));
+    }
+    report.push_str(&format!(
+        "; stat of another file during the write: {calls} calls, longest {longest} us (four jobs of {job} us and 5 ms: {bound} us)"
+    ));
+    Ok(report)
 }
 
 /// The machine is cut after the sector the point names was written (the service built for the crash
@@ -724,6 +1440,9 @@ mod tests {
             Mode::Cap,
             Mode::Full,
             Mode::Restart,
+            Mode::Fast,
+            Mode::Atomic,
+            Mode::Steps,
         ] {
             assert_eq!(read_lines(&good_of(mode), mode), Ok(()), "{mode:?}");
             // The end of another mode is not the end of this one.
@@ -760,6 +1479,9 @@ mod tests {
             ("full_run", Mode::Full),
             ("restart_run", Mode::Restart),
             ("throughput_run", Mode::Throughput),
+            ("fast_run", Mode::Fast),
+            ("atomic_run", Mode::Atomic),
+            ("steps_run", Mode::Steps),
         ] {
             let in_c = checks_of_function(source, role);
             assert_eq!(
@@ -836,5 +1558,274 @@ mod tests {
         assert!(restarted(&lines).unwrap_err().contains("1 times"));
         lines.push("datafs: root registered with the process service".to_owned());
         assert_eq!(restarted(&lines), Ok(()));
+    }
+
+    fn lines(texts: &[&str]) -> Vec<String> {
+        texts.iter().map(|t| (*t).to_owned()).collect()
+    }
+
+    /// The disk operations a good run of `data-fast` counts in its two phases.
+    struct Ops {
+        write_reads: u64,
+        write_writes: u64,
+        read_reads: u64,
+    }
+
+    const GOOD_OPS: Ops = Ops {
+        write_reads: 8_192,
+        write_writes: 16_416,
+        read_reads: 32_768,
+    };
+
+    /// The lines a good run of `data-fast` prints (the service's counters between the marks).
+    fn fast_lines(write_ms: u64, read_ms: u64, ops: Ops, read_kib_s: u64) -> Vec<String> {
+        lines(&[
+            "datafs: disk reads 100 writes 50 flushes 3",
+            "posix-data: fast mark begin write",
+            &format!(
+                "posix-data: fast big write 64 MiB bs 1048576 in {write_ms} ms: 30000 KiB/s, 1024 cell parts, 0 inline parts, 64 calls"
+            ),
+            &format!(
+                "datafs: disk reads {} writes {} flushes 9",
+                100 + ops.write_reads,
+                50 + ops.write_writes
+            ),
+            "posix-data: fast mark begin read",
+            &format!(
+                "posix-data: fast big read 64 MiB bs 1048576 in {read_ms} ms: {read_kib_s} KiB/s, 1024 cell parts, 0 inline parts, 0 mismatches"
+            ),
+            "posix-data: fast mark end read",
+            &format!(
+                "datafs: disk reads {} writes {} flushes 9",
+                100 + ops.write_reads + ops.read_reads,
+                50 + ops.write_writes
+            ),
+            "posix-data: fast bs4096 write 4 MiB bs 4096 in 900 ms: 4500 KiB/s, 1024 cell parts, 0 inline parts, 1024 calls",
+            "posix-data: fast bs4096 read 4 MiB bs 4096 in 500 ms: 8000 KiB/s, 1024 cell parts, 0 inline parts, 0 mismatches",
+            "posix-data: fast bs1000 write 4 MiB bs 1000 in 2000 ms: 2000 KiB/s, 0 cell parts, 0 inline parts, 4194 calls",
+            "posix-data: fast bs1000 read 4 MiB bs 1000 in 2500 ms: 1600 KiB/s, 0 cell parts, 0 inline parts, 0 mismatches",
+        ])
+    }
+
+    fn ops(write_reads: u64, write_writes: u64, read_reads: u64) -> Ops {
+        Ops {
+            write_reads,
+            write_writes,
+            read_reads,
+        }
+    }
+
+    #[test]
+    fn data_fast_passes_a_run_inside_the_bounds_and_says_the_numbers() {
+        let report = fast_verdict(&fast_lines(4200, 6000, GOOD_OPS, 10_900)).unwrap();
+        assert!(
+            report.contains("4200 ms") && report.contains("2.00 for each"),
+            "{report}"
+        );
+        // The edges: at the bound passes, one past fails.
+        let top = ops(
+            (FAST_WRITE_DISK_READS_PER_BLOCK_MAX * FAST_BLOCKS as f64) as u64,
+            FAST_WRITE_DISK_WRITES_MAX,
+            (FAST_READS_PER_BLOCK_MAX * FAST_BLOCKS as f64) as u64,
+        );
+        assert!(fast_verdict(&fast_lines(8000, 8000, top, 10_900)).is_ok());
+        let top = || ops(8_192, 16_416, 32_768);
+        for (lines, what) in [
+            (
+                fast_lines(4200, 6000, ops(9_831, 16_416, 32_768), 10_900),
+                "the write made",
+            ),
+            (
+                fast_lines(4200, 6000, ops(8_192, 16_449, 32_768), 10_900),
+                "the write made",
+            ),
+            (
+                fast_lines(4200, 6000, ops(8_192, 16_416, 33_600), 10_900),
+                "reads of the disk",
+            ),
+            // The write phase slower for each operation than the read phase.
+            (fast_lines(11_000, 6000, top(), 10_900), "a disk operation"),
+            // The big read as slow as the old path.
+            (fast_lines(4200, 6000, top(), 3_000), "times the control"),
+        ] {
+            let error = fast_verdict(&lines).unwrap_err();
+            assert!(error.contains(what), "{error}");
+        }
+    }
+
+    #[test]
+    fn data_fast_refuses_a_run_that_lacks_a_line_a_counter_or_the_parts() {
+        let good = fast_lines(4200, 6000, GOOD_OPS, 10_900);
+        // No line of the controls, no counter after the read.
+        for gone in [11, 7] {
+            let mut lines = good.clone();
+            lines.remove(gone);
+            assert!(fast_verdict(&lines).is_err(), "line {gone}");
+        }
+        let mut before = good.clone();
+        before.retain(|l| !l.contains("mark begin write"));
+        assert!(
+            fast_verdict(&before)
+                .unwrap_err()
+                .contains("before the write")
+        );
+        // The big write through messages (a refused window) is not the large path.
+        let mut inline = good.clone();
+        inline[2] = "posix-data: fast big write 64 MiB bs 1048576 in 2400 ms: 30000 KiB/s, 0 cell parts, 65536 inline parts, 64 calls".into();
+        assert!(fast_verdict(&inline).unwrap_err().contains("cell parts"));
+        // A read that came back wrong.
+        let mut wrong = good.clone();
+        wrong[5] = wrong[5].replace("0 mismatches", "3 mismatches");
+        assert!(fast_verdict(&wrong).unwrap_err().contains("differ"));
+        // The control of 1,000 bytes made parts: it is not the old path.
+        let mut parts = good.clone();
+        parts[11] = parts[11].replace("0 cell parts", "5 cell parts");
+        assert!(fast_verdict(&parts).is_err());
+        // The control of 4,096 bytes that did not go through the window.
+        let mut small = good;
+        small[8] = small[8].replace(
+            "1024 cell parts, 0 inline parts",
+            "0 cell parts, 1024 inline parts",
+        );
+        assert!(fast_verdict(&small).is_err());
+    }
+
+    #[test]
+    fn the_parts_line_of_the_service_is_read_and_the_numbers_of_the_helpers_are_the_digits_next_to_their_text()
+     {
+        let line = lines(&[
+            "datafs: parts write n 1024 cpu mean 700 us max 900 us total 716800 us own mean 800 us max 1000 us span 2000000 us",
+        ]);
+        assert_eq!(
+            parts_line(&line, "write"),
+            Some(Parts {
+                n: 1024,
+                cpu_mean: 700,
+                cpu_max: 900,
+                cpu_total: 716_800,
+                own_mean: 800,
+                own_max: 1000,
+                span: 2_000_000
+            })
+        );
+        assert_eq!(parts_line(&line, "read"), None);
+        // A line of a shorter pass is not the pass of 64 MiB.
+        let short = lines(&[
+            "datafs: parts write n 5 cpu mean 700 us max 900 us total 3500 us own mean 800 us max 1000 us span 20000 us",
+        ]);
+        assert_eq!(parts_line(&short, "write"), None);
+        assert_eq!(number_after("a in 12 ms", " in "), Some(12));
+        assert_eq!(number_before("x 7 cell parts", " cell parts"), Some(7));
+        assert_eq!(number_before("cell parts", " cell parts"), None);
+    }
+
+    /// The lines of a good run of the steps on `cpus` CPUs: the figures of the service and the probe.
+    fn steps_lines(cpu_total: u64, stat_us: u64, own_mean: u64) -> Vec<String> {
+        lines(&[
+            "service step: 17 kind 37 4000 ticks detail 65536",
+            "service step: 17 kind 39 4500 ticks detail 65536",
+            "service step: 17 kind 64 1000 ticks detail 0",
+            "datafs: cell map longest 4115 ticks (pages 16, call 1, access rw)",
+            "datafs: cell unmap longest 3000 ticks (pages 16, call 2, access -)",
+            "datafs: cell map quiet longest 3800 ticks (quiet calls 5, call 1)",
+            "datafs: cell unmap quiet longest 2900 ticks (quiet calls 5, call 2)",
+            "datafs: worker wall stretch WriteFrom 9000 ticks",
+            "datafs: worker wall stretch ReadInto 9000 ticks",
+            "datafs: worker wall stretch PreadInto 9000 ticks",
+            "datafs: job WriteFrom longest 2500 us",
+            &format!(
+                "datafs: parts write n 1024 cpu mean 700 us max 1000 us total {cpu_total} us own mean {own_mean} us max 1200 us span 2000000 us"
+            ),
+            &format!(
+                "datafs: parts read n 1024 cpu mean 700 us max 1000 us total {cpu_total} us own mean {own_mean} us max 1200 us span 2000000 us"
+            ),
+            &format!(
+                "posix-data: stat of another file during the write: 300 calls, longest {stat_us} us"
+            ),
+        ])
+    }
+
+    #[test]
+    fn data_steps_judges_the_share_of_the_worker_in_real_time_and_the_own_time_of_a_part_under_icount()
+     {
+        let report = steps_verdict(&steps_lines(500_000, 9000, 900), 2).unwrap();
+        assert!(
+            report.contains("share while the parts ran 25.0 %"),
+            "{report}"
+        );
+        assert!(report.contains("judged under -icount only"), "{report}");
+        // 30 % of the span passes, a tenth over fails; a mean CPU of a part is only told.
+        assert!(steps_verdict(&steps_lines(600_000, 15_000, 900), 2).is_ok());
+        let slow = steps_verdict(&steps_lines(601_000, 9000, 900), 2).unwrap_err();
+        assert!(slow.contains("share"), "{slow}");
+        assert!(steps_verdict(&steps_lines(500_000, 9000, 900), 2).is_ok());
+        // Under -icount on one CPU the own mean of a part is judged: 31.5 ms a write part, 3.8 ms a read.
+        let mut ok = steps_lines(0, 9000, 31_500);
+        for l in &mut ok {
+            if l.contains("parts read") {
+                *l = l.replace("own mean 31500", "own mean 3800");
+            }
+        }
+        assert!(steps_verdict(&ok, 1).is_ok());
+        let write = steps_verdict(&steps_lines(0, 9000, 31_501), 1).unwrap_err();
+        assert!(
+            write.contains("(write)") && write.contains("31500"),
+            "{write}"
+        );
+        let mut read = ok.clone();
+        for l in &mut read {
+            if l.contains("parts read") {
+                *l = l.replace("own mean 3800", "own mean 3801");
+            }
+        }
+        assert!(steps_verdict(&read, 1).unwrap_err().contains("(read)"));
+        // Four jobs of 2,500 us and 5 ms: 15,000 us.
+        let late = steps_verdict(&steps_lines(500_000, 15_001, 900), 2).unwrap_err();
+        assert!(late.contains("four jobs"), "{late}");
+        // On one CPU there is no budget: the CPU time is not judged (the service says 0).
+        let one = steps_lines(0, 9000, 900);
+        assert!(steps_verdict(&one, 1).unwrap().contains("own mean 900"));
+        assert!(steps_verdict(&one, 2).unwrap_err().contains("no CPU time"));
+        // On one CPU the steps are judged: a step past 0.9 B, a method of the parts past its bound,
+        // a cell map past B; on two CPUs they are told.
+        let mut over = steps_lines(500_000, 9000, 900);
+        over[0] = "service step: 17 kind 37 19000 ticks detail 65536".into();
+        assert!(steps_verdict(&over, 1).is_err());
+        assert!(steps_verdict(&over, 2).is_ok());
+        let mut part = steps_lines(500_000, 9000, 900);
+        part[0] = "service step: 17 kind 37 6500 ticks detail 65536".into();
+        assert!(steps_verdict(&part, 1).unwrap_err().contains("6000"));
+        // A write part with its data in the message copies it twice: its own bound of 8,048 ticks.
+        let mut inline = steps_lines(500_000, 9000, 900);
+        inline[1] = "service step: 17 kind 39 7305 ticks detail 102411".into();
+        assert!(steps_verdict(&inline, 1).is_ok());
+        inline[1] = "service step: 17 kind 39 8049 ticks detail 102411".into();
+        assert!(steps_verdict(&inline, 1).unwrap_err().contains("8048"));
+        let mut missing = steps_lines(500_000, 9000, 900);
+        missing.remove(1);
+        assert!(
+            steps_verdict(&missing, 1)
+                .unwrap_err()
+                .contains("method 39")
+        );
+        let mut map = steps_lines(500_000, 9000, 900);
+        // A long wall time is a preemption and is only told; a long quiet call is judged.
+        map[3] = "datafs: cell map longest 25000 ticks (pages 16, call 1, access rw)".into();
+        assert!(steps_verdict(&map, 1).is_ok());
+        assert!(steps_verdict(&map, 2).is_ok());
+        map[5] = "datafs: cell map quiet longest 12001 ticks (quiet calls 5, call 1)".into();
+        assert!(steps_verdict(&map, 1).unwrap_err().contains("12000"));
+        assert!(steps_verdict(&map, 2).is_ok());
+        map.remove(5);
+        assert!(steps_verdict(&map, 1).unwrap_err().contains("quiet"));
+    }
+
+    #[test]
+    fn the_breaks_of_the_atomic_probe_name_a_check_of_the_probe_and_a_feature_of_the_service() {
+        let manifest = include_str!("../../services/datafs/Cargo.toml");
+        for (feature, check) in BREAKS {
+            assert!(ATOMIC_CHECKS.contains(&check), "{check}");
+            assert!(manifest.contains(&format!("{feature} = [")), "{feature}");
+        }
     }
 }

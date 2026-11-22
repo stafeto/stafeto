@@ -112,6 +112,7 @@ unsafe extern "C" {
     fn datafs_set_orphan_cells(d: *mut c_void, cells: u32);
     fn datafs_set_block_cycles(d: *mut c_void, cycles: i32);
     fn datafs_set_ctz_hints(d: *mut c_void, hints: u32);
+    fn datafs_set_trust_prog(d: *mut c_void, on: u32);
     fn datafs_erases(d: *const c_void) -> u32;
     fn datafs_open_attr(
         d: *mut c_void,
@@ -846,6 +847,13 @@ impl<D: Device> Fs<'_, D> {
     pub fn set_ctz_hints(&mut self, hints: u32) {
         // SAFETY: as `set_orphan_table`.
         unsafe { datafs_set_ctz_hints(self.state.0.as_mut_ptr().cast(), hints) };
+    }
+
+    /// 1 (the service's setting) does not read a program back and keeps the block it wrote in the
+    /// read cache, 0 is the release's read back, before the next mount: the tests compare the two.
+    pub fn set_trust_prog(&mut self, on: u32) {
+        // SAFETY: as `set_orphan_table`.
+        unsafe { datafs_set_trust_prog(self.state.0.as_mut_ptr().cast(), on) };
     }
 
     /// A table of the repair of orphans of `cells` cells (0 is none), before the next mount.

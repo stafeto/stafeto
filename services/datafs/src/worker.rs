@@ -108,6 +108,93 @@ mod stretch {
     }
 }
 
+/// The steps build measures what the worker spends on a part of a full cell (64 KiB): the CPU time
+/// by the budget of the worker (`BudgetInfo.ran` before the pick-up and after the job, the disk
+/// waits spend nothing), and the time of the job less the time in the disk calls (`own`, on any
+/// number of CPUs, preemptions included). `report` says the totals of each direction, `datafs:
+/// parts write|read n N cpu mean M us max X us total T us own mean M us max X us span S us`: the
+/// span is from the pick-up of the first part to the end of the last one, so `cpu total / span` is
+/// the share of the CPU the worker took while the parts ran. `cpu` is 0 for a worker with no budget
+/// (a machine with one CPU).
+#[cfg(feature = "steps")]
+mod parts {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub struct Stat {
+        n: AtomicU64,
+        cpu: AtomicU64,
+        cpu_max: AtomicU64,
+        own: AtomicU64,
+        own_max: AtomicU64,
+        first: AtomicU64,
+        last: AtomicU64,
+        said: AtomicU64,
+    }
+
+    impl Stat {
+        const fn new() -> Stat {
+            Stat {
+                n: AtomicU64::new(0),
+                cpu: AtomicU64::new(0),
+                cpu_max: AtomicU64::new(0),
+                own: AtomicU64::new(0),
+                own_max: AtomicU64::new(0),
+                first: AtomicU64::new(0),
+                last: AtomicU64::new(0),
+                said: AtomicU64::new(0),
+            }
+        }
+    }
+
+    pub static WRITE: Stat = Stat::new();
+    pub static READ: Stat = Stat::new();
+
+    /// A part of a full cell ended: its CPU ticks, its own ticks, and the ticks it began and ended.
+    /// Every 256th part says the totals (the machine may stop at any time, and the quiet that
+    /// `report` waits for may not come).
+    pub fn note(name: &str, stat: &Stat, cpu: u64, own: u64, (began, ended): (u64, u64)) {
+        let n = stat.n.fetch_add(1, Relaxed) + 1;
+        stat.cpu.fetch_add(cpu, Relaxed);
+        stat.cpu_max.fetch_max(cpu, Relaxed);
+        stat.own.fetch_add(own, Relaxed);
+        stat.own_max.fetch_max(own, Relaxed);
+        let _ = stat.first.compare_exchange(0, began, Relaxed, Relaxed);
+        stat.last.store(ended, Relaxed);
+        if n.is_multiple_of(256) {
+            say(name, stat);
+        }
+    }
+
+    fn say(name: &str, stat: &Stat) {
+        let n = stat.n.load(Relaxed);
+        stat.said.store(n, Relaxed);
+        let us = |ticks: u64| rt::time::ticks_to_ns(ticks) / 1000;
+        let (cpu, own) = (stat.cpu.load(Relaxed), stat.own.load(Relaxed));
+        rt::println!(
+            "datafs: parts {name} n {n} cpu mean {} us max {} us total {} us own mean {} us max {} us span {} us",
+            us(cpu / n),
+            us(stat.cpu_max.load(Relaxed)),
+            us(cpu),
+            us(own / n),
+            us(stat.own_max.load(Relaxed)),
+            us(stat
+                .last
+                .load(Relaxed)
+                .saturating_sub(stat.first.load(Relaxed)))
+        );
+    }
+
+    /// The lines of the directions that changed since the last line.
+    pub fn report() {
+        for (name, stat) in [("write", &WRITE), ("read", &READ)] {
+            let n = stat.n.load(Relaxed);
+            if n != 0 && stat.said.load(Relaxed) != n {
+                say(name, stat);
+            }
+        }
+    }
+}
+
 /// The reads, writes and flushes of the disk when the conversion job took its first step.
 static CONVERSION_BASE: [core::sync::atomic::AtomicU64; 3] =
     [const { core::sync::atomic::AtomicU64::new(0) }; 3];
@@ -378,8 +465,12 @@ impl Device for Disk {
             // SAFETY: cell 0 of the mapped buffer; no request of it is in flight.
             unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), Self::cell(), chunk.len()) };
             if count > 0 {
+                #[cfg(feature = "steps")]
+                let asked = rt::time::now();
                 let key = self.io(Blk::Write, count, at).map_err(|_| DeviceError)?;
                 self.finish(key).map_err(|_| DeviceError)?;
+                #[cfg(feature = "steps")]
+                WAITED.fetch_add(rt::time::now().saturating_sub(asked), Relaxed);
                 #[cfg(feature = "steps")]
                 stretch::resume();
             }
@@ -659,6 +750,9 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             .as_ref()
             .is_some_and(|fs| u64::from(fs.window_state().2) == fs.blocks()),
     };
+    // What the report of the disk counters said last.
+    #[cfg(feature = "count")]
+    let mut said = (0u64, 0u64, 0u64);
     // The timer that wakes the worker when a lease lapses: the jobs that wait for it go then.
     let lease_timer = sys::timer_create(&kicks, LEVEL).ok();
     loop {
@@ -743,6 +837,8 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                         );
                         sys::process_exit(1);
                     }
+                    #[cfg(feature = "steps")]
+                    let before = (work_ran().0, WAITED.load(Relaxed));
                     let reply = match datafs::server::part_of(request) {
                         // A part with a cell: the worker maps the cell for the job.
                         Some((method, cell, count))
@@ -759,6 +855,30 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                         }
                         _ => server.handle(fs, job.owner, job.aux, request),
                     };
+                    #[cfg(feature = "steps")]
+                    if let Some((method, cell, count)) = datafs::server::part_of(request)
+                        && cell != proto_data::INLINE
+                        && count as usize == proto_data::CELL_BYTES
+                    {
+                        let ended = rt::time::now();
+                        let wall = ended.saturating_sub(began);
+                        let waited = WAITED.load(Relaxed).saturating_sub(before.1);
+                        let (name, stat) = if matches!(
+                            method,
+                            proto_data::Method::WriteFrom | proto_data::Method::PwriteFrom
+                        ) {
+                            ("write", &parts::WRITE)
+                        } else {
+                            ("read", &parts::READ)
+                        };
+                        parts::note(
+                            name,
+                            stat,
+                            work_ran().0.saturating_sub(before.0),
+                            wall.saturating_sub(waited),
+                            (began, ended),
+                        );
+                    }
                     let bytes = reply.as_bytes();
                     job.reply[..bytes.len()].copy_from_slice(bytes);
                     job.reply_len = bytes.len();
@@ -882,6 +1002,32 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             tell_pairs();
             continue;
         }
+        // The counters of the disk (the probe of the reads of a block): said once the queue has been
+        // quiet for `REPORT_QUIET_NS` after a change.
+        #[cfg(feature = "count")]
+        if let Some(fs) = volume.as_mut() {
+            let device = &fs.device().device;
+            let seen = (device.reads, device.writes, device.flushes);
+            if seen != said {
+                let now = rt::time::ticks_to_ns(rt::time::now());
+                if now.saturating_sub(idle.last_job) >= REPORT_QUIET_NS {
+                    said = seen;
+                    rt::println!(
+                        "datafs: disk reads {} writes {} flushes {}",
+                        seen.0,
+                        seen.1,
+                        seen.2
+                    );
+                } else if let Some(timer) = &timer {
+                    let _ = sys::timer_set(timer, idle.last_job + REPORT_QUIET_NS);
+                }
+            }
+            #[cfg(feature = "steps")]
+            if now_quiet(idle.last_job) {
+                parts::report();
+                window::report();
+            }
+        }
         // The queue is empty. A walk (the first after the mount, or the refresh) starts after the
         // queue has been quiet for `QUIET_NS` from the end of the last job: the requests of a boot
         // come in bursts, and a walk beside them would only slow them. A job that comes during a
@@ -911,6 +1057,16 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
         }
         let _ = sys::receive(&kicks);
     }
+}
+
+/// How long the queue is quiet before the counters of the disk are said (`count`).
+#[cfg(feature = "count")]
+const REPORT_QUIET_NS: u64 = 100_000_000;
+
+/// Whether the queue has been quiet for `REPORT_QUIET_NS` since the end of the last job.
+#[cfg(feature = "steps")]
+fn now_quiet(last_job: u64) -> bool {
+    rt::time::ticks_to_ns(rt::time::now()).saturating_sub(last_job) >= REPORT_QUIET_NS
 }
 
 /// The longest job of each method so far, in microseconds, under the feature `steps` (the probe of
