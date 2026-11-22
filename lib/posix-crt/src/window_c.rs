@@ -71,6 +71,25 @@ pub unsafe extern "C" fn stafeto_window_open(
     }
 }
 
+/// Describes the open window `win` in `*out`, as `stafeto_window_open` did.
+///
+/// # Safety
+/// `out` is null or points to a writable `struct stafeto_window`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_window_info(win: c_int, out: *mut Window) -> c_int {
+    if out.is_null() {
+        return fail(EINVAL);
+    }
+    match window::info(win) {
+        Ok(described) => {
+            // SAFETY: the caller's pointer, checked for null.
+            unsafe { out.write(described) };
+            0
+        }
+        Err(errno) => fail(errno),
+    }
+}
+
 /// Posts `buffer` with the `count` rectangles `r` (none: the whole window).
 ///
 /// # Safety

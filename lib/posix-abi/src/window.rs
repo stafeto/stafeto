@@ -470,6 +470,29 @@ fn drain() {
     }
 }
 
+/// `stafeto_window_info`: the window as `open` described it (its size, the
+/// bytes of a line, the format, the number of buffers and where each lies in
+/// the process); EBADF for a number that is no open window. The values are
+/// those of the open window, so a window closed and opened again shows as
+/// another description to a caller that kept the first.
+pub fn info(win: i32) -> Result<Window, i32> {
+    opened(win)?;
+    let shape = |k: usize| SHAPE[k].load(Ordering::Acquire);
+    let pixel = |k: usize| PIXELS[k].load(Ordering::Acquire) as usize;
+    let window = Window {
+        width: shape(0),
+        height: shape(1),
+        stride: shape(2),
+        format: shape(3),
+        buffers: shape(4),
+        reserved: 0,
+        pixels: [pixel(0), pixel(1), pixel(2)],
+    };
+    // A window closed while the description was read has no pixels left.
+    opened(win)?;
+    Ok(window)
+}
+
 /// `stafeto_window_free`: the free buffers by the account; 0 for a window
 /// that is not open.
 pub fn free(win: i32) -> u32 {

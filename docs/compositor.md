@@ -249,6 +249,10 @@ moves the library into `libc.so` and gives the window's channel to `poll`.
   A signal with a handler ends it with EINTR. One thread at a time waits and
   one takes events; another gets EBUSY. Events the service gave beyond the
   caller's room wait in the library for the next call.
+- `stafeto_window_info(win, &out)` gives a library that draws into the window another
+  part of the program opened (the EGL platform of stafeto, `docs/egl.md`) what
+  `stafeto_window_open` gave: the size, the line, the format, the buffers and where they lie.
+  EBADF for a number that is no open window. It asks nothing of the service.
 - `fork` gives the child no window (the state is reset in `after_fork`, and
   the map of the child has no piece of a buffer); `exec` and
   `stafeto_window_close` close the session, which ends the window in the

@@ -188,6 +188,18 @@ int stafeto_window_open(int x, int y, int w, int h, uint32_t format,
                         uint32_t buffers, uint32_t flags,
                         struct stafeto_window *out);
 
+/* Describes the open window `win` in *out as stafeto_window_open did: the
+ * size, the bytes of a line, the format, the number of buffers and where each
+ * buffer lies. A library that draws into a window another part of the program
+ * opened (the EGL platform of stafeto) learns its shape here. 0, or -1 with
+ * errno:
+ *   EBADF   win is not the window's number or the window was closed;
+ *   EINVAL  out is null.
+ * The values are those of the window that is open now: a window closed and
+ * opened again may have the same number and another description. No call to
+ * the service. */
+int stafeto_window_info(int win, struct stafeto_window *out);
+
 /* Posts buffer `buffer` of window `win`: the service shows it in its next
  * frame. r points at `count` rectangles in the window's coordinates that
  * cover every point differing from what the screen shows of this window now

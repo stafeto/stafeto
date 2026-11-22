@@ -171,6 +171,11 @@ static int child_without_window(void) {
     if (stafeto_window_events(0, e, 2, NULL) != -1 || errno != EBADF) return 43;
     errno = 0;
     if (stafeto_window_close(0) != -1 || errno != EBADF) return 44;
+    {
+        struct stafeto_window described;
+        errno = 0;
+        if (stafeto_window_info(0, &described) != -1 || errno != EBADF) return 46;
+    }
     /* The parent's signal comes while it waits: sent again every 200 ms
      * (the parent kills this child once a wait ended with EINTR), at most 150
      * times. */
@@ -214,6 +219,13 @@ static int setup_and_refusals(struct stafeto_window *w) {
     errno = 0;
     CHECK(stafeto_window_open(-1, 0, 10, 10, 1, 2, 0, w) == -1 && errno == EINVAL);
     CHECK(stafeto_window_free_buffers(0) == 0);
+    {
+        struct stafeto_window none;
+        errno = 0;
+        CHECK(stafeto_window_info(0, &none) == -1 && errno == EBADF);
+        errno = 0;
+        CHECK(stafeto_window_info(0, NULL) == -1 && errno == EINVAL);
+    }
     printf("posix-window: the screen is described, no window yet, and bad arguments leave nothing\n");
 
     memset(w, 0xAA, sizeof *w);
@@ -229,7 +241,18 @@ static int setup_and_refusals(struct stafeto_window *w) {
     }
     errno = 0;
     CHECK(stafeto_window_open(WIN_X, WIN_Y, 10, 10, 1, 1, 0, w) == -1 && errno == EBUSY);
-    printf("posix-window: a window of 200 by 100 with two zeroed buffers, a second open is EBUSY\n");
+    {
+        /* The description of the open window is the one open gave. */
+        struct stafeto_window again;
+        memset(&again, 0x55, sizeof again);
+        CHECK(stafeto_window_info(0, &again) == 0);
+        CHECK(memcmp(&again, w, sizeof again) == 0);
+        errno = 0;
+        CHECK(stafeto_window_info(1, &again) == -1 && errno == EBADF);
+        errno = 0;
+        CHECK(stafeto_window_info(0, NULL) == -1 && errno == EINVAL);
+    }
+    printf("posix-window: a window of 200 by 100 with two zeroed buffers, a second open is EBUSY, info repeats open\n");
 
     /* Post refusals: nothing goes to the service. */
     errno = 0;
@@ -368,8 +391,18 @@ static int run_role(void) {
     errno = 0;
     CHECK(stafeto_window_post(0, 0, NULL, 0) == -1 && errno == EBADF);
     CHECK(stafeto_window_free_buffers(0) == 0);
+    {
+        struct stafeto_window gone;
+        errno = 0;
+        CHECK(stafeto_window_info(0, &gone) == -1 && errno == EBADF);
+    }
     CHECK(stafeto_window_open(0, 0, 50, 40, STAFETO_WINDOW_XRGB8888, 1, 0, &w) == 0);
     CHECK(w.buffers == 1 && w.stride == 200 && w.pixels[1] == NULL);
+    {
+        struct stafeto_window second;
+        CHECK(stafeto_window_info(0, &second) == 0);
+        CHECK(second.width == 50 && second.height == 40 && second.buffers == 1);
+    }
     CHECK(stafeto_window_close(0) == 0);
     printf("posix-window: close ends the window, and a new one opens\n");
     return 0;
