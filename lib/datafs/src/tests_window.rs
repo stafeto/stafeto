@@ -18,11 +18,11 @@ fn byte(pos: usize) -> u8 {
     (pos.wrapping_mul(2_654_435_761) >> 11) as u8
 }
 
-fn pattern(from: usize, len: usize) -> Vec<u8> {
+pub(crate) fn pattern(from: usize, len: usize) -> Vec<u8> {
     (from..from + len).map(byte).collect()
 }
 
-fn head(handle: u32, count: usize, offset: u64, cell: u32, flags: u32) -> p::Part {
+pub(crate) fn head(handle: u32, count: usize, offset: u64, cell: u32, flags: u32) -> p::Part {
     p::Part {
         handle,
         count: count as u32,
@@ -35,22 +35,22 @@ fn head(handle: u32, count: usize, offset: u64, cell: u32, flags: u32) -> p::Par
 
 /// The reply to a part: the three words, and the bytes of an `INLINE` read.
 #[derive(Debug, PartialEq, Eq)]
-struct Reply {
-    count: u32,
-    flags: u32,
-    lease: u32,
-    bytes: Vec<u8>,
+pub(crate) struct Reply {
+    pub count: u32,
+    pub flags: u32,
+    pub lease: u32,
+    pub bytes: Vec<u8>,
 }
 
 impl Rig {
     /// The window of the session: it has one from here on (the worker holds the handle).
-    fn window(&mut self, who: u64) {
+    pub(crate) fn window(&mut self, who: u64) {
         self.server.set_window(who, true).unwrap();
     }
 
     /// One part: `data` are the bytes of a write (from the cell or the message), `cell` the cell
     /// memory of the test; the reply or the status.
-    fn part(
+    pub(crate) fn part(
         &mut self,
         who: u64,
         method: Method,
@@ -92,13 +92,13 @@ impl Rig {
 }
 
 /// A volume with `/d`, open to everyone.
-fn volume() -> Rig {
+pub(crate) fn volume() -> Rig {
     let mut rig = Rig::new();
     rig.mkdir(ROOT, b"/d", 0o777).unwrap();
     rig
 }
 
-fn cells() -> [Vec<u8>; 2] {
+pub(crate) fn cells() -> [Vec<u8>; 2] {
     [vec![0u8; p::CELL_BYTES], vec![0u8; p::CELL_BYTES]]
 }
 
@@ -116,24 +116,23 @@ fn a_file_written_in_parts_through_the_cells_reads_back_the_same_through_the_cel
     let all = pattern(0, total);
     let mut at = 0;
     let mut which = 0;
+    let mut lease = 0;
     while at < total {
         let n = (total - at).min(p::CELL_BYTES);
         let more = if at + n < total { p::MORE } else { 0 };
+        let mut part = head(h, n, 0, which, more);
+        part.lease = lease;
         let r = rig
-            .part(
-                OWNER,
-                Method::WriteFrom,
-                head(h, n, 0, which, more),
-                &all[at..at + n],
-                &mut c,
-            )
+            .part(OWNER, Method::WriteFrom, part, &all[at..at + n], &mut c)
             .unwrap();
-        assert_eq!((r.count as usize, r.lease), (n, 0));
-        // No lease is given yet: a part that asks for one is told so.
-        assert_eq!(r.flags, if more != 0 { p::UNLEASED } else { 0 });
+        // The first part takes a lease, the next ones carry it, the last one ends it.
+        assert_eq!((r.count as usize, r.flags), (n, 0));
+        assert_eq!(r.lease != 0, more != 0);
+        lease = r.lease;
         at += n;
         which ^= 1;
     }
+    assert_eq!(rig.server.lease_count(), 0);
     assert_eq!(rig.stat(OWNER, b"/d/f").unwrap().size, total as u64);
     // The old READ sees it, from the start (the position moved with the parts: seek back).
     rig.ok(OWNER, |w| p::seek(h, 0, p::SEEK_SET, w));
@@ -539,14 +538,14 @@ fn a_bound_client_stops_short_at_its_file_size_limit_in_a_part() {
 }
 
 #[test]
-fn leases_do_not_exist_yet_and_the_shape_of_a_part_is_checked() {
+fn a_lease_number_never_given_is_bad_handle_and_the_shape_of_a_part_is_checked() {
     let mut rig = volume();
     rig.window(OWNER);
     let mut c = cells();
     let h = rig
         .open(OWNER, b"/d/f", p::READ | p::WRITE | p::CREATE, 0o644)
         .unwrap();
-    // A lease number is one the service never gave.
+    // A lease number the service never gave.
     let mut leased = head(h, 1, 0, 0, 0);
     leased.lease = 9;
     assert_eq!(

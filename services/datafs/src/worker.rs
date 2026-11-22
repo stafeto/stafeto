@@ -659,8 +659,10 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             .as_ref()
             .is_some_and(|fs| u64::from(fs.window_state().2) == fs.blocks()),
     };
+    // The timer that wakes the worker when a lease lapses: the jobs that wait for it go then.
+    let lease_timer = sys::timer_create(&kicks, LEVEL).ok();
     loop {
-        while let Some(i) = oldest() {
+        while let Some(i) = next_job(server, &mut volume) {
             if STOPPING.load(Acquire) && stop_decision() == Drain::GiveUp {
                 break;
             }
@@ -763,7 +765,8 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                     report(request);
                 }
                 // The session passed VERIFY_SESSION: the identity of its old holder is not its own.
-                (Some(_), UNBIND) => {
+                (Some(fs), UNBIND) => {
+                    server.leases_end_of(fs, job.owner);
                     server.unbind(job.owner);
                     identities.remove(job.owner);
                     windows.remove(job.owner);
@@ -798,6 +801,10 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                 STOP_JOBS.fetch_add(1, Release);
             }
             let _ = sys::notify(wake, 1);
+        }
+        // Jobs that wait for a lease run when it lapses: the worker wakes at the first expiry.
+        if let (Some(timer), Some(at)) = (&lease_timer, server.next_lease_expiry()) {
+            let _ = sys::timer_set(timer, at.max(now_ns() + 1));
         }
         if STOPPING.load(Acquire) {
             put_away(server, &mut volume);
@@ -1144,6 +1151,49 @@ fn report(request: &[u8]) {
     if request.get(..2) == Some(&Method::Statfs.number().to_le_bytes()[..]) {
         rt::println!("datafs: written {}", WRITTEN.load(Acquire));
     }
+}
+
+/// The monotonic clock in nanoseconds, for the leases.
+fn now_ns() -> u64 {
+    rt::time::ticks_to_ns(rt::time::now())
+}
+
+/// The job to run next. With a volume the server chooses (`Server::pick`): the leases that lapsed end
+/// first, and the oldest job that no lease holds back goes, with the parts of a lease holder at the
+/// place of the oldest job that waits for its file; a stop ends every lease so that every job runs.
+/// With no volume the oldest job goes (every one answers NOT_READY).
+fn next_job(server: &mut Server, volume: &mut Option<Volume>) -> Option<usize> {
+    let Some(fs) = volume.as_mut() else {
+        return oldest();
+    };
+    server.set_mono(now_ns());
+    if STOPPING.load(Acquire) {
+        server.leases_end_all(fs);
+    } else {
+        server.leases_sweep(fs);
+    }
+    let mut seen = [datafs::server::Candidate {
+        id: 0,
+        ticket: 0,
+        owner: 0,
+        request: &[],
+    }; datafs::server::CANDIDATES_MAX];
+    let mut n = 0;
+    for i in 0..JOBS {
+        if state(i).load(Acquire) == QUEUED && n < seen.len() {
+            // SAFETY: a QUEUED job's request and ticket are set before the state is released, and
+            // the main thread does not touch it until it is DONE.
+            let job = unsafe { &*job(i) };
+            seen[n] = datafs::server::Candidate {
+                id: i,
+                ticket: job.ticket.load(Acquire),
+                owner: job.owner,
+                request: &job.request[..job.request_len],
+            };
+            n += 1;
+        }
+    }
+    server.pick(&seen[..n])
 }
 
 /// The oldest QUEUED job.

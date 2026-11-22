@@ -608,7 +608,7 @@ fn v4_window(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
     let cell = |i: usize| (WINDOW_AT + i * p::CELL_BYTES) as *mut u8;
     // 200,000 bytes in parts of a cell, alternating the two cells.
     let total = 200_000usize;
-    let (mut at, mut which, mut parts) = (0usize, 0usize, 0u32);
+    let (mut at, mut which, mut parts, mut lease) = (0usize, 0usize, 0u32, 0u32);
     while at < total {
         let n = (total - at).min(p::CELL_BYTES);
         // SAFETY: the window is mapped at WINDOW_AT for 128 KiB and a cell is 64 KiB of it; the
@@ -616,18 +616,29 @@ fn v4_window(c: &Client, start: &rt::startup::Startup) -> Result<(), Fail> {
         let bytes = unsafe { core::slice::from_raw_parts_mut(cell(which), n) };
         fill(bytes, at, 77);
         let more = if at + n < total { p::MORE } else { 0 };
+        let mut head = part(handle, n, which as u32, more);
+        // The first part takes a lease on the file, the next ones carry it, the last one ends it.
+        head.lease = lease;
         let mut w = Writer::new();
-        wire(
-            p::write_from(&part(handle, n, which as u32, more), &[], &mut w),
-            "request",
-        )?;
+        wire(p::write_from(&head, &[], &mut w), "request")?;
         let reply = wire(c.part(w.as_bytes()), "WRITE_FROM")?;
-        if reply.word(0) as usize != n {
-            return Err("a part of a cell was written short");
+        if reply.word(0) as usize != n || reply.word(4) != 0 {
+            return Err("a part of a cell was written short or lapsed");
+        }
+        lease = reply.word(8);
+        if (lease != 0) != (more != 0) {
+            return Err("the lease of a call in parts is not held until its last part");
         }
         at += n;
         which ^= 1;
         parts += 1;
+    }
+    // A lease number the service never gave is BAD_HANDLE.
+    if !matches!(
+        c.call(|w| p::release(0x0001_0777, w)),
+        Err(Status::Unknown(p::BAD_HANDLE))
+    ) {
+        return Err("a RELEASE of a number never given was not BAD_HANDLE");
     }
     // Back with PREAD_INTO into the cells, compared to the bytes their salt says.
     let mut at = 0usize;

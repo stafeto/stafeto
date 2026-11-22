@@ -36,6 +36,8 @@ mod tests_cut;
 #[cfg(test)]
 mod tests_entry_attr;
 #[cfg(test)]
+mod tests_lease;
+#[cfg(test)]
 mod tests_open;
 #[cfg(test)]
 mod tests_perm;

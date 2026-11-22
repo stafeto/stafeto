@@ -47,7 +47,7 @@ const DATAFS_TAG: &str = "17";
 /// The kinds of the loop that the probe's two runs use: the methods of proto_data that the series
 /// and the check send (the worker thread does the disk's work, so these steps are the queue's), the notices
 /// with the heartbeat (64) and the notification the service marks as its own (65, the worker's DONE).
-const STEP_KINDS: [(usize, &str); 20] = [
+const STEP_KINDS: [(usize, &str); 21] = [
     (1, "Open"),
     (2, "Close"),
     (3, "Read"),
@@ -65,6 +65,7 @@ const STEP_KINDS: [(usize, &str); 20] = [
     (37, "ReadInto"),
     (38, "PreadInto"),
     (39, "WriteFrom"),
+    (41, "Release"),
     (42, "OpenNumbered"),
     (64, "the notices and the heartbeat"),
     (65, "the service's own step"),
