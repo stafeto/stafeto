@@ -279,6 +279,97 @@ fn a_cut_in_the_recovery_is_finished_by_the_next_one() {
     let _ = (Error::Io, SECTORS);
 }
 
+/// A file written in parts of 64 KiB through the cells of a window (WRITE_FROM, the first part
+/// takes a lease, the last ends it) and synced, with the power cut at every sector of the write: the
+/// file is what a cut after `n` sectors of the parts left, a prefix of the bytes with its size
+/// whole, never bytes from another place; a cut after the sync leaves all of it.
+#[test]
+fn a_cut_at_every_sector_of_a_write_in_parts_of_64_kib_leaves_a_prefix_and_a_synced_file_whole() {
+    use crate::server::Cell;
+    use crate::tests_window::head;
+    // Three parts of a cell and a rest.
+    let data = pattern(3 * p::CELL_BYTES + 1000, 6);
+    let run = |cut: Option<u64>, survive: Survive| -> (Vec<u8>, u64, u64) {
+        let mut state = Box::new(Storage::new());
+        let mut rig = Rig {
+            server: Server::with_epoch(1),
+            fs: Fs::new(MemDevice::new(SECTORS), &mut state).unwrap(),
+        };
+        rig.fs.format().unwrap();
+        rig.fs.mount().unwrap();
+        server::ensure_orphans(&mut rig.fs).unwrap();
+        let h = rig.open(A, b"/big", p::READ | p::WRITE | p::CREATE);
+        rig.server.set_window(A, true).unwrap();
+        rig.fs.device().flush().unwrap();
+        let before = rig.fs.device().written;
+        rig.fs.device().cut_after(cut);
+        let mut lease = 0;
+        let mut synced = None;
+        for (i, chunk) in data.chunks(p::CELL_BYTES).enumerate() {
+            let more = (i + 1) * p::CELL_BYTES < data.len();
+            let mut part = head(
+                h,
+                chunk.len(),
+                0,
+                (i % 2) as u32,
+                if more { p::MORE } else { 0 },
+            );
+            part.lease = lease;
+            let mut w = Writer::new();
+            p::write_from(&part, &[], &mut w).unwrap();
+            let reply =
+                rig.server
+                    .handle_with(&mut rig.fs, A, 0, w.as_bytes(), Cell::Source(chunk));
+            // After the cut every call fails: the call stops there, as a client that got an error would.
+            let Ok(r) = p::reply(reply.as_bytes()) else {
+                break;
+            };
+            let Ok(got) = p::read_part_reply(r, false) else {
+                break;
+            };
+            lease = got.lease;
+            if !more {
+                let sync = rig.call(A, |w| p::handle_call(p::Method::Fsync, h, w));
+                if sync.is_ok() {
+                    synced = Some(rig.fs.device().written - before);
+                }
+            }
+        }
+        let written = rig.fs.device().written - before;
+        let mut device = rig.fs.into_device();
+        device.power_cycle(survive);
+        let mut state = Box::new(Storage::new());
+        let mut fs = Fs::new(device, &mut state).unwrap();
+        fs.mount().expect("the volume mounts after the cut");
+        server::recover_orphans(&mut fs).expect("the recovery runs");
+        let found = match read_tree(&mut fs).expect("the tree reads").get("/big") {
+            Some(Node::File(bytes)) => bytes.clone(),
+            other => panic!("/big is {other:?}"),
+        };
+        (found, written, synced.unwrap_or(u64::MAX))
+    };
+    let (whole, total, synced) = run(None, Survive::All);
+    assert!(whole == data, "the run without a cut");
+    assert!(
+        synced <= total && total >= 4 * 16,
+        "{synced} of {total} sectors"
+    );
+    for cut in 0..total {
+        for survive in [Survive::None, Survive::All, Survive::Random(cut * 2 + 1)] {
+            let (found, _, _) = run(Some(cut), survive);
+            assert!(
+                found.len() <= data.len() && found[..] == data[..found.len()],
+                "cut {cut} {survive:?}: {} bytes that are no prefix of the data",
+                found.len()
+            );
+            // The sync is the last write of the call: a cut at or after it leaves the whole file.
+            if cut >= synced && matches!(survive, Survive::All) {
+                assert!(found == data, "cut {cut} after the sync at {synced}");
+            }
+        }
+    }
+}
+
 /// The attribute of the version-3 server under the cut of the power at every sector: the creation
 /// of a file with its record, CHMOD, and the conversion of a volume of version 2.
 mod attributes {
