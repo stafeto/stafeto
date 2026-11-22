@@ -607,8 +607,8 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                     // Skips are printed only: with the client unable to post while
                     // its frame is in work almost no change waits at a period start.
                     //
-                    // The frames that released a buffer of the windows are the ones of
-                    // the scene, and each is late. A frame shown in the phase that
+                    // `late` counts the frames that released a buffer of the windows,
+                    // the ones of the scene, and each is late. A frame shown in the phase that
                     // released none (at most one) is the frame the end of the earlier
                     // phase made, black or tiny, which falls on either side of the
                     // boundary of the two readings of STATS by a few thousand ticks
@@ -1541,6 +1541,22 @@ mod tests {
             &format!("frames {}", f + 2),
         );
         assert!(verdict(&lines, true).is_err());
+        // A frame of the scene on time with a frame that released nothing: one
+        // more frame and one more release than late frames. `late` counts the
+        // released frames alone, so these counts pass no longer.
+        let mut lines = good();
+        overload_line(
+            &mut lines,
+            &format!("frames {f}"),
+            &format!("frames {}", f + 1),
+        );
+        overload_line(
+            &mut lines,
+            &format!("releases {f}"),
+            &format!("releases {}", f + 1),
+        );
+        let e = verdict(&lines, true).unwrap_err();
+        assert!(e.starts_with("overload: late"), "{e}");
         // Skips are printed and judge nothing.
         let mut lines = good();
         overload_line(
