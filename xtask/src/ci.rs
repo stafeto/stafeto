@@ -282,6 +282,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("nvme-persist mdts1", 80),
     ("nvme-persist steps", 500),
     ("nvme-persist key", 100),
+    ("users", 20),
     ("nvme-persist key nodisk", 100),
     ("nvme-persist key wrongdisk", 80),
     ("nvme-persist key wrongdisk breaks", 80),

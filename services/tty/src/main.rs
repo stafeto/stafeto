@@ -673,6 +673,9 @@ impl Tty {
         };
         let flags = request.flags & (3 | 0o4000);
         let result = match request.kind {
+            // The console is root's (mode 0620, which keeps `write` working; only a process of root opens it): its input carries what the operator types,
+            // passwords among it, so a process of an ordinary account may not open it.
+            proto_tty::OPEN_CONSOLE if who.euid != 0 => return status(PERMISSION),
             proto_tty::OPEN_CONSOLE => self
                 .endpoints
                 .open_console(&mut self.holdsets[s.data.holding].holds, flags),

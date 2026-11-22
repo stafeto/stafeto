@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# The set-user-ID part of BusyBox: a program of its own with `su` and `passwd`
+# alone, built from the same source by the script of the package busybox. The
+# shell's /bin/busybox carries no set-user-ID bit. Format: docs/packages.md.
+
+name = "busybox-suid"
+version = "1.37.0"
+kind = "base"
+image = "shell"
+release = "1"
+summary = "BusyBox su and passwd, set-user-ID"
+url = "https://busybox.net/downloads/busybox-1.37.0.tar.bz2"
+sha256 = "3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4"
+license = "GPL-2.0-only"
+build = "tools/build-busybox.py"
+program = "busybox-suid"

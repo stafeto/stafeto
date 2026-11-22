@@ -70,14 +70,14 @@
 #        web: no certificate could be made, 443 stays off
 #        fast: no nginx-fast in this image, 8080 stays off
 #        fast: netd.conf has no switch, 8080 stays off
-#        dropbear: no /root/.ssh/authorized_keys, SSH stays off
+#        dropbear: no authorized_keys of user, SSH stays off
 #        net: the ENA kind has no consumers of the switch yet
 #        ena: reset reason
 #   3. From the owner's machine (ADDRESS is the public address of the instance):
 #        curl http://ADDRESS/                  the page, 200
 #        curl -k https://ADDRESS/              the same page over TLS 1.3 (the certificate is self-signed)
 #        curl http://ADDRESS:8080/             the same page from nginx-fast
-#        ssh -i target/aws/S/try-key root@ADDRESS
+#        ssh -i target/aws/S/try-key user@ADDRESS
 #                                              the key pair of the instance gets in; the fingerprint of
 #                                              the host key is the one of the console line
 #        nmap -Pn -p 1-65535 ADDRESS           a full TCP scan: only 22, 80, 443 and 8080 are open
@@ -178,9 +178,9 @@
 #             curl -sS -o /dev/null -w '%{http_code} %{time_total}\n' http://ADDRESS/
 #             curl -sSk -o /dev/null -w '%{http_code} %{time_total}\n' https://ADDRESS/
 #             curl -sS -o /dev/null -w '%{http_code} %{time_total}\n' http://ADDRESS:8080/
-#             ssh -i target/aws/S/try-key -o BatchMode=yes root@ADDRESS true
+#             ssh -i target/aws/S/try-key -o BatchMode=yes user@ADDRESS true
 #           and, before the scan, a session that stays open and is used after it:
-#             ssh -i target/aws/S/try-key root@ADDRESS 'while :; do date; sleep 1; done'  (output redirected to a file)
+#             ssh -i target/aws/S/try-key user@ADDRESS 'while :; do date; sleep 1; done'  (output redirected to a file)
 #        e. Stop the capture. Read the console again (after about a minute; make one more request to
 #           trigger the line) and write down the three lines (the counters after).
 #      Repeat until a request fails, or twenty times in all. A failed request is read in the capture:

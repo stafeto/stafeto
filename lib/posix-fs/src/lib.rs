@@ -602,7 +602,7 @@ impl PreparedRead {
 /// The node information of the console's descriptors.
 const CONSOLE_INFO: NodeInfo = NodeInfo {
     kind: 3,
-    permissions: 0o666,
+    permissions: 0o620,
     device: 2,
     special_device: 1,
     inode: 1,

@@ -9,7 +9,7 @@
 //!
 //! `ssh: host key FNV:<16 hex digits>`
 //!
-//! Then the probe waits until `datakey` ends (it keeps a new key on the volume first), for two minutes at
+//! Then the probe waits until `datakey` ends or ten seconds have passed (with a volume the service stays, and it keeps a new key first), at
 //! most, and ends. The
 //! bytes of the key are never printed.
 
@@ -106,10 +106,12 @@ fn main(_: u64) -> u64 {
             return 2;
         }
     }
-    // The service ends once it has kept a new key (or has none to wait for): a request to it then
-    // fails. A look every tenth of a second, and a limit of two minutes.
+    // The service ends when it has no volume to keep anything on: a request to it then fails. With
+    // a volume it stays (it keeps the account files too), and the probe waits ten seconds, long
+    // enough for it to keep a new key (two looks of a second agree, then the key is written).
+    // A look every tenth of a second.
     if let Some(session) = session {
-        let limit = rt::time::now() + 120 * rt::time::frequency();
+        let limit = rt::time::now() + 10 * rt::time::frequency();
         while rt::time::now() < limit && rt::sys::send(&session, &[0]).is_ok() {
             let until = rt::time::now() + rt::time::frequency() / 10;
             while rt::time::now() < until {

@@ -3,8 +3,8 @@
 
 //! The probe of the SSH server (`cargo xtask net-ssh`): the image of the
 //! shell with the network service whose boot script (`/etc/rc`, tools/rc)
-//! starts Dropbear (`/bin/dropbear -F -s -j -k -r KEY`, from `/etc/rc.d/dropbear`
-//! once the key is in `/root/.ssh/authorized_keys`) on QEMU's user network, a port of the host forwarded to the
+//! starts Dropbear (`/bin/dropbear -F -s -j -k -w -r KEY`, from `/etc/rc.d/dropbear`
+//! once the key is in the authorized_keys of `user`) on QEMU's user network, a port of the host forwarded to the
 //! port 22 of the guest. xtask drives `ash` over the serial port, as
 //! `net-curl` does, and is the client with the host's own `ssh`:
 //!
@@ -19,7 +19,7 @@
 //!    (likewise), and the log goes to the standard error (the build has no
 //!    syslog). The console shows `ssh: host key SHA256:...` before the probe
 //!    connects, and the client sees the same key.
-//! 3. The key the probe made is in `/root/.ssh/authorized_keys` (the key
+//! 3. The key the probe made is in the authorized_keys of `user` (the key
 //!    `ec2-key` takes from the metadata of an instance; the image of the probe has a
 //!    script of its own that writes the key of the run): a login with it
 //!    runs a command and gives its exit status, a bulk transfer of 64 KiB
@@ -65,7 +65,7 @@ const UNAUTH_PER_IP: usize = 2;
 const AUTH_TIMEOUT: u64 = 30;
 
 /// The command line of the server that `/etc/rc.d/dropbear` starts.
-const SERVER_LINE: [&str; 7] = ["dropbear", "-F", "-s", "-j", "-k", "-r", HOST_KEY];
+const SERVER_LINE: [&str; 8] = ["dropbear", "-F", "-s", "-j", "-k", "-w", "-r", HOST_KEY];
 
 /// How long one login may take: the key exchange and the first command run
 /// on an emulated CPU.
@@ -93,16 +93,36 @@ static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 const PLACEHOLDER_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA placeholder";
 
-/// The script that stands for `ec2-key` in the image of the probe: it writes the key of the
-/// run as the metadata of an instance would give it.
+/// Sets the key of the run (the other probes of the image take it from here).
+pub(crate) fn set_key(line: String) -> Result<(), String> {
+    KEY.set(line)
+        .map_err(|_| "the key of the run is set twice".to_owned())
+}
+
+/// The text of the script that stands for `ec2-key` in the images of the probes: it writes
+/// `key` as the authorized_keys of `user` (the home /etc/passwd names, which the service
+/// `datakey` has put on the data volume when there is one), as the metadata of an instance would
+/// give it.
+pub fn key_script_text(key: &str, extra: &str) -> String {
+    format!(
+        "while IFS=: read -r n _ u g _ h _; do [ \"$n\" = user ] && break; done </etc/passwd\n\
+         umask 077\n\
+         mkdir -p \"$h/.ssh\"\n\
+         chown \"$u:$g\" \"$h\" \"$h/.ssh\"\n\
+         chmod 700 \"$h\" \"$h/.ssh\"\n\
+         echo '{key}' > \"$h/.ssh/authorized_keys\"\n\
+         chown \"$u:$g\" \"$h/.ssh/authorized_keys\"\n\
+         chmod 600 \"$h/.ssh/authorized_keys\"\n\
+         echo 'ec2-key: the key of the probe is placed'\n{extra}"
+    )
+}
+
+/// The script that stands for `ec2-key` in the image of the probe: the key of the run.
 pub fn key_script() -> &'static [u8] {
     static SCRIPT: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
     SCRIPT.get_or_init(|| {
         let key = KEY.get().map_or(PLACEHOLDER_KEY, String::as_str);
-        let text = format!(
-            "umask 077\nmkdir -p /root/.ssh\nchmod 700 /root/.ssh\necho '{key}' > /root/.ssh/authorized_keys\nchmod 600 /root/.ssh/authorized_keys\necho 'ec2-key: the key of the probe is placed'\n"
-        );
-        Box::leak(text.into_bytes().into_boxed_slice())
+        Box::leak(key_script_text(key, "").into_bytes().into_boxed_slice())
     })
 }
 
@@ -313,7 +333,7 @@ fn command_line(run: &mut qemu::Run) -> Result<(), String> {
 
 /// `-s`: the methods the server offers are the public key alone.
 fn methods(client: &Client) -> Result<(), String> {
-    let mut ssh = client.command("root", None, true);
+    let mut ssh = client.command("user", None, true);
     ssh.args(["-v", "-o", "PreferredAuthentications=none"])
         .arg("true");
     let said = run_for(ssh, b"", LOGIN_WITHIN)?;
@@ -335,7 +355,7 @@ fn methods(client: &Client) -> Result<(), String> {
 /// `-k` and `-j`: a remote forward is refused, and a local forward opens a
 /// listener on the host whose connections the server refuses to carry.
 fn forwarding(client: &Client, key: &Path) -> Result<(), String> {
-    let mut ssh = client.command("root", Some(key), true);
+    let mut ssh = client.command("user", Some(key), true);
     ssh.args([
         "-o",
         "ExitOnForwardFailure=yes",
@@ -352,7 +372,7 @@ fn forwarding(client: &Client, key: &Path) -> Result<(), String> {
     }
     println!("net-ssh: a remote port forward is refused (-k)");
     let local = crate::net_curl::free_tcp_port()?;
-    let mut command = client.command("root", Some(key), true);
+    let mut command = client.command("user", Some(key), true);
     command
         .args(["-N", "-L"])
         .arg(format!("{local}:127.0.0.1:80"))
@@ -452,7 +472,7 @@ fn preauth(run: &mut qemu::Run, client: &Client, key: &Path, http: u16) -> Resul
         }
     };
     crate::net_curl::check_body(&body)?;
-    let mut ssh = client.command("root", Some(key), true);
+    let mut ssh = client.command("user", Some(key), true);
     ssh.args(["-o", "ConnectTimeout=20"]).arg("true");
     let said = run_for(ssh, b"", LOGIN_WITHIN)?;
     if said.code == Some(0) {
@@ -480,7 +500,7 @@ fn preauth(run: &mut qemu::Run, client: &Client, key: &Path, http: u16) -> Resul
             "the held connections ended after {waited} s, the limit is {AUTH_TIMEOUT} s"
         ));
     }
-    let mut ssh = client.command("root", Some(key), true);
+    let mut ssh = client.command("user", Some(key), true);
     ssh.arg("echo again-$((6*7))");
     let said = run_for(ssh, b"", LOGIN_WITHIN)?;
     if said.code != Some(0) || !said.text().contains("again-42") {
@@ -504,7 +524,7 @@ fn terminals(client: &Client, key: &Path) -> Result<usize, String> {
     let mut held: Vec<std::process::Child> = Vec::new();
     let mut got = 0;
     for n in 1..=SESSIONS_AT_MOST {
-        let mut command = client.command("root", Some(key), true);
+        let mut command = client.command("user", Some(key), true);
         command
             .arg("-tt")
             .arg("echo tty-$(tty); sleep 600")
@@ -646,7 +666,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         command_line(&mut run)?;
 
         // 3.
-        let mut ssh = client.command("root", Some(&good), true);
+        let mut ssh = client.command("user", Some(&good), true);
         ssh.arg("echo ssh-ok-$((6*7)); id -u");
         let said = run_for(ssh, b"", LOGIN_WITHIN)?;
         if said.code != Some(0) || !said.text().contains("ssh-ok-42") {
@@ -658,6 +678,30 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
             ));
         }
         println!("net-ssh: the login with the key runs a command");
+        // The key opens the ordinary account and no other: root cannot log in over SSH (`-w`),
+        // and root is reached from `user` with `doas`.
+        let mut ssh = client.command("root", Some(&good), true);
+        ssh.arg("echo root-in");
+        let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+        if said.code == Some(0) || said.text().contains("root-in") {
+            return Err(format!(
+                "root logged in over SSH: {:?} {:?}",
+                said.text(),
+                said.stderr
+            ));
+        }
+        println!("net-ssh: a login as root with the key is refused");
+        let mut ssh = client.command("user", Some(&good), true);
+        ssh.arg("id -un; doas id");
+        let said = run_for(ssh, b"", LOGIN_WITHIN)?;
+        let text = said.text();
+        if said.code != Some(0) || !text.contains("user\n") || !text.contains("uid=0(root)") {
+            return Err(format!(
+                "`doas id` after the login: {:?} {text:?} {:?}",
+                said.code, said.stderr
+            ));
+        }
+        println!("net-ssh: the account user reaches root with doas");
         let keys = guest(&mut run, "ls /etc/dropbear", "keys1")?;
         let keys: Vec<&str> = keys
             .iter()
@@ -681,7 +725,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
             ));
         }
         println!("net-ssh: the key the client saw is the one the console named");
-        let mut ssh = client.command("root", Some(&good), true);
+        let mut ssh = client.command("user", Some(&good), true);
         ssh.arg("exit 7");
         let said = run_for(ssh, b"", LOGIN_WITHIN)?;
         if said.code != Some(7) {
@@ -690,7 +734,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
                 said.code, said.stderr
             ));
         }
-        let mut ssh = client.command("root", Some(&good), true);
+        let mut ssh = client.command("user", Some(&good), true);
         ssh.arg("cat /www/index.html");
         let said = run_for(ssh, b"", LOGIN_WITHIN)?;
         if said.stdout != rootfs::www_index() {
@@ -706,7 +750,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
             "net-ssh: exit status 7 and a page of {} bytes through the pipes are whole",
             rootfs::WWW_INDEX_LEN
         );
-        let mut ssh = client.command("root", Some(&good), true);
+        let mut ssh = client.command("user", Some(&good), true);
         ssh.arg("-tt");
         let script = format!(
             "tty\necho pty-$((6*7))\ni=0; while [ $i -lt {LINES} ]; do echo line-$i; i=$((i+1)); done\nexit 3\n"
@@ -739,7 +783,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         methods(&client)?;
         forwarding(&client, &good)?;
         // 4.
-        let mut ssh = client.command("root", Some(&bad), true);
+        let mut ssh = client.command("user", Some(&bad), true);
         ssh.arg("echo must-not-run");
         let said = run_for(ssh, b"", LOGIN_WITHIN)?;
         if said.code != Some(255)
@@ -808,7 +852,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
                 PAIRS - 1
             ));
         }
-        let mut ssh = client.command("root", Some(&good), true);
+        let mut ssh = client.command("user", Some(&good), true);
         ssh.args(["-tt", "tty"]);
         let said = run_for(ssh, b"", LOGIN_WITHIN)?;
         if said.code != Some(0) || !said.text().contains("/dev/") {
@@ -822,7 +866,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         println!("net-ssh: after they ended a new session got its terminal at once");
         // 7: the server is still the one process and still answers.
         command_line(&mut run)?;
-        let mut ssh = client.command("root", Some(&good), true);
+        let mut ssh = client.command("user", Some(&good), true);
         ssh.arg("echo last-$((6*7))");
         let said = run_for(ssh, b"", LOGIN_WITHIN)?;
         if said.code != Some(0) || !said.text().contains("last-42") {

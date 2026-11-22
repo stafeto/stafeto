@@ -146,6 +146,18 @@ const fn of(path: &'static str, mode: u32, (uid, gid): (u32, u32), source: Sourc
 const ROOT: (u32, u32) = (0, 0);
 /// An owner other than root, for the checks of owners in listings.
 const USER: (u32, u32) = (1000, 100);
+/// The owner of the RAM service's file (set-user-ID to it): a number no account has and nobody
+/// logs in as, so that no member of the group of `user` is more than that by running it.
+const SERVICE_OWNER: (u32, u32) = (65533, 65533);
+
+/// The rules of `doas` (/etc/doas.conf): one line, with no `keepenv` and no `persist`.
+pub const DOAS_CONF: &[u8] = b"permit nopass :wheel\n";
+
+/// The group file of the images that hold `doas`: the same and the group `wheel`, whose members
+/// the rule of /etc/doas.conf lets run any command as root. The probe images keep the file of
+/// three groups, which their tests count.
+const GROUP_WITH_WHEEL: &[u8] =
+    b"root:x:0:root\nwheel:x:10:user\nuser:x:100:user\nnobody:x:65534:nobody\n";
 
 /// Account databases are ordinary root-owned files in each shipped image.
 fn accounts() -> [RootFile; 4] {
@@ -278,12 +290,16 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 76] = [
+const SYSTEM_PATHS: [&str; 81] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
     "/libexec",
     "/libexec/ramfs",
+    "/bin/su",
+    "/bin/passwd",
+    "/bin/doas",
+    "/home",
     "/dev",
     "/proc",
     "/data",
@@ -313,6 +329,7 @@ const SYSTEM_PATHS: [&str; 76] = [
     "/etc/passwd",
     "/etc/group",
     "/etc/shadow",
+    "/etc/doas.conf",
     "/etc/resolv.conf",
     // The image on VZ with a static address for its second device.
     "/etc/netd.conf",
@@ -601,12 +618,27 @@ pub fn package_files(packages: &[crate::packages::Package]) -> Result<Vec<RootFi
 /// How many names of /bin beyond `ash`, `sh` and `busybox` are links to
 /// BusyBox in the shell image: the utilities of the packages that BusyBox
 /// carries.
+#[cfg(test)]
 pub fn utilities() -> usize {
     files_of("boot-ash-dialog.img")
         .iter()
         .filter(|f| f.source == Some(Source::Link("busybox")))
         .count()
         - 2
+}
+
+/// How many names `ls /bin` shows in the shell image of the dialogs: every file and link of the
+/// image directly under /bin (the set-user-ID programs and the links to BusyBox among them).
+pub fn bin_entries() -> usize {
+    files_of("boot-ash-dialog.img")
+        .iter()
+        .filter(|f| {
+            f.source.is_some()
+                && f.path
+                    .strip_prefix("/bin/")
+                    .is_some_and(|rest| !rest.contains('/'))
+        })
+        .count()
 }
 
 /// The shell's image: the base system (the RAM service, its directories and
@@ -632,7 +664,24 @@ fn shell_files(image: &str) -> Result<Vec<RootFile>, String> {
     files.extend([
         dir("/bin"),
         dir("/libexec"),
-        file("/libexec/ramfs", 0o4750, USER, "ramfs"),
+        file("/libexec/ramfs", 0o4750, SERVICE_OWNER, "ramfs"),
+        // The three programs with the set-user-ID bit of root. They are system files and no
+        // package's: the package file refuses a set-ID mode (a package may never bring one), and
+        // the packages `busybox-suid` and `doas` only build the programs.
+        file("/bin/su", 0o4755, ROOT, "busybox-suid"),
+        file("/bin/passwd", 0o4755, ROOT, "busybox-suid"),
+        file("/bin/doas", 0o4755, ROOT, "doas"),
+        // The one rule of `doas`: the members of `wheel` run any command as root with no
+        // password (the key that opens the account is the proof). Readable by root alone. It
+        // is a file of the images that hold `doas`: the probe images list /etc in full.
+        of(
+            "/etc/doas.conf",
+            0o400,
+            ROOT,
+            Source::Bytes("doas.conf", DOAS_CONF),
+        ),
+        // The homes of the ordinary accounts: `adduser -h /home/<name>` makes one here (in memory).
+        dir("/home"),
         dir("/dev"),
         dir("/proc"),
         // The directory of the CPUs, which htop and `nproc --all` count: a
@@ -2631,6 +2680,12 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         _ => Vec::new(),
     };
     files.extend(accounts());
+    // An image that holds `doas` has the group `wheel` its rule names.
+    if files.iter().any(|f| f.path == "/bin/doas") {
+        for f in files.iter_mut().filter(|f| f.path == "/etc/group") {
+            f.source = Some(Source::Bytes("group", GROUP_WITH_WHEEL));
+        }
+    }
     if name == "boot-ssh-probe.img" {
         add_star(name, &mut files);
     }
@@ -2847,6 +2902,138 @@ mod tests {
         }
     }
 
+    /// Privilege in the images (stafeto#565): the only files with the set-user-ID or set-group-ID
+    /// bit are `su`, `passwd` and `doas` (root's) and the RAM service's own file and probe fixture;
+    /// `/bin/busybox` and the links to it carry no bit (a set-user-ID BusyBox would give every
+    /// applet the bit through its links); no image has a table of applets for BusyBox
+    /// (/etc/busybox.conf); the one rule of `doas` is `permit nopass :wheel`, readable by root
+    /// alone; and no shipped shadow field is a hash.
+    #[test]
+    fn the_images_give_privilege_to_three_programs_and_to_no_other_file() {
+        const SUID: [&str; 3] = ["/bin/su", "/bin/passwd", "/bin/doas"];
+        for image in IMAGES {
+            let files = files_of(image);
+            assert!(
+                files.iter().all(|f| f.path != "/etc/busybox.conf"),
+                "{image}: /etc/busybox.conf"
+            );
+            for f in &files {
+                if f.mode & 0o6000 == 0 {
+                    continue;
+                }
+                if SUID.contains(&f.path) {
+                    assert_eq!(
+                        (f.mode, f.uid, f.gid),
+                        (0o4755, 0, 0),
+                        "{image}: {}",
+                        f.path
+                    );
+                    assert!(
+                        matches!(f.source, Some(Source::Elf(_))),
+                        "{image}: {}",
+                        f.path
+                    );
+                } else if files.iter().any(|f| f.path == "/bin/doas") {
+                    // An image with the packages of the shell has no other file with a bit but
+                    // the RAM service's own (the probe images carry fixtures of their own).
+                    assert!(
+                        ["/libexec/ramfs"].contains(&f.path),
+                        "{image}: {} has a set-ID bit",
+                        f.path
+                    );
+                }
+            }
+            if let Some(busybox) = files.iter().find(|f| f.path == "/bin/busybox") {
+                assert_eq!(busybox.mode, 0o755, "{image}: /bin/busybox");
+            }
+            // `wheel` is in the group file of the images that hold `doas`, and in no other.
+            let group = files.iter().find(|f| f.path == "/etc/group").unwrap();
+            let Some(Source::Bytes(_, group)) = group.source else {
+                panic!("{image}: /etc/group is not bytes");
+            };
+            assert_eq!(
+                group.windows(8).any(|w| w == b"wheel:x:"),
+                files.iter().any(|f| f.path == "/bin/doas"),
+                "{image}: group wheel and /bin/doas"
+            );
+            // The rule file is in the images that hold `doas`, and in no other.
+            let conf = files.iter().find(|f| f.path == "/etc/doas.conf");
+            assert_eq!(
+                conf.is_some(),
+                files.iter().any(|f| f.path == "/bin/doas"),
+                "{image}: /etc/doas.conf and /bin/doas"
+            );
+            if let Some(conf) = conf {
+                assert_eq!((conf.mode, conf.uid, conf.gid), (0o400, 0, 0), "{image}");
+                let Some(Source::Bytes(_, rules)) = conf.source else {
+                    panic!("{image}: /etc/doas.conf is not bytes");
+                };
+                assert_eq!(rules, b"permit nopass :wheel\n", "{image}");
+            }
+            let shadow = files.iter().find(|f| f.path == "/etc/shadow").unwrap();
+            let Some(Source::Bytes(_, bytes)) = shadow.source else {
+                panic!("{image}: /etc/shadow is not bytes");
+            };
+            for line in std::str::from_utf8(bytes).unwrap().lines() {
+                let field = line.split(':').nth(1).unwrap();
+                assert!(
+                    field == "!" || field == "*",
+                    "{image}: a hash in /etc/shadow"
+                );
+            }
+        }
+        let shell = files_of("boot-ash-dialog.img");
+        for path in SUID {
+            assert!(
+                shell.iter().any(|f| f.path == path),
+                "the shell image has no {path}"
+            );
+        }
+    }
+
+    /// No image ships a key of anyone's: no `authorized_keys` and no `.ssh` directory (the key of
+    /// an instance is written at boot by `ec2-key`).
+    #[test]
+    fn no_image_contains_an_authorized_keys_file_or_a_ssh_directory() {
+        for image in IMAGES {
+            for f in files_of(image) {
+                let bad = f.path.rsplit('/').next() == Some("authorized_keys")
+                    || f.path.split('/').any(|part| part == ".ssh");
+                assert!(!bad, "{image}: {}", f.path);
+            }
+        }
+    }
+
+    /// The accounts of the image keep to the rule of the account files kept on the data volume
+    /// (stafeto#565): identifiers under 1000 for the image's own accounts, except `user` (1000)
+    /// and `nobody` (65534), so that an account an operator adds never meets one of the image.
+    #[test]
+    fn the_accounts_of_the_images_keep_their_identifiers_apart_from_the_operators() {
+        for image in IMAGES {
+            let files = files_of(image);
+            let Some(Source::Bytes(_, bytes)) = files
+                .iter()
+                .find(|f| f.path == "/etc/passwd")
+                .unwrap()
+                .source
+            else {
+                panic!("{image}: /etc/passwd is not bytes");
+            };
+            for line in std::str::from_utf8(bytes).unwrap().lines() {
+                let f: Vec<&str> = line.split(':').collect();
+                let (name, uid): (&str, u32) = (f[0], f[2].parse().unwrap());
+                let probe_star = image == &"boot-ssh-probe.img" && name == SSH_PROBE_STAR;
+                assert!(
+                    uid < 1000
+                        || (name, uid) == ("user", 1000)
+                        || (name, uid) == ("nobody", 65534)
+                        || probe_star,
+                    "{image}: account {name} has uid {uid}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn hard_links_of_a_program_share_one_file_and_the_table_reads_back() {
         let bytes = table(&ramfs(), 5, 9).unwrap();
@@ -2864,6 +3051,21 @@ mod tests {
         assert_eq!(service.mode, rootfs::REGULAR | 0o4750);
         assert_eq!((service.uid, service.gid), USER);
         assert!(find("/bin").is_directory());
+    }
+
+    /// The count of /bin the dialogs wait for is the entries of the image list; the names that
+    /// are no link to BusyBox are 8 programs (busybox, bash, htop, nano, ncdu, su, passwd and
+    /// doas) and the names ash and sh, which `utilities` leaves out.
+    #[test]
+    fn the_count_of_bin_follows_the_list_of_the_shell_image() {
+        assert_eq!(bin_entries(), utilities() + 10);
+        let files = files_of("boot-ash-dialog.img");
+        for name in ["su", "passwd", "doas"] {
+            assert!(
+                files.iter().any(|f| f.path == format!("/bin/{name}")),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -3216,6 +3418,7 @@ mod tests {
         for p in packages.iter().filter(|p| p.files.is_empty()) {
             assert!(
                 crate::packages::SERVICE_LIBRARIES.contains(&p.name.as_str())
+                    || crate::packages::SYSTEM_PROGRAMS.contains(&p.name.as_str())
                     || packages.iter().any(|q| q.build_depends.contains(&p.name)),
                 "{} installs nothing and no package links it in",
                 p.name
@@ -3238,7 +3441,7 @@ mod tests {
         let row = |name: &str| {
             table
                 .lines()
-                .find(|l| l.starts_with(name))
+                .find(|l| l.split_whitespace().next() == Some(name))
                 .unwrap_or_else(|| panic!("no row {name}: {table}"))
                 .split_whitespace()
                 .map(str::to_owned)

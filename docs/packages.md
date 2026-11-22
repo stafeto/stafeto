@@ -273,9 +273,15 @@ them for the licence notes of the image.
   The server and `dropbearkey` are one program (`/bin/dropbearkey` is a link to `/bin/dropbear`).
   The description makes the empty directory `/etc/dropbear`. The boot script of the image
   (`/etc/rc` runs `/etc/rc.d/dropbear` after `ec2-key`, tools/rc), when
-  `/root/.ssh/authorized_keys` exists, makes an Ed25519 host key with `dropbearkey`, prints
-  `ssh: host key SHA256:...` on the console and starts `dropbear -F -s -j -k -r KEY` (`-s -j -k`
-  repeat what the build leaves out); the server is started again a second after it ends, and a line
+  the account `user` has an `authorized_keys` in the home `/etc/passwd` names, makes an Ed25519 host key with `dropbearkey`, prints
+  `ssh: host key SHA256:...` on the console and starts `dropbear -F -s -j -k -w -r KEY` (`-s -j -k`
+  repeat what the build leaves out; `-w` refuses a login as root, which is reached from `user` with `doas`).
+  `ec2-key` puts the key of the instance's key pair there, and only there: the home is `/data/home/user` when a data volume
+  is attached (the service `datakey` makes it) and `/home/user` in memory otherwise (the script makes it empty and says so
+  on the console); it refuses an account with an identifier under 1000, a home that is not an absolute path, and a home or
+  `.ssh` that is a symbolic link, and writes the key through a temporary file made with `set -C` that has its owner and mode
+  before it moves into place. To log in: `ssh -i KEY user@ADDRESS` (on QEMU, `ssh -i KEY -p PORT user@127.0.0.1` through the
+  forward), then `doas -s` for a root shell or `doas COMMAND` for one command. `pkg` is the one exception, for now: `doas` and `su` are set-user-ID programs, and a set-ID program takes no package session from its caller (the caller could have put a channel of its own there), so a root `pkg` started through them reports "no package service". Until the loader verifies the package slot (a separate task of series 0.7 that blocks the v0.7.0 tag), `pkg` works from the boot script and the console only, and over SSH it reports "no package service"; the server is started again a second after it ends, and a line
   it prints is shown once until it changes. The build has no syslog, so the log goes to the
   standard error, and `-E` is not an option of it. `cargo xtask net-ssh` runs it on
   `boot-ssh-probe.img`: logins with a key made by the host's `ssh-keygen`, a refused key, refused
@@ -284,6 +290,26 @@ them for the licence notes of the image.
   alone, so the script prints the command line it starts), the fingerprint on the console,
   connections held before authentication with an HTTP request and a login still answered after
   them, and the pseudo terminals.
+- Privilege and accounts. Three programs of the shell image carry the set-user-ID bit of root (mode 4755): `/bin/su` and
+  `/bin/passwd`, which are one program, `busybox-suid` (the package of that name: BusyBox 1.37 built a third time from the
+  same archive by `tools/build-busybox.py`, with the applets `su` and `passwd` alone, BusyBox's own set-user-ID support on,
+  no table of applets and so no `/etc/busybox.conf`, and the C main of `tools/busybox/suid-main.c`, which has none of the
+  console branches of the main of the shell's program), and `/bin/doas` (OpenDoas 6.8.2, ISC, `tools/build-doas.py`: no PAM,
+  no shadow authentication and no timestamps, so a rule with a password is refused and the program reads no password). The
+  shell's `/bin/busybox` is 0755 and has no bit: a bit on it would reach all its applets through their links, and its main
+  starts the console session for the name `ash-getty`, which no user may reach with the rights of root. The package file format
+  refuses a set-ID mode, so the three files are system files of the image (`xtask/src/rootfs.rs`, in `SYSTEM_PATHS`) that
+  name the programs the packages `busybox-suid` and `doas` build, and the host tests of `rootfs.rs` fail when any other file
+  of the shell image has the bit. The file `/etc/doas.conf` (mode 0400, root) holds one rule, `permit nopass
+  :wheel` with no `keepenv` and no `persist`: the members of the group `wheel` (gid 10, `wheel:x:10:user` in `/etc/group`)
+  run any command as any user without a password, and everyone else is refused with `Operation not permitted`.
+  `su` reads a password (the hash of the target in `/etc/shadow`; root's field is `!` in the shipped image, so `su root`
+  works after `passwd root` as root) and does not check `/etc/shells` (relibc has no `getusershell`). The hashes are
+  BusyBox's own (`USE_BB_CRYPT`, MD5 and SHA-256 or SHA-512, default SHA-512 with the 5000 rounds of the default, so no
+  `rounds=` in the field), never libc's DES `crypt`. The shell's BusyBox also has `adduser`, `addgroup`, `deluser`,
+  `delgroup` and `chpasswd` (the applets root runs; identifiers 100 to 999 for system accounts and 1000 to 60000 for the
+  others). `cargo xtask users` runs the probe: the modes above, `doas` for a member and a non-member of `wheel`, and `su` and
+  `passwd` with the identifiers they keep.
 - nginx 1.30.7 (`/bin/nginx`, BSD-2-Clause, with `/etc/nginx/mime.types` and
   `/etc/nginx/nginx.conf`) and PCRE2 10.49 (BSD-3-Clause with the PCRE2
   exception, linked into nginx, no file of its own) are network packages

@@ -90,15 +90,21 @@ static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 const PLACEHOLDER_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA placeholder";
 
+/// What the stand-in of `ec2-key` runs besides: the package manager as root, in the background,
+/// once the network has its address. The shell of a session over SSH cannot do it: `doas` is a
+/// set-user-ID program, a set-ID program takes no package session from its caller (a forged one
+/// would be believed by a root `pkg`), so a root `pkg` started through `doas` finds no service.
+/// The boot script's shell holds the session. The probe reads what these wrote.
+const PKG_AT_BOOT: &str = "(while [ ! -s /etc/resolv.conf ]; do sleep 1; done; \
+pkg update >/tmp/pkg-update 2>&1; pkg search compress >/tmp/pkg-search 2>&1; : >/tmp/pkg-done) &\n";
+
 /// The script that stands for `ec2-key` in the image of the run: it writes the key of the run as
 /// the metadata of an instance would give it.
 pub fn key_script() -> &'static [u8] {
     static SCRIPT: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
     SCRIPT.get_or_init(|| {
         let key = KEY.get().map_or(PLACEHOLDER_KEY, String::as_str);
-        let text = format!(
-            "umask 077\nmkdir -p /root/.ssh\nchmod 700 /root/.ssh\necho '{key}' > /root/.ssh/authorized_keys\nchmod 600 /root/.ssh/authorized_keys\necho 'ec2-key: the key of the probe is placed'\n"
-        );
+        let text = crate::net_ssh::key_script_text(key, PKG_AT_BOOT);
         Box::leak(text.into_bytes().into_boxed_slice())
     })
 }
@@ -420,7 +426,7 @@ const PAGE_SAYS: [&str; 17] = [
     "This is an experimental system",
     "Keep no secrets on it",
     "only to your own address",
-    "ssh root@",
+    "ssh user@",
     "key pair you chose when you launched",
     "pkg update",
     "pkg search nginx",
@@ -575,8 +581,10 @@ fn guest(
     command: &str,
     within: Duration,
 ) -> Result<crate::net_ssh::Ended, String> {
-    let mut ssh = client.command("root", Some(key), true);
-    ssh.arg(command);
+    // The key opens `user`; the commands of the run need root (`pkg`, the files of nginx), so
+    // they go through `doas`.
+    let mut ssh = client.command("user", Some(key), true);
+    ssh.arg(format!("doas ash -c '{}'", command.replace('\'', "'\\''")));
     run_for(ssh, b"", within)
 }
 
@@ -623,6 +631,17 @@ pub fn command(args: &[String]) -> Result<(), String> {
 
 pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
     run_probe(machine, false)
+}
+
+/// Whether `persist` runs the cases of the account files (`cargo xtask users persist`) and not
+/// those of the host key.
+static ACCOUNTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `cargo xtask users persist`: two boots of the image of the try-out over one data volume; the
+/// account files, the home of `user` and the host key come back at the second.
+pub fn accounts_persist() -> Result<(), String> {
+    ACCOUNTS.store(true, std::sync::atomic::Ordering::SeqCst);
+    run_probe(&qemu::VIRT_2G, true)
 }
 
 /// `cargo xtask net-try persist`: only the cases of the data volume (`persist`), on EFI's machine.
@@ -772,7 +791,11 @@ fn run_probe(machine: &'static qemu::Machine, persist_only: bool) -> Result<(), 
 
         // 3. The login, the host key, the files of the instance.
         let said = guest(&client, &good, "echo ssh-ok-$((6*7)); id -u", SSH_WITHIN)?;
-        if said.code != Some(0) || !said.text().contains("ssh-ok-42") {
+        // `guest` runs the command as root through `doas` after a login as `user`: the id is 0.
+        if said.code != Some(0)
+            || !said.text().contains("ssh-ok-42")
+            || !said.text().contains("\n0")
+        {
             return Err(format!(
                 "the login with the key gave {:?}: {:?} {:?}",
                 said.code,
@@ -781,6 +804,13 @@ fn run_probe(machine: &'static qemu::Machine, persist_only: bool) -> Result<(), 
             ));
         }
         println!("net-try: the login with the probe key runs a command");
+        let mut ssh = client.command("root", Some(&good), true);
+        ssh.arg("echo root-in");
+        let root = run_for(ssh, b"", SSH_WITHIN)?;
+        if root.code == Some(0) || root.text().contains("root-in") {
+            return Err(format!("root logged in over SSH: {:?}", root.text()));
+        }
+        println!("net-try: a login as root with the probe key is refused");
         let known = Command::new("ssh-keygen")
             .arg("-l")
             .arg("-f")
@@ -830,11 +860,19 @@ fn run_probe(machine: &'static qemu::Machine, persist_only: bool) -> Result<(), 
         );
 
         // 4. The package manager against the mirror of the probe.
-        let updated = guest_ok(&client, &good, "pkg update 2>&1", PKG_WITHIN)?;
+        // As root, from the boot script (see PKG_AT_BOOT); a root `pkg` through `doas` has no
+        // package service, and as `user` it is refused.
+        guest_ok(
+            &client,
+            &good,
+            "while [ ! -f /tmp/pkg-done ]; do sleep 2; done",
+            PKG_WITHIN,
+        )?;
+        let updated = guest_ok(&client, &good, "cat /tmp/pkg-update", SSH_WITHIN)?;
         if !updated.contains("serial 2") {
             return Err(format!("pkg update said {updated:?}, wanted serial 2"));
         }
-        let found = guest_ok(&client, &good, "pkg search compress 2>&1", PKG_WITHIN)?;
+        let found = guest_ok(&client, &good, "cat /tmp/pkg-search", SSH_WITHIN)?;
         if !found.contains("ncompress") {
             return Err(format!("pkg search compress said {found:?}"));
         }
@@ -949,6 +987,8 @@ enum Volume<'a> {
 struct Booted {
     lines: Vec<String>,
     seen: String,
+    /// What the `inside` of the boot gave (the account probe's output).
+    extra: String,
 }
 
 impl Booted {
@@ -1000,6 +1040,7 @@ fn boot_with_volume(
     volume: &Volume,
     case: &str,
     wanted: &[(&str, &str)],
+    inside: &dyn Fn(&Client, &Path) -> Result<String, String>,
 ) -> Result<Booted, String> {
     let Rig {
         firmware,
@@ -1074,11 +1115,12 @@ fn boot_with_volume(
             .arg(ssh_dir.join("known_hosts"))
             .output()
             .map_err(|e| format!("ssh-keygen: {e}"))?;
-        Ok(String::from_utf8_lossy(&known.stdout).into_owned())
+        let extra = inside(&client, good)?;
+        Ok((String::from_utf8_lossy(&known.stdout).into_owned(), extra))
     })();
     let output = run.stop();
     symbolize::backtrace(&output.lines, elf);
-    let seen = talked?;
+    let (seen, extra) = talked?;
     if let Some(line) = output.lines.iter().find(|l| {
         l.contains("process fault:")
             || l.contains("KERNEL PANIC")
@@ -1092,6 +1134,7 @@ fn boot_with_volume(
     Ok(Booted {
         lines: output.lines,
         seen,
+        extra,
     })
 }
 
@@ -1121,8 +1164,11 @@ fn persist(kernel: &Artifacts, image: &Path, dir: &Path, good: &Path) -> Result<
         dir,
     };
     let boot = |volume: &Volume, case: &str, wanted: &[(&str, &str)]| {
-        boot_with_volume(&rig, volume, case, wanted)
+        boot_with_volume(&rig, volume, case, wanted, &|_, _| Ok(String::new()))
     };
+    if ACCOUNTS.load(std::sync::atomic::Ordering::SeqCst) {
+        return accounts_cases(&rig, &volume);
+    }
     let kept = |b: &Booted, key: &str| -> Result<(), String> {
         if !b.seen.contains(key) {
             return Err(format!(
@@ -1253,7 +1299,132 @@ fn persist(kernel: &Artifacts, image: &Path, dir: &Path, good: &Path) -> Result<
         "net-try persist: the controller with another serial number was left alone, the file that looks blank has the same SHA-256 after the boot ({digest_after}), and the key is a per-boot one"
     );
     println!("net-try persist: {free_first}");
+
+    // 5. The accounts over a reboot, on a volume of their own (the same boots as
+    // `cargo xtask users persist`, which has no job of its own in ci: the two share the image,
+    // the directory and the key of the run, so they run in this one).
+    let accounts_volume = dir.join("accounts-volume.raw");
+    qemu::store_file(&accounts_volume, VOLUME_BYTES, true)?;
+    accounts_cases(&rig, &accounts_volume)?;
     println!("net-try persist passed");
+    Ok(())
+}
+
+/// The commands of the first boot of `accounts_cases`, as `user` (the key opens it): a note in
+/// the home, an account added and two passwords set through `doas`.
+const ACCOUNTS_FIRST: &str = "PATH=/bin; export PATH; echo kept > \"$HOME/note\"; echo home=$HOME; \
+     doas adduser -D -h /data/home/bob bob; echo 'bob:pw-1' | doas chpasswd; \
+     echo 'root:rootpw-2' | doas chpasswd; id -un";
+/// The commands of the second boot: what came back.
+const ACCOUNTS_SECOND: &str = "PATH=/bin; export PATH; cat \"$HOME/note\"; echo home=$HOME; \
+     grep '^bob:' /etc/passwd; doas grep '^root:' /etc/shadow | cut -c1-8; doas grep '^bob:' /etc/shadow | cut -c1-8; \
+     ls -ldn /data/home/user /data/home/bob; id -un; \
+     echo measure-meminfo; head -3 /proc/meminfo; \
+     echo measure-processes $(ls -d /proc/[0-9]* | wc -l); \
+     for p in /proc/[0-9]*; do read c < $p/cmdline; case $c in datakey*) echo measure-datakey ${p#/proc/}: $(cat $p/statm);; esac; done";
+
+/// A command of `user` over `ssh` (no `doas` around it).
+fn as_user(client: &Client, key: &Path, command: &str) -> Result<String, String> {
+    let mut ssh = client.command("user", Some(key), true);
+    ssh.arg(command);
+    let said = run_for(ssh, b"", SSH_WITHIN)?;
+    if said.code != Some(0) {
+        return Err(format!(
+            "{command:?} ended with {:?}: {} {}",
+            said.code,
+            said.text(),
+            said.stderr
+        ));
+    }
+    Ok(said.text())
+}
+
+/// The accounts over a reboot: the first boot of a blank volume makes the home of `user` on it
+/// (`/data/home/user`, the key of the instance is there), `user` writes a note, adds an account
+/// and sets two passwords with `doas`, and `datakey` keeps the three account files; the second
+/// boot of the same file brings the note, the account and the root hash back, with the same host
+/// key.
+fn accounts_cases(rig: &Rig, volume: &Path) -> Result<(), String> {
+    let first = boot_with_volume(
+        rig,
+        &Volume::Serial(DATA_SERIAL, volume),
+        "accounts-first",
+        &[
+            (
+                "the home made",
+                "datakey: /data/home/user made, owner 1000:100",
+            ),
+            ("the key kept", "datakey: host key saved to /data"),
+        ],
+        &|client, key| {
+            let said = as_user(client, key, ACCOUNTS_FIRST)?;
+            // Two looks of a second agree, then the three files are written: a few seconds.
+            std::thread::sleep(Duration::from_secs(10));
+            Ok(said)
+        },
+    )?;
+    for want in ["home=/data/home/user", "user"] {
+        if !first.extra.contains(want) {
+            return Err(format!(
+                "the first boot said {:?}, wanted {want:?}",
+                first.extra
+            ));
+        }
+    }
+    if !first.said("datakey: accounts saved to /data") {
+        return Err("the first boot did not save the accounts to /data".into());
+    }
+    let before = first.fingerprint()?;
+    println!("net-try accounts: the first boot made /data/home/user and kept the accounts");
+    let second = boot_with_volume(
+        rig,
+        &Volume::Serial(DATA_SERIAL, volume),
+        "accounts-second",
+        &[(
+            "the accounts restored",
+            "datakey: accounts restored from /data (3 of 3 files there)",
+        )],
+        &|client, key| as_user(client, key, ACCOUNTS_SECOND),
+    )?;
+    for want in [
+        "kept\n",
+        "home=/data/home/user",
+        "bob:x:100",
+        "root:$6$",
+        "bob:$6$",
+        "drwx------",
+        " 1000     100 ",
+    ] {
+        if !second.extra.contains(want) {
+            return Err(format!(
+                "the second boot said {:?}, wanted {want:?}",
+                second.extra
+            ));
+        }
+    }
+    if second.said("datakey: accounts restored from /data (0 of 3") || second.said("left out") {
+        return Err("the second boot left an entry out".into());
+    }
+    let after = second.fingerprint()?;
+    if before != after {
+        return Err(format!("the host key changed: {before} then {after}"));
+    }
+    // What the permanent datakey holds of the pool: the free memory and the number of processes
+    // with it running, and its own size (statm: pages), for the notes.
+    for line in second.extra.lines().skip_while(|l| *l != "measure-meminfo") {
+        println!("net-try accounts: {line}");
+    }
+    for line in second
+        .lines
+        .iter()
+        .filter(|l| l.contains("init: free pages "))
+    {
+        println!("net-try accounts: {line}");
+    }
+    println!(
+        "net-try accounts: the second boot brought the note, the account bob, the hashes of root and bob and the home back, with the same host key"
+    );
+    println!("net-try accounts passed");
     Ok(())
 }
 
