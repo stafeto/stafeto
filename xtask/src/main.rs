@@ -40,6 +40,8 @@ mod owner_lifetime;
 #[cfg(test)]
 #[path = "../../lib/rt/src/service/sample.rs"]
 mod service_sample;
+#[cfg(test)]
+mod wfd_lock_tests;
 
 mod abi_fingerprint;
 mod aws;

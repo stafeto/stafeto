@@ -27,6 +27,8 @@ mod fifo_io;
 pub mod fork;
 pub mod loader_probe;
 mod lock_call;
+#[cfg(any(feature = "wfc", feature = "wfd"))]
+mod plain_lock;
 #[cfg(feature = "lock-probe")]
 pub use lock_call::probe_hook as probe_lock_hook;
 mod lock_wait;
