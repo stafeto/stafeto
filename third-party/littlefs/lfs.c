@@ -3035,6 +3035,92 @@ static int lfs_ctz_find(lfs_t *lfs,
     return 0;
 }
 
+// stafeto: lfs_ctz_find for the file of a read, which starts from a waypost
+// the last reads left (the one of the smallest index that is not below the
+// target) and leaves the blocks it passes as wayposts. A block of the list
+// never changes while the list has the same head, so a waypost is right as
+// long as the pair (head, size) is the one it was recorded for; the writes and
+// the truncations of the file drop the wayposts as well.
+static void lfs_ctz_hint_add(struct lfs_ctz_hints *hints, lfs_size_t limit,
+        lfs_size_t index, lfs_block_t block) {
+    lfs_size_t worst = 0;
+    for (lfs_size_t i = 0; i < hints->count; i++) {
+        if (hints->at[i].index == index) {
+            return;
+        }
+        if (hints->at[i].index > hints->at[worst].index) {
+            worst = i;
+        }
+    }
+
+    if (hints->count < limit) {
+        worst = hints->count++;
+    } else if (hints->at[worst].index <= index) {
+        // all of the wayposts are nearer to the target
+        return;
+    }
+    hints->at[worst].index = index;
+    hints->at[worst].block = block;
+}
+
+static int lfs_ctz_find_hinted(lfs_t *lfs, lfs_file_t *file,
+        lfs_size_t pos, lfs_block_t *block, lfs_off_t *off) {
+    lfs_size_t limit = lfs_min(lfs->cfg->ctz_hints, LFS_CTZ_HINTS_MAX);
+    if (limit == 0 || file->ctz.size == 0) {
+        return lfs_ctz_find(lfs, NULL, &file->cache,
+                file->ctz.head, file->ctz.size, pos, block, off);
+    }
+
+    struct lfs_ctz_hints *hints = &file->hints;
+    if (hints->ctz.head != file->ctz.head
+            || hints->ctz.size != file->ctz.size
+            || hints->count > limit) {
+        hints->ctz = file->ctz;
+        hints->count = 0;
+    }
+
+    lfs_block_t head = file->ctz.head;
+    lfs_off_t current = lfs_ctz_index(lfs, &(lfs_off_t){file->ctz.size-1});
+    lfs_off_t target = lfs_ctz_index(lfs, &pos);
+
+    // forget the wayposts behind the target, and start from the nearest
+    // one that is not
+    lfs_size_t kept = 0;
+    for (lfs_size_t i = 0; i < hints->count; i++) {
+        if (hints->at[i].index >= target) {
+            hints->at[kept++] = hints->at[i];
+        }
+    }
+    hints->count = kept;
+    for (lfs_size_t i = 0; i < hints->count; i++) {
+        if (hints->at[i].index < current) {
+            current = hints->at[i].index;
+            head = hints->at[i].block;
+        }
+    }
+
+    while (current > target) {
+        lfs_size_t skip = lfs_min(
+                lfs_npw2(current-target+1) - 1,
+                lfs_ctz(current));
+
+        int err = lfs_bd_read(lfs,
+                NULL, &file->cache, sizeof(head),
+                head, 4*skip, &head, sizeof(head));
+        head = lfs_fromle32(head);
+        if (err) {
+            return err;
+        }
+
+        current -= 1 << skip;
+        lfs_ctz_hint_add(hints, limit, current, head);
+    }
+
+    *block = head;
+    *off = pos;
+    return 0;
+}
+
 #ifndef LFS_READONLY
 static int lfs_ctz_extend(lfs_t *lfs,
         lfs_cache_t *pcache, lfs_cache_t *rcache,
@@ -3202,6 +3288,9 @@ static int lfs_file_opencfg_(lfs_t *lfs, lfs_file_t *file,
     file->pos = 0;
     file->off = 0;
     file->cache.buffer = NULL;
+    file->hints.count = 0;
+    file->hints.ctz.head = LFS_BLOCK_NULL;
+    file->hints.ctz.size = 0;
 
     // allocate entry for file if it doesn't exist
     lfs_stag_t tag = lfs_dir_find(lfs, &file->m, &path, &file->id);
@@ -3632,8 +3721,7 @@ static lfs_ssize_t lfs_file_flushedread(lfs_t *lfs, lfs_file_t *file,
         if (!(file->flags & LFS_F_READING) ||
                 file->off == lfs->cfg->block_size) {
             if (!(file->flags & LFS_F_INLINE)) {
-                int err = lfs_ctz_find(lfs, NULL, &file->cache,
-                        file->ctz.head, file->ctz.size,
+                int err = lfs_ctz_find_hinted(lfs, file,
                         file->pos, &file->block, &file->off);
                 if (err) {
                     return err;
@@ -3782,6 +3870,9 @@ static lfs_ssize_t lfs_file_write_(lfs_t *lfs, lfs_file_t *file,
         const void *buffer, lfs_size_t size) {
     LFS_ASSERT((file->flags & LFS_O_WRONLY) == LFS_O_WRONLY);
 
+    // the list the wayposts name is about to change
+    file->hints.count = 0;
+
     if (file->flags & LFS_F_READING) {
         // drop any reads
         int err = lfs_file_flush(lfs, file);
@@ -3881,6 +3972,9 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
     if (size > LFS_FILE_MAX) {
         return LFS_ERR_INVAL;
     }
+
+    // the list the wayposts name is about to change
+    file->hints.count = 0;
 
     lfs_off_t pos = file->pos;
     lfs_off_t oldsize = lfs_file_size_(lfs, file);

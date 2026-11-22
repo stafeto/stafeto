@@ -111,6 +111,7 @@ unsafe extern "C" {
     fn datafs_set_orphan_table(d: *mut c_void, on: i32);
     fn datafs_set_orphan_cells(d: *mut c_void, cells: u32);
     fn datafs_set_block_cycles(d: *mut c_void, cycles: i32);
+    fn datafs_set_ctz_hints(d: *mut c_void, hints: u32);
     fn datafs_erases(d: *const c_void) -> u32;
     fn datafs_open_attr(
         d: *mut c_void,
@@ -838,6 +839,13 @@ impl<D: Device> Fs<'_, D> {
     pub fn set_block_cycles(&mut self, cycles: i32) {
         // SAFETY: as `set_orphan_table`.
         unsafe { datafs_set_block_cycles(self.state.0.as_mut_ptr().cast(), cycles) };
+    }
+
+    /// The wayposts each open file keeps for finding the blocks of a read (0 is none, the walk of
+    /// the release), before the next mount: the tests compare the two.
+    pub fn set_ctz_hints(&mut self, hints: u32) {
+        // SAFETY: as `set_orphan_table`.
+        unsafe { datafs_set_ctz_hints(self.state.0.as_mut_ptr().cast(), hints) };
     }
 
     /// A table of the repair of orphans of `cells` cells (0 is none), before the next mount.

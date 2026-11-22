@@ -27,6 +27,10 @@
 // that is repaired for the keys that did not fit with the walk of the release.
 #define ORPHAN_CELLS 4096u
 
+// The wayposts each open file keeps for finding the blocks of a read (lfs_config.ctz_hints, at most
+// LFS_CTZ_HINTS_MAX). The disk is the same with any number, 0 included.
+#define CTZ_HINTS 16u
+
 #ifndef DATAFS_FILES
 #define DATAFS_FILES 24
 #endif
@@ -162,6 +166,9 @@ void datafs_setup(struct datafs *d, uint32_t blocks)
     d->cfg.lookahead_buffer = d->lookahead;
     d->cfg.orphan_buffer = d->orphans;
     d->cfg.orphan_size = sizeof(d->orphans);
+    // The wayposts of an open file for the blocks of a read in order (a file read from start to end
+    // costs a few reads of the disk for each block, and about log2(n) without them).
+    d->cfg.ctz_hints = CTZ_HINTS;
     for (int i = 0; i < DATAFS_FILES; i++) {
         d->file_cfg[i].buffer = d->file_cache[i];
     }
@@ -189,6 +196,13 @@ void datafs_set_orphan_table(struct datafs *d, int on)
 void datafs_set_block_cycles(struct datafs *d, int32_t cycles)
 {
     d->cfg.block_cycles = cycles;
+}
+
+// The host tests only: the number of wayposts of an open file, 0 for none (the release's walk of the
+// skip list), set between `datafs_setup` and the next mount.
+void datafs_set_ctz_hints(struct datafs *d, uint32_t hints)
+{
+    d->cfg.ctz_hints = hints;
 }
 
 // The same with a table of `cells` cells (at most ORPHAN_CELLS), for the tests of a full table.

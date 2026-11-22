@@ -305,6 +305,15 @@ struct lfs_config {
     // The disk is the same with or without the table.
     void *orphan_buffer;
     lfs_size_t orphan_size;
+
+    // stafeto: the number of wayposts (at most LFS_CTZ_HINTS_MAX) that an open
+    // file keeps for finding the block of a position it reads. A read in
+    // order finds each new block with the reads of a few pointers where the
+    // release walks the skip list of the file back from its last block, about
+    // log2(n) reads for the n-th block. Zero (the default of a zeroed
+    // configuration) leaves the release's walk. The disk is the same with or
+    // without the wayposts, and the file structure has the room either way.
+    lfs_size_t ctz_hints;
 };
 
 // File info structure
@@ -411,6 +420,11 @@ typedef struct lfs_dir {
     lfs_block_t head[2];
 } lfs_dir_t;
 
+// stafeto: the wayposts of one open file, see lfs_config.ctz_hints
+#ifndef LFS_CTZ_HINTS_MAX
+#define LFS_CTZ_HINTS_MAX 16
+#endif
+
 // littlefs file type
 typedef struct lfs_file {
     struct lfs_file *next;
@@ -430,6 +444,19 @@ typedef struct lfs_file {
     lfs_cache_t cache;
 
     const struct lfs_file_config *cfg;
+
+    // stafeto: blocks of the skip list of the file (the pair ctz) that the last
+    // reads passed, each with its index in the list. They are valid while the
+    // file is the same pair (head, size), and are dropped by every write and
+    // truncation of the file.
+    struct lfs_ctz_hints {
+        struct lfs_ctz ctz;
+        uint8_t count;
+        struct lfs_ctz_hint {
+            lfs_block_t block;
+            lfs_size_t index;
+        } at[LFS_CTZ_HINTS_MAX];
+    } hints;
 } lfs_file_t;
 
 typedef struct lfs_superblock {
