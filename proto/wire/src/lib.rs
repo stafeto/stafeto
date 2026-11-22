@@ -23,7 +23,9 @@
 //! A protocol has one number `VERSION`, and its service takes that version
 //! alone. A new method keeps the version: an old client never calls it,
 //! and a new client gets UNKNOWN_METHOD from an old service. A new layout
-//! of a method changes the version.
+//! of a method changes the version. In an open series (`packages/abi.txt`)
+//! a new method also raises the version, so that the fingerprint of the
+//! protocols, which is built from the VERSION lines, records it.
 
 #![cfg_attr(not(test), no_std)]
 

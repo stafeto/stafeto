@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The protocol of the data file service (services/datafs), proto_wire, version 3. Every number goes
+//! The protocol of the data file service (services/datafs), proto_wire, version 4. Every number goes
 //! low byte first, every call is one request and one reply whose first four bytes are the status.
 //!
 //! Version 3 is the version the POSIX layer of a program speaks: permissions, identity, the times
 //! and numbers of files, `chmod`, `chown`, `utimensat`, `access`, a directory listing in batches,
-//! and the limits a shell and `tar` need. It is complete for the series that freezes it. Locks and
-//! transfers through shared memory stay out of it.
+//! and the limits a shell and `tar` need. Version 4 adds the transfer of file bytes through a
+//! window of shared memory in parts of up to 64 KiB, held together by a lease on the file so that
+//! one `read` or `write` of any size stays atomic (see "The window" and "Parts and leases"), and
+//! OPEN_NUMBERED for a native client. Numbers 1 to 35 are those of version 3 and never change.
+//! Locks of records stay out of it (ENOLCK).
 //!
 //! # Paths and descriptions
 //!
@@ -29,7 +32,8 @@
 //!
 //! # Requests
 //!
-//! Numbers 1 to 24 are the numbers of version 2 and never change. A request carries its fields in
+//! Numbers 1 to 24 are the numbers of version 2 and never change (25 to 35 those of version 3, 36
+//! to 42 are version 4). A request carries its fields in
 //! the order of the table, the path (when there is one) last and running to the end of the message.
 //! A message with bytes left over or short of a field is BAD_SIZE. Times are i64 nanoseconds since
 //! the Unix epoch. A mode is the twelve bits 07777; a request with any other bit set is INVALID.
@@ -70,6 +74,13 @@
 //! | WHERE (33) | `handle` u32 | the canonical path of the description, to the end of the message |
 //! | SESSION (34) | none, and one handle: a copy of the caller's identity session; through the root channel only | one handle: a new session of the service (SEND, TRANSFER), already bound |
 //! | VERIFY_SESSION (35) | none, and one handle (SEND, TRANSFER), through the root channel only | one handle: the offered session itself, which is a live session of the service |
+//! | WINDOW (36) | none, and one handle: a memory object of `WINDOW_BYTES` (MAP_READ, MAP_WRITE, TRANSFER) | none |
+//! | READ_INTO (37) | `handle` u32, `count` u32, `cell` u32, `flags` u32, `lease` u32 | `count` u32, `flags` u32, `lease` u32, and with `cell` = `INLINE` the bytes to the end of the message |
+//! | PREAD_INTO (38) | `handle` u32, `count` u32, `offset` u64, `cell` u32, `flags` u32, `lease` u32 | as READ_INTO |
+//! | WRITE_FROM (39) | `handle` u32, `count` u32, `cell` u32, `flags` u32, `lease` u32, and with `INLINE` the bytes to the end | `count` u32, `flags` u32, `lease` u32 |
+//! | PWRITE_FROM (40) | `handle` u32, `count` u32, `offset` u64, `cell` u32, `flags` u32, `lease` u32, and with `INLINE` the bytes | as WRITE_FROM |
+//! | RELEASE (41) | `lease` u32 | none |
+//! | OPEN_NUMBERED (42) | `flags` u32, `mode` u32, `ino` u64, the path | `handle` u32, `kind` u32 |
 //!
 //! `uid` and `gid` of CHOWN and FCHOWN equal to `UID_KEEP` (u32::MAX) mean "leave as is". `atime`
 //! and `mtime` of UTIMENS and FUTIMENS take `UTIME_NOW` (the present moment, read by the service)
@@ -164,7 +175,8 @@
 //!    A session that is unbound (a CLONE session before its first BIND, or one whose binding
 //!    lapsed) answers NOT_BOUND to every request except BIND, CLOSE, CLONE, CLONE_MORE and the
 //!    requests that only read or hand on a description it holds: READ, PREAD, SEEK, FSTAT,
-//!    READDIR, REWIND, WHERE, GET_FLAGS, EXPORT and ADOPT. WRITE, PWRITE, TRUNCATE, FSYNC,
+//!    READDIR, REWIND, WHERE, GET_FLAGS, EXPORT, ADOPT, WINDOW, READ_INTO, PREAD_INTO and RELEASE.
+//!    WRITE, PWRITE, WRITE_FROM, PWRITE_FROM, OPEN_NUMBERED, TRUNCATE, FSYNC,
 //!    SET_FLAGS, FCHMOD, FCHOWN and FUTIMENS need a binding, as does every request that names a
 //!    path. A session made by CLONE inherits neither the mark nor the identity: the child binds its
 //!    own session.
@@ -334,6 +346,85 @@
 //! | 32..40 | `mtime` i64 |
 //! | 40..48 | `ctime` i64 |
 //!
+//! # The window
+//!
+//! A client that moves more than one message of bytes in a call gives the service a window: a
+//! memory object of `WINDOW_BYTES` (131,072, 32 pages) with MAP_READ, MAP_WRITE and TRANSFER, sent
+//! with WINDOW. It holds `CELLS` (2) cells of `CELL_BYTES` (65,536); cell i is at i * `CELL_BYTES`.
+//! The client maps the whole window once. The service keeps the handle in the session, maps one
+//! cell for the time of one job (read only to write a file, read and write to read one), moves up
+//! to `CELL_BYTES` between the cell and the volume and unmaps it. A new WINDOW replaces the old one
+//! (the service closes the old handle). The service accepts only a memory object with MAP_READ and
+//! MAP_WRITE of exactly `WINDOW_BYTES`, else INVALID. The service never reads a field of the
+//! protocol from a cell: the client may change a cell while a job runs, which spoils only its own
+//! bytes. A part that names a cell in a session with no window is NO_WINDOW; the layer then sends
+//! WINDOW and the part again. NO_WINDOW touches neither the file nor a lease. WINDOW, READ_INTO,
+//! PREAD_INTO and RELEASE are open to a session that is not bound (it reads inherited
+//! descriptions), WRITE_FROM and PWRITE_FROM need a binding as WRITE and PWRITE do, every new
+//! method on the root channel is IS_ROOT, and the new methods check the access bits of the
+//! description as READ, PREAD, WRITE and PWRITE do (BAD_HANDLE).
+//!
+//! # Parts and leases
+//!
+//! A call that moves more than a cell is sent in parts, each one request of READ_INTO, PREAD_INTO,
+//! WRITE_FROM or PWRITE_FROM. `cell` is 0 or 1 (the part is in that cell and `count` is at most
+//! `CELL_BYTES`) or `INLINE` (u32::MAX: the bytes are in the message, `count` is at most
+//! `INLINE_READ` (1,008), `INLINE_WRITE` (996) or `INLINE_PWRITE` (988), and for a write equals the
+//! number of bytes the message carries); any other `cell` is INVALID. `INLINE` serves a session with
+//! no free cell, a call from a signal handler, and a client whose window could not be made.
+//! `flags` of a request is `MORE` (1: more parts of this call follow) or 0; any other bit is INVALID.
+//! `lease` is 0 with `MORE` on the first part (take a lease on the file: the answer carries its
+//! number), the number the answer gave on a later part, and 0 without `MORE` for a call of one
+//! part; the answer to the last part carries 0. A lease number is not 0 and carries a generation
+//! counter (and the epoch of the instance, as a handle does), so that a number that ended is not
+//! taken for a later lease: a part that carries the number of a lease of this instance that has
+//! ended or run out is answered with `LAPSED`, and a number the service never gave is BAD_HANDLE. While a lease on a file is held, the jobs of other
+//! calls on the same file wait for the end of the call: a write lease is exclusive, a read lease
+//! lets other reads go, so one call of any size is atomic to the others (POSIX.1-2024 XSH 2.9.7
+//! lists `read`, `write`, `pread`, `pwrite`, `readv`, `writev`, `ftruncate` and `fstat` as atomic
+//! with respect to each other on a file of the hierarchy, and `write` says each write is atomic).
+//! The answer's `flags` are `LAPSED` (1: the lease ran out before this part, which then ran
+//! without one, so the call was not atomic) and `UNLEASED` (2: no lease was given, because a limit
+//! was reached; the part ran as a call of its own, and the lease it carries in the answer is 0).
+//! Any other bit is BAD_SIZE in a reply, and so is `UNLEASED` with a lease number. A part that
+//! comes after `LAPSED` goes as a separate call (with `APPEND` it takes the end of the file again).
+//! A lease
+//! ends when the last part is answered, at RELEASE, when the session goes, or when the service
+//! lets it run out (a policy of the service, `LEASE_GAP` of 1 second between two parts). RELEASE
+//! with a lease that is not the session's is BAD_HANDLE, one of an earlier instance STALE. The
+//! limits `LEASES_PER_SESSION` (4) and `LEASES` (64) are minimums the service guarantees. A part
+//! that is stopped by a limit (file size, `FILE_MAX`, free space) answers the count it did and
+//! ends the lease (rule 13). With `APPEND` the first part takes the end of the file and the next
+//! ones follow it; the synchronisation of `SYNC` runs after the part that ended the call (the last
+//! one, or the one a limit of rule 13 stopped).
+//!
+//! OPEN_NUMBERED is OPEN with the number of the file chosen by the caller, for a native client
+//! (label `SERVICE`) such as the layered file service; any other session is PERMISSION. `ino` has
+//! bit 62 (`INO_NUMBERED`) set and bit 63 clear, else INVALID; the flags must include CREATE and
+//! EXCLUSIVE, else INVALID (the number goes only to a new file, and means nothing for an existing
+//! one). The reply is that of OPEN.
+//!
+//! # Where the standard was checked
+//!
+//! Against POSIX.1-2024 (https://pubs.opengroup.org/onlinepubs/9799919799/). The binding source of
+//! the atomicity is XSH 2.9.7, "Thread Interactions with File Operations": for threads, and except
+//! where specified otherwise, its second list (the functions that act on open file descriptors of
+//! files in the file hierarchy) says each of close, dup2, dup3, fcntl, fstat, fstatat, ftruncate,
+//! futimens, lseek, open, openat, pread, read, readv, pwrite, write and writev is atomic with
+//! respect to the others: if two threads each call one of them, each call sees all of the effects
+//! of the other or none. `write()`, in its description, with `O_APPEND`: "the file offset shall be
+//! set to the end of the file prior to each write" and "no intervening file modification operation
+//! shall occur between changing the file offset and the write operation"; a write with room for
+//! only some bytes writes those, and the next write of a non-zero number fails; a request past the
+//! file size limit raises SIGXFSZ for the thread, and EFBIG is for a write that had no room for
+//! any byte. The rationale of `write()` adds that each write is atomic. `pwrite()` writes at the
+//! given position and "does not change the file offset (regardless of whether O_APPEND is set)", so
+//! PWRITE and PWRITE_FROM write at their offset whatever the flag says; the Linux page pwrite(2)
+//! says in BUGS that with O_APPEND a Linux `pwrite()` appends regardless of the offset, which this
+//! service does not copy. `read()` returns 0 at or after the end of the file; its page has no
+//! reference to 2.9.7, and its rationale says I/O is intended to be atomic to ordinary files and
+//! pipes and FIFOs. The plan's "regular file" in the title of 2.9.7 is the page's "file".
+//!
 //! # Statuses and errno
 //!
 //! [`ERRNO`] gives the POSIX error each status of the service becomes in the layer; see the table
@@ -363,7 +454,7 @@
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 
 /// The longest path, in bytes: `/data` and a path reach `proto_fs::MAX_PATH` (511), and two of
 /// them with the fields of RENAME fill one message exactly. A fixed bound.
@@ -514,7 +605,37 @@ pub const IS_ROOT: u32 = 1222;
 /// The service refuses every change (EROFS).
 pub const READ_ONLY: u32 = 1223;
 
-pub const CODES: [u32; 23] = [
+/// A status of version 4: a part names a cell and the session has no window (the layer sends WINDOW
+/// and the part again; it never reaches a program).
+pub const NO_WINDOW: u32 = 1224;
+
+/// The bytes of the window of a session: a fixed layout.
+pub const WINDOW_BYTES: usize = 131_072;
+/// The bytes of one cell of the window; cell i lies at i * `CELL_BYTES`. A fixed layout.
+pub const CELL_BYTES: usize = 65_536;
+/// The cells of the window. A fixed layout.
+pub const CELLS: usize = 2;
+/// The value of `cell` of a part whose bytes are in the message.
+pub const INLINE: u32 = u32::MAX;
+/// The bytes of a part in the message: of READ_INTO and PREAD_INTO (the reply), of WRITE_FROM and
+/// of PWRITE_FROM (the request). Fixed bounds of the layout.
+pub const INLINE_READ: usize = MESSAGE_MAX - 4 - 12;
+pub const INLINE_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 20;
+pub const INLINE_PWRITE: usize = MESSAGE_MAX - HEADER_LEN - 28;
+/// The leases one session holds and the service holds at most: minimums the service guarantees.
+pub const LEASES_PER_SESSION: usize = 4;
+pub const LEASES: usize = 64;
+/// The flag of a request of a part: more parts of the call follow.
+pub const MORE: u32 = 1;
+/// The flags of the answer to a part: the lease ran out before this part; no lease was given.
+pub const LAPSED: u32 = 1;
+pub const UNLEASED: u32 = 2;
+/// The bit that the number of a file of OPEN_NUMBERED has, and bit 63 (a number made from a path)
+/// that it has not.
+pub const INO_NUMBERED: u64 = 1 << 62;
+pub const INO_PATH: u64 = 1 << 63;
+
+pub const CODES: [u32; 24] = [
     NO_ENTRY,
     EXISTS,
     NOT_DIRECTORY,
@@ -538,6 +659,7 @@ pub const CODES: [u32; 23] = [
     FILE_SIZE_LIMIT,
     IS_ROOT,
     READ_ONLY,
+    NO_WINDOW,
 ];
 
 /// The POSIX errors the statuses become (the names of `<errno.h>`; the layer owns the numbers).
@@ -563,12 +685,12 @@ pub enum Errno {
 }
 
 /// The errno of each status of the service. Where a status becomes EIO the layer does more first:
-/// NOT_BOUND makes it BIND and send the call again once; STALE marks the descriptor of the
+/// NOT_BOUND makes it BIND and send the call again once; NO_WINDOW makes it send WINDOW and the part again; STALE marks the descriptor of the
 /// restarted service (EIO for the call, `close` succeeds); NOT_READY, CORRUPT and IS_ROOT are the
 /// service's own failures. FILE_SIZE_LIMIT is EFBIG after the layer's SIGXFSZ; TOO_BIG is EFBIG
 /// for an offset or size past `FILE_MAX`. NO_SPACE is ENOSPC, also for a full directory (the
 /// directory cannot be expanded).
-pub const ERRNO: [(u32, Errno); 23] = [
+pub const ERRNO: [(u32, Errno); 24] = [
     (NO_ENTRY, Errno::Enoent),
     (EXISTS, Errno::Eexist),
     (NOT_DIRECTORY, Errno::Enotdir),
@@ -592,6 +714,7 @@ pub const ERRNO: [(u32, Errno); 23] = [
     (FILE_SIZE_LIMIT, Errno::Efbig),
     (IS_ROOT, Errno::Eio),
     (READ_ONLY, Errno::Erofs),
+    (NO_WINDOW, Errno::Eio),
 ];
 
 /// The errno of a status code of the service, or None for a code that is not the service's.
@@ -640,10 +763,17 @@ pub enum Method {
     Where = 33,
     Session = 34,
     VerifySession = 35,
+    Window = 36,
+    ReadInto = 37,
+    PreadInto = 38,
+    WriteFrom = 39,
+    PwriteFrom = 40,
+    Release = 41,
+    OpenNumbered = 42,
 }
 
 /// The number of methods.
-pub const METHOD_COUNT: usize = 35;
+pub const METHOD_COUNT: usize = 42;
 
 impl Method {
     pub const ALL: [Method; METHOD_COUNT] = [
@@ -682,6 +812,13 @@ impl Method {
         Method::Where,
         Method::Session,
         Method::VerifySession,
+        Method::Window,
+        Method::ReadInto,
+        Method::PreadInto,
+        Method::WriteFrom,
+        Method::PwriteFrom,
+        Method::Release,
+        Method::OpenNumbered,
     ];
 
     pub const fn number(self) -> u16 {
@@ -908,6 +1045,76 @@ pub fn access(path: &[u8], bits: u32, flags: u32, w: &mut Writer) -> Result<(), 
     w.bytes(path)
 }
 
+/// WINDOW: the header alone (the memory object goes as a handle of the call).
+pub fn window(w: &mut Writer) -> Result<(), Status> {
+    start(Method::Window, w)
+}
+
+/// One part of a transfer, as a request carries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Part {
+    pub handle: u32,
+    pub count: u32,
+    /// Used by PREAD_INTO and PWRITE_FROM only.
+    pub offset: u64,
+    /// 0 or 1, or `INLINE`.
+    pub cell: u32,
+    pub flags: u32,
+    pub lease: u32,
+}
+
+fn part_head(method: Method, p: &Part, positional: bool, w: &mut Writer) -> Result<(), Status> {
+    start(method, w)?;
+    w.u32(p.handle)?;
+    w.u32(p.count)?;
+    if positional {
+        w.u64(p.offset)?;
+    }
+    w.u32(p.cell)?;
+    w.u32(p.flags)?;
+    w.u32(p.lease)
+}
+
+pub fn read_into(p: &Part, w: &mut Writer) -> Result<(), Status> {
+    part_head(Method::ReadInto, p, false, w)
+}
+
+pub fn pread_into(p: &Part, w: &mut Writer) -> Result<(), Status> {
+    part_head(Method::PreadInto, p, true, w)
+}
+
+/// WRITE_FROM; `bytes` go in the message with `INLINE` and must then be `p.count` long, and are
+/// absent otherwise.
+pub fn write_from(p: &Part, bytes: &[u8], w: &mut Writer) -> Result<(), Status> {
+    part_head(Method::WriteFrom, p, false, w)?;
+    w.bytes(bytes)
+}
+
+pub fn pwrite_from(p: &Part, bytes: &[u8], w: &mut Writer) -> Result<(), Status> {
+    part_head(Method::PwriteFrom, p, true, w)?;
+    w.bytes(bytes)
+}
+
+pub fn release(lease: u32, w: &mut Writer) -> Result<(), Status> {
+    start(Method::Release, w)?;
+    w.u32(lease)
+}
+
+/// OPEN_NUMBERED.
+pub fn open_numbered(
+    path: &[u8],
+    flags: u32,
+    mode: u32,
+    ino: u64,
+    w: &mut Writer,
+) -> Result<(), Status> {
+    start(Method::OpenNumbered, w)?;
+    w.u32(flags)?;
+    w.u32(mode)?;
+    w.u64(ino)?;
+    w.bytes(path)
+}
+
 // The requests, read by the service from the body after the header.
 
 /// OPEN: `(flags, mode, path)`. INVALID for flags outside `FLAGS_ALL`, a mode outside the mode
@@ -923,6 +1130,165 @@ pub fn read_open<'a>(mut body: Reader<'a>) -> Result<(u32, u32, &'a [u8]), Statu
         return Err(code(INVALID));
     }
     Ok((flags, mode, path))
+}
+
+/// A part as the service reads it: the fields, and the bytes of an `INLINE` write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartIn<'a> {
+    pub part: Part,
+    pub bytes: &'a [u8],
+}
+
+impl PartIn<'_> {
+    /// Whether the part's bytes are in the message.
+    pub const fn inline(&self) -> bool {
+        self.part.cell == INLINE
+    }
+
+    /// Whether more parts of the call follow.
+    pub const fn more(&self) -> bool {
+        self.part.flags & MORE != 0
+    }
+}
+
+/// A part of READ_INTO, PREAD_INTO, WRITE_FROM or PWRITE_FROM, from its body after the header. The
+/// shape is checked here: `flags` has no bit but `MORE`, `cell` is 0, 1 or `INLINE`, `count` is at
+/// most the cell, or at most the inline bound of the method, and an `INLINE` write carries exactly
+/// `count` bytes, any other part none. Anything else is INVALID, and a body short of a field or
+/// with bytes left over is BAD_SIZE. A `count` of 0 is a valid part. `lease` is not judged here: the
+/// service knows its leases.
+pub fn read_part<'a>(method: Method, mut body: Reader<'a>) -> Result<PartIn<'a>, Status> {
+    let (positional, write) = match method {
+        Method::ReadInto => (false, false),
+        Method::PreadInto => (true, false),
+        Method::WriteFrom => (false, true),
+        Method::PwriteFrom => (true, true),
+        _ => return Err(code(INVALID)),
+    };
+    let handle = body.u32()?;
+    let count = body.u32()?;
+    let offset = if positional { body.u64()? } else { 0 };
+    let cell = body.u32()?;
+    let flags = body.u32()?;
+    let lease = body.u32()?;
+    let inline_max = match method {
+        Method::ReadInto | Method::PreadInto => INLINE_READ,
+        Method::WriteFrom => INLINE_WRITE,
+        _ => INLINE_PWRITE,
+    };
+    let bytes = if write && cell == INLINE {
+        body.bytes(body.left())?
+    } else {
+        &[]
+    };
+    body.finish()?;
+    let limit = match cell {
+        0 | 1 => CELL_BYTES,
+        INLINE => inline_max,
+        _ => return Err(code(INVALID)),
+    };
+    if flags & !MORE != 0 || count as usize > limit {
+        return Err(code(INVALID));
+    }
+    if write && cell == INLINE && bytes.len() != count as usize {
+        return Err(code(INVALID));
+    }
+    Ok(PartIn {
+        part: Part {
+            handle,
+            count,
+            offset,
+            cell,
+            flags,
+            lease,
+        },
+        bytes,
+    })
+}
+
+/// RELEASE: the lease.
+pub fn read_release(mut body: Reader<'_>) -> Result<u32, Status> {
+    let lease = body.u32()?;
+    body.finish()?;
+    Ok(lease)
+}
+
+/// OPEN_NUMBERED: `(flags, mode, ino, path)`. INVALID for what OPEN refuses, for an `ino` without
+/// `INO_NUMBERED` or with `INO_PATH`, and for flags without both CREATE and EXCLUSIVE (the number
+/// goes to a new file only).
+pub fn read_open_numbered<'a>(mut body: Reader<'a>) -> Result<(u32, u32, u64, &'a [u8]), Status> {
+    let flags = body.u32()?;
+    let mode = body.u32()?;
+    let ino = body.u64()?;
+    let path = body.bytes(body.left())?;
+    if flags & !FLAGS_ALL != 0 || mode & !MODE_MASK != 0 {
+        return Err(code(INVALID));
+    }
+    if flags & READ_WRITE_BOTH == 0 && flags != DIRECTORY {
+        return Err(code(INVALID));
+    }
+    if ino & INO_NUMBERED == 0 || ino & INO_PATH != 0 {
+        return Err(code(INVALID));
+    }
+    if flags & CREATE == 0 || flags & EXCLUSIVE == 0 {
+        return Err(code(INVALID));
+    }
+    Ok((flags, mode, ino, path))
+}
+
+/// The reply to a part, after the status: `count`, `flags`, `lease`, and with an `INLINE` read the
+/// bytes to the end of the message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartReply<'a> {
+    pub count: u32,
+    pub flags: u32,
+    pub lease: u32,
+    pub bytes: &'a [u8],
+}
+
+/// Writes the reply to a part; `bytes` are those of an `INLINE` read (empty for any other part).
+pub fn write_part_reply(
+    count: u32,
+    flags: u32,
+    lease: u32,
+    bytes: &[u8],
+    w: &mut Writer,
+) -> Result<(), Status> {
+    w.u32(count)?;
+    w.u32(flags)?;
+    w.u32(lease)?;
+    w.bytes(bytes)
+}
+
+/// Reads the reply to a part of the kind that `inline_read` says (an `INLINE` read has bytes, any
+/// other part has none). BAD_SIZE for a flag that is not `LAPSED` or `UNLEASED`, for a count that is
+/// not the number of bytes of an `INLINE` read, for `UNLEASED` with a lease number, and for bytes
+/// left over. A client also checks that the count is at most the part's own (it knows the part).
+pub fn read_part_reply<'a>(
+    mut body: Reader<'a>,
+    inline_read: bool,
+) -> Result<PartReply<'a>, Status> {
+    let count = body.u32()?;
+    let flags = body.u32()?;
+    let lease = body.u32()?;
+    let bytes = if inline_read {
+        body.bytes(body.left())?
+    } else {
+        &[]
+    };
+    body.finish()?;
+    if flags & !(LAPSED | UNLEASED) != 0
+        || (flags & UNLEASED != 0 && lease != 0)
+        || (inline_read && bytes.len() != count as usize)
+    {
+        return Err(Status::BadSize);
+    }
+    Ok(PartReply {
+        count,
+        flags,
+        lease,
+        bytes,
+    })
 }
 
 /// MKDIR and CHMOD: `(mode, path)`.
@@ -1220,6 +1586,15 @@ const _: () = {
         is_service(SERVICE) && !is_service(SERVICE | OWN) && is_root(ROOT) && !is_root(SERVICE)
     );
     assert!(UTIME_NOW < UTIME_OMIT);
+    // Version 4: the window is its cells, a cell is 16 blocks, the inline bounds are what is left
+    // of a message after the fields, and the flags and numbers do not overlap.
+    assert!(WINDOW_BYTES == CELLS * CELL_BYTES && CELL_BYTES == 16 * BLOCK as usize);
+    assert!(INLINE_READ == 1008 && INLINE_WRITE == 996 && INLINE_PWRITE == 988);
+    assert!(HEADER_LEN + 20 + INLINE_WRITE == MESSAGE_MAX);
+    assert!(HEADER_LEN + 28 + INLINE_PWRITE == MESSAGE_MAX);
+    assert!(4 + 12 + INLINE_READ == MESSAGE_MAX);
+    assert!(INLINE as usize > CELLS && LAPSED & UNLEASED == 0 && MORE == 1);
+    assert!(INO_NUMBERED & INO_PATH == 0);
 };
 
 /// The longest path of the file service, `proto_fs::MAX_PATH` (a test compares the two).
@@ -1295,7 +1670,19 @@ mod tests {
             assert_eq!(Method::from_number(m.number()), Some(m));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(36), None);
+        assert_eq!(Method::from_number(43), None);
+        for (method, number) in [
+            (Method::Window, 36),
+            (Method::ReadInto, 37),
+            (Method::PreadInto, 38),
+            (Method::WriteFrom, 39),
+            (Method::PwriteFrom, 40),
+            (Method::Release, 41),
+            (Method::OpenNumbered, 42),
+        ] {
+            assert_eq!(method.number(), number);
+        }
+        assert_eq!(METHOD_COUNT, 42);
         for (i, a) in CODES.iter().enumerate() {
             assert!(*a > 1200 && *a < 1300, "{a}");
             assert!(!CODES[i + 1..].contains(a));
@@ -1304,14 +1691,15 @@ mod tests {
             CODES,
             [
                 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211, 1212, 1213, 1214,
-                1215, 1216, 1217, 1218, 1219, 1220, 1221, 1222, 1223
+                1215, 1216, 1217, 1218, 1219, 1220, 1221, 1222, 1223, 1224
             ]
         );
         assert_eq!(
             (PERMISSION, NOT_BOUND, FILE_SIZE_LIMIT, IS_ROOT, READ_ONLY),
             (1219, 1220, 1221, 1222, 1223)
         );
-        assert_eq!(VERSION, 3);
+        assert_eq!(VERSION, 4);
+        assert_eq!(NO_WINDOW, 1224);
     }
 
     #[test]
@@ -1329,6 +1717,7 @@ mod tests {
         assert_eq!(errno(TABLE_FULL), Some(Errno::Enfile));
         assert_eq!(errno(NO_SPACE), Some(Errno::Enospc));
         assert_eq!(errno(READ_ONLY), Some(Errno::Erofs));
+        assert_eq!(errno(NO_WINDOW), Some(Errno::Eio));
         assert_eq!(errno(STALE), Some(Errno::Eio));
         assert_eq!(errno(BAD_HANDLE), Some(Errno::Ebadf));
     }
@@ -1499,8 +1888,8 @@ mod tests {
             one(&|w| handle_call(Method::Where, 9, w)),
             bytes_of(Method::Where, &[9, 0, 0, 0])
         );
-        // The header: method, version 3, four zero bytes.
-        assert_eq!(Method::Open.header().bytes(), [1, 0, 3, 0, 0, 0, 0, 0]);
+        // The header: method, version 4, four zero bytes.
+        assert_eq!(Method::Open.header().bytes(), [1, 0, 4, 0, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -1745,5 +2134,324 @@ mod tests {
         let mut w = Writer::new();
         write(1, &[0; MAX_WRITE], &mut w).unwrap();
         assert_eq!(w.as_bytes().len(), MESSAGE_MAX);
+    }
+
+    fn part(cell: u32, count: u32, flags: u32, lease: u32) -> Part {
+        Part {
+            handle: 9,
+            count,
+            offset: 0x0102,
+            cell,
+            flags,
+            lease,
+        }
+    }
+
+    #[test]
+    fn the_layout_of_the_window_is_pinned() {
+        assert_eq!(
+            (WINDOW_BYTES, CELL_BYTES, CELLS, INLINE),
+            (131_072, 65_536, 2, u32::MAX)
+        );
+        assert_eq!((INLINE_READ, INLINE_WRITE, INLINE_PWRITE), (1008, 996, 988));
+        assert_eq!((LEASES_PER_SESSION, LEASES), (4, 64));
+        assert_eq!((MORE, LAPSED, UNLEASED), (1, 1, 2));
+        assert_eq!((INO_NUMBERED, INO_PATH), (1 << 62, 1 << 63));
+    }
+
+    #[test]
+    fn the_new_requests_are_pinned_byte_for_byte() {
+        let one = |f: &dyn Fn(&mut Writer) -> Result<(), Status>| {
+            let mut w = Writer::new();
+            f(&mut w).unwrap();
+            w.as_bytes().to_vec()
+        };
+        assert_eq!(one(&|w| window(w)), bytes_of(Method::Window, &[]));
+        assert_eq!(
+            one(&|w| read_into(&part(1, 5, MORE, 7), w)),
+            bytes_of(
+                Method::ReadInto,
+                &[9, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0]
+            )
+        );
+        assert_eq!(
+            one(&|w| pread_into(&part(0, 5, 0, 0), w)),
+            bytes_of(
+                Method::PreadInto,
+                &[
+                    9, 0, 0, 0, 5, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0
+                ]
+            )
+        );
+        assert_eq!(
+            one(&|w| write_from(&part(INLINE, 2, 0, 0), b"xy", w)),
+            bytes_of(
+                Method::WriteFrom,
+                &[
+                    9, 0, 0, 0, 2, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, b'x', b'y'
+                ]
+            )
+        );
+        assert_eq!(
+            one(&|w| pwrite_from(&part(0, 4, MORE, 0), &[], w)),
+            bytes_of(
+                Method::PwriteFrom,
+                &[
+                    9, 0, 0, 0, 4, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+                    0, 0
+                ]
+            )
+        );
+        assert_eq!(
+            one(&|w| release(3, w)),
+            bytes_of(Method::Release, &[3, 0, 0, 0])
+        );
+        let mut want = vec![14, 0, 0, 0, 0xa4, 0x01, 0, 0];
+        want.extend_from_slice(&(INO_NUMBERED | 5).to_le_bytes());
+        want.extend_from_slice(b"/n");
+        assert_eq!(
+            one(&|w| open_numbered(
+                b"/n",
+                WRITE | CREATE | EXCLUSIVE,
+                0o644,
+                INO_NUMBERED | 5,
+                w
+            )),
+            bytes_of(Method::OpenNumbered, &want)
+        );
+    }
+
+    fn written(method: Method, p: &Part, bytes: &[u8]) -> Vec<u8> {
+        let mut w = Writer::new();
+        match method {
+            Method::ReadInto => read_into(p, &mut w),
+            Method::PreadInto => pread_into(p, &mut w),
+            Method::WriteFrom => write_from(p, bytes, &mut w),
+            _ => pwrite_from(p, bytes, &mut w),
+        }
+        .unwrap();
+        w.as_bytes().to_vec()
+    }
+
+    fn parsed(method: Method, raw: &[u8]) -> Result<PartIn<'_>, Status> {
+        read_part(method, Reader::new(&raw[HEADER_LEN..]))
+    }
+
+    #[test]
+    fn a_part_round_trips_for_each_method() {
+        for method in [
+            Method::ReadInto,
+            Method::PreadInto,
+            Method::WriteFrom,
+            Method::PwriteFrom,
+        ] {
+            let positional = matches!(method, Method::PreadInto | Method::PwriteFrom);
+            for cell in [0, 1] {
+                let p = part(cell, 65_536, MORE, 4);
+                let raw = written(method, &p, &[]);
+                let got = parsed(method, &raw).unwrap();
+                assert_eq!(got.part.handle, 9);
+                assert_eq!((got.part.count, got.part.cell), (65_536, cell));
+                assert_eq!((got.part.flags, got.part.lease), (MORE, 4));
+                assert_eq!(got.part.offset, if positional { 0x0102 } else { 0 });
+                assert!(got.more() && !got.inline() && got.bytes.is_empty());
+            }
+        }
+        let raw = written(Method::PwriteFrom, &part(INLINE, 3, 0, 0), b"abc");
+        let got = parsed(Method::PwriteFrom, &raw).unwrap();
+        assert!(got.inline() && !got.more());
+        assert_eq!(got.bytes, b"abc");
+        // A count of 0 is a valid part.
+        let raw = written(Method::ReadInto, &part(0, 0, 0, 0), &[]);
+        assert!(parsed(Method::ReadInto, &raw).is_ok());
+        // Any other method is not a part.
+        assert_eq!(parsed(Method::Read, &raw), Err(code(INVALID)));
+    }
+
+    #[test]
+    fn a_part_that_breaks_a_limit_is_refused() {
+        let invalid = Err(code(INVALID));
+        for method in [
+            Method::ReadInto,
+            Method::PreadInto,
+            Method::WriteFrom,
+            Method::PwriteFrom,
+        ] {
+            let write = matches!(method, Method::WriteFrom | Method::PwriteFrom);
+            // A count past the cell, past the inline bound, a cell that is neither, a flag that is no flag.
+            let raw = written(method, &part(0, 65_537, 0, 0), &[]);
+            assert_eq!(parsed(method, &raw).map(|_| ()), invalid, "{method:?}");
+            let raw = written(method, &part(2, 1, 0, 0), &[]);
+            assert_eq!(parsed(method, &raw).map(|_| ()), invalid);
+            let raw = written(method, &part(INLINE - 1, 1, 0, 0), &[]);
+            assert_eq!(parsed(method, &raw).map(|_| ()), invalid);
+            for flags in [2, 3, 0x8000_0000] {
+                let raw = written(method, &part(0, 1, flags, 0), &[]);
+                assert_eq!(parsed(method, &raw).map(|_| ()), invalid);
+            }
+            let bound = match method {
+                Method::WriteFrom => INLINE_WRITE,
+                Method::PwriteFrom => INLINE_PWRITE,
+                _ => INLINE_READ,
+            };
+            let bytes = vec![7u8; bound];
+            let raw = written(
+                method,
+                &part(INLINE, bound as u32, 0, 0),
+                if write { &bytes } else { &[] },
+            );
+            assert!(
+                parsed(method, &raw).is_ok(),
+                "{method:?} at its inline bound"
+            );
+            assert!(raw.len() <= MESSAGE_MAX);
+            let raw = written(method, &part(INLINE, bound as u32 + 1, 0, 0), &[]);
+            assert_eq!(parsed(method, &raw).map(|_| ()), invalid);
+            // A message with a byte left over is BAD_SIZE (a read or a part in a cell carries none).
+            if !write {
+                let mut raw = written(method, &part(0, 1, 0, 0), &[]);
+                raw.push(0);
+                assert_eq!(parsed(method, &raw).map(|_| ()), Err(Status::BadSize));
+            }
+            // A body short of a field is BAD_SIZE.
+            let raw = written(method, &part(0, 1, 0, 0), &[]);
+            assert_eq!(
+                parsed(method, &raw[..raw.len() - 1]).map(|_| ()),
+                Err(Status::BadSize)
+            );
+        }
+        // An inline write whose bytes are not `count`, and a write in a cell with bytes after it.
+        let raw = written(Method::WriteFrom, &part(INLINE, 3, 0, 0), b"ab");
+        assert_eq!(parsed(Method::WriteFrom, &raw).map(|_| ()), invalid);
+        let raw = written(Method::WriteFrom, &part(INLINE, 1, 0, 0), b"ab");
+        assert_eq!(parsed(Method::WriteFrom, &raw).map(|_| ()), invalid);
+        let raw = written(Method::WriteFrom, &part(1, 2, 0, 0), b"ab");
+        assert_eq!(
+            parsed(Method::WriteFrom, &raw).map(|_| ()),
+            Err(Status::BadSize)
+        );
+    }
+
+    #[test]
+    fn the_longest_inline_parts_fill_a_message_exactly() {
+        for (method, bound, fixed) in [
+            (Method::WriteFrom, INLINE_WRITE, 20),
+            (Method::PwriteFrom, INLINE_PWRITE, 28),
+        ] {
+            let bytes = vec![1u8; bound];
+            let raw = written(method, &part(INLINE, bound as u32, 0, 0), &bytes);
+            assert_eq!(raw.len(), HEADER_LEN + fixed + bound);
+            assert_eq!(raw.len(), MESSAGE_MAX);
+        }
+        // The reply of an inline read: the status, three words and the bytes.
+        let bytes = vec![2u8; INLINE_READ];
+        let mut w = Writer::new();
+        w.u32(0).unwrap();
+        write_part_reply(INLINE_READ as u32, 0, 0, &bytes, &mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), MESSAGE_MAX);
+    }
+
+    #[test]
+    fn the_reply_to_a_part_round_trips() {
+        let mut w = Writer::new();
+        write_part_reply(7, LAPSED, 3, &[], &mut w).unwrap();
+        assert_eq!(w.as_bytes(), [7, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0]);
+        let r = read_part_reply(Reader::new(w.as_bytes()), false).unwrap();
+        assert_eq!((r.count, r.flags, r.lease, r.bytes.len()), (7, 1, 3, 0));
+        let mut w = Writer::new();
+        write_part_reply(2, 0, 0, b"hi", &mut w).unwrap();
+        let r = read_part_reply(Reader::new(w.as_bytes()), true).unwrap();
+        assert_eq!((r.count, r.bytes), (2, &b"hi"[..]));
+        // A flag outside the two, a count that is not the bytes, bytes where none are meant, a short body.
+        let mut w = Writer::new();
+        write_part_reply(0, 4, 0, &[], &mut w).unwrap();
+        assert_eq!(
+            read_part_reply(Reader::new(w.as_bytes()), false),
+            Err(Status::BadSize)
+        );
+        let mut w = Writer::new();
+        write_part_reply(3, 0, 0, b"hi", &mut w).unwrap();
+        assert_eq!(
+            read_part_reply(Reader::new(w.as_bytes()), true),
+            Err(Status::BadSize)
+        );
+        assert_eq!(
+            read_part_reply(Reader::new(w.as_bytes()), false),
+            Err(Status::BadSize)
+        );
+        assert_eq!(
+            read_part_reply(Reader::new(&[1, 0, 0, 0, 0, 0, 0, 0]), false),
+            Err(Status::BadSize)
+        );
+    }
+
+    #[test]
+    fn release_and_open_numbered_are_read_and_checked() {
+        assert_eq!(read_release(Reader::new(&[5, 0, 0, 0])), Ok(5));
+        assert_eq!(
+            read_release(Reader::new(&[5, 0, 0, 0, 0])),
+            Err(Status::BadSize)
+        );
+        assert_eq!(read_release(Reader::new(&[5, 0, 0])), Err(Status::BadSize));
+        let make = |flags: u32, mode: u32, ino: u64| {
+            let mut w = Writer::new();
+            open_numbered(b"/n", flags, mode, ino, &mut w).unwrap();
+            w.as_bytes()[HEADER_LEN..].to_vec()
+        };
+        let good = INO_NUMBERED | 41;
+        let new_file = WRITE | CREATE | EXCLUSIVE;
+        assert_eq!(
+            read_open_numbered(Reader::new(&make(new_file, 0o600, good))),
+            Ok((new_file, 0o600, good, &b"/n"[..]))
+        );
+        let invalid = Err(code(INVALID));
+        for bad in [
+            make(new_file, 0, 41),                           // no bit 62
+            make(new_file, 0, INO_NUMBERED | INO_PATH | 41), // bit 63
+            make(new_file, 0, INO_PATH),                     // a number of a path
+            make(WRITE | CREATE, 0o600, good),               // CREATE without EXCLUSIVE
+            make(READ, 0, good),                             // no CREATE: the number is undefined
+            make(WRITE | EXCLUSIVE, 0, good),                // EXCLUSIVE without CREATE
+            make(DIRECTORY, 0, good),                        // no CREATE
+            make(new_file | 0x4000, 0, good),                // an unknown flag
+            make(new_file, 0o10000, good),                   // a bit outside the mode
+            make(CREATE | EXCLUSIVE, 0, good),               // no access and not DIRECTORY
+        ] {
+            assert_eq!(read_open_numbered(Reader::new(&bad)).map(|_| ()), invalid);
+        }
+    }
+
+    #[test]
+    fn unleased_has_no_lease_number() {
+        let mut w = Writer::new();
+        write_part_reply(1, UNLEASED, 5, &[], &mut w).unwrap();
+        assert_eq!(
+            read_part_reply(Reader::new(w.as_bytes()), false),
+            Err(Status::BadSize)
+        );
+        let mut w = Writer::new();
+        write_part_reply(1, UNLEASED, 0, &[], &mut w).unwrap();
+        assert!(read_part_reply(Reader::new(w.as_bytes()), false).is_ok());
+        let mut w = Writer::new();
+        write_part_reply(1, LAPSED, 5, &[], &mut w).unwrap();
+        assert!(read_part_reply(Reader::new(w.as_bytes()), false).is_ok());
+    }
+
+    #[test]
+    fn the_new_methods_are_not_root_methods_and_the_old_are_unchanged() {
+        for m in [
+            Method::Window,
+            Method::ReadInto,
+            Method::PreadInto,
+            Method::WriteFrom,
+            Method::PwriteFrom,
+            Method::Release,
+            Method::OpenNumbered,
+        ] {
+            assert!(!m.is_root_method());
+            assert_eq!(m.header(), Header::new(m.number(), 4));
+        }
+        assert!(Method::Session.is_root_method() && Method::VerifySession.is_root_method());
     }
 }

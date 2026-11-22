@@ -1273,6 +1273,15 @@ impl Server {
             // BIND, SESSION and VERIFY_SESSION carry a handle of the call and a vouching of the
             // process service, which the worker does (`Server::bind`, `Server::bind_new`).
             Method::Bind | Method::Session | Method::VerifySession => Err(p::code(p::INVALID)),
+            // The methods of version 4 are listed in the protocol and not served yet: the step
+            // that gives the service its window answers them.
+            Method::Window
+            | Method::ReadInto
+            | Method::PreadInto
+            | Method::WriteFrom
+            | Method::PwriteFrom
+            | Method::Release
+            | Method::OpenNumbered => Err(p::code(p::INVALID)),
             Method::Clone => {
                 let count = r.u32()?;
                 let mut handles = [0; CLONE_MAX];

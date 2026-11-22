@@ -577,11 +577,12 @@ mod tests {
             (p::FILE_SIZE_LIMIT, EFBIG),
             (p::IS_ROOT, EIO),
             (p::READ_ONLY, EROFS),
+            (p::NO_WINDOW, EIO),
         ] {
             assert_eq!(errno_of(code), want, "{code}");
         }
         // Every code the protocol lists is in the table above, and a code it does not have is EIO.
-        assert_eq!(p::CODES.len(), 23);
+        assert_eq!(p::CODES.len(), 24);
         assert_eq!(errno_of(0), EIO);
         assert_eq!(errno_of(9999), EIO);
         assert_eq!(errno::EROFS, 30);
