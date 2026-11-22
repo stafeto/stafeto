@@ -22,14 +22,17 @@
 /// row). A lower bound cannot hide step work: a step that took N with P preemptions did at least
 /// `N - P * c` ticks of its own for any true charge c at or above the bound, so judging by that
 /// value never passes a step that a true charge would fail. It judges the bound B.
-pub const PREEMPT_CHARGE_MIN: u64 = 487;
+pub const PREEMPT_CHARGE_MIN: u64 = 95;
 
-/// The measured cost of a preemption of the worst kind seen (a preemptor of another process, SIMD
-/// state live, a budget event), for the target 0.9 B. A probe is to measure it (the `preempt
-/// charge ticks` rows); until then it is the largest seen, 1 261 ticks in a step of the RAM file
-/// service on 19 November, with a margin. A c that is too small can only eat the margin between
+/// The cost of a preemption of the worst kind seen (a preemptor of another process), for the
+/// target 0.9 B. The stint of a thread begins at its return to EL0, so the entries for interrupts,
+/// the budget events and the SIMD switches are outside the time a step is measured by. The
+/// `preempt charge ticks` row of the kernel test fell from 487 to 95 with that change, a drop of
+/// 392 ticks in every preemption, and the worst step seen before it left 1 261 ticks in a step of
+/// the RAM file service on 19 November: 869 ticks now, with the margin of that figure (3 per
+/// cent, rounded up to the hundred) 900. A c that is too small can only eat the margin between
 /// 0.9 B and B, since `over_bound` holds B by the lower bound.
-pub const PREEMPT_CHARGE: u64 = 1_300;
+pub const PREEMPT_CHARGE: u64 = 900;
 
 /// A line of a step, read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -504,10 +507,10 @@ mod tests {
     #[test]
     fn a_step_is_judged_less_the_charge_of_its_preemptions() {
         let bound = 18_369;
-        // 19 000 raw with 2 preemptions is 16 400 of work at the measured charge: it passes the
+        // 19 000 raw with 2 preemptions is 17 200 of work at the measured charge: it passes the
         // judgement, and the raw time is named by a warning.
         let rows = lines(&["service step: 14 kind 33 19000 ticks detail 64 preempts 2"]);
-        assert_eq!(longest(&rows, "14"), vec![(33, 16_400, 64)]);
+        assert_eq!(longest(&rows, "14"), vec![(33, 17_200, 64)]);
         assert!(longest(&rows, "14")[0].1 <= bound);
         let warnings = raw_warnings(&rows, "14", bound);
         assert_eq!(warnings.len(), 1);
@@ -540,10 +543,10 @@ mod tests {
         assert_eq!(verdict(18_807, 3), (true, true));
         // No preemption: 19 000 fails 0.9 B.
         assert_eq!(verdict(19_000, 0), (true, false));
-        // 21 000 with one preemption is 20 513 of work at least: fails B.
+        // 21 000 with one preemption is 20 905 of work at least: fails B.
         assert_eq!(verdict(21_000, 1), (false, false));
-        // 20 800 with one preemption passes B (20 313) and fails 0.9 B (19 500).
-        assert_eq!(verdict(20_800, 1), (true, false));
+        // 20 500 with one preemption passes B (20 405) and fails 0.9 B (19 600).
+        assert_eq!(verdict(20_500, 1), (true, false));
     }
 
     #[test]
@@ -553,8 +556,8 @@ mod tests {
         assert!(
             said.contains("kind 33") && said.contains("raw 21000") && said.contains("preempts 1")
         );
-        assert!(said.contains("= 19700 against 0.9 B 18369"), "{said}");
-        assert!(said.contains("= 20513 against B 20410"), "{said}");
+        assert!(said.contains("= 20100 against 0.9 B 18369"), "{said}");
+        assert!(said.contains("= 20905 against B 20410"), "{said}");
         // Another service's lines are not read.
         assert!(over_bound(&rows, "4", 20_410, Kinds::All).is_none());
         // The probes call it for the kinds they judge: an exempt kind is not checked.
@@ -570,18 +573,18 @@ mod tests {
         // The services tell the pairs (kind, preemptions) no other pair beats in the table at the
         // end of a run (`service table:`), and the line of a new longest as the run goes on: the
         // three steps give three lines of the table, and the judged maximum is the second,
-        // 16 700 (the raw maximum alone gave 14 907).
+        // 17 100 (the raw maximum alone gave 16 107).
         let rows = lines(&[
             "service step: 17 kind 65 18807 ticks detail 0 preempts 3",
             "service table: 17 kind 65 18000 ticks detail 1 preempts 1",
             "service table: 17 kind 65 16400 ticks detail 2 preempts 0",
         ]);
-        assert_eq!(longest(&rows, "17"), vec![(65, 16_700, 1)]);
-        assert!(longest(&rows[..1], "17")[0].1 == 14_907);
+        assert_eq!(longest(&rows, "17"), vec![(65, 17_100, 1)]);
+        assert!(longest(&rows[..1], "17")[0].1 == 16_107);
         // The pair of 8 and more is judged with 8 preemptions, whatever the count of the line.
         let many = lines(&["service step: 17 kind 65 20000 ticks detail 0 preempts 12"]);
-        assert_eq!(longest(&many, "17"), vec![(65, 20_000 - 8 * 1_300, 0)]);
-        assert_eq!(parse(&many[0]).unwrap().least(), 20_000 - 8 * 487);
+        assert_eq!(longest(&many, "17"), vec![(65, 20_000 - 8 * 900, 0)]);
+        assert_eq!(parse(&many[0]).unwrap().least(), 20_000 - 8 * 95);
     }
 
     #[test]
