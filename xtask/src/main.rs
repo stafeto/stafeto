@@ -2539,7 +2539,7 @@ commands:
   posix-random-net-two the same with two stack instances of the network service on two CPUs: a socket homed on the second instance survives
   posix-random-net-two-steps the same under -icount, the steps of both instances
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
-  data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU
+  data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU; with an argument: write, cap, full, restart, throughput, fast (64 MiB through the window against the bounds of the plan), atomic (atomicity, lease, signals, fork, restart of the large calls), steps (the service's steps and the CPU time of its parts under -icount, on one CPU and on two), atomic-break FEATURE (the atomic probe on a service with a deliberate break, which it must catch)
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
   wfc-probe run the scene demo on OpenWF Composition (<WF/wfc.h>) in QEMU with the compositor: two scenes of three elements (elements of one to one scale, quarter turns, the filters none and faster, a global alpha and a mask; a stretch, a flip and the bilinear filter come back after the cost fix of the service's price model) over the windows of two producers, and a third scene of the window of the first revision shown straight, committed in turn 100 times and each composed on request, QEMU's screenshot compared with the CRC of the host's reference (tools/wfc-ref), then the scene changed 100 times on an active context with every screenshot one of the two and both of them among the shots; the counters of the service (no frame failed, bands grow, scene C a frame shown straight) and the device's trace; then the steps of the compositor and the driver under -icount
   wfd-probe run the display demo on OpenWF Display (<WF/wfd.h>) in QEMU with the display driver alone: 100 frames bound to the primary pipeline in turn, each compared with the guest's CRC, the host's own and QEMU's screenshot, and the cursor moved 100 times (the device's trace); then the driver's steps under -icount
@@ -3253,7 +3253,7 @@ const NVME_BREAKS: [&str; 10] = [
 /// The deliberate breaks of the data volume (`cargo xtask datafs-breaks`): each is a feature of
 /// `lib/datafs` that does one wrong thing, and its host tests (a cut of the power at every sector of a
 /// workload, the table of a new volume, the protocol) pass without it and fail with it.
-const DATAFS_BREAKS: [&str; 11] = [
+const DATAFS_BREAKS: [&str; 12] = [
     "break-datafs-sync",
     "break-datafs-consistent",
     "break-datafs-busy",
@@ -3265,6 +3265,7 @@ const DATAFS_BREAKS: [&str; 11] = [
     "break-datafs-lease-reader",
     "break-datafs-lease-renew",
     "break-datafs-lease-deref",
+    "break-datafs-append-end",
 ];
 
 fn datafs_breaks() -> Result<(), String> {
@@ -11227,6 +11228,16 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("data-posix write", || {
             data_posix::probe(data_posix::Mode::Write, &qemu::VIRT)
         }),
+        // The large calls on /data through the window: 64 MiB against the bounds of the plan, the
+        // atomicity of a call, the lease, signals, fork and a restart in the middle of a call, and
+        // the steps of the service under -icount.
+        job("data-fast", || {
+            data_posix::probe(data_posix::Mode::Fast, &qemu::VIRT)
+        }),
+        job("data-atomic", || {
+            data_posix::probe(data_posix::Mode::Atomic, &qemu::VIRT)
+        }),
+        job("data-steps", || data_posix::steps(&qemu::VIRT)),
         job("vi-dialog", vi_dialog::vi_dialog),
         // The window library of C programs against QEMU's screenshots.
         job("posix-window", || posix_window::probe(&qemu::VIRT)),
