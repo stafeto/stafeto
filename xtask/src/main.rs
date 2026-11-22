@@ -7564,6 +7564,10 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// changed it, so the store is on every pass, whatever the switches); 275 measured, 4 over, a load of
 /// the thread's level, the store, and the test of a switch with the store of the stint start.
 /// The change is of the path, so the reviewer of the kernel decides whether it stays.
+/// `NULL_MAX` 275 -> 277 (the stint of a thread begins at its return to EL0, stafeto#498): every
+/// pass of `thread::run` reads the tag that says the stint waits for EL0 (one load, one test of a
+/// bit); the paths that start a stint call out of line. 277 measured, 2 over, which are those two
+/// instructions. The change is of the path, so the reviewer of the kernel decides whether it stays.
 ///
 /// Rules for a guard that fires (the paths are deterministic under -icount,
 /// so a firing is no noise and a repeat does not clear it):
@@ -7584,7 +7588,7 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 ///    room the guard keeps (4, and 16 for S5; it does not fail), and
 ///    the next commit lowers the constant, so that a shorter path does not
 ///    turn into room for later growth.
-const NULL_MAX: u64 = 275;
+const NULL_MAX: u64 = 277;
 /// The longest hold of the lock OBJ (kernel/src/obj.rs) in instructions
 /// under -icount, over every kernel test and EL0 test of both images: the
 /// term of each other CPU's wait for it (B_N = B + (N-1) * OBJ_HOLD_MAX +
