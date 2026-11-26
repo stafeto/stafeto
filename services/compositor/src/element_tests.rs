@@ -1867,7 +1867,7 @@ fn commits_that_change_keys_faster_than_the_worker_draws_still_show_scenes() {
             shown.push(w);
         }
     }
-    // Scenes were taken again and again (a wait is two periods at most), not once.
+    // Scenes were taken again and again (a wait is two periods at most): more than once.
     assert!(shown.len() >= 4, "{shown:?}");
     // The worker catches up: the last scene shows whole.
     rig.drain();
