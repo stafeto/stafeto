@@ -156,6 +156,10 @@ pub struct Notice {
     pub label: u64,
     pub bits: u64,
     pub count: u32,
+    /// The level the kernel told with it (spec 6.6): the lower of the
+    /// slot's priority and the ceiling of the service's process, 0 for the
+    /// notification of a wait channel.
+    pub level: u8,
 }
 
 /// What `run` sends a client for its request.
@@ -209,9 +213,18 @@ pub struct Request<'a> {
     pub handles: Incoming,
     token: Option<Token>,
     reply: Option<Writer>,
+    level: u8,
 }
 
 impl<'a> Request<'a> {
+    /// The level the client gives the request (spec 6.6): the lower of its
+    /// effective priority when the request met the service and the ceiling
+    /// of the service's process, which the kernel tells in the result of
+    /// `receive` and no client can set. Never 0.
+    pub fn level(&self) -> u8 {
+        self.level
+    }
+
     /// The label of the handle the request came through.
     pub fn label(&self) -> u64 {
         self.label
@@ -461,7 +474,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
             beat.turn();
         }
         #[cfg(feature = "step-stats")]
-        let (began, incoming) = sys::receive_measured(channel);
+        let (began, incoming) = sys::receive_measured_lent(channel);
         #[cfg(not(feature = "step-stats"))]
         let incoming = owed.send_and_receive(channel);
         steps::restart();
@@ -469,13 +482,16 @@ pub fn run_in<S: Service<K>, const K: usize>(
         service.measured_begin();
         let notice = match incoming {
             Err(e) => return e,
-            Ok(Received::Message {
-                label,
-                len,
-                handles,
-                token,
-                words,
-            }) => {
+            Ok((
+                Received::Message {
+                    label,
+                    len,
+                    handles,
+                    token,
+                    words,
+                },
+                level,
+            )) => {
                 let len = len.min(MESSAGE_MAX);
                 let bytes = &mut buffer[..len];
                 if len <= INLINE_MAX {
@@ -500,6 +516,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
                                 bytes,
                                 handles,
                                 token,
+                                level,
                                 &mut owed,
                             );
                         },
@@ -517,6 +534,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
                         bytes,
                         handles,
                         token,
+                        level,
                         &mut owed,
                     );
                     steps::end(began, kind);
@@ -524,16 +542,20 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 service.between_requests();
                 continue;
             }
-            Ok(Received::Notification {
+            Ok((
+                Received::Notification {
+                    source,
+                    label,
+                    bits,
+                    count,
+                },
+                level,
+            )) => Notice {
                 source,
                 label,
                 bits,
                 count,
-            }) => Notice {
-                source,
-                label,
-                bits,
-                count,
+                level,
             },
         };
         #[cfg(not(feature = "step-stats"))]
@@ -1254,19 +1276,19 @@ impl Owed {
     /// PEER_CLOSED, which the receive after it reports itself) gets the
     /// client the error as its status, as `reply` does, and the receive
     /// follows, so a reply with handles that fails never ends the loop.
-    fn send_and_receive(&mut self, channel: &Handle<Channel>) -> Result<Received, Error> {
+    fn send_and_receive(&mut self, channel: &Handle<Channel>) -> Result<(Received, u8), Error> {
         let Some(token) = self.token.take() else {
-            return sys::receive(channel);
+            return sys::receive_lent(channel);
         };
         let again = token.again();
         let handles = core::mem::take(&mut self.handles);
-        match token.reply_receive_handles(channel, &self.bytes[..self.len], handles) {
+        match token.reply_receive_handles_lent(channel, &self.bytes[..self.len], handles) {
             Err(e) if e != Error::PeerClosed => {
                 // The token of a reply the kernel used up names no request now
                 // and this returns BAD_STATE; of one it refused before it
                 // reached the request, the client still waits for this.
                 let _ = again.reply(&proto_wire::reply(Status::Kernel(e)));
-                sys::receive(channel)
+                sys::receive_lent(channel)
             }
             received => received,
         }
@@ -1286,6 +1308,7 @@ fn request<S: Service<K>, const K: usize>(
     bytes: &[u8],
     handles: Incoming,
     token: Token,
+    level: u8,
     owed: &mut Owed,
 ) {
     let header = match Header::read(&mut Reader::new(bytes)) {
@@ -1310,6 +1333,7 @@ fn request<S: Service<K>, const K: usize>(
         handles,
         token: Some(token),
         reply: None,
+        level,
     };
     let answer = service.request(s, &mut r);
     let Some(token) = r.token.take() else {

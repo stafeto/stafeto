@@ -325,6 +325,9 @@ unsafe fn notice(slot: NonNull<Slot<Owner>>) -> (Notification, u8) {
         label: owner.label(),
         bits,
         count,
+        // The points that take it set the level, which depends on the
+        // channel and the receiver.
+        level: 0,
     };
     (n, s.priority())
 }

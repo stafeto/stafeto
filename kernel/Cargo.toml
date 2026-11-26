@@ -166,6 +166,10 @@ break-budget-exit-forgets = ["kcore/break-budget-exit-forgets"]
 break-budget-event-keeps-level = ["kcore/break-budget-event-keeps-level"]
 break-budget-early-replenish = ["kcore/break-budget-early-replenish"]
 break-reply-receive-split = []
+# Deliberate breakage of the level `receive` lends (spec 6.6): a request that
+# tells the receiver's own base, and a wait channel that lends a level.
+break-lent-level = []
+break-lent-notice = []
 break-reply-receive-copy = []
 break-idle-bell = ["idle-probe", "window-probe"]
 break-idle-drain = ["idle-probe", "window-probe"]

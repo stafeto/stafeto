@@ -211,8 +211,9 @@ pub fn notify(c: NonNull<Channel>, bits: u64, cause: u8) -> Result<(), Error> {
 /// source of notifications comes here, so none posts into a closed
 /// channel, and a source that is no call drops that error. Otherwise the
 /// bits merge. A slot that stood in no queue goes to the top receiver that
-/// waits, which takes it at once: its registers get the notification, it
-/// works at the slot's priority under its ceiling, it becomes ready at the
+/// waits, which takes it at once: its registers get the notification, with
+/// the level the slot lends in bits 32-37 of x1 (`message::notice_level`,
+/// spec 6.6), it works at the slot's priority under its ceiling, it becomes ready at the
 /// tail of that level with a new quantum (spec 6.1), and the reference of
 /// its wait goes. Otherwise the slot goes to the tail of its level in the
 /// queue of slots and holds its owner there. Runs inside the caller's
@@ -245,11 +246,13 @@ pub unsafe fn post(
         // SAFETY: the slot left no queue; `t` left the queue and is alive,
         // since the kernel's reference keeps a thread that waits.
         unsafe {
-            let (n, priority) = notice(slot);
+            let (mut n, priority) = notice(slot);
+            let (lends, ceiling) = (lends(c), ceiling(t));
+            n.level = message::notice_level(lends, priority, ceiling);
             (*t.as_ptr()).waits = None;
             syscall::set_notification(t, n);
-            if lends(c) {
-                sched::boost_in_place(k, t, priority, ceiling(t), false);
+            if lends {
+                sched::boost_in_place(k, t, priority, ceiling, false);
             }
             message::hold_notice(t, c);
             sched::wake(k, t, abi::WAKE_NOTIFY);

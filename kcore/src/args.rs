@@ -279,10 +279,21 @@ impl Desc {
     }
 
     /// x1 of a result that carries the message: its length and handles,
-    /// with the source 0 (abi::Source::Message) and no flag.
+    /// with the source 0 (abi::Source::Message) and no flag. The reply to a
+    /// `send` comes back as it is; a request `receive` takes gets the
+    /// level in bits 32-37 on top (`lent`, kernel `accept`).
     pub fn result(self) -> u64 {
         self.len as u64 | (self.handles as u64) << HANDLES_SHIFT
     }
+}
+
+/// The bits of x1 in which `receive` lends its receiver a level (spec 6.6):
+/// the lower of `level`, the effective priority of the client at the
+/// meeting or the priority of the notification's slot, and `ceiling`, the
+/// ceiling of the receiver's process, which is the value the boost takes.
+/// The kernel ORs it into the result; `send` and `reply` refuse these bits.
+pub fn lent(level: u8, ceiling: u8) -> u64 {
+    u64::from(level.min(ceiling)) << abi::LEVEL_SHIFT
 }
 
 /// The values of the handles a message carries, as the sender lists them
@@ -605,6 +616,9 @@ mod tests {
             1 << 17,
             1 << 24,
             0xF << 24,
+            1 << 32,
+            0x3F << 32,
+            28 << 32 | 8,
             1 << 63,
         ] {
             assert_eq!(Desc::from_send(raw), Err(Error::InvalidArgs), "{raw:#x}");
@@ -613,6 +627,23 @@ mod tests {
         assert_eq!(Desc::from_reply(NO_WAIT), Err(Error::InvalidArgs));
         assert_eq!(desc(1024, 4, true).result(), 1024 | 4 << 12);
         assert_eq!(desc(3, 0, false).result(), 3);
+    }
+
+    /// The level `receive` lends is the lower of the client's level and the
+    /// receiver's ceiling, in bits 32-37, clear of the length, the handles
+    /// and the source.
+    #[test]
+    fn a_lent_level_is_the_lower_of_level_and_ceiling() {
+        for level in [1u8, 28, 63] {
+            assert_eq!(lent(level, 63), u64::from(level) << 32);
+        }
+        assert_eq!(lent(50, 40), 40 << 32);
+        assert_eq!(lent(28, 40), 28 << 32);
+        let others = LEN_BITS | HANDLE_BITS | 0xF << abi::SOURCE_SHIFT;
+        for level in 0..64 {
+            assert_eq!(lent(level, 63) & others, 0);
+            assert_eq!(lent(level, 63) & !(abi::LEVEL_BITS << abi::LEVEL_SHIFT), 0);
+        }
     }
 
     /// A message carries each handle once, and never the channel `send`

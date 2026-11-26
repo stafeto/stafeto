@@ -683,6 +683,22 @@ pub mod msgbuf {
 /// Where the kind of what `receive` took starts in its x1: bits 24-27.
 pub const SOURCE_SHIFT: u32 = 24;
 
+/// Where the level that what `receive` took lends its receiver starts in
+/// its x1: bits 32-37 (spec 6.6). Only the kernel writes it: `send` and
+/// `reply` with any of these bits in their description fail with
+/// INVALID_ARGS. For a request it is the lower of the effective priority
+/// of the client at the meeting and the ceiling of the receiver's process,
+/// never 0 (thread priorities are 1-63). For a notification of a channel
+/// that lends it is the same for the slot, and 0 for the others: 0 means
+/// no level.
+pub const LEVEL_SHIFT: u32 = 32;
+
+/// The mask of the level once shifted down: six bits.
+pub const LEVEL_BITS: u64 = 0x3F;
+
+const _: () = assert!(LEVEL_SHIFT >= SOURCE_SHIFT + 4);
+const _: () = assert!(PRIORITY_LEVELS as u64 <= 1 << 6);
+
 /// Bit 63 of the bits of a session's notification: the last handle with
 /// its label went, or the process that held it ended (spec 5.3). Only the
 /// kernel posts it: `notify` with it fails with INVALID_ARGS.
@@ -754,18 +770,20 @@ impl Source {
 /// A notification as `receive` returns it (spec 6.5, 11): the kind of its
 /// source, the label of the handle the source came through (0 for none),
 /// the bits posted since the last `receive` took the slot, ORed together,
-/// and how many posts they merge, up to u32::MAX.
+/// and how many posts they merge, up to u32::MAX, and the level the
+/// notification lends (bits 32-37 of x1, LEVEL_SHIFT; 0 for none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Notification {
     pub source: Source,
     pub label: u64,
     pub bits: u64,
     pub count: u32,
+    pub level: u8,
 }
 
 impl Notification {
     /// x1-x11 as `receive` leaves them: x1 the description (no data and no
-    /// handles, the source in bits 24-27), x2 the bits, x3 the count, x4-x9
+    /// handles, the source in bits 24-27, the level in bits 32-37), x2 the bits, x3 the count, x4-x9
     /// zero, x10 the label, and x11 the token of a request, which a
     /// notification does not have: 0.
     pub const fn to_words(self) -> [u64; 11] {
@@ -779,7 +797,8 @@ impl Notification {
     /// notification.
     pub const fn write_words(self, words: &mut [u64; 11]) {
         *words = [0; 11];
-        words[0] = self.source.code() << SOURCE_SHIFT;
+        words[0] =
+            self.source.code() << SOURCE_SHIFT | (self.level as u64 & LEVEL_BITS) << LEVEL_SHIFT;
         words[1] = self.bits;
         words[2] = self.count as u64;
         words[9] = self.label;
@@ -792,6 +811,7 @@ impl Notification {
             label: words[9],
             bits: words[1],
             count: words[2] as u32,
+            level: ((words[0] >> LEVEL_SHIFT) & LEVEL_BITS) as u8,
         }
     }
 }
@@ -801,7 +821,9 @@ impl Notification {
 /// source 0; x2-x9 bytes 0-63 as `inline_words` packs them, zero past the
 /// length; x10 the label of the handle the request came through, 0 for
 /// none; x11 the token of its reply, never 0. The reply comes back to
-/// `send` in x1-x9 the same way.
+/// `send` in x1-x9 the same way, without the level. `level` is what the
+/// kernel adds to x1 in bits 32-37 (LEVEL_SHIFT) of a request `receive`
+/// took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Message {
     pub len: usize,
@@ -809,10 +831,12 @@ pub struct Message {
     pub words: [u64; 8],
     pub label: u64,
     pub token: u64,
+    pub level: u8,
 }
 
 impl Message {
-    /// The description in x1: the length and the count of handles.
+    /// The description in x1: the length and the count of handles, with no
+    /// level: the description `send` takes cannot carry one.
     pub const fn description(&self) -> u64 {
         self.len as u64 | (self.handles as u64) << HANDLES_SHIFT
     }
@@ -820,7 +844,7 @@ impl Message {
     /// x1-x11 as `receive` leaves them for this message.
     pub const fn to_words(self) -> [u64; 11] {
         let mut words = [0; 11];
-        words[0] = self.description();
+        words[0] = self.description() | (self.level as u64 & LEVEL_BITS) << LEVEL_SHIFT;
         let mut i = 0;
         while i < 8 {
             words[1 + i] = self.words[i];
@@ -846,6 +870,7 @@ impl Message {
             words: data,
             label: words[9],
             token: words[10],
+            level: ((words[0] >> LEVEL_SHIFT) & LEVEL_BITS) as u8,
         }
     }
 }
@@ -2198,6 +2223,7 @@ mod tests {
         assert_eq!(Source::from_code(15), Source::Unknown(15));
         assert_eq!(Source::Unknown(15).code(), 15);
         assert_eq!((NO_WAIT, SOURCE_SHIFT), (1 << 16, 24));
+        assert_eq!((LEVEL_SHIFT, LEVEL_BITS), (32, 0x3F));
         assert_eq!((MESSAGE_MAX, MESSAGE_HANDLES, HANDLES_SHIFT), (1024, 4, 12));
     }
 
@@ -2345,9 +2371,10 @@ mod tests {
             label: 0x1ABE1,
             bits: 1 << 63 | 5,
             count: u32::MAX,
+            level: 31,
         };
         let words = [
-            2 << 24,
+            2 << 24 | 31 << 32,
             1 << 63 | 5,
             0xFFFF_FFFF,
             0,
@@ -2361,6 +2388,21 @@ mod tests {
         ];
         assert_eq!(n.to_words(), words);
         assert_eq!(Notification::from_words(words), n);
+        let mut w = [u64::MAX; 11];
+        n.write_words(&mut w);
+        assert_eq!(w, words);
+        let none = Notification { level: 0, ..n };
+        assert_eq!(none.to_words()[0], 2 << 24);
+    }
+
+    #[test]
+    fn a_level_rides_above_the_other_fields() {
+        let words = [5 << 24 | 63 << 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let n = Notification::from_words(words);
+        assert_eq!((n.source, n.level), (Source::Interrupt, 63));
+        let words = [1024 | 4 << 12 | 63 << 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let m = Message::from_words(words);
+        assert_eq!((m.len, m.handles, m.level), (1024, 4, 63));
     }
 
     #[test]
@@ -2371,10 +2413,24 @@ mod tests {
             words: core::array::from_fn(|i| i as u64 + 1),
             label: 0x1ABE1,
             token: 7 << 16 | 3,
+            level: 28,
         };
-        let words = [1024 | 4 << 12, 1, 2, 3, 4, 5, 6, 7, 8, 0x1ABE1, 7 << 16 | 3];
+        let words = [
+            1024 | 4 << 12 | 28 << 32,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            0x1ABE1,
+            7 << 16 | 3,
+        ];
         assert_eq!(m.to_words(), words);
         assert_eq!(Message::from_words(words), m);
+        assert_eq!(m.description(), 1024 | 4 << 12);
         let mut w = [u64::MAX; 11];
         Notification::from_words(words).write_words(&mut w);
         assert_eq!(w, Notification::from_words(words).to_words());
