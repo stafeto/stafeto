@@ -190,12 +190,17 @@ impl Mode {
 }
 
 /// The checks of the atomic role, in the order the probe runs them.
-pub const ATOMIC_CHECKS: [&str; 12] = [
+pub const ATOMIC_CHECKS: [&str; 17] = [
     "1 MiB writes and reads never mix",
     "the service keeps no cell mapped",
     "O_APPEND 200 KiB records whole",
     "inline parts atomic",
     "lease lapses after 1 s",
+    "writev and readv of a program on small vectors",
+    "O_APPEND writev of 2 x 64 KiB whole",
+    "readv of 2 x 64 KiB never mixes",
+    "writev lease lapses after 1 s",
+    "readv lease lapses after 1 s",
     "siglongjmp out of a handler returns the cell",
     "thread exit mid-call returns the cell",
     "handler write during a long write",
