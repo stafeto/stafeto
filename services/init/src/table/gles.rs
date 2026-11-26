@@ -72,8 +72,8 @@ pub const WINDOW_TABLE: &[Record] = &[
 /// module makes contexts and surfaces of a few MiB.
 const DEQP_QUOTA: u64 = 256 * 1024 * 1024;
 
-/// dEQP-EGL (xtask deqp): the services of the pbuffer probe and the module
-/// of VK-GL-CTS. The arguments of a batch of cases are the lines of
+/// dEQP (xtask deqp): the services of the pbuffer probe and one module of
+/// VK-GL-CTS (EGL, GLES2, GLES3 or GLES31), which the image names `deqp`. The arguments of a batch of cases are the lines of
 /// /etc/deqp.args in the image (tests/deqp/platform/tcuStafetoMain.cpp), so
 /// the table holds none.
 pub const DEQP_TABLE: &[Record] = &[
@@ -85,9 +85,9 @@ pub const DEQP_TABLE: &[Record] = &[
     POSIX_ABI_TABLE[2],
     PIPE,
     Record {
-        name: "deqp-egl",
-        program: "deqp-egl",
-        args: b"deqp-egl\0",
+        name: "deqp",
+        program: "deqp",
+        args: b"deqp\0",
         connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
         root: true,
         quota: DEQP_QUOTA,

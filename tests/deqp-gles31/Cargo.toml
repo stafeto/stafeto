@@ -1,0 +1,17 @@
+[package]
+name = "deqp-gles31"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The dEQP-GLES31 module of VK-GL-CTS on stafeto (OpenGL ES 3.1 on Mesa's softpipe): the test framework of tests/deqp with the platform of tests/deqp/platform"
+build = "build.rs"
+
+[[bin]]
+name = "deqp-gles31"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt", features = ["window"] }
