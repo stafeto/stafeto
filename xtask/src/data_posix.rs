@@ -1692,7 +1692,7 @@ mod tests {
         out
     }
 
-    /// The lines of a good run with the rounds `rounds` in place of the good ones.
+    /// The lines of a good run whose rounds are `rounds`.
     fn with_pairs(rounds: &[(u64, u64, u64)]) -> Vec<String> {
         let mut out = fast_lines(4200, 6000, GOOD_OPS, 10_900);
         out.retain(|l| !l.contains("fast pair"));
