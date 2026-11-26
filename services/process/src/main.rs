@@ -5377,13 +5377,15 @@ impl Processes {
     /// did not start. Gives the count handed over, which is `exit` when the
     /// record's end waits for them.
     fn reap_images(&mut self, index: usize, exit: bool) -> usize {
-        let level = self.records.get(index).map_or(1, |r| r.level);
+        let (level, child) = self.records.get(index).map_or((1, 0), |r| {
+            (r.level, if exit { r.process.raw().0 } else { 0 })
+        });
         let mut handed = 0;
         while let Some(memory) = self.images.take_freed() {
             let Some(wake) = self.reaper_wake.as_ref() else {
                 continue;
             };
-            if reaper::give(wake, memory, level, index, exit).is_ok() {
+            if reaper::give(wake, memory, child, level, index, exit).is_ok() {
                 handed += 1;
             }
         }

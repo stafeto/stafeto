@@ -35,6 +35,9 @@ struct Place {
     /// The place is given and not taken yet.
     used: AtomicBool,
     handle: AtomicU64,
+    /// The handle of the process whose end freed the object (0 for none): its
+    /// memory account is what the thread watches after the close.
+    child: AtomicU64,
     level: AtomicU8,
     record: AtomicU16,
     /// The object is for the exit of the record: the loop reports its end
@@ -47,6 +50,7 @@ static PLACES: [Place; IMAGES] = [const {
     Place {
         used: AtomicBool::new(false),
         handle: AtomicU64::new(0),
+        child: AtomicU64::new(0),
         level: AtomicU8::new(1),
         record: AtomicU16::new(0),
         exit: AtomicBool::new(false),
@@ -90,11 +94,13 @@ pub fn start(
 }
 
 /// Gives the thread `memory` to close at `level`, for the record `record`
-/// (`exit`: its end waits for it). The object comes back when no place is
+/// (`exit`: its end waits for it, and `child` is the handle of its process,
+/// whose memory account the thread watches until the pages are back). The object comes back when no place is
 /// free or the thread could not be told.
 pub fn give(
     wake: &Handle<Channel>,
     memory: Handle<Memory>,
+    child: u64,
     level: u8,
     record: usize,
     exit: bool,
@@ -108,6 +114,7 @@ pub fn give(
     };
     let slot = &PLACES[place];
     slot.done.store(false, Ordering::Release);
+    slot.child.store(child, Ordering::Release);
     slot.level.store(level.max(1), Ordering::Release);
     slot.record.store(record as u16, Ordering::Release);
     slot.exit.store(exit, Ordering::Release);
@@ -150,23 +157,45 @@ extern "C" fn serve(_: u64) -> ! {
     let Ok(me) = sys::self_thread() else {
         sys::thread_exit();
     };
+    // The timer of the pauses is on the thread's own channel, as the loop's
+    // timer is on the loop's.
+    let nap = Nap::new(&waits, HIGH.load(Ordering::Acquire));
+    #[cfg(feature = "steps")]
+    if let Err(e) = &nap {
+        rt::println!("posix-process: the reaper has no timer ({e:?})");
+    }
+    let nap = nap.ok();
+    // The places told while the thread paused wait here.
+    let mut told = 0u64;
     loop {
-        match sys::receive(&waits) {
-            Ok(Received::Notification { bits, .. }) => {
-                for place in 0..PLACES.len() {
-                    if bits >> place & 1 != 0 {
-                        close(place, &me);
-                    }
-                }
+        if told == 0 {
+            match sys::receive(&waits) {
+                Ok(Received::Notification {
+                    source: abi::Source::Timer,
+                    ..
+                }) => {}
+                Ok(Received::Notification { bits, .. }) => told |= bits,
+                Ok(_) => {}
+                Err(_) => sys::thread_exit(),
             }
-            Ok(_) => {}
-            Err(_) => sys::thread_exit(),
+            continue;
+        }
+        let place = told.trailing_zeros() as usize;
+        told &= told - 1;
+        if place < PLACES.len() {
+            close(place, &me, nap.as_ref(), &waits, &mut told);
         }
     }
 }
 
 /// Closes the object of `place` at its level, then tells the loop.
-fn close(place: usize, me: &Handle<Thread>) {
+fn close(
+    place: usize,
+    me: &Handle<Thread>,
+    nap: Option<&Nap>,
+    waits: &Handle<Channel>,
+    told: &mut u64,
+) {
     let slot = &PLACES[place];
     let raw = slot.handle.swap(0, Ordering::Acquire);
     if raw == 0 {
@@ -184,8 +213,97 @@ fn close(place: usize, me: &Handle<Thread>) {
             rt::println!("posix-process: reaper level {level} {took} ticks");
         }
     }
+    let child = slot.child.load(Ordering::Acquire);
+    // Only the last object of a process waits for its pages: the account of
+    // the process holds the others' pages until they are closed too.
+    let more = PLACES.iter().enumerate().any(|(i, p)| {
+        i != place
+            && p.used.load(Ordering::Acquire)
+            && !p.done.load(Ordering::Acquire)
+            && p.handle.load(Ordering::Acquire) != 0
+            && p.child.load(Ordering::Acquire) == child
+    }) || *told != 0
+        && PLACES
+            .iter()
+            .enumerate()
+            .any(|(i, p)| *told >> i & 1 != 0 && p.child.load(Ordering::Acquire) == child);
+    if let (Some(nap), true, false) = (nap, child != 0, more) {
+        settle(nap, child, waits, told);
+    }
     slot.done.store(true, Ordering::Release);
     let _ = sys::thread_set_priority(me, HIGH.load(Ordering::Acquire), abi::Policy::Fifo);
     let tells = Handle::<Channel>::borrowed(abi::Handle(TELLS.load(Ordering::Acquire)));
     let _ = sys::notify(&tells, 1);
+}
+
+/// The memory a process uses once its pages are back (its own shell and
+/// tables), bytes: the pause for the pages ends below it.
+const SETTLED: u64 = 64 * 1024;
+/// The label of the thread's timer on its channel.
+const TIMER_LABEL: u64 = 1 << 62;
+/// The most pauses of `settle`, and one pause in nanoseconds.
+const NAPS: u32 = 100;
+const NAP_NS: u64 = 1_000_000;
+
+/// Waits at the thread's level until the memory account of the process
+/// `child` has what it keeps for its shell: the close queues what is left
+/// of the object and of its payer's shell at that level, and the queue
+/// runs there only when nothing above wants the CPU, so the thread pauses
+/// (1 ms at a time, 100 ms at most) and looks again. The process ends in
+/// the record once its pages are back.
+fn settle(nap: &Nap, child: u64, waits: &Handle<Channel>, told: &mut u64) {
+    let child = Handle::<Process>::borrowed(abi::Handle(child));
+    #[cfg(feature = "steps")]
+    let began = rt::time::now();
+    let mut naps = 0;
+    while naps < NAPS {
+        let used = sys::process_memory(&child).map_or(0, |m| m.used);
+        if used <= SETTLED || !nap.sleep(waits, told) {
+            break;
+        }
+        naps += 1;
+    }
+    #[cfg(feature = "steps")]
+    rt::println!(
+        "posix-process: reaper waited {naps} pauses, {} ticks, the child uses {}",
+        rt::time::now().saturating_sub(began),
+        sys::process_memory(&child).map_or(0, |m| m.used)
+    );
+}
+
+/// The thread's own timer, on the channel it waits on.
+struct Nap {
+    timer: Handle<rt::handle::Timer>,
+}
+
+impl Nap {
+    fn new(waits: &Handle<Channel>, level: u8) -> Result<Nap, abi::Error> {
+        let ends = sys::handle_label(waits, abi::Rights::RECEIVE, TIMER_LABEL, level)?;
+        let timer = sys::timer_create(&ends, level)?;
+        Ok(Nap { timer })
+    }
+
+    /// Sleeps a pause on `waits`; the places told meanwhile are added to
+    /// `told`. False when the timer or the channel failed.
+    fn sleep(&self, waits: &Handle<Channel>, told: &mut u64) -> bool {
+        let deadline = rt::time::ticks_to_ns(rt::time::now()) + NAP_NS;
+        if sys::timer_set(&self.timer, deadline).is_err() {
+            return false;
+        }
+        loop {
+            match sys::receive(waits) {
+                Ok(Received::Notification {
+                    source: abi::Source::Timer,
+                    ..
+                }) => {
+                    if rt::time::reached(deadline) {
+                        return true;
+                    }
+                }
+                Ok(Received::Notification { bits, .. }) => *told |= bits,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+    }
 }

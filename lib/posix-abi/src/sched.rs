@@ -223,10 +223,12 @@ pub fn thread_set(id: u64, policy: i32, priority: i32, tail: bool) -> Result<i32
 /// main thread applies to itself: the top level of the caller and `spec`
 /// (policy and priority), or the caller's own scheduling for None. A `spec`
 /// of SCHED_FIFO or SCHED_RR whose level is below the caller's top starts the
-/// image, its loader among it, at that level, which is its top: the word
-/// then names the greatest priority, the level of the image. EINVAL for a
-/// policy or priority out of range, EPERM for a rise the caller may not
-/// make.
+/// image, its loader among it, at that level; the word keeps the priority
+/// asked for and carries the caller's top (bits 16 to 23), which is the
+/// child's reference for the levels of its priorities, so that its
+/// sched_getparam says what was asked and the main thread is at the level
+/// the process was placed at. EINVAL for a policy or priority out of range,
+/// EPERM for a rise the caller may not make.
 pub(crate) fn for_child(spec: Option<(i32, i32)>) -> Result<(u8, u64), i32> {
     let own = unpack(crate::threads::own_block().sched.load(Ordering::Relaxed));
     let (policy, priority) = spec.unwrap_or(own);
@@ -237,7 +239,10 @@ pub(crate) fn for_child(spec: Option<(i32, i32)>) -> Result<(u8, u64), i32> {
     }
     let top = top()?;
     if spec.is_some() && matches!(policy, SCHED_FIFO | SCHED_RR) && level < top {
-        return Ok((level, START | pack(policy, MAX_PRIORITY)));
+        return Ok((
+            level,
+            START | pack(policy, priority) | u64::from(top) << TOP_SHIFT,
+        ));
     }
     Ok((top, START | pack(policy, priority)))
 }
@@ -246,6 +251,9 @@ pub(crate) fn for_child(spec: Option<(i32, i32)>) -> Result<(u8, u64), i32> {
 pub fn own_policy() -> i32 {
     unpack(crate::threads::own_block().sched.load(Ordering::Relaxed)).0
 }
+
+/// Where a start word carries the top of the parent's levels (0 for none).
+const TOP_SHIFT: u32 = 16;
 
 /// Bit 63 of a start word: the word names a scheduling.
 pub(crate) const START: u64 = 1 << 63;
@@ -261,6 +269,12 @@ pub(crate) fn start_apply(word: u64) {
         word
     };
     let (policy, priority) = unpack(word);
+    // A child placed below its parent's top maps its priorities to levels
+    // from the parent's top (`for_child`).
+    let parent_top = (word >> TOP_SHIFT & 0xFF) as u8;
+    if parent_top != 0 {
+        set_top(parent_top);
+    }
     let Ok((level, kernel)) = level_of(policy, priority) else {
         return;
     };
