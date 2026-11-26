@@ -646,7 +646,7 @@ static int paced_phase(const char *name, int frames, int stop_fd, int *posts_out
             if (poll(&p, 1, 0) > 0) break;
         }
         /* A wake-up is measured only after a real sleep: a post that is already due when
-         * the loop gets to it (the client was busy or starved) is an overrun, not a wake-up. */
+         * the loop gets to it (the client was busy or starved) counts as an overrun and has no wake-up to measure. */
         {
             uint64_t before = mono_ns();
             if (before >= due) {
