@@ -10,6 +10,7 @@
 //! * `layout`: the structures and constants of the header.
 //! * `account`: which buffers are free, by the bits the service sends.
 //! * `damage`: the rectangles of a POST, merged to what the service takes.
+//! * `flag`: a flag one thread holds for a scope.
 //! * `events`: the 16 bytes of an event, both ways.
 //! * `errno`: the service's refusals and the kernel's as errno.
 
@@ -19,4 +20,5 @@ pub mod account;
 pub mod damage;
 pub mod errno;
 pub mod events;
+pub mod flag;
 pub mod layout;
