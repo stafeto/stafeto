@@ -172,6 +172,10 @@ impl Driver<'_> {
         let Some((c, generation, block)) = self.side.blocks.alloc_except(&mut both, now, busy)
         else {
             self.inst.net.buffers.mappings().release(chunks);
+            // A number that left a moment ago comes back after the sweep: the client asks again.
+            if self.side.blocks.pending_sweep() > 0 {
+                return refuse(proto_net::SWEEPING);
+            }
             return limit();
         };
 

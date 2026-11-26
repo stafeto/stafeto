@@ -629,6 +629,24 @@ fn marker_in(line: &str, marker: &str) -> bool {
         || (marker.len() > 48 && marker.is_char_boundary(48) && line.contains(&marker[..48]))
 }
 
+/// Waits for a line that holds `marker` (`marker_in`: the console may glue it to the end of
+/// another line). A timeout that finds the marker as a substring of a collected line says so.
+fn expect_marker_line(
+    run: &mut Run,
+    what: &str,
+    marker: &str,
+    within: Duration,
+) -> Result<String, String> {
+    run.expect_line(what, |l| marker_in(l, marker), within)
+        .map_err(|e| {
+            if run.text().iter().any(|l| l.contains(marker)) {
+                format!("{e}; marker arrived glued to another line")
+            } else {
+                e
+            }
+        })
+}
+
 /// Judges the lines of a run: the device started twice, the address came
 /// each time as `mode` says, the client printed every line once and did
 /// not fail, and the service was killed once and restarted by init.
@@ -963,8 +981,7 @@ fn run(
         Mode::Dhcp => LEASE,
         Mode::Static => STATIC,
     };
-    let result = run
-        .expect_line(first, |l| l == first, within)
+    let result = expect_marker_line(&mut run, first, first, within)
         .map(|_| began.elapsed())
         .and_then(|took| {
             // The client ends with any code: a failure is read from its lines.
@@ -1262,7 +1279,7 @@ fn wire_echo_lines(
     let long = crate::BOOT_TIMEOUT * 20;
     let target: std::net::SocketAddr = ([127, 0, 0, 1], forwarded).into();
     let sent = (|| {
-        run.expect_line("the echo socket", |l| l == WIRE_ECHO_READY, long)?;
+        expect_marker_line(&mut run, "the echo socket", WIRE_ECHO_READY, long)?;
         socket
             .set_read_timeout(Some(Duration::from_secs(20)))
             .map_err(|e| format!("udp timeout: {e}"))?;

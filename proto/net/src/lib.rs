@@ -230,10 +230,13 @@ pub const NO_ENTRY: u32 = 732;
 pub const NO_SPACE: u32 = 733;
 /// The second device has an owner, or comes back from one (CLAIM).
 pub const BUSY: u32 = 734;
+/// ATTACH: no consumer number is usable yet, but some wait for the sweep of the flow table that
+/// ends their old flows; the same request succeeds once the sweep has gone on.
+pub const SWEEPING: u32 = 735;
 
 /// Every code of the service, for the checks that none repeats and none
 /// is a code of the wire (below 512).
-pub const CODES: [u32; 28] = [
+pub const CODES: [u32; 29] = [
     BAD_FD,
     AGAIN,
     MFILE,
@@ -262,6 +265,7 @@ pub const CODES: [u32; 28] = [
     NO_ENTRY,
     NO_SPACE,
     BUSY,
+    SWEEPING,
 ];
 
 pub const fn code(code: u32) -> Status {
@@ -650,9 +654,10 @@ mod tests {
                 EXISTS,
                 NO_ENTRY,
                 NO_SPACE,
-                BUSY
+                BUSY,
+                SWEEPING
             ],
-            [724, 725, 726, 727, 728, 729, 730, 731, 732, 733, 734]
+            [724, 725, 726, 727, 728, 729, 730, 731, 732, 733, 734, 735]
         );
     }
 

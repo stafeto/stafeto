@@ -96,7 +96,7 @@
 //! No line `[alert]`, `[emerg]` or `[crit]` in the whole run: they would
 //! show nginx's self-check of EPOLLRDHUP timing out or a worker not spawned.
 //! The settings are those of the package with 256 connections a worker and
-//! keep-alive of 10 s; `netd.conf` gives eight buffers.
+//! keep-alive of 75 s; `netd.conf` gives eight buffers.
 //!
 //! `cargo xtask nginx-probe steps` runs the same with the service counting its
 //! steps (`netd` built with the feature `steps`, under -icount with the guest
@@ -215,8 +215,13 @@ const BUFFER_KIND: usize = 25;
 /// CLONE and CLONE_MORE, which copy a session's sockets in portions.
 const CLONE_KINDS: [usize; 2] = [19, 20];
 
+/// The keep-alive timeout of the probe's nginx, in seconds. A connection that a step holds idle
+/// through rounds of scan traffic (4g, 4h) must outlive them on a slow runner: a round took more
+/// than 10 s there and nginx closed the held connection (stafeto#595).
+const KEEPALIVE_S: u64 = 75;
+
 /// The probe's settings: the package's with 256 connections a worker,
-/// keep-alive of 10 s and the server of TLS.
+/// keep-alive of 75 s (`KEEPALIVE_S`) and the server of TLS.
 pub fn probe_conf() -> &'static str {
     static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TEXT.get_or_init(|| {
@@ -225,7 +230,11 @@ pub fn probe_conf() -> &'static str {
             "worker_connections 512;",
             "worker_connections 256;",
         );
-        let text = replaced(&text, "keepalive_timeout 65;", "keepalive_timeout 10;");
+        let text = replaced(
+            &text,
+            "keepalive_timeout 65;",
+            &format!("keepalive_timeout {KEEPALIVE_S};"),
+        );
         replaced(
             &text,
             "    server {\n",
@@ -1457,6 +1466,7 @@ pub(crate) fn tls_scan(tls: &Tls, address: SocketAddr, rounds: usize) -> Result<
     };
     let at = Instant::now();
     for round in 1..=rounds {
+        let round_began = Instant::now();
         let mut held = Connection::open(address, CLIENT_WITHIN)
             .map_err(|e| format!("4g round {round}: the long-lived connection: {e}"))?;
         same(
@@ -1464,6 +1474,8 @@ pub(crate) fn tls_scan(tls: &Tls, address: SocketAddr, rounds: usize) -> Result<
             &held.get("/index.html").map_err(|e| format!("4g round {round}: reading the page on the long-lived connection before the round: {e}"))?,
             rootfs::www_index(),
         )?;
+        // The connection is idle from here to its last request.
+        let held_idle_since = Instant::now();
         let ran = Command::new("python3")
             .args(["-I", "-c", SCAN_CLIENT])
             .arg(&ports)
@@ -1511,9 +1523,13 @@ pub(crate) fn tls_scan(tls: &Tls, address: SocketAddr, rounds: usize) -> Result<
         )?;
         same(
             &format!("4g round {round}: the long-lived connection after the round"),
-            &held.get("/index.html").map_err(|e| format!("4g round {round}: reading the page on the long-lived connection after the round (opened before it): {e}"))?,
+            &held.get("/index.html").map_err(|e| format!("4g round {round}: reading the page on the long-lived connection after the round (opened before it): {e}; the connection was idle for {} s against the keep-alive of {KEEPALIVE_S} s", held_idle_since.elapsed().as_secs()))?,
             rootfs::www_index(),
         )?;
+        println!(
+            "nginx-probe: 4g round {round}: {} ms",
+            round_began.elapsed().as_millis()
+        );
     }
     println!(
         "nginx-probe: 4g {rounds} rounds of {} connections to port(s) {ports} ended at once or before the handshake: every first request, over TLS and over HTTP, and the long-lived connection answered ({} ms)",
@@ -1566,6 +1582,8 @@ fn tls_raw_scan(
         })?,
         rootfs::www_index(),
     )?;
+    // The connection is idle from here to its last request.
+    let held_idle_since = Instant::now();
     std::thread::sleep(Duration::from_secs(2));
     println!("nginx-probe: 4h before the scan: {}", tap.facts());
     if tap.frames() == 0 {
@@ -1629,7 +1647,7 @@ fn tls_raw_scan(
     )?;
     same(
         "4h: the long-lived connection after the scan",
-        &held.get("/index.html").map_err(|e| format!("4h: reading the page on the long-lived connection after the scan (opened before it): {e}"))?,
+        &held.get("/index.html").map_err(|e| format!("4h: reading the page on the long-lived connection after the scan (opened before it): {e}; the connection was idle for {} s against the keep-alive of {KEEPALIVE_S} s", held_idle_since.elapsed().as_secs()))?,
         rootfs::www_index(),
     )?;
     // The counters: the first report after the scan may come before its last
@@ -2004,7 +2022,7 @@ mod tests {
         assert!(NGINX_CONF.contains("error_log stderr notice;"));
         let probe = probe_conf();
         assert!(probe.contains("worker_connections 256;"));
-        assert!(probe.contains("keepalive_timeout 10;"));
+        assert!(probe.contains("keepalive_timeout 75;"));
         assert!(probe.contains("    include /etc/nginx/tls.conf;\n    server {\n"));
         assert_eq!(probe.lines().count(), NGINX_CONF.lines().count() + 1);
         let exclusive = exclusive_conf();
