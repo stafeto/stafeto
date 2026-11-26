@@ -783,9 +783,9 @@ pub struct Notification {
 
 impl Notification {
     /// x1-x11 as `receive` leaves them: x1 the description (no data and no
-    /// handles, the source in bits 24-27, the level in bits 32-37), x2 the bits, x3 the count, x4-x9
-    /// zero, x10 the label, and x11 the token of a request, which a
-    /// notification does not have: 0.
+    /// handles, the source in bits 24-27, the level in bits 32-37), x2 the
+    /// bits, x3 the count, x4-x9 zero, x10 the label, and x11 the token of a
+    /// request, which a notification does not have: 0.
     pub const fn to_words(self) -> [u64; 11] {
         let mut words = [0; 11];
         self.write_words(&mut words);
@@ -797,8 +797,9 @@ impl Notification {
     /// notification.
     pub const fn write_words(self, words: &mut [u64; 11]) {
         *words = [0; 11];
-        words[0] =
-            self.source.code() << SOURCE_SHIFT | (self.level as u64 & LEVEL_BITS) << LEVEL_SHIFT;
+        // The kernel's levels are priorities, 1-63: no mask on the way out.
+        debug_assert!(self.level as u64 <= LEVEL_BITS);
+        words[0] = self.source.code() << SOURCE_SHIFT | (self.level as u64) << LEVEL_SHIFT;
         words[1] = self.bits;
         words[2] = self.count as u64;
         words[9] = self.label;
@@ -844,7 +845,8 @@ impl Message {
     /// x1-x11 as `receive` leaves them for this message.
     pub const fn to_words(self) -> [u64; 11] {
         let mut words = [0; 11];
-        words[0] = self.description() | (self.level as u64 & LEVEL_BITS) << LEVEL_SHIFT;
+        debug_assert!(self.level as u64 <= LEVEL_BITS);
+        words[0] = self.description() | (self.level as u64) << LEVEL_SHIFT;
         let mut i = 0;
         while i < 8 {
             words[1 + i] = self.words[i];

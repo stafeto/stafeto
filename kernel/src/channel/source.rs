@@ -213,11 +213,11 @@ pub fn notify(c: NonNull<Channel>, bits: u64, cause: u8) -> Result<(), Error> {
 /// bits merge. A slot that stood in no queue goes to the top receiver that
 /// waits, which takes it at once: its registers get the notification, with
 /// the level the slot lends in bits 32-37 of x1 (`message::notice_level`,
-/// spec 6.6), it works at the slot's priority under its ceiling, it becomes ready at the
-/// tail of that level with a new quantum (spec 6.1), and the reference of
-/// its wait goes. Otherwise the slot goes to the tail of its level in the
-/// queue of slots and holds its owner there. Runs inside the caller's
-/// section. O(1).
+/// spec 6.6), it works at the slot's priority under its ceiling, it
+/// becomes ready at the tail of that level with a new quantum (spec 6.1),
+/// and the reference of its wait goes. Otherwise the slot goes to the tail
+/// of its level in the queue of slots and holds its owner there. Runs inside
+/// the caller's section. O(1).
 ///
 /// # Safety
 /// The caller holds a reference to `c` and to the owner of `slot`, which

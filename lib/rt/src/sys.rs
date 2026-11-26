@@ -1817,7 +1817,10 @@ fn received_lent(x: [u64; 12]) -> Result<(Received, u8), Error> {
     ))
 }
 
-/// Decodes the receive registers, with no look at the level.
+/// Decodes the receive registers, with no look at the level. It repeats
+/// `received_lent` on purpose: a plain `receive` that went through the
+/// tuple of `received_lent` and dropped the level cost 115 more ticks on
+/// the round trip of rt, from copying the larger result.
 #[inline(always)]
 fn received(x: [u64; 12]) -> Result<Received, Error> {
     if let Some(e) = Error::from_code(x[0]) {

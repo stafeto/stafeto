@@ -12185,6 +12185,17 @@ fn thread_at(p: NonNull<Process>, base: u8) -> Result<NonNull<Thread>, &'static 
     thread::create(p, USER_VA, USER_VA, 0, base, Policy::Fifo).map_err(|_| "no thread")
 }
 
+/// The effective priority of `r`, which took a request at `base`, is the
+/// level its x1 tells, or its base when that is higher: the told value is
+/// what the boost took.
+fn boosted_to_what_was_told(r: &Thread, base: u8) -> Result<(), &'static str> {
+    let told = (r.regs.x[1] >> abi::LEVEL_SHIFT) as u8;
+    check(
+        r.sched.priority() == told.max(base),
+        "the receiver's priority is not the level its receive told",
+    )
+}
+
 /// The receiver of `l` at `base` takes the request of a client at `client`
 /// from the queue: x1 of its receive. `raise` lifts the client in the queue.
 /// The receiver keeps its base, and rises to the level the client gives
@@ -12217,6 +12228,7 @@ fn level_from_the_queue(
         r.regs.x[0] == 0 && r.sched.base() == base,
         "the receive failed or changed the base",
     )?;
+    boosted_to_what_was_told(r, base)?;
     Ok(r.regs.x[1])
 }
 
@@ -12254,6 +12266,8 @@ fn level_at_the_meeting(
     )?;
     // SAFETY: the test holds the thread, which does not run.
     let (x1, token) = unsafe { (r.as_ref().regs.x[1], r.as_ref().regs.x[11]) };
+    // SAFETY: as above.
+    boosted_to_what_was_told(unsafe { r.as_ref() }, base)?;
     // SAFETY: as above.
     unsafe {
         (*r.as_ptr()).regs.x[0] = token;
@@ -12438,7 +12452,8 @@ pub fn a_notification_tells_its_level(_: &Boot) -> Result<(), &'static str> {
 
 /// The bits of the level are the kernel's (spec 6.6, 11): `send` and `reply`
 /// with a bit of 32-37 in the description fail with INVALID_ARGS and change
-/// x0 alone, with the channel and the token good or not.
+/// x0 alone: `send` through a channel of the caller, `reply` with a token
+/// that names nothing (the description is checked first).
 pub fn a_sent_level_is_refused(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
         let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
