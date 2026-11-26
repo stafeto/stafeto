@@ -608,7 +608,6 @@ static int gles_commit(const char *line) {
 #define LOAD_PERIOD_NS 16666667ULL
 #define LOAD_W 160
 #define LOAD_H 100
-#define LOAD_QUIET_FRAMES 120
 #define LOAD_CUBE_FRAMES_MAX 3000
 
 static uint64_t mono_ns(void) {
@@ -624,17 +623,22 @@ static void sleep_until_ns(uint64_t at) {
 
 /* One phase of the paced client: `frames` posts, or posts until `stop_fd` is readable (the
  * cube holds its last frame) at most LOAD_CUBE_FRAMES_MAX. Prints the phase's line. */
-static int paced_phase(const char *name, int frames, int stop_fd) {
+/* The posts so far over all phases: the buffer a post uses goes on across the phases, so
+ * that a phase does not begin with the buffer the last one left on show. */
+static unsigned posted_before;
+
+static int paced_phase(const char *name, int frames, int stop_fd, int *posts_out) {
     struct stafeto_window w;
     uint64_t t0 = mono_ns() + 2 * LOAD_PERIOD_NS;
-    uint64_t take_max = 0, take_sum = 0, wake_max = 0;
+    uint64_t take_max = 0, take_sum = 0, wake_max = 0, lag_max = 0;
     unsigned over1 = 0, over2 = 0, posts = 0, replaced = 0;
     int limit = stop_fd >= 0 ? LOAD_CUBE_FRAMES_MAX : frames;
 
     CHECK(stafeto_window_info(0, &w) == 0);
     for (int k = 0; k < limit; k++) {
         uint32_t free_bits = 0;
-        unsigned b = (unsigned)k % w.buffers, prev = (unsigned)(k + w.buffers - 1) % w.buffers;
+        unsigned n = posted_before + (unsigned)k;
+        unsigned b = n % w.buffers, prev = (n + w.buffers - 1) % w.buffers;
         uint64_t due = t0 + (uint64_t)k * LOAD_PERIOD_NS, woke, posted, took;
 
         if (stop_fd >= 0) {
@@ -659,15 +663,20 @@ static int paced_phase(const char *name, int frames, int stop_fd) {
             continue;
         }
         took = mono_ns() - posted;
+        /* The release against the time the post was due: independent of the phase
+         * of the compositor's frame. */
+        if (posted + took > due && posted + took - due > lag_max) lag_max = posted + took - due;
         take_sum += took;
         if (took > take_max) take_max = took;
         if (took > LOAD_PERIOD_NS) over1++;
         if (took > 2 * LOAD_PERIOD_NS) over2++;
     }
-    printf("wfc-demo: load %s posts %u late %u late2 %u take max %llu us mean %llu us wake max %llu us unfreed %u\n",
+    printf("wfc-demo: load %s posts %u late %u late2 %u take max %llu us mean %llu us wake max %llu us unfreed %u lag max %llu us\n",
            name, posts, over1, over2, (unsigned long long)(take_max / 1000),
            (unsigned long long)(posts > 1 ? take_sum / (posts - 1) / 1000 : 0),
-           (unsigned long long)(wake_max / 1000), replaced);
+           (unsigned long long)(wake_max / 1000), replaced, (unsigned long long)(lag_max / 1000));
+    posted_before += posts;
+    if (posts_out) *posts_out = (int)posts;
     fflush(stdout);
     return 0;
 }
@@ -685,13 +694,11 @@ static int run_load(void) {
     WFCint plain_at[4] = {20, 20, LOAD_W, LOAD_H};
     WFCint cube_at[4] = {GLES_CUBE_X, GLES_CUBE_Y, GLES_SIZE, GLES_SIZE};
     WFCfloat src[4] = {0, 0, LOAD_W, LOAD_H};
-    int cube_pipe = -1, status = 0;
+    int cube_pipe = -1, status = 0, cube_posts = 0;
     pid_t pid;
     /* The pool before the cube starts: when the cube is killed and waited for, the
-     * quota of its process and the pages of its image are back. The image's object is
-     * closed by the service's reaper before the end is told, and the cleanup of the
-     * payer's shell that follows runs at the cube's level, so the pool is read again
-     * (10 ms apart, 2 s at most) and the number of reads is printed. */
+     * quota of its process and the pages of its image are back: the service's reaper
+     * closes the image's objects and waits for the pages before the end is told. */
     unsigned long long pool_before = stafeto_probe_pool();
 
     CHECK(stafeto_window_open(20, 20, LOAD_W, LOAD_H, STAFETO_WINDOW_XRGB8888, 3, 0, &w) == 0);
@@ -708,8 +715,6 @@ static int run_load(void) {
     CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
     wfcActivate(dev, ctx);
     CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
-    CHECK(paced_phase("quiet", LOAD_QUIET_FRAMES, -1) == 0);
-
     pid = start_holder("/bin/gles-cube", cube_argv, 7, &cube_pipe);
     CHECK(pid > 0);
     CHECK(next_stream(&id_c) == 0);
@@ -721,32 +726,26 @@ static int run_load(void) {
     wfcInsertElement(dev, cube, plain);
     wfcCommit(dev, ctx, WFC_TRUE);
     CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
-    CHECK(paced_phase("cube", 0, cube_pipe) == 0);
+    CHECK(paced_phase("cube", 0, cube_pipe, &cube_posts) == 0);
     CHECK(wait_held(cube_pipe) == 0);
     printf("wfc-demo: load the cube held its last frame\n");
     fflush(stdout);
 
     kill(pid, SIGKILL);
-    printf("wfc-demo: load pool after kill %llu\n", stafeto_probe_pool());
     waitpid(pid, &status, 0);
     close(cube_pipe);
     {
         unsigned long long pool_after = stafeto_probe_pool();
-        int polls = 0;
-        printf("wfc-demo: load pool after wait %llu\n", pool_after);
-        while (pool_after != pool_before && polls < 200) {
-            struct timespec nap = {0, 10000000};
-            nanosleep(&nap, NULL);
-            pool_after = stafeto_probe_pool();
-            polls++;
-        }
-        printf("wfc-demo: load pool polls %d\n", polls);
         printf("wfc-demo: load pool before %llu after %llu\n", pool_before, pool_after);
         fflush(stdout);
         CHECK(pool_before != 0 && pool_after == pool_before);
     }
-    wfcDeactivate(dev, ctx);
+    /* The quiet phase after the cube's, as many posts as the cube's phase had. */
     wfcRemoveElement(dev, cube);
+    wfcCommit(dev, ctx, WFC_TRUE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    CHECK(paced_phase("quiet", cube_posts, -1, NULL) == 0);
+    wfcDeactivate(dev, ctx);
     wfcRemoveElement(dev, plain);
     wfcDestroyElement(dev, cube);
     wfcDestroyElement(dev, plain);

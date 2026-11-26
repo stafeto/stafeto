@@ -666,7 +666,7 @@ pub fn load(machine: &qemu::Machine) -> Result<(), String> {
         // The host's clock and the host's processor: the numbers are the report, and the
         // verdict of the late frames is the run under -icount's.
         println!(
-            "gles-probe on {}: the load and the stamps of the cube under HVF (the frames over two periods are judged)",
+            "gles-probe on {}: the load and the stamps of the cube under HVF (the release of the buffers against their due times is judged)",
             machine.name
         );
         return load_verdict_hvf(&output.lines);
@@ -759,6 +759,8 @@ pub struct Phase {
     pub take_mean_us: u64,
     pub wake_max_us: u64,
     pub unfreed: u64,
+    /// The most the release of a buffer came after the time its post was due.
+    pub lag_max_us: u64,
 }
 
 fn phase_of(lines: &[String], name: &str) -> Result<Phase, String> {
@@ -786,6 +788,7 @@ fn phase_of(lines: &[String], name: &str) -> Result<Phase, String> {
         take_mean_us: get("mean", 1)?,
         wake_max_us: get("wake", 2)?,
         unfreed: get("unfreed", 1)?,
+        lag_max_us: get("lag", 2)?,
     })
 }
 
@@ -793,8 +796,8 @@ fn phase_of(lines: &[String], name: &str) -> Result<Phase, String> {
 const IFWAIT_MAX_US: u64 = 2 * 16_667;
 /// The limit of the platform's wait of the swap interval (`WAIT_NS`), microseconds.
 const WAIT_LIMIT_US: u64 = 1_000_000;
-/// How much longer than the quiet phase's the wake-up of the paced client may be with the cube.
-const WAKE_SLACK_US: u64 = 2000;
+/// How much longer than the quiet phase's and the longest frame the wake-up of the paced client may be.
+const WAKE_SLACK_US: u64 = 500;
 
 /// The swaps of the cube beside the window: how many interval waits ran out (`timeout N` of
 /// the line of the platform) and the longest interval wait, microseconds.
@@ -814,11 +817,45 @@ fn swap_waits(lines: &[String]) -> (u64, u64) {
     (timeouts, longest)
 }
 
+/// The longest frame of the compositor in the lines before `LOAD_END` (`service frame: T n N
+/// bands B us U`), microseconds.
+fn longest_frame_us(lines: &[String]) -> u64 {
+    let end = lines
+        .iter()
+        .position(|l| l == LOAD_END)
+        .unwrap_or(lines.len());
+    lines[..end]
+        .iter()
+        .filter_map(|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            let at = words.iter().position(|w| *w == "us")?;
+            if words.first() != Some(&"service") || words.get(1) != Some(&"frame:") {
+                return None;
+            }
+            words.get(at + 1)?.parse::<u64>().ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The release of a buffer with the cube drawing, against the time its post was due.
+fn lag_verdict(cube: &Phase) -> Result<(), String> {
+    if cube.lag_max_us > IFWAIT_MAX_US {
+        return Err(format!(
+            "load: a buffer of the client with no GLES was released {} us after its post was due with the cube, {IFWAIT_MAX_US} at most",
+            cube.lag_max_us
+        ));
+    }
+    Ok(())
+}
+
 /// The load beside a window of a client with no GLES, the cube at level 28 below every
-/// interactive level (-icount, the verdict): the paced client has no late frame with the cube
-/// when it has none alone (else the late frames per post do not rise), no frame is over two
-/// periods, its wake-up is at most 2000 us longer than alone, no wait of the swap interval ran
-/// out and none lasted over two periods, and the client posted in both phases.
+/// interactive level (-icount, the verdict). The release of each buffer comes at most two
+/// periods after its post was due (it does not depend on the phase of the compositor's frame),
+/// the wake-up of the client is at most the longest frame of the compositor and 500 us above
+/// the quiet phase's (the compositor prepares the image of a posted window at its own level),
+/// no wait of the swap interval ran out and none lasted over two periods, and the client
+/// posted in both phases, the quiet one as long as the cube's.
 pub fn load_verdict(lines: &[String]) -> Result<(), String> {
     let quiet = phase_of(lines, "quiet")?;
     let cube = phase_of(lines, "cube")?;
@@ -828,29 +865,11 @@ pub fn load_verdict(lines: &[String]) -> Result<(), String> {
             quiet.posts, cube.posts
         ));
     }
-    if quiet.late == 0 && cube.late != 0 {
+    lag_verdict(&cube)?;
+    let frame = longest_frame_us(lines);
+    if cube.wake_max_us > quiet.wake_max_us + frame + WAKE_SLACK_US {
         return Err(format!(
-            "load: {} late frames of a window with no GLES with the cube, none alone",
-            cube.late
-        ));
-    }
-    if u128::from(cube.late) * u128::from(quiet.posts)
-        > u128::from(quiet.late) * u128::from(cube.posts)
-    {
-        return Err(format!(
-            "load: late frames of a window with no GLES rose with the cube: {} of {} against {} of {} alone",
-            cube.late, cube.posts, quiet.late, quiet.posts
-        ));
-    }
-    if cube.late2 != 0 {
-        return Err(format!(
-            "load: {} frames over two periods with the cube",
-            cube.late2
-        ));
-    }
-    if cube.wake_max_us > quiet.wake_max_us + WAKE_SLACK_US {
-        return Err(format!(
-            "load: the wake-up of the client reached {} us with the cube, {} us alone (slack {WAKE_SLACK_US})",
+            "load: the wake-up of the client reached {} us with the cube, {} us alone and the longest frame of the compositor {frame} us (slack {WAKE_SLACK_US})",
             cube.wake_max_us, quiet.wake_max_us
         ));
     }
@@ -868,18 +887,10 @@ pub fn load_verdict(lines: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// The verdict under HVF, on the host's clock: only the frames over two periods are judged
-/// (none more than alone); the rest is the report.
+/// The verdict under HVF, on the host's clock: the release of the buffers against the time
+/// their posts were due, which does not depend on the phase of the frame; the rest is the report.
 pub fn load_verdict_hvf(lines: &[String]) -> Result<(), String> {
-    let quiet = phase_of(lines, "quiet")?;
-    let cube = phase_of(lines, "cube")?;
-    if cube.late2 > quiet.late2 {
-        return Err(format!(
-            "load: {} frames over two periods with the cube, {} alone",
-            cube.late2, quiet.late2
-        ));
-    }
-    Ok(())
+    lag_verdict(&phase_of(lines, "cube")?)
 }
 
 /// The numbers of a run of stamps, in microseconds: the count, the most and the mean.
@@ -958,8 +969,15 @@ pub fn load_report(lines: &[String]) -> Result<String, String> {
     for name in ["quiet", "cube"] {
         let p = phase_of(lines, name)?;
         out += &format!(
-            "gles-probe: the client with no GLES, {name}: {} posts, late {}, over two periods {}, post to free bit max {} us mean {} us, wake-up late max {} us, buffers not freed {}\n",
-            p.posts, p.late, p.late2, p.take_max_us, p.take_mean_us, p.wake_max_us, p.unfreed
+            "gles-probe: the client with no GLES, {name}: {} posts, late {}, over two periods {}, post to free bit max {} us mean {} us, wake-up late max {} us, buffers not freed {}, release after due max {} us\n",
+            p.posts,
+            p.late,
+            p.late2,
+            p.take_max_us,
+            p.take_mean_us,
+            p.wake_max_us,
+            p.unfreed,
+            p.lag_max_us
         );
     }
     Ok(out.trim_end().to_owned())
@@ -1258,7 +1276,7 @@ mod tests {
         assert!(process_service_verdict(&high).is_err());
     }
 
-    fn load_lines(quiet_late: u64, cube_late: u64) -> Vec<String> {
+    fn load_lines(cube_lag_us: u64, cube_wake_us: u64) -> Vec<String> {
         let mut lines = Vec::new();
         for k in 0..6 {
             lines.push(format!(
@@ -1271,20 +1289,23 @@ mod tests {
             ));
             lines.push(format!("gles-cube: stamp swap {k} (interval 1) 9500 us"));
         }
+        lines.push("service frame: 17 n 24 bands 4 us 3000".to_owned());
         lines.push(format!(
-            "wfc-demo: load quiet posts 120 late {quiet_late} late2 0 take max 17000 us mean 8000 us wake max 120 us unfreed 0"
+            "wfc-demo: load cube posts 600 late 4 late2 0 take max 18000 us mean 8100 us wake max {cube_wake_us} us unfreed 0 lag max {cube_lag_us} us"
         ));
-        lines.push(format!(
-            "wfc-demo: load cube posts 600 late {cube_late} late2 0 take max 18000 us mean 8100 us wake max 300 us unfreed 0"
-        ));
+        lines.push(
+            "wfc-demo: load quiet posts 600 late 0 late2 0 take max 17000 us mean 8000 us wake max 120 us unfreed 0 lag max 9000 us"
+                .to_owned(),
+        );
         lines.push(LOAD_END.to_owned());
         lines
     }
 
     #[test]
-    fn the_load_with_no_more_late_frames_passes_and_is_reported() {
-        let lines = load_lines(2, 10);
+    fn the_load_with_the_releases_in_time_passes_and_is_reported() {
+        let lines = load_lines(20_000, 3_000);
         load_verdict(&lines).unwrap();
+        load_verdict_hvf(&lines).unwrap();
         let report = load_report(&lines).unwrap();
         assert!(
             report.contains("copy into the window (putImage): 6 max 200 mean 200"),
@@ -1294,44 +1315,42 @@ mod tests {
             report.contains("frame 3: draw 650003 us, swap 9500 us, egl-stamp: swap wait 3"),
             "{report}"
         );
-    }
-
-    #[test]
-    fn late_frames_that_rise_with_the_cube_fail() {
         assert!(
-            load_verdict(&load_lines(2, 11))
-                .unwrap_err()
-                .contains("rose")
+            report.contains("release after due max 20000 us"),
+            "{report}"
         );
-        assert!(load_verdict(&load_lines(0, 1)).is_err());
     }
 
     #[test]
-    fn a_slow_wake_up_a_timeout_or_a_long_interval_wait_fail() {
-        let mut lines = load_lines(0, 0);
-        let at = lines.iter().position(|l| l.contains("load cube")).unwrap();
-        lines[at] = lines[at].replace("wake max 300", "wake max 2200");
-        assert!(load_verdict(&lines).unwrap_err().contains("wake-up"));
-        let mut lines = load_lines(0, 0);
+    fn a_late_release_a_slow_wake_up_a_timeout_or_a_long_interval_wait_fail() {
+        let lines = load_lines(40_000, 3_000);
+        assert!(load_verdict(&lines).unwrap_err().contains("after its post"));
+        assert!(load_verdict_hvf(&lines).is_err());
+        // The wake-up may exceed the quiet phase's by the longest frame and 500 us.
+        assert!(load_verdict(&load_lines(0, 120 + 3000 + 500)).is_ok());
+        assert!(
+            load_verdict(&load_lines(0, 120 + 3000 + 501))
+                .unwrap_err()
+                .contains("wake-up")
+        );
+        let mut lines = load_lines(0, 300);
         lines[1] = lines[1].replace("timeout 0", "timeout 1");
         assert!(load_verdict(&lines).unwrap_err().contains("ran out"));
-        let mut lines = load_lines(0, 0);
+        let mut lines = load_lines(0, 300);
         lines[1] = lines[1].replace("ifwait 9000", "ifwait 40000");
         assert!(load_verdict(&lines).unwrap_err().contains("lasted"));
-        let mut lines = load_lines(0, 0);
-        let at = lines.iter().position(|l| l.contains("load cube")).unwrap();
-        lines[at] = lines[at].replace("late2 0", "late2 1");
+        // A platform that does not count says nothing: a wait of the whole limit is a timeout.
+        let mut lines = load_lines(0, 300);
+        lines[1] = lines[1].replace("ifwait 9000 us timeout 0", "ifwait 1000942 us");
         assert!(load_verdict(&lines).is_err());
-        assert!(load_verdict_hvf(&lines).is_err());
-        assert!(load_verdict_hvf(&load_lines(0, 0)).is_ok());
     }
 
     #[test]
     fn a_load_that_did_not_post_or_is_missing_fails() {
         assert!(load_verdict(&[]).is_err());
-        let mut lines = load_lines(0, 0);
+        let mut lines = load_lines(0, 300);
         let at = lines.iter().position(|l| l.contains("load quiet")).unwrap();
-        lines[at] = lines[at].replace("posts 120", "posts 5");
+        lines[at] = lines[at].replace("posts 600", "posts 5");
         assert!(load_verdict(&lines).unwrap_err().contains("60 at least"));
     }
 }
