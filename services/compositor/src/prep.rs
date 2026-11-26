@@ -71,6 +71,18 @@ pub struct Key {
     pub argb: bool,
 }
 
+impl Key {
+    /// A cheap summary of the key: two keys with different summaries differ.
+    pub fn summary(&self) -> u32 {
+        let mut h = self.source.wrapping_mul(0x9E37_79B1);
+        for n in self.src.iter().chain(self.size.iter()) {
+            h = (h.rotate_left(5) ^ (*n as u32)).wrapping_mul(0x9E37_79B1);
+        }
+        (h.rotate_left(5) ^ self.orient ^ self.filter << 8 ^ u32::from(self.argb) << 16)
+            .wrapping_mul(0x9E37_79B1)
+    }
+}
+
 /// Whether an element is made as an image of its own: it is not a plain copy of
 /// the window's points.
 pub fn needs(e: &Element) -> bool {
@@ -126,6 +138,8 @@ pub struct Geometry {
     pub w: u32,
     pub h: u32,
     pub page: u16,
+    /// `Key::summary` of the key.
+    pub sum: u32,
     /// The pages of one image.
     pub pages: u16,
     pub place: u8,
@@ -297,6 +311,7 @@ impl Slot {
                 w: 0,
                 h: 0,
                 page: 0,
+                sum: 0,
                 pages: 0,
                 place: 0,
             }),
@@ -349,6 +364,10 @@ pub struct Table {
     waiting: AtomicBool,
     /// The slots let go that the worker still held.
     zombies: AtomicU32,
+    /// The slots in use and the zombies, a bit each, kept with the flags of the slots
+    /// so that a plan reads two words.
+    used_mask: AtomicU64,
+    zombie_mask: AtomicU64,
     /// The slots the worker could not draw in (the other image is a frame's).
     blocked: AtomicU64,
     /// The slots that have something drawn the service has not told.
@@ -393,6 +412,8 @@ impl Table {
             busy: AtomicU32::new(0),
             waiting: AtomicBool::new(false),
             zombies: AtomicU32::new(0),
+            used_mask: AtomicU64::new(0),
+            zombie_mask: AtomicU64::new(0),
             blocked: AtomicU64::new(0),
             published: AtomicU64::new(0),
             level: AtomicU8::new(1),
@@ -536,33 +557,33 @@ impl Table {
         level: u8,
     ) -> Result<Map, Refuse> {
         self.reap();
-        let mut kept = [false; SLOTS];
+        let bit = |s: u8| 1u64 << s;
+        let mut kept = 0u64;
         for m in keep {
             for &s in m.iter() {
                 if s != NO_SLOT {
-                    kept[s as usize] = true;
+                    kept |= bit(s);
                 }
             }
         }
+        let used = self.used_mask.load(SeqCst);
         // The slots this scene shares: of the slots the scenes still hold, the one
-        // with the element's key.
-        let mut held = [0u8; SLOTS];
-        let mut n = 0;
-        for s in 0..SLOTS {
-            if kept[s] && self.used(s) {
-                held[n] = s as u8;
-                n += 1;
-            }
-        }
+        // with the element's key (the summary first: two keys that differ in it differ).
+        let mut sums = [0u32; MAX_ELEMENTS];
         let mut map = NO_MAP;
+        let held = kept & used;
         for (k, want) in wants.iter().enumerate().take(MAX_ELEMENTS) {
             let Some((key, place)) = want else {
                 continue;
             };
-            for &s in &held[..n] {
-                let g = self.geometry_ref(usize::from(s));
-                if g.key == *key && usize::from(g.place) == *place {
-                    map[k] = s;
+            sums[k] = key.summary();
+            let mut rest = held;
+            while rest != 0 {
+                let s = rest.trailing_zeros() as usize;
+                rest &= rest - 1;
+                let g = self.geometry_ref(s);
+                if g.sum == sums[k] && g.key == *key && usize::from(g.place) == *place {
+                    map[k] = s as u8;
                     break;
                 }
             }
@@ -570,34 +591,36 @@ impl Table {
         let mut shared = kept;
         for &s in map.iter() {
             if s != NO_SLOT {
-                shared[s as usize] = true;
+                shared |= bit(s);
             }
         }
         // The plan's view of the table: what is free after the slots to go are let
         // go. A slot the worker holds keeps its pages until the worker lets go.
         let mut words = self.page_words();
-        let mut free = [false; SLOTS];
-        let mut zombies = 0;
-        for s in 0..SLOTS {
-            if self.used(s) && !shared[s] {
-                if self.holds(s) {
-                    zombies += 1;
-                } else {
-                    let g = self.geometry_ref(s);
-                    set_in(
-                        &mut words,
-                        usize::from(g.page),
-                        2 * usize::from(g.pages),
-                        false,
-                    );
-                    free[s] = true;
-                }
-            } else if !self.used(s) {
-                if self.slots[s].zombie.load(SeqCst) {
-                    zombies += 1;
-                } else {
-                    free[s] = true;
-                }
+        let zombie = self.zombie_mask.load(SeqCst);
+        let all = if SLOTS == 64 {
+            u64::MAX
+        } else {
+            (1u64 << SLOTS) - 1
+        };
+        let mut free = all & !used & !zombie;
+        let mut zombies = zombie.count_ones() as usize;
+        let busy = (self.busy.load(SeqCst) & 0xFF) as usize;
+        let mut dead = used & !shared;
+        while dead != 0 {
+            let s = dead.trailing_zeros() as usize;
+            dead &= dead - 1;
+            if busy == s + 1 {
+                zombies += 1;
+            } else {
+                let g = self.geometry_ref(s);
+                set_in(
+                    &mut words,
+                    usize::from(g.page),
+                    2 * usize::from(g.pages),
+                    false,
+                );
+                free |= 1 << s;
             }
         }
         let short = |zombies: usize| {
@@ -607,7 +630,7 @@ impl Table {
                 Refuse::Full
             }
         };
-        // Where each new slot goes: (element, slot, first page).
+        // Where each new slot goes: (slot, first page); a twin shares its first's.
         let mut placed: [Option<(usize, usize)>; MAX_ELEMENTS] = [None; MAX_ELEMENTS];
         for (k, want) in wants.iter().enumerate().take(MAX_ELEMENTS) {
             let Some((key, place)) = want else {
@@ -619,7 +642,8 @@ impl Table {
             // An element of the scene whose twin (the same key) is planned shares
             // the twin's slot.
             let twin = (0..k).find(|&j| {
-                matches!(wants[j], Some((other, p)) if other == *key && p == *place)
+                sums[j] == sums[k]
+                    && matches!(wants[j], Some((other, p)) if other == *key && p == *place)
                     && (map[j] != NO_SLOT || placed[j].is_some())
             });
             if let Some(j) = twin {
@@ -631,20 +655,22 @@ impl Table {
             if 2 * pages > POOL_PAGES {
                 return Err(Refuse::Full);
             }
-            let slot = (0..SLOTS)
-                .find(|&s| free[s])
-                .ok_or_else(|| short(zombies))?;
+            if free == 0 {
+                return Err(short(zombies));
+            }
+            let slot = free.trailing_zeros() as usize;
             let first = find_in(&words, 2 * pages).ok_or_else(|| short(zombies))?;
-            free[slot] = false;
+            free &= !(1 << slot);
             set_in(&mut words, first, 2 * pages, true);
             map[k] = slot as u8;
             placed[k] = Some((slot, first));
         }
         // The apply phase: nothing refuses from here.
-        for s in 0..SLOTS {
-            if self.used(s) && !shared[s] {
-                self.release(s);
-            }
+        let mut dead = used & !shared;
+        while dead != 0 {
+            let s = dead.trailing_zeros() as usize;
+            dead &= dead - 1;
+            self.release(s);
         }
         for (k, want) in wants.iter().enumerate().take(MAX_ELEMENTS) {
             let (Some((key, place)), Some((slot, first))) = (want, placed[k]) else {
@@ -672,6 +698,7 @@ impl Table {
                 w,
                 h,
                 page: first as u16,
+                sum: key.summary(),
                 pages: pages as u16,
                 place: place as u8,
             };
@@ -683,6 +710,7 @@ impl Table {
         slot.drawn.store(EMPTY, SeqCst);
         slot.level.store(level.clamp(1, LEVEL_MAX), SeqCst);
         slot.used.store(true, SeqCst);
+        self.used_mask.fetch_or(1 << s, SeqCst);
         self.want.fetch_or(1 << s, SeqCst);
     }
 
@@ -691,11 +719,13 @@ impl Table {
     fn release(&self, s: usize) {
         let slot = &self.slots[s];
         slot.used.store(false, SeqCst);
+        self.used_mask.fetch_and(!(1 << s), SeqCst);
         self.want.fetch_and(!(1 << s), SeqCst);
         self.blocked.fetch_and(!(1 << s), SeqCst);
         self.published.fetch_and(!(1 << s), SeqCst);
         if self.holds(s) {
             slot.zombie.store(true, SeqCst);
+            self.zombie_mask.fetch_or(1 << s, SeqCst);
             self.zombies.fetch_add(1, SeqCst);
             self.waiting.store(true, SeqCst);
             // The worker may have let go between the look and the store.
@@ -711,6 +741,7 @@ impl Table {
         let g = self.geometry(s);
         self.pages_set(usize::from(g.page), 2 * usize::from(g.pages), false);
         if self.slots[s].zombie.swap(false, SeqCst) {
+            self.zombie_mask.fetch_and(!(1 << s), SeqCst);
             self.zombies.fetch_sub(1, SeqCst);
         }
     }
@@ -786,6 +817,18 @@ impl Table {
     /// The worker's claim moved since the last call.
     pub fn take_moved(&self) -> bool {
         self.moved.swap(false, SeqCst)
+    }
+
+    /// Whether the image of `slot` is made, or can never be made until its window
+    /// posts (the window is not told to the table, or has nothing to read): a scene
+    /// that shows the slot waits for the first and not for the second.
+    pub fn ready(&self, slot: usize) -> bool {
+        if self.slots[slot].state.load(Acquire) & READY != 0 {
+            return true;
+        }
+        let g = self.geometry_ref(slot);
+        let info = &self.windows[usize::from(g.place)];
+        info.id.load(SeqCst) != g.key.source || info.latest.load(SeqCst) == NO_BUFFER
     }
 
     /// The image of `slot` that shows now (its front), None before the first.

@@ -150,8 +150,9 @@
 //! makes them lets go of the slots it holds, which it does within one piece of its
 //! work at the commit's level (the service raises it to that level when it refuses with
 //! BUSY); the holder tries again after its next event or one period, never in a tight
-//! loop. An element shows its previous image until the new one is made, and nothing
-//! before its first.
+//! loop. A committed scene is taken when its images are made (the previous scene
+//! stays until then, and COMMITTED and COMPOSED come with the whole scene), except
+//! for a window that has posted nothing, whose element shows nothing until it posts.
 //!
 //! Input under a scene: the keys go to the window with the focus, which the
 //! scene gives by MANAGE FOCUS; the moves and buttons of the pointer go to

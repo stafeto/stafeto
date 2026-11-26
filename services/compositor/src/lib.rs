@@ -1597,6 +1597,25 @@ impl Scene {
         core::mem::take(&mut self.wake)
     }
 
+    /// Whether the pending scene has an image that is not made yet, of a window that
+    /// has something to read: the taking leaves the scene pending until it is, so that
+    /// a scene never shows with an element missing for the images' time (a window that
+    /// has posted nothing never has its image, and does not hold the scene).
+    fn pending_waits(&self) -> bool {
+        let (Some(t), Some(p)) = (self.prep, self.slot_pending) else {
+            return false;
+        };
+        self.maps[usize::from(p)]
+            .iter()
+            .any(|&s| s != prep::NO_SLOT && !t.ready(usize::from(s)))
+    }
+
+    /// The service has no worker (it could not be made): the elements that turn or
+    /// stretch are drawn by the bands through the transform, as without images.
+    pub fn clear_prep(&mut self) {
+        self.prep = None;
+    }
+
     /// The slots no scene holds are let go (a taking made another scene the
     /// working one, or the scene ended).
     fn sweep(&self) {
@@ -2199,6 +2218,11 @@ impl Scene {
             {
                 self.damage = Some(union(self.damage, h));
             }
+        }
+        // A pending scene is taken when its images are made: the frame waits (the
+        // damage and a request to compose stay) and the end of the images wakes it.
+        if self.pending_waits() {
+            return None;
         }
         let compose_now = core::mem::take(&mut self.stage.compose_due);
         let d = self.damage.take();
@@ -2927,8 +2951,23 @@ impl Scene {
         // With the pending scene's images kept, then, when they do not fit, with
         // them let go (the commit replaces that scene). A refused attempt changes
         // nothing.
+        // The pending scene's slots matter only when they are not the working
+        // scene's or the frame's: with none of those the second attempt is the first.
+        let pending_only = pending.is_some_and(|p| {
+            p.iter().any(|&s| {
+                s != prep::NO_SLOT
+                    && !working.is_some_and(|w| w.contains(&s))
+                    && !frame.contains(&s)
+            })
+        });
         let map = match t.reserve(&wants[..count], &both[..n], level) {
             Ok(map) => map,
+            Err(why) if !pending_only => {
+                return Err(match why {
+                    prep::Refuse::Full => Refusal::Limit,
+                    prep::Refuse::Wait => Refusal::Busy,
+                });
+            }
             Err(_) => {
                 let only = [working.as_ref().unwrap_or(&prep::NO_MAP), &frame];
                 t.reserve(&wants[..count], &only, level)
@@ -2993,7 +3032,7 @@ impl Scene {
     /// the first revision has its FLUSH answered). Whether the scene is held
     /// still: composed on request, with no request for this taking.
     fn take_scene(&mut self, compose_now: bool, damaged: bool) -> bool {
-        if self.pending_def().is_some_and(|p| p.active || compose_now) {
+        if self.pending_def().is_some_and(|p| p.active || compose_now) && !self.pending_waits() {
             self.slot_working = self.slot_pending.take();
             if core::mem::take(&mut self.stage.ask_committed) {
                 self.stage.committed_now = true;

@@ -1603,20 +1603,37 @@ fn a_prepared_element_with_an_alpha_or_a_mask_is_the_reference() {
 }
 
 #[test]
-fn an_element_whose_image_is_not_made_yet_shows_nothing() {
+fn a_scene_waits_to_be_taken_until_its_images_are_made() {
     let mut rig = Rig::prepared(&[(XRGB, 64, 40)]);
     let e = turned(rig.whole(0, [100, 50, 64, 40]), 1, 64, 40);
     rig.commit(&[e], BG).unwrap();
-    // The worker has not run: the frame is the background alone.
+    // The worker has not run: the scene is not taken, so no frame shows it with the
+    // element missing.
     let mut fb = vec![0xEE; (STRIDE * HEIGHT) as usize];
-    assert!(rig.render(&mut fb));
-    let blank = Rig::new(&[(XRGB, 64, 40)]);
-    assert!(blank.wrong(&fb, &[], BG).is_empty());
-    // The image is made and the screen is damaged where it shows: the next frame
-    // has the element.
+    rig.render(&mut fb);
+    assert!(rig.scene.working().is_none());
+    // The image is made and the screen is damaged: the next frame has the whole scene.
     rig.drain();
     assert!(rig.render(&mut fb));
+    assert!(rig.scene.working().is_some());
     assert!(rig.wrong(&fb, &[e], BG).is_empty());
+}
+
+#[test]
+fn a_scene_whose_window_has_posted_nothing_is_taken_without_waiting() {
+    // The window is not told to the table: its image cannot be made yet, so the scene
+    // does not wait for it (the element shows nothing until the window posts).
+    let table: &'static prep::Table = Box::leak(Box::new(prep::Table::new()));
+    let pool: &'static mut [u8] = Box::leak(vec![0u8; prep::POOL_BYTES].into_boxed_slice());
+    table.set_pool(pool.as_mut_ptr());
+    let mut rig = Rig::new(&[(XRGB, 64, 40)]);
+    rig.scene.set_prep(table);
+    rig.wins.1 = Some(table);
+    let e = turned(rig.whole(0, [100, 50, 64, 40]), 1, 64, 40);
+    rig.commit(&[e], BG).unwrap();
+    let mut fb = vec![0xEE; (STRIDE * HEIGHT) as usize];
+    assert!(rig.render(&mut fb));
+    assert!(rig.scene.working().is_some());
 }
 
 #[test]

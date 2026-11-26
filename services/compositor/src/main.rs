@@ -2348,6 +2348,15 @@ impl Compositor {
         if core::mem::replace(&mut self.worker_tried, true) {
             return false;
         }
+        if !self.make_worker() {
+            // Without a worker the elements are drawn by the bands, as before.
+            self.scene.clear_prep();
+            return false;
+        }
+        true
+    }
+
+    fn make_worker(&mut self) -> bool {
         let Ok(wait) = sys::channel_create_wait(1) else {
             rt::println!("compositor: no channel for the prepared images");
             return false;
@@ -2454,9 +2463,9 @@ impl Compositor {
                     usize::MAX,
                 );
             }
-            if self.scene.images_drawn(&[(slot, local)]) > 0 {
-                self.kick();
-            }
+            self.scene.images_drawn(&[(slot, local)]);
+            // A scene that waited for its images is taken now.
+            self.kick();
         }
         if TABLE.drawn_waits() {
             let _ = sys::notify(&self.notify, PREP);
