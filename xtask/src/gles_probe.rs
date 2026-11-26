@@ -84,16 +84,16 @@ pub const PROGRAMS: [ImageProgram; 13] = [
 /// steps, and the demo does not pause for the monitor.
 pub const STEPS_PROGRAMS: [ImageProgram; 13] = [
     ("init", "init", INIT_STACK_SIZE, &["table-gles-steps"]),
-    ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &["steps"]),
     (
         "posix-process-service",
         "posix-process-service",
         64 * 1024,
-        &[],
+        &["steps"],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
-    ("pipe", "pipe", crate::PIPE_STACK_SIZE, &[]),
-    ("loader", "loader", 0, &[]),
+    ("pipe", "pipe", crate::PIPE_STACK_SIZE, &["steps"]),
+    ("loader", "loader", 0, &["steps"]),
     (
         "virtio-gpu",
         "virtio-gpu",
@@ -113,13 +113,13 @@ pub const STEPS_PROGRAMS: [ImageProgram; 13] = [
         "virtio-rng",
         "virtio-rng",
         crate::entropy::RNG_STACK_SIZE,
-        &[],
+        &["steps"],
     ),
     (
         "entropy",
         "entropy",
         crate::entropy::ENTROPY_STACK_SIZE,
-        &[],
+        &["steps"],
     ),
 ];
 
@@ -523,6 +523,58 @@ pub fn steps_verdict(lines: &[String]) -> Result<(crate::wfc::Rows, crate::wfc::
     ))
 }
 
+/// The services the client of Mesa calls besides the compositor and the driver, by the
+/// tag init gives them in the image of the scene: the process service (`fork`, `exec`,
+/// the pool of the quotas), the RAM file service (the files of the programs, the
+/// sockets of the cube's child), the pipe service, the two services of the random
+/// numbers (Mesa and the libc seed from them).
+const CLIENT_SERVICES: [(&str, &str); 5] = [
+    ("1", "process service"),
+    ("2", "RAM file service"),
+    ("4", "pipe service"),
+    ("10", "random device driver"),
+    ("11", "entropy service"),
+];
+
+/// The longest step of each service the GLES client calls (`CLIENT_SERVICES`): every
+/// kind under the hard check against B, 0.9 of B and, for the own steps, the portion
+/// bound. Returns the text of the report: the service and its longest kind.
+pub fn client_services_verdict(lines: &[String]) -> Result<String, String> {
+    let mut said = Vec::new();
+    for (tag, name) in CLIENT_SERVICES {
+        let rows = crate::wfc::rows_of(lines, tag, name, &[])?;
+        let Some((kind, ticks, _)) = rows.iter().max_by_key(|r| r.1) else {
+            return Err(format!("the {name}: no step line (tag {tag})"));
+        };
+        said.push(format!("{name} kind {kind} {ticks}"));
+    }
+    Ok(said.join(", "))
+}
+
+/// The copies of the loader (feature `steps`), each kernel call of a copy with its
+/// ticks: printed, and the whole copy beside them. The kernel's B bounds the portions
+/// of a call, so no limit is put on them here (the process-steps probe's rule).
+fn loader_text(lines: &[String]) -> String {
+    let mut most = [0u64; 10];
+    for line in lines {
+        let Some(rest) = line.strip_prefix("loader step: kind ") else {
+            continue;
+        };
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        if let [kind, ticks, "ticks", ..] = words.as_slice()
+            && let (Ok(k), Ok(t)) = (kind.parse::<usize>(), ticks.parse::<u64>())
+            && k < most.len()
+        {
+            most[k] = most[k].max(t);
+        }
+    }
+    format!(
+        "loader: a kernel call of a copy {} ticks at most (kinds 1 to 7), the whole copy {}",
+        most[1..8].iter().max().copied().unwrap_or(0),
+        most[9]
+    )
+}
+
 /// The run under -icount: the demo does not pause for the monitor, and the steps
 /// of the compositor and the driver are read from their lines.
 pub fn steps(machine: &qemu::Machine) -> Result<(), String> {
@@ -548,6 +600,12 @@ pub fn steps(machine: &qemu::Machine) -> Result<(), String> {
             init::table::gles::STEPS_TABLE,
             "gles-probe"
         )?
+    );
+    let clients = client_services_verdict(&output.lines).map_err(|e| format!("gles-probe: {e}"))?;
+    println!(
+        "gles-probe: the services of the client, the longest step, ticks (0.9 of term B {}): {clients}; {}",
+        gpu_probe::STEP_MAX,
+        loader_text(&output.lines)
     );
     let text = |rows: &crate::wfc::Rows| -> String {
         rows.iter()
@@ -794,5 +852,41 @@ mod tests {
         }
         assert!(PROGRAMS[0].3.contains(&"table-gles"));
         assert!(STEPS_PROGRAMS[0].3.contains(&"table-gles-steps"));
+    }
+
+    fn service_lines(ticks: u64) -> Vec<String> {
+        let mut lines = Vec::new();
+        for (tag, _) in CLIENT_SERVICES {
+            lines.push(format!("service step: {tag} kind 3 1200 ticks"));
+        }
+        lines.push(format!("service step: 2 kind 10 {ticks} ticks"));
+        lines
+    }
+
+    #[test]
+    fn the_services_of_the_client_pass_under_the_gate_and_fail_over_it() {
+        let said = client_services_verdict(&service_lines(5000)).unwrap();
+        assert!(said.contains("RAM file service kind 10 5000"), "{said}");
+        let err = client_services_verdict(&service_lines(gpu_probe::STEP_MAX + 1)).unwrap_err();
+        assert!(err.contains("RAM file service"), "{err}");
+    }
+
+    #[test]
+    fn a_service_without_step_lines_is_refused() {
+        assert!(client_services_verdict(&[]).is_err());
+    }
+
+    #[test]
+    fn the_loader_text_names_the_calls_and_the_whole_copy() {
+        let lines = vec![
+            "loader step: kind 2 900 ticks detail 4096".to_owned(),
+            "loader step: kind 4 5000 ticks detail 4096".to_owned(),
+            "loader step: kind 9 70000 ticks detail 7".to_owned(),
+        ];
+        let text = loader_text(&lines);
+        assert!(
+            text.contains("5000 ticks at most") && text.ends_with("copy 70000"),
+            "{text}"
+        );
     }
 }
