@@ -222,7 +222,7 @@ pub const STEPS_CHECKS: [&str; 6] = [
 ];
 
 /// The checks of the read role.
-pub const READ_CHECKS: [&str; 29] = [
+pub const READ_CHECKS: [&str; 31] = [
     "read pub whole",
     "pread",
     "lseek",
@@ -249,6 +249,8 @@ pub const READ_CHECKS: [&str; 29] = [
     "real and effective access",
     "datax is the RAM service",
     "symlink onto data redirects",
+    "calls through a link follow",
+    "redirect under signals",
     "errno for bad paths",
     "statvfs",
     "realpath",

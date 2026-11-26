@@ -14,45 +14,10 @@ use proto_wire::{Reader, Status, Writer};
 
 mod change_release_reply;
 
-/// Where the path of a REDIRECT answer goes: a function of the layer above that keeps it for the
-/// calling thread. The failing call returns `Status::Unknown(REDIRECT)` and the layer follows the
-/// redirect with the kept path, once. 0 until a layer sets one; the answer then only fails.
-static REDIRECT_SINK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// Sets the function that takes the absolute path of a REDIRECT answer, called on the thread that
-/// made the request, before the failing call returns.
-pub fn set_redirect_sink(sink: fn(&[u8])) {
-    REDIRECT_SINK.store(sink as usize, core::sync::atomic::Ordering::Release);
-}
-
-/// Hands the path of a redirect to the layer's sink; a path that is not a path is a malformed reply.
-fn take_redirect(path: &[u8]) -> Status {
-    if path.is_empty() || path.len() > proto_fs::MAX_PATH || path[0] != b'/' {
-        return Status::BadSize;
-    }
-    let sink = REDIRECT_SINK.load(core::sync::atomic::Ordering::Acquire);
-    if sink != 0 {
-        // SAFETY: only `set_redirect_sink` stores a value, a `fn(&[u8])`.
-        let sink: fn(&[u8]) = unsafe { core::mem::transmute::<usize, fn(&[u8])>(sink) };
-        sink(path);
-    }
-    Status::Unknown(proto_fs::REDIRECT)
-}
-
-/// The failure a reply with a redirect makes, or None for any other reply.
-fn redirect_of(reply: &crate::sys::Reply) -> Option<Status> {
-    if reply.len <= proto_wire::HEADER_LEN
-        || reply.words[0] as u32 != proto_fs::REDIRECT
-        || !reply.handles.is_empty()
-    {
-        return None;
-    }
-    let mut buffer = [0; MESSAGE_MAX];
-    let bytes = reply.bytes(&mut buffer);
-    Some(match proto_fs::read_redirect(Reader::new(&bytes[4..])) {
-        Ok(path) => take_redirect(path),
-        Err(status) => status,
-    })
+/// The status of a reply whose first word says REDIRECT: the walk reached the name another service
+/// owns. The status alone says it, whatever the length of the reply (`proto_fs::Redirect`).
+fn is_redirect(reply: &crate::sys::Reply) -> bool {
+    reply.len >= 4 && reply.words[0] as u32 == proto_fs::REDIRECT && reply.handles.is_empty()
 }
 
 /// A console transport snapshot, without a borrow of the file owner.
@@ -314,6 +279,16 @@ fn resolve_start_job(len: usize, words: &[u64; 8], handles: usize) -> Result<u64
     Ok(job)
 }
 
+/// A redirect `Files::redirect_of` found: the fields of `proto_fs::Redirect`, and how many bytes
+/// of the caller's buffer hold its path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Redirected {
+    pub target: u32,
+    pub index: u32,
+    pub links: u32,
+    pub length: usize,
+}
+
 /// A retained service preparation; cancellation also releases the captured base.
 struct Proof<'a> {
     files: &'a Files,
@@ -327,8 +302,8 @@ impl Proof<'_> {
         let request = job_request(Method::ResolveStep, self.id);
         loop {
             let reply = self.send(&request)?;
-            if let Some(redirect) = redirect_of(&reply) {
-                return Err(redirect);
+            if is_redirect(&reply) {
+                return Err(Status::Unknown(proto_fs::REDIRECT));
             }
             match proof_ready_status(reply.len, reply.words[0], reply.handles.len())? {
                 Status::Ok => return Ok(()),
@@ -691,8 +666,8 @@ impl Files {
         .write(&mut w)?;
         w.u64(id)?;
         let reply = Self::send_on(&self.channel, w.as_bytes())?;
-        if !prepare && let Some(redirect) = redirect_of(&reply) {
-            return Err(redirect);
+        if !prepare && is_redirect(&reply) {
+            return Err(Status::Unknown(proto_fs::REDIRECT));
         }
         if Self::reply_code(&reply)? == proto_fs::RESOLVING {
             if reply.len != 8 || reply.words[0] >> 32 != 0 || !reply.handles.is_empty() {
@@ -1819,10 +1794,6 @@ impl Files {
         if !reply.done {
             return Ok(None);
         }
-        if reply.result == proto_fs::REDIRECT {
-            // The job is over; its result bytes are the path to continue with.
-            return Err(take_redirect(reply.bytes));
-        }
         out[..reply.bytes.len()].copy_from_slice(reply.bytes);
         Ok(Some(proto_fs::ChangeDone {
             result: reply.result,
@@ -1858,6 +1829,49 @@ impl Files {
         proto_fs::write_key_body(&mut request, key)?;
         let reply = sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)?;
         change_release_reply::read(&reply.words, reply.len, reply.handles.len())
+    }
+
+    /// Asks where a walk of `path` against `base` goes on, when it ends in a redirect: the redirect
+    /// (its path copied to `out`, its length in the answer), or None for a walk that ends in a node,
+    /// in a missing name or in any other refusal. The walk is the one that the failed call made
+    /// (`follow` as that call had it), asked again as a lookup that changes nothing.
+    pub fn redirect_of(
+        &self,
+        base: Option<(u32, u64)>,
+        path: &[u8],
+        follow: bool,
+        out: &mut [u8; proto_fs::MAX_PATH],
+    ) -> Result<Option<Redirected>, Status> {
+        let mut request = [0; 28 + proto_fs::MAX_PATH];
+        let len = resolve_start_request(&mut request, path, base, follow)?;
+        let reply = Self::send_on(&self.channel, &request[..len])?;
+        let proof = Proof {
+            files: self,
+            id: resolve_start_job(reply.len, &reply.words, reply.handles.len())?,
+        };
+        let step = job_request(Method::ResolveStep, proof.id);
+        loop {
+            let reply = proof.send(&step)?;
+            if is_redirect(&reply) {
+                let mut buffer = [0; MESSAGE_MAX];
+                let bytes = reply.bytes(&mut buffer);
+                let Some(found) = proto_fs::Redirect::read_reply(bytes) else {
+                    return Err(Status::BadSize);
+                };
+                let found = found?;
+                out[..found.path.len()].copy_from_slice(found.path);
+                return Ok(Some(Redirected {
+                    target: found.target,
+                    index: found.index,
+                    links: found.links,
+                    length: found.path.len(),
+                }));
+            }
+            match proof_ready_status(reply.len, reply.words[0], reply.handles.len())? {
+                Status::Unknown(proto_fs::RESOLVING) => {}
+                _ => return Ok(None),
+            }
+        }
     }
 
     /// A path against a base, for the requests that read: the node information

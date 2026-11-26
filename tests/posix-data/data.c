@@ -3037,6 +3037,148 @@ static int full_run(void) {
     return 0;
 }
 
+/* Every call that has one path follows a link onto /data, as a link of its own walk: the current
+ * directory becomes the path of the volume (cd -P), and the calls that make changes make them on the
+ * volume. rename and link between the two file systems stay EXDEV. A chain of links that go to
+ * /data and back is followed within the budget of 32 and fails with ELOOP past it. */
+static int calls_through_a_link_follow(void) {
+    struct stat st;
+    struct statvfs vfs, vfs_link;
+    char buf[PATH_MAX];
+    DATA_CHECK(mkdir("/lnk2", 0755) == 0);
+    DATA_CHECK(symlink("/data", "/lnk2/abs") == 0);
+    DATA_CHECK(symlink("/data/dir", "/lnk2/sub") == 0);
+    /* Reads of names. */
+    DATA_CHECK(realpath("/lnk2/abs/pub", buf) == buf && strcmp(buf, "/data/pub") == 0);
+    errno = 0;
+    DATA_CHECK(readlink("/lnk2/abs/pub", buf, sizeof buf) == -1 && errno == EINVAL);
+    DATA_CHECK(statvfs("/data", &vfs) == 0 && statvfs("/lnk2/abs", &vfs_link) == 0);
+    DATA_CHECK(vfs.f_bsize == vfs_link.f_bsize && vfs.f_namemax == vfs_link.f_namemax);
+    DIR *d = opendir("/lnk2/sub");
+    DATA_CHECK(d != NULL);
+    int names = 0;
+    for (struct dirent *e; (e = readdir(d)) != NULL;)
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) names++;
+    DATA_CHECK(closedir(d) == 0 && names == 3);
+    /* The current directory is the path of the volume. */
+    DATA_CHECK(chdir("/lnk2/sub") == 0 && getcwd(buf, sizeof buf) == buf);
+    DATA_CHECK(strcmp(buf, "/data/dir") == 0);
+    DATA_CHECK(stat("a", &st) == 0 && st.st_size == 10 && st.st_dev == data_device);
+    DATA_CHECK(chdir("/") == 0);
+    /* Changes land on the volume. */
+    DATA_CHECK(mkdir("/lnk2/abs/made", 0755) == 0);
+    DATA_CHECK(stat("/data/made", &st) == 0 && S_ISDIR(st.st_mode));
+    int fd = open("/lnk2/abs/made/f", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && write(fd, "abc", 3) == 3 && close(fd) == 0);
+    DATA_CHECK(stat("/data/made/f", &st) == 0 && st.st_size == 3);
+    DATA_CHECK(chmod("/lnk2/abs/made/f", 0600) == 0);
+    DATA_CHECK(stat("/data/made/f", &st) == 0 && (st.st_mode & 07777) == 0600);
+    DATA_CHECK(truncate("/lnk2/abs/made/f", 1) == 0);
+    DATA_CHECK(stat("/data/made/f", &st) == 0 && st.st_size == 1);
+    struct timespec times[2] = {{1700000100, 0}, {1700000200, 0}};
+    DATA_CHECK(utimensat(AT_FDCWD, "/lnk2/abs/made/f", times, 0) == 0);
+    DATA_CHECK(stat("/data/made/f", &st) == 0 && st.st_mtime == 1700000200);
+    DATA_CHECK(chown("/lnk2/abs/made/f", 0, 0) == 0);
+    errno = 0;
+    DATA_CHECK(symlink("x", "/lnk2/abs/made/s") == -1 && errno == EPERM);
+    errno = 0;
+    DATA_CHECK(mkfifo("/lnk2/abs/made/p", 0644) == -1 && errno == EPERM);
+    /* Two file systems: rename and link are EXDEV through a link (both paths cannot follow yet). */
+    errno = 0;
+    DATA_CHECK(rename("/lnk2/abs/made/f", "/lnk2/abs/made/g") == -1 && errno == EXDEV);
+    DATA_CHECK(unlink("/lnk2/abs/made/f") == 0);
+    DATA_CHECK(rmdir("/lnk2/abs/made") == 0);
+    errno = 0;
+    DATA_CHECK(stat("/data/made", &st) == -1 && errno == ENOENT);
+    /* A chain that goes to /data and back: /lnk2/c0 -> /data/../lnk2/c1 -> ... -> /data/pub. */
+    char from[64], to[96];
+    for (int i = 0; i < 5; i++) {
+        snprintf(from, sizeof from, "/lnk2/c%d", i);
+        if (i == 4) snprintf(to, sizeof to, "/data/pub");
+        else snprintf(to, sizeof to, "/data/../lnk2/c%d", i + 1);
+        DATA_CHECK(symlink(to, from) == 0);
+    }
+    fd = open("/lnk2/c0", O_RDONLY);
+    unsigned char head[16];
+    DATA_CHECK(fd >= 0 && read_up_to(fd, head, 16) == 16 && pattern_is(head, 0, 16, 1));
+    DATA_CHECK(close(fd) == 0);
+    for (int i = 0; i < 5; i++) {
+        snprintf(from, sizeof from, "/lnk2/c%d", i);
+        DATA_CHECK(unlink(from) == 0);
+    }
+    /* Twenty links that go back and forth: two of the budget each, 40 in all. */
+    for (int i = 0; i < 20; i++) {
+        snprintf(from, sizeof from, "/lnk2/d%d", i);
+        if (i == 19) snprintf(to, sizeof to, "/data/pub");
+        else snprintf(to, sizeof to, "/data/../lnk2/d%d", i + 1);
+        DATA_CHECK(symlink(to, from) == 0);
+    }
+    errno = 0;
+    DATA_CHECK(open("/lnk2/d0", O_RDONLY) == -1 && errno == ELOOP);
+    errno = 0;
+    DATA_CHECK(stat("/lnk2/d0", &st) == -1 && errno == ELOOP);
+    /* Within the budget from the middle of the chain. */
+    DATA_CHECK(stat("/lnk2/d10", &st) == 0 && st.st_size == 5000);
+    for (int i = 0; i < 20; i++) {
+        snprintf(from, sizeof from, "/lnk2/d%d", i);
+        DATA_CHECK(unlink(from) == 0);
+    }
+    DATA_CHECK(unlink("/lnk2/abs") == 0 && unlink("/lnk2/sub") == 0 && rmdir("/lnk2") == 0);
+    return 0;
+}
+
+/* A signal handler that makes calls through a link while the open of the interrupted thread is in
+ * flight: every redirect travels in the value of its own call, so neither disturbs the other. */
+static volatile int redirect_stop, redirect_handled, redirect_bad;
+static void on_redirect_signal(int sig) {
+    (void)sig;
+    struct stat st;
+    int saved = errno;
+    if (stat("/lnk3/abs/pub", &st) != 0 || st.st_size != 5000 || st.st_dev != data_device)
+        redirect_bad++;
+    char buf[PATH_MAX];
+    if (realpath("/lnk3/abs/dir", buf) != buf || strcmp(buf, "/data/dir") != 0) redirect_bad++;
+    redirect_handled++;
+    errno = saved;
+}
+static void *redirect_kicker(void *arg) {
+    pthread_t target = *(pthread_t *)arg;
+    while (!redirect_stop) {
+        pause_ms(15);
+        if (!redirect_stop) pthread_kill(target, SIGUSR1);
+    }
+    return NULL;
+}
+static int redirect_under_signals(void) {
+    unsigned char head[32];
+    DATA_CHECK(mkdir("/lnk3", 0755) == 0 && symlink("/data", "/lnk3/abs") == 0);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_redirect_signal;
+    sigemptyset(&sa.sa_mask);
+    DATA_CHECK(sigaction(SIGUSR1, &sa, NULL) == 0);
+    pthread_t me = pthread_self(), kicker_thread;
+    redirect_stop = redirect_handled = redirect_bad = 0;
+    DATA_CHECK(pthread_create(&kicker_thread, NULL, redirect_kicker, &me) == 0);
+    int failures_here = 0;
+    int opens = 0;
+    for (; opens < 2000 && redirect_handled < 10; opens++) {
+        int fd = open("/lnk3/abs/pub", O_RDONLY);
+        if (fd < 0 || read_up_to(fd, head, sizeof head) != (long)sizeof head ||
+            !pattern_is(head, 0, sizeof head, 1))
+            failures_here++;
+        if (fd >= 0) close(fd);
+    }
+    redirect_stop = 1;
+    DATA_CHECK(pthread_join(kicker_thread, NULL) == 0);
+    sa.sa_handler = SIG_DFL;
+    DATA_CHECK(sigaction(SIGUSR1, &sa, NULL) == 0);
+    printf("posix-data: the handler ran %d times during %d opens\n", redirect_handled, opens);
+    DATA_CHECK(failures_here == 0 && redirect_bad == 0 && redirect_handled > 0);
+    DATA_CHECK(unlink("/lnk3/abs") == 0 && rmdir("/lnk3") == 0);
+    return 0;
+}
+
 static int first(void) {
     if (getuid() != 0) {
         printf("posix-data: the probe is not user 0\n");
@@ -3068,6 +3210,8 @@ static int first(void) {
     run_check("real and effective access", real_and_effective_access);
     run_check("datax is the RAM service", datax_is_the_ram_service);
     run_check("symlink onto data redirects", symlink_onto_data_redirects);
+    run_check("calls through a link follow", calls_through_a_link_follow);
+    run_check("redirect under signals", redirect_under_signals);
     run_check("errno for bad paths", errno_for_bad_paths);
     run_check("statvfs", statvfs_of_the_volume);
     run_check("realpath", realpath_of_the_volume);

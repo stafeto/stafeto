@@ -1445,3 +1445,36 @@ fn a_name_a_user_makes_in_the_bucket_between_the_steps_of_a_search_is_found_afte
     assert_eq!(path(&ram, "/d").ok(), mine);
     drop(one);
 }
+
+#[test]
+fn a_root_entry_named_as_the_mount_is_a_conflict_only_when_the_mount_is_set() {
+    let spec = || Spec::new().dir("/data").file("/data/x", 0o644, b"x");
+    let mut ram = ram();
+    assert!(matches!(
+        attach(&mut ram, 1, spec().build()),
+        LayerReply::Done { .. }
+    ));
+    assert!(matches!(detach(&mut ram, 1), LayerReply::Done { .. }));
+    settle(&mut ram);
+    assert!(ram.storage.state.set_mount(proto_fs::DATA_MOUNT));
+    for what in [
+        Spec::new().dir("/data"),
+        spec(),
+        Spec::new().file("/data", 0o644, b"x"),
+    ] {
+        assert_eq!(
+            attach(&mut ram, 1, what.build()),
+            LayerReply::Entry {
+                status: CONFLICT,
+                entry: 0
+            }
+        );
+        assert!(settle(&mut ram)[0].failed);
+    }
+    // A name that only starts with the mount, or has it deeper, is a name of the tree.
+    let fine = Spec::new().dir("/data2").dir("/layer").dir("/layer/data");
+    assert!(matches!(
+        attach(&mut ram, 1, fine.build()),
+        LayerReply::Done { .. }
+    ));
+}

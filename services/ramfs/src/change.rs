@@ -361,12 +361,6 @@ impl ChangeJob {
             Ok(()) => Ok(()),
             Err(Stop::Fail(code)) => {
                 self.fail(ram, charge, second, code);
-                if code == proto_fs::REDIRECT
-                    && let Some(path) = self.first.redirect_path()
-                {
-                    // The path to continue with is the whole answer.
-                    self.length = path.len() as u16;
-                }
                 Ok(())
             }
             Err(Stop::Stale) => {
@@ -817,7 +811,7 @@ impl ChangeJob {
 
     fn reply(&self) -> ChangeReply<'_> {
         let done = self.stage == Stage::Done;
-        let bytes = if done && (self.result == 0 || self.result == proto_fs::REDIRECT) {
+        let bytes = if done && self.result == 0 {
             &self.first.buffer_ref()[..self.length as usize]
         } else {
             &[]

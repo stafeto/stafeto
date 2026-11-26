@@ -21,10 +21,6 @@ use crate::namespace::{Edge, Location, NamespacePath, NamespaceProof, RawSyntax}
 use crate::storage::{CHAIN_PORTION, NONE, Pin, ROOT, SYMLINK, Storage, Token};
 use proto_fs::{LOOP, MAX_PATH, NAME_TOO_LONG, NO_ENTRY, NOT_DIRECTORY, REDIRECT, STALE_PROOF};
 
-/// The name below the root that another service owns (the data volume): a walk that reaches it
-/// ends in a redirect to the same path in that service. The tree needs no directory of that name.
-pub const MOUNT: &[u8] = b"data";
-
 pub struct Resolve {
     original: [u8; MAX_PATH],
     path: [u8; MAX_PATH],
@@ -306,9 +302,11 @@ impl Resolve {
     pub fn invalidate(&mut self) {
         self.epoch = 0;
     }
-    /// The absolute path a walk that ended in REDIRECT continues with.
-    pub fn redirect_path(&self) -> Option<&[u8]> {
-        self.redirected.then(|| &self.path[..self.length])
+    /// The absolute path a walk that ended in REDIRECT continues with, and the links it had
+    /// expanded.
+    pub fn redirect(&self) -> Option<(&[u8], u32)> {
+        self.redirected
+            .then(|| (&self.path[..self.length], u32::from(self.links)))
     }
     pub fn step(&mut self, storage: &mut Storage<'_>, identity: Identity) -> Result<Progress, u32> {
         if self.redirected {
@@ -430,8 +428,8 @@ impl Resolve {
                 self.at = self.end;
                 return Ok(Progress::More);
             }
-            if self.current == ROOT && name == MOUNT {
-                return self.redirect_to_mount();
+            if self.current == ROOT && storage.state.mount() == Some(name) {
+                return self.redirect_to_mount(storage.state.mount().map_or(0, <[u8]>::len));
             }
             self.access_gen = directory.access_gen;
             self.name_gen = directory.name_gen;
@@ -501,16 +499,17 @@ impl Resolve {
     /// The walk stands before the name of the mount point below the root, whether the tree has such
     /// a directory or not: the rest of the walk belongs to the service of the volume. The path
     /// becomes the absolute one, the mount point and what follows it.
-    fn redirect_to_mount(&mut self) -> Result<Progress, u32> {
+    fn redirect_to_mount(&mut self, name: usize) -> Result<Progress, u32> {
+        // The name is the component the walk stands at: path[at..end].
         let rest = self.length - self.end;
-        let length = 1 + MOUNT.len() + rest;
+        let length = 1 + name + rest;
         if length > MAX_PATH {
             return Err(NAME_TOO_LONG);
         }
         let mut path = [0; MAX_PATH];
         path[0] = b'/';
-        path[1..=MOUNT.len()].copy_from_slice(MOUNT);
-        path[1 + MOUNT.len()..length].copy_from_slice(&self.path[self.end..self.length]);
+        path[1..=name].copy_from_slice(&self.path[self.at..self.end]);
+        path[1 + name..length].copy_from_slice(&self.path[self.end..self.length]);
         self.path = path;
         self.length = length;
         self.redirected = true;

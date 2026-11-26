@@ -25,6 +25,24 @@ impl Mode {
     }
 }
 
+/// The own arguments of the service: the time mode, and `mount=NAME` when init's table has the
+/// service of the volume that owns that name below the root. The words are apart by one space, in
+/// either order; no mount means no redirects.
+pub fn parse_args(args: &[u8]) -> Result<(Mode, Option<&[u8]>), Status> {
+    let mut mode = None;
+    let mut mount = None;
+    for word in args.split(|&byte| byte == b' ') {
+        if let Some(name) = word.strip_prefix(b"mount=") {
+            if mount.replace(name).is_some() || name.is_empty() {
+                return Err(Status::BadSize);
+            }
+        } else if mode.replace(Mode::parse(word)?).is_some() {
+            return Err(Status::BadSize);
+        }
+    }
+    Ok((mode.ok_or(Status::BadSize)?, mount))
+}
+
 /// An unstable snapshot defers the step. Overflow refuses its effect.
 pub fn read_timestamp_once(
     load: impl FnMut(usize, Ordering) -> u64,
@@ -196,6 +214,31 @@ mod tests {
         assert_eq!(Mode::parse(proto_fs::RAM_TIME_CLOCKED), Ok(Mode::Clocked));
         for args in [&b""[..], &b"time-clocked\0"[..], &b"time"[..]] {
             assert_eq!(Mode::parse(args), Err(Status::BadSize));
+        }
+    }
+
+    #[test]
+    fn the_mount_is_an_optional_second_word() {
+        let clocked = proto_fs::RAM_TIME_CLOCKED;
+        assert_eq!(parse_args(clocked), Ok((Mode::Clocked, None)));
+        assert_eq!(
+            parse_args(b"time-clocked mount=data"),
+            Ok((Mode::Clocked, Some(&b"data"[..])))
+        );
+        assert_eq!(
+            parse_args(b"mount=data time-legacy"),
+            Ok((Mode::Legacy, Some(&b"data"[..])))
+        );
+        for bad in [
+            &b""[..],
+            b"mount=data",
+            b"time-clocked mount=",
+            b"time-clocked mount=a mount=b",
+            b"time-clocked time-legacy",
+            b"time-clocked  mount=data",
+            b"time-clocked mount=data ",
+        ] {
+            assert_eq!(parse_args(bad), Err(Status::BadSize), "{bad:?}");
         }
     }
 

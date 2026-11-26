@@ -171,8 +171,182 @@ fn run_unit(request: &Request<'_>) -> Result<(), c_int> {
     run(request, &mut [0; RESULT_MAX]).map(|_| ())
 }
 
-/// unlink and rmdir: `flags` is 0 or AT_REMOVEDIR.
+/// Runs the call `attempt` against the path (`dirfd`, `path`) and, when the RAM file service answers
+/// that a walk reached the name another service owns (the call ends in EXDEV and the walk, asked
+/// again, ends in a redirect), against the path the redirect names, up to LINKS_MAX in all, the
+/// links the walks expanded counted with the redirects (ELOOP past it). `follow` says whether the
+/// call follows a link at the end of its path, as the walk of the call did.
+///
+/// The redirect is asked for after the failure, by a lookup of its own: the path comes back as the
+/// value of that call, so nothing is kept between the two, and a signal handler that makes a call
+/// of its own in between finds nothing to disturb. Dots of the new path go first, as for every path
+/// of the layer, so a path that leaves `/data` by `..` is a path of the RAM file service.
+pub(crate) fn follow_path<T>(
+    dirfd: c_int,
+    path: &[u8],
+    follow: bool,
+    mut attempt: impl FnMut(c_int, &[u8]) -> Result<T, c_int>,
+) -> Result<T, c_int> {
+    // The common case keeps no buffer of its own: only a failure of EXDEV can be a redirect.
+    let result = attempt(dirfd, path);
+    if !matches!(result, Err(EXDEV)) {
+        return result;
+    }
+    follow_redirects(dirfd, path, follow, &mut attempt, result)
+}
+
+#[inline(never)]
+fn follow_redirects<T>(
+    dirfd: c_int,
+    path: &[u8],
+    follow: bool,
+    attempt: &mut impl FnMut(c_int, &[u8]) -> Result<T, c_int>,
+    mut result: Result<T, c_int>,
+) -> Result<T, c_int> {
+    let mut next = [0u8; MAX_PATH + 1];
+    let mut length = 0;
+    let mut used = 0u32;
+    let mut redirected = false;
+    loop {
+        let (at, now) = if redirected {
+            (AT_FDCWD, &next[..length])
+        } else {
+            (dirfd, path)
+        };
+        // Only the RAM service redirects; the EXDEV of a path of the volume is its own.
+        if matches!(crate::data::route(at, now), Ok(Some(_))) {
+            return result;
+        }
+        let Ok(placed) = place(at, now) else {
+            return result;
+        };
+        let mut found = [0u8; MAX_PATH];
+        let asked =
+            crate::shared::with_files(|files| Ok(files.transport())).and_then(|transport| {
+                transport
+                    .files()
+                    .redirect_of(placed.start_fd(), placed.path(), follow, &mut found)
+                    .map_err(|_| EIO)
+            });
+        let Ok(Some(redirect)) = asked else {
+            return result;
+        };
+        used = used.saturating_add(1 + redirect.links);
+        if used > proto_fs::LINKS_MAX {
+            return Err(ELOOP);
+        }
+        // The RAM service's own path goes as it is; any other is simplified, and the layer then
+        // routes it by its text.
+        length = if redirect.target == proto_fs::REDIRECT_RAM {
+            next[..redirect.length].copy_from_slice(&found[..redirect.length]);
+            redirect.length
+        } else {
+            posix_path::simplify(&found[..redirect.length], &mut next)
+        };
+        redirected = true;
+        result = attempt(AT_FDCWD, &next[..length]);
+        if !matches!(result, Err(EXDEV)) {
+            return result;
+        }
+    }
+}
+
 pub fn unlinkat(dirfd: c_int, path: &[u8], flags: c_int) -> Result<(), c_int> {
+    follow_path(dirfd, path, false, |dirfd, path| {
+        unlinkat_once(dirfd, path, flags)
+    })
+}
+
+pub fn mkdirat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
+    follow_path(dirfd, path, false, |dirfd, path| {
+        mkdirat_once(dirfd, path, mode, umask)
+    })
+}
+
+pub fn mkfifoat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
+    follow_path(dirfd, path, false, |dirfd, path| {
+        mkfifoat_once(dirfd, path, mode, umask)
+    })
+}
+
+pub fn mksockat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
+    follow_path(dirfd, path, false, |dirfd, path| {
+        mksockat_once(dirfd, path, mode, umask)
+    })
+}
+
+pub fn faccessat(dirfd: c_int, path: &[u8], mode: c_int, flags: c_int) -> Result<(), c_int> {
+    follow_path(dirfd, path, true, |dirfd, path| {
+        faccessat_once(dirfd, path, mode, flags)
+    })
+}
+
+pub fn symlinkat(target: &[u8], new_dirfd: c_int, linkpath: &[u8]) -> Result<(), c_int> {
+    follow_path(new_dirfd, linkpath, false, |dirfd, path| {
+        symlinkat_once(target, dirfd, path)
+    })
+}
+
+pub fn readlinkat(dirfd: c_int, path: &[u8], out: &mut [u8]) -> Result<usize, c_int> {
+    follow_path(dirfd, path, false, |dirfd, path| {
+        readlinkat_once(dirfd, path, out)
+    })
+}
+
+pub fn directory_path(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
+    follow_path(AT_FDCWD, path, true, |_, path| {
+        directory_path_once(path, out)
+    })
+}
+
+pub fn realpath(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
+    follow_path(AT_FDCWD, path, true, |_, path| realpath_once(path, out))
+}
+
+pub fn statvfs(path: &[u8]) -> Result<Statvfs, c_int> {
+    follow_path(AT_FDCWD, path, true, |_, path| statvfs_once(path))
+}
+
+fn metadata(
+    op: ChangeOp,
+    named: Named,
+    dirfd: c_int,
+    path: &[u8],
+    at_flags: c_int,
+    args: [u64; 4],
+) -> Result<(), c_int> {
+    if path.is_empty() {
+        return metadata_once(op, named, dirfd, path, at_flags, args);
+    }
+    follow_path(
+        dirfd,
+        path,
+        at_flags & AT_SYMLINK_NOFOLLOW == 0,
+        |dirfd, path| metadata_once(op, named, dirfd, path, at_flags, args),
+    )
+}
+
+/// fstatat: the node information of a path, or with no path (or an empty
+/// one and AT_EMPTY_PATH) of the descriptor itself. The last link is not
+/// followed with AT_SYMLINK_NOFOLLOW, unless the path ends with a slash.
+pub fn fstatat(
+    dirfd: c_int,
+    path: Option<&[u8]>,
+    flags: c_int,
+) -> Result<proto_fs::NodeInfo, c_int> {
+    match path.filter(|path| !path.is_empty()) {
+        Some(path) => {
+            let follow = flags & AT_SYMLINK_NOFOLLOW == 0 || path.last() == Some(&b'/');
+            follow_path(dirfd, path, follow, |dirfd, path| {
+                fstatat_once(dirfd, Some(path), flags)
+            })
+        }
+        None => fstatat_once(dirfd, path, flags),
+    }
+}
+
+/// unlink and rmdir: `flags` is 0 or AT_REMOVEDIR.
+fn unlinkat_once(dirfd: c_int, path: &[u8], flags: c_int) -> Result<(), c_int> {
     if flags & !AT_REMOVEDIR != 0 {
         return Err(EINVAL);
     }
@@ -201,7 +375,7 @@ pub fn unlinkat(dirfd: c_int, path: &[u8], flags: c_int) -> Result<(), c_int> {
 }
 
 /// mkdir: the mode with the creation mask of the process.
-pub fn mkdirat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
+fn mkdirat_once(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
     if let Some(vol) = crate::data::route(dirfd, path)? {
         return crate::data::mkdir(&vol, mode, umask);
     }
@@ -214,7 +388,7 @@ pub fn mkdirat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c
 }
 
 /// Create a FIFO inode; its ring is allocated only by a later open.
-pub fn mkfifoat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
+fn mkfifoat_once(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
     // The volume keeps files and directories alone.
     if crate::data::route(dirfd, path)?.is_some() {
         return Err(EPERM);
@@ -228,7 +402,7 @@ pub fn mkfifoat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), 
 
 /// Create the node of kind socket that a bound socket of the pipe service
 /// names; EEXIST for a name in use.
-pub fn mksockat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
+fn mksockat_once(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
     if crate::data::route(dirfd, path)?.is_some() {
         return Err(EPERM);
     }
@@ -240,7 +414,7 @@ pub fn mksockat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), 
 }
 
 /// access and faccessat: the real IDs, the effective with AT_EACCESS.
-pub fn faccessat(dirfd: c_int, path: &[u8], mode: c_int, flags: c_int) -> Result<(), c_int> {
+fn faccessat_once(dirfd: c_int, path: &[u8], mode: c_int, flags: c_int) -> Result<(), c_int> {
     if flags & !AT_EACCESS != 0 || !(0..=7).contains(&mode) {
         return Err(EINVAL);
     }
@@ -281,20 +455,7 @@ pub fn faccessat(dirfd: c_int, path: &[u8], mode: c_int, flags: c_int) -> Result
         0
     };
     access.args = [mode as u64, 0, 0, 0];
-    crate::redirect::follow(|target| match target {
-        None => run_unit(&access),
-        // The service redirected a walk through a link onto /data.
-        Some(target) => match crate::data::route(AT_FDCWD, target)? {
-            Some(vol) => crate::data::access(&vol, mode, effective),
-            None => {
-                let placed = place(AT_FDCWD, target)?;
-                let mut again = request(ChangeOp::Access, &placed);
-                again.flags = access.flags;
-                again.args = access.args;
-                run_unit(&again)
-            }
-        },
-    })
+    run_unit(&access)
 }
 
 /// rename: `renameat2` without flags.
@@ -340,7 +501,7 @@ pub fn linkat(
 }
 
 /// symlink: `target` is stored as it is, up to 511 bytes, empty too.
-pub fn symlinkat(target: &[u8], new_dirfd: c_int, linkpath: &[u8]) -> Result<(), c_int> {
+fn symlinkat_once(target: &[u8], new_dirfd: c_int, linkpath: &[u8]) -> Result<(), c_int> {
     if target.len() > MAX_PATH {
         return Err(ENAMETOOLONG);
     }
@@ -357,7 +518,7 @@ pub fn symlinkat(target: &[u8], new_dirfd: c_int, linkpath: &[u8]) -> Result<(),
 
 /// readlink: the contents of the link, cut to the size of `out`, without a
 /// NUL. EINVAL for a buffer of no bytes and for a node that is no link.
-pub fn readlinkat(dirfd: c_int, path: &[u8], out: &mut [u8]) -> Result<usize, c_int> {
+fn readlinkat_once(dirfd: c_int, path: &[u8], out: &mut [u8]) -> Result<usize, c_int> {
     if out.is_empty() {
         return Err(EINVAL);
     }
@@ -422,7 +583,7 @@ fn metadata_target(dirfd: c_int, path: &[u8], at_flags: c_int) -> Result<(Placed
     Ok((placed, true))
 }
 
-fn metadata(
+fn metadata_once(
     op: ChangeOp,
     named: Named,
     dirfd: c_int,
@@ -521,7 +682,7 @@ pub fn utimensat(
 /// names the directory the link leads to. Other flags are EINVAL, an empty
 /// path without AT_EMPTY_PATH is ENOENT, a relative path against a descriptor
 /// of another service is ENOTDIR.
-pub fn fstatat(
+fn fstatat_once(
     dirfd: c_int,
     path: Option<&[u8]>,
     flags: c_int,
@@ -558,20 +719,10 @@ pub fn fstatat(
                 .map_err(error);
         }
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0 || placed.trailing_slash;
-        let info = crate::redirect::follow(|target| match target {
-            None => transport
-                .files()
-                .node_information_from(placed.start_fd(), placed.path(), follow)
-                .map_err(|status| error(FsError::from(status))),
-            // The service redirected a walk through a link onto /data.
-            Some(target) => match crate::data::route(AT_FDCWD, target)? {
-                Some(vol) => crate::data::stat(&vol),
-                None => transport
-                    .files()
-                    .node_information_from(None, target, follow)
-                    .map_err(|status| error(FsError::from(status))),
-            },
-        })?;
+        let info = transport
+            .files()
+            .node_information_from(placed.start_fd(), placed.path(), follow)
+            .map_err(|status| error(FsError::from(status)))?;
         if placed.trailing_slash && info.kind != 1 {
             return Err(ENOTDIR);
         }
@@ -596,7 +747,7 @@ pub fn fstatat(
 /// The canonical path of the directory `path` names, against the current
 /// directory: the service resolves the links, `.` and `..`, and checks that
 /// the caller may search it. The path of a name of the terminal is ENOTDIR.
-pub fn directory_path(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
+fn directory_path_once(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
     if let Some(vol) = crate::data::route(AT_FDCWD, path)? {
         return crate::data::directory(&vol, out);
     }
@@ -671,7 +822,7 @@ pub fn fchdir(fd: c_int) -> Result<(), c_int> {
 /// `out`. ENOENT for an empty path and for a name that does not exist,
 /// ENOTDIR for a part that is no directory, ELOOP, EACCES. A name of the
 /// terminal service is its directory's path and its name.
-pub fn realpath(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
+fn realpath_once(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
     if let Some(vol) = crate::data::route(AT_FDCWD, path)? {
         return crate::data::realpath(&vol, out);
     }
@@ -743,7 +894,7 @@ fn statvfs_words(request: &Request<'_>) -> Result<Statvfs, c_int> {
 
 /// statvfs: the file system of `path`. The right to search the directories
 /// above it is all it needs: a file of mode 0 answers.
-pub fn statvfs(path: &[u8]) -> Result<Statvfs, c_int> {
+fn statvfs_once(path: &[u8]) -> Result<Statvfs, c_int> {
     // /proc is no file system of the file service: it has no blocks.
     #[cfg(feature = "procfs")]
     if let Some(path) = crate::procfs::absolute(path) {
