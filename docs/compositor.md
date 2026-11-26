@@ -787,9 +787,9 @@ How a scene reaches the screen:
 `proto_comp::VERSION` is unchanged: the two methods are new numbers (26, 27) in a
 session that only the scene session can use.
 
-## Work for a window at the window's level (limit and deferred design)
+## Work for a window at the window's level (limit and design)
 
-Status: decided, code deferred. The limit below is what the service does today. The decisions in "When the work starts" are the design to build when a trigger in "Triggers" fires.
+Status: decided, under way. The limit below is what the service does today. The decisions in "When the work starts" are the design, built in the order of "Order of work".
 
 ### The limit
 
@@ -812,9 +812,16 @@ The work for a window then runs at the window's level: a worker thread of the co
 6. One worker thread, started at the first job, that changes its level. The main thread raises it at once when a job of a higher level arrives, and after each piece (a damaged part of an image) the worker takes the highest job. A post while the worker is on the element raises the generation and the worker goes on with the union of the damage not yet drawn, so the latest post wins.
 7. The bound: the frame of the cube falls to about the 7 bands of a plain window of its target size, 27 bands of about 14 000 ticks (`BAND_TICKS`), and the rows `F(n)` with the count of bands fall with it. With the fallback gone every frame is that cheap, so the bound falls as well. The new figure is the latency from a post to its image ready at level 28, about 8 to 10 ms. A new row of the probe holds it within one period in the idle and P phases.
 
-### Triggers
+### Order of work
 
-The work starts when a shipped scene transforms a low window under an interactive one (window-manager animations, a rotated display), or when the bound rows with transforms come close to the period. The kernel change of point 1 goes first.
+The owner decided not to defer the work. The limit above stays as the state of today until the steps below land. The kernel change is under way on the branch `lent-level`, and the compositor follows it as a part of its own. The decision note `tasks/2026-11-26-lent-level-kernel-decision.md` of `stafeto-design` has the step list of the kernel part (its section 8) and the compositor's part (its section 9). The order:
+
+1. The kernel report of the lent level (point 1 above): `LEVEL_SHIFT` and `level` in `lib/abi`, `accept` and the two notification paths in the kernel, `sys::receive_lent` and `Request::level()` in `rt`, the tests of the layout.
+2. The private pixman state of the worker (point 2).
+3. The worker with the generations and the two images of an element (points 3 and 6), at the level `min(Request::level(), 31)`.
+4. The pool and the raised quota (point 5).
+5. The fallback dropped, with LIMIT for a commit whose images cannot be reserved (point 4).
+6. The probe row of the latency from a post to the image ready (point 7), and the bound rows with the prepared elements.
 
 ## OpenWF Composition for C programs
 
