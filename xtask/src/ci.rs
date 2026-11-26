@@ -171,8 +171,8 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("relibc-hello", 23),
     ("relibc-threads", 23),
     ("cxx-probe", 20),
-    ("gles-probe", 100),
-    ("gles-probe steps", 70),
+    ("gles-probe", 130),
+    ("gles-probe steps", 72),
     ("posix-files", 29),
     ("posix-files steps", 31),
     ("posix-procs", 69),
@@ -321,11 +321,11 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("vi-dialog", 30),
     ("posix-window", 25),
     ("wfd-probe", 40),
-    ("wfc-probe", 60),
+    ("wfc-probe", 202),
     ("display-probe", 25),
-    ("lvgl-probe", 40),
+    ("lvgl-probe", 74),
     ("comp-late-probe", 25),
-    ("frame-probe", 60),
+    ("frame-probe", 73),
 ];
 const DEFAULT_WEIGHT: u32 = 20;
 
