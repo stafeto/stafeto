@@ -157,6 +157,22 @@ pub fn set_ids(c: Credentials, (uid, gid): (u32, u32)) -> Credentials {
     }
 }
 
+/// The bytes of the code of the loader one portion of the load maps: eight
+/// pages of 4096 bytes. A mapping of executable pages costs about a thousand
+/// ticks a page under -icount, and the whole code of the loader (20 pages)
+/// in one portion passed 0.9 of term B.
+pub const CODE_CHUNK_BYTES: u64 = 8 * 4096;
+
+/// The offset and the length of piece `chunk` of `code_len` bytes of code, or
+/// none past the last.
+pub fn code_chunk(code_len: u64, chunk: u64) -> Option<(u64, u64)> {
+    let offset = chunk.checked_mul(CODE_CHUNK_BYTES)?;
+    if offset >= code_len {
+        return None;
+    }
+    Some((offset, (code_len - offset).min(CODE_CHUNK_BYTES)))
+}
+
 /// The level of the place of the notices of the portions of a load: the
 /// level of the one who asked, so that the kernel puts a portion among the
 /// requests by that level (spec 2, 3.1), but never above the service's own.
@@ -468,6 +484,24 @@ impl<T> Loaders<T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn code_pieces_cover_the_code_once() {
+        for pages in [1u64, 7, 8, 9, 20, 24] {
+            let code_len = pages * 4096;
+            let mut at = 0;
+            let mut chunk = 0;
+            while let Some((offset, len)) = code_chunk(code_len, chunk) {
+                assert_eq!(offset, at);
+                assert!(len > 0 && len <= CODE_CHUNK_BYTES);
+                at += len;
+                chunk += 1;
+            }
+            assert_eq!(at, code_len);
+            assert_eq!(chunk, pages.div_ceil(8));
+        }
+        assert_eq!(code_chunk(0, 0), None);
+    }
+
     use super::*;
 
     fn grants() -> proto_init::Grants {

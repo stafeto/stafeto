@@ -543,10 +543,10 @@ pub fn client_services_verdict(lines: &[String]) -> Result<String, String> {
     let mut said = Vec::new();
     for (tag, name) in CLIENT_SERVICES {
         let rows = crate::wfc::rows_of(lines, tag, name, &[])?;
-        let Some((kind, ticks, _)) = rows.iter().max_by_key(|r| r.1) else {
+        let Some((kind, ticks, detail)) = rows.iter().max_by_key(|r| r.1) else {
             return Err(format!("the {name}: no step line (tag {tag})"));
         };
-        said.push(format!("{name} kind {kind} {ticks}"));
+        said.push(format!("{name} kind {kind} {ticks} detail {detail}"));
     }
     Ok(said.join(", "))
 }

@@ -255,11 +255,40 @@ struct Held {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Work {
     Page,
-    Code,
+    /// A piece of the code, by its number.
+    Code(u64),
     Rodata,
     Data,
     Thread,
 }
+impl Work {
+    /// The number of the piece in the detail of its step line.
+    fn detail(self) -> u64 {
+        match self {
+            Work::Page => 1,
+            Work::Code(chunk) => 0x10 + chunk,
+            Work::Rodata => 3,
+            Work::Data => 4,
+            Work::Thread => 6,
+        }
+    }
+}
+/// The detail of the step line of a notice of the loop (kind 64), by its
+/// source: the end of a process (an Exit notice), the step of the walks
+/// (STEP), of the terminal walk (TTY_STEP), the creation of a record
+/// (CREATING), the answers after a rejoin (REJOINED), the timers (TIMERS).
+/// A portion of a load has `DETAIL_PORTION + Work::detail()`: 0x2001 the
+/// page, 0x2010 and up the pieces of the code (8 pages each), 0x2003 the
+/// read-only data, 0x2004 the data and stack, 0x2006 the thread and its
+/// start. A handler that counts what it did (the answers of a step, the
+/// waiting Gets) sets that number over these.
+const DETAIL_EXIT: u64 = 0x1000;
+const DETAIL_PORTION: u64 = 0x2000;
+const DETAIL_CREATING: u64 = 0x3000;
+const DETAIL_WALK: u64 = 0x4000;
+const DETAIL_TTY: u64 = 0x5000;
+const DETAIL_REJOINED: u64 = 0x6000;
+const DETAIL_TIMERS: u64 = 0x7000;
 struct Making {
     work: Work,
     /// The page a child of SpawnStart or ForkStart starts with; none for
@@ -2103,6 +2132,12 @@ impl Processes {
             return Delivery::Done;
         }
         if signal == SIGKILL {
+            #[cfg(feature = "steps")]
+            rt::println!(
+                "process: kill of record {target}: ceiling {} service level {}",
+                record.ceiling,
+                self.level
+            );
             let _ = sys::process_kill_at(&record.process, record.ceiling);
             return Delivery::Done;
         }
@@ -3795,6 +3830,7 @@ impl Processes {
             return;
         };
         let (child, parent) = (place.record, place.parent);
+        rt::service::step_detail(DETAIL_PORTION + making.work.detail());
         let outcome = self.make_piece(slot, child, parent, &making);
         match outcome {
             Err(e) => {
@@ -3927,9 +3963,15 @@ impl Processes {
                     }
                     self.signal_newborn(child);
                 }
-                Ok(Some(Work::Code))
+                Ok(Some(Work::Code(0)))
             }
-            Work::Code => image.map_code(process).map(|()| Some(Work::Rodata)),
+            Work::Code(chunk) => image.map_code(process, chunk).map(|()| {
+                Some(if chunk + 1 < image.code_chunks() {
+                    Work::Code(chunk + 1)
+                } else {
+                    Work::Rodata
+                })
+            }),
             Work::Rodata => image.map_rodata(process).map(|()| Some(Work::Data)),
             Work::Data => image
                 .map_data(&make::own(), process)
@@ -5209,18 +5251,22 @@ impl Service<0> for Processes {
     /// without a parent. An end of an older generation takes nothing.
     fn notification(&mut self, n: Notice) {
         if n.source == Source::Session && n.label == STEP {
+            rt::service::step_detail(DETAIL_WALK);
             self.walk_step();
             return;
         }
         if n.source == Source::Session && n.label == TTY_STEP {
+            rt::service::step_detail(DETAIL_TTY);
             self.tty_step();
             return;
         }
         if n.source == Source::Session && n.label == CREATING {
+            rt::service::step_detail(DETAIL_CREATING);
             self.created();
             return;
         }
         if n.source == Source::Session && n.label == REJOINED {
+            rt::service::step_detail(DETAIL_REJOINED);
             self.rejoin_answers();
             return;
         }
@@ -5229,12 +5275,14 @@ impl Service<0> for Processes {
             return;
         }
         if n.source == Source::Timer && n.label == TIMERS {
+            rt::service::step_detail(DETAIL_TIMERS);
             self.timer_step();
             return;
         }
         if n.source != Source::Exit {
             return;
         }
+        rt::service::step_detail(DETAIL_EXIT);
         let Some((index, image)) = self.records.find_exit_any(n.label) else {
             return;
         };
