@@ -474,6 +474,7 @@ stafeto_swap(_EGLDisplay *disp, _EGLSurface *draw, const EGLint *rects,
    struct swap_plan plan;
    struct stafeto_rect post[SWAP_POST_MAX];
    int buffer, before;
+   unsigned timeouts = 0;
    const bool stamps = stafeto_stamps_on();
    uint64_t t0 = stamps ? now_ns() : 0, t1 = 0, t2 = 0, t3 = 0;
 
@@ -535,18 +536,20 @@ stafeto_swap(_EGLDisplay *disp, _EGLSurface *draw, const EGLint *rects,
          swap_history_reset(&s->history);
          return _eglError(EGL_BAD_NATIVE_WINDOW, "eglSwapBuffers: the service is gone");
       }
+      if (got < 0)
+         timeouts++;
    }
    if (stamps) {
       /* Microseconds: the wait for a free buffer, the driver's swap (which
        * holds the copy of the frame), the copy alone, the post and the wait of
-       * the interval. */
+       * the interval, and how many times that wait ran out (WAIT_NS). */
       fprintf(stderr,
-              "egl-stamp: swap wait %llu draw %llu copy %llu post %llu ifwait %llu us\n",
+              "egl-stamp: swap wait %llu draw %llu copy %llu post %llu ifwait %llu us timeout %u\n",
               (unsigned long long)((t1 - t0) / 1000),
               (unsigned long long)((t2 - t1) / 1000),
               (unsigned long long)(s->copy_ns / 1000),
               (unsigned long long)((t3 - t2) / 1000),
-              (unsigned long long)((now_ns() - t3) / 1000));
+              (unsigned long long)((now_ns() - t3) / 1000), timeouts);
    }
    return EGL_TRUE;
 }

@@ -551,6 +551,77 @@ pub fn client_services_verdict(lines: &[String]) -> Result<String, String> {
     Ok(said.join(", "))
 }
 
+/// The process service's gaps and the reaper (the steps image): every gap of a step of the
+/// service (`service gap: 1 kind K G ticks of A`, the time the step's own thread did not run
+/// and did not wait) is at most 0.9 of term B, every close of the reaper (`posix-process:
+/// reaper level L N ticks`) ran at a level of at most 31, and the report names the longest
+/// close and the longest notice step of each detail (0x1000 the first part of an exit, 0x8000
+/// its second part, 0x2000 and up the portions of a load).
+pub fn process_service_verdict(lines: &[String]) -> Result<String, String> {
+    let mut gap = 0;
+    let mut closed = (0u64, 0u64);
+    let mut details: Vec<(u64, u64)> = Vec::new();
+    for line in lines {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.as_slice() {
+            ["service", "gap:", "1", "kind", _, g, "ticks", "of", _] => {
+                gap = gap.max(g.parse::<u64>().unwrap_or(0));
+            }
+            ["posix-process:", "reaper", "level", level, ticks, "ticks"] => {
+                let (level, ticks) = (
+                    level.parse::<u64>().map_err(|e| format!("{line:?}: {e}"))?,
+                    ticks.parse::<u64>().map_err(|e| format!("{line:?}: {e}"))?,
+                );
+                if level > 31 {
+                    return Err(format!(
+                        "the reaper closed an image object at level {level}, 31 at most"
+                    ));
+                }
+                if ticks > closed.1 {
+                    closed = (level, ticks);
+                }
+            }
+            [
+                "service",
+                "step:",
+                "1",
+                "kind",
+                "64",
+                ticks,
+                "ticks",
+                "detail",
+                detail,
+                ..,
+            ] => {
+                if let (Ok(t), Ok(d)) = (ticks.parse::<u64>(), detail.parse::<u64>()) {
+                    match details.iter_mut().find(|(k, _)| *k == d) {
+                        Some(row) => row.1 = row.1.max(t),
+                        None => details.push((d, t)),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if gap > gpu_probe::STEP_MAX {
+        return Err(format!(
+            "the process service: a gap of {gap} ticks in a step, over 0.9 of term B ({})",
+            gpu_probe::STEP_MAX
+        ));
+    }
+    details.sort_unstable();
+    let rows: Vec<String> = details
+        .iter()
+        .map(|(d, t)| format!("detail {d:#x} {t}"))
+        .collect();
+    Ok(format!(
+        "the process service: the widest gap {gap} ticks; the reaper's longest close {} ticks at level {}; notice steps: {}",
+        closed.1,
+        closed.0,
+        rows.join(", ")
+    ))
+}
+
 /// The copies of the loader (feature `steps`), each kernel call of a copy with its
 /// ticks: printed, and the whole copy beside them. The kernel's B bounds the portions
 /// of a call, so no limit is put on them here (the process-steps probe's rule).
@@ -595,10 +666,10 @@ pub fn load(machine: &qemu::Machine) -> Result<(), String> {
         // The host's clock and the host's processor: the numbers are the report, and the
         // verdict of the late frames is the run under -icount's.
         println!(
-            "gles-probe on {}: the load and the stamps of the cube under HVF (no verdict)",
+            "gles-probe on {}: the load and the stamps of the cube under HVF (the frames over two periods are judged)",
             machine.name
         );
-        return Ok(());
+        return load_verdict_hvf(&output.lines);
     }
     load_verdict(&output.lines)
 }
@@ -647,6 +718,10 @@ fn judge_steps(machine: &qemu::Machine, output: &qemu::Outcome) -> Result<(), St
         )?
     );
     let clients = client_services_verdict(&output.lines).map_err(|e| format!("gles-probe: {e}"))?;
+    println!(
+        "gles-probe: {}",
+        process_service_verdict(&output.lines).map_err(|e| format!("gles-probe: {e}"))?
+    );
     println!(
         "gles-probe: the services of the client, the longest step, ticks (0.9 of term B {}): {clients}; {}",
         gpu_probe::STEP_MAX,
@@ -714,11 +789,36 @@ fn phase_of(lines: &[String], name: &str) -> Result<Phase, String> {
     })
 }
 
-/// The load beside a window of a client with no GLES: the cube drawing in its window must
-/// not raise the late frames of the paced client. The count of late frames (the post to the
-/// free bit over one period) per post of the phase with the cube is at most the quiet
-/// phase's, no frame is over two periods that was not in the quiet phase, and the client
-/// posted in both.
+/// The longest wait of `eglSwapInterval(1)` the verdict allows, microseconds: two periods of 60 Hz.
+const IFWAIT_MAX_US: u64 = 2 * 16_667;
+/// The limit of the platform's wait of the swap interval (`WAIT_NS`), microseconds.
+const WAIT_LIMIT_US: u64 = 1_000_000;
+/// How much longer than the quiet phase's the wake-up of the paced client may be with the cube.
+const WAKE_SLACK_US: u64 = 2000;
+
+/// The swaps of the cube beside the window: how many interval waits ran out (`timeout N` of
+/// the line of the platform) and the longest interval wait, microseconds.
+fn swap_waits(lines: &[String]) -> (u64, u64) {
+    let (mut timeouts, mut longest) = (0, 0);
+    for line in lines.iter().filter(|l| l.starts_with("egl-stamp: swap ")) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let after = |key: &str| {
+            let at = words.iter().position(|w| *w == key)?;
+            words.get(at + 1)?.parse::<u64>().ok()
+        };
+        let ifwait = after("ifwait").unwrap_or(0);
+        longest = longest.max(ifwait);
+        // A platform that does not count says nothing: a wait of the whole limit is a timeout.
+        timeouts += after("timeout").unwrap_or(u64::from(ifwait >= WAIT_LIMIT_US));
+    }
+    (timeouts, longest)
+}
+
+/// The load beside a window of a client with no GLES, the cube at level 28 below every
+/// interactive level (-icount, the verdict): the paced client has no late frame with the cube
+/// when it has none alone (else the late frames per post do not rise), no frame is over two
+/// periods, its wake-up is at most 2000 us longer than alone, no wait of the swap interval ran
+/// out and none lasted over two periods, and the client posted in both phases.
 pub fn load_verdict(lines: &[String]) -> Result<(), String> {
     let quiet = phase_of(lines, "quiet")?;
     let cube = phase_of(lines, "cube")?;
@@ -726,6 +826,12 @@ pub fn load_verdict(lines: &[String]) -> Result<(), String> {
         return Err(format!(
             "load: the client posted {} and {} times, 60 at least expected",
             quiet.posts, cube.posts
+        ));
+    }
+    if quiet.late == 0 && cube.late != 0 {
+        return Err(format!(
+            "load: {} late frames of a window with no GLES with the cube, none alone",
+            cube.late
         ));
     }
     if u128::from(cube.late) * u128::from(quiet.posts)
@@ -736,6 +842,37 @@ pub fn load_verdict(lines: &[String]) -> Result<(), String> {
             cube.late, cube.posts, quiet.late, quiet.posts
         ));
     }
+    if cube.late2 != 0 {
+        return Err(format!(
+            "load: {} frames over two periods with the cube",
+            cube.late2
+        ));
+    }
+    if cube.wake_max_us > quiet.wake_max_us + WAKE_SLACK_US {
+        return Err(format!(
+            "load: the wake-up of the client reached {} us with the cube, {} us alone (slack {WAKE_SLACK_US})",
+            cube.wake_max_us, quiet.wake_max_us
+        ));
+    }
+    let (timeouts, ifwait) = swap_waits(lines);
+    if timeouts != 0 {
+        return Err(format!(
+            "load: {timeouts} waits of the swap interval ran out"
+        ));
+    }
+    if ifwait > IFWAIT_MAX_US {
+        return Err(format!(
+            "load: a wait of the swap interval lasted {ifwait} us, {IFWAIT_MAX_US} at most"
+        ));
+    }
+    Ok(())
+}
+
+/// The verdict under HVF, on the host's clock: only the frames over two periods are judged
+/// (none more than alone); the rest is the report.
+pub fn load_verdict_hvf(lines: &[String]) -> Result<(), String> {
+    let quiet = phase_of(lines, "quiet")?;
+    let cube = phase_of(lines, "cube")?;
     if cube.late2 > quiet.late2 {
         return Err(format!(
             "load: {} frames over two periods with the cube, {} alone",
@@ -1095,6 +1232,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_gap_of_the_process_service_and_the_level_of_the_reaper_are_judged() {
+        let ok = vec![
+            "service gap: 1 kind 64 2113 ticks of 9641".to_owned(),
+            "service gap: 2 kind 64 900000 ticks of 900100".to_owned(),
+            "posix-process: reaper level 28 1200000 ticks".to_owned(),
+            "service step: 1 kind 64 6500 ticks detail 4096".to_owned(),
+            "service step: 1 kind 64 9900 ticks detail 32768".to_owned(),
+        ];
+        let said = process_service_verdict(&ok).unwrap();
+        assert!(
+            said.contains("gap 2113") && said.contains("1200000 ticks at level 28"),
+            "{said}"
+        );
+        assert!(
+            said.contains("detail 0x1000 6500, detail 0x8000 9900"),
+            "{said}"
+        );
+        let mut wide = ok.clone();
+        wide.push("service gap: 1 kind 64 1218768 ticks of 1230164".to_owned());
+        assert!(process_service_verdict(&wide).is_err());
+        let mut high = ok;
+        high.push("posix-process: reaper level 52 10 ticks".to_owned());
+        assert!(process_service_verdict(&high).is_err());
+    }
+
     fn load_lines(quiet_late: u64, cube_late: u64) -> Vec<String> {
         let mut lines = Vec::new();
         for k in 0..6 {
@@ -1103,7 +1266,7 @@ mod tests {
                 650_000 + k
             ));
             lines.push(format!(
-                "egl-stamp: swap wait 3 draw {} copy 200 post 40 ifwait 9000 us",
+                "egl-stamp: swap wait 3 draw {} copy 200 post 40 ifwait 9000 us timeout 0",
                 400 + k
             ));
             lines.push(format!("gles-cube: stamp swap {k} (interval 1) 9500 us"));
@@ -1144,10 +1307,31 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_wake_up_a_timeout_or_a_long_interval_wait_fail() {
+        let mut lines = load_lines(0, 0);
+        let at = lines.iter().position(|l| l.contains("load cube")).unwrap();
+        lines[at] = lines[at].replace("wake max 300", "wake max 2200");
+        assert!(load_verdict(&lines).unwrap_err().contains("wake-up"));
+        let mut lines = load_lines(0, 0);
+        lines[1] = lines[1].replace("timeout 0", "timeout 1");
+        assert!(load_verdict(&lines).unwrap_err().contains("ran out"));
+        let mut lines = load_lines(0, 0);
+        lines[1] = lines[1].replace("ifwait 9000", "ifwait 40000");
+        assert!(load_verdict(&lines).unwrap_err().contains("lasted"));
+        let mut lines = load_lines(0, 0);
+        let at = lines.iter().position(|l| l.contains("load cube")).unwrap();
+        lines[at] = lines[at].replace("late2 0", "late2 1");
+        assert!(load_verdict(&lines).is_err());
+        assert!(load_verdict_hvf(&lines).is_err());
+        assert!(load_verdict_hvf(&load_lines(0, 0)).is_ok());
+    }
+
+    #[test]
     fn a_load_that_did_not_post_or_is_missing_fails() {
         assert!(load_verdict(&[]).is_err());
         let mut lines = load_lines(0, 0);
-        lines[18] = lines[18].replace("posts 120", "posts 5");
+        let at = lines.iter().position(|l| l.contains("load quiet")).unwrap();
+        lines[at] = lines[at].replace("posts 120", "posts 5");
         assert!(load_verdict(&lines).unwrap_err().contains("60 at least"));
     }
 }
