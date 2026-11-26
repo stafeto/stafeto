@@ -83,6 +83,8 @@ table-relibc-threads = []
 table-cxx-probe = []
 # The cube in a pbuffer (xtask gles-pbuffer): the services of the POSIX probes and apps/gles-cube with a quota above 64 MiB.
 table-gles-pbuffer = []
+# dEQP-EGL of VK-GL-CTS (xtask deqp): the services of the POSIX probes and the program deqp-egl with a quota above 64 MiB; its arguments are the lines of /etc/deqp.args.
+table-deqp = []
 # The cube in a window of the composition service (xtask gles-window): the services of the POSIX probes, the display driver, the compositor and apps/gles-cube with a quota above 64 MiB.
 table-gles-window = []
 # The probe of the graphics of Mesa (xtask gles-probe): the services of the scene demo, which holds the scene, starts gles-cube and gles3-demo and shows their windows (the records have quotas above 64 MiB).

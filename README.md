@@ -81,6 +81,7 @@ cargo xtask help         # every command
 | [docs/posix-coverage.md](docs/posix-coverage.md) | POSIX coverage and the conformance work left |
 | [docs/openwf.md](docs/openwf.md) | OpenWF Composition and Display for C programs: what is implemented, how to run the demo, the differences and the real-time properties |
 | [docs/cxx.md](docs/cxx.md) | C++ programs: libc++, libc++abi and libunwind, how to link them, what the probe checks and the limits |
+| [docs/deqp.md](docs/deqp.md) | The dEQP test framework of VK-GL-CTS on stafeto: how it is built, the platform, the runner in batches, the results of dEQP-EGL |
 | [docs/packages.md](docs/packages.md) | how third-party programs are packaged |
 | [docs/release.md](docs/release.md) | versions and how a release is made |
 | [docs/debugging.md](docs/debugging.md) | debugging hangs and crashes |

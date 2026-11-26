@@ -2592,6 +2592,31 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        // The arguments of the program and the list of its cases are files of the
+        // image (xtask/src/deqp.rs), whose contents change from start to start.
+        "boot-deqp.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/deqp-egl", 0o755, ROOT, "deqp-egl"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files.extend([
+                of(
+                    "/etc/deqp.args",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("deqp.args", crate::deqp::args_bytes()),
+                ),
+                of(
+                    "/etc/deqp.cases",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("deqp.cases", crate::deqp::cases_bytes()),
+                ),
+            ]);
+            files
+        }
         "boot-posix-window.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -3741,6 +3766,7 @@ mod tests {
             "boot-posix-window.img",
             "boot-cxx-probe.img",
             "boot-gles-pbuffer.img",
+            "boot-deqp.img",
             "boot-gles-window.img",
             "boot-gles.img",
             "boot-gles-steps.img",
