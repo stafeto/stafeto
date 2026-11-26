@@ -44,6 +44,7 @@ const BASE: &str = "BusyBox and base packages";
 const ADDONS: &str = "add-on packages";
 const GAMES: &str = "game packages";
 const LVGL_HOST: &str = "lvgl host reference";
+const DEQP: &str = "dEQP, Mesa and libc++";
 const NET_PACKAGES: &str = "network packages";
 const KERNELS: &str = "kernel images";
 const IMAGES: &str = "boot images";
@@ -173,7 +174,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("cxx-probe", 20),
     ("gles-probe", 130),
     ("gles-probe steps", 72),
-    ("deqp-smoke", 700),
+    ("deqp-smoke", 150),
     ("posix-files", 29),
     ("posix-files steps", 31),
     ("posix-procs", 69),
@@ -495,6 +496,11 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     steps.push(step("build", LVGL_HOST, &[RELIBC, GAMES], || {
         super::run_cmd(super::build_script(super::root().join("tools/build-lvgl.py")).arg("--host"))
     }));
+    // The test framework dEQP with the Mesa and libc++ it links (a fetch of
+    // VK-GL-CTS and its sources, 8 minutes on a runner): built here, the run cache
+    // carries target/deqp to the group of the job deqp-smoke, which then only
+    // links the programs.
+    steps.push(step("build", DEQP, &[RELIBC], super::deqp));
     steps.push(step(
         "build",
         NET_PACKAGES,

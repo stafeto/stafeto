@@ -262,12 +262,12 @@ VK-GL-CTS commit. The two sources agree on every case both ran: 17 245 cases of
 19 files, 0 differences in status. The Linux run of all sets takes 3 minutes
 after the builds (17 000 cases, of which the GLES3 shaders are 6 500).
 
-The ci weight of `deqp-smoke` is 700 seconds, from the first run of the probe
-45841877135 on a runner (the command `deqp smoke` three times): 699 s, of which
-the build of dEQP is 506 s, the egl module 41 s, GLES2 121 s and GLES3 29 s; the
-second and third runs, with dEQP built, take 146 s and 143 s. Building dEQP in
-the build group, where the other jobs could share it, would leave the job at
-about 150 s.
+The build of dEQP, with Mesa and libc++, is a step of the group `build` of ci;
+the run cache hands `target` (with `target/deqp`) to the group of the job
+`deqp-smoke`, which only links the programs. The weight of the job is 150
+seconds, from the warm runs of the probe 45841877135 (`deqp smoke` three times
+on a runner): the first run took 699 s with the build of dEQP (506 s) in it,
+and the second and third 146 s and 143 s.
 
 | Platform | Mesa and dEQP builds in the container (12 cores) |
 |---|---|
