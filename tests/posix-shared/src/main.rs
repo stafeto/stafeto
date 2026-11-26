@@ -33,6 +33,7 @@ static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 /// The native threads of the probe run on static stacks with no guard page (rt::Stack): an overflow
 /// overwrites the statics below. The deepest call, a redirect on the driver, used 15,760 of the
 /// 16,384 bytes they had; 32 KiB leaves it half free, and the probe prints the use.
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 const NATIVE_STACK: usize = 32 * 1024;
 #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 static STACK: Stack<NATIVE_STACK> = Stack::new();

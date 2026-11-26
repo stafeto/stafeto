@@ -108,6 +108,7 @@ pub fn payload() -> bool {
 /// has no data service, so the path goes back to the RAM service and the redirects pile up to the
 /// budget of 32: ELOOP, after the deepest the redirect path goes. The stack the call used is
 /// printed at the end of the probe.
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 #[inline(never)]
 pub fn redirect() -> bool {
     use abi::names::{AT_FDCWD, symlinkat};
