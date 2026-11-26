@@ -458,8 +458,12 @@ static void window_present(EGLDisplay display, EGLSurface surface, int frame, in
 {
 	struct timespec pause = {2, 500000000};
 	long long started = now_ms();
+	long long swapped = stamps ? now_us() : 0;
 	CHECK(eglSwapInterval(display, frame % 2 ? 0 : 1) == EGL_TRUE);
 	CHECK(eglSwapBuffers(display, surface) == EGL_TRUE);
+	if (stamps)
+		printf("gles-cube: stamp swap %d (interval %d) %lld us\n", frame, frame % 2 ? 0 : 1,
+		       now_us() - swapped);
 	printf("gles-cube: time swap %d (interval %d) %lld ms\n", frame, frame % 2 ? 0 : 1,
 	       now_ms() - started);
 	if (frame == frames / 3 || frame == frames - 1) {
