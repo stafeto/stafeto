@@ -1,11 +1,10 @@
-# provisional: made in an arm64 Linux container off the runners
 # dEQP baseline of the set egl.swap (cargo xtask deqp-reference egl.swap)
 # module deqp-egl, platform x11_egl, patterns dEQP-EGL.functional.swap_buffers.* dEQP-EGL.functional.swap_buffers_with_damage.* dEQP-EGL.functional.buffer_age.* dEQP-EGL.functional.preserve_swap.* dEQP-EGL.functional.make_current.*
 # VK-GL-CTS opengl-es-cts-3.2.14.1 (067e8832315e79817ede1c4863804e440f5d1c80)
 # Mesa 26.3.1 softpipe, shared libraries, clang
-# machine Linux 6.12.76-linuxkit aarch64
+# machine Linux 7.0.0-1020-azure aarch64
 # arguments --deqp-log-images=disable --deqp-log-shader-sources=disable
-# 273 cases: 252 pass, 0 fail, 21 not supported, 0 other, in 15 s
+# 273 cases: 252 pass, 0 fail, 21 not supported, 0 other, in 33 s
 dEQP-EGL.functional.buffer_age.no_preserve.no_resize.odd_clear_clear_even_clear Pass
 dEQP-EGL.functional.buffer_age.no_preserve.no_resize.odd_clear_clear_even_clear_clear Pass
 dEQP-EGL.functional.buffer_age.no_preserve.no_resize.odd_clear_clear_even_none Pass

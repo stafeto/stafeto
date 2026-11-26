@@ -251,12 +251,23 @@ Every passing case of `egl.swap` on Linux is in those three groups, so the set
 gives nothing to smoke until the screen is taller (the display service has a
 fixed screen; a step of the window manager can change it).
 
-The baselines in `tests/deqp/baseline` are PROVISIONAL: they were made by
-`cargo xtask deqp-reference` in an arm64 Linux container (Ubuntu 24.04, Docker
-on a Mac), with the Mesa and the VK-GL-CTS commit of the guest, and each file
-says so in its first line. A probe of a runner (the commands above) replaces
-them. The Linux run of all sets takes 3 minutes after the builds (17 000
-cases, of which the GLES3 shaders are 6 500).
+The baselines in `tests/deqp/baseline` come from the probes of the runners
+(`probe.yml`, runs 45841842144, 45841854088 and 45841865612, Ubuntu arm64, Linux
+7.0 azure) except `egl.negative` and `egl.query`, which are PROVISIONAL (their
+first line says so): those two sets were split off `egl.api` and `egl.context`
+after the probes and need the `x11_egl` baseline, which a probe of `deqp-reference
+egl` makes. The provisional files came from `cargo xtask deqp-reference` in an
+arm64 Linux container (Ubuntu 24.04, Docker on a Mac) with the same Mesa and
+VK-GL-CTS commit. The two sources agree on every case both ran: 17 245 cases of
+19 files, 0 differences in status. The Linux run of all sets takes 3 minutes
+after the builds (17 000 cases, of which the GLES3 shaders are 6 500).
+
+The ci weight of `deqp-smoke` is 700 seconds, from the first run of the probe
+45841877135 on a runner (the command `deqp smoke` three times): 699 s, of which
+the build of dEQP is 506 s, the egl module 41 s, GLES2 121 s and GLES3 29 s; the
+second and third runs, with dEQP built, take 146 s and 143 s. Building dEQP in
+the build group, where the other jobs could share it, would leave the job at
+about 150 s.
 
 | Platform | Mesa and dEQP builds in the container (12 cores) |
 |---|---|

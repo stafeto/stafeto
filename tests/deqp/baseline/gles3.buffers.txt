@@ -1,11 +1,10 @@
-# provisional: made in an arm64 Linux container on a Mac not on a runner
 # dEQP baseline of the set gles3.buffers (cargo xtask deqp-reference gles3.buffers)
 # module deqp-gles3, platform surfaceless, patterns dEQP-GLES3.functional.transform_feedback.basic_types.* dEQP-GLES3.functional.ubo.single_basic_type.*
 # VK-GL-CTS opengl-es-cts-3.2.14.1 (067e8832315e79817ede1c4863804e440f5d1c80)
 # Mesa 26.3.1 softpipe, shared libraries, clang
-# machine Linux 6.12.76-linuxkit aarch64
+# machine Linux 7.0.0-1017-azure aarch64
 # arguments --deqp-surface-type=pbuffer --deqp-surface-width=256 --deqp-surface-height=256 --deqp-gl-config-name=rgba8888d24s8ms0 --deqp-visibility=hidden --deqp-log-images=disable --deqp-log-shader-sources=disable
-# 1346 cases: 1346 pass, 0 fail, 0 not supported, 0 other, in 29 s
+# 1346 cases: 1346 pass, 0 fail, 0 not supported, 0 other, in 50 s
 dEQP-GLES3.functional.transform_feedback.basic_types.interleaved.lines.highp_float Pass
 dEQP-GLES3.functional.transform_feedback.basic_types.interleaved.lines.highp_int Pass
 dEQP-GLES3.functional.transform_feedback.basic_types.interleaved.lines.highp_ivec2 Pass

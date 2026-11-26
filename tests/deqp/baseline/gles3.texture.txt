@@ -1,11 +1,10 @@
-# provisional: made in an arm64 Linux container on a Mac not on a runner
 # dEQP baseline of the set gles3.texture (cargo xtask deqp-reference gles3.texture)
 # module deqp-gles3, platform surfaceless, patterns dEQP-GLES3.functional.texture.format.*
 # VK-GL-CTS opengl-es-cts-3.2.14.1 (067e8832315e79817ede1c4863804e440f5d1c80)
 # Mesa 26.3.1 softpipe, shared libraries, clang
-# machine Linux 6.12.76-linuxkit aarch64
+# machine Linux 7.0.0-1017-azure aarch64
 # arguments --deqp-surface-type=pbuffer --deqp-surface-width=256 --deqp-surface-height=256 --deqp-gl-config-name=rgba8888d24s8ms0 --deqp-visibility=hidden --deqp-log-images=disable --deqp-log-shader-sources=disable
-# 546 cases: 546 pass, 0 fail, 0 not supported, 0 other, in 3 s
+# 546 cases: 546 pass, 0 fail, 0 not supported, 0 other, in 4 s
 dEQP-GLES3.functional.texture.format.compressed.eac_r11_2d_npot Pass
 dEQP-GLES3.functional.texture.format.compressed.eac_r11_2d_pot Pass
 dEQP-GLES3.functional.texture.format.compressed.eac_r11_cube_npot Pass

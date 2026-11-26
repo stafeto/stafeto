@@ -1,9 +1,8 @@
-# provisional: made in an arm64 Linux container off the runners
 # dEQP baseline of the set egl.config (cargo xtask deqp-reference egl.config)
 # module deqp-egl, platform nullws, patterns dEQP-EGL.functional.query_config.* dEQP-EGL.functional.choose_config.*
 # VK-GL-CTS opengl-es-cts-3.2.14.1 (067e8832315e79817ede1c4863804e440f5d1c80)
 # Mesa 26.3.1 softpipe, shared libraries, clang
-# machine Linux 6.12.76-linuxkit aarch64
+# machine Linux 7.0.0-1020-azure aarch64
 # arguments --deqp-log-images=disable --deqp-log-shader-sources=disable
 # 99 cases: 96 pass, 0 fail, 3 not supported, 0 other, in 1 s
 dEQP-EGL.functional.choose_config.color_component_type_ext.dont_care Pass
