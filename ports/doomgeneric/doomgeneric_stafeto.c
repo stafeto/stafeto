@@ -114,6 +114,14 @@ void DG_DrawFrame(void)
 
     if (!have_display)
         return;
+    // A frame drawn before the first tic (the engine waits twenty tics for its first one on a
+    // host that is slow to start) leaves `wipegamestate` at the game state of that frame, so the
+    // frame of the title that follows is the first of a wipe, a melt whose first steps depend on
+    // how many tics passed in its first iteration: the CRC of the title would then depend on the
+    // speed of the host. That frame shows nothing, so nothing is wiped away: the engine goes from
+    // it to the title as it does from the start.
+    if (gamestate == GS_LEVEL && gametic == 0)
+        wipegamestate = GS_DEMOSCREEN;
     stafeto_display_flush(0, 0, DOOMGENERIC_RESX, DOOMGENERIC_RESY);
     // The lines follow the flush: the screen shows the frame they name.
     if ((int)gamestate != state_said) {
