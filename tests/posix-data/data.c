@@ -3130,15 +3130,24 @@ static int calls_through_a_link_follow(void) {
 /* A signal handler that makes calls through a link while the open of the interrupted thread is in
  * flight: every redirect travels in the value of its own call, so neither disturbs the other. */
 static volatile int redirect_stop, redirect_handled, redirect_bad;
+static volatile unsigned long long redirect_slowest_us;
+void stafeto_probe_proof_cancel(unsigned *retries, unsigned *given_up);
+/* The handler is a stress test: realpath is not async-signal-safe, and the handler calls it (and
+ * stat) to make the calls of the layer nest inside an open that a signal interrupted. The time it
+ * takes is measured, to tell a signal that comes faster than the handler (starvation of the
+ * interrupted thread) from a call that does not end. */
 static void on_redirect_signal(int sig) {
     (void)sig;
     struct stat st;
     int saved = errno;
+    unsigned long long begin = now_us();
     if (stat("/lnk3/abs/pub", &st) != 0 || st.st_size != 5000 || st.st_dev != data_device)
         redirect_bad++;
     char buf[PATH_MAX];
     if (realpath("/lnk3/abs/dir", buf) != buf || strcmp(buf, "/data/dir") != 0) redirect_bad++;
     redirect_handled++;
+    unsigned long long took = now_us() - begin;
+    if (took > redirect_slowest_us) redirect_slowest_us = took;
     errno = saved;
 }
 static void *redirect_kicker(void *arg) {
@@ -3173,7 +3182,11 @@ static int redirect_under_signals(void) {
     DATA_CHECK(pthread_join(kicker_thread, NULL) == 0);
     sa.sa_handler = SIG_DFL;
     DATA_CHECK(sigaction(SIGUSR1, &sa, NULL) == 0);
-    printf("posix-data: the handler ran %d times during %d opens\n", redirect_handled, opens);
+    unsigned retries = 0, given_up = 0;
+    stafeto_probe_proof_cancel(&retries, &given_up);
+    printf("posix-data: the handler ran %d times during %d opens, the slowest took %llu us, "
+           "cancels retried %u, given up %u\n",
+           redirect_handled, opens, redirect_slowest_us, retries, given_up);
     DATA_CHECK(failures_here == 0 && redirect_bad == 0 && redirect_handled > 0);
     DATA_CHECK(unlink("/lnk3/abs") == 0 && rmdir("/lnk3") == 0);
     return 0;

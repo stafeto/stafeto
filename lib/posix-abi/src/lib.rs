@@ -199,6 +199,12 @@ pub fn probe_queued() -> u64 {
         .queued
 }
 
+/// The code of a walk of the RAM file service that ended at a name another service owns
+/// (`FsError::Redirect`), a value no errno has. It lives between the service's answer and
+/// `names::follow_path`, which takes the redirect and turns what is left into EXDEV before the
+/// call returns; no call hands it to its caller.
+pub const EREDIRECT: c_int = 0x4000_0001;
+
 /// The errno of a file error.
 pub fn error(error: FsError) -> c_int {
     match error {
@@ -234,6 +240,7 @@ pub fn error(error: FsError) -> c_int {
         FsError::NotEmpty => ENOTEMPTY,
         FsError::Busy => EBUSY,
         FsError::CrossDevice => EXDEV,
+        FsError::Redirect => EREDIRECT,
         FsError::NotSupported => EOPNOTSUPP,
         FsError::Io => EIO,
     }

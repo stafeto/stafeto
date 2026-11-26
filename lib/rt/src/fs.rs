@@ -313,10 +313,34 @@ impl Proof<'_> {
         }
     }
 }
+/// The sends of a cancel that a signal took back, and the cancels given up after `CANCEL_TRIES`
+/// of them (`proof_cancel_counts`): the probes read both.
+static CANCEL_RETRIES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static CANCEL_GIVEN_UP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// How often a cancel is sent again after an interruption. A thread whose entries stay deferred is
+/// interrupted by every send until they reopen, so the loop is bounded: the job that is left is
+/// released with the session (the service frees every job of a session that closes).
+const CANCEL_TRIES: u32 = 16;
+
+/// The retries of the cancels of the jobs of paths since the start of the process, and how many
+/// of them ended with the job left to the session.
+pub fn proof_cancel_counts() -> (u32, u32) {
+    (
+        CANCEL_RETRIES.load(core::sync::atomic::Ordering::Relaxed),
+        CANCEL_GIVEN_UP.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 impl Drop for Proof<'_> {
     fn drop(&mut self) {
         let request = job_request(Method::ResolveCancel, self.id);
-        while let Err(Status::Kernel(Error::Interrupted)) = self.send(&request) {}
+        for _ in 0..CANCEL_TRIES {
+            if !matches!(self.send(&request), Err(Status::Kernel(Error::Interrupted))) {
+                return;
+            }
+            CANCEL_RETRIES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        CANCEL_GIVEN_UP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 

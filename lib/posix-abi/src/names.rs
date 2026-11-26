@@ -171,28 +171,49 @@ fn run_unit(request: &Request<'_>) -> Result<(), c_int> {
     run(request, &mut [0; RESULT_MAX]).map(|_| ())
 }
 
-/// Runs the call `attempt` against the path (`dirfd`, `path`) and, when the RAM file service answers
-/// that a walk reached the name another service owns (the call ends in EXDEV and the walk, asked
-/// again, ends in a redirect), against the path the redirect names, up to LINKS_MAX in all, the
-/// links the walks expanded counted with the redirects (ELOOP past it). `follow` says whether the
-/// call follows a link at the end of its path, as the walk of the call did.
+/// Turns the internal code of a redirect that nobody followed into EXDEV, the answer of a call
+/// that leaves the RAM file service for another file system.
+fn leave<T>(result: Result<T, c_int>) -> Result<T, c_int> {
+    match result {
+        Err(crate::EREDIRECT) => Err(EXDEV),
+        result => result,
+    }
+}
+
+/// Runs the call `attempt` against the path (`dirfd`, `path`) and, when the RAM file service ends
+/// its walk at the name another service owns (the call fails with `EREDIRECT`), against the path
+/// that redirect names. The redirect is asked for after the failure, by a lookup of its own
+/// (`Files::redirect_of`): the path comes back as the value of that call, so nothing is kept
+/// between the two, and a signal handler that makes a call of its own in between disturbs
+/// nothing. `follow` says whether the call follows a link at the end of its path, as its walk did.
 ///
-/// The redirect is asked for after the failure, by a lookup of its own: the path comes back as the
-/// value of that call, so nothing is kept between the two, and a signal handler that makes a call
-/// of its own in between finds nothing to disturb. Dots of the new path go first, as for every path
-/// of the layer, so a path that leaves `/data` by `..` is a path of the RAM file service.
+/// A redirect counts as a link of the walk: the links the walks expanded and the redirects of one
+/// call are at most `LINKS_MAX` (ELOOP past it). The walk that ends the call is not in the count:
+/// it may expand `LINKS_MAX` links of its own, so the call may pass 32 and 32.
+///
+/// The dots of the new path go first, as for every path of the layer, so a path that leaves
+/// `/data` by `..` is a path of the RAM file service. The only exit turns a redirect nobody
+/// followed into EXDEV (`leave`): the code never reaches the caller.
 pub(crate) fn follow_path<T>(
     dirfd: c_int,
     path: &[u8],
     follow: bool,
     mut attempt: impl FnMut(c_int, &[u8]) -> Result<T, c_int>,
 ) -> Result<T, c_int> {
-    // The common case keeps no buffer of its own: only a failure of EXDEV can be a redirect.
-    let result = attempt(dirfd, path);
-    if !matches!(result, Err(EXDEV)) {
-        return result;
+    // The common case keeps no buffer of its own: only a redirect needs one.
+    match attempt(dirfd, path) {
+        Err(crate::EREDIRECT) => leave(follow_redirects(dirfd, path, follow, &mut attempt)),
+        result => result,
     }
-    follow_redirects(dirfd, path, follow, &mut attempt, result)
+}
+
+/// The errno of a lookup of a redirect that failed: a signal ended it (EINTR), anything else is
+/// an error of the service (EIO).
+fn lookup_failure(status: proto_wire::Status) -> c_int {
+    match status {
+        proto_wire::Status::Kernel(rt::abi::Error::Interrupted) => EINTR,
+        _ => EIO,
+    }
 }
 
 #[inline(never)]
@@ -201,52 +222,63 @@ fn follow_redirects<T>(
     path: &[u8],
     follow: bool,
     attempt: &mut impl FnMut(c_int, &[u8]) -> Result<T, c_int>,
-    mut result: Result<T, c_int>,
 ) -> Result<T, c_int> {
     let mut next = [0u8; MAX_PATH + 1];
     let mut length = 0;
     let mut used = 0u32;
     let mut redirected = false;
+    // A lookup that finds no redirect where the call met one: the tree changed in between.
+    let mut stale = false;
     loop {
+        // Here the call has just failed with EREDIRECT on this path.
         let (at, now) = if redirected {
             (AT_FDCWD, &next[..length])
         } else {
             (dirfd, path)
         };
-        // Only the RAM service redirects; the EXDEV of a path of the volume is its own.
-        if matches!(crate::data::route(at, now), Ok(Some(_))) {
-            return result;
-        }
-        let Ok(placed) = place(at, now) else {
-            return result;
-        };
+        let placed = place(at, now)?;
         let mut found = [0u8; MAX_PATH];
-        let asked =
-            crate::shared::with_files(|files| Ok(files.transport())).and_then(|transport| {
-                transport
-                    .files()
-                    .redirect_of(placed.start_fd(), placed.path(), follow, &mut found)
-                    .map_err(|_| EIO)
-            });
-        let Ok(Some(redirect)) = asked else {
-            return result;
-        };
-        used = used.saturating_add(1 + redirect.links);
+        let asked = crate::shared::with_files(|files| Ok(files.transport()))?
+            .files()
+            .redirect_of(placed.start_fd(), placed.path(), follow, &mut found)
+            .map_err(lookup_failure)?;
+        match asked {
+            None => {
+                // The call goes again on the same path once, and counts as a link.
+                if core::mem::replace(&mut stale, true) {
+                    return Err(EIO);
+                }
+                used += 1;
+            }
+            Some(redirect) => {
+                // A call with one path has the redirect of its first; the targets other than the
+                // route by path are for the layers of the file system (step C3 routes them).
+                if redirect.index != 0
+                    || redirect.target != proto_fs::REDIRECT_BY_PATH
+                    || redirect.length == 0
+                {
+                    return Err(EIO);
+                }
+                stale = false;
+                used = used.saturating_add(1 + redirect.links);
+                if used > proto_fs::LINKS_MAX {
+                    return Err(ELOOP);
+                }
+                length = posix_path::simplify(&found[..redirect.length], &mut next);
+                redirected = true;
+            }
+        }
         if used > proto_fs::LINKS_MAX {
             return Err(ELOOP);
         }
-        // The RAM service's own path goes as it is; any other is simplified, and the layer then
-        // routes it by its text.
-        length = if redirect.target == proto_fs::REDIRECT_RAM {
-            next[..redirect.length].copy_from_slice(&found[..redirect.length]);
-            redirect.length
+        let (at, now) = if redirected {
+            (AT_FDCWD, &next[..length])
         } else {
-            posix_path::simplify(&found[..redirect.length], &mut next)
+            (dirfd, path)
         };
-        redirected = true;
-        result = attempt(AT_FDCWD, &next[..length]);
-        if !matches!(result, Err(EXDEV)) {
-            return result;
+        match attempt(at, now) {
+            Err(crate::EREDIRECT) => {}
+            result => return result,
         }
     }
 }
@@ -469,7 +501,7 @@ pub fn renameat(old_dirfd: c_int, old: &[u8], new_dirfd: c_int, new: &[u8]) -> R
     check_virtual(Named::Rename, &first, Some(&second), true)?;
     let mut rename = request(ChangeOp::Rename, &first);
     rename.second = Some((second.base, second.path()));
-    run_unit(&rename)
+    leave(run_unit(&rename))
 }
 
 /// link and linkat: the new name is a link to the old name itself unless
@@ -497,7 +529,7 @@ pub fn linkat(
         0
     };
     link.second = Some((second.base, second.path()));
-    run_unit(&link)
+    leave(run_unit(&link))
 }
 
 /// symlink: `target` is stored as it is, up to 511 bytes, empty too.

@@ -2159,6 +2159,10 @@ mod tests {
             let has_data = table.iter().any(|record| record.name == DATA_SERVICE);
             let first = first_args(table, RAM_SERVICE);
             assert_eq!(!first.is_empty(), has_data);
+            // The extra arguments take the place of the DMA addresses of the start data
+            // (worker.rs): the RAM service has no DMA objects in any table.
+            let ram = table.iter().find(|record| record.name == RAM_SERVICE);
+            assert!(ram.is_none_or(|ram| ram.dma.is_empty() || first.is_empty()));
             with += usize::from(has_data);
             for record in table.iter().filter(|record| record.name != RAM_SERVICE) {
                 assert!(first_args(table, record.name).is_empty(), "{}", record.name);
@@ -3873,7 +3877,9 @@ mod tests {
             check(table).unwrap();
             let ram = table.iter().find(|r| r.name == "ramfs").unwrap();
             let clock = table.iter().find(|r| r.name == "clock").unwrap();
-            assert_eq!(ram.args, proto_fs::RAM_TIME_CLOCKED);
+            // The time mode, and for one probe table the mount of the data volume after it.
+            assert!(ram.args.starts_with(proto_fs::RAM_TIME_CLOCKED));
+            assert!(ram.args == proto_fs::RAM_TIME_CLOCKED || ram.args.ends_with(b" mount=data"));
             let has_pipe = table.iter().any(|r| r.name == PIPE_SERVICE);
             assert_eq!(
                 ram.connects,

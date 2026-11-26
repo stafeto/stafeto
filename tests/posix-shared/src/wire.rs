@@ -102,3 +102,27 @@ pub fn payload() -> bool {
     rt::println!("posix-message-probe: full request and reply payloads preserved");
     true
 }
+
+/// A call that takes a redirect on the stack of a native thread: the RAM service of this image has
+/// the mount of the data volume, and a link onto it ends the walk in a redirect. The layer here
+/// has no data service, so the path goes back to the RAM service and the redirects pile up to the
+/// budget of 32: ELOOP, after the deepest the redirect path goes. The stack the call used is
+/// printed at the end of the probe.
+#[inline(never)]
+pub fn redirect() -> bool {
+    use abi::names::{AT_FDCWD, symlinkat};
+    if symlinkat(b"/data", AT_FDCWD, b"/tmp/dl").is_err() {
+        return fail(80);
+    }
+    let first = abi::open(b"/tmp/dl/x", O_RDONLY);
+    let second = abi::open(b"/tmp/dl", O_RDONLY);
+    if first != Err(ELOOP) || second != Err(ELOOP) {
+        rt::println!("posix-message-probe: redirect {first:?} {second:?}");
+        return fail(81);
+    }
+    if abi::names::unlinkat(AT_FDCWD, b"/tmp/dl", 0).is_err() {
+        return fail(82);
+    }
+    rt::println!("posix-message-probe: a redirect taken on a native thread ends in ELOOP");
+    true
+}
