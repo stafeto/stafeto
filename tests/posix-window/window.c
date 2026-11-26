@@ -231,7 +231,7 @@ static int setup_and_refusals(struct stafeto_window *w) {
     memset(w, 0xAA, sizeof *w);
     CHECK(stafeto_window_open(WIN_X, WIN_Y, WIN_W, WIN_H, STAFETO_WINDOW_XRGB8888, 2, 0, w) == 0);
     CHECK(w->width == WIN_W && w->height == WIN_H && w->stride == WIN_W * 4);
-    CHECK(w->format == STAFETO_WINDOW_XRGB8888 && w->buffers == 2 && w->reserved == 0);
+    CHECK(w->format == STAFETO_WINDOW_XRGB8888 && w->buffers == 2 && w->generation != 0);
     CHECK(w->pixels[0] != NULL && w->pixels[1] != NULL && w->pixels[0] != w->pixels[1]);
     CHECK(w->pixels[2] == NULL);
     CHECK(stafeto_window_free_buffers(0) == (STAFETO_WINDOW_BUFFER(0) | STAFETO_WINDOW_BUFFER(1)));

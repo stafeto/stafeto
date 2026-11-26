@@ -139,6 +139,31 @@ pub unsafe extern "C" fn stafeto_window_wait(win: c_int, timeout_ns: u64, bits: 
     }
 }
 
+/// Waits until a buffer of `mask` is free; `*free` (null allowed) gets the
+/// free ones among them. The bits of the service stay for
+/// `stafeto_window_wait`.
+///
+/// # Safety
+/// `free` is null or points to a writable `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_window_wait_free(
+    win: c_int,
+    mask: u32,
+    timeout_ns: u64,
+    free: *mut u32,
+) -> c_int {
+    match window::wait_free(win, mask, timeout_ns) {
+        Ok(got) => {
+            if !free.is_null() {
+                // SAFETY: the caller's pointer, checked for null.
+                unsafe { free.write(got) };
+            }
+            0
+        }
+        Err(errno) => fail(errno),
+    }
+}
+
 /// Takes up to `max` events without waiting: the count.
 ///
 /// # Safety

@@ -93,9 +93,11 @@ struct stafeto_screen {
  * the format, the number of buffers and where each lies in the process.
  * pixels[k] for k below `buffers` points at height * stride bytes: the
  * program may write them while buffer k is free and read them at any time.
- * The other elements are null. reserved is 0. */
+ * The other elements are null. generation is 1 for the first window a
+ * process opens and grows with each window it opens after: a window closed
+ * and opened again under the same number has another generation. */
 struct stafeto_window {
-    uint32_t width, height, stride, format, buffers, reserved;
+    uint32_t width, height, stride, format, buffers, generation;
     void *pixels[STAFETO_WINDOW_BUFFERS_MAX];
 };
 
@@ -138,7 +140,7 @@ STAFETO_WINDOW_ASSERT(offsetof(struct stafeto_window, height) == 4);
 STAFETO_WINDOW_ASSERT(offsetof(struct stafeto_window, stride) == 8);
 STAFETO_WINDOW_ASSERT(offsetof(struct stafeto_window, format) == 12);
 STAFETO_WINDOW_ASSERT(offsetof(struct stafeto_window, buffers) == 16);
-STAFETO_WINDOW_ASSERT(offsetof(struct stafeto_window, reserved) == 20);
+STAFETO_WINDOW_ASSERT(offsetof(struct stafeto_window, generation) == 20);
 STAFETO_WINDOW_ASSERT(offsetof(struct stafeto_window, pixels) == 24);
 STAFETO_WINDOW_ASSERT(sizeof(struct stafeto_rect) == 16);
 STAFETO_WINDOW_ASSERT(sizeof(struct stafeto_window_event) == 16);
@@ -196,8 +198,8 @@ int stafeto_window_open(int x, int y, int w, int h, uint32_t format,
  *   EBADF   win is not the window's number or the window was closed;
  *   EINVAL  out is null.
  * The values are those of the window that is open now: a window closed and
- * opened again may have the same number and another description. No call to
- * the service. */
+ * opened again may have the same number and has another generation. No call
+ * to the service. */
 int stafeto_window_info(int win, struct stafeto_window *out);
 
 /* Posts buffer `buffer` of window `win`: the service shows it in its next
@@ -250,13 +252,32 @@ uint32_t stafeto_window_free_buffers(int win);
  *   ENODEV     the service ended (known from an earlier call; see below);
  *   EBUSY      another thread of the process is waiting on the window;
  *   EIO        the kernel refused the wait.
- * A wait does not learn of the service's end by itself: the check runs at
- * entry, so a wait that is under way when the service ends returns only when
- * a bit or its time comes, and a later call (post, events) is what finds the
- * service gone. A program should use a finite timeout.
+ * The service's end wakes a wait that is under way (the kernel tells the
+ * window's channel when the service's last copy of it goes), and the wait
+ * returns ENODEV; a call that finds the service gone (post, events) does
+ * too.
  * A later descriptor for poll will only add a way to sleep;
  * stafeto_window_wait(win, 0, &bits) stays the call that takes the bits. */
 int stafeto_window_wait(int win, uint64_t timeout_ns, uint32_t *bits);
+
+/* Waits until a buffer of `mask` (a mask of STAFETO_WINDOW_BUFFER(k) bits) is
+ * free by the library's account, at most timeout_ns nanoseconds (0 looks
+ * without waiting, UINT64_MAX waits with no limit), and gives in *free (null
+ * is allowed) the free buffers among them. It takes no bit away from
+ * stafeto_window_wait: the bits the service sent, the events bit among them,
+ * stay for the next call of that function, which a thread asleep in it is woken
+ * for. One thread at a time waits inside stafeto_window_wait; while one does,
+ * this function takes what waits on the channel without blocking and pauses a
+ * millisecond between looks, so it does not depend on that thread running.
+ * 0 when a buffer of the mask is free, or -1 with errno:
+ *   ETIMEDOUT  none was free in time;
+ *   EINTR      a signal with a handler ran during the wait;
+ *   EINVAL     mask is 0 or names a bit that is no buffer;
+ *   EBADF      win is not the window's number;
+ *   ENODEV     the service ended;
+ *   EIO        the kernel refused the wait. */
+int stafeto_window_wait_free(int win, uint32_t mask, uint64_t timeout_ns,
+                             uint32_t *free);
 
 /* Takes up to max events of the window's ring without waiting: the count,
  * 0 for none. A max above STAFETO_WINDOW_EVENTS_MAX takes that many. The
