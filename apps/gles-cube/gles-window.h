@@ -511,15 +511,27 @@ static void window_damage_swaps(EGLDisplay display, EGLSurface surface, uint8_t 
 /* The end of the window mode: eglTerminate with the surface and the context
  * still current marks them for deletion; a swap then finds the display not
  * initialized, and eglReleaseThread lets go of them. The window outlives its
- * surface: it is closed after. */
-static void window_terminate(EGLDisplay display, EGLSurface surface)
+ * surface: it is closed after, or, with --hold, kept for the holder of a scene. */
+static void window_terminate(EGLDisplay display, EGLSurface surface, int hold_fd)
 {
 	CHECK(eglTerminate(display) == EGL_TRUE);
 	CHECK(eglSwapBuffers(display, surface) == EGL_FALSE);
 	CHECK_ERROR(EGL_NOT_INITIALIZED);
 	CHECK(eglReleaseThread() == EGL_TRUE);
+	printf("gles-cube: api eglTerminate with the surface current, a swap after it is EGL_NOT_INITIALIZED and eglReleaseThread lets go\n");
+	if (hold_fd >= 0) {
+		/* The window stays as the last swap left it: its CRC, the byte for the
+		 * holder of the scene, and a sleep until the holder kills the program. */
+		printf("gles-cube: held crc %08x\n", (unsigned)screen_crc(shown_buffer()));
+		fflush(stdout);
+		char byte = 'h';
+		CHECK(write(hold_fd, &byte, 1) == 1);
+		for (;;) {
+			struct timespec forever = {3600, 0};
+			nanosleep(&forever, NULL);
+		}
+	}
 	CHECK(stafeto_window_close(window_number) == 0);
 	window_number = -1;
-	printf("gles-cube: api eglTerminate with the surface current, a swap after it is EGL_NOT_INITIALIZED and eglReleaseThread lets go\n");
 }
 
