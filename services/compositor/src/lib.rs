@@ -43,6 +43,7 @@ mod element_tests;
 pub mod elements;
 pub mod fit;
 pub mod frame;
+pub mod prep;
 
 /// The stack of the service in the images (`COMP_STACK_SIZE` of xtask, which a test
 /// holds to this): the steps build paints the part of it that `px::stack` scans.
@@ -875,6 +876,19 @@ pub struct Scene {
     slot_pending: Option<u8>,
     slot_working: Option<u8>,
     stage: Stage,
+    /// The prepared images of the elements that turn or stretch (`prep`), when the
+    /// service has a worker for them: the table, the slots of the elements of each
+    /// of the three places of scenes, and what the frame in work holds.
+    prep: Option<&'static prep::Table>,
+    maps: [prep::Map; 3],
+    /// The image of each slot the frame in work reads, taken at its start.
+    front: [Option<u8>; prep::SLOTS],
+    /// The buffers of each window whose free waits for the worker to let go of
+    /// them (a bit each), and the id of the window the worker was told of.
+    owed: [u8; MAX_WINDOWS],
+    told: [u32; MAX_WINDOWS],
+    /// A frame ended with the worker blocked on it: the worker is to be woken.
+    wake: bool,
 }
 
 /// What the scene session's own state holds besides its two scenes.
@@ -1020,7 +1034,20 @@ impl Scene {
             slot_pending: None,
             slot_working: None,
             stage: Stage::NEW,
+            prep: None,
+            maps: [prep::NO_MAP; 3],
+            front: [None; prep::SLOTS],
+            owed: [0; MAX_WINDOWS],
+            told: [0; MAX_WINDOWS],
+            wake: false,
         }
+    }
+
+    /// The elements that turn, reflect or stretch a window are drawn from the
+    /// prepared images of `table` from now on: a commit reserves them, and an
+    /// element shows nothing until its image is first made.
+    pub fn set_prep(&mut self, table: &'static prep::Table) {
+        self.prep = Some(table);
     }
 
     pub fn window(&self, i: usize) -> Option<&Window> {
@@ -1381,6 +1408,13 @@ impl Scene {
     /// the window changes nothing on the screen (no element uses it, or what
     /// they show of it is off the screen).
     fn window_damage(&self, i: usize, rects: &[Rect]) -> Option<Rect> {
+        self.window_damage_in(i, rects, self.prep.is_some())
+    }
+
+    /// `window_damage`, with or without the elements whose image the worker makes
+    /// (`prepared`: their change is damage when the image is made; a window that
+    /// goes is damage of all of them).
+    fn window_damage_in(&self, i: usize, rects: &[Rect], prepared: bool) -> Option<Rect> {
         let w = self.window(i)?;
         if !self.scene_on() {
             return Scene::changed(w.rect, rects).ok();
@@ -1398,7 +1432,7 @@ impl Scene {
         // may come before or after the window's buffer is taken.
         for def in [self.working(), self.pending_def()].into_iter().flatten() {
             for r in rects {
-                if let Some(d) = elements::window_damage(def, w.id, *r) {
+                if let Some(d) = elements::window_damage_by(def, w.id, *r, prepared) {
                     sum = Some(union(sum, d));
                 }
             }
@@ -1454,6 +1488,132 @@ impl Scene {
         self.post_inner(i, buffer, rects, Some((clock, now)))
     }
 
+    /// A post of `buffer` of window `i` with the changed `rects` (its own points,
+    /// none for all) by a client at `level`: the prepared images of the elements
+    /// that show the window are behind by what the element carries of the change,
+    /// and the worker is to draw it from `buffer`. True when some image is behind.
+    pub fn note_post(&mut self, i: usize, buffer: u8, rects: &[Rect], level: u8) -> bool {
+        let Some(t) = self.prep else {
+            return false;
+        };
+        let Some(w) = self.window(i).copied() else {
+            return false;
+        };
+        if self.told[i] != w.id {
+            t.set_window(i, w.id, w.format, w.stride, w.rect.w, w.rect.h);
+            self.told[i] = w.id;
+        }
+        t.set_latest(i, buffer);
+        let all = [Rect {
+            x: 0,
+            y: 0,
+            w: w.rect.w,
+            h: w.rect.h,
+        }];
+        let rects = if rects.is_empty() { &all[..] } else { rects };
+        let mut behind = false;
+        for k in [self.slot_working, self.slot_pending].into_iter().flatten() {
+            let k = usize::from(k);
+            for (j, e) in self.defs[k].elements().iter().enumerate() {
+                let slot = self.maps[k][j];
+                if e.source != w.id || slot == prep::NO_SLOT {
+                    continue;
+                }
+                for r in rects {
+                    if let Some(local) = elements::target_local(e, *r) {
+                        t.damage(usize::from(slot), local, level);
+                        behind = true;
+                    }
+                }
+            }
+        }
+        behind
+    }
+
+    /// The buffers whose free waited for the worker to let go and can be free
+    /// now, by window (a bit each): the clients are to be told.
+    #[allow(clippy::needless_range_loop)]
+    pub fn release_owed(&mut self) -> [u8; MAX_WINDOWS] {
+        let mut freed = [0u8; MAX_WINDOWS];
+        let Some(t) = self.prep else {
+            return freed;
+        };
+        for i in 0..MAX_WINDOWS {
+            for j in 0..BUFFERS {
+                if self.owed[i] & (1 << j) != 0 && !t.reads(i, Some(j as u8)) {
+                    self.owed[i] &= !(1 << j);
+                    if let Some(w) = self.windows[i].as_mut() {
+                        w.bufs[j] = Buf::Free;
+                        freed[i] |= 1 << j;
+                    }
+                }
+            }
+        }
+        freed
+    }
+
+    /// The worker drew the rectangles `drawn` of the images of some slots: the
+    /// screen is damaged where an element shows them (in the working scene and the
+    /// pending one, each at its own place), as a change of a window is. The number
+    /// of slots told.
+    pub fn images_drawn(&mut self, drawn: &[(usize, Rect)]) -> usize {
+        let mut told = 0;
+        for &(slot, local) in drawn {
+            let mut sum = None;
+            for k in [self.slot_working, self.slot_pending].into_iter().flatten() {
+                let k = usize::from(k);
+                for (j, e) in self.defs[k].elements().iter().enumerate() {
+                    if usize::from(self.maps[k][j]) != slot {
+                        continue;
+                    }
+                    let (x0, y0) = (
+                        i64::from(e.dx) + i64::from(local.x),
+                        i64::from(e.dy) + i64::from(local.y),
+                    );
+                    if let Some(r) =
+                        elements::clip(x0, y0, x0 + i64::from(local.w), y0 + i64::from(local.h))
+                    {
+                        sum = Some(union(sum, r));
+                    }
+                }
+            }
+            if let Some(d) = sum {
+                self.route_damage(d, true);
+                told += 1;
+            }
+        }
+        told
+    }
+
+    /// Whether the worker may be reading window `i` (its unmapping waits).
+    pub fn worker_reads(&self, i: usize) -> bool {
+        self.prep.is_some_and(|t| t.reads(i, None))
+    }
+
+    /// The frame ended with a slot waiting for the image a frame held: the worker
+    /// is to be woken (once).
+    pub fn take_wake(&mut self) -> bool {
+        core::mem::take(&mut self.wake)
+    }
+
+    /// The slots no scene holds are let go (a taking made another scene the
+    /// working one, or the scene ended).
+    fn sweep(&self) {
+        if let Some(t) = self.prep {
+            let keep: [Option<&prep::Map>; 2] = [
+                self.slot_working.map(|k| &self.maps[usize::from(k)]),
+                self.slot_pending.map(|k| &self.maps[usize::from(k)]),
+            ];
+            let mut held = [&prep::NO_MAP; 2];
+            let mut n = 0;
+            for m in keep.into_iter().flatten() {
+                held[n] = m;
+                n += 1;
+            }
+            let _ = t.reserve(&[], &held[..n], 1);
+        }
+    }
+
     fn post_inner(
         &mut self,
         i: usize,
@@ -1489,9 +1649,16 @@ impl Scene {
             }
         }
         w.bufs[buffer as usize] = Buf::Posted;
-        let replaced = w.posted.replace(buffer);
+        let mut replaced = w.posted.replace(buffer);
         if let Some(j) = replaced {
-            w.bufs[j as usize] = Buf::Free;
+            // A buffer the worker may be reading is free when it lets go.
+            if self.prep.is_some_and(|t| t.reads(i, Some(j))) {
+                w.bufs[j as usize] = Buf::Taken;
+                self.owed[i] |= 1 << j;
+                replaced = None;
+            } else {
+                w.bufs[j as usize] = Buf::Free;
+            }
         }
         let mut due = None;
         match paced {
@@ -1564,8 +1731,15 @@ impl Scene {
     /// the focus it had passes to the window on top, and the manager is
     /// told.
     pub fn destroy(&mut self, i: usize) -> Option<Window> {
-        let carried = self.scene_on().then(|| self.window_damage(i, &[]));
+        let carried = self
+            .scene_on()
+            .then(|| self.window_damage_in(i, &[], false));
         let w = self.windows.get_mut(i)?.take()?;
+        if let Some(t) = self.prep {
+            t.clear_window(i);
+        }
+        self.owed[i] = 0;
+        self.told[i] = 0;
         if w.legacy {
             self.release = true;
         }
@@ -1991,6 +2165,7 @@ impl Scene {
             self.slot_working = None;
             self.stage = Stage::NEW;
             self.add_damage(SCREEN);
+            self.sweep();
         }
         // The start the windows this taking leaves are due at, whether or not
         // anything else is taken: with nothing to take the caller says `hold`.
@@ -2093,6 +2268,14 @@ impl Scene {
         };
         self.whole = area == SCREEN;
         self.frame = true;
+        // The images the frame reads are taken now and held to its end.
+        if let (Some(t), Some(w)) = (self.prep, self.slot_working) {
+            for s in self.maps[usize::from(w)] {
+                if s != prep::NO_SLOT && self.front[usize::from(s)].is_none() {
+                    self.front[usize::from(s)] = t.frame_take(usize::from(s));
+                }
+            }
+        }
         Some(area)
     }
 
@@ -2152,14 +2335,30 @@ impl Scene {
     /// The frame is shown (or failed): what it frees of each window.
     pub fn end(&mut self, shown: bool) -> [Ended; MAX_WINDOWS] {
         let mut out = [Ended::default(); MAX_WINDOWS];
-        for (w, e) in self.windows.iter_mut().zip(out.iter_mut()) {
+        let prep = self.prep;
+        for (i, (w, e)) in self.windows.iter_mut().zip(out.iter_mut()).enumerate() {
             let Some(w) = w else {
                 continue;
             };
             e.in_frame = core::mem::take(&mut w.in_frame);
             if let Some(r) = w.retired.take() {
-                w.bufs[r as usize] = Buf::Free;
-                e.freed = Some(r);
+                // A buffer the worker may be reading is free when it lets go.
+                if prep.is_some_and(|t| t.reads(i, Some(r))) {
+                    self.owed[i] |= 1 << r;
+                } else {
+                    w.bufs[r as usize] = Buf::Free;
+                    e.freed = Some(r);
+                }
+            }
+        }
+        if let Some(t) = prep {
+            for s in 0..prep::SLOTS {
+                if self.front[s].take().is_some() {
+                    t.frame_release(s);
+                }
+            }
+            if t.unblock() {
+                self.wake = true;
             }
         }
         self.frame = false;
@@ -2301,7 +2500,7 @@ impl Scene {
         // The topmost opaque element that covers the damage whole: the base.
         let mut base = None;
         for (k, e) in def.elements().iter().enumerate() {
-            if let Some(r) = self.element_place(e)
+            if let Some(r) = self.element_place_at(k, e)
                 && e.transparency == 0
                 && covers_rect(r, damage)
             {
@@ -2316,17 +2515,23 @@ impl Scene {
         // The group that takes the next layer, when it fits.
         let mut open: Option<usize> = None;
         for (k, e) in def.elements().iter().enumerate().skip(base.unwrap_or(0)) {
-            let Some(r) = self.element_place(e) else {
+            let Some((view, prepared)) = self.drawn(k, e) else {
+                continue;
+            };
+            let Some(r) = elements::target_bounds(&view) else {
                 continue;
             };
             if !touches(r) {
                 continue;
             }
-            let argb = self
-                .place_of(e.source)
-                .and_then(|p| self.window(p))
-                .is_some_and(|w| w.format == Format::Argb);
-            let (first, second) = elements::classes(e, argb);
+            let argb = match prepared {
+                Some((slot, _)) => self.slot_argb(slot),
+                None => self
+                    .place_of(e.source)
+                    .and_then(|p| self.window(p))
+                    .is_some_and(|w| w.format == Format::Argb),
+            };
+            let (first, second) = elements::classes(&view, argb);
             let (a, b) = (PRICES[first.row()], second.map(|c| PRICES[c.row()]));
             // The alpha or the mask is part of the one call of pixman the stretch
             // makes: it adds its rows and points, and no second call. A stretch that
@@ -2614,6 +2819,12 @@ impl Scene {
     /// body said) is checked against the windows and becomes the pending one;
     /// what is refused leaves the scenes as they were.
     pub fn commit_done(&mut self, ask: bool) -> Result<(), Refusal> {
+        self.commit_done_at(ask, 1)
+    }
+
+    /// `commit_done` of a commit that came at `level`, the level the worker draws
+    /// the images of elements whose window has not posted yet.
+    pub fn commit_done_at(&mut self, ask: bool, level: u8) -> Result<(), Refusal> {
         let k = self.free_slot();
         let def = &self.defs[k];
         let shape = |id: u32| {
@@ -2626,6 +2837,8 @@ impl Scene {
                 })
         };
         elements::check(def, shape).map_err(|Fault::Invalid| Refusal::Invalid)?;
+        self.reserve_images(k, level)?;
+        let def = &self.defs[k];
         let active = def.active;
         let damage = elements::scene_damage(self.pending_def().or(self.working()), def);
         if active {
@@ -2640,6 +2853,7 @@ impl Scene {
                 None => {
                     self.slot_pending = None;
                     self.slot_working = Some(k as u8);
+                    self.sweep();
                     if core::mem::take(&mut self.stage.ask_committed) {
                         self.stage.committed_now = true;
                     }
@@ -2652,6 +2866,48 @@ impl Scene {
             self.slot_pending = Some(k as u8);
             self.stage.committed_now |= ask;
         }
+        Ok(())
+    }
+
+    /// The images of the elements of the scene parsed into place `k` are reserved
+    /// (`prep::Table::reserve`): the slots the working and the pending scene hold
+    /// are kept as they are, and when the pool is short for those too, the pending
+    /// scene's (the commit replaces it) are let go. LIMIT when the images do not fit
+    /// the pool at all, BUSY when they fit once the worker lets go of slots.
+    fn reserve_images(&mut self, k: usize, level: u8) -> Result<(), Refusal> {
+        let Some(t) = self.prep else {
+            return Ok(());
+        };
+        let mut wants: [Option<(prep::Key, usize)>; MAX_ELEMENTS] = [None; MAX_ELEMENTS];
+        for (j, e) in self.defs[k].elements().iter().enumerate() {
+            let Some(place) = self.place_of(e.source) else {
+                continue;
+            };
+            let Some(w) = self.window(place) else {
+                continue;
+            };
+            wants[j] = prep::key_of(e, w.format).map(|key| (key, place));
+        }
+        let working = self.slot_working.map(|w| self.maps[usize::from(w)]);
+        let pending = self.slot_pending.map(|p| self.maps[usize::from(p)]);
+        let mut both = [&prep::NO_MAP; 2];
+        let mut n = 0;
+        for m in [working.as_ref(), pending.as_ref()].into_iter().flatten() {
+            both[n] = m;
+            n += 1;
+        }
+        let map = match t.reserve(&wants[..self.defs[k].elements().len()], &both[..n], level) {
+            Ok(map) => map,
+            Err(_) => {
+                let only = [working.as_ref().unwrap_or(&prep::NO_MAP)];
+                t.reserve(&wants[..self.defs[k].elements().len()], &only, level)
+                    .map_err(|why| match why {
+                        prep::Refuse::Full => Refusal::Limit,
+                        prep::Refuse::Wait => Refusal::Busy,
+                    })?
+            }
+        };
+        self.maps[k] = map;
         Ok(())
     }
 
@@ -2669,8 +2925,10 @@ impl Scene {
         if !self.scene_on() {
             let k = self.free_slot();
             self.defs[k].clear();
+            self.maps[k] = prep::NO_MAP;
             self.slot_pending = Some(k as u8);
             self.stage.held = Some(SCREEN);
+            self.sweep();
         }
         self.stage.compose_due = true;
         self.stage.ask_composed = ask;
@@ -2693,6 +2951,7 @@ impl Scene {
             self.slot_working = None;
             self.stage = Stage::NEW;
             self.add_damage(SCREEN);
+            self.sweep();
         }
     }
 
@@ -2708,6 +2967,7 @@ impl Scene {
             if core::mem::take(&mut self.stage.ask_committed) {
                 self.stage.committed_now = true;
             }
+            self.sweep();
         }
         if compose_now {
             if damaged {
@@ -2725,6 +2985,7 @@ impl Scene {
             self.slot_working.map(|k| &self.defs[usize::from(k)]),
             self.slot_pending.map(|k| &self.defs[usize::from(k)]),
         );
+        let prep = self.prep;
         for (i, w) in self.windows.iter_mut().enumerate() {
             let Some(w) = w else {
                 continue;
@@ -2745,8 +3006,12 @@ impl Scene {
             } else if let Some(b) = w.posted.take() {
                 w.bufs[b as usize] = Buf::Taken;
                 if let Some(old) = w.current.replace(b) {
-                    w.bufs[old as usize] = Buf::Free;
-                    self.stage.given[i] = Some(old);
+                    if prep.is_some_and(|t| t.reads(i, Some(old))) {
+                        self.owed[i] |= 1 << old;
+                    } else {
+                        w.bufs[old as usize] = Buf::Free;
+                        self.stage.given[i] = Some(old);
+                    }
                 }
             }
         }
@@ -2778,6 +3043,39 @@ impl Scene {
     /// something now: its target rectangle cut to the screen, when its window
     /// has a buffer taken and holds the source rectangle; None otherwise (it
     /// shows nothing).
+    /// What element `k` (`e`) of the working scene draws now: the element as the
+    /// bands draw it and, for one whose image the worker makes, the slot and the
+    /// image of it the frame holds. None when it draws nothing: its window has
+    /// nothing taken or does not hold the source rectangle, or its image was
+    /// never made.
+    pub fn drawn(&self, k: usize, e: &Element) -> Option<(Element, Option<(u8, u8)>)> {
+        let w = self.window(self.place_of(e.source)?)?;
+        if w.current.is_none() || !elements::source_fits(e, w.rect.w, w.rect.h) {
+            return None;
+        }
+        if self.prep.is_some() && prep::needs(e) {
+            let slot = self.maps[usize::from(self.slot_working?)][k];
+            if slot == prep::NO_SLOT {
+                return None;
+            }
+            let image = self.front[usize::from(slot)]?;
+            return Some((prep::view(e), Some((slot, image))));
+        }
+        Some((*e, None))
+    }
+
+    /// The place of element `k` of the working scene on the screen (`drawn`).
+    pub fn element_place_at(&self, k: usize, e: &Element) -> Option<Rect> {
+        self.drawn(k, e)
+            .and_then(|(view, _)| elements::target_bounds(&view))
+    }
+
+    /// Whether the image slot `slot` holds is of ARGB8888 (and not XRGB8888).
+    fn slot_argb(&self, slot: u8) -> bool {
+        self.prep
+            .is_some_and(|t| t.geometry(usize::from(slot)).key.argb)
+    }
+
     pub fn element_place(&self, e: &Element) -> Option<Rect> {
         let w = self.window(self.place_of(e.source)?)?;
         if w.current.is_none() || !elements::source_fits(e, w.rect.w, w.rect.h) {
@@ -2865,6 +3163,21 @@ pub trait Source {
     /// The bytes of buffer `buffer` of window `window`: at least `stride`
     /// times the window's height.
     fn pixels(&self, window: usize, buffer: u8) -> &[u8];
+
+    /// The prepared image `image` of slot `slot` (`prep`): its bytes, stride,
+    /// size and whether it is of ARGB8888. A source with no prepared images has
+    /// none.
+    fn prepared(&self, slot: u8, image: u8) -> (&[u8], u32, (u32, u32), bool) {
+        let _ = (slot, image);
+        (&[], 0, (0, 0), false)
+    }
+}
+
+/// The number of the surface of image `image` of prepared slot `slot` for the
+/// raster's table of images: none (the table looks the image up in its ring).
+pub const fn prep_image(slot: u8, image: u8) -> usize {
+    let _ = (slot, image);
+    usize::MAX
 }
 
 /// The pixel operations of a band. The program's is pixman's.
@@ -3067,21 +3380,27 @@ fn compose_elements(
     let (x0, y0) = (i64::from(band.x), i64::from(band.y));
     let (x1, y1) = (x0 + i64::from(band.w), y0 + i64::from(band.h));
     let els = def.elements();
-    let places = |e: &Element| {
+    // What each element draws (`Scene::drawn`): as the element, or as its prepared
+    // image's view, and the slot and image of that.
+    let mut drawn = [None; MAX_ELEMENTS];
+    for (k, e) in els.iter().enumerate() {
+        drawn[k] = scene.drawn(k, e);
+    }
+    let places = |k: usize, e: &Element| {
         let place = scene.place_of(e.source)?;
-        scene.element_place(e).map(|_| (place, scene.window(place)))
+        drawn[k].map(|_| (place, scene.window(place)))
     };
     // Whether an element copies and covers the band whole.
-    let covers = |e: &Element| {
+    let covers = |k: usize, e: &Element| {
         e.transparency == 0
-            && places(e).is_some()
+            && drawn[k].is_some()
             && i64::from(e.dx) <= x0
             && i64::from(e.dy) <= y0
             && i64::from(e.dx) + i64::from(e.dw) >= x1
             && i64::from(e.dy) + i64::from(e.dh) >= y1
     };
     if passes.is_black(pass) {
-        if !els.iter().any(covers) {
+        if !els.iter().enumerate().any(|(k, e)| covers(k, e)) {
             raster.fill(fb, band, def.fill());
         }
         return product;
@@ -3090,12 +3409,12 @@ fn compose_elements(
     let base = els
         .iter()
         .enumerate()
-        .rposition(|(k, e)| passes.group_of(k) == Some(pass) && covers(e))
+        .rposition(|(k, e)| passes.group_of(k) == Some(pass) && covers(k, e))
         .unwrap_or(0);
     // The area an element covers of the band: None when nothing, or when the
     // element is under the base or has no window to draw from.
     let area_of = |k: usize, e: &Element| -> Option<(Rect, (i64, i64))> {
-        if k < base || places(e).is_none() {
+        if k < base || places(k, e).is_none() {
             return None;
         }
         let (ex0, ey0) = (i64::from(e.dx), i64::from(e.dy));
@@ -3119,23 +3438,41 @@ fn compose_elements(
         let Some((area, (dx, dy))) = area_of(k, e) else {
             continue;
         };
-        let Some((place, Some(w))) = places(e) else {
+        let Some((place, Some(w))) = places(k, e) else {
             continue;
         };
         let Some(b) = w.current else {
             continue;
         };
+        // The element as it is drawn: its prepared image's view when the worker
+        // makes the image, with the image as the surface.
+        let Some((e, prepared)) = drawn[k] else {
+            continue;
+        };
+        let e = &e;
         let plain = elements::is_plain(e);
         let from = (
             ((i64::from(e.sx) >> 16) + dx) as u32,
             ((i64::from(e.sy) >> 16) + dy) as u32,
         );
-        let surface = Surface {
-            bytes: src.pixels(place, b),
-            stride: w.stride,
-            format: w.format,
-            size: (w.rect.w, w.rect.h),
-            image: image_of(place, b),
+        let surface = match prepared {
+            Some((slot, image)) => {
+                let (bytes, stride, size, argb) = src.prepared(slot, image);
+                Surface {
+                    bytes,
+                    stride,
+                    format: if argb { Format::Argb } else { Format::Xrgb },
+                    size,
+                    image: prep_image(slot, image),
+                }
+            }
+            None => Surface {
+                bytes: src.pixels(place, b),
+                stride: w.stride,
+                format: w.format,
+                size: (w.rect.w, w.rect.h),
+                image: image_of(place, b),
+            },
         };
         if plain && (e.transparency == 0 || e.transparency == proto_comp::TRANSPARENCY_SOURCE) {
             raster.blit(

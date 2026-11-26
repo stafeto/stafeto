@@ -12,6 +12,7 @@
 //! must be the reference's, point for point.
 
 use super::*;
+use crate::prep;
 use proto_comp::{
     BILINEAR, MIRROR, NEAREST, NO_WINDOW, TRANSPARENCY_ALPHA, TRANSPARENCY_MASK,
     TRANSPARENCY_SOURCE, meaning,
@@ -90,11 +91,22 @@ fn point(bytes: &[u8], stride: u32, format: Format, x: u32, y: u32) -> u32 {
     }
 }
 
-struct Wins(Vec<Win>);
+struct Wins(Vec<Win>, Option<&'static prep::Table>);
 
 impl Source for Wins {
     fn pixels(&self, window: usize, _: u8) -> &[u8] {
         &self.0[window].bytes
+    }
+
+    fn prepared(&self, slot: u8, image: u8) -> (&[u8], u32, (u32, u32), bool) {
+        let t = self.1.expect("a table");
+        let g = t.geometry(usize::from(slot));
+        (
+            t.image(usize::from(slot), image),
+            g.stride(),
+            (g.w, g.h),
+            g.key.argb,
+        )
     }
 }
 
@@ -262,7 +274,7 @@ impl Rig {
         }
         Rig {
             scene,
-            wins: Wins(wins),
+            wins: Wins(wins, None),
         }
     }
 
@@ -1396,4 +1408,334 @@ fn a_product_that_is_refused_leaves_its_band_undrawn_and_the_frame_goes_on() {
     // The elements are not drawn: the point inside the first is the black's.
     assert_eq!(get(&fb, 70, 50), BG & 0xFF_FFFF);
     rig.scene.end(true);
+}
+
+// ---------------------------------------------------------------- prepared images
+
+/// The maker of the images of the tests: each point of the area is the one the
+/// reference's sampler takes from the window through the element's map.
+struct RefMaker;
+
+impl prep::Maker for RefMaker {
+    fn make(
+        &mut self,
+        dst: &mut [u8],
+        stride: u32,
+        argb: bool,
+        _: (u32, u32),
+        e: &Element,
+        src: &prep::Surface2<'_>,
+        area: Rect,
+    ) {
+        let [a, b, c, d, ee, f] = elements::matrix(e);
+        for y in area.y..area.y + area.h {
+            for x in area.x..area.x + area.w {
+                let (xc, yc) = ((i64::from(x) << 16) + 0x8000, (i64::from(y) << 16) + 0x8000);
+                let u = ((i64::from(a) * xc + i64::from(b) * yc) >> 16) + i64::from(c);
+                let v = ((i64::from(d) * xc + i64::from(ee) * yc) >> 16) + i64::from(f);
+                let fetch = |sx: u32, sy: u32| point(src.bytes, src.stride, src.format, sx, sy);
+                let mut s = meaning::at(e.filter, (u, v), src.size, fetch);
+                if !argb {
+                    s |= 0xFF00_0000;
+                }
+                let at = (y * stride + x * 4) as usize;
+                dst[at..at + 4].copy_from_slice(&s.to_le_bytes());
+            }
+        }
+    }
+}
+
+struct WinReads<'a>(&'a [Win]);
+
+impl prep::Reads for WinReads<'_> {
+    fn read(&self, place: usize, _: u8, _: usize) -> &[u8] {
+        &self.0[place].bytes
+    }
+}
+
+impl Rig {
+    /// The rig with the elements that turn or stretch drawn from prepared images
+    /// (the windows told to the table as a POST tells them).
+    fn prepared(specs: &[(Format, u32, u32)]) -> Rig {
+        let table: &'static prep::Table = Box::leak(Box::new(prep::Table::new()));
+        let pool: &'static mut [u8] = Box::leak(vec![0u8; prep::POOL_BYTES].into_boxed_slice());
+        table.set_pool(pool.as_mut_ptr());
+        let mut rig = Rig::new(specs);
+        rig.scene.set_prep(table);
+        rig.wins.1 = Some(table);
+        for i in 0..specs.len() {
+            rig.scene.note_post(i, 0, &[], 28);
+        }
+        rig
+    }
+
+    fn table(&self) -> &'static prep::Table {
+        self.wins.1.expect("a table")
+    }
+
+    /// The worker makes every image that waits, as the thread would, and the
+    /// screen is damaged where they show.
+    fn drain(&mut self) {
+        let t = self.table();
+        let mut job = prep::Job::NONE;
+        let reads = WinReads(&self.wins.0);
+        while let Some((slot, _)) = t.next(&job) {
+            match t.piece(&mut job, slot, &mut RefMaker, &reads) {
+                prep::Pass::More => {}
+                _ => {
+                    t.let_go();
+                }
+            }
+        }
+        let mut out = [(
+            0,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
+        ); prep::SLOTS];
+        let n = t.take_drawn(&mut out);
+        self.scene.images_drawn(&out[..n]);
+    }
+
+    /// A frame over `fb` (kept from frame to frame): false when the scene had
+    /// nothing to draw.
+    fn render(&mut self, fb: &mut [u8]) -> bool {
+        let Some(d) = self.scene.begin() else {
+            return false;
+        };
+        let mut at = Band {
+            row: d.y,
+            col: 0,
+            pass: 0,
+        };
+        let mut sampler = Sampler::new();
+        while at.row < d.y + d.h {
+            at = compose(&self.scene, d, at, fb, &self.wins, &mut sampler);
+        }
+        self.scene.end(true);
+        true
+    }
+
+    fn commit(&mut self, els: &[Element], bg: u32) -> Result<(), Refusal> {
+        self.scene
+            .scene_commit(&SceneCommit::new(proto_comp::ACTIVE, bg, els).unwrap())
+    }
+
+    /// The points of the screen that differ from the reference's (the first few).
+    fn wrong(&self, fb: &[u8], els: &[Element], bg: u32) -> Vec<(u32, u32, u32, u32)> {
+        let want = self.expected(els, bg);
+        let mut wrong = Vec::new();
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let (got, want) = (get(fb, x, y), want[(y * WIDTH + x) as usize]);
+                if got != want && wrong.len() < 5 {
+                    wrong.push((x, y, got, want));
+                }
+            }
+        }
+        wrong
+    }
+}
+
+/// A scene drawn from the prepared images is the reference's, as one drawn by the
+/// bands through the transform is.
+fn prepared_matches(specs: &[(Format, u32, u32)], els: &[Element]) {
+    let mut rig = Rig::prepared(specs);
+    rig.commit(els, BG).unwrap();
+    rig.drain();
+    let mut fb = vec![0xEE; (STRIDE * HEIGHT) as usize];
+    assert!(rig.render(&mut fb));
+    let wrong = rig.wrong(&fb, els, BG);
+    assert!(wrong.is_empty(), "points (x, y, got, want): {wrong:x?}");
+}
+
+#[test]
+fn a_prepared_element_of_every_orientation_scale_and_filter_is_the_reference() {
+    for format in [XRGB, ARGB] {
+        for orient in ORIENTS {
+            for (dw, dh) in [(128, 80), (32, 20), (128, 40), (64, 20)] {
+                for filter in [NEAREST, BILINEAR] {
+                    let mut rig = Rig::prepared(&[(format, 64, 40)]);
+                    let mut e = turned(rig.whole(0, [100, 50, 64, 40]), orient, dw, dh);
+                    e.filter = filter;
+                    if format == ARGB {
+                        e.transparency = TRANSPARENCY_SOURCE;
+                    }
+                    rig.commit(&[e], BG).unwrap();
+                    rig.drain();
+                    let mut fb = vec![0xEE; (STRIDE * HEIGHT) as usize];
+                    assert!(rig.render(&mut fb));
+                    let wrong = rig.wrong(&fb, &[e], BG);
+                    assert!(
+                        wrong.is_empty(),
+                        "{format:?} {orient} {dw}x{dh} {filter}: {wrong:x?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_prepared_element_with_an_alpha_or_a_mask_is_the_reference() {
+    for transparency in [
+        TRANSPARENCY_ALPHA,
+        TRANSPARENCY_MASK,
+        TRANSPARENCY_MASK | TRANSPARENCY_ALPHA,
+    ] {
+        for orient in [0, 1, 3 | MIRROR] {
+            let rig = Rig::new(&[(XRGB, 64, 40), (A8, 128, 80)]);
+            let mut e = turned(rig.whole(0, [100, 50, 64, 40]), orient, 128, 80);
+            e.transparency = transparency;
+            e.alpha = 150;
+            if transparency & TRANSPARENCY_MASK != 0 {
+                e.mask = rig.id(1);
+            }
+            let mut e = turned(e, orient, 128, 80);
+            e.dw = if orient & 1 != 0 { 80 } else { 128 };
+            e.dh = if orient & 1 != 0 { 128 } else { 80 };
+            // The mask is a window of the target's size.
+            let rig = Rig::new(&[(XRGB, 64, 40), (A8, e.dw as u32, e.dh as u32)]);
+            e.source = rig.id(0);
+            e.mask = if transparency & TRANSPARENCY_MASK != 0 {
+                rig.id(1)
+            } else {
+                NO_WINDOW
+            };
+            prepared_matches(&[(XRGB, 64, 40), (A8, e.dw as u32, e.dh as u32)], &[e]);
+        }
+    }
+}
+
+#[test]
+fn an_element_whose_image_is_not_made_yet_shows_nothing() {
+    let mut rig = Rig::prepared(&[(XRGB, 64, 40)]);
+    let e = turned(rig.whole(0, [100, 50, 64, 40]), 1, 64, 40);
+    rig.commit(&[e], BG).unwrap();
+    // The worker has not run: the frame is the background alone.
+    let mut fb = vec![0xEE; (STRIDE * HEIGHT) as usize];
+    assert!(rig.render(&mut fb));
+    let blank = Rig::new(&[(XRGB, 64, 40)]);
+    assert!(blank.wrong(&fb, &[], BG).is_empty());
+    // The image is made and the screen is damaged where it shows: the next frame
+    // has the element.
+    rig.drain();
+    assert!(rig.render(&mut fb));
+    assert!(rig.wrong(&fb, &[e], BG).is_empty());
+}
+
+#[test]
+fn a_post_is_drawn_into_the_image_the_frame_does_not_hold_and_the_latest_wins() {
+    let mut rig = Rig::prepared(&[(XRGB, 64, 40)]);
+    let e = turned(rig.whole(0, [100, 50, 64, 40]), 1, 64, 40);
+    rig.commit(&[e], BG).unwrap();
+    rig.drain();
+    let mut fb = vec![0xEE; (STRIDE * HEIGHT) as usize];
+    assert!(rig.render(&mut fb));
+    // Two more posts before a frame: only the last shows, and the window's points
+    // are read once, from the latest.
+    for round in 1..=2u8 {
+        for b in rig.wins.0[0].bytes.iter_mut() {
+            *b = b.wrapping_add(round * 37);
+        }
+        let i = 0;
+        // The window has one buffer: a post waits for its free (the frame freed it).
+        rig.scene
+            .post(
+                i,
+                0,
+                &[Rect {
+                    x: 0,
+                    y: 0,
+                    w: 64,
+                    h: 40,
+                }],
+            )
+            .ok();
+        rig.scene.note_post(
+            i,
+            0,
+            &[Rect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 40,
+            }],
+            28,
+        );
+    }
+    rig.drain();
+    assert!(rig.render(&mut fb));
+    assert!(rig.wrong(&fb, &[e], BG).is_empty());
+}
+
+#[test]
+fn the_worker_waits_for_a_frame_that_holds_the_image_it_would_draw_in() {
+    let mut rig = Rig::prepared(&[(XRGB, 64, 40)]);
+    let e = turned(rig.whole(0, [100, 50, 64, 40]), 1, 64, 40);
+    rig.commit(&[e], BG).unwrap();
+    rig.drain();
+    let t = rig.table();
+    let slot = (0..prep::SLOTS).find(|&s| t.used(s)).unwrap();
+    // A frame holds the front; a second image is published; the next post finds
+    // the other image the frame's.
+    let held = t.frame_take(slot).unwrap();
+    rig.scene.note_post(0, 0, &[], 28);
+    rig.drain();
+    assert_ne!(t.front_of(slot), Some(held));
+    rig.scene.note_post(0, 0, &[], 28);
+    let mut job = prep::Job::NONE;
+    let reads = WinReads(&rig.wins.0);
+    assert_eq!(
+        t.piece(&mut job, slot, &mut RefMaker, &reads),
+        prep::Pass::Blocked
+    );
+    t.let_go();
+    assert!(!t.work_waits());
+    // The frame ends: the slot wants the worker again.
+    t.frame_release(slot);
+    assert!(t.unblock());
+    assert!(t.work_waits());
+}
+
+#[test]
+fn a_commit_that_does_not_fit_the_pool_is_refused_with_a_limit() {
+    // Two images of 1500 by 700 points are 8.4 MiB.
+    let mut rig = Rig::prepared(&[(XRGB, 64, 40)]);
+    let e = turned(rig.whole(0, [0, 0, 64, 40]), 0, 1500, 700);
+    assert_eq!(rig.commit(&[e], BG), Err(Refusal::Limit));
+    // And the scene that was there is as it was: a smaller one still commits.
+    let ok = turned(rig.whole(0, [0, 0, 64, 40]), 1, 64, 40);
+    assert_eq!(rig.commit(&[ok], BG), Ok(()));
+}
+
+#[test]
+fn the_images_of_a_scene_that_goes_are_let_go_and_those_of_one_that_stays_are_kept() {
+    let mut rig = Rig::prepared(&[(XRGB, 64, 40)]);
+    let a = turned(rig.whole(0, [100, 50, 64, 40]), 1, 64, 40);
+    rig.commit(&[a], BG).unwrap();
+    rig.drain();
+    let t = rig.table();
+    let used = t.pages_used();
+    assert!(used > 0);
+    let mut fb = vec![0xEE; (STRIDE * HEIGHT) as usize];
+    assert!(rig.render(&mut fb));
+    // The element moves: the same image.
+    let moved = Element {
+        dx: 300,
+        dy: 200,
+        ..a
+    };
+    rig.commit(&[moved], BG).unwrap();
+    assert_eq!(t.pages_used(), used);
+    assert!(rig.render(&mut fb));
+    assert!(rig.wrong(&fb, &[moved], BG).is_empty());
+    // A scene with no element needing an image lets them go.
+    let plain = rig.whole(0, [10, 10, 64, 40]);
+    rig.commit(&[plain], BG).unwrap();
+    assert!(rig.render(&mut fb));
+    assert_eq!(t.pages_used(), 0);
 }
