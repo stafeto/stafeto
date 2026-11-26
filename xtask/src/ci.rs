@@ -173,6 +173,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("cxx-probe", 20),
     ("gles-probe", 130),
     ("gles-probe steps", 72),
+    ("deqp-smoke", 200),
     ("posix-files", 29),
     ("posix-files steps", 31),
     ("posix-procs", 69),
