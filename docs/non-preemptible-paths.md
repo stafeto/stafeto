@@ -579,6 +579,8 @@ entry, syscall or exit-loop interval requires its own measurement boundaries.
 
 ## Steps of the process service
 
+The release of the image objects (the code and read-only data of programs, tens of megabytes with Mesa) is no step of the loop: the loop hands the handle to the service's reaper thread (`services/process/src/reaper.rs`), which closes it at the base level of the process whose end freed it, so the kernel's cleanup of its frames runs in that thread's call and the exit of a process is told when its pages are back (a pause of 100 ms at most). The feature `teardown-trace` of the kernel (xtask `STAFETO_TEARDOWN_TRACE`) prints a line when the last reference of a process with a quota of 64 MiB or more goes; it is for diagnosis and adds no path.
+
 The rows above bound what a pending interrupt waits for. A step of a
 service is user-space work at the service's level, and a request that waits
 for the service waits for the steps ahead of it. `cargo xtask

@@ -205,6 +205,8 @@ pub(super) unsafe fn queue_shell(process: NonNull<Process>, cause: u8) {
     // and the pool keeps it in place.
     unsafe {
         if (*process.as_ptr()).shell_refs == 0 {
+            #[cfg(feature = "teardown-trace")]
+            super::trace("queue_shell", process, cause);
             let item = NonNull::new_unchecked(&raw mut (*process.as_ptr()).cleanup);
             cleanup::enqueue(item, Object::Process(process), cause);
         }

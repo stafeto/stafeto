@@ -2230,7 +2230,7 @@ commands:
             platform of EGL (the format, the handles, a second surface, a swap in a forked child,
             two threads), six frames swapped into a window of 160 by 160, QEMU's screenshot
             compared with the CRC the program prints at two of them
-  gles-probe [pbuffer|scene|steps] the probe of the graphics of Mesa (ci runs it): the cube into a
+  gles-probe [pbuffer|scene|steps|load [--hvf]] the probe of the graphics of Mesa (ci runs it): the cube into a
             pbuffer; then the scene (apps/wfc-demo --gles) that shows the cube of EGL and the field
             of 64 instanced cubes of OpenGL ES 3 in windows, with QEMU's screenshots compared with the
             CRCs the programs print and with the host's frame of the scene that turns the cube's
@@ -3763,9 +3763,19 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
         "--target",
         KERNEL_TARGET,
     ]);
-    if let Some(feature) = variant.feature() {
-        cmd.args(["--features", feature]);
+    // Diagnosis of the teardown of a process: lines when its last references go.
+    let traced = std::env::var_os("STAFETO_TEARDOWN_TRACE").is_some();
+    if traced {
+        println!(
+            "xtask: STAFETO_TEARDOWN_TRACE is set: the kernel is built with the feature teardown-trace"
+        );
     }
+    match (variant.feature(), traced) {
+        (Some(feature), true) => cmd.args(["--features", &format!("{feature},teardown-trace")]),
+        (Some(feature), false) => cmd.args(["--features", feature]),
+        (None, true) => cmd.args(["--features", "teardown-trace"]),
+        (None, false) => &mut cmd,
+    };
     let target = target_dir();
     // Every variant writes the same cargo output path; a copy next to each image
     // keeps the symbols that match it.
@@ -15195,6 +15205,22 @@ fn ci_lints() -> Result<(), String> {
             "clippy::undocumented_unsafe_blocks",
         ]));
     }
+    // The diagnosis feature of the teardown (STAFETO_TEARDOWN_TRACE) builds.
+    failed.lint(cargo().args([
+        "clippy",
+        "--package",
+        "kernel",
+        "--release",
+        "--target",
+        KERNEL_TARGET,
+        "--features",
+        "teardown-trace",
+        "--",
+        "-D",
+        "warnings",
+        "-D",
+        "clippy::undocumented_unsafe_blocks",
+    ]));
     failed.finish()
 }
 
