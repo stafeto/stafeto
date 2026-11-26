@@ -213,3 +213,27 @@ default display is the way in.
   current in one thread is `EGL_BAD_ACCESS` in another and moves between them,
   a thread asleep in `stafeto_window_wait` gets the bits of the swaps, and the
   program ends with `eglTerminate` with the surface current.
+- `cargo xtask gles-probe` (the line `gles-probe` of ci, and `gles-probe steps`):
+  the graphics of Mesa as a whole, in three boots. First the pbuffer probe
+  above. Then the scene (`apps/wfc-demo --gles`, image `boot-gles.img`): the
+  demo holds the scene of OpenWF Composition and starts `gles-cube --window-run
+  --hold` and `gles3-demo --probe --hold`, and shows their windows as elements
+  (the stream of `eglSwapBuffers` as the source of an element of libWFC). The
+  cube runs the checks of `gles-window` with its window shown by the scene, and
+  the two screenshots at its pauses have the CRC-32 it prints; it then holds its
+  last frame (a byte on a pipe tells the demo), and the screenshot has the CRC-32
+  it prints once more. `gles3-demo` (`apps/gles3-demo`: a vertex array object, a
+  uniform block of 208 bytes in the layout `std140`, one `glDrawElementsInstanced`
+  of 64 cubes whose place comes from `gl_InstanceID`, a divisor of 1 for the tint)
+  draws three frames into a pbuffer and the same three into a window; each frame
+  has the same CRC-32 in both, the rows of the window are the mirror of the
+  readback, and its window in the screenshot has the CRC-32 the program prints. The
+  CRC-32 of its three frames are pinned in `xtask/src/gles_probe.rs`. Last the demo
+  turns the cube's window by 90 degrees and scales it by one half (an element of
+  libWFC) beside the field, and xtask compares the screenshot with the frame that
+  `tools/wfc-ref` (`gles_frame`) draws point by point from the screenshots of the
+  two windows as they are. The third boot is the same scene under `-icount`
+  (`boot-gles-steps.img`, no pauses): the steps of the compositor and the driver
+  stay under 0.9 of term B and the portions under `PORTION_MAX`. The tables are
+  `services/init/src/table/gles.rs` (the demo's record and the process service's
+  pool have quotas above 64 MiB for the programs it starts).
