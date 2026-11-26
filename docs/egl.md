@@ -90,9 +90,15 @@ A swap makes one copy of the frame and one post:
    takes no bit away from the program's own `stafeto_window_wait`: the events
    bit (keys, pointer, focus) and the buffer bits stay for it through any number
    of swaps, in this thread or in another, which may be asleep in
-   `stafeto_window_wait` meanwhile. While another thread holds that wait, the
+   `stafeto_window_wait` meanwhile. While another thread sleeps in that wait, the
    swap looks at the channel without blocking and pauses a millisecond between
-   looks (it wakes the other thread to look again).
+   looks (it wakes the other thread to look again). The other way round, a
+   `stafeto_window_wait` of the program, a poll with a timeout of 0 included,
+   that comes while a swap holds the wait looks beside it in the same way and
+   gets no `EBUSY` (two waits of the program still exclude each other). The wait
+   of a swap has no limit and the swap is not a cancellation point: with a
+   compositor that is alive and never frees a buffer it waits for ever, and a
+   cancellation of the thread stays pending until it returns.
 2. It copies into that buffer what the buffer lacks of the newest frame. The
    driver keeps its own picture of the frame between swaps (the contents of
    the back buffer are kept), so each buffer of the window needs the union of

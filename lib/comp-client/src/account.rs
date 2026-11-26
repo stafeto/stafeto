@@ -112,6 +112,12 @@ impl Buffers {
     }
 }
 
+/// Whether `mask` is a wait for buffers of a window of `count` buffers: not
+/// empty, and no bit past the buffers (the events bit among them).
+pub const fn mask_ok(mask: u32, count: u32) -> bool {
+    mask != 0 && count <= BUFFERS_MAX as u32 && mask & !((1u32 << count) - 1) == 0
+}
+
 /// Whether a drain of the window's channel (by `post`, outside the wait)
 /// sends the wake: it took `taken` notifications of any kind (the service's
 /// bits, the timer's expiry, an earlier wake) and a thread waits. The waiter
@@ -126,6 +132,15 @@ pub const fn should_wake(taken: usize, waiting: bool) -> bool {
 mod tests {
     use super::*;
     use crate::layout::EVENTS;
+
+    #[test]
+    fn a_mask_names_buffers_of_the_window_only() {
+        assert!(mask_ok(0b1, 1) && mask_ok(0b101, 3) && mask_ok(0b11, 2));
+        assert!(!mask_ok(0, 2));
+        assert!(!mask_ok(0b100, 2));
+        assert!(!mask_ok(crate::layout::EVENTS, 3));
+        assert!(!mask_ok(0b1, 4));
+    }
 
     #[test]
     fn all_buffers_are_free_at_the_start() {

@@ -494,8 +494,19 @@ fn drain() {
     let own = channel();
     let mut taken = 0;
     while let Ok(got) = sys::try_receive(&own) {
+        // What a waiter may sit on: the service's notifications and a timer's
+        // expiry. A wake of another thread is not echoed.
+        let matters = matches!(
+            got,
+            Received::Notification {
+                source: Source::Session | Source::Timer,
+                ..
+            }
+        );
         absorb(&got);
-        taken += 1;
+        if matters {
+            taken += 1;
+        }
     }
     if comp_client::account::should_wake(taken, WAITING.load(Ordering::Acquire)) {
         let _ = sys::notify(&own, WAKE);
@@ -617,15 +628,42 @@ pub fn wait(win: i32, timeout_ns: u64) -> Result<u32, i32> {
 /// account and returns the free ones among them. The bits the service sent
 /// stay for `wait` (events among them). While another thread holds the wait
 /// it takes what waits on the channel without blocking and pauses, so it does
-/// not depend on that thread running.
+/// not depend on that thread running. EINVAL for a mask that is empty or names
+/// a bit that is no buffer of the window. The program's own wait looks beside
+/// it in the same way while it holds the wait, so it gets no EBUSY from it.
 pub fn wait_free(win: i32, mask: u32, timeout_ns: u64) -> Result<u32, i32> {
-    if mask == 0 || mask & !layout::BITS != 0 {
+    opened(win)?;
+    if !comp_client::account::mask_ok(mask, SHAPE[4].load(Ordering::Acquire)) {
         return Err(EINVAL);
     }
     wait_for(win, timeout_ns, Goal::Free(mask))
 }
 
-/// The pause of `wait_free` beside another waiter.
+/// A free-buffer wait holds `WAITING`.
+static FREE_HELD: AtomicBool = AtomicBool::new(false);
+
+struct FreeHeld;
+
+impl FreeHeld {
+    fn set() -> FreeHeld {
+        FREE_HELD.store(true, Ordering::Release);
+        FreeHeld
+    }
+}
+
+impl Drop for FreeHeld {
+    fn drop(&mut self) {
+        FREE_HELD.store(false, Ordering::Release);
+    }
+}
+
+/// The errno of a refusal of the kernel on the window's channel: a window
+/// closed meanwhile (by another thread) is EBADF.
+fn channel_errno(win: i32) -> i32 {
+    if opened(win).is_err() { EBADF } else { EIO }
+}
+
+/// The pause of a wait beside another waiter.
 const BESIDE_PAUSE_NS: i64 = 1_000_000;
 
 fn wait_for(win: i32, timeout_ns: u64, goal: Goal) -> Result<u32, i32> {
@@ -633,11 +671,16 @@ fn wait_for(win: i32, timeout_ns: u64, goal: Goal) -> Result<u32, i32> {
     alive()?;
     let until = crate::wait::now().saturating_add(timeout_ns);
     let Some(_waiting) = Flag::take(&WAITING) else {
+        // A free-buffer wait (a swap) holds the wait: the program's wait looks
+        // beside it as the swap looks beside the program's, so a poll never
+        // gets EBUSY from a swap. Another wait of the program still does.
         return match goal {
-            Goal::Bits => Err(EBUSY),
-            Goal::Free(_) => wait_beside(win, until, goal),
+            Goal::Bits if !FREE_HELD.load(Ordering::Acquire) => Err(EBUSY),
+            _ => wait_beside(win, until, goal),
         };
     };
+    // Held by a free-buffer wait until this call ends.
+    let _free_held = matches!(goal, Goal::Free(_)).then(FreeHeld::set);
     let own = channel();
     let timer = Handle::<Timer>::borrowed(rt::abi::Handle(TIMER.load(Ordering::Acquire)));
     let block = threads::own_block();
@@ -655,7 +698,7 @@ fn wait_for(win: i32, timeout_ns: u64, goal: Goal) -> Result<u32, i32> {
                     crate::signals::deliver_now();
                     return Err(EINTR);
                 }
-                Err(_) => return Err(EIO),
+                Err(_) => return Err(channel_errno(win)),
             }
         }
         alive()?;
@@ -698,7 +741,7 @@ fn wait_for(win: i32, timeout_ns: u64, goal: Goal) -> Result<u32, i32> {
                 crate::signals::deliver_now();
                 return Err(EINTR);
             }
-            Err(_) => return Err(EIO),
+            Err(_) => return Err(channel_errno(win)),
         }
     }
 }
@@ -707,8 +750,12 @@ fn wait_for(win: i32, timeout_ns: u64, goal: Goal) -> Result<u32, i32> {
 /// waits on the channel is taken without blocking (`drain` wakes the other
 /// waiter, which looks again), and a short pause follows.
 fn wait_beside(win: i32, until: u64, goal: Goal) -> Result<u32, i32> {
+    let generation = GENERATION.load(Ordering::Acquire);
     loop {
         opened(win)?;
+        if GENERATION.load(Ordering::Acquire) != generation {
+            return Err(EBADF);
+        }
         drain();
         alive()?;
         if let Some(bits) = reached(goal) {

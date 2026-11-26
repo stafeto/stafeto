@@ -250,8 +250,13 @@ uint32_t stafeto_window_free_buffers(int win);
  *   EINTR      a signal with a handler ran during the wait;
  *   EBADF      win is not the window's number;
  *   ENODEV     the service ended (known from an earlier call; see below);
- *   EBUSY      another thread of the process is waiting on the window;
+ *   EBUSY      another thread of the process is waiting on the window in
+ *              stafeto_window_wait (a thread in stafeto_window_wait_free is
+ *              no reason for it: this call then takes what waits on the
+ *              channel without blocking and pauses a millisecond between
+ *              looks, so a poll with a timeout of 0 answers at once);
  *   EIO        the kernel refused the wait.
+ * A window closed by another thread during the wait is EBADF.
  * The service's end wakes a wait that is under way (the kernel tells the
  * window's channel when the service's last copy of it goes), and the wait
  * returns ENODEV; a call that finds the service gone (post, events) does
@@ -266,13 +271,16 @@ int stafeto_window_wait(int win, uint64_t timeout_ns, uint32_t *bits);
  * is allowed) the free buffers among them. It takes no bit away from
  * stafeto_window_wait: the bits the service sent, the events bit among them,
  * stay for the next call of that function, which a thread asleep in it is woken
- * for. One thread at a time waits inside stafeto_window_wait; while one does,
- * this function takes what waits on the channel without blocking and pauses a
- * millisecond between looks, so it does not depend on that thread running.
+ * for. One thread at a time sleeps in the wait of the channel. While a thread
+ * is in stafeto_window_wait, this function takes what waits on the channel
+ * without blocking and pauses a millisecond between looks, so it does not
+ * depend on that thread running; and the other way round (see
+ * stafeto_window_wait).
  * 0 when a buffer of the mask is free, or -1 with errno:
  *   ETIMEDOUT  none was free in time;
  *   EINTR      a signal with a handler ran during the wait;
- *   EINVAL     mask is 0 or names a bit that is no buffer;
+ *   EINVAL     mask is 0 or names a bit that is no buffer of the window (the
+ *              events bit, or a buffer past the window's `buffers`);
  *   EBADF      win is not the window's number;
  *   ENODEV     the service ended;
  *   EIO        the kernel refused the wait. */

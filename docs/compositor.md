@@ -269,7 +269,9 @@ moves the library into `libc.so` and gives the window's channel to `poll`.
   of `mask` and takes no bit from `stafeto_window_wait`: the events bit and the
   buffer bits stay for the program's own wait. While another thread holds the
   wait it drains the channel without blocking (which wakes that thread to look
-  again) and pauses 1 ms between looks.
+  again) and pauses 1 ms between looks. The program's `stafeto_window_wait` does the same
+  while a `stafeto_window_wait_free` holds the wait, so a swap never makes it
+  answer EBUSY.
 - The generation: `stafeto_window_open` and `stafeto_window_info` give
   `struct stafeto_window.generation`, 1 for the first window of the process and
   raised by each open. `stafeto_window_info` reads it before and after the
