@@ -148,3 +148,29 @@ long swap_blit(unsigned char *dst, size_t dst_stride, int dst_w, int dst_h,
 	}
 	return points;
 }
+
+int swap_window_matches_readback(const unsigned char *window, size_t window_stride,
+				 const unsigned char *rgba, int w, int h)
+{
+	for (int y = 0; y < h; y++) {
+		const unsigned char *from = window + (size_t)y * window_stride;
+		const unsigned char *to = rgba + ((size_t)(h - 1 - y) * (size_t)w) * 4;
+		for (int x = 0; x < w; x++) {
+			if (from[x * 4 + 2] != to[x * 4] || from[x * 4 + 1] != to[x * 4 + 1] ||
+			    from[x * 4] != to[x * 4 + 2])
+				return 0;
+		}
+	}
+	return 1;
+}
+
+int swap_readback_is_symmetric(const unsigned char *rgba, int w, int h)
+{
+	for (int y = 0; y < h / 2; y++) {
+		const unsigned char *top = rgba + (size_t)y * (size_t)w * 4;
+		const unsigned char *bottom = rgba + (size_t)(h - 1 - y) * (size_t)w * 4;
+		if (memcmp(top, bottom, (size_t)w * 4) != 0)
+			return 0;
+	}
+	return 1;
+}
