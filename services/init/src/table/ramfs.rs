@@ -567,7 +567,12 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
 ];
 
 pub const POSIX_ABI_TABLE: &[Record] = &[
-    RAM_CLOCKED,
+    // The mount of the data volume is given with no data service in the image, for the probes
+    // of the redirect on the stacks of the threads of the layer (tests/posix-shared).
+    Record {
+        args: b"time-clocked mount=data",
+        ..RAM_CLOCKED
+    },
     Record {
         name: "posix",
         program: "posix-process-service",

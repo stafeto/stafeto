@@ -504,6 +504,10 @@ pub struct State {
     page_len: usize,
     generations: [u64; INODES],
     pub epoch: u64,
+    /// The name below the root that another service owns (init's `mount=` argument): the length
+    /// and the bytes. A walk that reaches it ends in a redirect. Length 0 is no mount.
+    mount_len: u8,
+    mount: [u8; MOUNT_MAX],
     pending: [Option<Reservation>; PREPARATIONS],
     preparation_used: u16,
     reclaim_queue: [u16; INODES],
@@ -555,6 +559,8 @@ impl State {
             page_len: PAGES,
             generations: [0; INODES],
             epoch: 1,
+            mount_len: 0,
+            mount: [0; MOUNT_MAX],
             pending: [None; PREPARATIONS],
             preparation_used: 0,
             reclaim_queue: [0; INODES],
@@ -580,7 +586,31 @@ impl State {
         }
     }
 }
+/// The longest name of a mount, bytes.
+pub const MOUNT_MAX: usize = 24;
+
 impl State {
+    /// Gives the name below the root that another service owns; false for a name that is no single
+    /// component of a path.
+    pub fn set_mount(&mut self, name: &[u8]) -> bool {
+        if name.is_empty()
+            || name.len() > MOUNT_MAX
+            || name.iter().any(|&byte| byte == b'/' || byte == 0)
+            || name == b"."
+            || name == b".."
+        {
+            return false;
+        }
+        self.mount[..name.len()].copy_from_slice(name);
+        self.mount_len = name.len() as u8;
+        true
+    }
+
+    /// The name of the mount, when there is one.
+    pub fn mount(&self) -> Option<&[u8]> {
+        (self.mount_len != 0).then(|| &self.mount[..self.mount_len as usize])
+    }
+
     pub fn initialize(&mut self) {
         self.nodes.fill(Node::EMPTY);
         self.boot_files = 0;

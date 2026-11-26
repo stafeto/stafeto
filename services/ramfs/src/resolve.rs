@@ -19,7 +19,7 @@ use crate::authority::Identity;
 use crate::metadata::{MetadataPath, MetadataProof};
 use crate::namespace::{Edge, Location, NamespacePath, NamespaceProof, RawSyntax};
 use crate::storage::{CHAIN_PORTION, NONE, Pin, ROOT, SYMLINK, Storage, Token};
-use proto_fs::{LOOP, MAX_PATH, NAME_TOO_LONG, NO_ENTRY, NOT_DIRECTORY, STALE_PROOF};
+use proto_fs::{LOOP, MAX_PATH, NAME_TOO_LONG, NO_ENTRY, NOT_DIRECTORY, REDIRECT, STALE_PROOF};
 
 pub struct Resolve {
     original: [u8; MAX_PATH],
@@ -67,6 +67,8 @@ pub struct Resolve {
     inert: bool,
     /// The pins are gone (see `retire`).
     retired: bool,
+    /// The walk ended in a redirect: `path` holds the absolute path to continue with.
+    redirected: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intent {
@@ -180,6 +182,7 @@ impl Resolve {
             restarts: 0,
             inert: false,
             retired: false,
+            redirected: false,
         })
     }
     /// A resolver that only carries bytes of 0 to 511: the contents of a new
@@ -229,6 +232,7 @@ impl Resolve {
             restarts: 0,
             inert: true,
             retired: false,
+            redirected: false,
         })
     }
     /// Whether the walk is in the chain of a name.
@@ -285,6 +289,7 @@ impl Resolve {
         self.looking = false;
         self.link = None;
         self.links = 0;
+        self.redirected = false;
         self.epoch = storage.state.epoch;
         self.identity = identity;
         Ok(())
@@ -297,7 +302,16 @@ impl Resolve {
     pub fn invalidate(&mut self) {
         self.epoch = 0;
     }
+    /// The absolute path a walk that ended in REDIRECT continues with, and the links it had
+    /// expanded.
+    pub fn redirect(&self) -> Option<(&[u8], u32)> {
+        self.redirected
+            .then(|| (&self.path[..self.length], u32::from(self.links)))
+    }
     pub fn step(&mut self, storage: &mut Storage<'_>, identity: Identity) -> Result<Progress, u32> {
+        if self.redirected {
+            return Err(REDIRECT);
+        }
         if self.epoch != storage.state.epoch || self.identity != identity {
             self.restarts = self.restarts.saturating_add(1);
             self.restart(storage, identity)?;
@@ -414,6 +428,9 @@ impl Resolve {
                 self.at = self.end;
                 return Ok(Progress::More);
             }
+            if self.current == ROOT && storage.state.mount() == Some(name) {
+                return self.redirect_to_mount(storage.state.mount().map_or(0, <[u8]>::len));
+            }
             self.access_gen = directory.access_gen;
             self.name_gen = directory.name_gen;
             let bucket = crate::storage::name_bucket(self.current, &self.path[self.at..self.end]);
@@ -478,6 +495,25 @@ impl Resolve {
             }
         }
         Ok(Progress::More)
+    }
+    /// The walk stands before the name of the mount point below the root, whether the tree has such
+    /// a directory or not: the rest of the walk belongs to the service of the volume. The path
+    /// becomes the absolute one, the mount point and what follows it.
+    fn redirect_to_mount(&mut self, name: usize) -> Result<Progress, u32> {
+        // The name is the component the walk stands at: path[at..end].
+        let rest = self.length - self.end;
+        let length = 1 + name + rest;
+        if length > MAX_PATH {
+            return Err(NAME_TOO_LONG);
+        }
+        let mut path = [0; MAX_PATH];
+        path[0] = b'/';
+        path[1..=name].copy_from_slice(&self.path[self.at..self.end]);
+        path[1 + name..length].copy_from_slice(&self.path[self.end..self.length]);
+        self.path = path;
+        self.length = length;
+        self.redirected = true;
+        Err(REDIRECT)
     }
     fn final_component(&self) -> bool {
         self.path[self.end..self.length]

@@ -1051,6 +1051,21 @@ pub unsafe extern "C" fn stafeto_probe_open_exec(path: *const c_char) -> c_int {
     posix_abi::process::probe_open_exec(path)
 }
 
+/// The retries of the cancels of the jobs of paths that a signal interrupted, and the cancels
+/// given up (rt::fs::proof_cancel_counts), for the probes of the redirect.
+///
+/// # Safety
+/// Both pointers are valid for a write of 4 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_proof_cancel(retries: *mut u32, given_up: *mut u32) {
+    let (r, g) = rt::fs::proof_cancel_counts();
+    // SAFETY: the caller's promise.
+    unsafe {
+        retries.write(r);
+        given_up.write(g);
+    }
+}
+
 /// The probe of condition O2 of 5c: Start of the next spawns carries a
 /// channel of the caller's (posix_abi::process::probe_decoy).
 #[unsafe(no_mangle)]
