@@ -1814,13 +1814,14 @@ fn alarm(f: &mut Fixture, p: NonNull<Process>, at: Option<u64>) -> Result<u64, &
 }
 
 /// x1-x11 of a receive that took one expiry of a timer made through a
-/// handle with no label.
-fn timer_notice() -> [u64; 11] {
+/// handle with no label, from a slot that lends `level`.
+fn timer_notice(level: u8) -> [u64; 11] {
     Notification {
         source: Source::Timer,
         label: 0,
         bits: 1,
         count: 1,
+        level,
     }
     .to_words()
 }
@@ -1863,7 +1864,7 @@ fn done_idle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         "the idle kernel did not arm the timer for the alarm",
     )?;
     check(
-        t.regs.x[0] == 0 && t.regs.x[1..12] == timer_notice(),
+        t.regs.x[0] == 0 && t.regs.x[1..12] == timer_notice(PRIORITY),
         "the thread did not wake with the alarm's notification",
     )?;
     check(
@@ -1911,7 +1912,7 @@ fn reached_idle(f: &Fixture) -> Result<(), &'static str> {
 fn done_wait_in_idle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     reached_idle(f)?;
     let mut results = [0; 12];
-    results[1..].copy_from_slice(&timer_notice());
+    results[1..].copy_from_slice(&timer_notice(PRIORITY));
     check_pattern(&t.regs, &f.patterns[0], &results)
 }
 
@@ -2676,6 +2677,7 @@ fn done_exit_notice(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         label: EXIT_LABEL,
         bits: 1,
         count: 1,
+        level: PRIORITY + 1,
     };
     match f.slot(t) {
         0 => check(
@@ -3011,11 +3013,11 @@ fn done_descendants(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         "the grandchild's thread ran to its end after its parent ended",
     )?;
     check(
-        t.regs.x[0] == 0 && t.regs.x[1..12] != timer_notice(),
+        t.regs.x[0] == 0 && t.regs.x[1..12] != timer_notice(PRIORITY),
         "no exit notification in 2 s",
     )?;
     check(
-        t.regs.x[1..12] == exit_notice(EXIT_LABEL),
+        t.regs.x[1..12] == exit_notice(PRIORITY - 5, EXIT_LABEL),
         "the child's exit notification did not come to its parent's channel",
     )?;
     check(
@@ -3053,25 +3055,27 @@ fn done_descendants(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 const EXIT_LABEL: u64 = 0xE417;
 
 /// x1-x11 of a receive that took the exit notification of a child whose
-/// exit channel carried `label` (spec 7.9).
-fn exit_notice(label: u64) -> [u64; 11] {
+/// exit channel carried `label` (spec 7.9), from a slot that lends `level`.
+fn exit_notice(level: u8, label: u64) -> [u64; 11] {
     Notification {
         source: Source::Exit,
         label,
         bits: 1,
         count: 1,
+        level,
     }
     .to_words()
 }
 
 /// x1-x11 of a receive that took one post of `bits` from the slot of label
-/// 0.
-fn notice(bits: u64) -> [u64; 11] {
+/// 0, which lends `level`.
+fn notice(level: u8, bits: u64) -> [u64; 11] {
     Notification {
         source: Source::Unlabeled,
         label: 0,
         bits,
         count: 1,
+        level,
     }
     .to_words()
 }
@@ -3111,7 +3115,7 @@ fn done_kill_waiting(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     let x = &t.regs.x;
     check(x[19] == 0 && x[20] == 0, "process_kill or notify failed")?;
     check(
-        x[0] == 0 && x[1..12] == notice(BITS),
+        x[0] == 0 && x[1..12] == notice(PRIORITY, BITS),
         "the notification did not stay in the channel for the killer",
     )?;
     let waiter = slot_thread(f, 0);
@@ -3210,7 +3214,7 @@ fn done_requeue(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         0 => Err("the thread that kept its level took the notification"),
         1 => check(
             x[0] == 0
-                && x[1..12] == notice(BITS)
+                && x[1..12] == notice(CAPPED, BITS)
                 && t.sched.base() == PRIORITY + 2
                 && t.sched.priority() == CAPPED,
             "the raised thread did not take the notification at its new level",
@@ -3418,7 +3422,7 @@ fn done_timer_latency(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         return Ok(());
     }
     check(
-        t.regs.x[0] == 0 && t.regs.x[1..12] == timer_notice(),
+        t.regs.x[0] == 0 && t.regs.x[1..12] == timer_notice(PRIORITY),
         "the thread did not wake with the alarm's notification",
     )?;
     check(!f.passed[1], "the alarm waited for the round-robin spinner")?;
@@ -3843,7 +3847,7 @@ fn done_kill_sender(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     let x = &t.regs.x;
     check(x[19] == 0 && x[20] == 0, "process_kill or notify failed")?;
     check(
-        x[0] == 0 && x[1..12] == notice(BITS),
+        x[0] == 0 && x[1..12] == notice(PRIORITY, BITS),
         "the notification did not stay in the channel for the killer",
     )?;
     check(
@@ -3911,7 +3915,7 @@ fn done_kill_states(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         "the request of the killed sender stayed in its channel",
     )?;
     check(
-        x[22] == 0 && x[0] == 0 && x[1..12] == notice(BITS),
+        x[22] == 0 && x[0] == 0 && x[1..12] == notice(PRIORITY, BITS),
         "the notification did not stay in the killed receiver's channel",
     )?;
     let q = f.processes[0].expect("the service's process");
@@ -4341,7 +4345,7 @@ fn done_labelled_close(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     let x = &t.regs.x;
     match f.slot(t) {
         0 => check(
-            x[0] == 0 && x[1..12] == labelled_notice(MOVED_LABEL, CLIENT_GONE),
+            x[0] == 0 && x[1..12] == labelled_notice(PRIORITY, MOVED_LABEL, CLIENT_GONE),
             "the carried label did not come as CLIENT_GONE",
         ),
         1 => check(
@@ -4362,13 +4366,14 @@ fn done_labelled_close(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 }
 
 /// x1-x11 of a receive that took a notification of the session with
-/// `label` of `bits`, once.
-fn labelled_notice(label: u64, bits: u64) -> [u64; 11] {
+/// `label` of `bits`, once, from a slot that lends `level`.
+fn labelled_notice(level: u8, label: u64, bits: u64) -> [u64; 11] {
     Notification {
         source: Source::Session,
         label,
         bits,
         count: 1,
+        level,
     }
     .to_words()
 }
@@ -4455,11 +4460,16 @@ fn start_fast_hit(f: &mut Fixture) -> Result<(), &'static str> {
 fn done_fast_hit(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     let x = &t.regs.x;
     if f.slot(t) == 0 {
-        return check(x[0] == 0, "the service's reply failed");
+        // x19 is the description the service took: the client's level in
+        // bits 32-37, which the service left out of its reply.
+        return check(
+            x[0] == 0 && x[19] == REQUEST_LEN | told(PRIORITY),
+            "the service's reply failed, or the request did not tell the client's level",
+        );
     }
     check(
         x[..3] == [0, REQUEST_LEN, REQUEST_WORD],
-        "the client did not get its request back",
+        "the client did not get its request back without a level",
     )?;
     check(
         FAST_PATH_HITS.load(Relaxed) == 1,
@@ -4654,8 +4664,8 @@ fn done_equal_ready(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     match f.slot(t) {
         0 => {
             check(
-                x[0] == 0 && x[1..3] == [REQUEST_LEN, REQUEST_WORD],
-                "the service did not take the request",
+                x[0] == 0 && x[1..3] == [REQUEST_LEN | told(PRIORITY + 2), REQUEST_WORD],
+                "the service did not take the request at its client's level",
             )?;
             check(
                 shared(f, 0) == 1 && FAST_PATH_HITS.load(Relaxed) == 0,
@@ -4730,8 +4740,8 @@ fn done_budget_demotes(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
                 return Err("the service noted no state");
             };
             check(
-                snap.regs[..3] == [0, REQUEST_LEN, REQUEST_WORD],
-                "the service did not take the request",
+                snap.regs[..3] == [0, REQUEST_LEN | told(1), REQUEST_WORD],
+                "the service did not take the request at the level its client had left",
             )?;
             check(
                 snap.states[2] != Some(State::Ready),
@@ -5175,8 +5185,8 @@ fn start_pending_interrupt(f: &mut Fixture) -> Result<(), &'static str> {
 fn done_pending_interrupt(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     let x = &t.regs.x;
     check(
-        x[0] == 0 && x[1..3] == [REQUEST_LEN, REQUEST_WORD],
-        "the service did not take the request",
+        x[0] == 0 && x[1..3] == [REQUEST_LEN | told(PRIORITY), REQUEST_WORD],
+        "the service did not take the request at its client's level",
     )?;
     check(
         f.interrupted == f.threads[1] && FAST_PATH_HITS.load(Relaxed) == 0,
@@ -5523,9 +5533,21 @@ fn done_lpi_path(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     kprintln!("interrupt path ticks: lpi={lpi}");
     kprintln!("its command ticks: max={max} long={long} commands={commands}");
     check(
-        t.regs.x[0] == 0 && t.regs.x[1] >> abi::SOURCE_SHIFT == Source::Interrupt.code(),
-        "the driver did not take the LPI's notification",
+        t.regs.x[0] == 0 && interrupt_taken(t, Some(DRIVER)),
+        "the driver did not take the LPI's notification at its level",
     )
+}
+
+/// The bits of x1 that tell the level `level` (spec 6.6).
+const fn told(level: u8) -> u64 {
+    (level as u64) << abi::LEVEL_SHIFT
+}
+
+/// Whether `t` took the notification of an interrupt (x1-x11 as `receive`
+/// leaves them), from a slot that lends `level` when it is given.
+fn interrupt_taken(t: &Thread, level: Option<u8>) -> bool {
+    let n = Notification::from_words(t.regs.x[1..12].try_into().expect("x1-x11"));
+    n.source == Source::Interrupt && level.is_none_or(|l| n.level == l)
 }
 
 /// Call `number` for `t`, which has not run, with `args` in x0 and up:
@@ -5549,7 +5571,7 @@ fn done_interrupt_path(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     let [bind, ack, portion] = f.measured;
     kprintln!("interrupt path ticks: driver={driver} bind={bind} ack={ack} portion={portion}");
     check(
-        t.regs.x[0] == 0 && t.regs.x[1] >> abi::SOURCE_SHIFT == Source::Interrupt.code(),
+        t.regs.x[0] == 0 && interrupt_taken(t, None),
         "the driver did not take the interrupt's notification",
     )?;
     check(portion > 0, "the binding's portion was not measured")
