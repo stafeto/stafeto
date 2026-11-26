@@ -1408,7 +1408,8 @@ impl Scene {
     /// the window changes nothing on the screen (no element uses it, or what
     /// they show of it is off the screen).
     fn window_damage(&self, i: usize, rects: &[Rect]) -> Option<Rect> {
-        self.window_damage_in(i, rects, self.prep.is_some())
+        let legacy = self.window(i).is_some_and(|w| w.legacy);
+        self.window_damage_in(i, rects, self.prep.is_some() && !legacy)
     }
 
     /// `window_damage`, with or without the elements whose image the worker makes
@@ -1600,11 +1601,13 @@ impl Scene {
     /// working one, or the scene ended).
     fn sweep(&self) {
         if let Some(t) = self.prep {
-            let keep: [Option<&prep::Map>; 2] = [
+            let frame = self.frame_map();
+            let keep: [Option<&prep::Map>; 3] = [
                 self.slot_working.map(|k| &self.maps[usize::from(k)]),
                 self.slot_pending.map(|k| &self.maps[usize::from(k)]),
+                Some(&frame),
             ];
-            let mut held = [&prep::NO_MAP; 2];
+            let mut held = [&prep::NO_MAP; 3];
             let mut n = 0;
             for m in keep.into_iter().flatten() {
                 held[n] = m;
@@ -1612,6 +1615,20 @@ impl Scene {
             }
             let _ = t.reserve(&[], &held[..n], 1);
         }
+    }
+
+    /// The slots whose image the frame in work holds: they stay until the frame ends,
+    /// whatever scene is the working one by then.
+    fn frame_map(&self) -> prep::Map {
+        let mut map = prep::NO_MAP;
+        let mut n = 0;
+        for (s, f) in self.front.iter().enumerate() {
+            if f.is_some() && n < map.len() {
+                map[n] = s as u8;
+                n += 1;
+            }
+        }
+        map
     }
 
     fn post_inner(
@@ -2890,21 +2907,31 @@ impl Scene {
             let Some(w) = self.window(place) else {
                 continue;
             };
-            wants[j] = prep::key_of(e, w.format).map(|key| (key, place));
+            if !w.legacy {
+                wants[j] = prep::key_of(e, w.format).map(|key| (key, place));
+            }
         }
         let working = self.slot_working.map(|w| self.maps[usize::from(w)]);
         let pending = self.slot_pending.map(|p| self.maps[usize::from(p)]);
-        let mut both = [&prep::NO_MAP; 2];
+        let frame = self.frame_map();
+        let mut both = [&prep::NO_MAP; 3];
         let mut n = 0;
-        for m in [working.as_ref(), pending.as_ref()].into_iter().flatten() {
+        for m in [working.as_ref(), pending.as_ref(), Some(&frame)]
+            .into_iter()
+            .flatten()
+        {
             both[n] = m;
             n += 1;
         }
-        let map = match t.reserve(&wants[..self.defs[k].elements().len()], &both[..n], level) {
+        let count = self.defs[k].elements().len();
+        // With the pending scene's images kept, then, when they do not fit, with
+        // them let go (the commit replaces that scene). A refused attempt changes
+        // nothing.
+        let map = match t.reserve(&wants[..count], &both[..n], level) {
             Ok(map) => map,
             Err(_) => {
-                let only = [working.as_ref().unwrap_or(&prep::NO_MAP)];
-                t.reserve(&wants[..self.defs[k].elements().len()], &only, level)
+                let only = [working.as_ref().unwrap_or(&prep::NO_MAP), &frame];
+                t.reserve(&wants[..count], &only, level)
                     .map_err(|why| match why {
                         prep::Refuse::Full => Refusal::Limit,
                         prep::Refuse::Wait => Refusal::Busy,
@@ -3043,10 +3070,6 @@ impl Scene {
         self.slot_working.map(|k| &self.defs[usize::from(k)])
     }
 
-    /// The place on the screen where element `e` of the working scene puts
-    /// something now: its target rectangle cut to the screen, when its window
-    /// has a buffer taken and holds the source rectangle; None otherwise (it
-    /// shows nothing).
     /// Whether element `k` (`e`) of the working scene draws something now: its
     /// window has a buffer taken and holds the source rectangle, and for an element
     /// whose image the worker makes, an image was made. The inner value is the slot
@@ -3057,7 +3080,9 @@ impl Scene {
         if w.current.is_none() || !elements::source_fits(e, w.rect.w, w.rect.h) {
             return None;
         }
-        if self.prep.is_some() && prep::needs(e) {
+        // A window of the first revision (its buffer is the pool, which no POST
+        // names) is drawn by the bands through the transform, as before.
+        if self.prep.is_some() && prep::needs(e) && !w.legacy {
             let slot = self.maps[usize::from(self.slot_working?)][k];
             if slot == prep::NO_SLOT {
                 return None;
@@ -3081,6 +3106,10 @@ impl Scene {
             .is_some_and(|t| t.geometry(usize::from(slot)).key.argb)
     }
 
+    /// The place on the screen where element `e` of the working scene puts
+    /// something now: its target rectangle cut to the screen, when its window
+    /// has a buffer taken and holds the source rectangle; None otherwise (it
+    /// shows nothing).
     pub fn element_place(&self, e: &Element) -> Option<Rect> {
         let w = self.window(self.place_of(e.source)?)?;
         if w.current.is_none() || !elements::source_fits(e, w.rect.w, w.rect.h) {

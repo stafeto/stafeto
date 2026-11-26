@@ -468,6 +468,8 @@ struct Compositor {
     /// thread, the wait channel it receives on and the copy of it the service
     /// wakes it through (NOTIFY alone: no request can queue there).
     worker: Option<Worker>,
+    /// The worker was tried once at the start.
+    worker_tried: bool,
 }
 
 struct Worker {
@@ -490,63 +492,48 @@ impl Reads for WorkerReads {
 }
 
 /// The worker thread: makes the prepared images, the slot of the highest level
-/// first, at that level. It waits on a wait channel for the service to say there is
-/// work, and tells the service (PREP) when it let go of something the service put off
-/// or drew an image.
+/// first. It waits on a wait channel for the service to say there is work, and tells
+/// the service (PREP) when it let go of something the service put off, moved to
+/// another buffer while the service waited, published an image, or went idle. It
+/// never sets its own level: the service owns it (`Compositor::steer_worker`),
+/// raises it on the request path and lowers it when told the worker is idle.
+///
+/// The loop has one shape: pieces while a slot is next, then let go and wait. Every
+/// pass that returns Idle or Blocked has cleared its slot's bit, and every setter of
+/// a bit outside the worker (a post, a commit, the end of a frame) is followed by a
+/// notice, so a slot that wants the worker is never left waiting and the worker
+/// never has the same slot for ever.
 extern "C" fn worker_main(_: u64) -> ! {
     let wait = Handle::<Channel>::borrowed(rt::abi::Handle(WORKER_WAIT.load(Ordering::Acquire)));
     let tell = Handle::<Channel>::borrowed(rt::abi::Handle(WORKER_TELL.load(Ordering::Acquire)));
-    let me = sys::self_thread();
     let mut maker = px::Worker::new();
     let mut job = prep::Job::NONE;
-    let mut idle = 0u32;
-    let mut level = 1;
-    let mut set_level = |to: u8| {
-        if to != level
-            && let Ok(me) = &me
-        {
-            let _ = sys::thread_set_priority(me, to, rt::abi::Policy::Fifo);
-            TABLE.set_worker_level(to);
-            level = to;
-        }
-    };
     loop {
-        let next = TABLE.next(&job);
-        let Some((slot, at)) = next else {
-            // Nothing to draw: the level drops, what the service waits for is let
-            // go, and the worker waits.
-            set_level(1);
-            let told = TABLE.let_go();
-            if told {
-                let _ = sys::notify(&tell, PREP);
-            }
-            let _ = sys::receive(&wait);
-            continue;
-        };
-        set_level(at);
-        match TABLE.piece(&mut job, slot, &mut maker, &WorkerReads) {
-            Pass::More => {}
-            Pass::Published => {
-                TABLE.let_go();
-                let _ = sys::notify(&tell, PREP);
-            }
-            Pass::Idle | Pass::Blocked => {
-                if TABLE.let_go() {
+        while let Some((slot, _)) = TABLE.next(&job) {
+            match TABLE.piece(&mut job, slot, &mut maker, &WorkerReads) {
+                Pass::More => {}
+                Pass::Published => {
+                    TABLE.let_go();
                     let _ = sys::notify(&tell, PREP);
                 }
-                // A pass that drew nothing, three times in a row, is no work: the
-                // worker never spins at a level above the clients that wait for the
-                // CPU, whatever the table says. It waits for the next wake.
-                idle += 1;
-                if idle >= 3 {
-                    idle = 0;
-                    set_level(1);
-                    let _ = sys::receive(&wait);
+                Pass::Idle | Pass::Blocked => {
+                    if TABLE.let_go() {
+                        let _ = sys::notify(&tell, PREP);
+                    }
                 }
-                continue;
+            }
+            // The claim moved to another buffer of a window while the service waited
+            // for the first: its free can go.
+            if TABLE.take_moved() && TABLE.deferred() {
+                let _ = sys::notify(&tell, PREP);
             }
         }
-        idle = 0;
+        // Idle: what the service waits for is let go, and a worker above its lowest
+        // level says so, for the service to lower it.
+        if TABLE.let_go() || TABLE.worker_level() > 1 {
+            let _ = sys::notify(&tell, PREP);
+        }
+        let _ = sys::receive(&wait);
     }
 }
 
@@ -620,6 +607,7 @@ fn main(_: u64) -> u64 {
         timer,
         _timer_view: timer_view,
         worker: None,
+        worker_tried: false,
     };
     TABLE.set_pool(IMAGES.0.get().cast());
     service.scene.set_prep(&TABLE);
@@ -2350,16 +2338,22 @@ impl Compositor {
         }
     }
 
-    /// The worker thread, made at the first job. False when it cannot be made: the
-    /// images are not drawn then (the elements that need them show nothing).
+    /// The worker thread, made once when the service starts. False when it cannot be
+    /// made (it is tried once, and the service says so on the console): the images
+    /// are not made then and the elements that need them show nothing.
     fn start_worker(&mut self) -> bool {
         if self.worker.is_some() {
             return true;
         }
+        if core::mem::replace(&mut self.worker_tried, true) {
+            return false;
+        }
         let Ok(wait) = sys::channel_create_wait(1) else {
+            rt::println!("compositor: no channel for the prepared images");
             return false;
         };
         let Ok(wake) = sys::handle_label(&wait, Rights::NOTIFY, 1, 1) else {
+            rt::println!("compositor: no handle for the prepared images");
             return false;
         };
         WORKER_WAIT.store(wait.raw().0, Ordering::Release);
@@ -2382,6 +2376,7 @@ impl Compositor {
             return false;
         };
         if sys::thread_start(&thread).is_err() {
+            rt::println!("compositor: the thread for the prepared images did not start");
             return false;
         }
         self.worker = Some(Worker {
@@ -2392,22 +2387,37 @@ impl Compositor {
         true
     }
 
-    /// The worker is raised at once to the level of the work that waits (the level
-    /// of the client that posted), and told.
-    fn wake_worker(&mut self) {
-        if !self.start_worker() {
-            return;
-        }
+    /// The worker's level is the service's to set, and the service sets it here only:
+    /// the level of the highest slot that wants the worker or that it holds (the level
+    /// of the client that posted, capped at 31), or `at_least` (a commit the service
+    /// refused with BUSY), or 1 when there is no work. Called on the request path
+    /// when work comes and when the worker says it let go or went idle, so that the
+    /// worker is never lowered under work it has.
+    fn steer_worker(&mut self, at_least: u8) {
         let Some(worker) = &self.worker else {
             return;
         };
-        if let Some(level) = TABLE.top_level()
-            && level > TABLE.worker_level()
+        let level = TABLE
+            .top_level()
+            .unwrap_or(1)
+            .max(at_least)
+            .min(prep::LEVEL_MAX);
+        if level != TABLE.worker_level()
             && sys::thread_set_priority(&worker.thread, level, rt::abi::Policy::Fifo).is_ok()
         {
             TABLE.set_worker_level(level);
         }
-        let _ = sys::notify(&worker.wake, 1);
+    }
+
+    /// The worker is raised to the level of the work that waits, and told.
+    fn wake_worker(&mut self) {
+        if !self.start_worker() {
+            return;
+        }
+        self.steer_worker(0);
+        if let Some(worker) = &self.worker {
+            let _ = sys::notify(&worker.wake, 1);
+        }
     }
 
     /// The worker let go of something or drew an image (PREP): the buffers whose free
@@ -2451,6 +2461,8 @@ impl Compositor {
         if TABLE.drawn_waits() {
             let _ = sys::notify(&self.notify, PREP);
         }
+        // The worker lets go or goes idle: its level follows the work that is left.
+        self.steer_worker(0);
         if self.extra.iter().any(|e| e.dying) {
             let _ = sys::notify(&self.notify, WORK);
         }
@@ -2692,6 +2704,11 @@ impl Compositor {
             flags & proto_comp::ASK_COMMITTED != 0,
             r.level().min(prep::LEVEL_MAX),
         ) {
+            // BUSY: the images fit once the worker lets go of the slots it holds; it
+            // runs at the commit's level until it does.
+            if refusal == Refusal::Busy {
+                self.steer_worker(r.level().min(prep::LEVEL_MAX));
+            }
             return Answer::Status(Compositor::refusal(refusal));
         }
         self.scene_label = r.label();

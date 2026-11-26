@@ -38,9 +38,16 @@ pub const POOL_PAGES: usize = POOL_BYTES / PAGE;
 pub const SLOTS: usize = 3 * MAX_ELEMENTS;
 /// The slot of an element that has none.
 pub const NO_SLOT: u8 = u8::MAX;
-/// The lines of the target one piece of the worker draws: the points between two
-/// looks of the worker at the jobs of the levels above.
-pub const PIECE_ROWS: u32 = 16;
+/// The points of the target one piece of the worker draws (whole lines of the
+/// rectangle, at least one): the work between two looks of the worker at the jobs of
+/// the levels above, and the longest a post waits for a pass of a lower level.
+pub const PIECE_POINTS: u32 = 4096;
+
+/// The lines of a piece over a rectangle `w` points wide.
+pub const fn piece_rows(w: u32) -> u32 {
+    let rows = PIECE_POINTS / if w == 0 { 1 } else { w };
+    if rows == 0 { 1 } else { rows }
+}
 /// The highest level the worker takes: the service's own is above it.
 pub const LEVEL_MAX: u8 = 31;
 /// The least target side and the greatest the pool allows an element.
@@ -154,6 +161,70 @@ const READY: u32 = 1 << 5;
 
 const fn held_of(s: u32) -> u32 {
     (s & HELD) >> 1
+}
+
+/// The pages of one image of `key` (at least one), None for a target that is empty
+/// or has a side past `SIDE_MAX`.
+fn pages_of(key: &Key) -> Option<usize> {
+    let (w, h) = (key.size[0], key.size[1]);
+    if w <= 0 || h <= 0 || w as u32 > SIDE_MAX || h as u32 > SIDE_MAX {
+        return None;
+    }
+    Some((w as usize * h as usize * 4).div_ceil(PAGE))
+}
+
+/// The bits `n` from `bit` in a word.
+const fn word_mask(bit: usize, n: usize) -> u64 {
+    if n == 64 {
+        u64::MAX
+    } else {
+        ((1u64 << n) - 1) << bit
+    }
+}
+
+/// The pages `first` and the `n` after it of a bitmap in use (`on`) or free.
+fn set_in(words: &mut [u64; POOL_PAGES / 64], first: usize, n: usize, on: bool) {
+    let mut p = first;
+    let end = first + n;
+    while p < end {
+        let bit = p % 64;
+        let take = (64 - bit).min(end - p);
+        if on {
+            words[p / 64] |= word_mask(bit, take);
+        } else {
+            words[p / 64] &= !word_mask(bit, take);
+        }
+        p += take;
+    }
+}
+
+/// The first run of `n` free pages of a bitmap, found a word at a time.
+fn find_in(words: &[u64; POOL_PAGES / 64], n: usize) -> Option<usize> {
+    let (mut p, mut start, mut run) = (0, 0, 0);
+    while p < POOL_PAGES {
+        let word = words[p / 64] >> (p % 64);
+        let left = 64 - p % 64;
+        if word & 1 != 0 {
+            // Used pages: the run so far ends.
+            p += (word.trailing_ones() as usize).min(left);
+            run = 0;
+            continue;
+        }
+        if run == 0 {
+            start = p;
+        }
+        let zeros = if word == 0 {
+            left
+        } else {
+            word.trailing_zeros() as usize
+        };
+        run += zeros;
+        p += zeros;
+        if run >= n {
+            return (start + n <= POOL_PAGES).then_some(start);
+        }
+    }
+    None
 }
 
 /// The packed rectangle: x0, y0, x1, y1 in 16 bits each; 0 is empty.
@@ -282,8 +353,11 @@ pub struct Table {
     blocked: AtomicU64,
     /// The slots that have something drawn the service has not told.
     published: AtomicU64,
-    /// The level the worker runs at now.
+    /// The level the service last set the worker to (the service alone sets it).
     level: AtomicU8,
+    /// The worker's claim moved to another buffer of the window while the service
+    /// waited (`take_moved`): a free that waited for the old buffer can go.
+    moved: AtomicBool,
 }
 
 // SAFETY: the one non-atomic field, the geometry of a slot, is written by the
@@ -322,6 +396,7 @@ impl Table {
             blocked: AtomicU64::new(0),
             published: AtomicU64::new(0),
             level: AtomicU8::new(1),
+            moved: AtomicBool::new(false),
         }
     }
 
@@ -357,9 +432,11 @@ impl Table {
         self.windows[place].latest.store(buffer, SeqCst);
     }
 
-    /// Whether the worker may be reading buffer `buffer` of window `place`
-    /// (`any` buffer for None); the service puts the free of such a buffer off
-    /// (`waiting`).
+    /// Whether the worker may be reading buffer `buffer` of window `place` (any
+    /// buffer for None). The service asks before it frees a buffer or unmaps a
+    /// window and puts the free off when the answer is yes; the question sets
+    /// `waiting`, so that the worker tells the service when it lets go or moves to
+    /// another buffer.
     pub fn reads(&self, place: usize, buffer: Option<u8>) -> bool {
         self.waiting.store(true, SeqCst);
         let b = self.busy.load(SeqCst);
@@ -402,11 +479,7 @@ impl Table {
         while p < end {
             let bit = p % 64;
             let take = (64 - bit).min(end - p);
-            let mask = if take == 64 {
-                u64::MAX
-            } else {
-                ((1u64 << take) - 1) << bit
-            };
+            let mask = word_mask(bit, take);
             if on {
                 self.pages[p / 64].fetch_or(mask, Relaxed);
             } else {
@@ -416,43 +489,47 @@ impl Table {
         }
     }
 
-    /// The first run of `n` free pages, found a word of the bitmap at a time.
-    fn find_pages(&self, n: usize) -> Option<usize> {
-        let (mut p, mut start, mut run) = (0, 0, 0);
-        while p < POOL_PAGES {
-            let word = self.pages[p / 64].load(Relaxed) >> (p % 64);
-            let left = 64 - p % 64;
-            if word & 1 != 0 {
-                // Used pages: the run so far ends.
-                p += (word.trailing_ones() as usize).min(left);
-                run = 0;
-                continue;
-            }
-            if run == 0 {
-                start = p;
-            }
-            let zeros = if word == 0 {
-                left
-            } else {
-                word.trailing_zeros() as usize
-            };
-            run += zeros;
-            p += zeros;
-            if run >= n {
-                return (start + n <= POOL_PAGES).then_some(start);
-            }
+    /// The bitmap as a plan sees it: a copy the plan changes and the table does not.
+    fn page_words(&self) -> [u64; POOL_PAGES / 64] {
+        let mut words = [0u64; POOL_PAGES / 64];
+        for (w, a) in words.iter_mut().zip(self.pages.iter()) {
+            *w = a.load(Relaxed);
         }
-        None
+        words
     }
 
-    /// Reserves the images of the elements of a scene. `wants[k]` is the key of
-    /// element `k` that needs an image (with the place of its window), None for
-    /// the others; the slots `keep` hold (the scenes still in use) stay as they
-    /// are and an element of a key they hold shares its slot. The slots no map of
-    /// `keep` has are let go first. On success the map of the new scene;
-    /// nothing a failure allocated stays. A new slot is to be drawn whole: its
-    /// level is `level`.
+    /// The first run of `n` free pages of the table.
+    #[cfg(test)]
+    fn find_pages(&self, n: usize) -> Option<usize> {
+        find_in(&self.page_words(), n)
+    }
+
+    /// Reserves the images of the elements of a scene in two phases. The plan reads
+    /// the table and changes nothing: it finds the slots of the scenes that stay
+    /// (`keep`) that an element shares by its key, the slots nothing holds any more
+    /// (let go once the plan fits), and for the elements that need a new slot a slot
+    /// and a run of pages in a copy of the bitmap with the pages of the slots to go
+    /// free. The apply phase lets go of the slots and makes the new ones as planned.
+    /// A refused reservation (Full: it does not fit the pool whatever the worker
+    /// holds; Wait: it fits once the worker lets go of the slots it holds) leaves
+    /// the table as it was. `wants[k]` is the key of element `k` that needs an image
+    /// (with the place of its window), None for the others. A new slot is drawn whole
+    /// at `level`.
     pub fn reserve(
+        &self,
+        wants: &[Option<(Key, usize)>],
+        keep: &[&Map],
+        level: u8,
+    ) -> Result<Map, Refuse> {
+        let made = self.reserve_planned(wants, keep, level);
+        if made == Err(Refuse::Wait) {
+            // The worker is to tell when it lets go of what the plan waits for.
+            self.waiting.store(true, SeqCst);
+        }
+        made
+    }
+
+    fn reserve_planned(
         &self,
         wants: &[Option<(Key, usize)>],
         keep: &[&Map],
@@ -496,15 +573,42 @@ impl Table {
                 shared[s as usize] = true;
             }
         }
-        // What nothing holds any more is let go.
+        // The plan's view of the table: what is free after the slots to go are let
+        // go. A slot the worker holds keeps its pages until the worker lets go.
+        let mut words = self.page_words();
+        let mut free = [false; SLOTS];
+        let mut zombies = 0;
         for s in 0..SLOTS {
             if self.used(s) && !shared[s] {
-                self.release(s);
+                if self.holds(s) {
+                    zombies += 1;
+                } else {
+                    let g = self.geometry_ref(s);
+                    set_in(
+                        &mut words,
+                        usize::from(g.page),
+                        2 * usize::from(g.pages),
+                        false,
+                    );
+                    free[s] = true;
+                }
+            } else if !self.used(s) {
+                if self.slots[s].zombie.load(SeqCst) {
+                    zombies += 1;
+                } else {
+                    free[s] = true;
+                }
             }
         }
-        // The new ones, in the order of the elements; a failure lets them go.
-        let mut made = [false; SLOTS];
-        let mut result = Ok(());
+        let short = |zombies: usize| {
+            if zombies > 0 {
+                Refuse::Wait
+            } else {
+                Refuse::Full
+            }
+        };
+        // Where each new slot goes: (element, slot, first page).
+        let mut placed: [Option<(usize, usize)>; MAX_ELEMENTS] = [None; MAX_ELEMENTS];
         for (k, want) in wants.iter().enumerate().take(MAX_ELEMENTS) {
             let Some((key, place)) = want else {
                 continue;
@@ -512,61 +616,53 @@ impl Table {
             if map[k] != NO_SLOT {
                 continue;
             }
-            // An element of the scene that the new slots of it already made for
-            // the same key shares that slot.
+            // An element of the scene whose twin (the same key) is planned shares
+            // the twin's slot.
             let twin = (0..k).find(|&j| {
                 matches!(wants[j], Some((other, p)) if other == *key && p == *place)
-                    && map[j] != NO_SLOT
+                    && (map[j] != NO_SLOT || placed[j].is_some())
             });
             if let Some(j) = twin {
                 map[k] = map[j];
+                placed[k] = placed[j];
                 continue;
             }
-            match self.make(*key, *place, level) {
-                Ok(s) => {
-                    map[k] = s as u8;
-                    made[s] = true;
-                }
-                Err(why) => {
-                    result = Err(why);
-                    break;
-                }
+            let pages = pages_of(key).ok_or(Refuse::Full)?;
+            if 2 * pages > POOL_PAGES {
+                return Err(Refuse::Full);
+            }
+            let slot = (0..SLOTS)
+                .find(|&s| free[s])
+                .ok_or_else(|| short(zombies))?;
+            let first = find_in(&words, 2 * pages).ok_or_else(|| short(zombies))?;
+            free[slot] = false;
+            set_in(&mut words, first, 2 * pages, true);
+            map[k] = slot as u8;
+            placed[k] = Some((slot, first));
+        }
+        // The apply phase: nothing refuses from here.
+        for s in 0..SLOTS {
+            if self.used(s) && !shared[s] {
+                self.release(s);
             }
         }
-        if let Err(why) = result {
-            for s in 0..SLOTS {
-                if made[s] {
-                    self.release(s);
-                }
+        for (k, want) in wants.iter().enumerate().take(MAX_ELEMENTS) {
+            let (Some((key, place)), Some((slot, first))) = (want, placed[k]) else {
+                continue;
+            };
+            // A twin is made once, at the element that planned it first.
+            if !self.slots[slot].used.load(Relaxed) {
+                self.make_at(*key, *place, level, slot, first);
             }
-            return Err(why);
         }
         Ok(map)
     }
 
-    /// A slot and its two images for `key`, drawn whole before it shows.
-    fn make(&self, key: Key, place: usize, level: u8) -> Result<usize, Refuse> {
-        let (w, h) = (key.size[0], key.size[1]);
-        if w <= 0 || h <= 0 || w as u32 > SIDE_MAX || h as u32 > SIDE_MAX {
-            return Err(Refuse::Full);
-        }
-        let (w, h) = (w as u32, h as u32);
-        let pages = (w as usize * h as usize * 4).div_ceil(PAGE);
-        if 2 * pages > POOL_PAGES {
-            return Err(Refuse::Full);
-        }
-        let Some(s) = (0..SLOTS)
-            .find(|&s| !self.slots[s].used.load(Relaxed) && !self.slots[s].zombie.load(Relaxed))
-        else {
-            return Err(Refuse::Wait);
-        };
-        let Some(first) = self.find_pages(2 * pages) else {
-            // Whether the pool would have room with the zombies' pages free.
-            let held = (0..SLOTS)
-                .filter(|&z| self.slots[z].zombie.load(Relaxed))
-                .count();
-            return Err(if held > 0 { Refuse::Wait } else { Refuse::Full });
-        };
+    /// A slot and its two images for `key` at the planned place, drawn whole before
+    /// it shows.
+    fn make_at(&self, key: Key, place: usize, level: u8, s: usize, first: usize) {
+        let (w, h) = (key.size[0] as u32, key.size[1] as u32);
+        let pages = pages_of(&key).unwrap_or(0);
         self.pages_set(first, 2 * pages, true);
         let slot = &self.slots[s];
         // SAFETY: the slot is not used and no zombie: nothing reads it.
@@ -588,7 +684,6 @@ impl Table {
         slot.level.store(level.clamp(1, LEVEL_MAX), SeqCst);
         slot.used.store(true, SeqCst);
         self.want.fetch_or(1 << s, SeqCst);
-        Ok(s)
     }
 
     /// Slot `s` is let go: its pages are free now, or when the worker lets go of
@@ -679,10 +774,18 @@ impl Table {
     /// The highest level of the slots that want the worker, None when none does.
     pub fn top_level(&self) -> Option<u8> {
         let want = self.want.load(SeqCst);
+        // The slot the worker holds is work in hand: its level counts too.
+        let busy = (self.busy.load(SeqCst) & 0xFF) as usize;
+        let held = busy.checked_sub(1).filter(|&s| s < SLOTS && self.used(s));
         (0..SLOTS)
-            .filter(|&s| want & (1 << s) != 0 && self.used(s))
+            .filter(|&s| (want & (1 << s) != 0 && self.used(s)) || held == Some(s))
             .map(|s| self.level_of(s))
             .max()
+    }
+
+    /// The worker's claim moved since the last call.
+    pub fn take_moved(&self) -> bool {
+        self.moved.swap(false, SeqCst)
     }
 
     /// The image of `slot` that shows now (its front), None before the first.
@@ -691,7 +794,7 @@ impl Table {
         (st & READY != 0).then_some((st & FRONT) as u8)
     }
 
-    /// The level the worker runs at, as the service last set it.
+    /// The level the service last set the worker to.
     pub fn worker_level(&self) -> u8 {
         self.level.load(Relaxed)
     }
@@ -810,6 +913,12 @@ impl Table {
     /// window shows now, claimed. None when the slot is gone, or the window is not
     /// the slot's or has nothing to read; the claim is then the slot's alone.
     fn hold(&self, slot: usize) -> Option<(Geometry, Surface)> {
+        self.hold_with(slot, &mut || {})
+    }
+
+    /// `hold` with a step the tests inject between the claim and the look that
+    /// confirms it, where the service may move the window's buffer.
+    fn hold_with(&self, slot: usize, between: &mut dyn FnMut()) -> Option<(Geometry, Surface)> {
         loop {
             if !self.used(slot) {
                 return None;
@@ -823,8 +932,14 @@ impl Table {
             if b == NO_BUFFER {
                 return None;
             }
-            self.busy
-                .store(claim(slot, usize::from(g.place), b), SeqCst);
+            let now = claim(slot, usize::from(g.place), b);
+            let before = self.busy.swap(now, SeqCst);
+            // A claim that moves from a buffer to another is told to a service that
+            // waits for the first.
+            if before != now && before >> 8 != 0 && before >> 8 != now >> 8 {
+                self.moved.store(true, SeqCst);
+            }
+            between();
             // The service may have changed what the window shows meanwhile.
             if self.used(slot)
                 && info.id.load(SeqCst) == g.key.source
@@ -846,7 +961,8 @@ impl Table {
                     },
                 ));
             }
-            self.busy.store(claim_slot(slot), SeqCst);
+            // The claim stays until the next look replaces it (or the pass lets
+            // go): a free that waited for the old buffer is told when it moves.
         }
     }
 }
@@ -922,6 +1038,9 @@ pub struct Job {
     row: u32,
     /// What was drawn of the image so far.
     done: Option<Rect>,
+    /// The damage that came during the pass was taken once already: what comes
+    /// after waits for the next pass.
+    extended: bool,
     live: bool,
 }
 
@@ -932,6 +1051,7 @@ impl Job {
         rect: None,
         row: 0,
         done: None,
+        extended: false,
         live: false,
     };
 
@@ -962,7 +1082,11 @@ impl Table {
                 self.abandon(job);
             }
             self.busy.store(claim_slot(slot), SeqCst);
+            // Every Idle or Blocked return leaves the slot's bit clear (the
+            // service sets it again with a notice), or the worker would be given
+            // the same slot for ever.
             if !self.used(slot) {
+                self.want.fetch_and(!(1 << slot), SeqCst);
                 return Pass::Idle;
             }
             // The image the worker draws in: the one that is not the front, nor a
@@ -999,6 +1123,7 @@ impl Table {
                 rect: Some(rect),
                 row: rect.y,
                 done: None,
+                extended: false,
                 live: true,
             };
         }
@@ -1007,14 +1132,16 @@ impl Table {
             // damage stays with the slot, and the slot wants the worker again when a
             // post comes (`damage`), never before, or the worker would spin on it.
             self.give_back(job, false);
+            self.want.fetch_and(!(1 << slot), SeqCst);
             return Pass::Idle;
         };
         let Some(rect) = job.rect else {
             self.give_back(job, false);
+            self.want.fetch_and(!(1 << slot), SeqCst);
             return Pass::Idle;
         };
         let end = (rect.y + rect.h).min(g.h);
-        let rows = PIECE_ROWS.min(end.saturating_sub(job.row));
+        let rows = piece_rows(rect.w).min(end.saturating_sub(job.row));
         if rows > 0 {
             let area = Rect {
                 x: rect.x,
@@ -1064,9 +1191,12 @@ impl Table {
                 return Pass::More;
             }
         }
-        // The rectangle is drawn: damage that came meanwhile is drawn too, and
-        // then the image shows.
-        if let Some(more) = unpack(s.dirty[usize::from(job.target)].swap(EMPTY, SeqCst)) {
+        // The rectangle is drawn: the damage that came meanwhile is drawn too, once;
+        // what comes after that waits for the next pass.
+        if !job.extended
+            && let Some(more) = unpack(s.dirty[usize::from(job.target)].swap(EMPTY, SeqCst))
+        {
+            job.extended = true;
             job.rect = Some(more);
             job.row = more.y;
             return Pass::More;
@@ -1078,6 +1208,11 @@ impl Table {
                 Ok(_) => break,
                 Err(now) => cur = now,
             }
+        }
+        // Damage that came after the last look is the next pass's: the image that
+        // shows lacks it.
+        if s.dirty[usize::from(job.target)].load(SeqCst) != EMPTY {
+            self.want.fetch_or(1 << slot, SeqCst);
         }
         // What shows now is damage of the screen: the union of what the pass drew.
         if let Some(r) = job.done.take() {
@@ -1232,9 +1367,9 @@ mod tests {
     #[test]
     fn a_pass_given_up_gives_back_what_it_took_and_the_slot_wants_the_worker_again() {
         let t = table();
-        let a = t.reserve(&[Some((key(8, 64, 40), 0))], &[], 28).unwrap();
+        let a = t.reserve(&[Some((key(8, 128, 64), 0))], &[], 28).unwrap();
         let slot = usize::from(a[0]);
-        t.set_window(0, 8, Format::Xrgb, 256, 64, 40);
+        t.set_window(0, 8, Format::Xrgb, 512, 128, 64);
         t.set_latest(0, 0);
         struct Nothing;
         impl Maker for Nothing {
@@ -1256,7 +1391,7 @@ mod tests {
                 &self.0
             }
         }
-        let win = Window(vec![0; 256 * 40]);
+        let win = Window(vec![0; 512 * 64]);
         let mut job = Job::NONE;
         assert_eq!(t.piece(&mut job, slot, &mut Nothing, &win), Pass::More);
         assert!(!t.work_waits());
@@ -1273,8 +1408,9 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
-        // 40 lines in pieces of 16 lines: three pieces, the last publishes.
-        assert_eq!(passes, 3);
+        // 64 lines in pieces of 32 lines (4096 points over 128): two pieces, the last
+        // publishes.
+        assert_eq!(passes, 2);
         assert_eq!(t.front_of(slot), Some(1));
     }
 
@@ -1368,5 +1504,274 @@ mod tests {
                 }
             )
         );
+    }
+
+    struct NoMaker;
+
+    impl Maker for NoMaker {
+        fn make(
+            &mut self,
+            _: &mut [u8],
+            _: u32,
+            _: bool,
+            _: (u32, u32),
+            _: &Element,
+            _: &Surface2<'_>,
+            _: Rect,
+        ) {
+        }
+    }
+
+    struct Flat(Vec<u8>);
+
+    impl Reads for Flat {
+        fn read(&self, _: usize, _: u8, _: usize) -> &[u8] {
+            &self.0
+        }
+    }
+
+    /// The worker's loop as the service runs it: pieces while a slot is next, every
+    /// pass that ends lets go. The slots a pass ended on.
+    fn run(t: &Table, job: &mut Job, win: &Flat) -> Vec<(usize, Pass)> {
+        let mut ended = Vec::new();
+        let mut guard = 0;
+        while let Some((slot, _)) = t.next(job) {
+            guard += 1;
+            assert!(guard < 1000, "the worker spins");
+            let pass = t.piece(job, slot, &mut NoMaker, win);
+            match pass {
+                Pass::More => {}
+                Pass::Published => {
+                    t.let_go();
+                    ended.push((slot, pass));
+                }
+                Pass::Idle | Pass::Blocked => {
+                    // Every Idle or Blocked return has cleared the slot's bit.
+                    assert_eq!(t.want.load(SeqCst) & (1 << slot), 0, "slot {slot} {pass:?}");
+                    t.let_go();
+                    ended.push((slot, pass));
+                }
+            }
+        }
+        ended
+    }
+
+    #[test]
+    fn slots_of_windows_not_posted_yet_do_not_starve_a_later_slot_of_a_posted_window() {
+        let t = table();
+        // Three elements: two show windows that have posted nothing, the last a
+        // posted static window.
+        let wants = [
+            Some((key(8, 64, 40), 0)),
+            Some((key(9, 64, 40), 1)),
+            Some((key(10, 64, 40), 2)),
+        ];
+        let map = t.reserve(&wants, &[], 28).unwrap();
+        t.set_window(2, 10, Format::Xrgb, 256, 64, 40);
+        t.set_latest(2, 0);
+        let win = Flat(vec![0; 256 * 40]);
+        let mut job = Job::NONE;
+        let ended = run(&t, &mut job, &win);
+        assert!(ended.contains(&(usize::from(map[2]), Pass::Published)));
+        assert!(ended.contains(&(usize::from(map[0]), Pass::Idle)));
+        assert!(ended.contains(&(usize::from(map[1]), Pass::Idle)));
+        assert_eq!(t.front_of(usize::from(map[2])), Some(1));
+        assert_eq!(t.front_of(usize::from(map[0])), None);
+        // Nothing wants the worker now, and a later post wakes a slot again.
+        assert!(!t.work_waits());
+        t.set_window(0, 8, Format::Xrgb, 256, 64, 40);
+        t.set_latest(0, 0);
+        t.damage(
+            usize::from(map[0]),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+            },
+            28,
+        );
+        let ended = run(&t, &mut job, &win);
+        assert_eq!(ended, vec![(usize::from(map[0]), Pass::Published)]);
+    }
+
+    #[test]
+    fn a_slot_a_frame_holds_blocks_until_the_frame_ends_and_clears_its_bit() {
+        let t = table();
+        let map = t.reserve(&[Some((key(8, 64, 40), 0))], &[], 28).unwrap();
+        let slot = usize::from(map[0]);
+        t.set_window(0, 8, Format::Xrgb, 256, 64, 40);
+        t.set_latest(0, 0);
+        let win = Flat(vec![0; 256 * 40]);
+        let mut job = Job::NONE;
+        run(&t, &mut job, &win);
+        let held = t.frame_take(slot).unwrap();
+        t.damage(
+            slot,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+            },
+            28,
+        );
+        run(&t, &mut job, &win);
+        // The front is now the other image; the next post finds the held one.
+        assert_ne!(t.front_of(slot), Some(held));
+        t.damage(
+            slot,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+            },
+            28,
+        );
+        let ended = run(&t, &mut job, &win);
+        assert_eq!(ended, vec![(slot, Pass::Blocked)]);
+        assert!(!t.work_waits());
+        t.frame_release(slot);
+        assert!(t.unblock());
+        let ended = run(&t, &mut job, &win);
+        assert_eq!(ended, vec![(slot, Pass::Published)]);
+    }
+
+    #[test]
+    fn a_refused_reservation_leaves_the_slots_the_pages_and_the_bits_as_they_were() {
+        let t = table();
+        let old = t
+            .reserve(
+                &[Some((key(8, 64, 40), 0)), Some((key(8, 32, 20), 0))],
+                &[],
+                28,
+            )
+            .unwrap();
+        let before = (t.pages_used(), t.want.load(SeqCst));
+        let used: Vec<bool> = (0..SLOTS).map(|s| t.used(s)).collect();
+        // Sixteen new keys, the first fifteen small and the last too big for what
+        // is left: the old slots are dead (no scene keeps them) and stay.
+        let mut wants = Vec::new();
+        for k in 0..15 {
+            wants.push(Some((key(20 + k, 100, 100), 1)));
+        }
+        wants.push(Some((key(99, 700, 350), 1)));
+        assert_eq!(t.reserve(&wants, &[], 28), Err(Refuse::Full));
+        assert_eq!(before, (t.pages_used(), t.want.load(SeqCst)));
+        let after: Vec<bool> = (0..SLOTS).map(|s| t.used(s)).collect();
+        assert_eq!(used, after);
+        assert!(t.used(usize::from(old[0])));
+        // The same wants without the last element go through, and the dead slots go.
+        let ok = t.reserve(&wants[..15], &[], 28).unwrap();
+        assert!(ok[..15].iter().all(|&s| s != NO_SLOT));
+        // The old slots' pages went: only the fifteen new slots hold pages.
+        assert_eq!(t.pages_used(), 15 * 2 * 10);
+    }
+
+    #[test]
+    fn a_reservation_that_waits_for_the_worker_changes_nothing_and_asks_to_be_told() {
+        let t = table();
+        let a = t.reserve(&[Some((key(8, 700, 350), 0))], &[], 28).unwrap();
+        t.busy.store(claim_slot(usize::from(a[0])), SeqCst);
+        let used = t.pages_used();
+        assert_eq!(
+            t.reserve(&[Some((key(9, 700, 350), 0))], &[], 28),
+            Err(Refuse::Wait)
+        );
+        assert!(t.deferred());
+        // The slot to go is still there, not yet a zombie.
+        assert!(t.used(usize::from(a[0])));
+        assert_eq!(t.pages_used(), used);
+    }
+
+    #[test]
+    fn the_claim_moves_with_the_window_and_a_buffer_the_worker_left_can_be_freed() {
+        let t = table();
+        let a = t.reserve(&[Some((key(8, 64, 40), 0))], &[], 28).unwrap();
+        let slot = usize::from(a[0]);
+        t.set_window(0, 8, Format::Xrgb, 256, 64, 40);
+        t.set_latest(0, 0);
+        // The service moves the window to buffer 1 between the worker's claim of
+        // buffer 0 and the look that confirms it.
+        let mut once = true;
+        let (_, win) = t
+            .hold_with(slot, &mut || {
+                if once {
+                    once = false;
+                    t.set_latest(0, 1);
+                    // The service frees buffer 0 of the window now: the worker may
+                    // be reading it.
+                    assert!(t.reads(0, Some(0)));
+                }
+            })
+            .expect("a window to read");
+        assert_eq!(win.buffer, 1);
+        assert!(t.take_moved());
+        // The claim is buffer 1 now: buffer 0 can go, buffer 1 waits.
+        assert!(!t.reads(0, Some(0)));
+        assert!(t.reads(0, Some(1)));
+        assert!(t.let_go());
+        assert!(!t.reads(0, Some(1)));
+    }
+
+    #[test]
+    fn damage_that_comes_during_a_pass_is_drawn_once_and_the_rest_is_the_next_passes() {
+        let t = table();
+        let a = t.reserve(&[Some((key(8, 128, 64), 0))], &[], 28).unwrap();
+        let slot = usize::from(a[0]);
+        t.set_window(0, 8, Format::Xrgb, 512, 128, 64);
+        t.set_latest(0, 0);
+        let win = Flat(vec![0; 512 * 64]);
+        let mut job = Job::NONE;
+        // The first piece takes the whole damage; two posts come meanwhile.
+        assert_eq!(t.piece(&mut job, slot, &mut NoMaker, &win), Pass::More);
+        t.damage(
+            slot,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8,
+            },
+            28,
+        );
+        loop {
+            match t.piece(&mut job, slot, &mut NoMaker, &win) {
+                Pass::More => {
+                    // A second post in the extension is the next pass's.
+                    t.damage(
+                        slot,
+                        Rect {
+                            x: 8,
+                            y: 0,
+                            w: 8,
+                            h: 8,
+                        },
+                        28,
+                    );
+                }
+                Pass::Published => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        t.let_go();
+        // The image shows, and the slot wants the worker for what came last.
+        assert_eq!(t.front_of(slot), Some(1));
+        assert!(t.work_waits());
+    }
+
+    #[test]
+    fn the_level_of_the_worker_is_that_of_the_work_it_holds_as_well_as_the_work_that_waits() {
+        let t = table();
+        let a = t.reserve(&[Some((key(8, 64, 40), 0))], &[], 28).unwrap();
+        let slot = usize::from(a[0]);
+        assert_eq!(t.top_level(), Some(28));
+        // The worker took the slot's bit and holds the slot: its level still counts.
+        t.want.fetch_and(!(1 << slot), SeqCst);
+        t.busy.store(claim_slot(slot), SeqCst);
+        assert_eq!(t.top_level(), Some(28));
+        t.let_go();
+        assert_eq!(t.top_level(), None);
     }
 }

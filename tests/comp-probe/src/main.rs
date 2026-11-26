@@ -1096,6 +1096,22 @@ impl Probe<'_> {
         }
         self.commit(&display, ACTIVE, &[first; 16])
             .map_err(say("a scene of 16"))?;
+        // The worst commit of the images the service plans: fifteen new keys of about
+        // 100 by 100 points that fit the pool and a sixteenth that does not, so the
+        // plan fails at its last element. It is refused with LIMIT and the scene that
+        // was there stays (the next commit is accepted as before).
+        let mut worst = [first; 16];
+        for (k, e) in worst.iter_mut().enumerate() {
+            e.orient = 1;
+            e.dw = 100;
+            e.dh = 100 + k as i32;
+        }
+        worst[15].dw = 700;
+        worst[15].dh = 350;
+        if !refused(self.commit(&display, ACTIVE, &worst), proto_gpu::LIMIT) {
+            return Err("a scene whose images do not fit the pool was not refused with LIMIT");
+        }
+        rt::println!("comp-probe: a scene whose images do not fit the pool is refused with LIMIT");
         rt::println!("comp-probe: a scene is committed by its session and refused past its limits");
         // The scene of the two windows. COMMITTED comes with the frame that takes it.
         self.commit(&display, ACTIVE | ASK_COMMITTED, &[first, second])

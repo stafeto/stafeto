@@ -24,7 +24,7 @@
 //! | INJECT (23) | input | one event of 16 bytes | the status alone | INVALID, NOT_ALLOWED |
 //! | SET (24) | window | `property`, `value` (u32) | the status alone | INVALID, UNSUPPORTED, NOT_ALLOWED, REVOKED |
 //! | STATS (25) | context, window, manager, input | `flags` (u32) | status, 17 counters, 33 buckets, `count` (u32), then `count` records of 32 bytes | INVALID, NOT_ALLOWED, REVOKED |
-//! | SCENE_COMMIT (26) | scene | `flags`, `bg`, `count` (u32), then `count` records of 56 bytes | the status alone, at once | INVALID, NOT_ALLOWED |
+//! | SCENE_COMMIT (26) | scene | `flags`, `bg`, `count` (u32), then `count` records of 56 bytes | the status alone, at once | INVALID, NOT_ALLOWED, BUSY, LIMIT_REACHED |
 //! | SCENE_COMPOSE (27) | scene | `flags` (u32) | the status alone, at once | INVALID, NOT_ALLOWED, UNSUPPORTED, BUSY |
 //!
 //! The context is the `Display` session. A window is a session of its own
@@ -139,6 +139,19 @@
 //! reflection, the filter, the global alpha and the mask; `meaning` says what each
 //! field comes to point by point); SCENE_COMMIT refuses with INVALID what no
 //! drawing could make sense of.
+//!
+//! The elements that turn, reflect or stretch a window are drawn from images the
+//! service makes, which a SCENE_COMMIT reserves (two images of 4 bytes a point of the
+//! target for each such element, in a pool of 2 MiB shared with the scenes still in
+//! use). A refused commit changes nothing. LIMIT_REACHED: the images do not fit the pool
+//! beside the images of the working scene, or its fragmentation does not allow them
+//! (a scene that fits alone can still get LIMIT); the holder commits a smaller scene.
+//! BUSY (also the answer of a second holder): the images fit once the worker that
+//! makes them lets go of the slots it holds, which it does within one piece of its
+//! work at the commit's level (the service raises it to that level when it refuses with
+//! BUSY); the holder tries again after its next event or one period, never in a tight
+//! loop. An element shows its previous image until the new one is made, and nothing
+//! before its first.
 //!
 //! Input under a scene: the keys go to the window with the focus, which the
 //! scene gives by MANAGE FOCUS; the moves and buttons of the pointer go to
