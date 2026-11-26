@@ -108,6 +108,11 @@ pub struct Record<P> {
     ready: bool,
     /// The ceiling of its process.
     pub ceiling: u8,
+    /// The base level of its process: the priority of its first thread at
+    /// the start (the ceiling until the service sets it). The teardown of
+    /// the process runs at this level, apart from the stages that stop its
+    /// threads and children, which run at the ceiling (spec 7.7).
+    pub level: u8,
     /// The quota and the room for handles of its process, which a child
     /// it spawns from a file gets too (5c).
     pub quota: u64,
@@ -595,6 +600,7 @@ impl<P> Records<P> {
             ready_next: None,
             ready: false,
             ceiling,
+            level: ceiling,
             quota: 0,
             handle_limit: 0,
             process_quota: 0,

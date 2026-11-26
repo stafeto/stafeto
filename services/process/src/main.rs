@@ -65,6 +65,7 @@ mod lifetime_page;
 mod loader;
 mod make;
 mod pages;
+mod reaper;
 mod rejoiner;
 mod replace;
 use core::mem::{ManuallyDrop, MaybeUninit};
@@ -218,6 +219,10 @@ const TIMERS: u64 = 1 << 63 | 0xFFFE;
 /// loop that it made a session for a request or failed (`rejoin_answers`),
 /// a service label no record has.
 const REJOINED: u64 = 1 << 63 | 0xFFFB;
+/// The label of the notice with which the thread of the reaper tells the
+/// loop that it closed an object of an image (`reaped`), a service label no
+/// record has.
+const REAPED: u64 = 1 << 63 | 0xFFFA;
 /// The label of the notice that makes the next portion of a Create (the
 /// service's own place, as STEP is).
 const CREATING: u64 = 1 << 63 | 0xFFFD;
@@ -276,7 +281,9 @@ impl Work {
 /// The detail of the step line of a notice of the loop (kind 64), by its
 /// source: the end of a process (an Exit notice), the step of the walks
 /// (STEP), of the terminal walk (TTY_STEP), the creation of a record
-/// (CREATING), the answers after a rejoin (REJOINED), the timers (TIMERS).
+/// (CREATING), the answers after a rejoin (REJOINED), the timers (TIMERS),
+/// the end of a process whose image objects the reaper closed (REAPED: the
+/// second part of the end, 0x8000; the Exit notice is the first, 0x1000).
 /// A portion of a load has `DETAIL_PORTION + Work::detail()`: 0x2001 the
 /// page, 0x2010 and up the pieces of the code (8 pages each), 0x2003 the
 /// read-only data, 0x2004 the data and stack, 0x2006 the thread and its
@@ -289,6 +296,7 @@ const DETAIL_WALK: u64 = 0x4000;
 const DETAIL_TTY: u64 = 0x5000;
 const DETAIL_REJOINED: u64 = 0x6000;
 const DETAIL_TIMERS: u64 = 0x7000;
+const DETAIL_REAPED: u64 = 0x8000;
 struct Making {
     work: Work,
     /// The page a child of SpawnStart or ForkStart starts with; none for
@@ -437,6 +445,16 @@ struct Processes {
     /// serves them (rejoiner.rs); none when the thread did not start.
     rejoin: Rejoin<Pending>,
     rejoin_wake: Option<Handle<Channel>>,
+    /// The copy of the channel that tells the thread of the reaper
+    /// (reaper.rs) of an object to close, and the place that tells the loop
+    /// again of a place that is done (REAPED); none when the thread did not
+    /// start (the loop closes the objects itself then). For each record,
+    /// the objects of its exit the thread has not closed yet and the number
+    /// of its image.
+    reaper_wake: Option<Handle<Channel>>,
+    reaped_notice: Option<Handle<Channel>>,
+    reaping: [u8; RECORDS],
+    reaping_image: [u32; RECORDS],
     /// The loaders that run (5c), the loader's program, the session of the
     /// loaders with the RAM file service (proto_fs LOADERS) and a console
     /// for the programs they start.
@@ -636,6 +654,18 @@ fn main(_: u64) -> u64 {
     match started {
         Ok(wake) => owner.rejoin_wake = Some(wake),
         Err(e) => rt::println!("posix-process: no thread for EntropyRejoin ({e:?})"),
+    }
+    // The thread that closes the objects of images at the level of the
+    // process that freed them, and the notices through which it tells the
+    // loop.
+    let reaping = sys::handle_label(&channel, Rights::NOTIFY, REAPED, level)
+        .and_then(|tells| reaper::start(&start.process, tells, level));
+    match reaping {
+        Ok(wake) => {
+            owner.reaper_wake = Some(wake);
+            owner.reaped_notice = sys::handle_label(&channel, Rights::NOTIFY, REAPED, level).ok();
+        }
+        Err(e) => rt::println!("posix-process: no thread for the reaper ({e:?})"),
     }
     // The timers of the processes: one timer of the kernel on a labelled
     // copy of the channel, so that its notice comes apart from the
@@ -902,6 +932,7 @@ impl Processes {
         );
         if let Some(record) = self.records.get_mut(index) {
             record.quota = create.quota;
+            record.level = create.priority.clamp(1, create.ceiling.max(1));
             record.process_quota = create.quota;
             record.limits = proto_process::ResourceLimits::initial(create.quota);
             if create.root {
@@ -1842,6 +1873,7 @@ impl Processes {
             }
             proto_process::IMAGE_DETACH if r.handles.is_empty() => {
                 self.images.detach(&key, child);
+                self.reap_images(child, false);
                 self.wake_loaders();
                 Answer::Status(Status::Ok)
             }
@@ -2098,8 +2130,9 @@ impl Processes {
     /// record in `target`: Denied past kill's rule (`signals::may_signal`),
     /// Refused for a signal outside the supported range; signal 0 and a
     /// zombie take nothing; SIGKILL
-    /// ends the process from the service at the target's ceiling
-    /// (process_kill_at); any other is posted on the target's page
+    /// ends the process from the service at the target's base level
+    /// (process_kill_at; only the stages that stop its threads and children
+    /// rise to its ceiling); any other is posted on the target's page
     /// (`signal`). O(1).
     fn deliver(&mut self, sender: usize, target: usize, signal: u8) -> Delivery {
         self.deliver_with(sender, target, signal, SI_USER, 0)
@@ -2134,11 +2167,12 @@ impl Processes {
         if signal == SIGKILL {
             #[cfg(feature = "steps")]
             rt::println!(
-                "process: kill of record {target}: ceiling {} service level {}",
+                "process: kill of record {target}: ceiling {} level {} service level {}",
                 record.ceiling,
+                record.level,
                 self.level
             );
-            let _ = sys::process_kill_at(&record.process, record.ceiling);
+            let _ = sys::process_kill_at(&record.process, record.level);
             return Delivery::Done;
         }
         let Some(page) = self.pages.page(target) else {
@@ -2552,7 +2586,7 @@ impl Processes {
     fn timer_signal(&mut self, owner: usize, signal: u8, info: Info) -> Posted {
         if signal == SIGKILL {
             if let Some(record) = self.records.get(owner) {
-                let _ = sys::process_kill_at(&record.process, record.ceiling);
+                let _ = sys::process_kill_at(&record.process, record.level);
             }
             return Posted::Pending;
         }
@@ -3273,7 +3307,7 @@ impl Processes {
             return Delivery::Done;
         }
         if signal == SIGKILL {
-            let _ = sys::process_kill_at(&record.process, record.ceiling);
+            let _ = sys::process_kill_at(&record.process, record.level);
             return Delivery::Done;
         }
         let Some(page) = self.pages.page(target) else {
@@ -3638,11 +3672,20 @@ impl Processes {
                     .is_some_and(|link| link.sid == parent.sid && link.generation == generation)
             })
         };
+        // A child that starts below the level of its parent (a spawn with a
+        // scheduling that puts it there, posix-abi `for_child`) has the level
+        // and one above it as its ceiling: all of its work, the load and the
+        // teardown among it, stays below the parent's own.
+        let ceiling = if birth.level < parent.level {
+            parent.ceiling.min(birth.level.saturating_add(1))
+        } else {
+            parent.ceiling
+        };
         let create = Create {
             quota: parent.quota,
             handle_limit: parent.handle_limit,
-            ceiling: parent.ceiling,
-            priority: birth.level.clamp(1, parent.ceiling),
+            ceiling,
+            priority: birth.level.clamp(1, ceiling),
             root: false,
             cpus: parent.cpus,
             ticket: 0,
@@ -3730,6 +3773,7 @@ impl Processes {
         self.rejoin.born(child);
         if let Some(record) = self.records.get_mut(child) {
             record.quota = create.quota;
+            record.level = create.priority;
             record.process_quota = process_quota;
             if let Some(m) = holder {
                 // The limits of data and of the address space that still
@@ -4274,7 +4318,7 @@ impl Processes {
             .saturating_sub(record.base_kernel);
         record.base_ticks = 0;
         record.base_kernel = 0;
-        let ceiling = record.ceiling;
+        let level = record.level;
         record.image = image;
         record.image_pages = image_pages;
         record.process_quota = record.quota;
@@ -4295,6 +4339,7 @@ impl Processes {
         // The entries of the image it replaced it uses no more; those of
         // the new image it joined are its own now.
         self.images.commit(index);
+        self.reap_images(index, false);
         self.wake_sharers();
         self.timers.clear(index as u8, false);
         if let Some(page) = self.pages.page(index) {
@@ -4326,7 +4371,7 @@ impl Processes {
             self.dispatch_replace();
             return Answer::Deferred;
         }
-        let _ = sys::process_kill_at(&old, ceiling);
+        let _ = sys::process_kill_at(&old, level);
         if let Some(ready) = ready.as_ref() {
             let _ = sys::notify(ready, 1);
         }
@@ -4393,8 +4438,8 @@ impl Processes {
             return;
         };
         if let Some(old) = replacing.old.as_ref() {
-            let ceiling = self.records.get(index).map_or(0, |r| r.ceiling);
-            let _ = sys::process_kill_at(old, ceiling);
+            let level = self.records.get(index).map_or(0, |r| r.level);
+            let _ = sys::process_kill_at(old, level);
         }
         if let Some(ready) = replacing.ready.as_ref() {
             let _ = sys::notify(ready, 1);
@@ -4438,6 +4483,7 @@ impl Processes {
         // What the load joined in the table of images, and the object it
         // made, go with it.
         self.images.abort(child);
+        self.reap_images(child, false);
         self.wake_loaders();
         #[cfg(feature = "image-probe")]
         let place = self.free_observed_loader(child, Terminal::Aborted);
@@ -4450,8 +4496,8 @@ impl Processes {
             }
             // An exec's new process goes; the record keeps its old one.
             if let Some(incoming) = place.held.incoming {
-                let ceiling = self.records.get(child).map_or(0, |r| r.ceiling);
-                let _ = sys::process_kill_at(&incoming, ceiling);
+                let level = self.records.get(child).map_or(0, |r| r.level);
+                let _ = sys::process_kill_at(&incoming, level);
                 return;
             }
         }
@@ -4748,6 +4794,7 @@ impl Processes {
             .map_or(0, |place| place.image_pages);
         if !fork {
             self.images.commit(child);
+            self.reap_images(child, false);
             self.wake_loaders();
         }
         if !fork {
@@ -5265,6 +5312,11 @@ impl Service<0> for Processes {
             self.created();
             return;
         }
+        if n.source == Source::Session && n.label == REAPED {
+            rt::service::step_detail(DETAIL_REAPED);
+            self.reaped();
+            return;
+        }
         if n.source == Source::Session && n.label == REJOINED {
             rt::service::step_detail(DETAIL_REJOINED);
             self.rejoin_answers();
@@ -5302,6 +5354,72 @@ impl Service<0> for Processes {
                 #[cfg(not(feature = "image-probe"))]
                 self.abort_load(index, Status::from_code(proto_process::AGAIN));
             }
+            return;
+        }
+        // The first part: the image objects the process used go to the
+        // reaper, and its end waits for them (`reaped`); with none to close
+        // the end goes on at once.
+        self.images.drop_user(index);
+        let handed = self.reap_images(index, true);
+        if handed > 0 {
+            self.reaping[index] = handed as u8;
+            self.reaping_image[index] = image;
+            return;
+        }
+        self.exit_end(index, image);
+    }
+}
+
+impl Processes {
+    /// The objects of the images that went out of the table (`Images::
+    /// take_freed`) go to the reaper at the base level of the record in
+    /// `index`; the loop closes one itself when the thread has no place or
+    /// did not start. Gives the count handed over, which is `exit` when the
+    /// record's end waits for them.
+    fn reap_images(&mut self, index: usize, exit: bool) -> usize {
+        let level = self.records.get(index).map_or(1, |r| r.level);
+        let mut handed = 0;
+        while let Some(memory) = self.images.take_freed() {
+            let Some(wake) = self.reaper_wake.as_ref() else {
+                continue;
+            };
+            if reaper::give(wake, memory, level, index, exit).is_ok() {
+                handed += 1;
+            }
+        }
+        handed
+    }
+
+    /// The thread of the reaper closed objects (REAPED): the end of a
+    /// process whose last object is back goes on (`exit_end`), one process
+    /// a step, and the next waits for a notice of its own.
+    fn reaped(&mut self) {
+        while let Some((record, exit)) = reaper::take() {
+            if !exit || self.reaping[record] == 0 {
+                continue;
+            }
+            self.reaping[record] -= 1;
+            if self.reaping[record] > 0 {
+                continue;
+            }
+            self.exit_end(record, self.reaping_image[record]);
+            if reaper::waiting()
+                && let Some(notice) = self.reaped_notice.as_ref()
+            {
+                let _ = sys::notify(notice, 1);
+            }
+            return;
+        }
+    }
+
+    /// The second part of the end of the process of the record in `index`,
+    /// whose image is number `image`: its record ends with its reason
+    /// (proto_process::End), and the rest of the end.
+    fn exit_end(&mut self, index: usize, image: u32) {
+        let Some(record) = self.records.get(index) else {
+            return;
+        };
+        if image != record.image {
             return;
         }
         self.lifetimes.retire(record.label.pid());
@@ -5370,7 +5488,6 @@ impl Service<0> for Processes {
         self.routers[index] = None;
         self.queued.clear(index);
         self.shares.drop_user(index);
-        self.images.drop_user(index);
         self.wake_sharers();
         self.timers.clear(index as u8, true);
         if let Exit::Zombie { parent } = exit {

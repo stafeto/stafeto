@@ -91,6 +91,11 @@ const GONE: u8 = u8::MAX;
 
 pub struct Images<T, W> {
     entries: [Option<Entry<T>>; IMAGES],
+    /// The objects of the entries that went, which the caller takes with
+    /// `take_freed` after each call that may free one: the service hands
+    /// them to a thread at a low level, so that the release of their pages
+    /// never runs inside a step of the loop.
+    freed: [Option<T>; IMAGES],
     waiting: [Option<Waiting<W>>; WAITING],
     ages: u32,
 }
@@ -107,6 +112,7 @@ impl<T, W> Images<T, W> {
         // in `new`.
         unsafe {
             rt::bss::fill_none(addr_of_mut!((*at).entries));
+            rt::bss::fill_none(addr_of_mut!((*at).freed));
             rt::bss::fill_none(addr_of_mut!((*at).waiting));
         }
     }
@@ -114,6 +120,7 @@ impl<T, W> Images<T, W> {
     pub const fn new() -> Self {
         Images {
             entries: [const { None }; IMAGES],
+            freed: [const { None }; IMAGES],
             waiting: [const { None }; WAITING],
             ages: 0,
         }
@@ -127,7 +134,17 @@ impl<T, W> Images<T, W> {
 
     /// The entry in `i` goes; the requests that wait for it lose their entry.
     fn free(&mut self, i: usize) {
-        self.entries[i] = None;
+        if let Some(Entry {
+            state: State::Ready { memory, .. },
+            ..
+        }) = self.entries[i].take()
+        {
+            // A call that frees more than the places hold lets the object
+            // go here (the caller drains after each call, so it does not).
+            if let Some(place) = self.freed.iter_mut().find(|p| p.is_none()) {
+                *place = Some(memory);
+            }
+        }
         for w in self.waiting.iter_mut().flatten() {
             if usize::from(w.entry) == i {
                 w.entry = GONE;
@@ -382,6 +399,11 @@ impl<T, W> Images<T, W> {
         }
     }
 
+    /// An object of an entry that went (`free`), or none.
+    pub fn take_freed(&mut self) -> Option<T> {
+        self.freed.iter_mut().find_map(Option::take)
+    }
+
     /// The entries in use.
     pub fn len(&self) -> usize {
         self.entries.iter().flatten().count()
@@ -441,8 +463,11 @@ mod tests {
         t.commit(2);
         t.drop_user(1);
         assert_eq!(t.len(), 1, "the second keeps the entry");
+        assert_eq!(t.take_freed(), None, "the entry is in use");
         t.drop_user(2);
         assert!(t.is_empty());
+        assert_eq!(t.take_freed(), Some(55), "the object goes to the caller");
+        assert_eq!(t.take_freed(), None);
     }
 
     #[test]
