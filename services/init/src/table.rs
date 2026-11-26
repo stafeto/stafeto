@@ -1598,6 +1598,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-relibc-threads") as usize
     + cfg!(feature = "table-cxx-probe") as usize
     + cfg!(feature = "table-gles-pbuffer") as usize
+    + cfg!(feature = "table-gles-window") as usize
     + cfg!(feature = "table-posix-procs") as usize
     + cfg!(feature = "table-posix-lock-ring") as usize
     + cfg!(feature = "table-posix-shares") as usize
@@ -1711,6 +1712,7 @@ const _: () = assert!(
     feature = "table-relibc-threads",
     feature = "table-cxx-probe",
     feature = "table-gles-pbuffer",
+    feature = "table-gles-window",
     feature = "table-posix-procs",
     feature = "table-posix-lock-ring",
     feature = "table-posix-shares",
@@ -1832,6 +1834,8 @@ pub const TABLE: &[Record] = ramfs::RELIBC_THREADS_TABLE;
 pub const TABLE: &[Record] = ramfs::CXX_PROBE_TABLE;
 #[cfg(feature = "table-gles-pbuffer")]
 pub const TABLE: &[Record] = gles::PBUFFER_TABLE;
+#[cfg(feature = "table-gles-window")]
+pub const TABLE: &[Record] = gles::WINDOW_TABLE;
 #[cfg(feature = "table-os-test")]
 pub const TABLE: &[Record] = ramfs::OS_TEST_TABLE;
 #[cfg(feature = "table-os-test-data")]
@@ -4360,6 +4364,7 @@ mod tests {
             wfc::TABLE,
             wfc::STEPS_TABLE,
             gles::PBUFFER_TABLE,
+            gles::WINDOW_TABLE,
             wfd::TABLE,
             wfd::STEPS_TABLE,
             ramfs::DISPLAY_TABLE,

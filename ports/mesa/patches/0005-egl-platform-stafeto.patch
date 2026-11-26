@@ -1,0 +1,159 @@
+The EGL platform of stafeto: the platform enumeration, the option and the build files.
+SPDX-License-Identifier: MIT
+Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+The platform itself is ports/mesa/stafeto/platform_stafeto.c (with swap.c,
+the arithmetic of its swaps), which tools/build-mesa.py copies into
+src/egl/drivers/dri2 before meson runs. This patch adds what Mesa's own files
+need to know of it: the option `platform-stafeto` (and `stafeto` among the
+values of `egl-native-platform`, the platform EGL_DEFAULT_DISPLAY takes),
+the sources in src/egl/meson.build, the value _EGL_PLATFORM_STAFETO and its
+name for EGL_PLATFORM, the call of dri2_initialize_stafeto and the surface's
+pointer to the window it draws into.
+
+diff --git a/meson.build b/meson.build
+index 769b844..9422bfa 100644
+--- a/meson.build
++++ b/meson.build
+@@ -578,12 +578,16 @@ endif
+ 
+ if with_egl
+   _platforms += 'surfaceless'
++  # stafeto: the platform of the windows of the composition service.
++  if get_option('platform-stafeto')
++    _platforms += 'stafeto'
++  endif
+   if with_gbm and not with_platform_android
+     _platforms += 'drm'
+   endif
+ 
+   # All the other platforms can be detected and cannot reach the native platform code
+-  _undetectable_platforms = ['x11', 'haiku', 'android', 'surfaceless']
++  _undetectable_platforms = ['x11', 'haiku', 'android', 'surfaceless', 'stafeto']
+ 
+   # Don't enforce the native platform if none of the undetectable platforms are enabled
+   _undetectable_platforms_enabled = []
+diff --git a/meson.options b/meson.options
+index beb2837..30afc25 100644
+--- a/meson.options
++++ b/meson.options
+@@ -23,11 +23,18 @@ option(
+   type : 'combo',
+   value : 'auto',
+   choices : [
+-    'auto', 'x11', 'haiku', 'android', 'surfaceless',
++    'auto', 'x11', 'haiku', 'android', 'surfaceless', 'stafeto',
+   ],
+   description : 'the window system EGL assumes for EGL_DEFAULT_DISPLAY',
+ )
+ 
++option(
++  'platform-stafeto',
++  type : 'boolean',
++  value : false,
++  description : 'the EGL platform of the windows of stafeto (src/egl/drivers/dri2/platform_stafeto.c)',
++)
++
+ option(
+   'android-stub',
+   type : 'boolean',
+diff --git a/src/egl/drivers/dri2/egl_dri2.c b/src/egl/drivers/dri2/egl_dri2.c
+index 3fab818..56269b5 100644
+--- a/src/egl/drivers/dri2/egl_dri2.c
++++ b/src/egl/drivers/dri2/egl_dri2.c
+@@ -932,6 +932,11 @@ dri2_initialize(_EGLDisplay *disp)
+    case _EGL_PLATFORM_ANDROID:
+       ret = dri2_initialize_android(disp);
+       break;
++#ifdef HAVE_STAFETO_PLATFORM
++   case _EGL_PLATFORM_STAFETO:
++      ret = dri2_initialize_stafeto(disp);
++      break;
++#endif
+    default:
+       UNREACHABLE("Callers ensure we cannot get here.");
+       return EGL_FALSE;
+@@ -1021,6 +1026,8 @@ dri2_display_destroy(_EGLDisplay *disp)
+       break;
+    case _EGL_PLATFORM_SURFACELESS:
+       break;
++   case _EGL_PLATFORM_STAFETO:
++      break;
+    case _EGL_PLATFORM_DEVICE:
+       break;
+    default:
+diff --git a/src/egl/drivers/dri2/egl_dri2.h b/src/egl/drivers/dri2/egl_dri2.h
+index 31916f8..3626587 100644
+--- a/src/egl/drivers/dri2/egl_dri2.h
++++ b/src/egl/drivers/dri2/egl_dri2.h
+@@ -299,10 +299,15 @@ struct dri2_egl_context {
+    struct dri_context *dri_context;
+ };
+ 
++struct dri2_stafeto_surface;
++
+ struct dri2_egl_surface {
+    _EGLSurface base;
+    struct dri_drawable *dri_drawable;
+ 
++   /* stafeto: the window of a window surface (platform_stafeto.c). */
++   struct dri2_stafeto_surface *stafeto;
++
+ #ifdef HAVE_X11_PLATFORM
+    xcb_drawable_t drawable;
+    xcb_xfixes_region_t region;
+@@ -565,6 +570,11 @@ dri2_initialize_android(_EGLDisplay *disp)
+ EGLBoolean
+ dri2_initialize_surfaceless(_EGLDisplay *disp);
+ 
++#ifdef HAVE_STAFETO_PLATFORM
++EGLBoolean
++dri2_initialize_stafeto(_EGLDisplay *disp);
++#endif
++
+ EGLBoolean
+ dri2_initialize_device(_EGLDisplay *disp);
+ static inline void
+diff --git a/src/egl/main/egldisplay.c b/src/egl/main/egldisplay.c
+index ef653aa..3c7206f 100644
+--- a/src/egl/main/egldisplay.c
++++ b/src/egl/main/egldisplay.c
+@@ -84,6 +84,7 @@ static const struct {
+    {_EGL_PLATFORM_SURFACELESS, "surfaceless"},
+    {_EGL_PLATFORM_DEVICE, "device"},
+    {_EGL_PLATFORM_WINDOWS, "windows"},
++   {_EGL_PLATFORM_STAFETO, "stafeto"},
+ };
+ 
+ /**
+diff --git a/src/egl/main/egldisplay.h b/src/egl/main/egldisplay.h
+index 6178140..ce74449 100644
+--- a/src/egl/main/egldisplay.h
++++ b/src/egl/main/egldisplay.h
+@@ -55,6 +55,7 @@ enum _egl_platform_type {
+    _EGL_PLATFORM_SURFACELESS,
+    _EGL_PLATFORM_DEVICE,
+    _EGL_PLATFORM_WINDOWS,
++   _EGL_PLATFORM_STAFETO,
+ 
+    _EGL_NUM_PLATFORMS,
+    _EGL_INVALID_PLATFORM = -1
+diff --git a/src/egl/meson.build b/src/egl/meson.build
+index 0f8cfed..49b60e7 100644
+--- a/src/egl/meson.build
++++ b/src/egl/meson.build
+@@ -89,6 +89,14 @@ if with_dri
+     'drivers/dri2/platform_device.c',
+     'drivers/dri2/platform_surfaceless.c',
+   )
++  # stafeto: the platform of the windows of the composition service and the
++  # arithmetic of its swaps (copied into the tree by tools/build-mesa.py).
++  if get_option('platform-stafeto')
++    files_egl += files(
++      'drivers/dri2/platform_stafeto.c',
++      'drivers/dri2/swap.c',
++    )
++  endif
+ 
+   if with_platform_x11
+     files_egl += files('drivers/dri2/platform_x11.c')

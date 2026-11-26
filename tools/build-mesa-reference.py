@@ -41,12 +41,14 @@ ROOT = bm.ROOT
 WORK = ROOT / "target" / "mesa-reference"
 XTASK = ROOT / "xtask" / "src" / "gles_pbuffer.rs"
 # The options of the stafeto build less the ones that make static targets
-# for a cross build.
-OMITTED = {"default_library", "b_staticpic", "c_std"}
+# for a cross build and the platform of stafeto (a Mesa of Linux has none; its
+# EGL_DEFAULT_DISPLAY is the surfaceless platform, as it was before that one).
+OMITTED = {"default_library", "b_staticpic", "c_std", "platform-stafeto"}
 
 
 def native_options() -> list[str]:
     options = {k: v for k, v in bm.OPTIONS.items() if k not in OMITTED}
+    options["egl-native-platform"] = "surfaceless"
     return bm.meson_options(options, bm.LIBDRM_OPTIONS) + [f"--prefix={WORK / 'prefix'}"]
 
 

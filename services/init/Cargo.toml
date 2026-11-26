@@ -83,6 +83,8 @@ table-relibc-threads = []
 table-cxx-probe = []
 # The cube in a pbuffer (xtask gles-pbuffer): the services of the POSIX probes and apps/gles-cube with a quota above 64 MiB.
 table-gles-pbuffer = []
+# The cube in a window of the composition service (xtask gles-window): the services of the POSIX probes, the display driver, the compositor and apps/gles-cube with a quota above 64 MiB.
+table-gles-window = []
 # The probe of POSIX processes (posix-procs) and the records it spawns.
 table-posix-procs = []
 table-posix-lock-ring = []

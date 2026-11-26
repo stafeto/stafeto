@@ -249,15 +249,34 @@ moves the library into `libc.so` and gives the window's channel to `poll`.
   A signal with a handler ends it with EINTR. One thread at a time waits and
   one takes events; another gets EBUSY. Events the service gave beyond the
   caller's room wait in the library for the next call.
+- `stafeto_window_info(win, &out)` gives a library that draws into the window another
+  part of the program opened (the EGL platform of stafeto, `docs/egl.md`) what
+  `stafeto_window_open` gave: the size, the line, the format, the buffers and where they lie.
+  EBADF for a number that is no open window. It asks nothing of the service.
 - `fork` gives the child no window (the state is reset in `after_fork`, and
   the map of the child has no piece of a buffer); `exec` and
   `stafeto_window_close` close the session, which ends the window in the
   service, unmap the buffers and close the channel and the timer (a failed
   unmap is told once on the console). A call that finds the service ended
-  (post, events, shown) answers ENODEV, and the calls after it too. A
-  `stafeto_window_wait` does not learn of the end by itself, since its check
-  runs at entry: it ends with a bit or its time, so a program uses a finite
-  timeout.
+  (post, events, shown) answers ENODEV, and the calls after it too. The
+  service holds a labelled copy of the window's channel (`handle_label`, one
+  label for each try of WINDOW_CREATE): when its last copy goes the kernel
+  posts CLIENT_GONE in that session's slot of the window's channel, the
+  library marks the window gone, and a `stafeto_window_wait` or
+  `stafeto_window_wait_free` under way returns ENODEV. The label tells the end
+  of the service's copy from the end of a copy it refused.
+- `stafeto_window_wait_free(win, mask, timeout, &free)` waits for a free buffer
+  of `mask` and takes no bit from `stafeto_window_wait`: the events bit and the
+  buffer bits stay for the program's own wait. While another thread holds the
+  wait it drains the channel without blocking (which wakes that thread to look
+  again) and pauses 1 ms between looks. The program's `stafeto_window_wait` does the same
+  while a `stafeto_window_wait_free` holds the wait, so a swap never makes it
+  answer EBUSY.
+- The generation: `stafeto_window_open` and `stafeto_window_info` give
+  `struct stafeto_window.generation`, 1 for the first window of the process and
+  raised by each open. `stafeto_window_info` reads it before and after the
+  description and answers EBADF when it moved, so a description never mixes two
+  windows.
 - `stafeto_window_events` asks the service again while its replies are full
   (32 events) and the caller has room, so a call returns fewer than `max`
   only when the ring is empty; the ring holds 64 and the service sends its

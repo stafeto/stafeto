@@ -38,8 +38,15 @@ class LeakedNames(unittest.TestCase):
             MODULE.leaked_names(names),
             ["wfcCompose", "wfcCreateContext", "wfdCreateDevice", "wfdStafetoStream"])
 
+    def test_the_functions_of_egl_and_opengl_es_are_found(self):
+        names = {"eglSwapBuffers", "eglGetDisplay", "glDrawElements", "glClear", "glob", "write"}
+        self.assertEqual(
+            MODULE.leaked_names(names),
+            ["eglGetDisplay", "eglSwapBuffers", "glClear", "glDrawElements"])
+
     def test_names_of_libc_are_not_taken_for_them(self):
-        names = {"wfdlike", "wfc", "wf", "stafeto_display_open", "stafeto_input_read", "wcscpy"}
+        names = {"wfdlike", "wfc", "wf", "stafeto_display_open", "stafeto_input_read", "wcscpy",
+                 "glob", "globfree", "glibc_version", "eglobal", "gl", "egl"}
         self.assertEqual(MODULE.leaked_names(names), [])
 
 

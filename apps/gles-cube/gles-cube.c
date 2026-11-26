@@ -21,6 +21,13 @@
  * characters by brightness). The program asks for the software path of Mesa itself
  * (LIBGL_ALWAYS_SOFTWARE=1) and exits with 0 after the line "gles-cube: ok".
  * Built with -fno-builtin; every result is compared.
+ *
+ * `gles-cube --window` (built for stafeto with -DSTAFETO_WINDOW, gles-window.h)
+ * draws the same cube into a window of the composition service
+ * (<stafeto/window.h>, the window surface of EGL on stafeto's platform) and
+ * swaps each frame; the default size is 320. It checks the API of the platform
+ * first (docs/egl.md) and prints the CRC of the screen two times for the host
+ * to compare with QEMU's screenshot.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -221,15 +228,28 @@ static void print_string(const char *label, GLenum name)
 	printf("gles-cube: %s %s\n", label, text ? (const char *)text : "(none)");
 }
 
+#ifdef STAFETO_WINDOW
+#include "gles-window.h"
+#endif
+
 int main(int argc, char **argv)
 {
-	int size = 160;
+	int size = 0;
 	int frames = FRAMES_MAX;
 	int pbuffer = 0;
+	int window = 0;
+	int window_run = 0;
 	int ascii = -1;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--pbuffer") == 0) {
 			pbuffer = 1;
+#ifdef STAFETO_WINDOW
+		} else if (strcmp(argv[i], "--window") == 0) {
+			window = 1;
+		} else if (strcmp(argv[i], "--window-run") == 0) {
+			window = 1;
+			window_run = 1;
+#endif
 		} else if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
 			size = atoi(argv[++i]);
 		} else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
@@ -241,10 +261,17 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
-	if (!pbuffer || size < 16 || size > 1024 || frames < 1 || frames > FRAMES_MAX) {
-		printf("usage: gles-cube --pbuffer [--size N] [--frames N]\n");
+	if (size == 0)
+		size = window ? 320 : 160;
+	if (!(pbuffer || window) || size < 16 || size > 1024 || frames < 1 || frames > FRAMES_MAX) {
+		printf("usage: gles-cube --pbuffer|--window [--size N] [--frames N]\n");
 		return 2;
 	}
+#ifdef STAFETO_WINDOW
+	/* A program init starts cannot fork: the copy that draws is a child. */
+	if (window && !window_run)
+		return window_launch(argc, argv);
+#endif
 	for (int face = 0; face < 6; face++) {
 		static const uint16_t quad[6] = {0, 1, 2, 0, 2, 3};
 		for (int k = 0; k < 6; k++)
@@ -252,10 +279,16 @@ int main(int argc, char **argv)
 	}
 	crc_init();
 
-	/* The software path of Mesa: there is no device to find. */
-	CHECK(setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1) == 0);
+	/* The software path of Mesa: there is no device to find. The platform of
+	 * stafeto (the window) needs no word of it. */
+	if (!window)
+		CHECK(setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1) == 0);
 	EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
 	CHECK(display != EGL_NO_DISPLAY);
+#ifdef STAFETO_WINDOW
+	if (window)
+		window_before_initialize(display);
+#endif
 	EGLint major = 0, minor = 0;
 	CHECK(eglInitialize(display, &major, &minor) == EGL_TRUE);
 	printf("gles-cube: EGL %d.%d %s\n", (int)major, (int)minor, eglQueryString(display, EGL_VENDOR));
@@ -269,10 +302,18 @@ int main(int argc, char **argv)
 		EGL_NONE};
 	EGLConfig config;
 	EGLint configs = 0;
-	CHECK(eglChooseConfig(display, config_attributes, &config, 1, &configs) == EGL_TRUE);
-	CHECK(configs == 1);
-	const EGLint surface_attributes[] = {EGL_WIDTH, size, EGL_HEIGHT, size, EGL_NONE};
-	EGLSurface surface = eglCreatePbufferSurface(display, config, surface_attributes);
+	EGLSurface surface = EGL_NO_SURFACE;
+#ifdef STAFETO_WINDOW
+	if (window) {
+		surface = window_surface(display, size, &config);
+	} else
+#endif
+	{
+		CHECK(eglChooseConfig(display, config_attributes, &config, 1, &configs) == EGL_TRUE);
+		CHECK(configs == 1);
+		const EGLint surface_attributes[] = {EGL_WIDTH, size, EGL_HEIGHT, size, EGL_NONE};
+		surface = eglCreatePbufferSurface(display, config, surface_attributes);
+	}
 	CHECK(surface != EGL_NO_SURFACE);
 	static const EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
 	EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attributes);
@@ -281,6 +322,11 @@ int main(int argc, char **argv)
 	print_string("GL_VENDOR", GL_VENDOR);
 	print_string("GL_RENDERER", GL_RENDERER);
 	print_string("GL_VERSION", GL_VERSION);
+#ifdef STAFETO_WINDOW
+	/* Before the shaders: the memory of the compiler is not in a child. */
+	if (window)
+		window_api_checks(display, surface, config, size);
+#endif
 
 	long long compiled = now_ms();
 	GLuint program = glCreateProgram();
@@ -363,7 +409,14 @@ int main(int argc, char **argv)
 		CHECK(glGetError() == GL_NO_ERROR);
 		memset(pixels, 0xA5, (size_t)size * size * 4);
 		glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-		CHECK(glGetError() == GL_NO_ERROR);
+		{
+			GLenum error = glGetError();
+			if (error != GL_NO_ERROR) {
+				printf("gles-cube: check failed at line %d: glReadPixels gave 0x%x\n", __LINE__,
+				       (unsigned)error);
+				exit(1);
+			}
+		}
 		uint64_t sum = 0;
 		for (size_t i = 0; i < (size_t)size * size * 4; i++)
 			sum += pixels[i];
@@ -372,8 +425,23 @@ int main(int argc, char **argv)
 		printf("gles-cube: time frame %d %lld ms\n", frame, now_ms() - started);
 		if (frame == ascii)
 			print_ascii(pixels, size);
+#ifdef STAFETO_WINDOW
+		if (window)
+			window_present(display, surface, frame, frames, pixels, size);
+#endif
 	}
+#ifdef STAFETO_WINDOW
+	if (window)
+		window_damage_swaps(display, surface, pixels, size);
+#endif
 	free(pixels);
+#ifdef STAFETO_WINDOW
+	if (window) {
+		window_terminate(display, surface);
+		printf("gles-cube: ok\n");
+		return 0;
+	}
+#endif
 	CHECK(eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) == EGL_TRUE);
 	CHECK(eglDestroyContext(display, context) == EGL_TRUE);
 	CHECK(eglDestroySurface(display, surface) == EGL_TRUE);

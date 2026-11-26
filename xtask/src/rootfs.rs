@@ -2601,6 +2601,16 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        // The cube starts its own file once: the copy that draws can fork.
+        "boot-gles-window.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/gles-cube", 0o755, ROOT, "gles-cube"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
         "boot-wfc.img" | "boot-wfc-steps.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -3719,6 +3729,7 @@ mod tests {
             "boot-posix-window.img",
             "boot-cxx-probe.img",
             "boot-gles-pbuffer.img",
+            "boot-gles-window.img",
             "boot-wfc.img",
             "boot-wfc-steps.img",
             "boot-wfd.img",

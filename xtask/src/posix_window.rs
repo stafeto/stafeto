@@ -72,7 +72,7 @@ const SHOTS: [&str; 3] = [
 /// The lines of the probe, each a check that passed.
 const LINES: [&str; 8] = [
     "posix-window: the screen is described, no window yet, and bad arguments leave nothing",
-    "posix-window: a window of 200 by 100 with two zeroed buffers, a second open is EBUSY",
+    "posix-window: a window of 200 by 100 with two zeroed buffers, a second open is EBUSY, info repeats open",
     "posix-window: post refuses a wrong buffer, window or rectangle, and a buffer that is out",
     "posix-window: the frame is shown and its bit frees the replaced buffer",
     "posix-window: five rectangles merge into their bounding box",
