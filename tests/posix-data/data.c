@@ -1789,8 +1789,9 @@ struct fast_result {
 };
 
 /* `mib` MiB written in calls of `bs` bytes to the file `path`, synced, read back in calls of `bs`
- * bytes and compared. Only the time of the calls of write, fsync, close and read counts. */
-static int fast_dd(const char *path, unsigned long mib, unsigned long bs, int marks, struct fast_result *out) {
+ * bytes and compared. Only the time of the calls of write, fsync, close and read counts. The file
+ * is unlinked at the end unless `keep` is set. */
+static int fast_dd(const char *path, unsigned long mib, unsigned long bs, int marks, int keep, struct fast_result *out) {
     memset(out, 0, sizeof *out);
     if (marks) printf("posix-data: fast mark begin write\n");
     int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
@@ -1842,7 +1843,7 @@ static int fast_dd(const char *path, unsigned long mib, unsigned long bs, int ma
         printf("posix-data: fast mark end read\n");
         pause_ms(300);
     }
-    DATA_CHECK(unlink(path) == 0);
+    if (!keep) DATA_CHECK(unlink(path) == 0);
     return 0;
 }
 
@@ -1860,7 +1861,7 @@ static int fast_large(void) {
     DATA_CHECK(raise_fsize());
     struct fast_result r;
     pause_ms(300);
-    int bad = fast_dd("/data/fast-big", FAST_MIB, MIB, 1, &r);
+    int bad = fast_dd("/data/fast-big", FAST_MIB, MIB, 1, 1, &r);
     if (bad != 0) return bad;
     fast_say("big", FAST_MIB, MIB, &r);
     DATA_CHECK(r.mismatches == 0);
@@ -1871,7 +1872,7 @@ static int fast_control(unsigned long bs) {
     struct fast_result r;
     char tag[16];
     snprintf(tag, sizeof tag, "bs%lu", bs);
-    int bad = fast_dd("/data/fast-control", FAST_CONTROL_MIB, bs, 0, &r);
+    int bad = fast_dd("/data/fast-control", FAST_CONTROL_MIB, bs, 0, bs == 1000, &r);
     if (bad != 0) return bad;
     fast_say(tag, FAST_CONTROL_MIB, bs, &r);
     DATA_CHECK(r.mismatches == 0);
@@ -1881,6 +1882,60 @@ static int fast_control(unsigned long bs) {
 static int fast_control_4096(void) { return fast_control(4096); }
 static int fast_control_1000(void) { return fast_control(1000); }
 
+/* Eight rounds that each time a write, a read of the big file and a read of the control file
+ * within a short span, so that the three see the same load of the host. */
+#define FAST_PAIRS 8
+#define FAST_PAIR_BIG_BYTES (4UL * MIB)
+#define FAST_PAIR_CONTROL_BYTES (512UL * 1024)
+
+static int fast_pread_all(int fd, unsigned long long *us, unsigned long bs, unsigned long total, unsigned long off) {
+    unsigned long done = 0;
+    while (done < total) {
+        unsigned long at = done % MIB;
+        unsigned long n = total - done < bs ? total - done : bs;
+        if (n > MIB - at) n = MIB - at;
+        unsigned long long t = now_us();
+        ssize_t r = pread(fd, big_buf + at, n, (off_t)(off + done));
+        *us += now_us() - t;
+        DATA_CHECK(r == (ssize_t)n);
+        done += n;
+    }
+    return 0;
+}
+
+static int fast_pairs(void) {
+    DATA_CHECK(raise_fsize());
+    int wfd = open("/data/fast-pairw", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(wfd >= 0);
+    int bfd = open("/data/fast-big", O_RDONLY);
+    DATA_CHECK(bfd >= 0);
+    int cfd = open("/data/fast-control", O_RDONLY);
+    DATA_CHECK(cfd >= 0);
+    for (unsigned long i = 0; i < FAST_PAIRS; i++) {
+        unsigned long long write_us = 0, big_us = 0, control_us = 0;
+        for (unsigned long b = 0; b < 4; b++) {
+            fast_fill(big_buf, i * 4 + b);
+            unsigned long long t = now_us();
+            ssize_t w = write(wfd, big_buf, MIB);
+            write_us += now_us() - t;
+            DATA_CHECK(w == (ssize_t)MIB);
+        }
+        unsigned long long t = now_us();
+        DATA_CHECK(fsync(wfd) == 0);
+        write_us += now_us() - t;
+        if (fast_pread_all(bfd, &big_us, MIB, FAST_PAIR_BIG_BYTES, i * 8 * MIB) != 0) return 1;
+        if (fast_pread_all(cfd, &control_us, 1000, FAST_PAIR_CONTROL_BYTES, (i * FAST_PAIR_CONTROL_BYTES) % (4 * MIB)) != 0)
+            return 1;
+        printf("posix-data: fast pair %lu write %llu us big %llu us control %llu us\n", i, write_us, big_us, control_us);
+    }
+    DATA_CHECK(close(wfd) == 0 && close(bfd) == 0 && close(cfd) == 0);
+    DATA_CHECK(unlink("/data/fast-pairw") == 0);
+    DATA_CHECK(unlink("/data/fast-big") == 0);
+    DATA_CHECK(unlink("/data/fast-control") == 0);
+    printf("posix-data: fast pairs done\n");
+    return 0;
+}
+
 static int fast_run(void) {
     if (getuid() != 0) {
         printf("posix-data: the probe is not user 0\n");
@@ -1889,6 +1944,7 @@ static int fast_run(void) {
     run_check("dd 64 MiB through the window", fast_large);
     run_check("dd bs 4096 control", fast_control_4096);
     run_check("dd bs 1000 control", fast_control_1000);
+    run_check("dd paired against the control", fast_pairs);
     if (failures != 0) {
         printf("posix-data: %d checks failed\n", failures);
         return 20;

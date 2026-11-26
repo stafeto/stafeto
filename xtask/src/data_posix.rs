@@ -152,6 +152,7 @@ impl Mode {
                 "dd 64 MiB through the window",
                 "dd bs 4096 control",
                 "dd bs 1000 control",
+                "dd paired against the control",
             ],
             Mode::Atomic => &ATOMIC_CHECKS,
             Mode::Steps => &STEPS_CHECKS,
@@ -680,11 +681,13 @@ pub const FAST_READS_PER_BLOCK_MAX: f64 = 2.05;
 /// The time of one disk operation in the write phase (reads and writes of the disk) is at most this
 /// many times the time of one in the read phase of the same run.
 pub const FAST_WRITE_OP_TIME_RATIO_MAX: f64 = 1.35;
-/// The speed of the big read against the control of 1,000 bytes read in the same run: the ratio
-/// measured on the Mac and on the runners of GitHub (the lower of the two, 2.53 on a runner), and
-/// the share of it the check requires.
-pub const FAST_READ_RATIO_MAC: f64 = 2.49;
-pub const FAST_READ_RATIO_RUNNER: f64 = 2.53;
+/// The speed of the big read against the control of 1,000 bytes read in the same round (the median
+/// of the 8 paired rounds): the lowest median measured standalone on the Mac and on the runners of
+/// GitHub, and the share of the lower of the two the check requires.
+pub const FAST_PAIRED_READ_RATIO_MAC: f64 = 2.39;
+/// The lowest median of 3 standalone runs on the Mac is 2.39 (2.45, 2.48, 2.39). PROVISIONAL: the
+/// runner value equals the Mac value until the repeats on GitHub are measured.
+pub const FAST_PAIRED_READ_RATIO_RUNNER: f64 = 2.39;
 pub const FAST_READ_RATIO_SHARE: f64 = 0.8;
 /// The controls of 1,000 bytes (the old path) run at least this fast, in KiB/s: the speed of 0.6.0
 /// was 2,106 (write) and 1,352 (read) on 64 MiB.
@@ -742,6 +745,40 @@ fn phase(lines: &[String], tag: &str, what: &str) -> Result<Phase, String> {
         })
     };
     read().ok_or_else(|| format!("data-fast: the line is not read: {line:?}"))
+}
+
+/// The rounds of `posix-data: fast pair I write W us big B us control C us`: the time of 4 MiB
+/// appended with one fsync, of 4 MiB read from the big file and of 512 KiB read from the control.
+fn pairs(lines: &[String]) -> Result<Vec<(u64, u64, u64)>, String> {
+    let found: Vec<(u64, u64, u64)> = lines
+        .iter()
+        .filter(|l| l.contains("posix-data: fast pair "))
+        .map(|l| {
+            let read = || -> Option<(u64, u64, u64)> {
+                Some((
+                    number_after(l, " write ")?,
+                    number_after(l, " big ")?,
+                    number_after(l, " control ")?,
+                ))
+            };
+            read().ok_or_else(|| format!("data-fast: the line is not read: {l:?}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if found.len() != 8 {
+        return Err(format!("data-fast: {} pair lines, 8 expected", found.len()));
+    }
+    Ok(found)
+}
+
+/// The median of the values (the mean of the two in the middle for an even count).
+fn median(mut values: Vec<f64>) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let n = values.len();
+    if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        (values[n / 2 - 1] + values[n / 2]) / 2.0
+    }
 }
 
 /// The counters of the disk the service said (`datafs: disk reads R writes W`): the last pair said
@@ -868,16 +905,36 @@ pub fn fast_verdict(lines: &[String]) -> Result<String, String> {
             ));
         }
     }
-    let share = FAST_READ_RATIO_SHARE * FAST_READ_RATIO_MAC.min(FAST_READ_RATIO_RUNNER);
+    let share =
+        FAST_READ_RATIO_SHARE * FAST_PAIRED_READ_RATIO_MAC.min(FAST_PAIRED_READ_RATIO_RUNNER);
     let ratio = read.kib_s as f64 / r1.kib_s.max(1) as f64;
-    if ratio < share {
+    // The rounds: a write, a big read and a control read within a short span, so that the three see
+    // the same load of the host. The medians are judged.
+    let rounds = pairs(lines)?;
+    let write_per_block = 1.0 + ops.write_reads as f64 / FAST_BLOCKS as f64;
+    let read_ratios: Vec<f64> = rounds
+        .iter()
+        .map(|&(_, big, control)| (4096.0 / big.max(1) as f64) / (512.0 / control.max(1) as f64))
+        .collect();
+    let write_ratios: Vec<f64> = rounds
+        .iter()
+        .map(|&(write, big, _)| {
+            (write as f64 / (1024.0 * write_per_block)) / (big.max(1) as f64 / (1024.0 * per_block))
+        })
+        .collect();
+    let (read_median, write_median) = (median(read_ratios), median(write_ratios));
+    if read_median < share {
         return Err(format!(
-            "data-fast: the read of 64 MiB ran at {} KiB/s, {ratio:.2} times the control of 1,000 bytes ({} KiB/s), under {share:.2}",
-            read.kib_s, r1.kib_s
+            "data-fast: the paired read of 4 MiB ran {read_median:.2} times the control of 1,000 bytes (median of 8 rounds), under {share:.2} (the whole phase {ratio:.2} times)"
+        ));
+    }
+    if write_median > FAST_WRITE_OP_TIME_RATIO_MAX {
+        return Err(format!(
+            "data-fast: a disk operation of the paired write took {write_median:.2} times one of the paired read (median of 8 rounds), over {FAST_WRITE_OP_TIME_RATIO_MAX}"
         ));
     }
     Ok(format!(
-        "data-fast: write 64 MiB {} ms ({} KiB/s, Mac reference {FAST_WRITE_MS_REFERENCE}), read {} ms ({} KiB/s, Mac reference {FAST_READ_MS_REFERENCE}); the write made {} disk writes and {} reads ({write_op_us:.1} us an operation), the read {} reads = {per_block:.2} for each of {FAST_BLOCKS} blocks ({read_op_us:.1} us an operation, the write phase {op_ratio:.2} times, bound {FAST_WRITE_OP_TIME_RATIO_MAX}); the big read is {ratio:.2} times the control of 1,000 bytes (bound {share:.2}); controls 4 MiB: bs 4096 write {} read {} KiB/s, bs 1000 write {} read {} KiB/s",
+        "data-fast: write 64 MiB {} ms ({} KiB/s, Mac reference {FAST_WRITE_MS_REFERENCE}), read {} ms ({} KiB/s, Mac reference {FAST_READ_MS_REFERENCE}); the write made {} disk writes and {} reads ({write_op_us:.1} us an operation), the read {} reads = {per_block:.2} for each of {FAST_BLOCKS} blocks ({read_op_us:.1} us an operation, the write phase {op_ratio:.2} times, bound {FAST_WRITE_OP_TIME_RATIO_MAX}); the big read is {ratio:.2} times the control of 1,000 bytes over the whole phase; paired medians of 8 rounds: read {read_median:.2} times the control (bound {share:.2}), write {write_median:.2} times a read operation (bound {FAST_WRITE_OP_TIME_RATIO_MAX}); controls 4 MiB: bs 4096 write {} read {} KiB/s, bs 1000 write {} read {} KiB/s",
         write.ms,
         write.kib_s,
         read.ms,
@@ -1610,6 +1667,44 @@ mod tests {
             "posix-data: fast bs1000 write 4 MiB bs 1000 in 2000 ms: 2000 KiB/s, 0 cell parts, 0 inline parts, 4194 calls",
             "posix-data: fast bs1000 read 4 MiB bs 1000 in 2500 ms: 1600 KiB/s, 0 cell parts, 0 inline parts, 0 mismatches",
         ])
+        .into_iter()
+        .chain(pair_lines(&[GOOD_PAIR; 8]))
+        .collect()
+    }
+
+    /// A round with the paired read ratio 3.0 and the paired write ratio 1.0 under `GOOD_OPS`.
+    const GOOD_PAIR: (u64, u64, u64) = (300_000, 400_000, 150_000);
+    /// A round with the paired read ratio 1.0 (the big read as slow as the control).
+    const SLOW_READ_PAIR: (u64, u64, u64) = (300_000, 400_000, 50_000);
+    /// A round with the paired write ratio 1.5.
+    const SLOW_WRITE_PAIR: (u64, u64, u64) = (450_000, 400_000, 150_000);
+
+    /// The lines of the rounds of the paired check, and the line that ends it.
+    fn pair_lines(rounds: &[(u64, u64, u64)]) -> Vec<String> {
+        let mut out: Vec<String> = rounds
+            .iter()
+            .enumerate()
+            .map(|(i, (w, b, c))| {
+                format!("posix-data: fast pair {i} write {w} us big {b} us control {c} us")
+            })
+            .collect();
+        out.push("posix-data: fast pairs done".into());
+        out
+    }
+
+    /// The lines of a good run with the rounds `rounds` in place of the good ones.
+    fn with_pairs(rounds: &[(u64, u64, u64)]) -> Vec<String> {
+        let mut out = fast_lines(4200, 6000, GOOD_OPS, 10_900);
+        out.retain(|l| !l.contains("fast pair"));
+        out.extend(pair_lines(rounds));
+        out
+    }
+
+    /// `n` rounds of `bad` and the rest good.
+    fn mixed(n: usize, bad: (u64, u64, u64)) -> Vec<(u64, u64, u64)> {
+        (0..8)
+            .map(|i| if i < n { bad } else { GOOD_PAIR })
+            .collect()
     }
 
     fn ops(write_reads: u64, write_writes: u64, read_reads: u64) -> Ops {
@@ -1634,6 +1729,10 @@ mod tests {
             (FAST_READS_PER_BLOCK_MAX * FAST_BLOCKS as f64) as u64,
         );
         assert!(fast_verdict(&fast_lines(8000, 8000, top, 10_900)).is_ok());
+        // The medians of the rounds: 3 slow rounds of 8 pass, a slow whole phase does not matter.
+        assert!(fast_verdict(&with_pairs(&mixed(3, SLOW_READ_PAIR))).is_ok());
+        assert!(fast_verdict(&with_pairs(&mixed(3, SLOW_WRITE_PAIR))).is_ok());
+        assert!(fast_verdict(&fast_lines(4200, 6000, GOOD_OPS, 3_000)).is_ok());
         let top = || ops(8_192, 16_416, 32_768);
         for (lines, what) in [
             (
@@ -1650,8 +1749,9 @@ mod tests {
             ),
             // The write phase slower for each operation than the read phase.
             (fast_lines(11_000, 6000, top(), 10_900), "a disk operation"),
-            // The big read as slow as the old path.
-            (fast_lines(4200, 6000, top(), 3_000), "times the control"),
+            // The big read as slow as the old path in most rounds.
+            (with_pairs(&mixed(5, SLOW_READ_PAIR)), "times the control"),
+            (with_pairs(&mixed(5, SLOW_WRITE_PAIR)), "a disk operation"),
         ] {
             let error = fast_verdict(&lines).unwrap_err();
             assert!(error.contains(what), "{error}");
@@ -1667,6 +1767,13 @@ mod tests {
             lines.remove(gone);
             assert!(fast_verdict(&lines).is_err(), "line {gone}");
         }
+        // 7 pair lines are refused, and so are 9.
+        let mut seven = good.clone();
+        seven.retain(|l| !l.contains("fast pair 7 "));
+        assert!(fast_verdict(&seven).unwrap_err().contains("7 pair lines"));
+        let mut nine = good.clone();
+        nine.push("posix-data: fast pair 8 write 1 us big 1 us control 1 us".into());
+        assert!(fast_verdict(&nine).unwrap_err().contains("9 pair lines"));
         let mut before = good.clone();
         before.retain(|l| !l.contains("mark begin write"));
         assert!(
