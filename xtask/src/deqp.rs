@@ -957,7 +957,7 @@ init: deqp-egl ended: signal 11, not restarted
     /// Whether the baselines may be provisional (made off the runners). It
     /// turns false when the files of the runners land, and a baseline that says
     /// `provisional:` fails the test from then on.
-    const ALLOW_PROVISIONAL: bool = true;
+    const ALLOW_PROVISIONAL: bool = false;
 
     /// The files of tests/deqp: the baselines of Linux, the smoke list and the
     /// departures agree with each other and with the sets of the runner.

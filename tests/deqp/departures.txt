@@ -30,3 +30,7 @@ dEQP-EGL.functional.buffer_age.** | NotSupported | mesa | the platform does not 
 dEQP-EGL.functional.preserve_swap.** | NotSupported | window | the tests open a window of 480 by 480 points, and the screen of the display service is 640 by 400 | M1
 dEQP-EGL.functional.swap_buffers_with_damage.** | NotSupported | window | the tests open a window of 480 by 480 points, and the screen of the display service is 640 by 400 | M1
 dEQP-EGL.functional.fence_sync.** | NotSupported | window | every test opens a window of 480 by 480 points, and the screen of the display service is 640 by 400 | M1
+dEQP-EGL.functional.reusable_sync.invalid.wait_server_invalid_display | NotSupported | window | the test opens a window of 480 by 480 points, and the screen of the display service is 640 by 400 | M1
+dEQP-EGL.functional.reusable_sync.invalid.wait_server_invalid_sync | NotSupported | window | the test opens a window of 480 by 480 points, and the screen of the display service is 640 by 400 | M1
+dEQP-EGL.functional.create_surface.platform_window.* | NotSupported | mesa | the platform has no number for eglCreatePlatformWindowSurface (the framework finds no CAPABILITY_CREATE_SURFACE_PLATFORM; plan 3.2, question 1) | none
+dEQP-EGL.functional.create_surface.platform_ext_window.* | NotSupported | mesa | the platform has no number for eglCreatePlatformWindowSurfaceEXT (the framework finds no CAPABILITY_CREATE_SURFACE_PLATFORM; plan 3.2, question 1) | none

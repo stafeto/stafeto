@@ -160,7 +160,7 @@ to the log between the lines `==== BEGIN tests/deqp/baseline/<set>.txt ====` and
 `==== END ... ====`, and with `--write` to `tests/deqp/baseline/`. A file has
 `#` lines (what made it: the versions, the platform, the arguments, the counts,
 the time) and one line `CASE STATUS` for each case. A file that says
-`# provisional:` was not made by a probe of a runner, and the comparison says so.
+`# provisional:` was not made by a probe of a runner; the comparison says so, and the host test refuses such a file.
 A platform that does not build costs its sets only; the command prints the
 others and fails at the end.
 
@@ -218,9 +218,9 @@ The host test `the_files_of_the_comparison_agree` checks the files together:
 every case of the baselines lies in the patterns of its set, the smoke list
 holds 150 to 250 cases that pass on Linux and depart nowhere, every set that
 gives to smoke has a case in it, and every line of the departures matches a
-case that passes on Linux (a line for a breakdown, one that fails). A constant
-of the test (`ALLOW_PROVISIONAL`) turns false when the baselines of the runners
-land, and a file that says `provisional:` fails it from then on.
+case that passes on Linux (a line for a breakdown, one that fails). The constant
+`ALLOW_PROVISIONAL` of the test is false: a baseline file that says
+`provisional:` fails it.
 
 ## deqp-smoke
 
@@ -251,16 +251,24 @@ Every passing case of `egl.swap` on Linux is in those three groups, so the set
 gives nothing to smoke until the screen is taller (the display service has a
 fixed screen; a step of the window manager can change it).
 
-The baselines in `tests/deqp/baseline` come from the probes of the runners
-(`probe.yml`, runs 45841842144, 45841854088 and 45841865612, Ubuntu arm64, Linux
-7.0 azure) except `egl.negative` and `egl.query`, which are PROVISIONAL (their
-first line says so): those two sets were split off `egl.api` and `egl.context`
-after the probes and need the `x11_egl` baseline, which a probe of `deqp-reference
-egl` makes. The provisional files came from `cargo xtask deqp-reference` in an
-arm64 Linux container (Ubuntu 24.04, Docker on a Mac) with the same Mesa and
-VK-GL-CTS commit. The two sources agree on every case both ran: 17 245 cases of
-19 files, 0 differences in status. The Linux run of all sets takes 3 minutes
-after the builds (17 000 cases, of which the GLES3 shaders are 6 500).
+The baselines in `tests/deqp/baseline` all come from probes of the runners
+(`probe.yml`: runs 45841842144, 45841854088, 45841865612 and 45848607548,
+Ubuntu arm64, Linux 7.0 azure). A container run of the same sets (arm64 Ubuntu
+24.04 under Docker, the same Mesa and VK-GL-CTS commit) agrees with them on
+every case: 17 245 cases, 0 differences in status. No file says `provisional:`,
+and the host test refuses one. Linux runs all sets in 3 minutes after the builds.
+
+Window sets in the guest (probes 45848619132, 45848631030 and 45848643875, the
+image with the compositor on a runner):
+
+| Set | Cases | Pass | NotSupported | Time | Departures used |
+|---|---|---|---|---|---|
+| `egl.surface` | 273 | 48 | 225 | 599 s | 12 (`platform_window`, `platform_ext_window`) |
+| `egl.swap` | 273 | 0 | 273 | 617 s | 252 (`buffer_age`, `preserve_swap`, `swap_buffers_with_damage`) |
+| `egl.sync` | 51 | 21 | 30 | 548 s | 30 (`fence_sync`, two `reusable_sync` cases) |
+
+No case needed two windows at once: none ended in a resource error. The cases
+that fail on Linux too (225 and 21 of them) are not compared.
 
 The build of dEQP, with Mesa and libc++, is a step of the group `build` of ci;
 the run cache hands `target` (with `target/deqp`) to the group of the job
