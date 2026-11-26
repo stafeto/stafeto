@@ -81,6 +81,7 @@ macro_rules! why {
 use crate::datawin;
 use core::ffi::c_int;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+pub use posix_fs::data::RawIov;
 use posix_fs::data::{self as pure, errno_of};
 use posix_fs::{DataTarget, Target};
 use proto_data as p;
@@ -908,21 +909,54 @@ fn read_filling(handle: u32, offset: Option<u64>, out: &mut [u8]) -> Result<usiz
     }
 }
 
-/// readv at the position of the description (`offset` None) or at `offset` (preadv): the bytes
-/// read into the buffers in order, as one call atomic as `read`. No caller yet: the C library's
-/// `readv` waits for a hook of the layer, so nothing is promised for `readv` to a program. A
-/// lapsed lease ends it short.
-pub fn readv(handle: u32, offset: Option<u64>, iov: &mut [&mut [u8]]) -> Result<usize, i32> {
-    let total = pure::total_len_mut(iov);
-    if !pure::fits_one_message(total, p::MAX_READ) {
-        return transfer(handle, offset, &mut Reading(Dst::Many(iov))).map(|(n, _)| n);
+/// The vector checked once before a call moves bytes: no buffer with a length above 0 lacks a
+/// base (EFAULT), and the sum of the lengths is at most SSIZE_MAX (EINVAL). The sum.
+fn check_iov(iov: &[pure::RawIov]) -> Result<usize, i32> {
+    let mut total = 0usize;
+    for part in iov {
+        if part.base.is_null() && part.len > 0 {
+            return Err(EFAULT);
+        }
+        total = total
+            .checked_add(part.len)
+            .filter(|sum| *sum <= isize::MAX as usize)
+            .ok_or(EINVAL)?;
     }
-    let mut bytes = [0u8; p::MAX_READ];
-    let n = match offset {
-        None => read(handle, &mut bytes[..total])?,
-        Some(at) => pread(handle, at, &mut bytes[..total])?,
-    };
-    Ok(pure::scatter(iov, 0, &bytes[..n]))
+    Ok(total)
+}
+
+/// readv at the position of the description (`offset` None) or at `offset` (preadv): the bytes
+/// read into the buffers in order, as one call atomic as `read`; a call whose lease lapsed goes on
+/// without the lease as `read` does, so it is short only at the end of the file or on an error.
+/// The C library's `readv` of a file reaches it through `posix_abi::readv_data`.
+///
+/// # Safety
+/// Each buffer with a length above 0 has a base writable for that length.
+pub unsafe fn readv(handle: u32, offset: Option<u64>, iov: &[pure::RawIov]) -> Result<usize, i32> {
+    let total = check_iov(iov)?;
+    if pure::fits_one_message(total, p::MAX_READ) {
+        let mut bytes = [0u8; p::MAX_READ];
+        let n = match offset {
+            None => read(handle, &mut bytes[..total])?,
+            Some(at) => pread(handle, at, &mut bytes[..total])?,
+        };
+        // SAFETY: the caller's promise.
+        return Ok(unsafe { pure::scatter_raw(iov, 0, &bytes[..n]) });
+    }
+    let mut done = 0;
+    loop {
+        let at = offset.map(|o| o.saturating_add(done as u64));
+        match transfer(handle, at, &mut Reading(Dst::Raw(iov, done))) {
+            Ok((n, lapsed)) => {
+                done += n;
+                if !lapsed || n == 0 || done == total {
+                    return Ok(done);
+                }
+            }
+            Err(_) if done > 0 => return Ok(done),
+            Err(errno) => return Err(errno),
+        }
+    }
 }
 
 /// The bytes after the count of a read reply.
@@ -1020,19 +1054,23 @@ pub fn pwrite(handle: u32, offset: u64, bytes: &[u8]) -> Result<usize, i32> {
 }
 
 /// writev at the position of the description (`offset` None) or at `offset` (pwritev): all the
-/// buffers as one call, atomic as `write`. No caller yet: the C library's `writev` waits for a
-/// hook of the layer, so nothing is promised for `writev` to a program.
-pub fn writev(handle: u32, offset: Option<u64>, iov: &[&[u8]]) -> Result<usize, i32> {
-    let total = pure::total_len(iov);
+/// buffers as one call, atomic as `write`. The C library's `writev` of a file reaches it through
+/// `posix_abi::writev_data`.
+///
+/// # Safety
+/// Each buffer with a length above 0 has a base readable for that length.
+pub unsafe fn writev(handle: u32, offset: Option<u64>, iov: &[pure::RawIov]) -> Result<usize, i32> {
+    let total = check_iov(iov)?;
     let one = match offset {
         None => pure::WRITE_MAX,
         Some(_) => pure::PWRITE_MAX,
     };
     if !pure::fits_one_message(total, one) {
-        return transfer(handle, offset, &mut Writing(Src::Many(iov))).map(|(n, _)| n);
+        return transfer(handle, offset, &mut Writing(Src::Raw(iov))).map(|(n, _)| n);
     }
     let mut bytes = [0u8; pure::WRITE_MAX];
-    let n = pure::gather(iov, 0, &mut bytes[..total]);
+    // SAFETY: the caller's promise.
+    let n = unsafe { pure::gather_raw(iov, 0, &mut bytes[..total]) };
     match offset {
         None => write(handle, &bytes[..n]),
         Some(at) => pwrite(handle, at, &bytes[..n]),
@@ -1044,13 +1082,13 @@ pub fn writev(handle: u32, offset: Option<u64>, iov: &[&[u8]]) -> Result<usize, 
 /// The bytes of a write: one buffer or a vector.
 enum Src<'a> {
     One(&'a [u8]),
-    Many(&'a [&'a [u8]]),
+    Raw(&'a [pure::RawIov]),
 }
 
-/// The buffers of a read: one or a vector.
-enum Dst<'a, 'b> {
+/// The buffers of a read: one, or a vector of which the first `usize` bytes are done.
+enum Dst<'a> {
     One(&'a mut [u8]),
-    Many(&'a mut [&'b mut [u8]]),
+    Raw(&'a [pure::RawIov], usize),
 }
 
 /// The side of a call that moves bytes between the program's buffers and the parts: a write
@@ -1072,7 +1110,7 @@ trait Side {
 }
 
 struct Writing<'a>(Src<'a>);
-struct Reading<'a, 'b>(Dst<'a, 'b>);
+struct Reading<'a>(Dst<'a>);
 
 impl Side for Writing<'_> {
     const WRITE: bool = true;
@@ -1080,7 +1118,9 @@ impl Side for Writing<'_> {
     fn total(&self) -> usize {
         match &self.0 {
             Src::One(bytes) => bytes.len(),
-            Src::Many(iov) => pure::total_len(iov),
+            Src::Raw(iov) => iov
+                .iter()
+                .fold(0, |sum, v| usize::saturating_add(sum, v.len)),
         }
     }
 
@@ -1095,7 +1135,8 @@ impl Side for Writing<'_> {
                 out.copy_from_slice(&bytes[at..at + out.len()]);
                 out.len()
             }
-            Src::Many(iov) => pure::gather(iov, at, out),
+            // SAFETY: `check_iov` passed and the caller of `writev` promised the buffers.
+            Src::Raw(iov) => unsafe { pure::gather_raw(iov, at, out) },
         }
     }
 
@@ -1104,13 +1145,17 @@ impl Side for Writing<'_> {
     fn store_from_message(&mut self, _at: usize, _bytes: &[u8]) {}
 }
 
-impl Side for Reading<'_, '_> {
+impl Side for Reading<'_> {
     const WRITE: bool = false;
 
     fn total(&self) -> usize {
         match &self.0 {
             Dst::One(out) => out.len(),
-            Dst::Many(iov) => pure::total_len_mut(iov),
+            Dst::Raw(iov, done) => {
+                iov.iter()
+                    .fold(0, |sum, v| usize::saturating_add(sum, v.len))
+                    - done
+            }
         }
     }
 
@@ -1127,8 +1172,9 @@ impl Side for Reading<'_, '_> {
     fn store_from_message(&mut self, at: usize, bytes: &[u8]) {
         match &mut self.0 {
             Dst::One(out) => out[at..at + bytes.len()].copy_from_slice(bytes),
-            Dst::Many(iov) => {
-                pure::scatter(iov, at, bytes);
+            Dst::Raw(iov, done) => {
+                // SAFETY: `check_iov` passed and the caller of `readv` promised the buffers.
+                unsafe { pure::scatter_raw(iov, *done + at, bytes) };
             }
         }
     }

@@ -815,6 +815,66 @@ pub fn scatter(iov: &mut [&mut [u8]], at: usize, bytes: &[u8]) -> usize {
     done
 }
 
+/// One buffer of a vector call of a program as the C library has it (`struct iovec`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RawIov {
+    pub base: *mut u8,
+    pub len: usize,
+}
+
+/// `gather` over the buffers of the program, which are made into slices one at a time, as the
+/// bytes are copied.
+///
+/// # Safety
+/// Each buffer with a length above 0 has a base readable for that length (the layer checked the
+/// vector once before the call).
+pub unsafe fn gather_raw(iov: &[RawIov], at: usize, out: &mut [u8]) -> usize {
+    let mut skip = at;
+    let mut done = 0;
+    for part in iov {
+        if done == out.len() {
+            break;
+        }
+        if skip >= part.len {
+            skip -= part.len;
+            continue;
+        }
+        let take = (part.len - skip).min(out.len() - done);
+        // SAFETY: the caller's promise; skip + take is within the part.
+        let from = unsafe { core::slice::from_raw_parts(part.base.add(skip).cast_const(), take) };
+        out[done..done + take].copy_from_slice(from);
+        done += take;
+        skip = 0;
+    }
+    done
+}
+
+/// `scatter` over the buffers of the program, which are made into slices one at a time.
+///
+/// # Safety
+/// Each buffer with a length above 0 has a base writable for that length.
+pub unsafe fn scatter_raw(iov: &[RawIov], at: usize, bytes: &[u8]) -> usize {
+    let mut skip = at;
+    let mut done = 0;
+    for part in iov {
+        if done == bytes.len() {
+            break;
+        }
+        if skip >= part.len {
+            skip -= part.len;
+            continue;
+        }
+        let take = (part.len - skip).min(bytes.len() - done);
+        // SAFETY: the caller's promise; skip + take is within the part.
+        let to = unsafe { core::slice::from_raw_parts_mut(part.base.add(skip), take) };
+        to.copy_from_slice(&bytes[done..done + take]);
+        done += take;
+        skip = 0;
+    }
+    done
+}
+
 /// The total bytes of the buffers of a vector.
 pub fn total_len(iov: &[&[u8]]) -> usize {
     iov.iter()
@@ -1491,6 +1551,40 @@ mod tests {
         assert_eq!(scatter(&mut vec, 5, &[9, 9, 9, 9]), 2);
         assert_eq!(x, [0, 0, 1]);
         assert_eq!(z, [2, 3, 9, 9]);
+    }
+
+    #[test]
+    fn raw_gather_and_scatter_walk_the_buffers_of_a_program() {
+        let mut a = [1u8, 2, 3];
+        let mut b = [4u8, 5];
+        let mut d = [6u8, 7, 8, 9];
+        let iov = [
+            RawIov {
+                base: a.as_mut_ptr(),
+                len: 3,
+            },
+            RawIov {
+                base: core::ptr::null_mut(),
+                len: 0,
+            },
+            RawIov {
+                base: b.as_mut_ptr(),
+                len: 2,
+            },
+            RawIov {
+                base: d.as_mut_ptr(),
+                len: 4,
+            },
+        ];
+        let mut out = [0u8; 4];
+        assert_eq!(unsafe { gather_raw(&iov, 2, &mut out) }, 4);
+        assert_eq!(out, [3, 4, 5, 6]);
+        let mut out = [0u8; 8];
+        assert_eq!(unsafe { gather_raw(&iov, 6, &mut out) }, 3);
+        assert_eq!(unsafe { gather_raw(&iov, 9, &mut out) }, 0);
+        assert_eq!(unsafe { scatter_raw(&iov, 2, &[10, 11, 12]) }, 3);
+        assert_eq!(unsafe { scatter_raw(&iov, 8, &[20, 21, 22]) }, 1);
+        assert_eq!((a, b, d), ([1, 2, 10], [11, 12], [6, 7, 8, 20]));
     }
 
     #[test]
