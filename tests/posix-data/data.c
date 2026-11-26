@@ -553,6 +553,64 @@ static int datax_is_the_ram_service(void) {
     return 0;
 }
 
+/* A symbolic link of the RAM service that leads onto /data: the service answers the walk with a
+ * redirect and the layer continues at the data service, once. A loop of redirects is ELOOP. */
+static int symlink_onto_data_redirects(void) {
+    struct stat st;
+    unsigned char buf[5000];
+    DATA_CHECK(mkdir("/lnk", 0755) == 0);
+    DATA_CHECK(symlink("/data", "/lnk/abs") == 0);
+    DATA_CHECK(symlink("/data/dir", "/lnk/sub") == 0);
+    DATA_CHECK(symlink("../data/pub", "/lnk/rel") == 0);
+    DATA_CHECK(symlink("/data/../lnk/loop", "/lnk/loop") == 0);
+    DATA_CHECK(symlink("/data/../lnk", "/lnk/back") == 0);
+    /* The link itself is a name of the RAM service. */
+    DATA_CHECK(lstat("/lnk/abs", &st) == 0 && S_ISLNK(st.st_mode) && st.st_dev == ram_device);
+    /* open follows the redirect: through an absolute link, a link to a directory and a relative link. */
+    int fd = open("/lnk/abs/pub", O_RDONLY);
+    DATA_CHECK(fd >= 0 && read_up_to(fd, buf, sizeof buf) == 5000 && pattern_is(buf, 0, 5000, 1));
+    DATA_CHECK(close(fd) == 0);
+    fd = open("/lnk/sub/a", O_RDONLY);
+    DATA_CHECK(fd >= 0 && read_up_to(fd, buf, 10) == 10 && pattern_is(buf, 0, 10, 4));
+    DATA_CHECK(close(fd) == 0);
+    fd = open("/lnk/rel", O_RDONLY);
+    DATA_CHECK(fd >= 0 && read_up_to(fd, buf, 100) == 100 && pattern_is(buf, 0, 100, 1));
+    DATA_CHECK(close(fd) == 0);
+    /* openat from a directory of the RAM service. */
+    int dir = open("/lnk", O_RDONLY | O_DIRECTORY);
+    DATA_CHECK(dir >= 0);
+    fd = openat(dir, "rel", O_RDONLY);
+    DATA_CHECK(fd >= 0 && read_up_to(fd, buf, 100) == 100 && pattern_is(buf, 0, 100, 1));
+    DATA_CHECK(close(fd) == 0);
+    DATA_CHECK(close(dir) == 0);
+    /* stat, fstatat and access name the file of the volume. */
+    DATA_CHECK(stat("/lnk/abs/pub", &st) == 0 && st.st_size == 5000 && st.st_dev == data_device);
+    DATA_CHECK(stat("/lnk/abs", &st) == 0 && S_ISDIR(st.st_mode) && st.st_dev == data_device);
+    DATA_CHECK(stat("/lnk/rel", &st) == 0 && st.st_size == 5000 && st.st_dev == data_device);
+    DATA_CHECK(fstatat(AT_FDCWD, "/lnk/sub/b", &st, 0) == 0 && st.st_size == 11);
+    DATA_CHECK(access("/lnk/abs/pub", R_OK) == 0);
+    errno = 0;
+    DATA_CHECK(access("/lnk/abs/nothing", F_OK) == -1 && errno == ENOENT);
+    errno = 0;
+    DATA_CHECK(stat("/lnk/abs/nothing", &st) == -1 && errno == ENOENT);
+    errno = 0;
+    DATA_CHECK(open("/lnk/abs/nothing", O_RDONLY) == -1 && errno == ENOENT);
+    /* A dot-dot that leaves the volume lands in the RAM service again: one level of redirect. */
+    DATA_CHECK(stat("/lnk/back", &st) == 0 && S_ISDIR(st.st_mode) && st.st_dev == ram_device);
+    /* A redirect that leads to a redirect again is a loop. */
+    errno = 0;
+    DATA_CHECK(open("/lnk/loop", O_RDONLY) == -1 && errno == ELOOP);
+    errno = 0;
+    DATA_CHECK(stat("/lnk/loop", &st) == -1 && errno == ELOOP);
+    /* A program is never run from the volume. */
+    char *argv[] = {"pub", NULL};
+    errno = 0;
+    DATA_CHECK(execv("/lnk/abs/pub", argv) == -1 && errno == EACCES);
+    DATA_CHECK(unlink("/lnk/abs") == 0 && unlink("/lnk/sub") == 0 && unlink("/lnk/rel") == 0);
+    DATA_CHECK(unlink("/lnk/loop") == 0 && unlink("/lnk/back") == 0 && rmdir("/lnk") == 0);
+    return 0;
+}
+
 static int errno_for_bad_paths(void) {
     struct stat st;
     errno = 0;
@@ -3009,6 +3067,7 @@ static int first(void) {
     run_check("set-ID program reads the descriptor", setid_program_reads_descriptor);
     run_check("real and effective access", real_and_effective_access);
     run_check("datax is the RAM service", datax_is_the_ram_service);
+    run_check("symlink onto data redirects", symlink_onto_data_redirects);
     run_check("errno for bad paths", errno_for_bad_paths);
     run_check("statvfs", statvfs_of_the_volume);
     run_check("realpath", realpath_of_the_volume);

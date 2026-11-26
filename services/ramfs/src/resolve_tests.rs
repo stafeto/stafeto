@@ -2505,3 +2505,62 @@ fn foreign_bucket_changes_keep_missing_proofs_and_reservations() {
     ram.storage.check_name_index();
     job.release(&mut ram.storage);
 }
+
+/// Walks `path` to its end and returns what the walk ended with.
+fn walk_to_end(r: &mut Ram<'_>, path: &[u8]) -> (Result<Token, u32>, Option<std::vec::Vec<u8>>) {
+    let mut job = Resolve::new(&mut r.storage, path, ROOT, OWNER, true).unwrap();
+    let result = finish(r, &mut job, OWNER);
+    let target = job.redirect_path().map(<[u8]>::to_vec);
+    job.release(&mut r.storage);
+    (result, target)
+}
+
+#[test]
+fn a_link_onto_the_mount_point_redirects_with_the_rest_of_the_path() {
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    create(&mut r, ROOT, b"data", DIR, 0o755);
+    let tmp = create(&mut r, ROOT, b"area", DIR, 0o755);
+    let absolute = create(&mut r, tmp, b"d", SYMLINK, 0o777);
+    r.storage
+        .write(absolute, ROOT_ACCOUNT, 0, b"/data")
+        .unwrap();
+    let relative = create(&mut r, tmp, b"r", SYMLINK, 0o777);
+    r.storage
+        .write(relative, ROOT_ACCOUNT, 0, b"../data/sub")
+        .unwrap();
+    for (path, want) in [
+        (&b"/area/d"[..], &b"/data"[..]),
+        (b"/area/d/a/b", b"/data/a/b"),
+        (b"/area/d/", b"/data/"),
+        (b"/area/r/file", b"/data/sub/file"),
+        (b"/area/../data/x", b"/data/x"),
+    ] {
+        let (result, target) = walk_to_end(&mut r, path);
+        assert_eq!(result, Err(proto_fs::REDIRECT), "{path:?}");
+        assert_eq!(target.as_deref(), Some(want), "{path:?}");
+    }
+    // The walk that has redirected redirects again on a repeat of the step.
+    let mut job = Resolve::new(&mut r.storage, b"/area/d/x", ROOT, OWNER, true).unwrap();
+    assert_eq!(finish(&mut r, &mut job, OWNER), Err(proto_fs::REDIRECT));
+    assert_eq!(job.step(&mut r.storage, OWNER), Err(proto_fs::REDIRECT));
+    job.release(&mut r.storage);
+}
+
+#[test]
+fn the_name_data_of_the_root_redirects_with_or_without_a_directory_and_no_other_name_does() {
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let area = create(&mut r, ROOT, b"area", DIR, 0o755);
+    let inner = create(&mut r, area, b"data", DIR, 0o755);
+    let file = create(&mut r, ROOT, b"data2", REG, 0o644);
+    assert_eq!(walk_to_end(&mut r, b"/area/data").0, Ok(inner));
+    assert_eq!(walk_to_end(&mut r, b"/data2").0, Ok(file));
+    // The tree has no directory data: the name is the volume's all the same.
+    let (result, target) = walk_to_end(&mut r, b"/data/x");
+    assert_eq!(result, Err(proto_fs::REDIRECT));
+    assert_eq!(target.as_deref(), Some(&b"/data/x"[..]));
+    create(&mut r, ROOT, b"data", DIR, 0o755);
+    assert_eq!(
+        walk_to_end(&mut r, b"/data").1.as_deref(),
+        Some(&b"/data"[..])
+    );
+}

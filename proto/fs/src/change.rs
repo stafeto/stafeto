@@ -364,7 +364,9 @@ impl ChangeReply<'_> {
     pub fn validate(&self) -> Result<(), Status> {
         if self.bytes.len() > RESULT_MAX
             || (!self.done && (self.result != 0 || self.value != 0 || !self.bytes.is_empty()))
-            || (self.result != 0 && (self.value != 0 || !self.bytes.is_empty()))
+            || (self.result != 0
+                && (self.value != 0 || (!self.bytes.is_empty() && self.result != crate::REDIRECT)))
+            || (self.result == crate::REDIRECT && self.bytes.first() != Some(&b'/'))
         {
             return Err(Status::BadSize);
         }
@@ -656,6 +658,14 @@ mod tests {
                 restarts: u32::MAX,
                 value: 0,
                 bytes: &[],
+            },
+            // A redirect carries the path to continue with as its bytes.
+            ChangeReply {
+                done: true,
+                result: crate::REDIRECT,
+                restarts: 0,
+                value: 0,
+                bytes: b"/data/a",
             },
         ] {
             let mut out = Writer::new();

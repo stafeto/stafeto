@@ -361,6 +361,12 @@ impl ChangeJob {
             Ok(()) => Ok(()),
             Err(Stop::Fail(code)) => {
                 self.fail(ram, charge, second, code);
+                if code == proto_fs::REDIRECT
+                    && let Some(path) = self.first.redirect_path()
+                {
+                    // The path to continue with is the whole answer.
+                    self.length = path.len() as u16;
+                }
                 Ok(())
             }
             Err(Stop::Stale) => {
@@ -416,7 +422,13 @@ impl ChangeJob {
                 if let Some(second) = second.as_deref_mut()
                     && !second.is_inert()
                 {
-                    match second.step(&mut ram.storage, identity)? {
+                    // A second path that meets the mount point of another service is across
+                    // two file systems.
+                    let step = match second.step(&mut ram.storage, identity) {
+                        Err(proto_fs::REDIRECT) => Err(proto_fs::CROSS_DEVICE),
+                        step => step,
+                    };
+                    match step? {
                         Progress::More => return Ok(()),
                         Progress::Found(_) | Progress::Missing(_) => {}
                     }
@@ -805,7 +817,7 @@ impl ChangeJob {
 
     fn reply(&self) -> ChangeReply<'_> {
         let done = self.stage == Stage::Done;
-        let bytes = if done && self.result == 0 {
+        let bytes = if done && (self.result == 0 || self.result == proto_fs::REDIRECT) {
             &self.first.buffer_ref()[..self.length as usize]
         } else {
             &[]

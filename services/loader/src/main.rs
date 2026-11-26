@@ -1950,7 +1950,8 @@ fn open(own: &Own, path: &[u8]) -> Result<Handle<Channel>, u32> {
 fn exec_status(s: Status) -> u32 {
     match s {
         Status::Unknown(proto_fs::NO_ENTRY) => pl::NO_ENTRY,
-        Status::Unknown(proto_fs::ACCESS_DENIED) => pl::ACCESS,
+        // A link onto /data: a program is never run from the volume.
+        Status::Unknown(proto_fs::ACCESS_DENIED | proto_fs::REDIRECT) => pl::ACCESS,
         Status::Unknown(proto_fs::NOT_DIRECTORY) => pl::NOT_DIRECTORY,
         Status::Unknown(proto_fs::PERMISSION) => pl::PERMISSION,
         Status::Unknown(proto_fs::NAME_TOO_LONG) => pl::NAME_TOO_LONG,

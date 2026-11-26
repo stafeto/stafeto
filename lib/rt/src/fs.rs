@@ -14,6 +14,47 @@ use proto_wire::{Reader, Status, Writer};
 
 mod change_release_reply;
 
+/// Where the path of a REDIRECT answer goes: a function of the layer above that keeps it for the
+/// calling thread. The failing call returns `Status::Unknown(REDIRECT)` and the layer follows the
+/// redirect with the kept path, once. 0 until a layer sets one; the answer then only fails.
+static REDIRECT_SINK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Sets the function that takes the absolute path of a REDIRECT answer, called on the thread that
+/// made the request, before the failing call returns.
+pub fn set_redirect_sink(sink: fn(&[u8])) {
+    REDIRECT_SINK.store(sink as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Hands the path of a redirect to the layer's sink; a path that is not a path is a malformed reply.
+fn take_redirect(path: &[u8]) -> Status {
+    if path.is_empty() || path.len() > proto_fs::MAX_PATH || path[0] != b'/' {
+        return Status::BadSize;
+    }
+    let sink = REDIRECT_SINK.load(core::sync::atomic::Ordering::Acquire);
+    if sink != 0 {
+        // SAFETY: only `set_redirect_sink` stores a value, a `fn(&[u8])`.
+        let sink: fn(&[u8]) = unsafe { core::mem::transmute::<usize, fn(&[u8])>(sink) };
+        sink(path);
+    }
+    Status::Unknown(proto_fs::REDIRECT)
+}
+
+/// The failure a reply with a redirect makes, or None for any other reply.
+fn redirect_of(reply: &crate::sys::Reply) -> Option<Status> {
+    if reply.len <= proto_wire::HEADER_LEN
+        || reply.words[0] as u32 != proto_fs::REDIRECT
+        || !reply.handles.is_empty()
+    {
+        return None;
+    }
+    let mut buffer = [0; MESSAGE_MAX];
+    let bytes = reply.bytes(&mut buffer);
+    Some(match proto_fs::read_redirect(Reader::new(&bytes[4..])) {
+        Ok(path) => take_redirect(path),
+        Err(status) => status,
+    })
+}
+
 /// A console transport snapshot, without a borrow of the file owner.
 /// It carries no application buffer or file-state pointer. The owning Files
 /// must remain alive while this snapshot is used; it does not retain a UART
@@ -286,6 +327,9 @@ impl Proof<'_> {
         let request = job_request(Method::ResolveStep, self.id);
         loop {
             let reply = self.send(&request)?;
+            if let Some(redirect) = redirect_of(&reply) {
+                return Err(redirect);
+            }
             match proof_ready_status(reply.len, reply.words[0], reply.handles.len())? {
                 Status::Ok => return Ok(()),
                 Status::Unknown(proto_fs::RESOLVING) => {}
@@ -647,6 +691,9 @@ impl Files {
         .write(&mut w)?;
         w.u64(id)?;
         let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        if !prepare && let Some(redirect) = redirect_of(&reply) {
+            return Err(redirect);
+        }
         if Self::reply_code(&reply)? == proto_fs::RESOLVING {
             if reply.len != 8 || reply.words[0] >> 32 != 0 || !reply.handles.is_empty() {
                 return Err(Status::BadSize);
@@ -1771,6 +1818,10 @@ impl Files {
         let reply = proto_fs::ChangeReply::read(&bytes[..length], 0)?;
         if !reply.done {
             return Ok(None);
+        }
+        if reply.result == proto_fs::REDIRECT {
+            // The job is over; its result bytes are the path to continue with.
+            return Err(take_redirect(reply.bytes));
         }
         out[..reply.bytes.len()].copy_from_slice(reply.bytes);
         Ok(Some(proto_fs::ChangeDone {

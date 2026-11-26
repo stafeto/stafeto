@@ -281,7 +281,20 @@ pub fn faccessat(dirfd: c_int, path: &[u8], mode: c_int, flags: c_int) -> Result
         0
     };
     access.args = [mode as u64, 0, 0, 0];
-    run_unit(&access)
+    crate::redirect::follow(|target| match target {
+        None => run_unit(&access),
+        // The service redirected a walk through a link onto /data.
+        Some(target) => match crate::data::route(AT_FDCWD, target)? {
+            Some(vol) => crate::data::access(&vol, mode, effective),
+            None => {
+                let placed = place(AT_FDCWD, target)?;
+                let mut again = request(ChangeOp::Access, &placed);
+                again.flags = access.flags;
+                again.args = access.args;
+                run_unit(&again)
+            }
+        },
+    })
 }
 
 /// rename: `renameat2` without flags.
@@ -545,10 +558,20 @@ pub fn fstatat(
                 .map_err(error);
         }
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0 || placed.trailing_slash;
-        let info = transport
-            .files()
-            .node_information_from(placed.start_fd(), placed.path(), follow)
-            .map_err(|status| error(FsError::from(status)))?;
+        let info = crate::redirect::follow(|target| match target {
+            None => transport
+                .files()
+                .node_information_from(placed.start_fd(), placed.path(), follow)
+                .map_err(|status| error(FsError::from(status))),
+            // The service redirected a walk through a link onto /data.
+            Some(target) => match crate::data::route(AT_FDCWD, target)? {
+                Some(vol) => crate::data::stat(&vol),
+                None => transport
+                    .files()
+                    .node_information_from(None, target, follow)
+                    .map_err(|status| error(FsError::from(status))),
+            },
+        })?;
         if placed.trailing_slash && info.kind != 1 {
             return Err(ENOTDIR);
         }

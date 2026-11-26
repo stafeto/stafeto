@@ -127,7 +127,9 @@ impl From<Status> for FsError {
             Status::Unknown(proto_fs::TOO_MANY_LINKS) => Self::TooManyLinks,
             Status::Unknown(proto_fs::NOT_EMPTY) => Self::NotEmpty,
             Status::Unknown(proto_fs::BUSY) => Self::Busy,
-            Status::Unknown(proto_fs::CROSS_DEVICE) => Self::CrossDevice,
+            // A path that goes through a link onto the data volume, in a call that does not follow
+            // the redirect, reaches another file system.
+            Status::Unknown(proto_fs::CROSS_DEVICE | proto_fs::REDIRECT) => Self::CrossDevice,
             Status::Unknown(proto_fs::NOT_SUPPORTED) => Self::NotSupported,
             _ => Self::Io,
         }

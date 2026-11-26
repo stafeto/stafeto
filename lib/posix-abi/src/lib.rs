@@ -69,6 +69,7 @@ pub mod process;
 #[cfg(feature = "procfs")]
 pub mod procfs;
 pub mod random;
+mod redirect;
 pub mod relibc;
 pub mod resources;
 pub mod sched;
@@ -298,7 +299,19 @@ fn open_policy_inner(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result
         return data::open(&vol, flags, mode, umask);
     }
     // The RAM file service takes every write as done at its return: the bit is the volume's.
-    open_image(name, flags & !(O_SYNC | O_SEARCH), mode, umask)
+    // A link that leads onto /data is the service's redirect: the path it names is opened once.
+    redirect::follow(|target| match target {
+        None => open_image(name, flags & !(O_SYNC | O_SEARCH), mode, umask),
+        Some(target) => open_redirected(target, flags, mode, umask),
+    })
+}
+
+/// Opens the absolute path a redirect of the RAM file service names.
+fn open_redirected(target: &[u8], flags: c_int, mode: u32, umask: u32) -> Result<c_int, c_int> {
+    if let Some(vol) = data::route(names::AT_FDCWD, target)? {
+        return data::open(&vol, flags, mode, umask);
+    }
+    open_image(target, flags & !(O_SYNC | O_SEARCH), mode, umask)
 }
 
 /// Opens a path of the image's file service.
@@ -355,6 +368,7 @@ pub fn openat_policy(
     if let Some(vol) = data::route(dirfd, name)? {
         return data::open(&vol, flags, mode, umask);
     }
+    let given = flags;
     let flags = flags & !(O_SYNC | O_SEARCH);
     let point = threads::cancel::Point::begin();
     let result = (|| {
@@ -364,7 +378,11 @@ pub fn openat_policy(
         let proto_fs::Base::Fd { fd, generation } = names::descriptor_base(dirfd)? else {
             return Err(EBADF);
         };
-        shared::open_from(Some((fd, generation)), name, flags, mode, umask).map(|fd| fd as c_int)
+        redirect::follow(|target| match target {
+            None => shared::open_from(Some((fd, generation)), name, flags, mode, umask)
+                .map(|fd| fd as c_int),
+            Some(target) => open_redirected(target, given, mode, umask),
+        })
     })();
     if result.is_ok() {
         point.end();

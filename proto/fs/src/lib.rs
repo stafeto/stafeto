@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 21 of the bounded RAM file service. Numbers are little endian.
+//! Version 22 of the bounded RAM file service. Numbers are little endian.
 //! Ordinary sessions first Bind with a genuine Process identity capability,
 //! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
@@ -56,6 +56,15 @@
 //! recovery retains the full description token and captured device type.
 //! ResolveCancel releases the job and hidden descriptor; committed file effects
 //! remain observable. Ordinary descriptor APIs and Clone exclude the hidden fd.
+//!
+//! REDIRECT: a walk that meets a name another service owns (the mount point of `/data`) stops
+//! with the status REDIRECT. The reply of ResolveStep (the paths of an OpenStart job too) then
+//! carries the absolute path the caller continues with, 1..=511 bytes: status u32, path bytes. The
+//! job is over and the answer made no description (an OPEN gets no fd), so the caller opens or asks
+//! again at the owner of the path and follows one redirect only; a second one is ELOOP. A Change
+//! job that meets one finishes with the result REDIRECT and the path as the bytes of its result.
+//! A walk that reaches the mount point by a symbolic link or by `..` redirects; a path that names
+//! it from the start is the caller's to route. `redirect_reply` and `read_redirect` make and read it.
 //!
 //! OPEN: flags u32, proof u64. Reply: status, fd u32, optional RANDOM_DEVICE u32.
 //! LOOKUP/INFO_PATH: proof u64. Reply: status then metadata/NodeInfo.
@@ -140,7 +149,7 @@ use proto_wire::{HEADER_LEN, Header, Status};
 pub const RAM_TIME_LEGACY: &[u8] = b"time-legacy";
 /// Explicit startup mode requiring the shared Clock realtime page.
 pub const RAM_TIME_CLOCKED: &[u8] = b"time-clocked";
-pub const VERSION: u16 = 21;
+pub const VERSION: u16 = 22;
 /// Original descriptor custody keys and sixteen independent Control keys.
 pub const JOB_KEY_PLACES: usize = 48;
 pub const MAX_PATH: usize = 511;
@@ -195,6 +204,24 @@ impl SnapshotReply {
         }
         Ok(value)
     }
+}
+
+/// The reply of a ResolveStep that ends in a redirect: the status REDIRECT, then the path.
+pub fn redirect_reply(path: &[u8], w: &mut proto_wire::Writer) -> Result<(), Status> {
+    if path.is_empty() || path.len() > MAX_PATH || path[0] != b'/' {
+        return Err(Status::BadSize);
+    }
+    w.u32(REDIRECT)?;
+    w.bytes(path)
+}
+
+/// The path of a redirect reply, after its status.
+pub fn read_redirect(mut r: proto_wire::Reader<'_>) -> Result<&[u8], Status> {
+    let path = r.bytes(r.left())?;
+    if path.is_empty() || path.len() > MAX_PATH || path[0] != b'/' {
+        return Err(Status::BadSize);
+    }
+    Ok(path)
 }
 
 pub const READ_ONLY: u32 = 0;
@@ -327,6 +354,10 @@ pub const BAD_LAYER: u32 = 336;
 /// An entry of the layer has a set-ID, set-GID or sticky bit, or an owner other than 0:0.
 /// The reply carries the number of the entry.
 pub const BAD_MODE: u32 = 337;
+/// The walk met a name another service owns (the mount point of `/data`): the reply carries the
+/// absolute path to continue with (`redirect_reply`). The caller follows one redirect and answers
+/// ELOOP to a second.
+pub const REDIRECT: u32 = 338;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenKey {
@@ -766,5 +797,25 @@ mod tests {
         assert!(is_image(OWN | IMAGE_SESSION | 12));
         assert!(!is_image(OWN | 12));
         assert!(!is_image(LOADERS | 12));
+    }
+
+    #[test]
+    fn a_redirect_reply_carries_an_absolute_path() {
+        let mut w = proto_wire::Writer::new();
+        redirect_reply(b"/data/a/b", &mut w).unwrap();
+        let mut r = proto_wire::Reader::new(w.as_bytes());
+        assert_eq!(r.u32(), Ok(REDIRECT));
+        assert_eq!(read_redirect(r), Ok(&b"/data/a/b"[..]));
+        let mut w = proto_wire::Writer::new();
+        assert_eq!(redirect_reply(b"data", &mut w), Err(Status::BadSize));
+        assert_eq!(redirect_reply(b"", &mut w), Err(Status::BadSize));
+        assert_eq!(
+            redirect_reply(&[b'/'; MAX_PATH + 1], &mut w),
+            Err(Status::BadSize)
+        );
+        assert_eq!(
+            read_redirect(proto_wire::Reader::new(b"x")),
+            Err(Status::BadSize)
+        );
     }
 }

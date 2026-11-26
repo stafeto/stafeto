@@ -6292,6 +6292,29 @@ impl Fs {
         match result {
             Ok(Progress::More) => status(proto_fs::RESOLVING),
             Ok(Progress::Found(_) | Progress::Missing(_)) => Answer::Status(Status::Ok),
+            Err(proto_fs::REDIRECT) => {
+                // The walk met the mount point of another service: the job is over, it made no
+                // description, and the reply names the path to continue with.
+                let mut target = [0u8; proto_fs::MAX_PATH];
+                let length = {
+                    let found = path
+                        .second
+                        .as_ref()
+                        .filter(|second| second.redirect_path().is_some())
+                        .unwrap_or(&path.resolver);
+                    found.redirect_path().map_or(0, |bytes| {
+                        target[..bytes.len()].copy_from_slice(bytes);
+                        bytes.len()
+                    })
+                };
+                self.cancel_job(id, r.label(), Some(fds));
+                let w = r.reply();
+                if proto_fs::redirect_reply(&target[..length], w).is_err() {
+                    status(proto_fs::INVALID_ARGUMENT)
+                } else {
+                    Answer::Reply(Outgoing::new())
+                }
+            }
             Err(code) => {
                 self.cancel_job(id, r.label(), Some(fds));
                 status(code)
