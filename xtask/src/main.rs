@@ -2214,9 +2214,16 @@ commands:
   mesa-reference build the same Mesa for Linux and run the cube on it, then compare its ten CRCs
             with the ones gles-pbuffer expects (tools/build-mesa-reference.py; arm64 Linux only,
             as on the runners of probe.yml)
-  deqp      build the test framework dEQP of VK-GL-CTS for stafeto (tools/build-deqp.py) into
-            target/deqp, then run its EGL groups info and create_context in QEMU in batches
-            of 200 cases, restarting the program after a crash, and print their counts
+  deqp [SET|MODULE|all|smoke|smoke-select]...  build the test framework dEQP of VK-GL-CTS for
+            stafeto (tools/build-deqp.py) into target/deqp, then run the sets of cases in QEMU
+            in batches of 200, restarting the program after a crash, print their counts and
+            compare each with its baseline of Linux (tests/deqp/baseline) and the departures
+            (tests/deqp/departures.txt); no argument runs egl.info and egl.context, smoke the
+            cases of tests/deqp/smoke.txt (docs/deqp.md)
+  deqp-reference SET|MODULE|all... [--write] [--no-build] [--provisional TEXT]  build the same
+            Mesa and dEQP for Linux (tools/build-deqp-reference.py), run the sets there and write
+            their baselines to target/deqp-reference/baseline and to the log (arm64 Linux only,
+            as on the runners of probe.yml)
   gles-pbuffer run a cube on Mesa's softpipe in QEMU, with no compositor: ten frames
             drawn into a pbuffer, read back, and their CRCs
   gles-window run the cube in a window of the composition service in QEMU: the API checks of the
@@ -2733,7 +2740,8 @@ fn main() {
         Some("cxx-probe") => cxx_probe::probe(&qemu::VIRT),
         Some("mesa") => mesa(),
         Some("mesa-reference") => mesa_reference(),
-        Some("deqp") => deqp::probe(&qemu::VIRT_1G),
+        Some("deqp") => deqp::probe(&qemu::VIRT_1G, &args[1..]),
+        Some("deqp-reference") => deqp::reference(&args[1..]),
         Some("gles-pbuffer") => gles_pbuffer::probe(&qemu::VIRT_1G),
         Some("gles-window") => gles_window::probe(&qemu::VIRT_1G),
         Some("gles-probe") => gles_probe::command(&args[1..], &qemu::VIRT_1G),
@@ -11007,6 +11015,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("cxx-probe", || cxx_probe::probe(&qemu::VIRT)),
         job("gles-probe", || gles_probe::probe(&qemu::VIRT_1G, false)),
         job("gles-probe steps", || gles_probe::steps(&qemu::VIRT_1G)),
+        job("deqp-smoke", || {
+            deqp::smoke(&qemu::VIRT_1G, &deqp::Module::ALL)
+        }),
         job("posix-files", posix_files_probe),
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
@@ -11553,6 +11564,7 @@ fn host_tests() -> Result<(), String> {
         "tools/test_build_libcxx.py",
         "tools/test_build_mesa.py",
         "tools/test_build_deqp.py",
+        "tools/test_build_deqp_reference.py",
         "tools/test_build_lvgl.py",
         "tools/test_lvgl_port.py",
         "tools/test_build_libc_so.py",
@@ -17933,6 +17945,9 @@ mod entropy_in_images_tests {
             ("cxx_probe::PROGRAMS", &crate::cxx_probe::PROGRAMS),
             ("gles_pbuffer::PROGRAMS", &crate::gles_pbuffer::PROGRAMS),
             ("deqp::PROGRAMS", &crate::deqp::PROGRAMS),
+            ("deqp::PROGRAMS_GLES2", &crate::deqp::PROGRAMS_GLES2),
+            ("deqp::PROGRAMS_GLES3", &crate::deqp::PROGRAMS_GLES3),
+            ("deqp::PROGRAMS_GLES31", &crate::deqp::PROGRAMS_GLES31),
             ("gles_window::PROGRAMS", &crate::gles_window::PROGRAMS),
             ("gles_probe::PROGRAMS", &crate::gles_probe::PROGRAMS),
             (

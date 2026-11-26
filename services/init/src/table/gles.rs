@@ -80,8 +80,10 @@ pub const WINDOW_TABLE: &[Record] = &[
 /// module makes contexts and surfaces of a few MiB.
 const DEQP_QUOTA: u64 = 256 * 1024 * 1024;
 
-/// dEQP-EGL (xtask deqp): the services of the pbuffer probe and the module
-/// of VK-GL-CTS. The arguments of a batch of cases are the lines of
+/// dEQP (xtask deqp): the services of the window probe (the display driver and
+/// the compositor, under the name `gpu` the program's place `Display` meets)
+/// and one module of VK-GL-CTS (EGL, GLES2, GLES3 or GLES31), which the image
+/// names `deqp`. The arguments of a batch of cases are the lines of
 /// /etc/deqp.args in the image (tests/deqp/platform/tcuStafetoMain.cpp), so
 /// the table holds none.
 pub const DEQP_TABLE: &[Record] = &[
@@ -92,11 +94,13 @@ pub const DEQP_TABLE: &[Record] = &[
     },
     POSIX_ABI_TABLE[2],
     PIPE,
+    comp::DISPLAY,
+    comp::COMPOSITOR,
     Record {
-        name: "deqp-egl",
-        program: "deqp-egl",
-        args: b"deqp-egl\0",
-        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
+        name: "deqp",
+        program: "deqp",
+        args: b"deqp\0",
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy", "gpu"],
         root: true,
         quota: DEQP_QUOTA,
         ..POSIX

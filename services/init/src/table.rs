@@ -4397,7 +4397,7 @@ mod tests {
                     "relibc-threads",
                     "cxx-probe",
                     "gles-cube",
-                    "deqp-egl",
+                    "deqp",
                     "os-test-run",
                     "rtbench-posix",
                     "posix-random",

@@ -120,6 +120,17 @@ jobs:
           printf '%s\n' "${summary[@]}"
           exit "$failed"
 
+      # The baselines of `deqp-reference` (docs/deqp.md): the files are also in
+      # the log between the lines BEGIN and END of each.
+      - name: Upload the baselines of dEQP
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: deqp-baseline
+          path: target/deqp-reference/baseline/*.txt
+          if-no-files-found: ignore
+          retention-days: 30
+
       - name: Collect logs
         if: failure()
         run: |

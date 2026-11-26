@@ -37,11 +37,15 @@ gives these types).
 
 ### Configurations
 
-Every configuration has a color buffer of XRGB8888 (8 bits each of red, green
-and blue, none of alpha) or ARGB8888 (8 bits each, with alpha), no
+The configurations of windows have a color buffer of XRGB8888 (8 bits each of
+red, green and blue, none of alpha) or ARGB8888 (8 bits each, with alpha), no
 multisampling, and a depth and stencil buffer of 0 and 0, 16 and 0, or 24 and
-8 bits. `EGL_NATIVE_VISUAL_ID` is the format of the window the configuration
-serves (`STAFETO_WINDOW_XRGB8888` or `STAFETO_WINDOW_ARGB8888`).
+8 bits. The other formats of the driver (5-6-5, 10-10-10-2, 16 bits a channel
+in integers and in floating point) have pbuffer-only configurations with every
+depth and stencil of the driver, as Mesa's surfaceless platform has them: their
+`EGL_SURFACE_TYPE` is `EGL_PBUFFER_BIT` and their `EGL_NATIVE_VISUAL_ID` is 0.
+For a configuration of windows `EGL_NATIVE_VISUAL_ID` is the format of the
+window it serves (`STAFETO_WINDOW_XRGB8888` or `STAFETO_WINDOW_ARGB8888`) and
 `EGL_SURFACE_TYPE` holds `EGL_WINDOW_BIT`, `EGL_PBUFFER_BIT` and
 `EGL_SWAP_BEHAVIOR_PRESERVED_BIT`. `EGL_MIN_SWAP_INTERVAL` is 0 and
 `EGL_MAX_SWAP_INTERVAL` is 1. `EGL_RENDERABLE_TYPE` names OpenGL ES 2 and 3.

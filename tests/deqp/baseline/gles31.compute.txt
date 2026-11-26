@@ -1,0 +1,48 @@
+# dEQP baseline of the set gles31.compute (cargo xtask deqp-reference gles31.compute)
+# module deqp-gles31, platform surfaceless, patterns dEQP-GLES31.functional.compute.basic.*
+# VK-GL-CTS opengl-es-cts-3.2.14.1 (067e8832315e79817ede1c4863804e440f5d1c80)
+# Mesa 26.3.1 softpipe, shared libraries, clang
+# machine Linux 7.0.0-1017-azure aarch64
+# arguments --deqp-surface-type=pbuffer --deqp-surface-width=256 --deqp-surface-height=256 --deqp-gl-config-name=rgba8888d24s8ms0 --deqp-visibility=hidden --deqp-log-images=disable --deqp-log-shader-sources=disable
+# 41 cases: 41 pass, 0 fail, 0 not supported, 0 other, in 1 s
+dEQP-GLES31.functional.compute.basic.atomic_counter_multiple_groups Pass
+dEQP-GLES31.functional.compute.basic.atomic_counter_multiple_invocations Pass
+dEQP-GLES31.functional.compute.basic.atomic_counter_single_group Pass
+dEQP-GLES31.functional.compute.basic.atomic_counter_single_invocation Pass
+dEQP-GLES31.functional.compute.basic.copy_image_to_ssbo_large Pass
+dEQP-GLES31.functional.compute.basic.copy_image_to_ssbo_small Pass
+dEQP-GLES31.functional.compute.basic.copy_ssbo_multiple_groups Pass
+dEQP-GLES31.functional.compute.basic.copy_ssbo_multiple_invocations Pass
+dEQP-GLES31.functional.compute.basic.copy_ssbo_single_invocation Pass
+dEQP-GLES31.functional.compute.basic.copy_ssbo_to_image_large Pass
+dEQP-GLES31.functional.compute.basic.copy_ssbo_to_image_small Pass
+dEQP-GLES31.functional.compute.basic.empty Pass
+dEQP-GLES31.functional.compute.basic.image_atomic_op_local_size_1 Pass
+dEQP-GLES31.functional.compute.basic.image_atomic_op_local_size_8 Pass
+dEQP-GLES31.functional.compute.basic.image_barrier_multiple Pass
+dEQP-GLES31.functional.compute.basic.image_barrier_single Pass
+dEQP-GLES31.functional.compute.basic.shared_atomic_op_multiple_groups Pass
+dEQP-GLES31.functional.compute.basic.shared_atomic_op_multiple_invocations Pass
+dEQP-GLES31.functional.compute.basic.shared_atomic_op_single_group Pass
+dEQP-GLES31.functional.compute.basic.shared_atomic_op_single_invocation Pass
+dEQP-GLES31.functional.compute.basic.shared_var_multiple_groups Pass
+dEQP-GLES31.functional.compute.basic.shared_var_multiple_invocations Pass
+dEQP-GLES31.functional.compute.basic.shared_var_single_group Pass
+dEQP-GLES31.functional.compute.basic.shared_var_single_invocation Pass
+dEQP-GLES31.functional.compute.basic.ssbo_cmd_barrier_multiple Pass
+dEQP-GLES31.functional.compute.basic.ssbo_cmd_barrier_single Pass
+dEQP-GLES31.functional.compute.basic.ssbo_local_barrier_multiple_groups Pass
+dEQP-GLES31.functional.compute.basic.ssbo_local_barrier_single_group Pass
+dEQP-GLES31.functional.compute.basic.ssbo_local_barrier_single_invocation Pass
+dEQP-GLES31.functional.compute.basic.ssbo_rw_multiple_groups Pass
+dEQP-GLES31.functional.compute.basic.ssbo_rw_single_invocation Pass
+dEQP-GLES31.functional.compute.basic.ssbo_unsized_arr_multiple_groups Pass
+dEQP-GLES31.functional.compute.basic.ssbo_unsized_arr_single_invocation Pass
+dEQP-GLES31.functional.compute.basic.ubo_to_ssbo_multiple_groups Pass
+dEQP-GLES31.functional.compute.basic.ubo_to_ssbo_multiple_invocations Pass
+dEQP-GLES31.functional.compute.basic.ubo_to_ssbo_single_group Pass
+dEQP-GLES31.functional.compute.basic.ubo_to_ssbo_single_invocation Pass
+dEQP-GLES31.functional.compute.basic.write_multiple_arr_multiple_groups Pass
+dEQP-GLES31.functional.compute.basic.write_multiple_arr_single_invocation Pass
+dEQP-GLES31.functional.compute.basic.write_multiple_unsized_arr_multiple_groups Pass
+dEQP-GLES31.functional.compute.basic.write_multiple_unsized_arr_single_invocation Pass

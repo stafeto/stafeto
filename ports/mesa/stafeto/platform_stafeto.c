@@ -36,6 +36,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -592,11 +593,33 @@ static const struct dri2_egl_display_vtbl dri2_stafeto_display_vtbl = {
    .create_image = dri2_create_image_khr,
 };
 
+/* The formats of the driver that no window has: Mesa's surfaceless platform
+ * offers them to pbuffers (dri2_pbuffer_visuals of egl_dri2.c, less the two
+ * formats of a window, which have configurations that serve windows too). */
+static bool
+stafeto_pbuffer_only_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R16G16B16X16_FLOAT:
+   case PIPE_FORMAT_R16G16B16A16_UNORM:
+   case PIPE_FORMAT_R16G16B16X16_UNORM:
+   case PIPE_FORMAT_B10G10R10A2_UNORM:
+   case PIPE_FORMAT_B10G10R10X2_UNORM:
+   case PIPE_FORMAT_B5G6R5_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
 /* The configurations: the two formats of a window (the points of the format
  * are what softpipe's BGRA8888 and BGRX8888 hold), no multisampling, the
  * depths and stencils 0 and 0, 16 and 0, 24 and 8. Every one serves window
  * surfaces (the double-buffered driver configuration) and pbuffers (the
- * single-buffered one). */
+ * single-buffered one). The other formats of the driver have pbuffer-only
+ * configurations with every depth and stencil the driver has, as the
+ * surfaceless platform of Mesa has them: a window has no such format. */
 static void
 stafeto_add_configs(_EGLDisplay *disp)
 {
@@ -606,6 +629,18 @@ stafeto_add_configs(_EGLDisplay *disp)
       const struct gl_config *gl = (const struct gl_config *)dri2_dpy->driver_configs[i];
       EGLint format;
 
+      if (stafeto_pbuffer_only_format(gl->color_format)) {
+         if (gl->samples <= 1) {
+            const EGLint group[] = {
+               EGL_CONFIG_SELECT_GROUP_EXT,
+               util_format_is_unorm16(util_format_description(gl->color_format)) ? 1 : 0,
+               EGL_NONE,
+            };
+
+            dri2_add_config(disp, dri2_dpy->driver_configs[i], EGL_PBUFFER_BIT, group);
+         }
+         continue;
+      }
       if (gl->color_format == PIPE_FORMAT_BGRA8888_UNORM)
          format = STAFETO_WINDOW_ARGB8888;
       else if (gl->color_format == PIPE_FORMAT_BGRX8888_UNORM)

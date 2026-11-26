@@ -94,9 +94,9 @@ static EGLint config_value(EGLDisplay display, EGLConfig config, EGLint attribut
  * program wants one of them. */
 static EGLConfig window_choose(EGLDisplay display, EGLint alpha)
 {
-	EGLConfig all[64];
+	EGLConfig all[256];
 	EGLint count = 0;
-	CHECK(eglGetConfigs(display, all, 64, &count) == EGL_TRUE);
+	CHECK(eglGetConfigs(display, all, 256, &count) == EGL_TRUE);
 	for (EGLint i = 0; i < count; i++) {
 		if ((config_value(display, all[i], EGL_SURFACE_TYPE) & EGL_WINDOW_BIT) &&
 		    (config_value(display, all[i], EGL_RENDERABLE_TYPE) & EGL_OPENGL_ES2_BIT) &&
@@ -132,14 +132,22 @@ static EGLSurface window_surface(EGLDisplay display, int size, EGLConfig *config
 	CHECK(window_number == 0);
 	CHECK(window_shape.width == (uint32_t)size && window_shape.buffers == WINDOW_BUFFERS);
 
-	/* The configurations: every one names the format of the window it takes. */
-	EGLConfig all[64];
+	/* The configurations: every one that serves windows names the format of the
+	 * window it takes; the others (the formats of the driver that no window has)
+	 * are pbuffer-only. */
+	EGLConfig all[256];
 	EGLint count = 0;
-	CHECK(eglGetConfigs(display, all, 64, &count) == EGL_TRUE);
+	CHECK(eglGetConfigs(display, all, 256, &count) == EGL_TRUE);
 	CHECK(count > 0);
 	for (EGLint i = 0; i < count; i++) {
 		EGLint visual = config_value(display, all[i], EGL_NATIVE_VISUAL_ID);
-		CHECK(visual == STAFETO_WINDOW_XRGB8888 || visual == STAFETO_WINDOW_ARGB8888);
+		EGLint kinds = config_value(display, all[i], EGL_SURFACE_TYPE);
+		if (kinds & EGL_WINDOW_BIT) {
+			CHECK(visual == STAFETO_WINDOW_XRGB8888 || visual == STAFETO_WINDOW_ARGB8888);
+		} else {
+			CHECK(kinds & EGL_PBUFFER_BIT);
+			CHECK(visual == 0);
+		}
 		CHECK(config_value(display, all[i], EGL_SAMPLES) == 0);
 		CHECK(config_value(display, all[i], EGL_MAX_SWAP_INTERVAL) == 1);
 		CHECK(config_value(display, all[i], EGL_MIN_SWAP_INTERVAL) == 0);
