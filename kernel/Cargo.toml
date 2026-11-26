@@ -21,6 +21,9 @@ kboot = { path = "../kboot" }
 kcore = { path = "../kcore" }
 
 [features]
+# Diagnosis only: a line when the last reference or the last shell reference of a
+# process with a quota of 64 MiB or more goes (xtask, STAFETO_TEARDOWN_TRACE).
+teardown-trace = []
 ktest = ["karch/ktest"]
 # The kernel tests with those that need `-icount` added (ktest::el0).
 icount = ["ktest", "measure"]

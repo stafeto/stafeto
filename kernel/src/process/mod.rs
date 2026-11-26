@@ -823,6 +823,26 @@ unsafe fn refs<'a>(process: NonNull<Process>) -> &'a mut Refs {
     unsafe { &mut (*process.as_ptr()).refs }
 }
 
+/// Diagnosis (feature `teardown-trace`): the line of a count that reached 0
+/// for a process with a quota of 64 MiB or more.
+#[cfg(feature = "teardown-trace")]
+pub(super) fn trace(what: &str, process: NonNull<Process>, cause: u8) {
+    // SAFETY: the callers hold the process; only fields are read.
+    unsafe {
+        let p = process.as_ptr();
+        if (*p).quota.limit() >= 64 << 20 {
+            kprintln!(
+                "ttrace {what}: process {:p} quota {} used {} shell_refs {} cause {cause} thread {:?}",
+                p,
+                (*p).quota.limit(),
+                (*p).quota.used(),
+                (*p).shell_refs,
+                crate::thread::current()
+            );
+        }
+    }
+}
+
 /// Adds a reference to a live process (Refs::retain).
 pub fn retain(process: NonNull<Process>) {
     // SAFETY: the caller holds a reference, so the process is alive.
@@ -843,6 +863,8 @@ pub unsafe fn release(process: NonNull<Process>, cause: u8) {
     if !unsafe { refs(process) }.release() {
         return;
     }
+    #[cfg(feature = "teardown-trace")]
+    trace("release", process, cause);
     // SAFETY: that was the last reference: nothing else reaches the
     // process, and the pool keeps it in place; only the fields are touched.
     unsafe {
@@ -893,6 +915,10 @@ pub unsafe fn release_shell(process: NonNull<Process>, cause: u8) {
             .shell_refs
             .checked_sub(1)
             .unwrap_or_else(|| kcore::fail_here!("a shell is released once too often"));
+        #[cfg(feature = "teardown-trace")]
+        if (*p).shell_refs == 0 {
+            trace("release_shell", process, cause);
+        }
         if (*p).shell_refs == 0 && refs == 0 && (*p).stage == Stage::Shell {
             queue_shell(process, cause);
         }

@@ -3755,9 +3755,14 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
         "--target",
         KERNEL_TARGET,
     ]);
-    if let Some(feature) = variant.feature() {
-        cmd.args(["--features", feature]);
-    }
+    // Diagnosis of the teardown of a process: lines when its last references go.
+    let traced = std::env::var_os("STAFETO_TEARDOWN_TRACE").is_some();
+    match (variant.feature(), traced) {
+        (Some(feature), true) => cmd.args(["--features", &format!("{feature},teardown-trace")]),
+        (Some(feature), false) => cmd.args(["--features", feature]),
+        (None, true) => cmd.args(["--features", "teardown-trace"]),
+        (None, false) => &mut cmd,
+    };
     let target = target_dir();
     // Every variant writes the same cargo output path; a copy next to each image
     // keeps the symbols that match it.
