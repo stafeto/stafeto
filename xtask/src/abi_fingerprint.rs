@@ -785,6 +785,38 @@ mod tests {
         assert_ne!(digest(&p), digest(&q));
     }
 
+    /// The layer service's protocol is for native programs: neither the POSIX layer nor
+    /// `libc.so` may reach it, or the fingerprint of the protocols would carry its version.
+    #[test]
+    fn the_layer_protocol_is_outside_the_closure_of_the_layer() {
+        let root = crate::root();
+        let text = crate::stdout_of(Command::new("cargo").current_dir(&root).args([
+            "tree",
+            "--offline",
+            "--prefix",
+            "none",
+            "-F",
+            &layer_features(&root).unwrap(),
+            "--target",
+            "aarch64-unknown-none",
+            "-e",
+            "normal,build",
+            "--format",
+            "{p}",
+            "-p",
+            "posix-abi",
+            "-p",
+            "posix-crt",
+        ]))
+        .unwrap();
+        let names: Vec<String> = proto_crates(&text, &root)
+            .into_iter()
+            .map(|c| c.0)
+            .collect();
+        assert!(names.contains(&"proto-fs".to_string()), "{names:?}");
+        assert!(!names.contains(&"proto-layer".to_string()), "{names:?}");
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("stafeto-abi-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

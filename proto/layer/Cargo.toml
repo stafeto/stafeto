@@ -1,0 +1,20 @@
+[package]
+name = "proto-layer"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The protocol of the layer service of stafeto (services/layerd): its method numbers, codes and the bodies of its requests and replies"
+
+[lib]
+bench = false
+
+[dependencies]
+proto-wire = { path = "../wire" }
+
+[dev-dependencies]
+proto-data = { path = "../data" }
+proto-pkg = { path = "../pkg" }
+proto-fs = { path = "../fs" }
+abi = { path = "../../lib/abi" }
