@@ -58,12 +58,16 @@ registers the module by a static object that nothing refers to, so its archive
 is linked whole. The programs are 20.1 MB (EGL), 23.0 MB (GLES2), 27.9 MB
 (GLES3) and 26.9 MB (GLES31) in the image.
 
-The platform (`tests/deqp/platform`, 290 lines, MIT) implements `tcu::Platform`,
+The platform (`tests/deqp/platform`, 330 lines, MIT) implements `tcu::Platform`,
 `glu::Platform` and `eglu::Platform` over `EGL_DEFAULT_DISPLAY`: the display
 is linked in, the GL contexts come from `eglu::GLContextFactory`, and a native
 window is a window of the composition service (`stafeto_window_open`, two
 buffers, the format of the configuration's `EGL_NATIVE_VISUAL_ID`; the handle
-is the window number plus 1). The process has one window at a time, so a test
+is the window number plus 1). The platform registers a pixmap factory whose
+pixmap has the handle `nullptr`, as the platform nullws of dEQP does
+(`framework/platform/nullws/tcuNullWSPlatform.cpp`): the platform of EGL
+refuses pixmap surfaces, and the tests of the negative API reach EGL with the
+stub. This differs from plan 5.1, which names no pixmap factory. The process has one window at a time, so a test
 that holds two windows fails with a resource error until the window manager
 exists. A window has no resize and no visibility, and those tests are
 `NotSupported`. `tcuStafetoMain.cpp` holds the entry: the arguments of a start
@@ -74,19 +78,21 @@ so every case is on the console as soon as it ends.
 
 ## Where it runs
 
-The image of the probe is the one of `gles-pbuffer` with the program of one
+The image of the probe is the one of `gles-window` with the program of one
 module, which the image calls `deqp` (`/bin/deqp`, the record `deqp` of init's
-table `table-deqp`, quota 256 MiB): the services of the POSIX probes and QEMU
-with 1 GiB. The program is a file of the RAM service, as the programs of
+table `table-deqp`, quota 256 MiB): the services of the POSIX probes, the
+display driver and the compositor (the record `gpu`, which the place `Display`
+of the platform meets) and QEMU with 1 GiB and the display of `qemu::GPU`. The program is a file of the RAM service, as the programs of
 os-test are; the images are 41 MB (EGL) to 59 MB (GLES31) and the RAM service
 takes them, so the data volume `datafs` is not needed. The modules GLES2,
 GLES3 and GLES31 read data files (the shader tests of the GLSL conformance, the
 images of the texture tests; 77, 91 and 109 files, 1.1 to 3.7 MB) from
 `/data/<module>`, files of the image that `deqp.rs` takes from the build tree
-(`--deqp-archive-dir=/data`). The image has no display driver and no
-composition service, so a case that opens a native window ends with a resource
-error, and the framework ends its process on it (the runner starts it again).
-Every run of a GLES module asks for pbuffer surfaces of 256 by 256 and the
+(`--deqp-archive-dir=/data`). The screen of the display driver is 640 by 400
+points (a constant of the service), so a window of 480 by 480, which the sync,
+preserving-swap and damage tests open, is larger than the screen and the case is
+`NotSupported` (departures, class `window`). A resource error ends the process
+of the framework, and the runner starts it again. Every run of a GLES module asks for pbuffer surfaces of 256 by 256 and the
 configuration `rgba8888d24s8ms0`, as the CI of Mesa does, and the run on Linux
 takes the same arguments (`Module::arguments`).
 
@@ -95,13 +101,19 @@ takes the same arguments (`Module::arguments`).
 `cargo xtask deqp [SET | MODULE | all | smoke | smoke-select]...` (`xtask/src/deqp.rs`):
 
 - A set is a group of dEQP cases of one module, the unit of a run and of a
-  baseline file: `egl.info`, `egl.context`, `egl.config`, `egl.sync`,
-  `egl.api`, `egl.surface`, `egl.swap`, `gles2.basic`, `gles2.buffer`,
+  baseline file: `egl.info`, `egl.context`, `egl.query`, `egl.config`,
+  `egl.sync`, `egl.api`, `egl.negative`, `egl.surface`, `egl.swap`, `gles2.basic`, `gles2.buffer`,
   `gles2.texture`, `gles2.shaders1`, `gles2.shaders2`, `gles2.fragops`,
   `gles2.raster`, `gles3.basic`, `gles3.shaders`, `gles3.texture`,
   `gles3.buffers` and `gles31.compute` (`SETS` in `xtask/src/deqp/baseline.rs`
   holds the patterns of each: the groups of plan G8, 7.4). A module name runs
   its sets. With no argument the command runs `egl.info` and `egl.context`.
+  In the sets `gles2.fragops`, `gles2.shaders1` and `gles2.shaders2` the groups
+  `fragment_ops.blend`, `fragment_ops.depth_stencil`, `fragment_ops.random`,
+  `fragment_ops.interaction`, `shaders.conversions` and `shaders.swizzles` run
+  one case in four in the order of names (the field `sample`; the baseline holds
+  every case and the comparison takes the cases that ran). The others run in
+  full.
 - The cases of a set come from its baseline file (it holds every case the set
   has on Linux); a set with no baseline file is listed by one start of the
   program with `--deqp-runmode=stdout-caselist`, and the list is kept in
@@ -141,7 +153,7 @@ crash on Linux costs one case as it does in the guest. The platforms
 |---|---|---|---|
 | `surfaceless` | gles2, gles3, gles31 | the GLES sets | GLES contexts over EGL pbuffers; it has no `eglu::Platform`, so no deqp-egl |
 | `nullws` | egl | `egl.info`, `egl.context`, `egl.config`, `egl.api` | deqp-egl with a native window of `nullptr`: the groups that need no window |
-| `x11_egl` | egl | `egl.sync`, `egl.surface`, `egl.swap` | deqp-egl on an X server (Xvfb), for the groups that pass only with windows or sync objects; X11 is on the side of the baseline only |
+| `x11_egl` | egl | `egl.query`, `egl.sync`, `egl.negative`, `egl.surface`, `egl.swap` | deqp-egl on an X server (Xvfb), for the groups that take windows (the negative API opens one) or pass only with them; X11 is on the side of the baseline only |
 
 The baseline of each set goes to `target/deqp-reference/baseline/<set>.txt`,
 to the log between the lines `==== BEGIN tests/deqp/baseline/<set>.txt ====` and
@@ -165,62 +177,86 @@ gh workflow run probe.yml --ref BRANCH -f command="deqp-reference gles2" -f time
 gh workflow run probe.yml --ref BRANCH -f command="deqp-reference gles3 gles31" -f timeout=60
 ```
 
+The sets `egl.api`, `egl.context`, `egl.query` and `egl.negative` changed after
+the first probe runs, so the first command runs again.
+
 Each probe uploads the files as the artifact `deqp-baseline` (30 days) and
 prints them in the log. The files replace the ones of `tests/deqp/baseline`;
 `cargo xtask deqp smoke-select` then makes `tests/deqp/smoke.txt` again.
 
 ## The departures
 
-`tests/deqp/departures.txt` has a line `CASE | REASON | STEP` for every case
-that passes on Linux and does not pass on stafeto. CASE is a case name or a
-pattern with `*` in it; STEP is the step of the plan that returns the case,
-`none` for a difference the plan keeps (pixmap surfaces, 16-bit configurations)
-or `open` for one the review has to place. The comparison (`compare`):
+`tests/deqp/departures.txt` has a line `CASE | STATUS | CLASS | REASON | STEP`
+for every case that passes on Linux and does not pass on stafeto:
+
+- CASE is a case name or a pattern: `*` stands for any run of characters in one
+  group of the names (no dot), `**` for any run at all;
+- STATUS is the status stafeto ends with, usually `NotSupported`;
+- CLASS is `posix` (the layer of POSIX under Mesa), `mesa` (Mesa or its
+  platform), `window` (the composition service, the window manager), `config`
+  (the configurations the platform offers) or `harness` (the test platform or
+  the runner);
+- STEP is the step of the plan that returns the case (`M<n>`, `G<n>.<m>`) or
+  `none` for a difference the plan keeps. `open` is no step: the parser refuses
+  it.
+
+The comparison (`compare`):
 
 - a case that passes on Linux (`Pass`, `QualityWarning`,
   `CompatibilityWarning`) and does not pass here, or has no result, needs a
-  line, or the run fails;
+  line, and the line must name the status the case ends with: another status
+  is a regression;
+- a case that fails on Linux and ends in `Crash`, `Timeout` or `InternalError`
+  here is a regression unless a line names that status;
 - a line of one case that now passes is stale and fails the run, so a step that
-  returns a case drops its line;
-- a case that Linux does not pass is not compared;
+  returns a case drops its line; after a run of every case of its sets, a
+  pattern that matches cases passing on Linux and covered none is stale too;
+- the run prints how many cases each line covered;
 - a case the baseline does not know fails the run.
 
 The host test `the_files_of_the_comparison_agree` checks the files together:
 every case of the baselines lies in the patterns of its set, the smoke list
-holds 150 to 250 cases that all pass on Linux, and every line of the
-departures names a case that passes on Linux.
+holds 150 to 250 cases that pass on Linux and depart nowhere, every set that
+gives to smoke has a case in it, and every line of the departures matches a
+case that passes on Linux (a line for a breakdown, one that fails). A constant
+of the test (`ALLOW_PROVISIONAL`) turns false when the baselines of the runners
+land, and a file that says `provisional:` fails it from then on.
 
 ## deqp-smoke
 
-`tests/deqp/smoke.txt` lists 194 cases, one of each group of the passing cases
-of the baselines (`cargo xtask deqp smoke-select` cuts the names at the deepest
-level that gives at most 250 groups), from the EGL groups without windows and the
-GLES2 and GLES3 groups. `cargo xtask deqp smoke` runs them in the three
-programs and compares them; it is the job `deqp-smoke` of ci.
+`tests/deqp/smoke.txt` lists 199 cases: one of each group of the passing cases
+of the baselines that gives groups (`cargo xtask deqp smoke-select` cuts the names
+at the deepest level that gives at most 250 groups and leaves out the cases a
+departure covers), and the first passing case of each set of windows that has
+one left (`egl.surface`; every passing case of `egl.swap` departs, see the
+results). `cargo xtask deqp smoke` runs them in the three programs and compares
+them; `smoke:egl` runs the cases of one module. It is the job `deqp-smoke` of ci.
 
 ## Results
 
-Run in QEMU (TCG, 1 GiB) on a Mac, against the provisional baselines (below):
+Run in QEMU (TCG, 1 GiB, the image with the compositor) on a Mac, against the
+provisional baselines (below):
 
-| Run | Cases | Pass | Fail | NotSupported | Departures used | Time |
-|---|---|---|---|---|---|---|
-| `deqp smoke` (EGL 67, GLES2 71, GLES3 56) | 194 | 179 | 0 | 15 | 15 | 205 s in three starts |
-| `deqp gles31.compute` | 41 | 41 | 0 | 0 | 0 | 16 s |
-| `deqp egl.info` and `egl.context` (G8.5) | 27 | 12 | 0 | 15 | | |
+| Run | Cases | Pass | Fail | NotSupported | Time |
+|---|---|---|---|---|---|
+| `deqp smoke` (EGL 72, GLES2 71, GLES3 56) | 199 | 199 | 0 | 0 | 91 s + 58 s + 15 s in three starts |
+| `deqp gles31.compute` | 41 | 41 | 0 | 0 | 16 s |
 
-The 15 `NotSupported` cases of the smoke list are the configurations the
-platform of EGL does not offer: 16-bit colour, an 8-bit colour with a stencil
-and no depth buffer, and a colour format that no configuration has
-(`departures.txt`, reason and step on each line). The window cases of
-`negative_api` end their process on a resource error in this image and stay out
-of the smoke list (`SMOKE_EXCLUDED`).
+With the pbuffer-only configurations of the platform (below) and the windows of
+the compositor the smoke list needs no departure to pass. The departures that
+stand cover the groups the screen of 640 by 400 keeps out: `fence_sync`,
+`preserve_swap` and `swap_buffers_with_damage` open a window of 480 by 480, and
+`buffer_age` needs `EGL_EXT_buffer_age`, which the platform does not offer.
+Every passing case of `egl.swap` on Linux is in those three groups, so the set
+gives nothing to smoke until the screen is taller (the display service has a
+fixed screen; a step of the window manager can change it).
 
 The baselines in `tests/deqp/baseline` are PROVISIONAL: they were made by
 `cargo xtask deqp-reference` in an arm64 Linux container (Ubuntu 24.04, Docker
 on a Mac), with the Mesa and the VK-GL-CTS commit of the guest, and each file
 says so in its first line. A probe of a runner (the commands above) replaces
-them. The Linux run of all 19 sets takes 3 minutes after the builds (17 000 cases,
-of which the GLES3 shaders are 6 500).
+them. The Linux run of all sets takes 3 minutes after the builds (17 000
+cases, of which the GLES3 shaders are 6 500).
 
 | Platform | Mesa and dEQP builds in the container (12 cores) |
 |---|---|
@@ -232,4 +268,7 @@ The comparison fails as it should: with the display of the platform made to
 throw `NotSupportedError` (a change of `tcuStafetoPlatform.cpp`, undone), the
 five cases of `egl.info` that pass on Linux are `NotSupported` and
 `cargo xtask deqp egl.info` ends with `5 regressions`. The host tests do the
-same on synthetic results.
+same on synthetic results, with the statuses of the departures too.
+
+No multisampling is offered, which rules out a run of the ES 3.0 conformance
+runner (`cts_runner`) of the suite: it asks for multisampled configurations.

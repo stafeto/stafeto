@@ -1,4 +1,4 @@
-# provisional: made in an arm64 Linux container on a Mac not on a runner
+# provisional: made in an arm64 Linux container off the runners
 # dEQP baseline of the set egl.surface (cargo xtask deqp-reference egl.surface)
 # module deqp-egl, platform x11_egl, patterns dEQP-EGL.functional.create_surface.* dEQP-EGL.functional.query_surface.*
 # VK-GL-CTS opengl-es-cts-3.2.14.1 (067e8832315e79817ede1c4863804e440f5d1c80)

@@ -1,4 +1,4 @@
-# provisional: made in an arm64 Linux container on a Mac not on a runner
+# provisional: made in an arm64 Linux container off the runners
 # dEQP baseline of the set egl.info (cargo xtask deqp-reference egl.info)
 # module deqp-egl, platform nullws, patterns dEQP-EGL.info.*
 # VK-GL-CTS opengl-es-cts-3.2.14.1 (067e8832315e79817ede1c4863804e440f5d1c80)

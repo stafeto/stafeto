@@ -1,11 +1,11 @@
-# provisional: made in an arm64 Linux container on a Mac not on a runner
+# provisional: made in an arm64 Linux container off the runners
 # dEQP baseline of the set egl.context (cargo xtask deqp-reference egl.context)
-# module deqp-egl, platform nullws, patterns dEQP-EGL.functional.create_context.* dEQP-EGL.functional.create_context_ext.* dEQP-EGL.functional.query_context.*
+# module deqp-egl, platform nullws, patterns dEQP-EGL.functional.create_context.* dEQP-EGL.functional.create_context_ext.*
 # VK-GL-CTS opengl-es-cts-3.2.14.1 (067e8832315e79817ede1c4863804e440f5d1c80)
 # Mesa 26.3.1 softpipe, shared libraries, clang
 # machine Linux 6.12.76-linuxkit aarch64
 # arguments --deqp-log-images=disable --deqp-log-shader-sources=disable
-# 487 cases: 46 pass, 0 fail, 441 not supported, 0 other, in 3 s
+# 422 cases: 29 pass, 0 fail, 393 not supported, 0 other, in 2 s
 dEQP-EGL.functional.create_context.no_config Pass
 dEQP-EGL.functional.create_context.other Pass
 dEQP-EGL.functional.create_context.rgb565_depth_no_stencil Pass
@@ -428,68 +428,3 @@ dEQP-EGL.functional.create_context_ext.robust_gles_3_ext.rgba8888_depth_no_stenc
 dEQP-EGL.functional.create_context_ext.robust_gles_3_ext.rgba8888_depth_stencil NotSupported
 dEQP-EGL.functional.create_context_ext.robust_gles_3_ext.rgba8888_no_depth_no_stencil NotSupported
 dEQP-EGL.functional.create_context_ext.robust_gles_3_ext.rgba8888_no_depth_stencil NotSupported
-dEQP-EGL.functional.query_context.get_current_context.other Pass
-dEQP-EGL.functional.query_context.get_current_context.rgb565_pbuffer Pass
-dEQP-EGL.functional.query_context.get_current_context.rgb565_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_context.rgb565_window NotSupported
-dEQP-EGL.functional.query_context.get_current_context.rgb888_pbuffer Pass
-dEQP-EGL.functional.query_context.get_current_context.rgb888_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_context.rgb888_window NotSupported
-dEQP-EGL.functional.query_context.get_current_context.rgba4444_pbuffer NotSupported
-dEQP-EGL.functional.query_context.get_current_context.rgba4444_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_context.rgba4444_window NotSupported
-dEQP-EGL.functional.query_context.get_current_context.rgba5551_pbuffer NotSupported
-dEQP-EGL.functional.query_context.get_current_context.rgba5551_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_context.rgba5551_window NotSupported
-dEQP-EGL.functional.query_context.get_current_context.rgba8888_pbuffer Pass
-dEQP-EGL.functional.query_context.get_current_context.rgba8888_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_context.rgba8888_window NotSupported
-dEQP-EGL.functional.query_context.get_current_display.other Pass
-dEQP-EGL.functional.query_context.get_current_display.rgb565_pbuffer Pass
-dEQP-EGL.functional.query_context.get_current_display.rgb565_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_display.rgb565_window NotSupported
-dEQP-EGL.functional.query_context.get_current_display.rgb888_pbuffer Pass
-dEQP-EGL.functional.query_context.get_current_display.rgb888_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_display.rgb888_window NotSupported
-dEQP-EGL.functional.query_context.get_current_display.rgba4444_pbuffer NotSupported
-dEQP-EGL.functional.query_context.get_current_display.rgba4444_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_display.rgba4444_window NotSupported
-dEQP-EGL.functional.query_context.get_current_display.rgba5551_pbuffer NotSupported
-dEQP-EGL.functional.query_context.get_current_display.rgba5551_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_display.rgba5551_window NotSupported
-dEQP-EGL.functional.query_context.get_current_display.rgba8888_pbuffer Pass
-dEQP-EGL.functional.query_context.get_current_display.rgba8888_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_display.rgba8888_window NotSupported
-dEQP-EGL.functional.query_context.get_current_surface.other Pass
-dEQP-EGL.functional.query_context.get_current_surface.rgb565_pbuffer Pass
-dEQP-EGL.functional.query_context.get_current_surface.rgb565_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_surface.rgb565_window NotSupported
-dEQP-EGL.functional.query_context.get_current_surface.rgb888_pbuffer Pass
-dEQP-EGL.functional.query_context.get_current_surface.rgb888_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_surface.rgb888_window NotSupported
-dEQP-EGL.functional.query_context.get_current_surface.rgba4444_pbuffer NotSupported
-dEQP-EGL.functional.query_context.get_current_surface.rgba4444_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_surface.rgba4444_window NotSupported
-dEQP-EGL.functional.query_context.get_current_surface.rgba5551_pbuffer NotSupported
-dEQP-EGL.functional.query_context.get_current_surface.rgba5551_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_surface.rgba5551_window NotSupported
-dEQP-EGL.functional.query_context.get_current_surface.rgba8888_pbuffer Pass
-dEQP-EGL.functional.query_context.get_current_surface.rgba8888_pixmap NotSupported
-dEQP-EGL.functional.query_context.get_current_surface.rgba8888_window NotSupported
-dEQP-EGL.functional.query_context.query_context.other Pass
-dEQP-EGL.functional.query_context.query_context.rgb565_pbuffer Pass
-dEQP-EGL.functional.query_context.query_context.rgb565_pixmap NotSupported
-dEQP-EGL.functional.query_context.query_context.rgb565_window NotSupported
-dEQP-EGL.functional.query_context.query_context.rgb888_pbuffer Pass
-dEQP-EGL.functional.query_context.query_context.rgb888_pixmap NotSupported
-dEQP-EGL.functional.query_context.query_context.rgb888_window NotSupported
-dEQP-EGL.functional.query_context.query_context.rgba4444_pbuffer NotSupported
-dEQP-EGL.functional.query_context.query_context.rgba4444_pixmap NotSupported
-dEQP-EGL.functional.query_context.query_context.rgba4444_window NotSupported
-dEQP-EGL.functional.query_context.query_context.rgba5551_pbuffer NotSupported
-dEQP-EGL.functional.query_context.query_context.rgba5551_pixmap NotSupported
-dEQP-EGL.functional.query_context.query_context.rgba5551_window NotSupported
-dEQP-EGL.functional.query_context.query_context.rgba8888_pbuffer Pass
-dEQP-EGL.functional.query_context.query_context.rgba8888_pixmap NotSupported
-dEQP-EGL.functional.query_context.query_context.rgba8888_window NotSupported
-dEQP-EGL.functional.query_context.simple.query_api Pass

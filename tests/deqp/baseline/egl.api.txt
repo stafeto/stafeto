@@ -1,11 +1,11 @@
-# provisional: made in an arm64 Linux container on a Mac not on a runner
+# provisional: made in an arm64 Linux container off the runners
 # dEQP baseline of the set egl.api (cargo xtask deqp-reference egl.api)
-# module deqp-egl, platform nullws, patterns dEQP-EGL.functional.negative_api.* dEQP-EGL.functional.surfaceless_context.* dEQP-EGL.functional.client_extensions.* dEQP-EGL.functional.get_proc_address.*
+# module deqp-egl, platform nullws, patterns dEQP-EGL.functional.surfaceless_context.* dEQP-EGL.functional.client_extensions.* dEQP-EGL.functional.get_proc_address.*
 # VK-GL-CTS opengl-es-cts-3.2.14.1 (067e8832315e79817ede1c4863804e440f5d1c80)
 # Mesa 26.3.1 softpipe, shared libraries, clang
 # machine Linux 6.12.76-linuxkit aarch64
 # arguments --deqp-log-images=disable --deqp-log-shader-sources=disable
-# 259 cases: 247 pass, 1 fail, 11 not supported, 0 other, in 1 s
+# 233 cases: 222 pass, 0 fail, 11 not supported, 0 other, in 1 s
 dEQP-EGL.functional.client_extensions.base Pass
 dEQP-EGL.functional.client_extensions.disjoint Pass
 dEQP-EGL.functional.client_extensions.extensions Pass
@@ -218,32 +218,6 @@ dEQP-EGL.functional.get_proc_address.extension.gl_qcom_shader_framebuffer_fetch_
 dEQP-EGL.functional.get_proc_address.extension.gl_qcom_shading_rate Pass
 dEQP-EGL.functional.get_proc_address.extension.gl_qcom_texture_foveated Pass
 dEQP-EGL.functional.get_proc_address.extension.gl_qcom_tiled_rendering Pass
-dEQP-EGL.functional.negative_api.bind_api Pass
-dEQP-EGL.functional.negative_api.bind_tex_image Pass
-dEQP-EGL.functional.negative_api.choose_config Pass
-dEQP-EGL.functional.negative_api.copy_buffers Pass
-dEQP-EGL.functional.negative_api.create_context Pass
-dEQP-EGL.functional.negative_api.create_pbuffer_from_client_buffer Pass
-dEQP-EGL.functional.negative_api.create_pbuffer_surface Pass
-dEQP-EGL.functional.negative_api.create_pixmap_surface Fail
-dEQP-EGL.functional.negative_api.create_window_surface Pass
-dEQP-EGL.functional.negative_api.destroy_context Pass
-dEQP-EGL.functional.negative_api.destroy_surface Pass
-dEQP-EGL.functional.negative_api.get_config_attrib Pass
-dEQP-EGL.functional.negative_api.get_configs Pass
-dEQP-EGL.functional.negative_api.get_current_context Pass
-dEQP-EGL.functional.negative_api.get_current_surface Pass
-dEQP-EGL.functional.negative_api.initialize Pass
-dEQP-EGL.functional.negative_api.make_current Pass
-dEQP-EGL.functional.negative_api.query_context Pass
-dEQP-EGL.functional.negative_api.query_string Pass
-dEQP-EGL.functional.negative_api.query_surface Pass
-dEQP-EGL.functional.negative_api.release_tex_image Pass
-dEQP-EGL.functional.negative_api.surface_attrib Pass
-dEQP-EGL.functional.negative_api.swap_buffers Pass
-dEQP-EGL.functional.negative_api.swap_interval Pass
-dEQP-EGL.functional.negative_api.terminate Pass
-dEQP-EGL.functional.negative_api.wait_native Pass
 dEQP-EGL.functional.surfaceless_context.other Pass
 dEQP-EGL.functional.surfaceless_context.rgb565_depth_no_stencil Pass
 dEQP-EGL.functional.surfaceless_context.rgb565_depth_stencil Pass

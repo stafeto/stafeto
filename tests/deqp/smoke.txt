@@ -1,5 +1,6 @@
 # The cases of deqp-smoke (cargo xtask deqp smoke, the ci job of that name):
-# one passing case of each group of the baselines of Linux, made by
+# one passing case of each group of the baselines of Linux (and one of each set
+# of windows that has no groups here), made by
 # `cargo xtask deqp smoke-select` (the deepest cut of the names that gives at
 # most 250 groups). Every case here passes on Linux (a host test checks it) and
 # must pass on stafeto or have a line in departures.txt. Made again, with the
@@ -23,15 +24,17 @@ dEQP-EGL.functional.create_context.rgba8888_depth_stencil
 dEQP-EGL.functional.create_context.rgba8888_no_depth_no_stencil
 dEQP-EGL.functional.create_context_ext.gles_20.rgb565_depth_no_stencil
 dEQP-EGL.functional.create_context_ext.gles_30.rgb565_depth_no_stencil
+dEQP-EGL.functional.create_surface.pbuffer.rgb888_depth_no_stencil
 dEQP-EGL.functional.get_proc_address.core.egl
 dEQP-EGL.functional.get_proc_address.extension.egl_android_blob_cache
 dEQP-EGL.functional.negative_api.bind_api
 dEQP-EGL.functional.negative_api.bind_tex_image
 dEQP-EGL.functional.negative_api.choose_config
-dEQP-EGL.functional.negative_api.copy_buffers
 dEQP-EGL.functional.negative_api.create_context
 dEQP-EGL.functional.negative_api.create_pbuffer_from_client_buffer
 dEQP-EGL.functional.negative_api.create_pbuffer_surface
+dEQP-EGL.functional.negative_api.create_pixmap_surface
+dEQP-EGL.functional.negative_api.create_window_surface
 dEQP-EGL.functional.negative_api.destroy_context
 dEQP-EGL.functional.negative_api.destroy_surface
 dEQP-EGL.functional.negative_api.get_config_attrib
@@ -48,14 +51,17 @@ dEQP-EGL.functional.negative_api.surface_attrib
 dEQP-EGL.functional.negative_api.swap_buffers
 dEQP-EGL.functional.negative_api.swap_interval
 dEQP-EGL.functional.negative_api.terminate
+dEQP-EGL.functional.negative_api.wait_native
 dEQP-EGL.functional.query_config.constraints.color_buffer_size
 dEQP-EGL.functional.query_config.get_config_attrib.alpha_mask_size
 dEQP-EGL.functional.query_config.get_configs.get_configs_bounds
-dEQP-EGL.functional.query_context.get_current_context.other
-dEQP-EGL.functional.query_context.get_current_display.other
-dEQP-EGL.functional.query_context.get_current_surface.other
-dEQP-EGL.functional.query_context.query_context.other
+dEQP-EGL.functional.query_context.get_current_context.rgb888_pbuffer
+dEQP-EGL.functional.query_context.get_current_display.rgb888_pbuffer
+dEQP-EGL.functional.query_context.get_current_surface.rgb888_pbuffer
+dEQP-EGL.functional.query_context.query_context.rgb888_pbuffer
 dEQP-EGL.functional.query_context.simple.query_api
+dEQP-EGL.functional.reusable_sync.invalid.create_invalid_attribs
+dEQP-EGL.functional.reusable_sync.valid.create_empty_attribs
 dEQP-EGL.functional.surfaceless_context.other
 dEQP-EGL.functional.surfaceless_context.rgb565_depth_no_stencil
 dEQP-EGL.functional.surfaceless_context.rgb565_depth_stencil

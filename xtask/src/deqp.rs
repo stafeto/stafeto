@@ -16,14 +16,14 @@ mod baseline;
 mod reference;
 
 pub use baseline::{
-    Baseline, Departure, Module, SETS, SMOKE_EXCLUDED, Set, compare, load_baseline,
-    parse_departures, parse_smoke, passes, select_smoke, sets_of,
+    Baseline, Departure, Module, SETS, Set, Smoke, compare, load_baseline, parse_departures,
+    parse_smoke, passes, sampled, select_smoke, sets_of,
 };
 pub use reference::reference;
 
 use crate::{
     BOOT_PROFILE, INIT_STACK_SIZE, ImageProgram, PIPE_STACK_SIZE, RAMFS_STACK_SIZE, Variant, build,
-    qemu, rootfs, run_until, write_boot_image_files,
+    gpu_probe, qemu, rootfs, run_until, write_boot_image_files,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -77,7 +77,7 @@ static CASES: Mutex<String> = Mutex::new(String::new());
 
 /// The image of the probe: the services of the POSIX process probe and the
 /// program of a module of the suite, which the image calls `deqp`.
-pub const fn programs(module: Module) -> [ImageProgram; 9] {
+pub const fn programs(module: Module) -> [ImageProgram; 11] {
     [
         ("init", "init", INIT_STACK_SIZE, &["table-deqp"]),
         ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -89,6 +89,13 @@ pub const fn programs(module: Module) -> [ImageProgram; 9] {
             &[],
         ),
         ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+        ("virtio-gpu", "virtio-gpu", gpu_probe::GPU_STACK_SIZE, &[]),
+        (
+            "compositor",
+            "compositor",
+            crate::comp_probe::COMP_STACK_SIZE,
+            &[],
+        ),
         ("deqp", module.package(), DEQP_STACK_SIZE, &[]),
         ("loader", "loader", 0, &[]),
         (
@@ -108,14 +115,14 @@ pub const fn programs(module: Module) -> [ImageProgram; 9] {
 
 /// The image of dEQP-EGL (the lists the checks of the images walk).
 #[cfg(test)]
-pub const PROGRAMS: [ImageProgram; 9] = programs(Module::Egl);
+pub const PROGRAMS: [ImageProgram; 11] = programs(Module::Egl);
 /// The images of the other modules.
 #[cfg(test)]
-pub const PROGRAMS_GLES2: [ImageProgram; 9] = programs(Module::Gles2);
+pub const PROGRAMS_GLES2: [ImageProgram; 11] = programs(Module::Gles2);
 #[cfg(test)]
-pub const PROGRAMS_GLES3: [ImageProgram; 9] = programs(Module::Gles3);
+pub const PROGRAMS_GLES3: [ImageProgram; 11] = programs(Module::Gles3);
 #[cfg(test)]
-pub const PROGRAMS_GLES31: [ImageProgram; 9] = programs(Module::Gles31);
+pub const PROGRAMS_GLES31: [ImageProgram; 11] = programs(Module::Gles31);
 
 /// The result of one case: its path and the status code of the log.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -225,9 +232,10 @@ pub fn settle(batch: &[String], parsed: &Parsed) -> Result<Settled, String> {
         .collect();
     if results.is_empty() {
         return Err(format!(
-            "the program settled none of the {} cases of the batch (it died before the first: {:?})",
+            "the program settled none of the {} cases of the batch: it died in or before {:?} (the first of the batch; the next are {:?})",
             batch.len(),
-            batch.first()
+            batch.first(),
+            batch.iter().skip(1).take(2).collect::<Vec<_>>()
         ));
     }
     Ok(Settled { results, requeue })
@@ -384,6 +392,7 @@ fn start(
     )?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
+    cmd.args(qemu::GPU);
     let outcome = run_until(cmd, TIMEOUT, Some(ENDED), &kernel.elf)?;
     Ok(outcome.lines)
 }
@@ -479,6 +488,9 @@ fn report(label: &str, c: &baseline::Comparison, provisional: bool) -> Result<()
     for (case, step) in &c.departed {
         println!("deqp: departure {case} (returned by {step})");
     }
+    for (pattern, n) in &c.covered {
+        println!("deqp: departure line {pattern} covered {n} cases");
+    }
     for line in &c.regressions {
         println!("deqp: REGRESSION {line}");
     }
@@ -529,7 +541,14 @@ pub fn probe(machine: &qemu::Machine, words: &[String]) -> Result<(), String> {
     let mut failed = Vec::new();
     for word in &words {
         let outcome = match word.as_str() {
-            "smoke" => smoke(machine),
+            "smoke" => smoke(machine, &Module::ALL),
+            // `smoke:gles2`: the cases of one module of the list.
+            word if word.starts_with("smoke:") => {
+                match Module::ALL.iter().find(|m| m.name() == &word[6..]) {
+                    Some(module) => smoke(machine, &[*module]),
+                    None => Err(format!("no module in {word:?}")),
+                }
+            }
             "smoke-select" => smoke_select(),
             _ => sets_of(word).and_then(|sets| {
                 let mut worst = Ok(());
@@ -555,11 +574,13 @@ pub fn probe(machine: &qemu::Machine, words: &[String]) -> Result<(), String> {
 /// One set in the guest.
 fn run_set(machine: &qemu::Machine, set: &Set) -> Result<(), String> {
     let baseline = load_baseline(&baseline_dir(), set)?;
-    let cases = list_cases(machine, set, baseline.as_ref())?;
+    let listed = list_cases(machine, set, baseline.as_ref())?;
+    let cases = sampled(set, &listed);
     println!(
-        "deqp: set {}: {} cases in {}",
+        "deqp: set {}: {} cases of {} in {}",
         set.name,
         cases.len(),
+        listed.len(),
         set.patterns.join(", ")
     );
     let started = std::time::Instant::now();
@@ -587,7 +608,13 @@ fn run_set(machine: &qemu::Machine, set: &Set) -> Result<(), String> {
     match baseline {
         Some(b) => report(
             &format!("set {}", set.name),
-            &compare(&b.cases, &cases, &results, &load_departures()?),
+            &compare(
+                &b.cases,
+                &cases,
+                &results,
+                &load_departures()?,
+                set.sample.is_empty(),
+            ),
             b.provisional,
         ),
         None => {
@@ -626,14 +653,17 @@ fn smoke_cases() -> Result<Vec<String>, String> {
 
 /// `deqp-smoke`: the cases of the smoke list, every one that passes on Linux
 /// must pass here.
-pub fn smoke(machine: &qemu::Machine) -> Result<(), String> {
-    let cases = smoke_cases()?;
+pub fn smoke(machine: &qemu::Machine, modules: &[Module]) -> Result<(), String> {
+    let cases: Vec<String> = smoke_cases()?
+        .into_iter()
+        .filter(|c| Module::of_case(c).is_some_and(|m| modules.contains(&m)))
+        .collect();
     if cases.is_empty() {
         return Err("tests/deqp/smoke.txt lists no case".to_owned());
     }
     let (linux, provisional) = all_baselines()?;
     let mut results = Vec::new();
-    for module in Module::ALL {
+    for &module in modules {
         let mine: Vec<String> = cases
             .iter()
             .filter(|c| Module::of_case(c) == Some(module))
@@ -658,7 +688,7 @@ pub fn smoke(machine: &qemu::Machine) -> Result<(), String> {
     print_tally("deqp-smoke", machine, &results);
     report(
         "smoke",
-        &compare(&linux, &cases, &results, &load_departures()?),
+        &compare(&linux, &cases, &results, &load_departures()?, false),
         provisional,
     )
 }
@@ -666,22 +696,30 @@ pub fn smoke(machine: &qemu::Machine) -> Result<(), String> {
 /// `cargo xtask deqp smoke-select`: the cases the smoke list would hold, from
 /// the passing cases of the baselines of the sets that give cases to it.
 fn smoke_select() -> Result<(), String> {
+    let departures = load_departures()?;
+    let departed = |case: &str| departures.iter().any(|d| baseline::glob(&d.pattern, case));
     let mut passing = BTreeSet::new();
-    for set in SETS.iter().filter(|s| s.smoke) {
-        if let Some(b) = load_baseline(&baseline_dir(), set)? {
-            passing.extend(
-                b.cases
-                    .into_iter()
-                    .filter(|(case, status)| {
-                        passes(status) && !SMOKE_EXCLUDED.contains(&case.as_str())
-                    })
-                    .map(|(case, _)| case),
-            );
+    let mut ones = Vec::new();
+    for set in SETS.iter().filter(|s| s.smoke != Smoke::Skip) {
+        let Some(b) = load_baseline(&baseline_dir(), set)? else {
+            continue;
+        };
+        let mut mine = b
+            .cases
+            .into_iter()
+            .filter(|(case, status)| passes(status) && !departed(case))
+            .map(|(case, _)| case);
+        match set.smoke {
+            Smoke::Groups => passing.extend(mine),
+            Smoke::One => ones.extend(mine.next()),
+            Smoke::Skip => {}
         }
     }
-    let picked = select_smoke(&passing, SMOKE_MOST);
+    let mut picked = select_smoke(&passing, SMOKE_MOST - ones.len());
+    picked.extend(ones);
+    picked.sort();
     println!(
-        "# {} cases, one of each group of the passing cases of the baselines",
+        "# {} cases, one of each group of the passing cases of the baselines and one of each set of windows",
         picked.len()
     );
     for case in picked {
@@ -916,33 +954,47 @@ init: deqp-egl ended: signal 11, not restarted
         assert!(text.lines().all(|l| l.starts_with("--deqp-")));
     }
 
+    /// Whether the baselines may be provisional (made off the runners). It
+    /// turns false when the files of the runners land, and a baseline that says
+    /// `provisional:` fails the test from then on.
+    const ALLOW_PROVISIONAL: bool = true;
+
     /// The files of tests/deqp: the baselines of Linux, the smoke list and the
     /// departures agree with each other and with the sets of the runner.
     #[test]
     fn the_files_of_the_comparison_agree() {
         let mut linux = BTreeMap::new();
+        let mut of_set: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
         for set in SETS {
-            if let Some(b) = load_baseline(&baseline_dir(), set).unwrap() {
-                for case in b.cases.keys() {
-                    assert!(
-                        set.patterns.iter().any(|p| {
-                            let prefix = p.strip_suffix('*').unwrap_or(p);
-                            case.starts_with(prefix)
-                        }),
-                        "{case} is not in the patterns of {}",
-                        set.name
-                    );
-                }
-                linux.extend(b.cases);
+            let Some(b) = load_baseline(&baseline_dir(), set).unwrap() else {
+                continue;
+            };
+            assert!(
+                ALLOW_PROVISIONAL || !b.provisional,
+                "the baseline of {} says it is provisional",
+                set.name
+            );
+            for case in b.cases.keys() {
+                assert!(
+                    // The patterns of --deqp-case: a star crosses dots there.
+                    set.patterns
+                        .iter()
+                        .any(|p| baseline::glob(&p.replace('*', "**"), case)),
+                    "{case} is not in the patterns of {}",
+                    set.name
+                );
             }
+            of_set.insert(set.name, b.cases.keys().cloned().collect());
+            linux.extend(b.cases);
         }
+        let departures = load_departures().unwrap();
+        let departed = |case: &str| departures.iter().any(|d| baseline::glob(&d.pattern, case));
         let smoke = smoke_cases().unwrap();
         assert!(
             (150..=250).contains(&smoke.len()),
             "{} smoke cases",
             smoke.len()
         );
-        assert!(smoke.iter().all(|c| !SMOKE_EXCLUDED.contains(&c.as_str())));
         let unique: BTreeSet<&String> = smoke.iter().collect();
         assert_eq!(unique.len(), smoke.len(), "a case twice in smoke.txt");
         for case in &smoke {
@@ -950,24 +1002,29 @@ init: deqp-egl ended: signal 11, not restarted
                 .get(case)
                 .unwrap_or_else(|| panic!("{case}: no baseline"));
             assert!(passes(status), "{case} is {status} on Linux");
+            assert!(!departed(case), "{case} is in smoke.txt and departs");
         }
-        for d in load_departures().unwrap() {
-            if d.pattern.contains('*') {
+        for set in SETS.iter().filter(|s| s.smoke != Smoke::Skip) {
+            if let Some(cases) = of_set.get(set.name) {
+                // A set whose every passing case departs has nothing to give.
+                let has_one = cases.iter().any(|c| passes(&linux[c]) && !departed(c));
                 assert!(
-                    linux.keys().any(|c| baseline::glob(&d.pattern, c)),
-                    "{} matches no case of the baselines",
-                    d.pattern
-                );
-            } else {
-                let status = linux
-                    .get(&d.pattern)
-                    .unwrap_or_else(|| panic!("{}: no baseline", d.pattern));
-                assert!(
-                    passes(status),
-                    "{} is {status} on Linux: no departure",
-                    d.pattern
+                    !has_one || smoke.iter().any(|c| cases.contains(c)),
+                    "no case of {} in smoke.txt",
+                    set.name
                 );
             }
+        }
+        // Every line names cases that pass on Linux (or, for a breakdown, fail).
+        for d in &departures {
+            let breakdown = matches!(d.status.as_str(), "Crash" | "Timeout" | "InternalError");
+            let mut hit = false;
+            for (case, status) in &linux {
+                if baseline::glob(&d.pattern, case) && (passes(status) || breakdown) {
+                    hit = true;
+                }
+            }
+            assert!(hit, "{} matches no case that passes on Linux", d.pattern);
         }
     }
 }

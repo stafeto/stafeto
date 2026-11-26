@@ -107,6 +107,18 @@ impl Target {
     }
 }
 
+/// What a set gives to `deqp-smoke`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Smoke {
+    /// Nothing.
+    Skip,
+    /// The first passing case of the set (a set of windows: its run in ci
+    /// would be long, and one case shows the compositor works).
+    One,
+    /// One passing case of each group of the names.
+    Groups,
+}
+
 /// A set of cases: the unit of a run on Linux (a probe of 60 minutes), of a
 /// baseline file and of a run in the guest.
 pub struct Set {
@@ -116,9 +128,12 @@ pub struct Set {
     pub target: Target,
     /// The patterns of `--deqp-case`.
     pub patterns: &'static [&'static str],
-    /// Whether the set gives cases to `deqp-smoke` (a set whose cases need a
-    /// window of the composition service cannot run in the probe image).
-    pub smoke: bool,
+    /// What the set gives to `deqp-smoke`.
+    pub smoke: Smoke,
+    /// Patterns (globs, `**` crosses dots) of groups that the run in the guest
+    /// thins to one case in four, in the order of names. The baseline holds
+    /// every case, and the comparison takes the cases that ran.
+    pub sample: &'static [&'static str],
 }
 
 const fn set(
@@ -126,7 +141,7 @@ const fn set(
     module: Module,
     target: Target,
     patterns: &'static [&'static str],
-    smoke: bool,
+    smoke: Smoke,
 ) -> Set {
     Set {
         name,
@@ -134,6 +149,7 @@ const fn set(
         target,
         patterns,
         smoke,
+        sample: &[],
     }
 }
 
@@ -145,7 +161,7 @@ pub const SETS: &[Set] = &[
         Module::Egl,
         Target::Nullws,
         &["dEQP-EGL.info.*"],
-        true,
+        Smoke::Groups,
     ),
     set(
         "egl.context",
@@ -154,9 +170,17 @@ pub const SETS: &[Set] = &[
         &[
             "dEQP-EGL.functional.create_context.*",
             "dEQP-EGL.functional.create_context_ext.*",
-            "dEQP-EGL.functional.query_context.*",
         ],
-        true,
+        Smoke::Groups,
+    ),
+    // The queries of a context take a window or a pbuffer and a current
+    // context, so they have the baseline with windows.
+    set(
+        "egl.query",
+        Module::Egl,
+        Target::X11Egl,
+        &["dEQP-EGL.functional.query_context.*"],
+        Smoke::Groups,
     ),
     set(
         "egl.config",
@@ -166,7 +190,7 @@ pub const SETS: &[Set] = &[
             "dEQP-EGL.functional.query_config.*",
             "dEQP-EGL.functional.choose_config.*",
         ],
-        true,
+        Smoke::Groups,
     ),
     set(
         "egl.sync",
@@ -177,19 +201,27 @@ pub const SETS: &[Set] = &[
             "dEQP-EGL.functional.reusable_sync.*",
             "dEQP-EGL.functional.wait_sync.*",
         ],
-        false,
+        Smoke::Groups,
     ),
     set(
         "egl.api",
         Module::Egl,
         Target::Nullws,
         &[
-            "dEQP-EGL.functional.negative_api.*",
             "dEQP-EGL.functional.surfaceless_context.*",
             "dEQP-EGL.functional.client_extensions.*",
             "dEQP-EGL.functional.get_proc_address.*",
         ],
-        true,
+        Smoke::Groups,
+    ),
+    // The negative API takes windows (create_window_surface, wait_native), so
+    // its baseline is the one with windows.
+    set(
+        "egl.negative",
+        Module::Egl,
+        Target::X11Egl,
+        &["dEQP-EGL.functional.negative_api.*"],
+        Smoke::Groups,
     ),
     set(
         "egl.surface",
@@ -199,7 +231,7 @@ pub const SETS: &[Set] = &[
             "dEQP-EGL.functional.create_surface.*",
             "dEQP-EGL.functional.query_surface.*",
         ],
-        false,
+        Smoke::One,
     ),
     set(
         "egl.swap",
@@ -212,7 +244,7 @@ pub const SETS: &[Set] = &[
             "dEQP-EGL.functional.preserve_swap.*",
             "dEQP-EGL.functional.make_current.*",
         ],
-        false,
+        Smoke::One,
     ),
     set(
         "gles2.basic",
@@ -224,14 +256,14 @@ pub const SETS: &[Set] = &[
             "dEQP-GLES2.functional.color_clear.*",
             "dEQP-GLES2.functional.depth_stencil_clear.*",
         ],
-        true,
+        Smoke::Groups,
     ),
     set(
         "gles2.buffer",
         Module::Gles2,
         Target::Surfaceless,
         &["dEQP-GLES2.functional.buffer.*"],
-        true,
+        Smoke::Groups,
     ),
     set(
         "gles2.texture",
@@ -241,37 +273,51 @@ pub const SETS: &[Set] = &[
             "dEQP-GLES2.functional.texture.format.*",
             "dEQP-GLES2.functional.texture.size.*",
         ],
-        true,
+        Smoke::Groups,
     ),
-    set(
-        "gles2.shaders1",
-        Module::Gles2,
-        Target::Surfaceless,
-        &[
-            "dEQP-GLES2.functional.shaders.operator.*",
-            "dEQP-GLES2.functional.shaders.constants.*",
-            "dEQP-GLES2.functional.shaders.conversions.*",
+    Set {
+        sample: &["dEQP-GLES2.functional.shaders.conversions.**"],
+        ..set(
+            "gles2.shaders1",
+            Module::Gles2,
+            Target::Surfaceless,
+            &[
+                "dEQP-GLES2.functional.shaders.operator.*",
+                "dEQP-GLES2.functional.shaders.constants.*",
+                "dEQP-GLES2.functional.shaders.conversions.*",
+            ],
+            Smoke::Groups,
+        )
+    },
+    Set {
+        sample: &["dEQP-GLES2.functional.shaders.swizzles.**"],
+        ..set(
+            "gles2.shaders2",
+            Module::Gles2,
+            Target::Surfaceless,
+            &[
+                "dEQP-GLES2.functional.shaders.functions.*",
+                "dEQP-GLES2.functional.shaders.swizzles.*",
+                "dEQP-GLES2.functional.shaders.struct.*",
+            ],
+            Smoke::Groups,
+        )
+    },
+    Set {
+        sample: &[
+            "dEQP-GLES2.functional.fragment_ops.blend.**",
+            "dEQP-GLES2.functional.fragment_ops.depth_stencil.**",
+            "dEQP-GLES2.functional.fragment_ops.random.**",
+            "dEQP-GLES2.functional.fragment_ops.interaction.**",
         ],
-        true,
-    ),
-    set(
-        "gles2.shaders2",
-        Module::Gles2,
-        Target::Surfaceless,
-        &[
-            "dEQP-GLES2.functional.shaders.functions.*",
-            "dEQP-GLES2.functional.shaders.swizzles.*",
-            "dEQP-GLES2.functional.shaders.struct.*",
-        ],
-        true,
-    ),
-    set(
-        "gles2.fragops",
-        Module::Gles2,
-        Target::Surfaceless,
-        &["dEQP-GLES2.functional.fragment_ops.*"],
-        true,
-    ),
+        ..set(
+            "gles2.fragops",
+            Module::Gles2,
+            Target::Surfaceless,
+            &["dEQP-GLES2.functional.fragment_ops.*"],
+            Smoke::Groups,
+        )
+    },
     set(
         "gles2.raster",
         Module::Gles2,
@@ -280,7 +326,7 @@ pub const SETS: &[Set] = &[
             "dEQP-GLES2.functional.rasterization.*",
             "dEQP-GLES2.functional.vertex_arrays.*",
         ],
-        true,
+        Smoke::Groups,
     ),
     set(
         "gles3.basic",
@@ -290,21 +336,21 @@ pub const SETS: &[Set] = &[
             "dEQP-GLES3.functional.prerequisite.*",
             "dEQP-GLES3.functional.implementation_limits.*",
         ],
-        true,
+        Smoke::Groups,
     ),
     set(
         "gles3.shaders",
         Module::Gles3,
         Target::Surfaceless,
         &["dEQP-GLES3.functional.shaders.operator.*"],
-        true,
+        Smoke::Groups,
     ),
     set(
         "gles3.texture",
         Module::Gles3,
         Target::Surfaceless,
         &["dEQP-GLES3.functional.texture.format.*"],
-        true,
+        Smoke::Groups,
     ),
     set(
         "gles3.buffers",
@@ -314,16 +360,38 @@ pub const SETS: &[Set] = &[
             "dEQP-GLES3.functional.transform_feedback.basic_types.*",
             "dEQP-GLES3.functional.ubo.single_basic_type.*",
         ],
-        true,
+        Smoke::Groups,
     ),
     set(
         "gles31.compute",
         Module::Gles31,
         Target::Surfaceless,
         &["dEQP-GLES31.functional.compute.basic.*"],
-        false,
+        Smoke::Skip,
     ),
 ];
+
+/// The cases of a set that the guest runs: every case, except that the groups
+/// of `sample` give one case in four in the order of names (the first, the
+/// fifth, ...).
+pub fn sampled(set: &Set, cases: &[String]) -> Vec<String> {
+    let mut sorted: Vec<&String> = cases.iter().collect();
+    sorted.sort();
+    let mut counts = vec![0usize; set.sample.len()];
+    let mut kept = Vec::new();
+    for case in sorted {
+        match set.sample.iter().position(|p| glob(p, case)) {
+            Some(group) => {
+                if counts[group].is_multiple_of(4) {
+                    kept.push(case.clone());
+                }
+                counts[group] += 1;
+            }
+            None => kept.push(case.clone()),
+        }
+    }
+    kept
+}
 
 pub fn find_set(name: &str) -> Option<&'static Set> {
     SETS.iter().find(|s| s.name == name)
@@ -422,31 +490,70 @@ pub fn load_baseline(dir: &Path, set: &Set) -> Result<Option<Baseline>, String> 
     }
 }
 
-/// Whether `text` matches `pattern`, where `*` stands for any run of
-/// characters (none included).
+/// Whether `text` matches `pattern`: `*` stands for any run of characters but
+/// a dot (so it stays in one group of the names), `**` for any run at all.
 pub fn glob(pattern: &str, text: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    let (first, rest) = (parts[0], &parts[1..]);
-    let Some(mut tail) = text.strip_prefix(first) else {
-        return false;
-    };
-    let Some((last, middle)) = rest.split_last() else {
-        return tail.is_empty();
-    };
-    for part in middle {
-        match tail.find(part) {
-            Some(at) => tail = &tail[at + part.len()..],
-            None => return false,
+    fn go(p: &[u8], t: &[u8]) -> bool {
+        match p.split_first() {
+            None => t.is_empty(),
+            Some((b'*', rest)) => {
+                let (deep, rest) = match rest.split_first() {
+                    Some((b'*', more)) => (true, more),
+                    _ => (false, rest),
+                };
+                let mut at = 0;
+                loop {
+                    if go(rest, &t[at..]) {
+                        return true;
+                    }
+                    if at == t.len() || (!deep && t[at] == b'.') {
+                        return false;
+                    }
+                    at += 1;
+                }
+            }
+            Some((c, rest)) => t.first() == Some(c) && go(rest, &t[1..]),
         }
     }
-    tail.len() >= last.len() && tail.ends_with(last)
+    go(pattern.as_bytes(), text.as_bytes())
 }
 
-/// One line of the departures: a case (or a pattern with `*`) that passes
-/// on Linux and does not on stafeto, why, and the step that returns it.
+/// The kind of difference a departure stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// The layer of POSIX under Mesa.
+    Posix,
+    /// Mesa or its platform for stafeto.
+    Mesa,
+    /// The windows (the composition service, the window manager).
+    Window,
+    /// The configurations the platform offers.
+    Config,
+    /// The test platform or the runner.
+    Harness,
+}
+
+impl Class {
+    fn parse(word: &str) -> Option<Class> {
+        Some(match word {
+            "posix" => Class::Posix,
+            "mesa" => Class::Mesa,
+            "window" => Class::Window,
+            "config" => Class::Config,
+            "harness" => Class::Harness,
+            _ => return None,
+        })
+    }
+}
+
+/// One line of the departures: a case (or a pattern with `*`) on which stafeto
+/// differs from Linux, the status it ends with, the kind of the difference,
+/// why, and the step that returns it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Departure {
     pub pattern: String,
+    pub status: String,
+    pub class: Class,
     pub reason: String,
     pub step: String,
 }
@@ -462,9 +569,40 @@ impl Departure {
     }
 }
 
-/// The departures: lines `CASE | REASON | STEP` (the step names the plan step
-/// that returns the case, `none` for a difference the plan keeps, or `open` for
-/// one the review has to place); `#` lines and blank lines are comments.
+/// Whether a step names a step of the plan: `none` (the plan keeps the
+/// difference), `M` and a number (a step of the window manager) or `G` with a
+/// step of the graphics plan, as `G8.7`.
+pub fn step_is_valid(step: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if step == "none" {
+        return true;
+    }
+    if let Some(n) = step.strip_prefix('M') {
+        return digits(n);
+    }
+    step.strip_prefix('G')
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(a, b)| digits(a) && digits(b))
+}
+
+/// The statuses a log can hold (the status codes of dEQP).
+const STATUSES: &[&str] = &[
+    "Pass",
+    "Fail",
+    "QualityWarning",
+    "CompatibilityWarning",
+    "Pending",
+    "NotSupported",
+    "ResourceError",
+    "InternalError",
+    "Crash",
+    "Timeout",
+    "Waiver",
+];
+
+/// The departures: lines `CASE | STATUS | CLASS | REASON | STEP`; `#` lines
+/// and blank lines are comments. STATUS is the status stafeto ends with
+/// (usually `NotSupported`): another status on that case is a regression.
 pub fn parse_departures(text: &str) -> Result<Vec<Departure>, String> {
     let mut list: Vec<Departure> = Vec::new();
     for (n, line) in text.lines().enumerate() {
@@ -472,27 +610,44 @@ pub fn parse_departures(text: &str) -> Result<Vec<Departure>, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        let at = n + 1;
         let parts: Vec<&str> = line.split('|').map(str::trim).collect();
-        let [pattern, reason, step] = parts[..] else {
+        let [pattern, status, class, reason, step] = parts[..] else {
             return Err(format!(
-                "departures line {}: {line:?} is not `CASE | REASON | STEP`",
-                n + 1
+                "departures line {at}: {line:?} is not `CASE | STATUS | CLASS | REASON | STEP`"
             ));
         };
-        if pattern.is_empty() || reason.is_empty() || step.is_empty() {
-            return Err(format!("departures line {}: an empty field", n + 1));
+        if [pattern, status, class, reason, step]
+            .iter()
+            .any(|f| f.is_empty())
+        {
+            return Err(format!("departures line {at}: an empty field"));
         }
         if pattern.contains(char::is_whitespace) || !pattern.starts_with("dEQP-") {
             return Err(format!(
-                "departures line {}: {pattern:?} is not a case name or a pattern of names",
-                n + 1
+                "departures line {at}: {pattern:?} is not a case name or a pattern of names"
+            ));
+        }
+        if !STATUSES.contains(&status) || passes(status) {
+            return Err(format!(
+                "departures line {at}: {status:?} is not a status that departs from a pass"
+            ));
+        }
+        let class = Class::parse(class).ok_or_else(|| {
+            format!("departures line {at}: the class {class:?} is none of posix, mesa, window, config, harness")
+        })?;
+        if !step_is_valid(step) {
+            return Err(format!(
+                "departures line {at}: the step {step:?} is none, M<n> or G<n>.<m>"
             ));
         }
         if list.iter().any(|d| d.pattern == pattern) {
-            return Err(format!("departures line {}: {pattern} twice", n + 1));
+            return Err(format!("departures line {at}: {pattern} twice"));
         }
         list.push(Departure {
             pattern: pattern.to_owned(),
+            status: status.to_owned(),
+            class,
             reason: reason.to_owned(),
             step: step.to_owned(),
         });
@@ -503,17 +658,21 @@ pub fn parse_departures(text: &str) -> Result<Vec<Departure>, String> {
 /// What the comparison found.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Comparison {
-    /// Cases that pass on Linux, do not pass here and have no departure (or
-    /// have no result at all).
+    /// Cases that pass on Linux and do not pass here without a departure that
+    /// names their status (or have no result at all), and cases that fail on
+    /// Linux and crash here.
     pub regressions: Vec<String>,
-    /// Exact departures of cases that now pass: the step already returned
-    /// them, and the line must go.
+    /// Departures of cases that now pass, or (after a full run) lines that
+    /// cover no case though they match cases that pass on Linux: the step
+    /// returned them, and the line must go.
     pub stale: Vec<String>,
     /// Cases the departures cover: case, step.
     pub departed: Vec<(String, String)>,
+    /// How many cases each departure covered, in the order of the list.
+    pub covered: Vec<(String, usize)>,
     /// Cases that ran and the baseline does not know.
     pub unknown: Vec<String>,
-    /// Cases compared.
+    /// Cases compared (those that pass on Linux, or crash here).
     pub checked: usize,
 }
 
@@ -523,15 +682,25 @@ impl Comparison {
     }
 }
 
+/// Statuses that end a case with no verdict: where Linux has a plain failure
+/// they are still a difference.
+fn is_breakdown(status: &str) -> bool {
+    matches!(status, "Crash" | "Timeout" | "InternalError")
+}
+
 /// Compares the results of `expected` cases on stafeto with their status on
-/// Linux. A case that passes on Linux must pass here, or a departure names
-/// it; a departure of a case that passes here is stale; a case with no result
-/// counts as a failure.
+/// Linux. A case that passes on Linux must pass here, or a departure names it
+/// with the status it ends with; a case that fails on Linux must not crash,
+/// time out or end in an internal error here unless a departure names that;
+/// a departure of a case that passes here is stale; a case with no result
+/// counts as a failure. With `full` (a run of every case of the sets) a
+/// pattern that matches cases passing on Linux and covered none is stale too.
 pub fn compare(
     baseline: &BTreeMap<String, String>,
     expected: &[String],
     results: &[CaseResult],
     departures: &[Departure],
+    full: bool,
 ) -> Comparison {
     let mut out = Comparison::default();
     let by_name: BTreeMap<&str, &str> = results
@@ -543,26 +712,69 @@ pub fn compare(
         .map(String::as_str)
         .chain(results.iter().map(|r| r.name.as_str()))
         .collect();
+    let mut covered = vec![0usize; departures.len()];
+    let mut matched_passing = vec![0usize; departures.len()];
     for case in names {
         let Some(linux) = baseline.get(case) else {
             out.unknown.push(case.to_owned());
             continue;
         };
-        out.checked += 1;
         let here = by_name.get(case).copied();
-        let departure = departures.iter().find(|d| d.matches(case));
+        let departure = departures.iter().position(|d| d.matches(case));
+        if let Some(d) = departure
+            && passes(linux)
+        {
+            matched_passing[d] += 1;
+        }
         let here_passes = here.is_some_and(passes);
         if !passes(linux) {
+            // A failure on Linux asks nothing of stafeto but an end of the
+            // case: no crash, timeout or internal error, unless a line says so.
+            if let Some(h) = here.filter(|h| is_breakdown(h)) {
+                out.checked += 1;
+                match departure.filter(|&d| departures[d].status == h) {
+                    Some(d) => {
+                        covered[d] += 1;
+                        out.departed
+                            .push((case.to_owned(), departures[d].step.clone()));
+                    }
+                    None => out.regressions.push(format!(
+                        "{case}: Linux {linux}, stafeto {h} (a failure on Linux must not end like that)"
+                    )),
+                }
+            }
             continue;
         }
+        out.checked += 1;
         match (here_passes, departure) {
-            (true, Some(d)) if d.exact() => out.stale.push(case.to_owned()),
+            (true, Some(d)) if departures[d].exact() => out.stale.push(case.to_owned()),
             (true, _) => {}
-            (false, Some(d)) => out.departed.push((case.to_owned(), d.step.clone())),
+            (false, Some(d)) => {
+                let h = here.unwrap_or("no result");
+                if h == departures[d].status {
+                    covered[d] += 1;
+                    out.departed
+                        .push((case.to_owned(), departures[d].step.clone()));
+                } else {
+                    out.regressions.push(format!(
+                        "{case}: Linux {linux}, stafeto {h}, the departure says {}",
+                        departures[d].status
+                    ));
+                }
+            }
             (false, None) => out.regressions.push(format!(
                 "{case}: Linux {linux}, stafeto {}",
                 here.unwrap_or("no result")
             )),
+        }
+    }
+    for (d, dep) in departures.iter().enumerate() {
+        out.covered.push((dep.pattern.clone(), covered[d]));
+        if full && covered[d] == 0 && matched_passing[d] > 0 && !dep.exact() {
+            out.stale.push(format!(
+                "{}: matches {} cases that pass on Linux and covers none",
+                dep.pattern, matched_passing[d]
+            ));
         }
     }
     out
@@ -577,17 +789,10 @@ pub fn parse_smoke(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Cases the smoke list leaves out: they need a native window, the image of
-/// dEQP runs no composition service, and the framework ends its process on the
-/// resource error that follows (each such case costs a start of the program).
-pub const SMOKE_EXCLUDED: &[&str] = &[
-    "dEQP-EGL.functional.negative_api.create_window_surface",
-    "dEQP-EGL.functional.negative_api.wait_native",
-];
-
-/// The cases for `deqp-smoke` out of the passing cases of the baselines: one
-/// case of each group of the names cut at the deepest level that gives no more
-/// than `most` groups (the first case of the group in the order of names).
+/// The cases for `deqp-smoke` out of the passing cases of the baselines of the
+/// sets that give groups (`Smoke::Groups`): one case of each group of the names
+/// cut at the deepest level that gives no more than `most` groups (the first
+/// case of the group in the order of names); the departed cases are left out.
 pub fn select_smoke(passing: &BTreeSet<String>, most: usize) -> Vec<String> {
     let mut best: Vec<String> = Vec::new();
     for depth in 2..12 {
@@ -629,6 +834,10 @@ mod tests {
         list.iter().map(|s| (*s).to_owned()).collect()
     }
 
+    fn deps(text: &str) -> Vec<Departure> {
+        parse_departures(text).unwrap()
+    }
+
     const A: &str = "dEQP-EGL.info.version";
     const B: &str = "dEQP-EGL.info.vendor";
     const C: &str = "dEQP-EGL.functional.create_context.rgb565_window";
@@ -637,47 +846,130 @@ mod tests {
     fn a_pass_on_linux_that_is_not_supported_here_is_a_regression() {
         let linux = base(&[(A, "Pass"), (B, "Pass")]);
         let ran = [result(A, "Pass"), result(B, "NotSupported")];
-        let c = compare(&linux, &names(&[A, B]), &ran, &[]);
+        let c = compare(&linux, &names(&[A, B]), &ran, &[], true);
         assert_eq!(c.regressions.len(), 1);
         assert!(c.regressions[0].starts_with(B));
         assert!(c.regressions[0].contains("NotSupported"));
         assert!(!c.is_ok());
+        assert_eq!(c.checked, 2);
     }
 
     #[test]
-    fn a_fail_on_linux_is_no_regression_wherever_it_ends_here() {
+    fn a_fail_on_linux_asks_only_that_the_case_ends() {
         let linux = base(&[(A, "Fail"), (B, "NotSupported"), (C, "Crash")]);
         let ran = [
             result(A, "Pass"),
             result(B, "Fail"),
             result(C, "NotSupported"),
         ];
-        let c = compare(&linux, &names(&[A, B, C]), &ran, &[]);
+        let c = compare(&linux, &names(&[A, B, C]), &ran, &[], true);
         assert!(c.is_ok(), "{c:?}");
-        assert_eq!(c.checked, 3);
+        // No case passes on Linux and none broke down here: none is compared.
+        assert_eq!(c.checked, 0);
     }
 
     #[test]
-    fn a_departure_covers_its_case_and_a_pattern_covers_many() {
+    fn a_crash_timeout_or_internal_error_where_linux_fails_is_a_regression_unless_named() {
+        let linux = base(&[(A, "Fail"), (B, "Fail"), (C, "Fail")]);
+        let ran = [
+            result(A, "Crash"),
+            result(B, "Timeout"),
+            result(C, "InternalError"),
+        ];
+        let c = compare(&linux, &names(&[A, B, C]), &ran, &[], true);
+        assert_eq!(c.regressions.len(), 3, "{c:?}");
+        assert_eq!(c.checked, 3);
+        let named = deps(&format!(
+            "{A} | Crash | posix | the heap ends | G8.7\n{B} | NotSupported | mesa | other | none\n"
+        ));
+        let c = compare(&linux, &names(&[A, B, C]), &ran, &named, false);
+        // A is named with its status; B's line says another status.
+        assert_eq!(c.regressions.len(), 2, "{c:?}");
+        assert!(c.departed.contains(&(A.to_owned(), "G8.7".to_owned())));
+    }
+
+    #[test]
+    fn a_departure_covers_its_case_with_its_status_only() {
         let linux = base(&[(A, "Pass"), (B, "Pass"), (C, "Pass")]);
         let ran = [
-            result(A, "Fail"),
+            result(A, "NotSupported"),
             result(B, "Pass"),
             result(C, "NotSupported"),
         ];
-        let d = parse_departures(&format!(
-            "{A} | no EGL 1.5 string | G8.3\ndEQP-EGL.functional.* | one window at a time | M1\n"
-        ))
-        .unwrap();
-        let c = compare(&linux, &names(&[A, B, C]), &ran, &d);
+        let d = deps(&format!(
+            "{A} | NotSupported | harness | no EGL 1.5 string | G8.3\ndEQP-EGL.functional.** | NotSupported | window | one window at a time | M1\n"
+        ));
+        let c = compare(&linux, &names(&[A, B, C]), &ran, &d, true);
         assert!(c.is_ok(), "{c:?}");
         assert_eq!(c.departed.len(), 2);
         assert!(c.departed.contains(&(A.to_owned(), "G8.3".to_owned())));
         assert!(c.departed.contains(&(C.to_owned(), "M1".to_owned())));
+        assert_eq!(c.covered[1].1, 1);
+        // The same case ending in another status is a regression.
+        let ran = [
+            result(A, "Fail"),
+            result(B, "Pass"),
+            result(C, "ResourceError"),
+        ];
+        let c = compare(&linux, &names(&[A, B, C]), &ran, &d, true);
+        assert_eq!(c.regressions.len(), 2, "{c:?}");
+        assert!(c.regressions[0].contains("the departure says NotSupported"));
     }
 
     #[test]
-    fn a_pattern_has_stars_anywhere() {
+    fn a_departure_of_a_case_that_passes_is_stale() {
+        let linux = base(&[(A, "Pass")]);
+        let d = deps(&format!(
+            "{A} | NotSupported | harness | was wrong | G8.7\n"
+        ));
+        let c = compare(&linux, &names(&[A]), &[result(A, "Pass")], &d, false);
+        assert_eq!(c.stale, [A]);
+        assert!(!c.is_ok());
+    }
+
+    #[test]
+    fn a_pattern_that_covers_nothing_after_a_full_run_is_stale() {
+        let linux = base(&[(A, "Pass"), (B, "Pass")]);
+        let ran = [result(A, "Pass"), result(B, "Pass")];
+        let d = deps("dEQP-EGL.info.* | NotSupported | config | some | M1\n");
+        // A partial run (the smoke list) cannot tell.
+        assert!(compare(&linux, &names(&[A, B]), &ran, &d, false).is_ok());
+        let c = compare(&linux, &names(&[A, B]), &ran, &d, true);
+        assert_eq!(c.stale.len(), 1);
+        assert!(c.stale[0].contains("covers none"));
+        // A pattern that matches no case that passes on Linux is not judged here.
+        let d = deps("dEQP-EGL.other.* | NotSupported | config | some | M1\n");
+        assert!(compare(&linux, &names(&[A, B]), &ran, &d, true).is_ok());
+    }
+
+    #[test]
+    fn a_case_that_never_ran_counts_as_a_failure_and_an_unknown_one_is_an_error() {
+        let linux = base(&[(A, "Pass")]);
+        let c = compare(&linux, &names(&[A]), &[], &[], true);
+        assert_eq!(c.regressions.len(), 1);
+        assert!(c.regressions[0].contains("no result"));
+        let both = [result(A, "Pass"), result(B, "Pass")];
+        let c = compare(&linux, &names(&[A]), &both, &[], true);
+        assert_eq!(c.unknown, [B]);
+        assert!(!c.is_ok());
+    }
+
+    #[test]
+    fn warnings_pass_on_both_sides() {
+        let linux = base(&[(A, "QualityWarning")]);
+        let ran = [result(A, "CompatibilityWarning")];
+        assert!(compare(&linux, &names(&[A]), &ran, &[], true).is_ok());
+        let ran = [result(A, "Waiver")];
+        assert_eq!(
+            compare(&linux, &names(&[A]), &ran, &[], true)
+                .regressions
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_pattern_has_stars_that_stop_at_a_dot_and_double_stars_that_do_not() {
         assert!(glob("a*", "abc"));
         assert!(glob("a*", "a"));
         assert!(glob("*c", "abc"));
@@ -688,70 +980,40 @@ mod tests {
         assert!(!glob("abc", "abcd"));
         assert!(!glob("a*c", "abcd"));
         assert!(!glob("a*b*c", "a1c2b"));
-        assert!(!glob("a*bc", "abc1bc2"));
         assert!(glob("a*bc", "abcbc"));
         assert!(!glob("ab*", "a"));
-        let d =
-            parse_departures("dEQP-EGL.functional.*.rgb565_* | no 16-bit configuration | none\n")
-                .unwrap();
-        assert!(d[0].matches("dEQP-EGL.functional.create_context.rgb565_depth_stencil"));
-        assert!(!d[0].matches("dEQP-EGL.functional.create_context.rgba8888_depth_stencil"));
+        // One star stays in one group of the names.
+        assert!(!glob("g.*.rgb565_*", "g.a.b.rgb565_x"));
+        assert!(glob("g.*.rgb565_*", "g.a.rgb565_x"));
+        assert!(!glob("g.*", "g.a.b"));
+        assert!(glob("g.**", "g.a.b"));
+        assert!(glob("g.**.x", "g.a.b.x"));
+        assert!(glob("**", ""));
     }
 
     #[test]
-    fn a_departure_of_a_case_that_passes_is_stale() {
-        let linux = base(&[(A, "Pass")]);
-        let d = parse_departures(&format!("{A} | was wrong | G8.7\n")).unwrap();
-        let c = compare(&linux, &names(&[A]), &[result(A, "Pass")], &d);
-        assert_eq!(c.stale, [A]);
-        assert!(!c.is_ok());
-        // A pattern may cover cases that pass: it is never stale.
-        let d = parse_departures("dEQP-EGL.info.* | some | M1\n").unwrap();
-        assert!(compare(&linux, &names(&[A]), &[result(A, "Pass")], &d).is_ok());
-    }
-
-    #[test]
-    fn a_case_that_never_ran_counts_as_a_failure_and_an_unknown_one_is_an_error() {
-        let linux = base(&[(A, "Pass")]);
-        let c = compare(&linux, &names(&[A]), &[], &[]);
-        assert_eq!(c.regressions.len(), 1);
-        assert!(c.regressions[0].contains("no result"));
-        let c = compare(
-            &linux,
-            &names(&[A]),
-            &[result(A, "Pass"), result(B, "Pass")],
-            &[],
-        );
-        assert_eq!(c.unknown, [B]);
-        assert!(!c.is_ok());
-    }
-
-    #[test]
-    fn warnings_pass_on_both_sides() {
-        let linux = base(&[(A, "QualityWarning")]);
-        let c = compare(
-            &linux,
-            &names(&[A]),
-            &[result(A, "CompatibilityWarning")],
-            &[],
-        );
-        assert!(c.is_ok());
-        let c = compare(&linux, &names(&[A]), &[result(A, "Waiver")], &[]);
-        assert_eq!(c.regressions.len(), 1);
-    }
-
-    #[test]
-    fn departures_have_three_fields_and_unique_cases() {
-        assert!(parse_departures("dEQP-EGL.info.version | why\n").is_err());
-        assert!(parse_departures("dEQP-EGL.info.version | why | \n").is_err());
-        assert!(parse_departures("info.version | why | M1\n").is_err());
-        assert!(
-            parse_departures("dEQP-EGL.info.version | a | M1\ndEQP-EGL.info.version | b | M1\n")
-                .is_err()
-        );
-        let ok = parse_departures("# c\n\ndEQP-EGL.info.* | a | M1\n").unwrap();
-        assert_eq!(ok.len(), 1);
-        assert_eq!(ok[0].step, "M1");
+    fn departures_have_five_fields_a_status_a_class_and_a_step() {
+        let ok = "dEQP-EGL.info.* | NotSupported | config | why | none\n";
+        assert_eq!(deps(ok)[0].class, Class::Config);
+        for bad in [
+            "dEQP-EGL.info.version | NotSupported | config | why\n",
+            "dEQP-EGL.info.version | NotSupported | config | why | \n",
+            "info.version | NotSupported | config | why | M1\n",
+            "dEQP-EGL.info.version | Pass | config | why | M1\n",
+            "dEQP-EGL.info.version | Maybe | config | why | M1\n",
+            "dEQP-EGL.info.version | NotSupported | kernel | why | M1\n",
+            "dEQP-EGL.info.version | NotSupported | config | why | open\n",
+            "dEQP-EGL.info.version | NotSupported | config | why | never\n",
+            "dEQP-EGL.info.version | NotSupported | config | why | G8\n",
+            "dEQP-EGL.info.version | NotSupported | config | why | M\n",
+            "dEQP-EGL.info.version | NotSupported | config | a | M1\ndEQP-EGL.info.version | Fail | mesa | b | M1\n",
+        ] {
+            assert!(parse_departures(bad).is_err(), "{bad}");
+        }
+        for step in ["none", "M1", "M12", "G8.7", "G10.12"] {
+            assert!(step_is_valid(step), "{step}");
+        }
+        assert!(parse_departures("# c\n\n").unwrap().is_empty());
     }
 
     #[test]
@@ -795,6 +1057,55 @@ mod tests {
         assert!(sets_of("gles2").unwrap().len() > 3);
         assert_eq!(sets_of("all").unwrap().len(), SETS.len());
         assert!(sets_of("gles9").is_err());
+    }
+
+    #[test]
+    fn a_sampled_group_gives_one_case_in_four_in_the_order_of_names() {
+        let set = Set {
+            sample: &["g.big.**"],
+            ..set(
+                "x",
+                Module::Gles2,
+                Target::Surfaceless,
+                &["g.*"],
+                Smoke::Skip,
+            )
+        };
+        let mut cases: Vec<String> = (0..10).map(|n| format!("g.big.c{n}")).collect();
+        cases.extend((0..3).map(|n| format!("g.small.c{n}")));
+        cases.reverse();
+        let kept = sampled(&set, &cases);
+        assert_eq!(
+            kept,
+            [
+                "g.big.c0",
+                "g.big.c4",
+                "g.big.c8",
+                "g.small.c0",
+                "g.small.c1",
+                "g.small.c2"
+            ]
+        );
+        // A set with no sample runs every case.
+        let all = Set { sample: &[], ..set };
+        assert_eq!(sampled(&all, &cases).len(), 13);
+    }
+
+    #[test]
+    fn the_sample_of_gles2_is_the_groups_of_the_coordinator() {
+        let mut thinned: Vec<&str> = SETS.iter().flat_map(|s| s.sample.iter().copied()).collect();
+        thinned.sort_unstable();
+        assert_eq!(
+            thinned,
+            [
+                "dEQP-GLES2.functional.fragment_ops.blend.**",
+                "dEQP-GLES2.functional.fragment_ops.depth_stencil.**",
+                "dEQP-GLES2.functional.fragment_ops.interaction.**",
+                "dEQP-GLES2.functional.fragment_ops.random.**",
+                "dEQP-GLES2.functional.shaders.conversions.**",
+                "dEQP-GLES2.functional.shaders.swizzles.**",
+            ]
+        );
     }
 
     #[test]

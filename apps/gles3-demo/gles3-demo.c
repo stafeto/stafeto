@@ -173,9 +173,9 @@ static EGLint config_value(EGLDisplay display, EGLConfig config, EGLint attribut
  * of alpha, a 16-bit depth buffer, windows and pbuffers both. */
 static EGLConfig choose_config(EGLDisplay display)
 {
-	EGLConfig all[64];
+	EGLConfig all[256];
 	EGLint count = 0;
-	CHECK(eglGetConfigs(display, all, 64, &count) == EGL_TRUE);
+	CHECK(eglGetConfigs(display, all, 256, &count) == EGL_TRUE);
 	for (EGLint i = 0; i < count; i++) {
 		EGLint types = config_value(display, all[i], EGL_SURFACE_TYPE);
 		if ((types & EGL_WINDOW_BIT) && (types & EGL_PBUFFER_BIT) &&

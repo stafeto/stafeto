@@ -11005,7 +11005,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("cxx-probe", || cxx_probe::probe(&qemu::VIRT)),
         job("gles-probe", || gles_probe::probe(&qemu::VIRT_1G, false)),
         job("gles-probe steps", || gles_probe::steps(&qemu::VIRT_1G)),
-        job("deqp-smoke", || deqp::smoke(&qemu::VIRT_1G)),
+        job("deqp-smoke", || {
+            deqp::smoke(&qemu::VIRT_1G, &deqp::Module::ALL)
+        }),
         job("posix-files", posix_files_probe),
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),

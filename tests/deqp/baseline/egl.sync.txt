@@ -1,11 +1,11 @@
-# provisional: made in an arm64 Linux container on a Mac not on a runner
+# provisional: made in an arm64 Linux container off the runners
 # dEQP baseline of the set egl.sync (cargo xtask deqp-reference egl.sync)
 # module deqp-egl, platform x11_egl, patterns dEQP-EGL.functional.fence_sync.* dEQP-EGL.functional.reusable_sync.* dEQP-EGL.functional.wait_sync.*
 # VK-GL-CTS opengl-es-cts-3.2.14.1 (067e8832315e79817ede1c4863804e440f5d1c80)
 # Mesa 26.3.1 softpipe, shared libraries, clang
 # machine Linux 6.12.76-linuxkit aarch64
 # arguments --deqp-log-images=disable --deqp-log-shader-sources=disable
-# 51 cases: 51 pass, 0 fail, 0 not supported, 0 other, in 2 s
+# 51 cases: 51 pass, 0 fail, 0 not supported, 0 other, in 1 s
 dEQP-EGL.functional.fence_sync.invalid.create_invalid_attribs Pass
 dEQP-EGL.functional.fence_sync.invalid.create_invalid_context Pass
 dEQP-EGL.functional.fence_sync.invalid.create_invalid_display Pass

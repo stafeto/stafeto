@@ -1,0 +1,73 @@
+# provisional: made in an arm64 Linux container off the runners
+# dEQP baseline of the set egl.query (cargo xtask deqp-reference egl.query)
+# module deqp-egl, platform x11_egl, patterns dEQP-EGL.functional.query_context.*
+# VK-GL-CTS opengl-es-cts-3.2.14.1 (067e8832315e79817ede1c4863804e440f5d1c80)
+# Mesa 26.3.1 softpipe, shared libraries, clang
+# machine Linux 6.12.76-linuxkit aarch64
+# arguments --deqp-log-images=disable --deqp-log-shader-sources=disable
+# 65 cases: 17 pass, 0 fail, 48 not supported, 0 other, in 1 s
+dEQP-EGL.functional.query_context.get_current_context.other NotSupported
+dEQP-EGL.functional.query_context.get_current_context.rgb565_pbuffer NotSupported
+dEQP-EGL.functional.query_context.get_current_context.rgb565_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_context.rgb565_window NotSupported
+dEQP-EGL.functional.query_context.get_current_context.rgb888_pbuffer Pass
+dEQP-EGL.functional.query_context.get_current_context.rgb888_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_context.rgb888_window Pass
+dEQP-EGL.functional.query_context.get_current_context.rgba4444_pbuffer NotSupported
+dEQP-EGL.functional.query_context.get_current_context.rgba4444_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_context.rgba4444_window NotSupported
+dEQP-EGL.functional.query_context.get_current_context.rgba5551_pbuffer NotSupported
+dEQP-EGL.functional.query_context.get_current_context.rgba5551_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_context.rgba5551_window NotSupported
+dEQP-EGL.functional.query_context.get_current_context.rgba8888_pbuffer Pass
+dEQP-EGL.functional.query_context.get_current_context.rgba8888_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_context.rgba8888_window Pass
+dEQP-EGL.functional.query_context.get_current_display.other NotSupported
+dEQP-EGL.functional.query_context.get_current_display.rgb565_pbuffer NotSupported
+dEQP-EGL.functional.query_context.get_current_display.rgb565_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_display.rgb565_window NotSupported
+dEQP-EGL.functional.query_context.get_current_display.rgb888_pbuffer Pass
+dEQP-EGL.functional.query_context.get_current_display.rgb888_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_display.rgb888_window Pass
+dEQP-EGL.functional.query_context.get_current_display.rgba4444_pbuffer NotSupported
+dEQP-EGL.functional.query_context.get_current_display.rgba4444_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_display.rgba4444_window NotSupported
+dEQP-EGL.functional.query_context.get_current_display.rgba5551_pbuffer NotSupported
+dEQP-EGL.functional.query_context.get_current_display.rgba5551_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_display.rgba5551_window NotSupported
+dEQP-EGL.functional.query_context.get_current_display.rgba8888_pbuffer Pass
+dEQP-EGL.functional.query_context.get_current_display.rgba8888_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_display.rgba8888_window Pass
+dEQP-EGL.functional.query_context.get_current_surface.other NotSupported
+dEQP-EGL.functional.query_context.get_current_surface.rgb565_pbuffer NotSupported
+dEQP-EGL.functional.query_context.get_current_surface.rgb565_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_surface.rgb565_window NotSupported
+dEQP-EGL.functional.query_context.get_current_surface.rgb888_pbuffer Pass
+dEQP-EGL.functional.query_context.get_current_surface.rgb888_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_surface.rgb888_window Pass
+dEQP-EGL.functional.query_context.get_current_surface.rgba4444_pbuffer NotSupported
+dEQP-EGL.functional.query_context.get_current_surface.rgba4444_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_surface.rgba4444_window NotSupported
+dEQP-EGL.functional.query_context.get_current_surface.rgba5551_pbuffer NotSupported
+dEQP-EGL.functional.query_context.get_current_surface.rgba5551_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_surface.rgba5551_window NotSupported
+dEQP-EGL.functional.query_context.get_current_surface.rgba8888_pbuffer Pass
+dEQP-EGL.functional.query_context.get_current_surface.rgba8888_pixmap NotSupported
+dEQP-EGL.functional.query_context.get_current_surface.rgba8888_window Pass
+dEQP-EGL.functional.query_context.query_context.other NotSupported
+dEQP-EGL.functional.query_context.query_context.rgb565_pbuffer NotSupported
+dEQP-EGL.functional.query_context.query_context.rgb565_pixmap NotSupported
+dEQP-EGL.functional.query_context.query_context.rgb565_window NotSupported
+dEQP-EGL.functional.query_context.query_context.rgb888_pbuffer Pass
+dEQP-EGL.functional.query_context.query_context.rgb888_pixmap NotSupported
+dEQP-EGL.functional.query_context.query_context.rgb888_window Pass
+dEQP-EGL.functional.query_context.query_context.rgba4444_pbuffer NotSupported
+dEQP-EGL.functional.query_context.query_context.rgba4444_pixmap NotSupported
+dEQP-EGL.functional.query_context.query_context.rgba4444_window NotSupported
+dEQP-EGL.functional.query_context.query_context.rgba5551_pbuffer NotSupported
+dEQP-EGL.functional.query_context.query_context.rgba5551_pixmap NotSupported
+dEQP-EGL.functional.query_context.query_context.rgba5551_window NotSupported
+dEQP-EGL.functional.query_context.query_context.rgba8888_pbuffer Pass
+dEQP-EGL.functional.query_context.query_context.rgba8888_pixmap NotSupported
+dEQP-EGL.functional.query_context.query_context.rgba8888_window Pass
+dEQP-EGL.functional.query_context.simple.query_api Pass
