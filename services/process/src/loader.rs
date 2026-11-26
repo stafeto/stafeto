@@ -110,20 +110,33 @@ impl Image {
         })
     }
 
-    /// The first piece of putting the loader into `process`, a new process:
-    /// its code from the shared object. On an error the caller kills the
+    /// The first pieces of putting the loader into `process`, a new
+    /// process: its code from the shared object, `loaders::CODE_CHUNK_BYTES`
+    /// a piece (`code_chunks` of them). On an error the caller kills the
     /// process. Each piece is a portion of the service's loop, no longer
-    /// than term B (spec 2, 3.1).
-    pub fn map_code(&self, process: &Handle<Process>) -> Result<(), Error> {
+    /// than term B (spec 2, 3.1); a mapping of executable pages costs about
+    /// a thousand ticks a page under -icount, so the whole code in one
+    /// piece would pass 0.9 of B.
+    pub fn map_code(&self, process: &Handle<Process>, chunk: u64) -> Result<(), Error> {
         let code = &self.layout.segments[Part::Code as usize];
+        let Some((offset, len)) = crate::loaders::code_chunk(self.code_len, chunk) else {
+            return Ok(());
+        };
         loader::map_narrowed(
             process,
             &self.shared,
-            0,
-            self.code_len,
-            code.vaddr as usize,
+            offset,
+            len,
+            code.vaddr as usize + offset as usize,
             Access::ReadExec,
         )
+    }
+
+    /// How many pieces the code takes (at least one).
+    pub fn code_chunks(&self) -> u64 {
+        self.code_len
+            .div_ceil(crate::loaders::CODE_CHUNK_BYTES)
+            .max(1)
     }
 
     /// The second piece: its read-only data from the shared object (none
