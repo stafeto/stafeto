@@ -62,6 +62,20 @@ pub const SEED: &str = "seed";
 pub const BOOT_IMAGE: &str = "bootimage";
 /// The name of the RAM file service's record: it gets the boot image.
 pub const RAM_SERVICE: &str = "ramfs";
+/// What init puts before the own arguments of the RAM file service when the table has the data
+/// service: the name below the root that the volume owns (`proto_fs::RAM_MOUNT_ARG` and a space).
+/// With no data service the service redirects nothing.
+const RAM_MOUNT_FIRST: &[u8] = b"mount=data ";
+
+/// The arguments that go before those of the record `name` of `table`: the mount of the data
+/// volume for the RAM file service of a table that has the data service, nothing for any other.
+pub fn first_args(table: &[Record], name: &str) -> &'static [u8] {
+    if name == RAM_SERVICE && table.iter().any(|record| record.name == DATA_SERVICE) {
+        RAM_MOUNT_FIRST
+    } else {
+        &[]
+    }
+}
 pub const CLOCK_SERVICE: &str = "clock";
 pub const PIPE_SERVICE: &str = "pipe";
 /// The network service's name.
@@ -2129,6 +2143,34 @@ mod tests {
         tables
     }
 
+    /// The RAM file service redirects the name of the data volume only in a table that has the data
+    /// service, and no other service gets the argument.
+    #[test]
+    fn the_mount_argument_goes_to_the_ram_service_of_a_table_with_the_data_service() {
+        assert!(RAM_MOUNT_FIRST.starts_with(proto_fs::RAM_MOUNT_ARG));
+        assert_eq!(&RAM_MOUNT_FIRST[proto_fs::RAM_MOUNT_ARG.len()..], b" ");
+        assert_eq!(
+            RAM_MOUNT_FIRST.strip_prefix(b"mount="),
+            Some(&b"data "[..]),
+            "the name is the one the POSIX layer routes"
+        );
+        let mut with = 0;
+        for table in all_tables() {
+            let has_data = table.iter().any(|record| record.name == DATA_SERVICE);
+            let first = first_args(table, RAM_SERVICE);
+            assert_eq!(!first.is_empty(), has_data);
+            // The extra arguments take the place of the DMA addresses of the start data
+            // (worker.rs): the RAM service has no DMA objects in any table.
+            let ram = table.iter().find(|record| record.name == RAM_SERVICE);
+            assert!(ram.is_none_or(|ram| ram.dma.is_empty() || first.is_empty()));
+            with += usize::from(has_data);
+            for record in table.iter().filter(|record| record.name != RAM_SERVICE) {
+                assert!(first_args(table, record.name).is_empty(), "{}", record.name);
+            }
+        }
+        assert!(with > 0);
+    }
+
     /// The CPU a thread is left on when the loader is asked nothing for it, and the CPU asked for the
     /// driver of the console, written out apart from `budget_cpu`.
     fn thread_cpu(log: bool, mask: u8) -> u8 {
@@ -3835,7 +3877,9 @@ mod tests {
             check(table).unwrap();
             let ram = table.iter().find(|r| r.name == "ramfs").unwrap();
             let clock = table.iter().find(|r| r.name == "clock").unwrap();
-            assert_eq!(ram.args, proto_fs::RAM_TIME_CLOCKED);
+            // The time mode, and for one probe table the mount of the data volume after it.
+            assert!(ram.args.starts_with(proto_fs::RAM_TIME_CLOCKED));
+            assert!(ram.args == proto_fs::RAM_TIME_CLOCKED || ram.args.ends_with(b" mount=data"));
             let has_pipe = table.iter().any(|r| r.name == PIPE_SERVICE);
             assert_eq!(
                 ram.connects,

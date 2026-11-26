@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 21 of the bounded RAM file service. Numbers are little endian.
+//! Version 22 of the bounded RAM file service. Numbers are little endian.
 //! Ordinary sessions first Bind with a genuine Process identity capability,
 //! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
@@ -56,6 +56,21 @@
 //! recovery retains the full description token and captured device type.
 //! ResolveCancel releases the job and hidden descriptor; committed file effects
 //! remain observable. Ordinary descriptor APIs and Clone exclude the hidden fd.
+//!
+//! REDIRECT: a walk that reaches the name another service owns (`DATA_MOUNT` below the root, when
+//! init gives the service `mount=data`) stops there, however it got there: a symbolic link, `..`,
+//! or a path that names it from the start. Callers route a path under `/data` themselves first,
+//! only to save the round trip. The reply of a ResolveStep (the walk of an OpenStart job too) is
+//! then the status REDIRECT and a `Redirect`: target u32, index u32 (0 the first path of the job,
+//! 1 the second), links u32 (the links the walk had expanded), then the absolute path to continue
+//! with, 1..=511 bytes with no NUL. The job is over and made no description, so an OPEN gets no
+//! fd. The target says where the path goes on: 0 route by the path, 1 the RAM file service, 2 the
+//! data service. A caller follows redirects as links of its own walk: the sum of the links and the
+//! redirects of one call stays within `LINKS_MAX`, or the answer is ELOOP. A Change job that
+//! meets one finishes with the result REDIRECT and no bytes: a client that does not follow, or
+//! cannot, takes REDIRECT as "not here" (EXDEV) and may ask the walk again with a ResolveStart for
+//! the redirect itself. A client of proto_fs 21 gets BAD_VERSION from a service of 22 (series 0.7
+//! is one break), and the RAM file service of 22 refuses it the same way.
 //!
 //! OPEN: flags u32, proof u64. Reply: status, fd u32, optional RANDOM_DEVICE u32.
 //! LOOKUP/INFO_PATH: proof u64. Reply: status then metadata/NodeInfo.
@@ -140,7 +155,7 @@ use proto_wire::{HEADER_LEN, Header, Status};
 pub const RAM_TIME_LEGACY: &[u8] = b"time-legacy";
 /// Explicit startup mode requiring the shared Clock realtime page.
 pub const RAM_TIME_CLOCKED: &[u8] = b"time-clocked";
-pub const VERSION: u16 = 21;
+pub const VERSION: u16 = 22;
 /// Original descriptor custody keys and sixteen independent Control keys.
 pub const JOB_KEY_PLACES: usize = 48;
 pub const MAX_PATH: usize = 511;
@@ -194,6 +209,77 @@ impl SnapshotReply {
             return Err(Status::BadSize);
         }
         Ok(value)
+    }
+}
+
+/// The names of the walks the RAM file service gives away: the name below the root that the data
+/// service owns. The POSIX layer's `/data` is this name with a slash before it.
+pub const DATA_MOUNT: &[u8] = b"data";
+/// The argument init gives the RAM file service in an image whose table has the data service, after
+/// the time mode: `mount=data`. With no such argument the service redirects nothing.
+pub const RAM_MOUNT_ARG: &[u8] = b"mount=data";
+/// The links one walk may expand, and with a client that follows redirects, the sum of the links
+/// and the redirects of one call (POSIX {SYMLOOP_MAX} at its minimum is 8; this is the service's).
+pub const LINKS_MAX: u32 = 32;
+
+/// Where a redirect says the path goes on.
+pub const REDIRECT_BY_PATH: u32 = 0;
+pub const REDIRECT_RAM: u32 = 1;
+pub const REDIRECT_DATA: u32 = 2;
+
+/// The body of the answer REDIRECT, after its status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Redirect<'a> {
+    pub target: u32,
+    pub index: u32,
+    pub links: u32,
+    pub path: &'a [u8],
+}
+
+impl<'a> Redirect<'a> {
+    fn valid(&self) -> bool {
+        self.target <= REDIRECT_DATA
+            && self.index <= 1
+            && self.links <= LINKS_MAX
+            && !self.path.is_empty()
+            && self.path.len() <= MAX_PATH
+            && self.path[0] == b'/'
+            && !self.path.contains(&0)
+    }
+
+    /// The reply: the status REDIRECT, then the fields and the path.
+    pub fn write(&self, w: &mut proto_wire::Writer) -> Result<(), Status> {
+        if !self.valid() {
+            return Err(Status::BadSize);
+        }
+        w.u32(REDIRECT)?;
+        w.u32(self.target)?;
+        w.u32(self.index)?;
+        w.u32(self.links)?;
+        w.bytes(self.path)
+    }
+
+    /// Reads a whole reply of any ResolveStep: None when its status is not REDIRECT, the redirect
+    /// (or the malformed reply) when it is. The status alone says it: a path of one byte makes a
+    /// reply no longer than 13, so no length tells a redirect from another answer.
+    pub fn read_reply(bytes: &'a [u8]) -> Option<Result<Self, Status>> {
+        let mut r = proto_wire::Reader::new(bytes);
+        if r.u32().ok()? != REDIRECT {
+            return None;
+        }
+        Some((|| {
+            let value = Self {
+                target: r.u32()?,
+                index: r.u32()?,
+                links: r.u32()?,
+                path: r.bytes(r.left())?,
+            };
+            if value.valid() {
+                Ok(value)
+            } else {
+                Err(Status::BadSize)
+            }
+        })())
     }
 }
 
@@ -327,6 +413,8 @@ pub const BAD_LAYER: u32 = 336;
 /// An entry of the layer has a set-ID, set-GID or sticky bit, or an owner other than 0:0.
 /// The reply carries the number of the entry.
 pub const BAD_MODE: u32 = 337;
+/// The walk reached the name another service owns (`DATA_MOUNT`): the reply carries a `Redirect`.
+pub const REDIRECT: u32 = 338;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenKey {
@@ -766,5 +854,75 @@ mod tests {
         assert!(is_image(OWN | IMAGE_SESSION | 12));
         assert!(!is_image(OWN | 12));
         assert!(!is_image(LOADERS | 12));
+    }
+
+    #[test]
+    fn a_redirect_reply_round_trips_for_any_path_length() {
+        for path in [&b"/"[..], b"/bin", b"/data/a/b", &[b'/'; MAX_PATH][..]] {
+            let redirect = Redirect {
+                target: REDIRECT_DATA,
+                index: 1,
+                links: 3,
+                path,
+            };
+            let mut w = proto_wire::Writer::new();
+            redirect.write(&mut w).unwrap();
+            assert_eq!(Redirect::read_reply(w.as_bytes()), Some(Ok(redirect)));
+        }
+        // Another answer is no redirect, whatever its length.
+        let mut w = proto_wire::Writer::new();
+        w.u32(0).unwrap();
+        w.u32(0).unwrap();
+        assert_eq!(Redirect::read_reply(w.as_bytes()), None);
+        assert_eq!(Redirect::read_reply(&[1, 2]), None);
+    }
+
+    #[test]
+    fn a_malformed_redirect_is_refused_both_ways() {
+        let good = Redirect {
+            target: REDIRECT_BY_PATH,
+            index: 0,
+            links: 0,
+            path: b"/data",
+        };
+        for bad in [
+            Redirect {
+                path: b"data",
+                ..good
+            },
+            Redirect { path: b"", ..good },
+            Redirect {
+                path: b"/a\0b",
+                ..good
+            },
+            Redirect { target: 3, ..good },
+            Redirect { index: 2, ..good },
+            Redirect {
+                links: LINKS_MAX + 1,
+                ..good
+            },
+            Redirect {
+                path: &[b'/'; MAX_PATH + 1],
+                ..good
+            },
+        ] {
+            let mut w = proto_wire::Writer::new();
+            assert_eq!(bad.write(&mut w), Err(Status::BadSize), "{bad:?}");
+        }
+        // The same fields on the wire.
+        let mut w = proto_wire::Writer::new();
+        for word in [REDIRECT, 0, 0, 0] {
+            w.u32(word).unwrap();
+        }
+        w.bytes(b"/a\0b").unwrap();
+        assert_eq!(
+            Redirect::read_reply(w.as_bytes()),
+            Some(Err(Status::BadSize))
+        );
+        // A reply that stops inside the fields.
+        let mut w = proto_wire::Writer::new();
+        w.u32(REDIRECT).unwrap();
+        w.u32(0).unwrap();
+        assert!(matches!(Redirect::read_reply(w.as_bytes()), Some(Err(_))));
     }
 }

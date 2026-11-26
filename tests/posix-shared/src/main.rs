@@ -30,8 +30,13 @@ mod wire;
 
 #[used]
 static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
+/// The native threads of the probe run on static stacks with no guard page (rt::Stack): an overflow
+/// overwrites the statics below. The deepest call, a redirect on the driver, used 15,760 of the
+/// 16,384 bytes they had; 32 KiB leaves it half free, and the probe prints the use.
 #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
-static STACK: Stack<16384> = Stack::new();
+const NATIVE_STACK: usize = 32 * 1024;
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+static STACK: Stack<NATIVE_STACK> = Stack::new();
 #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 static FD: AtomicUsize = AtomicUsize::new(0);
 #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
@@ -132,6 +137,35 @@ extern "C" fn main(_: isize, _: *mut *mut c_char, _: *mut *mut c_char) -> c_int 
     });
     #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
     let passed = in_native_thread(process);
+    #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+    let roomy = {
+        // The statics of the two native threads and the stack of the main thread (an object the
+        // loader maps under INIT_STACK_TOP, 64 KiB; nothing is mapped below it). The use is the
+        // deepest nonzero byte of a stack that began zeroed.
+        const MAIN_STACK: u64 = 64 * 1024;
+        let low = (rt::abi::INIT_STACK_TOP - MAIN_STACK) as *const u8;
+        // SAFETY: the loader maps the whole object, MAIN_STACK bytes under INIT_STACK_TOP.
+        let main_used = (0..MAIN_STACK as usize)
+            .find(|&at| unsafe { low.add(at).read_volatile() } != 0)
+            .map_or(0, |at| MAIN_STACK as usize - at);
+        rt::println!(
+            "posix-shared-probe: stack used: driver {}/{}, worker {}/{}, main {}/{}",
+            DRIVER_STACK.used(),
+            NATIVE_STACK,
+            STACK.used(),
+            NATIVE_STACK,
+            main_used,
+            MAIN_STACK
+        );
+        // A quarter of each stack stays free: with no guard page a deeper path overwrites statics.
+        DRIVER_STACK.used() <= NATIVE_STACK * 3 / 4 && STACK.used() <= NATIVE_STACK * 3 / 4
+    };
+    #[cfg(any(feature = "input-probe", feature = "interrupt-probe"))]
+    let roomy = true;
+    if passed && !roomy {
+        rt::println!("posix-shared-probe: a native stack is more than three quarters used");
+        return 5;
+    }
     if passed {
         rt::println!("posix-shared-probe: ok");
         0
@@ -202,7 +236,7 @@ fn in_native_thread(process: rt::abi::Handle) -> bool {
 }
 
 #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
-static DRIVER_STACK: Stack<16384> = Stack::new();
+static DRIVER_STACK: Stack<NATIVE_STACK> = Stack::new();
 #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 static PROCESS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
@@ -221,6 +255,9 @@ extern "C" fn driver(completion: u64) -> ! {
 #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 fn scenario(process: rt::abi::Handle) -> bool {
     if !wire::payload() {
+        return false;
+    }
+    if !wire::redirect() {
         return false;
     }
     let (Ok(fd), Ok(alias)) = (abi::open(b"/etc/motd", O_RDONLY), abi::dup(3)) else {
@@ -328,7 +365,7 @@ static RELEASED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 static LATE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
-static HOLDER_STACK: Stack<16384> = Stack::new();
+static HOLDER_STACK: Stack<NATIVE_STACK> = Stack::new();
 
 /// The hook between a request's snapshot and its request to the service:
 /// the first request after arming waits there until the other thread's
