@@ -770,6 +770,15 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::reply_receive_takes_the_queued_request_at_its_level,
     ),
     (
+        "a_request_tells_its_level",
+        calls::a_request_tells_its_level,
+    ),
+    (
+        "a_notification_tells_its_level",
+        calls::a_notification_tells_its_level,
+    ),
+    ("a_sent_level_is_refused", calls::a_sent_level_is_refused),
+    (
         "reply_receive_with_a_handle_takes_the_queued_request_in_one_entry",
         calls::reply_receive_with_a_handle_takes_the_queued_request_in_one_entry,
     ),

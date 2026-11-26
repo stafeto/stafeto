@@ -656,6 +656,7 @@ pub fn breaks() -> Result<(), String> {
     stint_visit_break()?;
     unbound_break()?;
     crate::log_quiet::breaks()?;
+    lent_breaks()?;
     // init's table check: budgets that take all of a CPU must be refused.
     let out = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .current_dir(crate::root())
@@ -677,6 +678,35 @@ pub fn breaks() -> Result<(), String> {
     // unbound and init with no `free` level.
     crate::budget_journal::breaks()?;
     crate::service_budget::breaks(None)
+}
+
+/// `cargo xtask lent-breaks` (part of `budget-breaks`): the kernel tests of the level that
+/// `receive` tells (spec 6.6) fail on a kernel whose request tells the receiver's own base
+/// (`break-lent-level`), and on one whose wait channel lends a level (`break-lent-notice`).
+pub fn lent_breaks() -> Result<(), String> {
+    for (variant, test, what) in [
+        (
+            Variant::LentLevelTest,
+            "a_request_tells_its_level",
+            "a request that tells the receiver's base",
+        ),
+        (
+            Variant::LentNoticeTest,
+            "a_notification_tells_its_level",
+            "a wait channel that lends a level",
+        ),
+    ] {
+        let a = build(variant)?;
+        let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+        cmd.args(qemu::HEADLESS);
+        let o = qemu::run_until(cmd, Duration::from_secs(300), None)?;
+        let report = qemu::parse_report(&o.lines);
+        if !report.failed.iter().any(|(name, _)| name == test) {
+            return Err(format!("the kernel with {what} passed {test}"));
+        }
+        println!("lent-breaks: a kernel with {what} fails {test}");
+    }
+    Ok(())
 }
 
 /// The host tests of kcore with `break-stint-visit` fail, and the two tests of

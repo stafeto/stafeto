@@ -178,9 +178,11 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
                     ))));
                 }
                 q.take_slot();
-                let (n, priority) = notice(slot);
+                let (mut n, priority) = notice(slot);
+                let lends = lends(c);
+                n.level = notice_level(lends, priority, ceiling);
                 syscall::set_notification(t, n);
-                if lends(c) {
+                if lends {
                     sched::boost_in_place(k, t, priority, ceiling, false);
                 }
                 hold_notice(t, c);
@@ -548,12 +550,26 @@ unsafe fn deliver(to: NonNull<Thread>, from: NonNull<Thread>, desc: Desc) {
     }
 }
 
+/// The level a notification taken from a channel lends its receiver (spec
+/// 6.6): what the boost takes, the lower of the priority of the slot and the
+/// ceiling of the receiver's process, and 0 from a channel that does not
+/// lend (`lends` false, a wait channel): no level. O(1).
+#[inline(always)]
+pub(super) fn notice_level(lends: bool, priority: u8, ceiling: u8) -> u8 {
+    if cfg!(feature = "break-lent-notice") || lends {
+        priority.min(ceiling)
+    } else {
+        0
+    }
+}
+
 /// The request of `client` goes to `r`, the receiver, in its receive (spec
 /// 6.1, 6.6): the client's count grows by 1 and the token names the
 /// request; the client's own slot goes to the tail of its level in the
 /// queue of accepted requests of `r`'s process, where the client waits for
 /// the reply; x0-x11 of `r` get the message (`deliver`) with its handles,
-/// the label of `via` and the token; and `r` works at the client's level,
+/// the label of `via`, the token and, in bits 32-37 of x1, the level the
+/// client gives (`kcore::args::lent`); and `r` works at the client's level,
 /// under its own ceiling, until its reply with this token or its next
 /// receive. O(1).
 ///
@@ -578,10 +594,20 @@ unsafe fn accept(
         process::accepted(p, k.s).push_tail(slot);
         (*client.as_ptr()).waits = Some(Wait::Reply(p));
         deliver(r, client, desc);
+        // The level the client gives, which the boost below takes too.
+        let level = (*slot.as_ptr()).priority();
+        let ceiling = ceiling(r);
         let to = &mut (*r.as_ptr()).regs.x;
+        // The break tells the receiver's own base, which a client below a
+        // service of a higher base never shows.
+        #[cfg(feature = "break-lent-level")]
+        let told = (*r.as_ptr()).sched.base();
+        #[cfg(not(feature = "break-lent-level"))]
+        let told = level;
+        to[1] |= kcore::args::lent(told, ceiling);
         to[10] = via.label();
         to[11] = token;
-        sched::boost_in_place(k, r, (*slot.as_ptr()).priority(), ceiling(r), true);
+        sched::boost_in_place(k, r, level, ceiling, true);
         (*r.as_ptr()).boost_token = token;
         thread::set_server(client, r);
         let ch = via.channel().as_ptr();

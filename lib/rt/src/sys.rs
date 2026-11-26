@@ -1358,6 +1358,16 @@ impl Token {
         self.reply_receive_handles(channel, bytes, Outgoing::new())
     }
 
+    /// `reply_receive` that also returns the level the request or the
+    /// notification lends (`receive_lent`).
+    pub fn reply_receive_lent(
+        self,
+        channel: &Handle<Channel>,
+        bytes: &[u8],
+    ) -> Result<(Received, u8), Error> {
+        self.reply_receive_handles_lent(channel, bytes, Outgoing::new())
+    }
+
     /// reply_receive with `handles` in the reply, an `Outgoing` of at most
     /// abi::MESSAGE_HANDLES, each with TRANSFER: they move as `reply_handles`
     /// moves them. The kernel checks the message and its handles before it
@@ -1378,6 +1388,32 @@ impl Token {
         bytes: &[u8],
         handles: Outgoing,
     ) -> Result<Received, Error> {
+        self.reply_receive_with(channel, bytes, handles, received, receive)
+    }
+
+    /// `reply_receive_handles` that also returns the level the request or
+    /// the notification lends (`receive_lent`).
+    pub fn reply_receive_handles_lent(
+        self,
+        channel: &Handle<Channel>,
+        bytes: &[u8],
+        handles: Outgoing,
+    ) -> Result<(Received, u8), Error> {
+        self.reply_receive_with(channel, bytes, handles, received_lent, receive_lent)
+    }
+
+    /// The call of `reply_receive_handles` and its `_lent` form: `decode`
+    /// reads the registers the call left, and `receive` is the plain receive
+    /// that follows a reply the kernel refused for its token.
+    #[inline(always)]
+    fn reply_receive_with<R>(
+        self,
+        channel: &Handle<Channel>,
+        bytes: &[u8],
+        handles: Outgoing,
+        decode: fn([u64; 12]) -> Result<R, Error>,
+        receive: fn(&Handle<Channel>) -> Result<R, Error>,
+    ) -> Result<R, Error> {
         if bytes.len() > MESSAGE_MAX {
             return Err(Error::InvalidArgs);
         }
@@ -1390,7 +1426,7 @@ impl Token {
         // SAFETY: reply_receive uses no memory of the program but its own
         // message buffer; it reads x0-x10 and writes x0-x11 only.
         unsafe { trap::<{ Call::ReplyReceive.number() }, true>(&mut x) };
-        let result = received(x);
+        let result = decode(x);
         // x1 of an error says which half failed (abi::Call::ReplyReceive): 0, nothing
         // happened (BAD_STATE is the reply's: the token named no request that waited, and the
         // call receives as `receive` does); 1, the reply went and its handles are gone.
@@ -1707,25 +1743,84 @@ pub(crate) fn send_beat(channel: &Handle<Channel>, bytes: &[u8]) -> Result<Reply
 /// An enabled pending upcall within an entry deferral returns INTERRUPTED
 /// before consuming a notification or request. `try_receive` still polls.
 pub fn receive(channel: &Handle<Channel>) -> Result<Received, Error> {
-    receive_with(channel, 0)
+    received(receive_regs(channel, 0))
 }
 
 /// receive with abi::NO_WAIT: WOULD_BLOCK when the channel has nothing.
 pub fn try_receive(channel: &Handle<Channel>) -> Result<Received, Error> {
-    receive_with(channel, abi::NO_WAIT)
+    received(receive_regs(channel, abi::NO_WAIT))
 }
 
-/// receive with `flags`; the call is said to change x0-x11 (spec 11).
-fn receive_with(channel: &Handle<Channel>, flags: u64) -> Result<Received, Error> {
+/// `receive` that also returns the level the kernel tells in bits 32-37 of
+/// x1 (spec 6.6, abi::LEVEL_SHIFT): for a request the lower of the client's
+/// level at the meeting and the ceiling of the caller's process, for a
+/// notification of a channel that lends the same for its slot, 0 for the
+/// notification of a wait channel.
+pub fn receive_lent(channel: &Handle<Channel>) -> Result<(Received, u8), Error> {
+    received_lent(receive_regs(channel, 0))
+}
+
+/// `try_receive` that also returns the level (`receive_lent`).
+pub fn try_receive_lent(channel: &Handle<Channel>) -> Result<(Received, u8), Error> {
+    received_lent(receive_regs(channel, abi::NO_WAIT))
+}
+
+/// receive with `flags`: x0-x11 as the kernel left them; the call is said to
+/// change x0-x11 (spec 11).
+#[inline(always)]
+fn receive_regs(channel: &Handle<Channel>, flags: u64) -> [u64; 12] {
     let mut x = [0; 12];
     x[0] = channel.raw().0;
     x[1] = flags;
     // SAFETY: receive uses no memory of the program; it writes x0-x11 only.
     unsafe { trap::<{ Call::Receive.number() }, true>(&mut x) };
-    received(x)
+    x
 }
 
-/// Decodes the receive registers, retaining the complete message and handles.
+/// Decodes the receive registers, retaining the complete message and handles,
+/// with the level of bits 32-37 of x1.
+#[inline(always)]
+fn received_lent(x: [u64; 12]) -> Result<(Received, u8), Error> {
+    if let Some(e) = Error::from_code(x[0]) {
+        return Err(strict::<{ Call::Receive.number() }>(e));
+    }
+    let words: [u64; 11] = x[1..].try_into().expect("x1-x11");
+    if Source::from_code((words[0] >> SOURCE_SHIFT) & 0xF) == Source::Message {
+        let m = Message::from_words(words);
+        keep_whole(m.len, &m.words);
+        return Ok((
+            Received::Message {
+                label: m.label,
+                len: m.len,
+                handles: Incoming::from_buffer(m.handles),
+                token: Token(m.token),
+                words: m.words,
+            },
+            m.level,
+        ));
+    }
+    let Notification {
+        source,
+        label,
+        bits,
+        count,
+        level,
+    } = Notification::from_words(words);
+    Ok((
+        Received::Notification {
+            source,
+            label,
+            bits,
+            count,
+        },
+        level,
+    ))
+}
+
+/// Decodes the receive registers, with no look at the level. It repeats
+/// `received_lent` on purpose: a plain `receive` that went through the
+/// tuple of `received_lent` and dropped the level cost 115 more ticks on
+/// the round trip of rt, from copying the larger result.
 #[inline(always)]
 fn received(x: [u64; 12]) -> Result<Received, Error> {
     if let Some(e) = Error::from_code(x[0]) {
@@ -1748,6 +1843,7 @@ fn received(x: [u64; 12]) -> Result<Received, Error> {
         label,
         bits,
         count,
+        ..
     } = Notification::from_words(words);
     Ok(Received::Notification {
         source,
@@ -1762,6 +1858,13 @@ fn received(x: [u64; 12]) -> Result<Received, Error> {
 /// Kernel receive and idle before its return are outside this interval.
 #[cfg(feature = "step-stats")]
 pub fn receive_measured(channel: &Handle<Channel>) -> (u64, Result<Received, Error>) {
+    let (began, result) = receive_measured_lent(channel);
+    (began, result.map(|(r, _)| r))
+}
+
+/// `receive_measured` that also returns the level (`receive_lent`).
+#[cfg(feature = "step-stats")]
+pub fn receive_measured_lent(channel: &Handle<Channel>) -> (u64, Result<(Received, u8), Error>) {
     let mut x = [0; 12];
     x[0] = channel.raw().0;
     #[cfg(feature = "count-calls")]
@@ -1791,7 +1894,7 @@ pub fn receive_measured(channel: &Handle<Channel>) -> (u64, Result<Received, Err
             options(nostack),
         );
     }
-    (began, received(x))
+    (began, received_lent(x))
 }
 
 /// clock_now: nanoseconds on the counter's scale (spec 10), rounded down;
@@ -1827,4 +1930,60 @@ pub fn timer_set(timer: &Handle<Timer>, deadline: u64) -> Result<(), Error> {
 /// in its slot. A timer that is not armed is left as it is.
 pub fn timer_cancel(timer: &Handle<Timer>) -> Result<(), Error> {
     call::<{ Call::TimerCancel.number() }>(&[timer.raw().0]).map(drop)
+}
+
+#[cfg(test)]
+mod lent_tests {
+    use super::*;
+
+    /// A result of `receive` with the level in bits 32-37 of x1 gives the
+    /// same `Received` as one without it, and the level beside it.
+    #[test]
+    fn received_gives_the_level_beside_the_message() {
+        let message = |level: u64| {
+            let mut x = [0u64; 12];
+            // No handles: dropping an `Incoming` that holds some makes calls,
+            // which the host cannot make.
+            x[1] = 3 | level << abi::LEVEL_SHIFT;
+            x[2] = 0x0102_0304;
+            x[10] = 0xBEE;
+            x[11] = 7 << 16 | 1;
+            x
+        };
+        let (plain, level) = received_lent(message(0)).expect("a message");
+        assert_eq!(level, 0);
+        for told in [1, 28, 63] {
+            let (got, level) = received_lent(message(told)).expect("a message");
+            assert_eq!(got, plain);
+            assert_eq!(u64::from(level), told);
+            assert_eq!(received(message(told)).expect("a message"), plain);
+        }
+        let mut x = [0u64; 12];
+        x[1] = (Source::Timer.code() << SOURCE_SHIFT) | 31 << abi::LEVEL_SHIFT;
+        x[2] = 1;
+        x[3] = 2;
+        let (got, level) = received_lent(x).expect("a notification");
+        assert_eq!(level, 31);
+        assert_eq!(
+            got,
+            Received::Notification {
+                source: Source::Timer,
+                label: 0,
+                bits: 1,
+                count: 2,
+            }
+        );
+    }
+
+    /// An error reads x0 alone: the half that failed in x1 of a
+    /// `reply_receive` stays a bare 0 or 1.
+    #[test]
+    fn an_error_ignores_the_level_bits() {
+        let mut x = [0u64; 12];
+        x[0] = Error::PeerClosed.code();
+        x[1] = 1;
+        assert_eq!(received_lent(x).err(), Some(Error::PeerClosed));
+        assert!(reply_receive_took_handles(x[1], Error::PeerClosed));
+        assert!(!reply_receive_took_handles(0, Error::BadHandle));
+    }
 }
