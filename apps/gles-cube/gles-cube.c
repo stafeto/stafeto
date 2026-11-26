@@ -16,6 +16,10 @@
  * the lines it prints there are the reference of the lines it prints here
  * (tools/mesa-reference).
  *
+ * --stamps prints the microseconds of each frame's draw and swap and, with
+ * stafeto's platform, sets STAFETO_EGL_STAMPS so that every swap prints its own
+ * stamps (the wait, the driver's swap, the copy, the post, the interval's wait).
+ *
  * Options: --size N (the side of the square, default 160), --frames N (1 to
  * 10, default 10), --ascii N (print frame N, counted from 0, as 32 lines of 64
  * characters by brightness). The program asks for the software path of Mesa itself
@@ -153,6 +157,17 @@ static long long now_ms(void)
 	return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
+/* Whether the program prints its clock stamps (--stamps): microseconds of the
+ * draw of each frame and of its swap. Off, no clock is read for them. */
+static int stamps;
+
+static long long now_us(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (long long)t.tv_sec * 1000000 + t.tv_nsec / 1000;
+}
+
 static void crc_init(void)
 {
 	for (uint32_t n = 0; n < 256; n++) {
@@ -261,6 +276,8 @@ int main(int argc, char **argv)
 #endif
 		} else if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
 			size = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--stamps") == 0) {
+			stamps = 1;
 		} else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
 			frames = atoi(argv[++i]);
 		} else if (strcmp(argv[i], "--ascii") == 0 && i + 1 < argc) {
@@ -270,6 +287,8 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
+	if (stamps)
+		CHECK(setenv("STAFETO_EGL_STAMPS", "1", 1) == 0);
 	if (size == 0)
 		size = window ? 320 : 160;
 	if (!(pbuffer || window) || size < 16 || size > 1024 || frames < 1 || frames > FRAMES_MAX) {
@@ -398,6 +417,7 @@ int main(int argc, char **argv)
 		0, 0, -2.222222222f, 0};
 	for (int frame = 0; frame < frames; frame++) {
 		long long started = now_ms();
+		long long drawn = stamps ? now_us() : 0;
 		float sy = SIN_Y[frame], cy = COS_Y[frame], sx = SIN_X[frame], cx = COS_X[frame];
 		/* model = Rx * Ry, then the view moves the cube 4 units away. */
 		float ry[16] = {cy, 0, -sy, 0, 0, 1, 0, 0, sy, 0, cy, 0, 0, 0, 0, 1};
@@ -415,6 +435,8 @@ int main(int argc, char **argv)
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 		glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, (const void *)0);
 		glFinish();
+		if (stamps)
+			printf("gles-cube: stamp frame %d draw %lld us\n", frame, now_us() - drawn);
 		CHECK(glGetError() == GL_NO_ERROR);
 		memset(pixels, 0xA5, (size_t)size * size * 4);
 		glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
