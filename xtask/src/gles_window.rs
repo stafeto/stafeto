@@ -78,8 +78,8 @@ pub const SIZE: usize = 160;
 
 /// The prefix of the program's lines, and of the lines with the CRC the
 /// screenshots are compared with.
-const PREFIX: &str = "gles-cube: ";
-const SHOTS: [&str; 2] = ["gles-cube: window crc ", "gles-cube: last crc "];
+pub(crate) const PREFIX: &str = "gles-cube: ";
+pub(crate) const SHOTS: [&str; 2] = ["gles-cube: window crc ", "gles-cube: last crc "];
 const ENDED: &str = "init: gles-cube ended: exit code 0, not restarted";
 
 /// The checks of the API, each a line the program prints once it passed
@@ -139,7 +139,7 @@ const API: [(&str, &str); 13] = [
 /// A line that ends the probe in failure: a check of the program that failed,
 /// a shader that did not compile, the drawing copy ending in another way, or
 /// the program ending with a code other than 0.
-fn failure(line: &str) -> Option<String> {
+pub(crate) fn failure(line: &str) -> Option<String> {
     let failed = line.starts_with("gles-cube: check failed")
         || line.starts_with("gles-cube: shader")
         || line.starts_with("gles-cube: the drawing copy")
@@ -181,6 +181,20 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<[u32; 2], String> {
 /// six frames came in order with different CRCs and sums above 0, each swap
 /// took a time, and the two screenshots differ.
 pub fn verdict(lines: &[String], shots: [u32; 2]) -> Result<(), String> {
+    verdict_of(lines, shots, End::Exit)
+}
+
+/// How the program ends: with the code 0 after "ok" (init's line follows), or
+/// holding the window for a scene's holder (`--hold`), the CRC of the screen it
+/// holds being its last line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum End {
+    Exit,
+    Held,
+}
+
+/// `verdict` for either end.
+pub fn verdict_of(lines: &[String], shots: [u32; 2], end: End) -> Result<(), String> {
     if let Some(failed) = lines.iter().find_map(|l| failure(l)) {
         return Err(failed);
     }
@@ -253,14 +267,27 @@ pub fn verdict(lines: &[String], shots: [u32; 2]) -> Result<(), String> {
     if shots[0] == shots[1] {
         return Err("the screen did not change between the two screenshots".to_owned());
     }
-    if seen.last() != Some(&"ok") {
-        return Err(format!(
-            "the program ended with {:?}, \"ok\" expected",
-            seen.last()
-        ));
-    }
-    if !lines.iter().any(|l| l == ENDED) {
-        return Err(format!("init never printed {ENDED:?}"));
+    match end {
+        End::Exit => {
+            if seen.last() != Some(&"ok") {
+                return Err(format!(
+                    "the program ended with {:?}, \"ok\" expected",
+                    seen.last()
+                ));
+            }
+            if !lines.iter().any(|l| l == ENDED) {
+                return Err(format!("init never printed {ENDED:?}"));
+            }
+        }
+        End::Held => {
+            let held = seen.iter().filter(|l| l.starts_with("held crc ")).count();
+            if held != 1 || !seen.last().is_some_and(|l| l.starts_with("held crc ")) {
+                return Err(format!(
+                    "the program held {held} times and its last line is {:?}, one \"held crc\" line as the last expected",
+                    seen.last()
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -439,6 +466,22 @@ mod tests {
                     .contains("pbuffer probe")
             );
         }
+    }
+
+    /// A cube that holds its window ends with the line of its held CRC and no "ok".
+    #[test]
+    fn a_held_window_ends_with_its_held_crc() {
+        let mut lines = run();
+        lines.retain(|l| l != "gles-cube: ok" && l != ENDED);
+        assert!(verdict_of(&lines, [1, 2], End::Held).is_err());
+        lines.push("gles-cube: held crc 99e46166".to_owned());
+        assert_eq!(verdict_of(&lines, [1, 2], End::Held), Ok(()));
+        // Twice, or followed by another line of the cube, is refused.
+        let mut twice = lines.clone();
+        twice.push("gles-cube: held crc 99e46166".to_owned());
+        assert!(verdict_of(&twice, [1, 2], End::Held).is_err());
+        lines.push("gles-cube: ok".to_owned());
+        assert!(verdict_of(&lines, [1, 2], End::Held).is_err());
     }
 
     #[test]

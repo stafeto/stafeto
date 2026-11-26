@@ -96,3 +96,38 @@ pub const DEQP_TABLE: &[Record] = &[
     entropy::RNG,
     entropy::ENTROPY,
 ];
+
+const fn scene_table(args: &'static [u8]) -> [Record; 9] {
+    [
+        RAM_FIFO_CLOCKED,
+        Record {
+            quota: POSIX_ABI_TABLE[1].quota + 3 * CUBE_QUOTA + 384 * PAGE,
+            ..POSIX_ABI_TABLE[1]
+        },
+        POSIX_ABI_TABLE[2],
+        PIPE,
+        comp::DISPLAY,
+        comp::COMPOSITOR,
+        Record {
+            name: "wfc-demo",
+            program: "wfc-demo",
+            args,
+            connects: &["ramfs", "pipe", "clock", "posix", "entropy", "gpu"],
+            root: true,
+            quota: CUBE_QUOTA,
+            ..POSIX
+        },
+        entropy::RNG,
+        entropy::ENTROPY,
+    ]
+}
+
+/// The probe of the graphics of Mesa (xtask gles-probe): the demo of scenes
+/// (`table::COMP_SCENES` gives its session the scene's mark) starts the cube
+/// and the field of cubes, each with the quota it inherits from the demo's
+/// record, 128 MiB, and shows their windows. The process service's pool holds
+/// three such quotas: the cube, its child that forks and swaps, and the field.
+pub const TABLE: &[Record] = &scene_table(b"wfc-demo\0--gles\0");
+
+/// The probe under -icount: no pauses, the services' steps counted.
+pub const STEPS_TABLE: &[Record] = &scene_table(b"wfc-demo\0--gles\0--quick\0");

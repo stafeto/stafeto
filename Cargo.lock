@@ -466,6 +466,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gles3-demo"
+version = "0.7.0-pre.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "gpu-probe"
 version = "0.1.0"
 dependencies = [

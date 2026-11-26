@@ -1600,6 +1600,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-gles-pbuffer") as usize
     + cfg!(feature = "table-deqp") as usize
     + cfg!(feature = "table-gles-window") as usize
+    + cfg!(feature = "table-gles") as usize
+    + cfg!(feature = "table-gles-steps") as usize
     + cfg!(feature = "table-posix-procs") as usize
     + cfg!(feature = "table-posix-lock-ring") as usize
     + cfg!(feature = "table-posix-shares") as usize
@@ -1715,6 +1717,8 @@ const _: () = assert!(
     feature = "table-gles-pbuffer",
     feature = "table-deqp",
     feature = "table-gles-window",
+    feature = "table-gles",
+    feature = "table-gles-steps",
     feature = "table-posix-procs",
     feature = "table-posix-lock-ring",
     feature = "table-posix-shares",
@@ -1840,6 +1844,10 @@ pub const TABLE: &[Record] = gles::PBUFFER_TABLE;
 pub const TABLE: &[Record] = gles::WINDOW_TABLE;
 #[cfg(feature = "table-deqp")]
 pub const TABLE: &[Record] = gles::DEQP_TABLE;
+#[cfg(feature = "table-gles")]
+pub const TABLE: &[Record] = gles::TABLE;
+#[cfg(feature = "table-gles-steps")]
+pub const TABLE: &[Record] = gles::STEPS_TABLE;
 #[cfg(feature = "table-os-test")]
 pub const TABLE: &[Record] = ramfs::OS_TEST_TABLE;
 #[cfg(feature = "table-os-test-data")]
@@ -4216,7 +4224,7 @@ mod tests {
         // Every holder the table names is a record of some image.
         for name in COMP_SCENES {
             assert!(
-                [comp::TABLE, wfc::TABLE]
+                [comp::TABLE, wfc::TABLE, gles::TABLE]
                     .iter()
                     .any(|t| t.iter().any(|r| r.name == *name)),
                 "{name}"
@@ -4370,6 +4378,8 @@ mod tests {
             gles::PBUFFER_TABLE,
             gles::WINDOW_TABLE,
             gles::DEQP_TABLE,
+            gles::TABLE,
+            gles::STEPS_TABLE,
             wfd::TABLE,
             wfd::STEPS_TABLE,
             ramfs::DISPLAY_TABLE,

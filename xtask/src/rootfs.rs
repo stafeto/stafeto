@@ -2636,6 +2636,18 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        // The demo of scenes starts the cube and the field of cubes from their files.
+        "boot-gles.img" | "boot-gles-steps.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/wfc-demo", 0o755, ROOT, "wfc-demo"),
+                file("/bin/gles-cube", 0o755, ROOT, "gles-cube"),
+                file("/bin/gles3-demo", 0o755, ROOT, "gles3-demo"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
         "boot-wfc.img" | "boot-wfc-steps.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -3756,6 +3768,8 @@ mod tests {
             "boot-gles-pbuffer.img",
             "boot-deqp.img",
             "boot-gles-window.img",
+            "boot-gles.img",
+            "boot-gles-steps.img",
             "boot-wfc.img",
             "boot-wfc-steps.img",
             "boot-wfd.img",

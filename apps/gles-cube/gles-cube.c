@@ -27,7 +27,11 @@
  * (<stafeto/window.h>, the window surface of EGL on stafeto's platform) and
  * swaps each frame; the default size is 320. It checks the API of the platform
  * first (docs/egl.md) and prints the CRC of the screen two times for the host
- * to compare with QEMU's screenshot.
+ * to compare with QEMU's screenshot. With --hold FD (the copy that draws,
+ * --window-run) the window is kept after the last check: the program prints the
+ * CRC of the screen once more ("held crc"), writes a byte to the descriptor FD
+ * and sleeps until it is killed, so that the holder of a scene (wfc-demo
+ * --gles) can show the window and compare.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -240,6 +244,9 @@ int main(int argc, char **argv)
 	int window = 0;
 	int window_run = 0;
 	int ascii = -1;
+#ifdef STAFETO_WINDOW
+	int hold_fd = -1;
+#endif
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--pbuffer") == 0) {
 			pbuffer = 1;
@@ -249,6 +256,8 @@ int main(int argc, char **argv)
 		} else if (strcmp(argv[i], "--window-run") == 0) {
 			window = 1;
 			window_run = 1;
+		} else if (strcmp(argv[i], "--hold") == 0 && i + 1 < argc) {
+			hold_fd = atoi(argv[++i]);
 #endif
 		} else if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
 			size = atoi(argv[++i]);
@@ -264,7 +273,7 @@ int main(int argc, char **argv)
 	if (size == 0)
 		size = window ? 320 : 160;
 	if (!(pbuffer || window) || size < 16 || size > 1024 || frames < 1 || frames > FRAMES_MAX) {
-		printf("usage: gles-cube --pbuffer|--window [--size N] [--frames N]\n");
+		printf("usage: gles-cube --pbuffer|--window [--size N] [--frames N] [--hold FD]\n");
 		return 2;
 	}
 #ifdef STAFETO_WINDOW
@@ -437,7 +446,7 @@ int main(int argc, char **argv)
 	free(pixels);
 #ifdef STAFETO_WINDOW
 	if (window) {
-		window_terminate(display, surface);
+		window_terminate(display, surface, hold_fd);
 		printf("gles-cube: ok\n");
 		return 0;
 	}

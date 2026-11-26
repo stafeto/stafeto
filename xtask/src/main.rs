@@ -78,6 +78,7 @@ mod frame_probe;
 mod fstack_device;
 mod fstack_probe;
 mod gles_pbuffer;
+mod gles_probe;
 mod gles_window;
 mod gpu_probe;
 mod guards;
@@ -2222,6 +2223,11 @@ commands:
             platform of EGL (the format, the handles, a second surface, a swap in a forked child,
             two threads), six frames swapped into a window of 160 by 160, QEMU's screenshot
             compared with the CRC the program prints at two of them
+  gles-probe [pbuffer|scene|steps] the probe of the graphics of Mesa (ci runs it): the cube into a
+            pbuffer; then the scene (apps/wfc-demo --gles) that shows the cube of EGL and the field
+            of 64 instanced cubes of OpenGL ES 3 in windows, with QEMU's screenshots compared with the
+            CRCs the programs print and with the host's frame of the scene that turns the cube's
+            window by 90 degrees and scales it by one half; then the same scene under -icount
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
   sporadic-probe SCHED_SPORADIC in 0.5.0 through relibc and the layer: refused for root and for a user
@@ -2730,6 +2736,7 @@ fn main() {
         Some("deqp") => deqp::probe(&qemu::VIRT_1G),
         Some("gles-pbuffer") => gles_pbuffer::probe(&qemu::VIRT_1G),
         Some("gles-window") => gles_window::probe(&qemu::VIRT_1G),
+        Some("gles-probe") => gles_probe::command(&args[1..], &qemu::VIRT_1G),
         Some("os-test") => match &args[1..] {
             [flag, rest @ ..] if flag == "--full-basic" => {
                 jobs::parse_jobs("os-test --full-basic", rest).and_then(ostest::run_full_basic)
@@ -10988,7 +10995,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("relibc-hello", relibc_hello_probe),
         job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
         job("cxx-probe", || cxx_probe::probe(&qemu::VIRT)),
-        job("gles-pbuffer", || gles_pbuffer::probe(&qemu::VIRT_1G)),
+        job("gles-probe", || gles_probe::probe(&qemu::VIRT_1G, false)),
+        job("gles-probe steps", || gles_probe::steps(&qemu::VIRT_1G)),
         job("posix-files", posix_files_probe),
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
@@ -15096,6 +15104,7 @@ fn ci_lints() -> Result<(), String> {
         "gles-cube",
         "--package",
         "deqp-egl",
+        "gles3-demo",
         "--package",
         "posix-procs",
         "--package",
@@ -17900,6 +17909,11 @@ mod entropy_in_images_tests {
             ("gles_pbuffer::PROGRAMS", &crate::gles_pbuffer::PROGRAMS),
             ("deqp::PROGRAMS", &crate::deqp::PROGRAMS),
             ("gles_window::PROGRAMS", &crate::gles_window::PROGRAMS),
+            ("gles_probe::PROGRAMS", &crate::gles_probe::PROGRAMS),
+            (
+                "gles_probe::STEPS_PROGRAMS",
+                &crate::gles_probe::STEPS_PROGRAMS,
+            ),
             ("wfd::PROGRAMS", &crate::wfd::PROGRAMS),
             ("wfd::STEPS_PROGRAMS", &crate::wfd::STEPS_PROGRAMS),
             ("store_probe::PROGRAMS", &crate::store_probe::PROGRAMS),
