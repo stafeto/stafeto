@@ -578,20 +578,65 @@ fn loader_text(lines: &[String]) -> String {
 /// The run under -icount: the demo does not pause for the monitor, and the steps
 /// of the compositor and the driver are read from their lines.
 pub fn steps(machine: &qemu::Machine) -> Result<(), String> {
+    let output = run_steps_image(machine)?;
+    // The numbers of the load and of the stamps are told before the verdicts of the steps.
+    println!("{}", load_report(&output.lines)?);
+    judge_steps(machine, &output)?;
+    load_verdict(&output.lines)
+}
+
+/// `gles-probe load`: the run of the same image, with the numbers of the load beside a
+/// window with no GLES and of the clock stamps, and the verdict on the load alone (the
+/// verdicts of the steps are `steps`').
+pub fn load(machine: &qemu::Machine) -> Result<(), String> {
+    let output = run_steps_image(machine)?;
+    println!("{}", load_report(&output.lines)?);
+    if machine.is_hvf() {
+        // The host's clock and the host's processor: the numbers are the report, and the
+        // verdict of the late frames is the run under -icount's.
+        println!(
+            "gles-probe on {}: the load and the stamps of the cube under HVF (no verdict)",
+            machine.name
+        );
+        return Ok(());
+    }
+    load_verdict(&output.lines)
+}
+
+/// The lines of the scene proper: the demo's first part is the load (`run_load` of
+/// wfc-demo), which ends with the line `LOAD_END`.
+fn scene_lines(lines: &[String]) -> &[String] {
+    match lines.iter().position(|l| l == LOAD_END) {
+        Some(at) => &lines[at + 1..],
+        None => lines,
+    }
+}
+
+/// The run of the image under -icount, up to the demo's end and its marker.
+fn run_steps_image(machine: &qemu::Machine) -> Result<qemu::Outcome, String> {
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-gles-steps.img", &STEPS_PROGRAMS, BOOT_PROFILE)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::GPU);
-    cmd.args(qemu::ICOUNT);
+    // -icount and HVF exclude each other: the hypervisor's run keeps the host's clock.
+    if !machine.is_hvf() {
+        cmd.args(qemu::ICOUNT);
+    }
     let output = run_until(cmd, crate::BOOT_TIMEOUT * 8, Some(ENDS), &kernel.elf)?;
     qemu::expect_stopped_on(&output, ENDED)?;
     if let Some(failed) = output.lines.iter().find_map(|l| failure(l)) {
         return Err(format!("gles-probe under -icount: {failed}"));
     }
     qemu::expect_marker(&output, LINE_OK)?;
+    Ok(output)
+}
+
+/// The verdicts of the steps of the run.
+fn judge_steps(machine: &qemu::Machine, output: &qemu::Outcome) -> Result<(), String> {
     // The screenshots are not taken here: the programs' own lines are judged.
-    lines_verdict(&output.lines, [1, 2]).map_err(|e| format!("gles-probe under -icount: {e}"))?;
+    lines_verdict(scene_lines(&output.lines), [1, 2])
+        .map_err(|e| format!("gles-probe under -icount: {e}"))?;
     let (comp, driver) = steps_verdict(&output.lines)?;
     println!(
         "{}",
@@ -625,15 +670,175 @@ pub fn steps(machine: &qemu::Machine) -> Result<(), String> {
     Ok(())
 }
 
-/// `cargo xtask gles-probe [pbuffer|scene|steps]`: the three boots, or one.
+const LOAD_END: &str = "wfc-demo: load ok";
+const LOAD_PREFIX: &str = "wfc-demo: load ";
+
+/// What the paced client of the demo told of a phase: `wfc-demo: load PHASE posts P late L
+/// late2 L2 take max T us mean M us wake max W us unfreed U`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Phase {
+    pub posts: u64,
+    pub late: u64,
+    pub late2: u64,
+    pub take_max_us: u64,
+    pub take_mean_us: u64,
+    pub wake_max_us: u64,
+    pub unfreed: u64,
+}
+
+fn phase_of(lines: &[String], name: &str) -> Result<Phase, String> {
+    let prefix = format!("{LOAD_PREFIX}{name} posts ");
+    let line = lines
+        .iter()
+        .find(|l| l.starts_with(&prefix))
+        .ok_or_else(|| format!("no line {prefix:?} of the load"))?;
+    let words: Vec<&str> = line[LOAD_PREFIX.len()..].split_whitespace().collect();
+    let get = |key: &str, skip: usize| -> Result<u64, String> {
+        let at = words
+            .iter()
+            .position(|w| *w == key)
+            .ok_or_else(|| format!("{line:?}: no {key}"))?;
+        words
+            .get(at + skip)
+            .and_then(|w| w.parse().ok())
+            .ok_or_else(|| format!("{line:?}: no number after {key}"))
+    };
+    Ok(Phase {
+        posts: get("posts", 1)?,
+        late: get("late", 1)?,
+        late2: get("late2", 1)?,
+        take_max_us: get("take", 2)?,
+        take_mean_us: get("mean", 1)?,
+        wake_max_us: get("wake", 2)?,
+        unfreed: get("unfreed", 1)?,
+    })
+}
+
+/// The load beside a window of a client with no GLES: the cube drawing in its window must
+/// not raise the late frames of the paced client. The count of late frames (the post to the
+/// free bit over one period) per post of the phase with the cube is at most the quiet
+/// phase's, no frame is over two periods that was not in the quiet phase, and the client
+/// posted in both.
+pub fn load_verdict(lines: &[String]) -> Result<(), String> {
+    let quiet = phase_of(lines, "quiet")?;
+    let cube = phase_of(lines, "cube")?;
+    if quiet.posts < 60 || cube.posts < 60 {
+        return Err(format!(
+            "load: the client posted {} and {} times, 60 at least expected",
+            quiet.posts, cube.posts
+        ));
+    }
+    if u128::from(cube.late) * u128::from(quiet.posts)
+        > u128::from(quiet.late) * u128::from(cube.posts)
+    {
+        return Err(format!(
+            "load: late frames of a window with no GLES rose with the cube: {} of {} against {} of {} alone",
+            cube.late, cube.posts, quiet.late, quiet.posts
+        ));
+    }
+    if cube.late2 > quiet.late2 {
+        return Err(format!(
+            "load: {} frames over two periods with the cube, {} alone",
+            cube.late2, quiet.late2
+        ));
+    }
+    Ok(())
+}
+
+/// The numbers of a run of stamps, in microseconds: the count, the most and the mean.
+fn stat(values: &[u64]) -> String {
+    match values.iter().max() {
+        None => "none".to_owned(),
+        Some(max) => format!(
+            "{} max {max} mean {}",
+            values.len(),
+            values.iter().sum::<u64>() / values.len() as u64
+        ),
+    }
+}
+
+/// The numbers after `key` in the stamp lines that start with `prefix`.
+fn stamps_of(lines: &[String], prefix: &str, key: &str) -> Vec<u64> {
+    lines
+        .iter()
+        .filter(|l| l.starts_with(prefix))
+        .filter_map(|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            if key == "us" {
+                // The number before the last word: `... (interval 1) 9500 us`.
+                return words.get(words.len().checked_sub(2)?)?.parse().ok();
+            }
+            let at = words.iter().position(|w| *w == key)?;
+            words.get(at + 1)?.parse().ok()
+        })
+        .collect()
+}
+
+/// The report of the load and of the clock stamps (the cube's frames, the swap and the
+/// copy of the frame into the window, microseconds of the clock under -icount): the
+/// per-frame lines and the summary of each of the two runs of the cube, the one beside the
+/// window of the client (the load) and the one of the scene.
+pub fn load_report(lines: &[String]) -> Result<String, String> {
+    let at = lines.iter().position(|l| l == LOAD_END);
+    let (beside, alone): (&[String], &[String]) = match at {
+        Some(at) => (&lines[..at], &lines[at + 1..]),
+        None => (&[], lines),
+    };
+    let mut out = String::new();
+    for (name, part) in [("beside a window with no GLES", beside), ("scene", alone)] {
+        out += &format!("gles-probe: the cube, {name}:\n");
+        let mut swaps: Vec<String> = Vec::new();
+        for k in 0..6 {
+            let draw = stamps_of(part, &format!("gles-cube: stamp frame {k} "), "draw");
+            let swap = stamps_of(part, &format!("gles-cube: stamp swap {k} "), "us");
+            // The platform prints its line of a swap just before the cube's.
+            let egl = part
+                .iter()
+                .position(|l| l.starts_with(&format!("gles-cube: stamp swap {k} ")))
+                .and_then(|at| at.checked_sub(1))
+                .map(|at| &part[at])
+                .filter(|l| l.starts_with("egl-stamp: "));
+            out += &format!(
+                "  frame {k}: draw {} us, swap {} us, {}\n",
+                draw.first().map_or("none".to_owned(), u64::to_string),
+                swap.first().map_or("none".to_owned(), u64::to_string),
+                egl.map_or("no stamp of the platform", |l| l.as_str())
+            );
+            swaps.extend(egl.cloned());
+        }
+        let draw = stamps_of(part, "gles-cube: stamp frame ", "draw");
+        let swap = stamps_of(&swaps, "egl-stamp: swap ", "draw");
+        let copy = stamps_of(&swaps, "egl-stamp: swap ", "copy");
+        let ifwait = stamps_of(&swaps, "egl-stamp: swap ", "ifwait");
+        out += &format!(
+            "  draw of a frame (us): {}; swap of the driver: {}; copy into the window (putImage): {}; wait of the interval: {}\n",
+            stat(&draw),
+            stat(&swap),
+            stat(&copy),
+            stat(&ifwait)
+        );
+    }
+    for name in ["quiet", "cube"] {
+        let p = phase_of(lines, name)?;
+        out += &format!(
+            "gles-probe: the client with no GLES, {name}: {} posts, late {}, over two periods {}, post to free bit max {} us mean {} us, wake-up late max {} us, buffers not freed {}\n",
+            p.posts, p.late, p.late2, p.take_max_us, p.take_mean_us, p.wake_max_us, p.unfreed
+        );
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+/// `cargo xtask gles-probe [pbuffer|scene|steps|load [--hvf]]`: the three boots, or one.
 pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
     match args.first().map(String::as_str) {
         None => probe(machine, true),
         Some("pbuffer") => crate::gles_pbuffer::probe(machine),
         Some("scene") => scene(machine),
         Some("steps") => steps(machine),
+        Some("load") if args.get(1).map(String::as_str) == Some("--hvf") => load(&qemu::HVF_V2_1G),
+        Some("load") => load(machine),
         Some(other) => Err(format!(
-            "gles-probe: unknown argument {other:?}; pbuffer, scene, steps or none"
+            "gles-probe: unknown argument {other:?}; pbuffer, scene, steps, load or none"
         )),
     }
 }
@@ -888,5 +1093,61 @@ mod tests {
             text.contains("5000 ticks at most") && text.ends_with("copy 70000"),
             "{text}"
         );
+    }
+
+    fn load_lines(quiet_late: u64, cube_late: u64) -> Vec<String> {
+        let mut lines = Vec::new();
+        for k in 0..6 {
+            lines.push(format!(
+                "gles-cube: stamp frame {k} draw {} us",
+                650_000 + k
+            ));
+            lines.push(format!(
+                "egl-stamp: swap wait 3 draw {} copy 200 post 40 ifwait 9000 us",
+                400 + k
+            ));
+            lines.push(format!("gles-cube: stamp swap {k} (interval 1) 9500 us"));
+        }
+        lines.push(format!(
+            "wfc-demo: load quiet posts 120 late {quiet_late} late2 0 take max 17000 us mean 8000 us wake max 120 us unfreed 0"
+        ));
+        lines.push(format!(
+            "wfc-demo: load cube posts 600 late {cube_late} late2 0 take max 18000 us mean 8100 us wake max 300 us unfreed 0"
+        ));
+        lines.push(LOAD_END.to_owned());
+        lines
+    }
+
+    #[test]
+    fn the_load_with_no_more_late_frames_passes_and_is_reported() {
+        let lines = load_lines(2, 10);
+        load_verdict(&lines).unwrap();
+        let report = load_report(&lines).unwrap();
+        assert!(
+            report.contains("copy into the window (putImage): 6 max 200 mean 200"),
+            "{report}"
+        );
+        assert!(
+            report.contains("frame 3: draw 650003 us, swap 9500 us, egl-stamp: swap wait 3"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn late_frames_that_rise_with_the_cube_fail() {
+        assert!(
+            load_verdict(&load_lines(2, 11))
+                .unwrap_err()
+                .contains("rose")
+        );
+        assert!(load_verdict(&load_lines(0, 1)).is_err());
+    }
+
+    #[test]
+    fn a_load_that_did_not_post_or_is_missing_fails() {
+        assert!(load_verdict(&[]).is_err());
+        let mut lines = load_lines(0, 0);
+        lines[18] = lines[18].replace("posts 120", "posts 5");
+        assert!(load_verdict(&lines).unwrap_err().contains("60 at least"));
     }
 }

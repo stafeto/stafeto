@@ -79,6 +79,9 @@ struct dri2_stafeto_surface {
    int target;
    struct swap_rect copy;
    bool copied;
+   /* The clock stamps of the swap under way (STAFETO_EGL_STAMPS): the time of
+    * the copy into the window's buffer, in nanoseconds. */
+   uint64_t copy_ns;
 };
 
 static uint64_t
@@ -88,6 +91,18 @@ now_ns(void)
 
    clock_gettime(CLOCK_MONOTONIC, &t);
    return (uint64_t)t.tv_sec * UINT64_C(1000000000) + (uint64_t)t.tv_nsec;
+}
+
+/* Whether the swaps print their clock stamps: the variable STAFETO_EGL_STAMPS is
+ * set (looked at once). With it unset a swap reads no clock and prints nothing. */
+static bool
+stafeto_stamps_on(void)
+{
+   static int on = -1;
+
+   if (on < 0)
+      on = getenv("STAFETO_EGL_STAMPS") != NULL;
+   return on;
 }
 
 /* The window of the surface is open and is the one the surface was made for:
@@ -163,9 +178,13 @@ stafeto_put_image2(struct dri_drawable *draw, int op, int x, int y, int w,
     * front buffer) have nowhere to go. */
    if (op != __DRI_SWRAST_IMAGE_OP_SWAP || !s || s->target < 0)
       return;
+   uint64_t began = stafeto_stamps_on() ? now_ns() : 0;
+
    swap_blit(s->window.pixels[s->target], s->window.stride, s->window.width,
              s->window.height, (const unsigned char *)data, (size_t)stride, x, y,
              w, h, BYTES_PER_POINT, 0, s->copy);
+   if (began)
+      s->copy_ns = now_ns() - began;
    s->copied = true;
 }
 
@@ -455,6 +474,8 @@ stafeto_swap(_EGLDisplay *disp, _EGLSurface *draw, const EGLint *rects,
    struct swap_plan plan;
    struct stafeto_rect post[SWAP_POST_MAX];
    int buffer, before;
+   const bool stamps = stafeto_stamps_on();
+   uint64_t t0 = stamps ? now_ns() : 0, t1 = 0, t2 = 0, t3 = 0;
 
    /* A forked child has no window: the surface is the parent's, and what the
     * window library knows in the child is another window's or none. A child
@@ -475,12 +496,17 @@ stafeto_swap(_EGLDisplay *disp, _EGLSurface *draw, const EGLint *rects,
       return _eglError(EGL_BAD_NATIVE_WINDOW, "eglSwapBuffers: no free buffer");
    }
 
+   if (stamps)
+      t1 = now_ns();
    swap_plan_make(&s->history, (unsigned)buffer, rects, n_rects, &plan);
    s->target = buffer;
+   s->copy_ns = 0;
    s->copy = plan.copy;
    s->copied = false;
    driSwapBuffers(dri2_surf->dri_drawable, 0, NULL);
    s->target = -1;
+   if (stamps)
+      t2 = now_ns();
    if (!s->copied && !swap_rect_empty(plan.copy))
       _eglLog(_EGL_WARNING, "eglSwapBuffers: the driver put no image");
 
@@ -496,6 +522,8 @@ stafeto_swap(_EGLDisplay *disp, _EGLSurface *draw, const EGLint *rects,
    }
    before = s->shown;
    s->shown = buffer;
+   if (stamps)
+      t3 = now_ns();
 
    /* An interval of 1 waits until the service takes the frame into one of its
     * own, which frees the buffer the window showed before. A frame that is
@@ -507,6 +535,18 @@ stafeto_swap(_EGLDisplay *disp, _EGLSurface *draw, const EGLint *rects,
          swap_history_reset(&s->history);
          return _eglError(EGL_BAD_NATIVE_WINDOW, "eglSwapBuffers: the service is gone");
       }
+   }
+   if (stamps) {
+      /* Microseconds: the wait for a free buffer, the driver's swap (which
+       * holds the copy of the frame), the copy alone, the post and the wait of
+       * the interval. */
+      fprintf(stderr,
+              "egl-stamp: swap wait %llu draw %llu copy %llu post %llu ifwait %llu us\n",
+              (unsigned long long)((t1 - t0) / 1000),
+              (unsigned long long)((t2 - t1) / 1000),
+              (unsigned long long)(s->copy_ns / 1000),
+              (unsigned long long)((t3 - t2) / 1000),
+              (unsigned long long)((now_ns() - t3) / 1000));
    }
    return EGL_TRUE;
 }

@@ -31,6 +31,7 @@
  */
 
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -583,10 +584,145 @@ static int gles_commit(const char *line) {
     return 0;
 }
 
+/* The load of the cube beside a window with no GLES (--gles --quick, under -icount): a
+ * paced client of 60 Hz in a window of its own posts a moving stripe each period, first
+ * alone and then while the cube draws in its window. For each post it takes the time
+ * from the post to the free bit of the buffer the window showed before (the wait an
+ * eglSwapInterval(1) makes), and the lateness of its own wake-up. A frame is late when
+ * that time is over one period. The two lines are compared by the probe. */
+#define LOAD_PERIOD_NS 16666667ULL
+#define LOAD_W 160
+#define LOAD_H 100
+#define LOAD_QUIET_FRAMES 120
+#define LOAD_CUBE_FRAMES_MAX 3000
+
+static uint64_t mono_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ULL + (uint64_t)t.tv_nsec;
+}
+
+static void sleep_until_ns(uint64_t at) {
+    struct timespec t = {(time_t)(at / 1000000000ULL), (long)(at % 1000000000ULL)};
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, NULL);
+}
+
+/* One phase of the paced client: `frames` posts, or posts until `stop_fd` is readable (the
+ * cube holds its last frame) at most LOAD_CUBE_FRAMES_MAX. Prints the phase's line. */
+static int paced_phase(const char *name, int frames, int stop_fd) {
+    struct stafeto_window w;
+    uint64_t t0 = mono_ns() + 2 * LOAD_PERIOD_NS;
+    uint64_t take_max = 0, take_sum = 0, wake_max = 0;
+    unsigned over1 = 0, over2 = 0, posts = 0, replaced = 0;
+    int limit = stop_fd >= 0 ? LOAD_CUBE_FRAMES_MAX : frames;
+
+    CHECK(stafeto_window_info(0, &w) == 0);
+    for (int k = 0; k < limit; k++) {
+        uint32_t free_bits = 0;
+        unsigned b = (unsigned)k % w.buffers, prev = (unsigned)(k + w.buffers - 1) % w.buffers;
+        uint64_t due = t0 + (uint64_t)k * LOAD_PERIOD_NS, woke, posted, took;
+
+        if (stop_fd >= 0) {
+            struct pollfd p = {stop_fd, POLLIN, 0};
+            if (poll(&p, 1, 0) > 0) break;
+        }
+        sleep_until_ns(due);
+        woke = mono_ns();
+        if (woke > due && woke - due > wake_max) wake_max = woke - due;
+        if (!(stafeto_window_free_buffers(0) & (1u << b)))
+            CHECK(stafeto_window_wait_free(0, 1u << b, 1000000000ULL, &free_bits) == 0);
+        for (int y = 0; y < 8; y++) {
+            uint32_t *row = (uint32_t *)((char *)w.pixels[b] + (size_t)((k * 9 + y) % LOAD_H) * w.stride);
+            for (int x = 0; x < LOAD_W; x++) row[x] = 0x00C04020u | (uint32_t)(k & 0x3F) << 8;
+        }
+        CHECK(stafeto_window_post(0, b, NULL, 0) == 0);
+        posted = mono_ns();
+        posts++;
+        if (k == 0) continue;
+        if (stafeto_window_wait_free(0, 1u << prev, 1000000000ULL, &free_bits) != 0) {
+            replaced++;
+            continue;
+        }
+        took = mono_ns() - posted;
+        take_sum += took;
+        if (took > take_max) take_max = took;
+        if (took > LOAD_PERIOD_NS) over1++;
+        if (took > 2 * LOAD_PERIOD_NS) over2++;
+    }
+    printf("wfc-demo: load %s posts %u late %u late2 %u take max %llu us mean %llu us wake max %llu us unfreed %u\n",
+           name, posts, over1, over2, (unsigned long long)(take_max / 1000),
+           (unsigned long long)(posts > 1 ? take_sum / (posts - 1) / 1000 : 0),
+           (unsigned long long)(wake_max / 1000), replaced);
+    fflush(stdout);
+    return 0;
+}
+
+static int run_load(void) {
+    static const char *const cube_argv[] = {"gles-cube", "--window-run", "--size", "160",
+                                            "--frames", "6", "--stamps"};
+    struct stafeto_window w;
+    WFCNativeStreamType id_p = 0, id_c = 0;
+    WFCSource source_p, source_c;
+    WFCElement plain, cube;
+    WFCint plain_at[4] = {20, 20, LOAD_W, LOAD_H};
+    WFCint cube_at[4] = {GLES_CUBE_X, GLES_CUBE_Y, GLES_SIZE, GLES_SIZE};
+    WFCfloat src[4] = {0, 0, LOAD_W, LOAD_H};
+    int cube_pipe = -1, status = 0;
+    pid_t pid;
+
+    CHECK(stafeto_window_open(20, 20, LOAD_W, LOAD_H, STAFETO_WINDOW_XRGB8888, 3, 0, &w) == 0);
+    CHECK(next_stream(&id_p) == 0);
+    source_p = wfcCreateSourceFromStream(dev, ctx, id_p, NULL);
+    CHECK(source_p != WFC_INVALID_HANDLE);
+    plain = wfcCreateElement(dev, ctx, NULL);
+    CHECK(plain != WFC_INVALID_HANDLE);
+    wfcSetElementAttribi(dev, plain, WFC_ELEMENT_SOURCE, (WFCint)source_p);
+    wfcSetElementAttribfv(dev, plain, WFC_ELEMENT_SOURCE_RECTANGLE, 4, src);
+    wfcSetElementAttribiv(dev, plain, WFC_ELEMENT_DESTINATION_RECTANGLE, 4, plain_at);
+    wfcInsertElement(dev, plain, WFC_INVALID_HANDLE);
+    wfcCommit(dev, ctx, WFC_TRUE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    wfcActivate(dev, ctx);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    CHECK(paced_phase("quiet", LOAD_QUIET_FRAMES, -1) == 0);
+
+    pid = start_holder("/bin/gles-cube", cube_argv, 7, &cube_pipe);
+    CHECK(pid > 0);
+    CHECK(next_stream(&id_c) == 0);
+    source_c = wfcCreateSourceFromStream(dev, ctx, id_c, NULL);
+    CHECK(source_c != WFC_INVALID_HANDLE);
+    cube = wfcCreateElement(dev, ctx, NULL);
+    CHECK(cube != WFC_INVALID_HANDLE);
+    gles_element(cube, source_c, WFC_ROTATION_0, cube_at);
+    wfcInsertElement(dev, cube, plain);
+    wfcCommit(dev, ctx, WFC_TRUE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    CHECK(paced_phase("cube", 0, cube_pipe) == 0);
+    CHECK(wait_held(cube_pipe) == 0);
+    printf("wfc-demo: load the cube held its last frame\n");
+    fflush(stdout);
+
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+    close(cube_pipe);
+    wfcDeactivate(dev, ctx);
+    wfcRemoveElement(dev, cube);
+    wfcRemoveElement(dev, plain);
+    wfcDestroyElement(dev, cube);
+    wfcDestroyElement(dev, plain);
+    wfcDestroySource(dev, source_c);
+    wfcDestroySource(dev, source_p);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    CHECK(stafeto_window_close(0) == 0);
+    printf("wfc-demo: load ok\n");
+    fflush(stdout);
+    return 0;
+}
+
 /* The scenes of --gles: the cube's window alone at the middle, both windows as
  * they are, and the cube turned and scaled by one half beside the field. */
 static int run_gles(void) {
-    static const char *const cube_argv[] = {"gles-cube", "--window-run", "--size", "160", "--frames", "6"};
+    static const char *const cube_argv[] = {"gles-cube", "--window-run", "--size", "160", "--frames", "6", "--stamps"};
     static const char *const field_argv[] = {"gles3-demo", "--probe", "--size", "160"};
     WFCNativeStreamType id_cube = 0, id_field = 0;
     WFCSource source_cube, source_field;
@@ -599,7 +735,8 @@ static int run_gles(void) {
     CHECK(describe_device() == 0);
     CHECK(context_checks() == 0);
     wfcSetContextAttribi(dev, ctx, WFC_CONTEXT_BG_COLOR, 0x000000FF);
-    pid_cube = start_holder("/bin/gles-cube", cube_argv, 6, &cube_pipe);
+    if (quick) CHECK(run_load() == 0);
+    pid_cube = start_holder("/bin/gles-cube", cube_argv, quick ? 7 : 6, &cube_pipe);
     CHECK(pid_cube > 0);
     CHECK(next_stream(&id_cube) == 0);
     source_cube = wfcCreateSourceFromStream(dev, ctx, id_cube, NULL);

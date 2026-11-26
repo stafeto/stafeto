@@ -237,3 +237,16 @@ default display is the way in.
   stay under 0.9 of term B and the portions under `PORTION_MAX`. The tables are
   `services/init/src/table/gles.rs` (the demo's record and the process service's
   pool have quotas above 64 MiB for the programs it starts).
+
+## Clock stamps
+
+With the variable `STAFETO_EGL_STAMPS` set in the environment of a program, each
+`eglSwapBuffers` of a window surface prints one line to the console:
+`egl-stamp: swap wait W draw D copy C post P ifwait I us`, the microseconds the
+swap spent waiting for a free buffer, in the driver's swap (which holds the copy),
+in the copy of the frame into the window's buffer (the `putImage` of the platform),
+in the post, and in the wait of `eglSwapInterval(1)` for the service to take the
+frame. With the variable unset a swap reads no clock and prints nothing.
+`gles-cube --stamps` sets the variable and prints the draw and the swap of each
+frame; `cargo xtask gles-probe load` (and `--hvf` for the host's processor) prints
+them per frame with a summary, beside the numbers of a client with no GLES.

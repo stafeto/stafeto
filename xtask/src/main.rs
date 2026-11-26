@@ -2223,7 +2223,7 @@ commands:
             platform of EGL (the format, the handles, a second surface, a swap in a forked child,
             two threads), six frames swapped into a window of 160 by 160, QEMU's screenshot
             compared with the CRC the program prints at two of them
-  gles-probe [pbuffer|scene|steps] the probe of the graphics of Mesa (ci runs it): the cube into a
+  gles-probe [pbuffer|scene|steps|load [--hvf]] the probe of the graphics of Mesa (ci runs it): the cube into a
             pbuffer; then the scene (apps/wfc-demo --gles) that shows the cube of EGL and the field
             of 64 instanced cubes of OpenGL ES 3 in windows, with QEMU's screenshots compared with the
             CRCs the programs print and with the host's frame of the scene that turns the cube's
