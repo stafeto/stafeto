@@ -37,6 +37,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -1979,9 +1980,9 @@ static int mix_body(unsigned writers, unsigned writes, unsigned reads) {
 
 /* The record `n` of the writer `letter`: the letter, the number in four digits and a dash, then
  * bytes that depend on both. */
-static void make_record(unsigned char *rec, char letter, unsigned n) {
+static void make_record_n(unsigned char *rec, unsigned long size, char letter, unsigned n) {
     unsigned v = 6;
-    for (unsigned long i = 6; i < APPEND_REC; i++) {
+    for (unsigned long i = 6; i < size; i++) {
         rec[i] = (unsigned char)(letter + n * 7u + v);
         if (++v == 251u) v = 0;
     }
@@ -1993,14 +1994,18 @@ static void make_record(unsigned char *rec, char letter, unsigned n) {
     rec[5] = '-';
 }
 
-static int is_record(const unsigned char *rec, char letter, unsigned n) {
+static int is_record_n(const unsigned char *rec, unsigned long size, char letter, unsigned n) {
     unsigned v = 6;
-    for (unsigned long i = 6; i < APPEND_REC; i++) {
+    for (unsigned long i = 6; i < size; i++) {
         if (rec[i] != (unsigned char)(letter + n * 7u + v)) return 0;
         if (++v == 251u) v = 0;
     }
     return 1;
 }
+
+static void make_record(unsigned char *rec, char letter, unsigned n) { make_record_n(rec, APPEND_REC, letter, n); }
+
+static int is_record(const unsigned char *rec, char letter, unsigned n) { return is_record_n(rec, APPEND_REC, letter, n); }
 
 static int append_writer(char letter, unsigned count) {
     atomic_start();
@@ -2049,6 +2054,173 @@ static int append_body(unsigned records) {
     return 0;
 }
 
+/* ---- readv and writev of a program: one call of the layer for the whole vector (issue #581) ---- */
+
+#define VEC_HALF CELL_BYTES_C
+#define VEC_REC (2UL * VEC_HALF)
+
+/* An O_APPEND writer of the vector form: a record of 128 KiB in two buffers of 64 KiB, `count`
+ * times, each by one writev. */
+static int vec_append_writer(char letter, unsigned count) {
+    atomic_start();
+    int fd = open("/data/vapp", O_WRONLY | O_APPEND);
+    if (fd < 0) return 1;
+    for (unsigned n = 0; n < count; n++) {
+        make_record_n(big_buf, VEC_REC, letter, n);
+        struct iovec v[2] = {{big_buf, VEC_HALF}, {big_buf + VEC_HALF, VEC_HALF}};
+        if (writev(fd, v, 2) != (ssize_t)VEC_REC) return 2;
+    }
+    return close(fd) == 0 ? 0 : 3;
+}
+
+/* Two processes append records of two buffers each with writev: the file is whole records, each
+ * once, so no buffer of one writer came between the buffers of the other. */
+static int vec_append_body(unsigned records) {
+    atomic_start();
+    int fd = open("/data/vapp", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0 && close(fd) == 0);
+    pid_t pids[2];
+    for (int k = 0; k < 2; k++) {
+        pids[k] = fork();
+        DATA_CHECK(pids[k] >= 0);
+        if (pids[k] == 0) _exit(vec_append_writer((char)('A' + k), records));
+    }
+    DATA_CHECK(wait_ok(pids[0]) == 0 && wait_ok(pids[1]) == 0);
+    struct stat st;
+    DATA_CHECK(stat("/data/vapp", &st) == 0 && (unsigned long)st.st_size == 2UL * records * VEC_REC);
+    fd = open("/data/vapp", O_RDONLY);
+    DATA_CHECK(fd >= 0);
+    static unsigned char seen[2 * 128];
+    DATA_CHECK(2 * records <= sizeof seen);
+    memset(seen, 0, sizeof seen);
+    for (unsigned k = 0; k < 2 * records; k++) {
+        DATA_CHECK(read_up_to(fd, big_buf, VEC_REC) == (long)VEC_REC);
+        unsigned n = 0;
+        for (int d = 1; d <= 4; d++) n = n * 10u + (unsigned)(big_buf[d] - '0');
+        if ((big_buf[0] != 'A' && big_buf[0] != 'B') || big_buf[5] != '-' || n >= records ||
+            !is_record_n(big_buf, VEC_REC, (char)big_buf[0], n)) {
+            printf("posix-data: vector record %u is cut or mixed: %c %u\n", k, big_buf[0], n);
+            return 20;
+        }
+        unsigned slot = (unsigned)(big_buf[0] == 'B') * records + n;
+        DATA_CHECK(!seen[slot]);
+        seen[slot] = 1;
+    }
+    DATA_CHECK(close(fd) == 0 && unlink("/data/vapp") == 0);
+    return 0;
+}
+
+static int append_vector_body(void) { return vec_append_body(3); }
+static int check_writev_append(void) { return vec_append_body(60 / atomic_less); }
+
+/* The writer of the readv check: 128 KiB of the pattern of A, then of B, at offset 0, `count`
+ * times, by messages (small parts: the parts of a reader meet it at every position). */
+static int vec_alternating(unsigned count) {
+    stafeto_probe_data_ban_window();
+    int fd = open("/data/vmix", O_WRONLY);
+    if (fd < 0) return 1;
+    for (unsigned i = 0; i < count; i++) {
+        fill_salt(big_buf, VEC_REC, 21u + (i & 1u));
+        if (pwrite(fd, big_buf, VEC_REC, 0) != (ssize_t)VEC_REC) return 2;
+    }
+    return close(fd) == 0 ? 0 : 3;
+}
+
+/* One process rewrites a file of 128 KiB with two patterns in turn while another reads it with
+ * readv into two buffers of 64 KiB: every readv returns all 128 KiB of one pattern. The reader goes
+ * on after `reads` calls until the writer has ended, so the calls overlap its writes. */
+static int vec_read_body(unsigned writes, unsigned reads) {
+    atomic_start();
+    int fd = open("/data/vmix", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    fill_salt(big_buf, VEC_REC, 20);
+    DATA_CHECK(pwrite(fd, big_buf, VEC_REC, 0) == (ssize_t)VEC_REC);
+    pid_t pid = fork();
+    DATA_CHECK(pid >= 0);
+    if (pid == 0) _exit(vec_alternating(writes));
+    unsigned long seen[3] = {0, 0, 0};
+    int ended = 0, status = 0;
+    for (unsigned i = 0; !ended || i < reads; i++) {
+        struct iovec v[2] = {{big_buf, VEC_HALF}, {big_buf + VEC_HALF, VEC_HALF}};
+        DATA_CHECK(lseek(fd, 0, SEEK_SET) == 0);
+        ssize_t got = readv(fd, v, 2);
+        if (got != (ssize_t)VEC_REC) {
+            printf("posix-data: a readv of 128 KiB returned %ld (read %u)\n", (long)got, i);
+            return 20;
+        }
+        int salt = big_buf[0];
+        int which = salt == 20 ? 0 : salt == 21 ? 1 : salt == 22 ? 2 : -1;
+        if (which < 0 || !is_salt(big_buf, VEC_REC, (unsigned)salt)) {
+            printf("posix-data: a readv of 2 x 64 KiB is mixed: first byte %d, read %u\n", salt, i);
+            return 20;
+        }
+        seen[which]++;
+        if (!ended && i + 1 >= reads) {
+            pid_t done = waitpid(pid, &status, WNOHANG);
+            DATA_CHECK(done == 0 || done == pid);
+            ended = done == pid;
+        }
+        DATA_CHECK(i < 100000);
+    }
+    DATA_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    printf("posix-data: vector reads: %lu saw the first pattern, %lu the pattern of A, %lu the pattern of B\n", seen[0],
+           seen[1], seen[2]);
+    if (seen[1] + seen[2] == 0) {
+        printf("posix-data: vector reads: no read overlapped the writes\n");
+        return 22;
+    }
+    DATA_CHECK(close(fd) == 0 && unlink("/data/vmix") == 0);
+    return 0;
+}
+
+static int check_readv_whole(void) { return vec_read_body(40 / atomic_less, 80 / atomic_less); }
+static int readv_inline_body(void) { return vec_read_body(4, 8); }
+
+/* The vector calls of any size in the small: parts of 100, 0 and 5000 bytes, the position that
+ * moves, the end of the file, the empty vector, a directory. */
+static int check_vector_small(void) {
+    int fd = open("/data/vsmall", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    unsigned char a[100], b[5000], c[5100];
+    fill_salt(a, sizeof a, 30);
+    fill_salt_at(b, sizeof b, 30, 100);
+    struct iovec w[3] = {{a, sizeof a}, {NULL, 0}, {b, sizeof b}};
+    DATA_CHECK(writev(fd, w, 3) == 5100);
+    DATA_CHECK(lseek(fd, 0, SEEK_CUR) == 5100);
+    DATA_CHECK(lseek(fd, 0, SEEK_SET) == 0);
+    unsigned char first[1], rest[5099], more[1];
+    struct iovec r[3] = {{first, 1}, {rest, sizeof rest}, {more, 1}};
+    DATA_CHECK(readv(fd, r, 3) == 5100);
+    memcpy(c, first, 1);
+    memcpy(c + 1, rest, sizeof rest);
+    DATA_CHECK(is_salt(c, 5100, 30));
+    DATA_CHECK(lseek(fd, 0, SEEK_CUR) == 5100);
+    DATA_CHECK(readv(fd, r, 3) == 0);
+    errno = 0;
+    DATA_CHECK(readv(fd, r, 0) == -1 && errno == EINVAL);
+    errno = 0;
+    DATA_CHECK(writev(fd, w, 0) == -1 && errno == EINVAL);
+    /* More buffers than the hook takes at once: each buffer still lands. */
+    static unsigned char many[70];
+    struct iovec m[70];
+    for (int k = 0; k < 70; k++) {
+        many[k] = (unsigned char)(k + 1);
+        m[k].iov_base = &many[k];
+        m[k].iov_len = 1;
+    }
+    DATA_CHECK(lseek(fd, 0, SEEK_SET) == 0);
+    DATA_CHECK(writev(fd, m, 70) == 70);
+    unsigned char back[70];
+    DATA_CHECK(pread(fd, back, 70, 0) == 70 && memcmp(back, many, 70) == 0);
+    DATA_CHECK(close(fd) == 0 && unlink("/data/vsmall") == 0);
+    int dir = open("/data", O_RDONLY);
+    DATA_CHECK(dir >= 0);
+    errno = 0;
+    DATA_CHECK(readv(dir, r, 3) == -1 && errno == EISDIR);
+    DATA_CHECK(close(dir) == 0);
+    return 0;
+}
+
 /* Runs `body` in a child that goes by messages, and judges what the child's counters say. */
 static int inline_child(int (*body)(void)) {
     pid_t pid = fork();
@@ -2091,6 +2263,8 @@ static int check_append(void) { return append_body(100 / atomic_less); }
 static int check_inline(void) {
     DATA_CHECK(inline_child(mix_whole_inline) == 0);
     DATA_CHECK(inline_child(append_inline_body) == 0);
+    DATA_CHECK(inline_child(append_vector_body) == 0);
+    DATA_CHECK(inline_child(readv_inline_body) == 0);
     return 0;
 }
 
@@ -2139,6 +2313,62 @@ static int check_lapse(void) {
     DATA_CHECK(close(fd) == 0 && unlink("/data/lapse") == 0);
     return 0;
 }
+
+/* The vector forms of the lapse: a child calls writev or readv of two halves of 1 MiB again and
+ * again until a call comes back short (the lease lapsed while the child was stopped). The count of
+ * lapsed calls rises, so the call went through the layer's parts. */
+static int lapse_vector_child(int reading) {
+    int fd = open("/data/lapse", reading ? O_RDONLY : O_WRONLY);
+    if (fd < 0) return 1;
+    fill_salt(big_buf, MIB, 42);
+    struct iovec v[2] = {{big_buf, MIB / 2}, {big_buf + MIB / 2, MIB / 2}};
+    unsigned long long lapsed0 = dcounts().lapsed;
+    for (int i = 0; i < 6000; i++) {
+        if (lseek(fd, 0, SEEK_SET) != 0) return 5;
+        ssize_t r = reading ? readv(fd, v, 2) : writev(fd, v, 2);
+        if (r == (ssize_t)MIB) continue;
+        unsigned long long lapsed = dcounts().lapsed - lapsed0;
+        printf("posix-data: the stopped %s: a call returned %ld of 1 MiB, lapsed calls %llu\n", reading ? "reader" : "writer", (long)r, lapsed);
+        if (r < 0 || (unsigned long)r % CELL_BYTES_C != 0) return 3;
+        return lapsed >= 1 ? 0 : 4;
+    }
+    return 2;
+}
+
+/* The same stop as `check_lapse`: another caller of the file waits for the lease of the stopped
+ * child about a second, and the child's call returns the bytes it moved. */
+static int lapse_vector(int reading) {
+    int fd = open("/data/lapse", O_RDWR | O_CREAT | O_EXCL, 0644);
+    DATA_CHECK(fd >= 0);
+    fill_salt(big_buf, MIB, 42);
+    DATA_CHECK(pwrite(fd, big_buf, MIB, 0) == (ssize_t)MIB);
+    pid_t pid = fork();
+    DATA_CHECK(pid >= 0);
+    if (pid == 0) _exit(lapse_vector_child(reading));
+    unsigned long long waited = 0;
+    int attempts = 0;
+    while (attempts < 40 && waited < 800) {
+        pause_ms(30 + (unsigned)(attempts * 13 % 47));
+        DATA_CHECK(kill(pid, SIGSTOP) == 0);
+        unsigned long long t0 = now_ms();
+        /* A reader holds back writers; a writer holds back readers. */
+        char b = 42;
+        DATA_CHECK((reading ? pwrite(fd, &b, 1, 0) : pread(fd, &b, 1, 0)) >= 0);
+        waited = now_ms() - t0;
+        DATA_CHECK(kill(pid, SIGCONT) == 0);
+        attempts++;
+    }
+    printf("posix-data: a call on the file of a stopped %s of vectors answered after %llu ms (attempt %d)\n",
+           reading ? "reader" : "writer", waited, attempts);
+    if (waited < 800) kill(pid, SIGKILL);
+    DATA_CHECK(wait_ok(pid) == 0 || waited < 800);
+    DATA_CHECK(waited >= 800 && waited <= 2500);
+    DATA_CHECK(close(fd) == 0 && unlink("/data/lapse") == 0);
+    return 0;
+}
+
+static int check_lapse_writev(void) { return lapse_vector(0); }
+static int check_lapse_readv(void) { return lapse_vector(1); }
 
 /* The checks with signals, threads and forks run in a process of their own, on a thread with a
  * stack of 128 KiB (the main thread's is 64 KiB, and a handler that calls the layer runs on it
@@ -2617,6 +2847,11 @@ static int atomic_run(void) {
     run_check("O_APPEND 200 KiB records whole", check_append);
     run_check("inline parts atomic", check_inline);
     run_check("lease lapses after 1 s", check_lapse);
+    run_check("writev and readv of a program on small vectors", check_vector_small);
+    run_check("O_APPEND writev of 2 x 64 KiB whole", check_writev_append);
+    run_check("readv of 2 x 64 KiB never mixes", check_readv_whole);
+    run_check("writev lease lapses after 1 s", check_lapse_writev);
+    run_check("readv lease lapses after 1 s", check_lapse_readv);
     run_check("siglongjmp out of a handler returns the cell", check_jump);
     run_check("thread exit mid-call returns the cell", check_exit);
     run_check("handler write during a long write", check_handler_write);

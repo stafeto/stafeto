@@ -14,8 +14,8 @@ use posix_abi::sockets as layer;
 /// struct iovec and struct msghdr of Linux AArch64.
 #[repr(C)]
 pub struct IoVec {
-    base: *mut u8,
-    len: usize,
+    pub(crate) base: *mut u8,
+    pub(crate) len: usize,
 }
 
 #[repr(C)]
@@ -42,7 +42,7 @@ const IOV_MAX: usize = 16;
 
 /// # Safety
 /// `pointer` is null or readable for `len` bytes.
-unsafe fn input<'a>(pointer: *const u8, len: usize) -> Result<&'a [u8], c_int> {
+pub(crate) unsafe fn input<'a>(pointer: *const u8, len: usize) -> Result<&'a [u8], c_int> {
     if len == 0 {
         return Ok(&[]);
     }
@@ -55,7 +55,7 @@ unsafe fn input<'a>(pointer: *const u8, len: usize) -> Result<&'a [u8], c_int> {
 
 /// # Safety
 /// `pointer` is null or writable for `len` bytes.
-unsafe fn output<'a>(pointer: *mut u8, len: usize) -> Result<&'a mut [u8], c_int> {
+pub(crate) unsafe fn output<'a>(pointer: *mut u8, len: usize) -> Result<&'a mut [u8], c_int> {
     if len == 0 {
         return Ok(&mut []);
     }

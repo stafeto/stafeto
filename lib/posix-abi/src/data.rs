@@ -909,9 +909,8 @@ fn read_filling(handle: u32, offset: Option<u64>, out: &mut [u8]) -> Result<usiz
 }
 
 /// readv at the position of the description (`offset` None) or at `offset` (preadv): the bytes
-/// read into the buffers in order, as one call atomic as `read`. No caller yet: the C library's
-/// `readv` waits for a hook of the layer, so nothing is promised for `readv` to a program. A
-/// lapsed lease ends it short.
+/// read into the buffers in order, as one call atomic as `read`. The C library's `readv` of a file
+/// reaches it through the platform's `stafeto_readv_data`. A lapsed lease ends it short.
 pub fn readv(handle: u32, offset: Option<u64>, iov: &mut [&mut [u8]]) -> Result<usize, i32> {
     let total = pure::total_len_mut(iov);
     if !pure::fits_one_message(total, p::MAX_READ) {
@@ -1020,8 +1019,8 @@ pub fn pwrite(handle: u32, offset: u64, bytes: &[u8]) -> Result<usize, i32> {
 }
 
 /// writev at the position of the description (`offset` None) or at `offset` (pwritev): all the
-/// buffers as one call, atomic as `write`. No caller yet: the C library's `writev` waits for a
-/// hook of the layer, so nothing is promised for `writev` to a program.
+/// buffers as one call, atomic as `write`. The C library's `writev` of a file reaches it through
+/// the platform's `stafeto_writev_data`.
 pub fn writev(handle: u32, offset: Option<u64>, iov: &[&[u8]]) -> Result<usize, i32> {
     let total = pure::total_len(iov);
     let one = match offset {
