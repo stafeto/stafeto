@@ -1033,7 +1033,27 @@ fn reload(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Re
         }
         std::thread::sleep(Duration::from_millis(500));
     };
+    // A new worker whose ATTACH finds no usable number asks again for up to the bound of the
+    // consumer (`SWEEP_WAIT_NS`): the old workers' numbers come back with the sweep.
+    let attach_by = Instant::now()
+        + Duration::from_nanos(proto_net::switch::SWEEP_WAIT_NS)
+        + Duration::from_secs(10);
+    let mut sweeping = sweeping;
+    while run.lines()[window..]
+        .iter()
+        .filter(|l| l.contains("ATTACH ok"))
+        .count()
+        < old.len()
+        && Instant::now() < attach_by
+    {
+        std::thread::sleep(Duration::from_millis(500));
+        sweeping = stat(run, "reload")?.sweeping;
+    }
     let lines = &run.lines()[window..];
+    let said: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("gracefully shutting down"))
+        .collect();
     let refused: Vec<&String> = lines
         .iter()
         .filter(|l| l.contains("ATTACH refused"))
@@ -1050,7 +1070,7 @@ fn reload(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Re
             })
             .collect();
         format!(
-            "old workers [{}], {} ATTACH ok, {} ATTACH refused {refused:?}, {left} LEAVE(s) of {}, {sweeping} number(s) in the sweep",
+            "old workers [{}] ({said:?}), {} ATTACH ok, {} ATTACH refused {refused:?}, {left} LEAVE(s) of {}, {sweeping} number(s) in the sweep",
             shut.join(", "),
             attached,
             refused.len(),
