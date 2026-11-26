@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The line `service step: T kind K N ticks detail D preempts P wall W` of `rt::service` (`preempts P`
-//! is left out when P is 0 and no wall is told; `wall W` is told when the clock's part of the
+//! The line `service step: T kind K N ticks detail D preempts P wall W` of `rt::service` (`detail D`
+//! is left out when D is 0, `preempts P` when P is 0 and no wall is told; `wall W` is told when the clock's part of the
 //! step, W, is longer than N) and the judgement of a step against the bound B.
 //!
 //! The line carries the raw time N of the step, the CPU ticks of the thread in it, and is
@@ -236,54 +236,36 @@ fn parse_any(line: &str) -> Option<StepLine<'_>> {
 
 fn parse_word<'a>(line: &'a str, word: &str) -> Option<StepLine<'a>> {
     let words: Vec<&str> = line.split_whitespace().collect();
-    let (tag, kind, ticks, detail, preempts, wall) = match words.as_slice() {
-        [
-            "service",
-            w,
-            tag,
-            "kind",
-            kind,
-            ticks,
-            "ticks",
-            "detail",
-            detail,
-        ] if *w == word => (tag, kind, ticks, detail, "0", None),
-        [
-            "service",
-            w,
-            tag,
-            "kind",
-            kind,
-            ticks,
-            "ticks",
-            "detail",
-            detail,
-            "preempts",
-            preempts,
-        ] if *w == word => (tag, kind, ticks, detail, *preempts, None),
-        [
-            "service",
-            w,
-            tag,
-            "kind",
-            kind,
-            ticks,
-            "ticks",
-            "detail",
-            detail,
-            "preempts",
-            preempts,
-            "wall",
-            wall,
-        ] if *w == word => (tag, kind, ticks, detail, *preempts, Some(*wall)),
-        _ => return None,
+    let ["service", w, tag, "kind", kind, ticks, "ticks", rest @ ..] = words.as_slice() else {
+        return None;
     };
+    if *w != word {
+        return None;
+    }
+    // The tail is `detail D`, `preempts P` and `wall W` in this order, each left out when it is
+    // 0 (a step line) or told (a table line, which always has the detail and the count).
+    let mut rest = rest;
+    let mut take = |name: &str| -> Option<Option<&'a str>> {
+        match rest {
+            [n, v, tail @ ..] if *n == name => {
+                rest = tail;
+                Some(Some(*v))
+            }
+            _ => Some(None),
+        }
+    };
+    let detail = take("detail")?;
+    let preempts = take("preempts")?;
+    let wall = take("wall")?;
+    if !rest.is_empty() || (word == "table:" && (detail.is_none() || preempts.is_none())) {
+        return None;
+    }
     Some(StepLine {
         tag,
         kind: kind.parse().ok()?,
         ticks: ticks.parse().ok()?,
-        detail: detail.parse().ok()?,
-        preempts: preempts.parse().ok()?,
+        detail: detail.map_or(Some(0), |d| d.parse().ok())?,
+        preempts: preempts.map_or(Some(0), |p| p.parse().ok())?,
         wall: match wall {
             Some(w) => Some(w.parse().ok()?),
             None => None,
@@ -497,6 +479,25 @@ mod tests {
         let t =
             parse_table("service table: 4 kind 14 15000 ticks detail 0 preempts 1 wall 9").unwrap();
         assert_eq!(t.wall, Some(9));
+    }
+
+    #[test]
+    fn a_line_is_read_without_the_detail_when_it_is_0() {
+        let l = parse("service step: 14 kind 2 3131 ticks").unwrap();
+        assert_eq!(
+            (l.tag, l.kind, l.ticks, l.detail, l.preempts, l.wall),
+            ("14", 2, 3131, 0, 0, None)
+        );
+        let l = parse("service step: 14 kind 2 3131 ticks preempts 1").unwrap();
+        assert_eq!((l.detail, l.preempts, l.wall), (0, 1, None));
+        let l = parse("service step: 14 kind 2 3131 ticks preempts 1 wall 9000").unwrap();
+        assert_eq!((l.detail, l.preempts, l.wall), (0, 1, Some(9000)));
+        let l = parse("service step: 14 kind 2 3131 ticks detail 5 wall 9000");
+        assert_eq!(l.unwrap().wall, Some(9000));
+        assert!(parse("service step: 14 kind 2 3131 ticks preempts 1 detail 5").is_none());
+        assert!(parse("service step: 14 kind 2 3131 ticks bogus").is_none());
+        assert!(parse_table("service table: 14 kind 2 3131 ticks").is_none());
+        assert!(parse_table("service table: 14 kind 2 3131 ticks detail 0").is_none());
     }
 
     #[test]
