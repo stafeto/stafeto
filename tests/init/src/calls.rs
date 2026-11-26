@@ -2584,18 +2584,20 @@ fn least(round: &mut dyn FnMut() -> bool) -> Result<u64, &'static str> {
 /// Replies to each request on channel `h` with its bytes, until a request
 /// with none, and ends; raw calls on both sides of the round trip. The
 /// reply takes the request's registers as they came: x1, its length with
-/// no handles, and its bytes in x2-x9, with the token from x11.
+/// no handles and without the level the kernel tells in bits 32-37 (which
+/// `reply` refuses), and its bytes in x2-x9, with the token from x11.
 extern "C" fn echo_until_empty(h: u64) -> ! {
     loop {
         let x = receive_x0_to_x11(abi::Handle(h), 0, 0, 0);
         if x[0] != 0 {
             break;
         }
-        let reply = [x[11], x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8], x[9]];
+        let x1 = x[1] & !(abi::LEVEL_BITS << abi::LEVEL_SHIFT);
+        let reply = [x[11], x1, x[2], x[3], x[4], x[5], x[6], x[7], x[8], x[9]];
         // SAFETY: reply runs no code of the program and uses none of its
         // memory for a reply of at most 64 bytes.
         let replied = unsafe { sys::raw::<{ Call::Reply.number() }>(reply) };
-        if x[1] == 0 || replied[0] != 0 {
+        if x1 == 0 || replied[0] != 0 {
             break;
         }
     }

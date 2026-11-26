@@ -561,8 +561,8 @@ el0_send:
 // A service of one request: receive(x0 channel, 0), the message kept in
 // x19-x29 (x1-x11 of the result: the description, the data, the label
 // and the token), then reply with the token, the request's description
-// and its data: the client gets its request back. Ends with the last
-// call's x0.
+// and its data (the description without the level the kernel adds in bits
+// 32-37): the client gets its request back. Ends with the last call's x0.
 .global el0_serve
 el0_serve:
     mov     x1, #0
@@ -580,7 +580,7 @@ el0_serve:
     mov     x28, x10
     mov     x29, x11
     mov     x0, x29
-    mov     x1, x19
+    and     x1, x19, #0xFFFFFFFF    // without the level in bits 32-37
     svc     #CALL_REPLY
 1:  svc     #SVC_DONE
 
@@ -797,6 +797,7 @@ el0_serve_snap:
     cbnz    x0, 2f
     svc     #SVC_SNAP
     mov     x0, x11
+    and     x1, x1, #0xFFFFFFFF     // without the level in bits 32-37
     svc     #CALL_REPLY
     subs    x20, x20, #1
     b.ne    1b
@@ -856,6 +857,7 @@ el0_serve_loop:
     svc     #CALL_RECEIVE
     cbnz    x0, 2f
     mov     x0, x11
+    and     x1, x1, #0xFFFFFFFF     // without the level in bits 32-37
     svc     #CALL_REPLY
     b       1b
 2:  svc     #SVC_DONE
