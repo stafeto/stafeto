@@ -1942,7 +1942,9 @@ mod lent_tests {
     fn received_gives_the_level_beside_the_message() {
         let message = |level: u64| {
             let mut x = [0u64; 12];
-            x[1] = 3 | 1 << 12 | level << abi::LEVEL_SHIFT;
+            // No handles: dropping an `Incoming` that holds some makes calls,
+            // which the host cannot make.
+            x[1] = 3 | level << abi::LEVEL_SHIFT;
             x[2] = 0x0102_0304;
             x[10] = 0xBEE;
             x[11] = 7 << 16 | 1;
