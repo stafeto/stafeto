@@ -231,6 +231,9 @@ struct Stat {
     looped: u64,
     /// Memberships ended by LEAVE.
     left: u64,
+    /// Consumer numbers that left and wait for the sweep (`sweeping`): ATTACH of a new worker
+    /// has no number for them yet.
+    sweeping: u64,
     /// Closed streams whose four a new SYN took over before the sweep.
     orphan_reused: u64,
     /// The refusals by reason (cumulative, also of consumers that left).
@@ -337,6 +340,7 @@ fn stat_once(run: &mut qemu::Run, tag: &str, within: Duration) -> Result<Stat, S
         park_given: counter(&line, "park_given").ok_or_else(|| torn(&line))?,
         looped: counter(&line, "looped").ok_or_else(|| torn(&line))?,
         left: counter(&line, "left").ok_or_else(|| torn(&line))?,
+        sweeping: counter(&line, "sweeping").ok_or_else(|| torn(&line))?,
         rx_by,
         line,
     })
@@ -979,13 +983,31 @@ fn kill(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Resu
 /// listener for). No connection fails, and the switch counts one LEAVE per old worker.
 fn reload(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Result<(), String> {
     let (m, old) = fast_nginx::master_and_workers(run, "r4", false)?;
-    let left_before = stat(run, "reload")?.left;
+    // The worker that was killed before this step left its consumer number to the sweep of the
+    // flow table; the new workers' ATTACH finds the number usable once the sweep is over.
+    let sweep_wait = Duration::from_secs(60);
+    let swept_by = Instant::now() + sweep_wait;
+    let left_before = loop {
+        let st = stat(run, "reload")?;
+        if st.sweeping == 0 {
+            break st.left;
+        }
+        if Instant::now() >= swept_by {
+            return Err(format!(
+                "reload: {} consumer number(s) still wait for the sweep after {} s",
+                st.sweeping,
+                sweep_wait.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
     let stream = Stream::start(nginx);
     let until = Instant::now() + Duration::from_secs(60);
     while stream.answered() < 5 && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(50));
     }
     let before = stream.answered();
+    let window = run.lines().len();
     run.send(&format!("kill -HUP {m}"))?;
     for _ in 0..old.len() {
         run.expect_line(
@@ -1000,22 +1022,71 @@ fn reload(run: &mut qemu::Run, nginx: SocketAddr, notes: &mut Vec<String>) -> Re
     }
     let after = stream.answered();
     let failures = stream.finish();
+    // Each old worker ends by closing its listeners (LEAVE), after it has served what it holds:
+    // the counter is read until all of them left.
+    let left_by = Instant::now() + Duration::from_secs(30);
+    let (left, sweeping) = loop {
+        let st = stat(run, "reload")?;
+        let left = st.left - left_before;
+        if left >= old.len() as u64 || Instant::now() >= left_by {
+            break (left, st.sweeping);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let lines = &run.lines()[window..];
+    let refused: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("ATTACH refused"))
+        .collect();
+    let attached = lines.iter().filter(|l| l.contains("ATTACH ok")).count();
+    let report = || {
+        let shut: Vec<String> = old
+            .iter()
+            .map(|pid| {
+                let said = lines
+                    .iter()
+                    .any(|l| l.contains(&format!("{pid}#0: gracefully shutting down")));
+                format!("{pid} {}", if said { "shut down" } else { "silent" })
+            })
+            .collect();
+        format!(
+            "old workers [{}], {} ATTACH ok, {} ATTACH refused {refused:?}, {left} LEAVE(s) of {}, {sweeping} number(s) in the sweep",
+            shut.join(", "),
+            attached,
+            refused.len(),
+            old.len()
+        )
+    };
     if !failures.is_empty() || after < before + 10 {
         return Err(format!(
-            "reload: {} failed, {before} answered before and {after} after, the first failure {:?}",
+            "reload: {} failed, {before} answered before and {after} after, the first failure {:?}; {}",
             failures.len(),
-            failures.first().map(|f| &f.why)
+            failures.first().map(|f| &f.why),
+            report()
         ));
     }
-    let left = stat(run, "reload")?.left - left_before;
+    if !refused.is_empty() {
+        return Err(format!(
+            "reload: a new worker's ATTACH was refused; {}",
+            report()
+        ));
+    }
+    if attached < old.len() {
+        return Err(format!(
+            "reload: {attached} of {} new workers attached; {}",
+            old.len(),
+            report()
+        ));
+    }
     if left < old.len() as u64 {
         return Err(format!(
-            "reload: {} old workers closed their listeners and the switch heard {left} LEAVE(s)",
-            old.len()
+            "reload: {} old workers closed their listeners and the switch heard {left} LEAVE(s); {}",
+            old.len(),
+            report()
         ));
     }
     notes.push(format!(
-        "reload under load: {before} answered before, {after} in all, no failure, {left} LEAVE(s) for {} old workers",
+        "reload under load: {before} answered before, {after} in all, no failure, {attached} ATTACH ok, {left} LEAVE(s) for {} old workers",
         old.len()
     ));
     Ok(())
