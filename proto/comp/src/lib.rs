@@ -150,16 +150,20 @@
 //! makes them lets go of the slots it holds, which it does within one piece of its
 //! work at the commit's level (the service raises it to that level when it refuses with
 //! BUSY); the holder tries again after its next event or one period, never in a tight
-//! loop. A committed scene is taken when its images are made (the previous scene
-//! stays until then, and COMMITTED and COMPOSED come with the whole scene), except
-//! for a window that has posted nothing, whose element shows nothing until it posts.
+//! loop. A committed scene is taken when its images are made, at the latest at the start
+//! of the second period after the commit (the frames of the previous scene go on
+//! meanwhile): COMMITTED and COMPOSED come with the whole scene within about one to
+//! two periods of the commit, or with elements missing that show their previous image
+//! or nothing. A window that has posted nothing does not hold the scene, and its
+//! element shows nothing until it posts.
 //!
 //! Input under a scene: the keys go to the window with the focus, which the
 //! scene gives by MANAGE FOCUS; the moves and buttons of the pointer go to
 //! the scene's ring as events of the screen's coordinates, and to no window.
 //!
 //! DESCRIBE's `flags` has bit 0 (HAS_MANAGER) set while a manager has
-//! subscribed, and bit 1 (CURSOR_PLANE) once the service put the pointer's
+//! subscribed, bit 2 (NO_IMAGE_WORKER) when the service draws the transforms in
+//! its bands for want of a worker, and bit 1 (CURSOR_PLANE) once the service put the pointer's
 //! picture on the display's cursor pipeline. Its `open` is the windows alive
 //! now, `created` the windows ever made, `frames` the frames shown, `busy` 1
 //! while a frame is being made or waits to be: a probe that waits for `busy`
@@ -216,6 +220,10 @@ pub const HAS_MANAGER: u32 = 1;
 /// the frames) never hold it. Without the bit the service draws the picture
 /// into the frame.
 pub const CURSOR_PLANE: u32 = 2;
+/// DESCRIBE's `flags`: the service has no worker for the images of the elements that
+/// turn or stretch a window (it could not make the thread), so the bands draw them
+/// through the transform, as before the images. A probe tells the two modes by it.
+pub const NO_IMAGE_WORKER: u32 = 4;
 
 /// The bytes of a line of `width` points of `format` at the least: 4 a point,
 /// or for FORMAT_A8 a byte a point rounded up to a multiple of 4 (the stride

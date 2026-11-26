@@ -889,6 +889,12 @@ pub struct Scene {
     told: [u32; MAX_WINDOWS],
     /// A frame ended with the worker blocked on it: the worker is to be woken.
     wake: bool,
+    /// The period the service is in (`set_period`), the period of the commit the
+    /// pending scene's wait began at, and the takings the wait has seen (the count
+    /// serves where there is no clock of periods).
+    period: u64,
+    pending_since: Option<u64>,
+    waited: u32,
 }
 
 /// What the scene session's own state holds besides its two scenes.
@@ -907,6 +913,9 @@ struct Stage {
     composed_now: bool,
     /// A window no element shows posted something: a taking gives it back.
     give_back: bool,
+    /// The damage of a commit whose scene waits for its images: kept aside, and
+    /// applied at the taking that makes the scene the working one.
+    pending_damage: Option<Rect>,
     /// The scene session ended while a frame was in work: the taking that
     /// follows goes back to the policy of the windows.
     ending: bool,
@@ -926,6 +935,7 @@ impl Stage {
         committed_now: false,
         composed_now: false,
         give_back: false,
+        pending_damage: None,
         ending: false,
         given: [None; MAX_WINDOWS],
         answered: 0,
@@ -1040,7 +1050,17 @@ impl Scene {
             owed: [0; MAX_WINDOWS],
             told: [0; MAX_WINDOWS],
             wake: false,
+            period: 0,
+            pending_since: None,
+            waited: 0,
         }
+    }
+
+    /// The period the service is in, for the commits that follow: a scene that waits
+    /// for its images is taken at the latest at the start of the second period after
+    /// the commit's (`u64::MAX` for no clock of periods: the third taking).
+    pub fn set_period(&mut self, k: u64) {
+        self.period = k;
     }
 
     /// The elements that turn, reflect or stretch a window are drawn from the
@@ -1602,18 +1622,43 @@ impl Scene {
     /// a scene never shows with an element missing for the images' time (a window that
     /// has posted nothing never has its image, and does not hold the scene).
     fn pending_waits(&self) -> bool {
-        let (Some(t), Some(p)) = (self.prep, self.slot_pending) else {
+        self.slot_pending
+            .is_some_and(|p| self.waits_map(usize::from(p)))
+    }
+
+    /// Whether the scene at place `k` has an image that is not made yet.
+    fn waits_map(&self, k: usize) -> bool {
+        let Some(t) = self.prep else {
             return false;
         };
-        self.maps[usize::from(p)]
+        self.maps[k]
             .iter()
             .any(|&s| s != prep::NO_SLOT && !t.ready(usize::from(s)))
+    }
+
+    /// Whether the pending scene's wait for its images is over: the second start of a
+    /// period after the commit that began it, or with no clock of periods the third
+    /// taking. The elements still without an image then show their previous image or
+    /// nothing.
+    fn wait_over(&mut self, k: u64) -> bool {
+        if k == u64::MAX {
+            self.waited += 1;
+            return self.waited > 2;
+        }
+        self.pending_since
+            .is_some_and(|since| k >= since.saturating_add(2))
     }
 
     /// The service has no worker (it could not be made): the elements that turn or
     /// stretch are drawn by the bands through the transform, as without images.
     pub fn clear_prep(&mut self) {
         self.prep = None;
+    }
+
+    /// Whether the elements that turn or stretch are drawn from images a worker makes
+    /// (false: the bands draw them through the transform, as without a worker).
+    pub fn prepared(&self) -> bool {
+        self.prep.is_some()
     }
 
     /// The slots no scene holds are let go (a taking made another scene the
@@ -2219,14 +2264,22 @@ impl Scene {
                 self.damage = Some(union(self.damage, h));
             }
         }
-        // A pending scene is taken when its images are made: the frame waits (the
-        // damage and a request to compose stay) and the end of the images wakes it.
-        if self.pending_waits() {
+        // A pending scene is taken when its images are made, at the latest when the
+        // wait is over (`wait_over`). Until then the frames go on with the working
+        // scene; a frame that is asked for the pending scene (SCENE_COMPOSE) waits,
+        // and the end of the images wakes it.
+        let hold = self.pending_waits() && !self.wait_over(k);
+        if hold && self.stage.compose_due {
             return None;
         }
         let compose_now = core::mem::take(&mut self.stage.compose_due);
         let d = self.damage.take();
-        let frozen = self.take_scene(compose_now, d.is_some());
+        let frozen = self.take_scene(compose_now, d.is_some(), hold);
+        // The damage the commit kept aside came with the taking.
+        let d = match (d, self.damage.take()) {
+            (Some(a), Some(b)) => Some(union(Some(a), b)),
+            (a, b) => a.or(b),
+        };
         let d = d?;
         let x1 = (d.x + d.w).min(WIDTH);
         let y1 = (d.y + d.h).min(HEIGHT);
@@ -2886,10 +2939,31 @@ impl Scene {
         let def = &self.defs[k];
         let active = def.active;
         let damage = elements::scene_damage(self.pending_def().or(self.working()), def);
+        // A scene that waits for its images keeps its damage aside until it is taken,
+        // and the wait is timed from the first commit that waits.
+        let waits = self.waits_map(k);
+        if waits {
+            if self.pending_since.is_none() {
+                self.pending_since = Some(self.period);
+                self.waited = 0;
+            }
+        } else {
+            self.pending_since = None;
+        }
         if active {
             self.stage.ask_committed |= ask;
             match damage {
+                Some(d) if waits => {
+                    self.stage.pending_damage = Some(union(self.stage.pending_damage, d));
+                    self.slot_pending = Some(k as u8);
+                }
                 Some(d) => {
+                    // The damage kept aside by a pending scene this one replaces
+                    // comes with this one.
+                    let d = match self.stage.pending_damage.take() {
+                        Some(a) => union(Some(a), d),
+                        None => d,
+                    };
                     self.add_damage(d);
                     self.slot_pending = Some(k as u8);
                 }
@@ -2978,6 +3052,12 @@ impl Scene {
             }
         };
         self.maps[k] = map;
+        // The holder lends its level to the images its scene waits for.
+        for &s in map.iter() {
+            if s != prep::NO_SLOT && !t.ready(usize::from(s)) {
+                t.raise_level(usize::from(s), level);
+            }
+        }
         Ok(())
     }
 
@@ -3031,9 +3111,14 @@ impl Scene {
     /// buffers of the windows no scene shows are given back at once (a window of
     /// the first revision has its FLUSH answered). Whether the scene is held
     /// still: composed on request, with no request for this taking.
-    fn take_scene(&mut self, compose_now: bool, damaged: bool) -> bool {
-        if self.pending_def().is_some_and(|p| p.active || compose_now) && !self.pending_waits() {
+    fn take_scene(&mut self, compose_now: bool, damaged: bool, hold: bool) -> bool {
+        if self.pending_def().is_some_and(|p| p.active || compose_now) && !hold {
             self.slot_working = self.slot_pending.take();
+            self.pending_since = None;
+            self.waited = 0;
+            if let Some(d) = self.stage.pending_damage.take() {
+                self.add_damage(d);
+            }
             if core::mem::take(&mut self.stage.ask_committed) {
                 self.stage.committed_now = true;
             }

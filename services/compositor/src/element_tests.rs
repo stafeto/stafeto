@@ -258,6 +258,11 @@ struct Rig {
 impl Rig {
     /// Windows of the formats and sizes, each with one buffer posted.
     fn new(specs: &[(Format, u32, u32)]) -> Rig {
+        Rig::with_buffers(specs, 1)
+    }
+
+    /// `new` with `buffers` buffers attached to each window.
+    fn with_buffers(specs: &[(Format, u32, u32)], buffers: u8) -> Rig {
         let mut scene = Scene::new();
         scene.set_manager(true);
         let mut wins = Vec::new();
@@ -268,7 +273,7 @@ impl Rig {
                 .unwrap();
             scene.set_format(i, format);
             let win = Win::new(format, w, h);
-            scene.attach(i, 1, win.stride).unwrap();
+            scene.attach(i, buffers, win.stride).unwrap();
             scene.post(i, 0, &[]).unwrap();
             wins.push(win);
         }
@@ -1457,10 +1462,14 @@ impl Rig {
     /// The rig with the elements that turn or stretch drawn from prepared images
     /// (the windows told to the table as a POST tells them).
     fn prepared(specs: &[(Format, u32, u32)]) -> Rig {
+        Rig::prepared_with(specs, 1)
+    }
+
+    fn prepared_with(specs: &[(Format, u32, u32)], buffers: u8) -> Rig {
         let table: &'static prep::Table = Box::leak(Box::new(prep::Table::new()));
         let pool: &'static mut [u8] = Box::leak(vec![0u8; prep::POOL_BYTES].into_boxed_slice());
         table.set_pool(pool.as_mut_ptr());
-        let mut rig = Rig::new(specs);
+        let mut rig = Rig::with_buffers(specs, buffers);
         rig.scene.set_prep(table);
         rig.wins.1 = Some(table);
         for i in 0..specs.len() {
@@ -1747,4 +1756,124 @@ fn the_images_of_a_scene_that_goes_are_let_go_and_those_of_one_that_stays_are_ke
     rig.commit(&[plain], BG).unwrap();
     assert!(rig.render(&mut fb));
     assert_eq!(t.pages_used(), 0);
+}
+
+/// A frame of the period `k` over `fb`.
+fn render_at(rig: &mut Rig, k: u64, fb: &mut [u8]) -> bool {
+    let Some(d) = rig.scene.begin_at(k) else {
+        return false;
+    };
+    let mut at = Band {
+        row: d.y,
+        col: 0,
+        pass: 0,
+    };
+    let mut sampler = Sampler::new();
+    while at.row < d.y + d.h {
+        at = compose(&rig.scene, d, at, fb, &rig.wins, &mut sampler);
+    }
+    rig.scene.end(true);
+    true
+}
+
+/// The width the first element of the working scene has (which scene it is).
+fn working_width(rig: &Rig) -> Option<i32> {
+    rig.scene.working().map(|d| d.elements()[0].dw)
+}
+
+#[test]
+fn a_commit_with_a_slow_image_does_not_stop_the_frames_of_the_working_scene() {
+    let mut rig = Rig::prepared_with(&[(XRGB, 64, 40), (XRGB, 64, 40)], 2);
+    let old = turned(rig.whole(0, [100, 50, 64, 40]), 1, 64, 40);
+    let plain = rig.whole(1, [300, 200, 64, 40]);
+    rig.scene.set_period(1);
+    rig.commit(&[old, plain], BG).unwrap();
+    rig.drain();
+    let mut fb = vec![0xEE; (STRIDE * HEIGHT) as usize];
+    assert!(render_at(&mut rig, 1, &mut fb));
+    assert_eq!(working_width(&rig), Some(40));
+    // The next scene has a new key whose image the worker has not made.
+    let new = turned(rig.whole(0, [100, 50, 64, 40]), 1, 128, 80);
+    rig.scene.set_period(2);
+    rig.commit(&[new, plain], BG).unwrap();
+    // The window under the plain element posts: a frame of the working scene is made,
+    // and the new scene is not taken.
+    rig.wins.0[1]
+        .bytes
+        .iter_mut()
+        .for_each(|b| *b = b.wrapping_add(9));
+    rig.scene
+        .post(
+            1,
+            1,
+            &[Rect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 40,
+            }],
+        )
+        .unwrap();
+    rig.scene.note_post(
+        1,
+        1,
+        &[Rect {
+            x: 0,
+            y: 0,
+            w: 64,
+            h: 40,
+        }],
+        28,
+    );
+    assert!(render_at(&mut rig, 3, &mut fb));
+    assert_eq!(working_width(&rig), Some(40));
+    assert!(rig.wrong(&fb, &[old, plain], BG).is_empty());
+    // One period later the wait is over: the scene is taken whole with the element
+    // missing, and the screen is damaged where the scene differs.
+    assert!(render_at(&mut rig, 4, &mut fb));
+    assert_eq!(working_width(&rig), Some(80));
+    assert!(rig.wrong(&fb, &[plain], BG).is_empty());
+    // The image is made: the element shows.
+    rig.drain();
+    assert!(render_at(&mut rig, 5, &mut fb));
+    assert!(rig.wrong(&fb, &[new, plain], BG).is_empty());
+}
+
+#[test]
+fn commits_that_change_keys_faster_than_the_worker_draws_still_show_scenes() {
+    let mut rig = Rig::prepared(&[(XRGB, 64, 40)]);
+    // A turn by a quarter at the scale of one of the first `rows` lines of the window:
+    // the key changes with `rows` (a zoom), and the points are the reference's.
+    let zoom = |rig: &Rig, rows: i32| Element {
+        orient: 1,
+        ..rig.element(0, [0, 0, 64 << 16, rows << 16], [100, 50, rows, 64])
+    };
+    let first = zoom(&rig, 40);
+    rig.scene.set_period(0);
+    rig.commit(&[first], BG).unwrap();
+    rig.drain();
+    let mut fb = vec![0xEE; (STRIDE * HEIGHT) as usize];
+    assert!(render_at(&mut rig, 0, &mut fb));
+    // Every period a commit with another key, and the worker never gets to run.
+    let mut shown = Vec::new();
+    for k in 1..=12u64 {
+        let e = zoom(&rig, 40 - k as i32);
+        rig.scene.set_period(k);
+        rig.commit(&[e], BG).unwrap();
+        render_at(&mut rig, k, &mut fb);
+        if let Some(w) = working_width(&rig)
+            && shown.last() != Some(&w)
+        {
+            shown.push(w);
+        }
+    }
+    // Scenes were taken again and again (a wait is two periods at most), not once.
+    assert!(shown.len() >= 4, "{shown:?}");
+    // The worker catches up: the last scene shows whole.
+    rig.drain();
+    let last = zoom(&rig, 28);
+    render_at(&mut rig, 20, &mut fb);
+    assert_eq!(working_width(&rig), Some(28));
+    let w = rig.wrong(&fb, &[last], BG);
+    assert!(w.is_empty(), "{w:x?}");
 }

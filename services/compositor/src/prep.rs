@@ -292,6 +292,9 @@ struct Slot {
     /// What the worker drew since the service last asked, to be damage.
     drawn: AtomicU64,
     level: AtomicU8,
+    /// The level the commit that waits for the image lent (`raise_level`): the
+    /// slot's work runs at the higher of it and the poster's until the image is made.
+    lend: AtomicU8,
 }
 
 impl Slot {
@@ -319,6 +322,7 @@ impl Slot {
             dirty: [AtomicU64::new(EMPTY), AtomicU64::new(EMPTY)],
             drawn: AtomicU64::new(EMPTY),
             level: AtomicU8::new(1),
+            lend: AtomicU8::new(0),
         }
     }
 }
@@ -685,7 +689,13 @@ impl Table {
     }
 
     /// A slot and its two images for `key` at the planned place, drawn whole before
-    /// it shows.
+    /// it shows. A slot the worker still holds when it is let go is a zombie and is
+    /// not made again until `reap` frees it; that is safe because there is one worker,
+    /// which works on one slot at a time and finishes (or abandons) a pass before it
+    /// takes another, so a stale piece of a zombie's pass can only write into pages
+    /// the next slot there has not been drawn in yet, and the next slot's first pass
+    /// draws them whole after it. On a machine with several CPUs the worker is still
+    /// one thread, so the order holds.
     fn make_at(&self, key: Key, place: usize, level: u8, s: usize, first: usize) {
         let (w, h) = (key.size[0] as u32, key.size[1] as u32);
         let pages = pages_of(&key).unwrap_or(0);
@@ -709,6 +719,7 @@ impl Table {
         slot.dirty[1].store(all, SeqCst);
         slot.drawn.store(EMPTY, SeqCst);
         slot.level.store(level.clamp(1, LEVEL_MAX), SeqCst);
+        slot.lend.store(level.clamp(1, LEVEL_MAX), SeqCst);
         slot.used.store(true, SeqCst);
         self.used_mask.fetch_or(1 << s, SeqCst);
         self.want.fetch_or(1 << s, SeqCst);
@@ -794,7 +805,26 @@ impl Table {
 
     /// The level the slot's work has.
     pub fn level_of(&self, slot: usize) -> u8 {
-        self.slots[slot].level.load(Relaxed)
+        let s = &self.slots[slot];
+        let level = s.level.load(Relaxed);
+        if s.state.load(Relaxed) & READY == 0 {
+            level.max(s.lend.load(Relaxed))
+        } else {
+            level
+        }
+    }
+
+    /// A commit at `level` waits for the image of `slot`: the slot's work runs at
+    /// that level too until the image is made.
+    pub fn raise_level(&self, slot: usize, level: u8) {
+        self.slots[slot]
+            .lend
+            .fetch_max(level.clamp(1, LEVEL_MAX), SeqCst);
+    }
+
+    /// The slots let go that the worker still holds.
+    pub fn zombies_left(&self) -> u32 {
+        self.zombies.load(SeqCst)
     }
 
     /// Whether the slots have work the worker can do: some slot wants it.
@@ -1816,5 +1846,33 @@ mod tests {
         assert_eq!(t.top_level(), Some(28));
         t.let_go();
         assert_eq!(t.top_level(), None);
+    }
+
+    #[test]
+    fn a_commit_that_waits_lends_its_level_to_the_image_until_it_is_made() {
+        let t = table();
+        let a = t.reserve(&[Some((key(8, 64, 40), 0))], &[], 20).unwrap();
+        let slot = usize::from(a[0]);
+        t.set_window(0, 8, Format::Xrgb, 256, 64, 40);
+        t.set_latest(0, 0);
+        // A poster at 25 has the slot at 25; the commit at 28 lends 28 while it waits.
+        t.damage(
+            slot,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+            },
+            25,
+        );
+        t.raise_level(slot, 28);
+        assert_eq!(t.level_of(slot), 28);
+        let win = Flat(vec![0; 256 * 40]);
+        let mut job = Job::NONE;
+        run(&t, &mut job, &win);
+        // The image is made: the poster's level is the slot's again.
+        assert_eq!(t.level_of(slot), 25);
+        assert!(t.ready(slot));
     }
 }

@@ -470,6 +470,9 @@ struct Compositor {
     worker: Option<Worker>,
     /// The worker was tried once at the start.
     worker_tried: bool,
+    /// The level a commit refused with BUSY lent the worker, until the pages it waits
+    /// for are free.
+    busy_boost: u8,
 }
 
 struct Worker {
@@ -508,8 +511,19 @@ extern "C" fn worker_main(_: u64) -> ! {
     let tell = Handle::<Channel>::borrowed(rt::abi::Handle(WORKER_TELL.load(Ordering::Acquire)));
     let mut maker = px::Worker::new();
     let mut job = prep::Job::NONE;
+    // The level the service was told is too high for the work in hand.
+    let mut told_level = 0;
     loop {
-        while let Some((slot, _)) = TABLE.next(&job) {
+        while let Some((slot, at)) = TABLE.next(&job) {
+            // A slot of a level below the worker's: the service is told, to lower the
+            // worker, once for a level, so that the pass does not run above its level.
+            let now = TABLE.worker_level();
+            if at < now && told_level != now {
+                told_level = now;
+                let _ = sys::notify(&tell, PREP);
+            } else if at >= now {
+                told_level = 0;
+            }
             match TABLE.piece(&mut job, slot, &mut maker, &WorkerReads) {
                 Pass::More => {}
                 Pass::Published => {
@@ -608,6 +622,7 @@ fn main(_: u64) -> u64 {
         _timer_view: timer_view,
         worker: None,
         worker_tried: false,
+        busy_boost: 0,
     };
     TABLE.set_pool(IMAGES.0.get().cast());
     service.scene.set_prep(&TABLE);
@@ -2122,7 +2137,8 @@ impl Compositor {
             height: HEIGHT,
             format: proto_comp::FORMAT_XRGB8888,
             flags: (u32::from(self.scene.has_manager()) * proto_comp::HAS_MANAGER)
-                | (u32::from(self.scene.cursor_plane()) * proto_comp::CURSOR_PLANE),
+                | (u32::from(self.scene.cursor_plane()) * proto_comp::CURSOR_PLANE)
+                | (u32::from(!self.scene.prepared()) * proto_comp::NO_IMAGE_WORKER),
             open: self.scene.open(),
             created: self.scene.created(),
             frames: self.scene.frames(),
@@ -2410,6 +2426,7 @@ impl Compositor {
             .top_level()
             .unwrap_or(1)
             .max(at_least)
+            .max(self.busy_boost)
             .min(prep::LEVEL_MAX);
         if level != TABLE.worker_level()
             && sys::thread_set_priority(&worker.thread, level, rt::abi::Policy::Fifo).is_ok()
@@ -2469,6 +2486,10 @@ impl Compositor {
         }
         if TABLE.drawn_waits() {
             let _ = sys::notify(&self.notify, PREP);
+        }
+        // The raise for a commit refused with BUSY ends when the pages are free.
+        if TABLE.zombies_left() == 0 {
+            self.busy_boost = 0;
         }
         // The worker lets go or goes idle: its level follows the work that is left.
         self.steer_worker(0);
@@ -2709,6 +2730,11 @@ impl Compositor {
         {
             return Answer::Status(proto_comp::code(proto_comp::BUSY));
         }
+        self.scene.set_period(if self.pacer.is_free() {
+            u64::MAX
+        } else {
+            self.pacer.clock().index(now_ns())
+        });
         if let Err(refusal) = self.scene.commit_done_at(
             flags & proto_comp::ASK_COMMITTED != 0,
             r.level().min(prep::LEVEL_MAX),
@@ -2716,7 +2742,10 @@ impl Compositor {
             // BUSY: the images fit once the worker lets go of the slots it holds; it
             // runs at the commit's level until it does.
             if refusal == Refusal::Busy {
-                self.steer_worker(r.level().min(prep::LEVEL_MAX));
+                // The raise stays until the pages are free (`prep_done`), so that a
+                // lowering for other work does not undo it early.
+                self.busy_boost = self.busy_boost.max(r.level().min(prep::LEVEL_MAX));
+                self.steer_worker(0);
             }
             return Answer::Status(Compositor::refusal(refusal));
         }
