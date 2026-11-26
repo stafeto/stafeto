@@ -102,8 +102,7 @@ PLATFORM_DIR = Path("src") / "egl" / "drivers" / "dri2"
 # The functions of the window library (<stafeto/window.h>) the platform calls:
 # the program links them (the feature `window` of posix-crt), so the archive
 # leaves them undefined.
-WINDOW_LIBRARY = {"stafeto_window_info", "stafeto_window_free_buffers",
-                  "stafeto_window_post", "stafeto_window_wait"}
+WINDOW_LIBRARY = {"stafeto_window_info", "stafeto_window_post", "stafeto_window_wait_free"}
 # The Python packages the generators of Mesa import, and meson for a host
 # whose own is older than MESON_MINIMUM: requirements files with the hashes of
 # the wheels (the versions are in them and in the stamp).

@@ -64,39 +64,68 @@ resize). Errors:
 A window with `ARGB8888` holds colors already multiplied by their alpha; the
 program writes them so (the compositor lays the window over what is below).
 
-`stafeto_window_info` gives the platform the size, the format and the buffers
-of the window. The surface keeps the description it saw and checks it at every
-swap: a window closed (and opened again, with another shape) is
-`EGL_BAD_NATIVE_WINDOW` from then on.
+`stafeto_window_info` gives the platform the size, the format, the buffers and
+the generation of the window. The surface keeps the description it saw and
+compares the number and the generation at every swap: a window closed (and
+opened again, with the same number and another generation) is
+`EGL_BAD_NATIVE_WINDOW` from then on. The window must outlive its surface: a
+program destroys the surface (or ends EGL, see below) before it closes the
+window. A swap after the close fails, a surface made for the window and read
+after it gives black.
+
+A program that links `libmesa.a` links the window library too (the feature
+`window` of `posix-crt`; `apps/gles-cube/Cargo.toml` is the model), because the
+platform calls it. The functions are not weak: a program without the feature
+does not link.
 
 ### eglSwapBuffers
 
 A swap makes one copy of the frame and one post:
 
-1. It takes a free buffer of the window (the bits of `stafeto_window_free_buffers`).
-   When none is free it waits with `stafeto_window_wait` for up to one second; a
-   signal that ends the wait lets it go on until the same time. A time that
-   runs out, or a compositor that has gone (`ENODEV`), is
-   `EGL_BAD_NATIVE_WINDOW` for that call. The surface stays.
+1. It takes a free buffer of the window with `stafeto_window_wait_free`. The
+   wait has no limit: it ends when a buffer is free or when the compositor is
+   gone (`ENODEV`: the kernel tells the window's channel when the compositor's
+   last copy of it goes), which is `EGL_BAD_NATIVE_WINDOW` for that call (the
+   surface stays). A signal that runs its handler does not end it. The wait
+   takes no bit away from the program's own `stafeto_window_wait`: the events
+   bit (keys, pointer, focus) and the buffer bits stay for it through any number
+   of swaps, in this thread or in another, which may be asleep in
+   `stafeto_window_wait` meanwhile. While another thread holds that wait, the
+   swap looks at the channel without blocking and pauses a millisecond between
+   looks (it wakes the other thread to look again).
 2. It copies into that buffer what the buffer lacks of the newest frame. The
    driver keeps its own picture of the frame between swaps (the contents of
    the back buffer are kept), so each buffer of the window needs the union of
    the changed areas since the swap that last filled it (`ports/mesa/stafeto/swap.c`,
    tested on the host by `swap_test.c`): the first copy of a buffer is the whole
    window, and the later ones are the bounding box of the damage of the swaps in
-   between. The rows of the frame are those of the window (top row first); the
-   rectangles of `eglSwapBuffersWithDamageKHR` and `...EXT`, which EGL gives
-   from the bottom up, are turned over for the post and the copy.
+   between. The rows are copied as the driver keeps them, top row first. This
+   departs from the plan of the step (section 5.3), which asked for a flip in
+   the copy: the picture of a window-system framebuffer is top-down in Mesa
+   already (`glReadPixels` turns it over), and a flipped copy shows the frame
+   upside down. `gles-cube --window` checks it against `glReadPixels` (the
+   window's rows must be the frame's, mirrored) and `swap_test.c` holds the same
+   fault for the host. Only the rectangles of `eglSwapBuffersWithDamageKHR`
+   and `...EXT`, which EGL gives from the bottom up, are turned over, for the
+   post and the copy.
 3. It posts the buffer with the damage of this swap: up to four rectangles as
    given, more as their bounding box, none (a plain swap) as the whole window,
    and a damage that clips to nothing as one point. The first post of a window
    is the whole window.
 4. With a swap interval of 1 (the default) it waits until the compositor has
    taken the frame into one of its own, which frees the buffer the window showed
-   before (up to one second; a frame that is late is no error). An interval of 0
-   returns at once and the compositor takes the latest frame. `eglSwapInterval`
-   clamps an interval above 1 to 1 (`EGL_MAX_SWAP_INTERVAL`), as EGL 1.5
-   section 3.10.3 asks.
+   before (up to one second; a frame that is late is no error, the compositor
+   gone is). An interval of 0 returns at once and the compositor takes the
+   latest frame. `eglSwapInterval` clamps an interval above 1 to 1
+   (`EGL_MAX_SWAP_INTERVAL`), as EGL 1.5 section 3.10.3 asks.
+
+A failure after the check of the process (the window gone, no buffer, a post
+that failed) resets the history of the surface: the next swap copies and posts
+the whole window. A swap that succeeds leaves `errno` as it found it. The swap
+is not a cancellation point (`pthread_setcancelstate` disables cancellation for
+its length), and a thread is not cancelled inside any other call of EGL or
+OpenGL either: a program that cancels a thread that draws does it while the
+thread is between calls, or lets the thread end itself.
 
 `EGL_SWAP_BEHAVIOR` of a new window surface is `EGL_BUFFER_DESTROYED` (Mesa
 sets it so for windows); `eglSurfaceAttrib` accepts `EGL_BUFFER_PRESERVED`
@@ -105,21 +134,49 @@ cases. `EGL_EXT_buffer_age` is not offered.
 
 Other errors of a swap: `EGL_BAD_SURFACE` when the surface is not the current
 draw surface of the thread (EGL 1.5 section 3.10.4) or when the swap is made in
-a child of `fork`.
+a child of `fork`; `EGL_NOT_INITIALIZED` after `eglTerminate`.
 
 ### fork, exec, signals and threads
 
 - A child of `fork` has no window (the window library says so) and its surface
-  is the parent's: `eglSwapBuffers` in the child answers `EGL_BAD_SURFACE`
-  (the surface remembers the process that made it). Contexts and pbuffers in the
-  child follow Mesa on Linux: a program that forks from several threads calls
-  only functions that are safe in a signal handler before `exec`.
+  is the parent's: `eglSwapBuffers` in the child answers `EGL_BAD_SURFACE`.
+  The reason for that error and no other: the surface is valid and was made
+  by another process, EGL 1.5 has no word on `fork`, and `EGL_BAD_NATIVE_WINDOW`
+  would say the window is invalid, which it is not for the parent. The answer
+  holds when no other thread was inside EGL at the `fork` (the child's memory is
+  a copy, and a lock another thread held stays held there); a program that forks
+  from a thread of a program that draws in others calls only functions that are
+  safe in a signal handler before `exec`. Fork of a program that holds Mesa is
+  charged a full quota for the child (its picture, textures and compiler are in
+  memory), so `posix_spawn` is the way to start another program, and the
+  program of `gles-cube --window` starts its own file once because a program
+  init starts cannot fork at all.
+- The surface remembers the process that made it and compares it with
+  `getpid()` at every swap and read, where the plan of the step (section 5.4)
+  had an atfork handler that marks the surfaces dead. A comparison needs no
+  registration, no list of surfaces and no lock in the child, and it covers a
+  surface made after the handler would have run.
 - `exec` closes the window (the window library does) and the memory of Mesa
   goes with the old image.
-- The functions of EGL and OpenGL are not safe in a signal handler.
+- The functions of EGL and OpenGL are not safe in a signal handler, and a
+  handler that runs inside a swap must not call them.
 - Mesa keeps the current context of a thread in thread-local memory. A second
-  thread makes its own context (and pbuffer) and draws; `gles-cube --window`
-  checks it.
+  thread makes its own context (and pbuffer) and draws. A surface is current in
+  one thread: another thread that tries to make it current gets
+  `EGL_BAD_ACCESS`, and after the first thread releases it, the second can make
+  it current, swap and release, and the first can take it back. A thread that
+  used EGL calls `eglReleaseThread` before it ends. `eglTerminate` in another
+  thread waits for a swap under way (the swap holds the surface's lock);
+  `eglTerminate` with the surface current marks it for deletion, a swap then
+  answers `EGL_NOT_INITIALIZED`, and `eglReleaseThread` lets go of it.
+  `gles-cube --window` checks each of these.
+- A thread that makes GL calls needs a large stack: the compiler of GLSL
+  recurses deeper than 64 KiB. The main stack of a program is the size its file
+  asks for (`-z stack-size`; a copy a spawn starts gets 64 KiB otherwise), so a
+  program that links Mesa asks for 1 MiB (`apps/gles-cube/build.rs`; a host test
+  of xtask reads `PT_GNU_STACK` of the built program and compares it with the
+  stack the image gives), and a thread that compiles shaders is created with a
+  stack of the same size or more (`pthread_attr_setstacksize`).
 
 ### Not offered
 
@@ -143,5 +200,10 @@ default display is the way in.
   contexts), draws six frames, swaps each one (the interval alternates 1 and 0)
   and prints the CRC-32 of the screen it should show at two of them. xtask asks
   QEMU for a screenshot at each and compares. The frames it reads back before
-  each swap are those of the pbuffer probe, so the window and the pbuffer give
-  the same pictures.
+  each swap are compared by xtask with those of the pbuffer probe, so the window
+  and the pbuffer give the same pictures. At the third frame the window's
+  rows are compared with the readback (the orientation), four swaps with
+  damage over a scissored clear leave the window equal to the frame, a surface
+  current in one thread is `EGL_BAD_ACCESS` in another and moves between them,
+  a thread asleep in `stafeto_window_wait` gets the bits of the swaps, and the
+  program ends with `eglTerminate` with the surface current.

@@ -85,4 +85,18 @@ long swap_blit(unsigned char *dst, size_t dst_stride, int dst_w, int dst_h,
 	       const unsigned char *src, size_t src_stride, int src_x, int src_y, int src_w, int src_h,
 	       unsigned bpp, int flip, struct swap_rect region);
 
+/* The check of the orientation of a frame: 1 when every point of the window's
+ * picture (w by h points, rows from the top, window_stride bytes a row, each
+ * point a 32-bit word stored low byte first with the colour in its low 24 bits:
+ * the bytes are blue, green, red and one that is ignored) has the red, green
+ * and blue of the point of `rgba` (w by h points of the bytes red, green, blue,
+ * alpha, rows from the bottom up, as glReadPixels gives them) in the mirrored
+ * row. The platform's copy, which keeps the rows of the driver's picture as
+ * they are, passes it; a copy that flipped them does not. */
+int swap_window_matches_readback(const unsigned char *window, size_t window_stride,
+				 const unsigned char *rgba, int w, int h);
+/* 1 when the readback is its own mirror (the check above could not tell a
+ * flipped copy from a right one). */
+int swap_readback_is_symmetric(const unsigned char *rgba, int w, int h);
+
 #endif

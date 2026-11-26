@@ -669,6 +669,17 @@ class PlatformTests(unittest.TestCase):
         self.assertIn("STAFETO_WINDOW_ARGB8888", text)
         # A swap in a forked child.
         self.assertIn("getpid()", text)
+        # The copy keeps the rows of the driver's picture (flip 0): the picture of
+        # a window-system framebuffer is top-down already. The guest checks the
+        # orientation against glReadPixels (a planted flip 1 fails it; swap_test.c
+        # holds the same fault for the host).
+        self.assertIn("BYTES_PER_POINT, 0, s->copy)", text)
+        # The wait for a free buffer takes no bit from the program's wait.
+        self.assertIn("stafeto_window_wait_free(", text)
+        self.assertNotIn("stafeto_window_wait(", text)
+        self.assertNotIn("stafeto_window_free_buffers(", text)
+        # The swap is no cancellation point.
+        self.assertIn("PTHREAD_CANCEL_DISABLE", text)
         # A window has no images: the loader answers 0 for its buffers.
         self.assertRegex(text, r"EGL_WINDOW_BIT\)\s+return 0;")
 

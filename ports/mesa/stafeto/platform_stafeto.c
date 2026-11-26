@@ -35,6 +35,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,7 +90,9 @@ now_ns(void)
    return (uint64_t)t.tv_sec * UINT64_C(1000000000) + (uint64_t)t.tv_nsec;
 }
 
-/* The window of the surface is open and is the one the surface was made for. */
+/* The window of the surface is open and is the one the surface was made for:
+ * the number and the generation of the window say it (a window closed and
+ * opened again has another generation). */
 static bool
 stafeto_surface_is_the_window(const struct dri2_stafeto_surface *s)
 {
@@ -97,48 +100,33 @@ stafeto_surface_is_the_window(const struct dri2_stafeto_surface *s)
 
    if (stafeto_window_info(s->number, &now) != 0)
       return false;
-   return now.width == s->window.width && now.height == s->window.height &&
-          now.stride == s->window.stride && now.format == s->window.format &&
-          now.buffers == s->window.buffers &&
-          memcmp(now.pixels, s->window.pixels, sizeof now.pixels) == 0;
+   return now.generation == s->window.generation;
 }
 
-/* Waits until a buffer of `mask` is free (the library's account), at most
- * until `deadline`. The index of the buffer, or -1 with errno: ETIMEDOUT,
- * ENODEV (the service is gone) or what the wait gave. A signal that ends the
- * wait goes on with it. */
+/* Waits until a buffer of `mask` is free, for `timeout_ns` at most
+ * (UINT64_MAX: without limit). The index of the buffer, or -1 with errno:
+ * ETIMEDOUT, ENODEV (the service is gone) or what the wait gave. A signal
+ * that ends the wait goes on with it. The wait takes no bit from the
+ * program's own stafeto_window_wait (the events among them). */
 static int
 stafeto_wait_for_buffer(const struct dri2_stafeto_surface *s, uint32_t mask,
-                        uint64_t deadline)
+                        uint64_t timeout_ns)
 {
+   const uint64_t start = now_ns();
+
    for (;;) {
-      uint32_t free = stafeto_window_free_buffers(s->number) & mask;
-      uint32_t bits;
-      uint64_t now;
+      uint64_t left = timeout_ns;
+      uint32_t free = 0;
 
-      if (free)
+      if (timeout_ns != UINT64_MAX) {
+         uint64_t spent = now_ns() - start;
+
+         left = spent >= timeout_ns ? 0 : timeout_ns - spent;
+      }
+      if (stafeto_window_wait_free(s->number, mask, left, &free) == 0)
          return __builtin_ctz(free);
-      now = now_ns();
-      if (now >= deadline) {
-         errno = ETIMEDOUT;
+      if (errno != EINTR)
          return -1;
-      }
-      if (stafeto_window_wait(s->number, deadline - now, &bits) == 0)
-         continue;
-      switch (errno) {
-      case EINTR:
-      case ETIMEDOUT:
-         break;
-      case EBUSY: {
-         /* Another thread of the program waits on the window: look again soon. */
-         struct timespec pause = {0, 1000000};
-
-         nanosleep(&pause, NULL);
-         break;
-      }
-      default:
-         return -1;
-      }
    }
 }
 
@@ -205,6 +193,12 @@ stafeto_get_image(struct dri_drawable *read, int x, int y, int w, int h,
    if (dri2_surf->base.Type != EGL_WINDOW_BIT) {
       swrast_pbuffer_loader_extension.getImage(read, x, y, w, h, data,
                                                loaderPrivate);
+      return;
+   }
+   /* The child of a fork and a window that is not the surface's give black:
+    * their pixels are not what the surface showed. */
+   if (s && (s->pid != getpid() || !stafeto_surface_is_the_window(s))) {
+      memset(data, 0, (size_t)h * stride);
       return;
    }
    for (int i = 0; i < h; i++) {
@@ -449,29 +443,37 @@ dri2_stafeto_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
    return EGL_TRUE;
 }
 
-/* eglSwapBuffers and eglSwapBuffersWithDamage*: one copy of the frame into a
- * free buffer of the window and one POST (docs/egl.md). */
+/* The swap itself (docs/egl.md). A failure after the check of the process
+ * leaves the history as if no frame had been taken: the next swap copies and
+ * posts the whole window. */
 static EGLBoolean
-dri2_stafeto_swap_buffers(_EGLDisplay *disp, _EGLSurface *draw,
-                          const EGLint *rects, EGLint n_rects)
+stafeto_swap(_EGLDisplay *disp, _EGLSurface *draw, const EGLint *rects,
+             EGLint n_rects)
 {
    struct dri2_egl_surface *dri2_surf = dri2_egl_surface(draw);
    struct dri2_stafeto_surface *s = dri2_surf->stafeto;
    struct swap_plan plan;
    struct stafeto_rect post[SWAP_POST_MAX];
-   uint64_t deadline;
    int buffer, before;
 
-   /* A forked child has no window; the surface is the parent's. */
+   /* A forked child has no window: the surface is the parent's, and what the
+    * window library knows in the child is another window's or none. A child
+    * cannot swap into the parent's window, and a window it opened itself is
+    * not the surface's. */
    if (s->pid != getpid())
       return _eglError(EGL_BAD_SURFACE, "eglSwapBuffers: the window belongs to the parent");
-   if (!stafeto_surface_is_the_window(s))
+   if (!stafeto_surface_is_the_window(s)) {
+      swap_history_reset(&s->history);
       return _eglError(EGL_BAD_NATIVE_WINDOW, "eglSwapBuffers: the window is gone");
+   }
 
-   deadline = now_ns() + WAIT_NS;
-   buffer = stafeto_wait_for_buffer(s, (1u << s->window.buffers) - 1, deadline);
-   if (buffer < 0)
+   /* No limit: the wait ends when a buffer is free or the service is gone (the
+    * library tells it). A signal that ran its handler does not end it. */
+   buffer = stafeto_wait_for_buffer(s, (1u << s->window.buffers) - 1, UINT64_MAX);
+   if (buffer < 0) {
+      swap_history_reset(&s->history);
       return _eglError(EGL_BAD_NATIVE_WINDOW, "eglSwapBuffers: no free buffer");
+   }
 
    swap_plan_make(&s->history, (unsigned)buffer, rects, n_rects, &plan);
    s->target = buffer;
@@ -489,7 +491,6 @@ dri2_stafeto_swap_buffers(_EGLDisplay *disp, _EGLSurface *draw,
       post[i].h = plan.post[i].h;
    }
    if (stafeto_window_post(s->number, (uint32_t)buffer, post, plan.post_count) != 0) {
-      /* The service did not take the frame: the next swap starts whole. */
       swap_history_reset(&s->history);
       return _eglError(EGL_BAD_NATIVE_WINDOW, "eglSwapBuffers: the post failed");
    }
@@ -498,14 +499,37 @@ dri2_stafeto_swap_buffers(_EGLDisplay *disp, _EGLSurface *draw,
 
    /* An interval of 1 waits until the service takes the frame into one of its
     * own, which frees the buffer the window showed before. A frame that is
-    * late is no error. */
+    * late (a second) is no error. */
    if (draw->SwapInterval > 0 && before >= 0 && before != buffer) {
-      int got = stafeto_wait_for_buffer(s, 1u << before, now_ns() + WAIT_NS);
+      int got = stafeto_wait_for_buffer(s, 1u << before, WAIT_NS);
 
-      if (got < 0 && errno == ENODEV)
+      if (got < 0 && errno != ETIMEDOUT) {
+         swap_history_reset(&s->history);
          return _eglError(EGL_BAD_NATIVE_WINDOW, "eglSwapBuffers: the service is gone");
+      }
    }
    return EGL_TRUE;
+}
+
+/* eglSwapBuffers and eglSwapBuffersWithDamage*: one copy of the frame into a
+ * free buffer of the window and one POST (docs/egl.md). The swap is not a
+ * cancellation point (a thread cancelled in the middle would leave the buffer
+ * taken and the history half made), and a swap that succeeds leaves errno as
+ * it found it. */
+static EGLBoolean
+dri2_stafeto_swap_buffers(_EGLDisplay *disp, _EGLSurface *draw,
+                          const EGLint *rects, EGLint n_rects)
+{
+   const int saved = errno;
+   int cancel_state = PTHREAD_CANCEL_ENABLE;
+   EGLBoolean swapped;
+
+   pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+   swapped = stafeto_swap(disp, draw, rects, n_rects);
+   pthread_setcancelstate(cancel_state, NULL);
+   if (swapped)
+      errno = saved;
+   return swapped;
 }
 
 static EGLBoolean

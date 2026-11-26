@@ -353,6 +353,57 @@ static void test_blit_clips_the_region_to_the_destination(void)
 	CHECK(dst[0] == 5 && dst[15] == 5);
 }
 
+/* A picture as the driver keeps it (rows from the top, blue green red x) and its readback
+ * (red green blue alpha, rows from the bottom up). */
+static void make_picture(unsigned char *top_down, unsigned char *readback, int w, int h)
+{
+	for (int y = 0; y < h; y++)
+		for (int x = 0; x < w; x++) {
+			unsigned char r = (unsigned char)(x * 7 + y * 3), g = (unsigned char)(y * 11),
+				      b = (unsigned char)(x * 5);
+			unsigned char *p = top_down + ((size_t)y * w + x) * 4;
+			unsigned char *q = readback + ((size_t)(h - 1 - y) * w + x) * 4;
+			p[0] = b; p[1] = g; p[2] = r; p[3] = 0;
+			q[0] = r; q[1] = g; q[2] = b; q[3] = 255;
+		}
+}
+
+static void test_a_copy_that_keeps_the_rows_matches_the_readback(void)
+{
+	enum { W = 8, H = 6 };
+	unsigned char top_down[W * H * 4], readback[W * H * 4], window[W * H * 4];
+	make_picture(top_down, readback, W, H);
+	memset(window, 0, sizeof window);
+	CHECK(swap_blit(window, W * 4, W, H, top_down, W * 4, 0, 0, W, H, 4, 0,
+			(struct swap_rect){0, 0, W, H}) == W * H);
+	CHECK(swap_window_matches_readback(window, W * 4, readback, W, H));
+	CHECK(!swap_readback_is_symmetric(readback, W, H));
+}
+
+static void test_a_copy_that_flips_the_rows_fails_the_readback_check(void)
+{
+	enum { W = 8, H = 6 };
+	unsigned char top_down[W * H * 4], readback[W * H * 4], window[W * H * 4];
+	make_picture(top_down, readback, W, H);
+	memset(window, 0, sizeof window);
+	/* The planted fault: flip = 1 in the copy. */
+	CHECK(swap_blit(window, W * 4, W, H, top_down, W * 4, 0, 0, W, H, 4, 1,
+			(struct swap_rect){0, 0, W, H}) == W * H);
+	CHECK(!swap_window_matches_readback(window, W * 4, readback, W, H));
+}
+
+static void test_a_symmetric_picture_is_told_from_the_rest(void)
+{
+	enum { W = 4, H = 4 };
+	unsigned char rgba[W * H * 4];
+	for (int y = 0; y < H; y++)
+		for (int x = 0; x < W * 4; x++)
+			rgba[y * W * 4 + x] = (unsigned char)(y < H / 2 ? y : H - 1 - y);
+	CHECK(swap_readback_is_symmetric(rgba, W, H));
+	rgba[0] ^= 1;
+	CHECK(!swap_readback_is_symmetric(rgba, W, H));
+}
+
 struct test {
 	const char *name;
 	void (*run)(void);
@@ -391,6 +442,9 @@ int main(void)
 		T(test_blit_stops_at_the_sources_edge),
 		T(test_blit_of_nothing_copies_nothing),
 		T(test_blit_clips_the_region_to_the_destination),
+		T(test_a_copy_that_keeps_the_rows_matches_the_readback),
+		T(test_a_copy_that_flips_the_rows_fails_the_readback_check),
+		T(test_a_symmetric_picture_is_told_from_the_rest),
 	};
 	for (size_t i = 0; i < sizeof tests / sizeof tests[0]; i++) {
 		int before = failures;
