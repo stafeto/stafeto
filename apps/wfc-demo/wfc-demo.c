@@ -33,6 +33,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
+#include <sched.h>
 #include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -546,7 +547,21 @@ static pid_t start_holder(const char *program, const char *const *argv_head, int
     argv[count] = (char *)"--hold";
     argv[count + 1] = hold;
     argv[count + 2] = NULL;
-    if (posix_spawn(&pid, program, NULL, NULL, argv, environ) != 0) return -1;
+    /* The holder is a best-effort client that draws on the CPU: SCHED_RR 30, which
+     * is level 28 for this program (top 30), the level and the top of the holder, below
+     * every interactive level, its load and its teardown too. */
+    posix_spawnattr_t attr;
+    struct sched_param param = {.sched_priority = 30};
+    if (posix_spawnattr_init(&attr) != 0) return -1;
+    if (posix_spawnattr_setschedpolicy(&attr, SCHED_RR) != 0 ||
+        posix_spawnattr_setschedparam(&attr, &param) != 0 ||
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSCHEDULER | POSIX_SPAWN_SETSCHEDPARAM) != 0) {
+        posix_spawnattr_destroy(&attr);
+        return -1;
+    }
+    int spawned = posix_spawn(&pid, program, NULL, &attr, argv, environ);
+    posix_spawnattr_destroy(&attr);
+    if (spawned != 0) return -1;
     close(fds[1]);
     *read_end = fds[0];
     return pid;
@@ -657,6 +672,9 @@ static int paced_phase(const char *name, int frames, int stop_fd) {
     return 0;
 }
 
+/* The bytes the process service has left in its pool (Pool, kind 33). */
+extern unsigned long long stafeto_probe_pool(void);
+
 static int run_load(void) {
     static const char *const cube_argv[] = {"gles-cube", "--window-run", "--size", "160",
                                             "--frames", "6", "--stamps"};
@@ -669,6 +687,12 @@ static int run_load(void) {
     WFCfloat src[4] = {0, 0, LOAD_W, LOAD_H};
     int cube_pipe = -1, status = 0;
     pid_t pid;
+    /* The pool before the cube starts: when the cube is killed and waited for, the
+     * quota of its process and the pages of its image are back. The image's object is
+     * closed by the service's reaper before the end is told, and the cleanup of the
+     * payer's shell that follows runs at the cube's level, so the pool is read again
+     * (10 ms apart, 2 s at most) and the number of reads is printed. */
+    unsigned long long pool_before = stafeto_probe_pool();
 
     CHECK(stafeto_window_open(20, 20, LOAD_W, LOAD_H, STAFETO_WINDOW_XRGB8888, 3, 0, &w) == 0);
     CHECK(next_stream(&id_p) == 0);
@@ -703,8 +727,24 @@ static int run_load(void) {
     fflush(stdout);
 
     kill(pid, SIGKILL);
+    printf("wfc-demo: load pool after kill %llu\n", stafeto_probe_pool());
     waitpid(pid, &status, 0);
     close(cube_pipe);
+    {
+        unsigned long long pool_after = stafeto_probe_pool();
+        int polls = 0;
+        printf("wfc-demo: load pool after wait %llu\n", pool_after);
+        while (pool_after != pool_before && polls < 200) {
+            struct timespec nap = {0, 10000000};
+            nanosleep(&nap, NULL);
+            pool_after = stafeto_probe_pool();
+            polls++;
+        }
+        printf("wfc-demo: load pool polls %d\n", polls);
+        printf("wfc-demo: load pool before %llu after %llu\n", pool_before, pool_after);
+        fflush(stdout);
+        CHECK(pool_before != 0 && pool_after == pool_before);
+    }
     wfcDeactivate(dev, ctx);
     wfcRemoveElement(dev, cube);
     wfcRemoveElement(dev, plain);

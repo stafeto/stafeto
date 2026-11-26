@@ -221,18 +221,25 @@ pub fn thread_set(id: u64, policy: i32, priority: i32, tail: bool) -> Result<i32
 
 /// The level a new process image starts at and the scheduling word its
 /// main thread applies to itself: the top level of the caller and `spec`
-/// (policy and priority), or the caller's own scheduling for None. EINVAL
-/// for a policy or priority out of range, EPERM for a rise the caller may
-/// not make.
+/// (policy and priority), or the caller's own scheduling for None. A `spec`
+/// of SCHED_FIFO or SCHED_RR whose level is below the caller's top starts the
+/// image, its loader among it, at that level, which is its top: the word
+/// then names the greatest priority, the level of the image. EINVAL for a
+/// policy or priority out of range, EPERM for a rise the caller may not
+/// make.
 pub(crate) fn for_child(spec: Option<(i32, i32)>) -> Result<(u8, u64), i32> {
     let own = unpack(crate::threads::own_block().sched.load(Ordering::Relaxed));
     let (policy, priority) = spec.unwrap_or(own);
     refused(posix_types::sporadic::Call::Spawn, policy)?;
-    level_of(policy, priority)?;
+    let (level, _) = level_of(policy, priority)?;
     if spec.is_some() && !permitted(own, (policy, priority)) {
         return Err(EPERM);
     }
-    Ok((top()?, START | pack(policy, priority)))
+    let top = top()?;
+    if spec.is_some() && matches!(policy, SCHED_FIFO | SCHED_RR) && level < top {
+        return Ok((level, START | pack(policy, MAX_PRIORITY)));
+    }
+    Ok((top, START | pack(policy, priority)))
 }
 
 /// The POSIX policy of the calling thread.
