@@ -2138,8 +2138,11 @@ impl Processes {
     /// Refused for a signal outside the supported range; signal 0 and a
     /// zombie take nothing; SIGKILL
     /// ends the process from the service at the target's base level
-    /// (process_kill_at; only the stages that stop its threads and children
-    /// rise to its ceiling); any other is posted on the target's page
+    /// (process_kill_at). The kernel's teardown level R is the higher of that
+    /// level and the priority of the exit notification, which `exit_place`
+    /// puts at the ceiling, so every stage runs at the ceiling; the base
+    /// level changes when the call returns and the level the reaper closes
+    /// the image objects at. Any other signal is posted on the target's page
     /// (`signal`). O(1).
     fn deliver(&mut self, sender: usize, target: usize, signal: u8) -> Delivery {
         self.deliver_with(sender, target, signal, SI_USER, 0)

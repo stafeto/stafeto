@@ -115,7 +115,13 @@ fn kernel_policy(policy: i32) -> Policy {
 /// ceiling does not allow (`posix_thread::levels`).
 pub(crate) fn level_of(policy: i32, priority: i32) -> Result<(u8, Policy), i32> {
     let ceiling = crate::ceiling().map_err(|_| EIO)?;
-    let level = posix_thread::levels::level_for(policy, priority, top()?, ceiling)?;
+    let level = posix_thread::levels::level_for(
+        policy,
+        priority,
+        top()?,
+        ceiling,
+        TOP_INHERITED.load(Ordering::Relaxed),
+    )?;
     let kernel = if matches!(policy, SCHED_FIFO | SCHED_RR) {
         kernel_policy(policy)
     } else {
@@ -349,6 +355,18 @@ pub fn set(pid: i32, policy: i32, priority: i32) -> Result<i32, i32> {
 
 // ---- PTHREAD_PRIO_PROTECT ----
 
+/// The level of a mutex of ceiling `priority`, held down to what a thread of
+/// the process may have (`posix_thread::levels::protect_level`).
+fn protect_level(priority: i32) -> Result<u8, i32> {
+    let ceiling = crate::ceiling().map_err(|_| EIO)?;
+    posix_thread::levels::protect_level(
+        priority,
+        top()?,
+        ceiling,
+        TOP_INHERITED.load(Ordering::Relaxed),
+    )
+}
+
 /// The caller takes a mutex of ceiling `priority` (POSIX, 1 to 32): it runs
 /// at least at that priority's level until `protect_leave`. EINVAL for a
 /// priority out of range or a caller with a higher priority than the
@@ -359,7 +377,7 @@ pub fn protect_enter(priority: i32) -> Result<(), i32> {
     if policy != SCHED_OTHER && own > priority {
         return Err(EINVAL);
     }
-    let (level, _) = level_of(SCHED_FIFO, priority)?;
+    let level = protect_level(priority)?;
     let mut bytes = block.protect.load(Ordering::Relaxed).to_le_bytes();
     let Some(free) = bytes.iter_mut().find(|b| **b == 0) else {
         return Err(EAGAIN);
@@ -376,7 +394,7 @@ pub fn protect_enter(priority: i32) -> Result<(), i32> {
 /// The caller let go of a mutex of ceiling `priority`.
 pub fn protect_leave(priority: i32) {
     let block = crate::threads::own_block();
-    let Ok((level, _)) = level_of(SCHED_FIFO, priority) else {
+    let Ok(level) = protect_level(priority) else {
         return;
     };
     let mut bytes = block.protect.load(Ordering::Relaxed).to_le_bytes();

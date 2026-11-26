@@ -110,11 +110,12 @@ pub struct Record<P> {
     pub ceiling: u8,
     /// The base level of its process: the priority of its first thread at
     /// the start (the ceiling until the service sets it). The service kills
-    /// the process at this level (process_kill_at), so the stages of its
-    /// teardown after those that stop its threads and children run at it
-    /// (spec 7.7: R, the level of the cause); those two stages run at the
-    /// ceiling whatever R is, and the notice of its end keeps the level of
-    /// its exit place, the ceiling (`exit_place`).
+    /// the process at this level (process_kill_at) and the reaper closes the
+    /// image objects of its end at it. The teardown stages all run at the
+    /// ceiling: the kernel's R is the higher of the kill level and the
+    /// priority of the exit notification (`set_exit`), and `exit_place` puts
+    /// that at the ceiling. The base level only decides when the kill call
+    /// returns and at what level the reaper works.
     pub level: u8,
     /// The quota and the room for handles of its process, which a child
     /// it spawns from a file gets too (5c).

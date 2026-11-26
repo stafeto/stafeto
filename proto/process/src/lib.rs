@@ -229,6 +229,8 @@ pub mod sporadic;
 
 /// Version 17: the mark PKG joins the marks of the services that send a root with Register, with
 /// the root `ROOT_PKG` for the slot Packages of the loader; TakeRoot refuses it.
+/// Version 18: bit 62 of the scheduling word of SpawnStart (`START_LOWERED`): the spawn asked
+/// for a scheduling below the caller's top.
 /// Version 16: TakeRoot (number 44), the process's own request for the root of the data file
 /// service, and the mark DATAFS joins the marks of the services that send a root with Register.
 /// Version 15: Budget (number 42), the time budgets of POSIX threads under
@@ -238,7 +240,7 @@ pub mod sporadic;
 /// had) names the slot whose root it asks for in a body, and the notary marks
 /// PIPE, NET and ENTROPY join TERMINAL as the marks of a service that sends
 /// its root with Register.
-pub const VERSION: u16 = 17;
+pub const VERSION: u16 = 18;
 
 /// The bytes of the name a record keeps for `ps` (the last component of
 /// the path of its program, cut to fit, with a terminating zero).
@@ -2123,7 +2125,7 @@ mod tests {
         assert!(METHODS.iter().all(|&m| m < 64));
         // The request is a header and no body.
         let header = Method::EntropyRejoin.header();
-        assert_eq!(header.version, 17);
+        assert_eq!(header.version, 18);
         assert_eq!(header.bytes().len(), 8);
         assert_eq!(Header::read(&mut Reader::new(&header.bytes())), Ok(header));
     }
@@ -2399,7 +2401,7 @@ mod tests {
         assert_eq!(Method::TakeRoot as u16, 44);
         assert!(METHODS.contains(&44));
         assert!(METHODS.iter().all(|&m| m < 64));
-        assert_eq!(VERSION, 17);
+        assert_eq!(VERSION, 18);
         let mut w = Writer::new();
         LoaderRoot { root: ROOT_DATA }.write(&mut w).unwrap();
         assert_eq!(
@@ -2469,7 +2471,7 @@ mod tests {
         long.push(0);
         assert_eq!(Held::read(&long), Err(Status::BadSize));
         assert_eq!(Held::Write.word(), HELD_WRITE);
-        assert_eq!(VERSION, 17);
+        assert_eq!(VERSION, 18);
     }
 
     #[test]

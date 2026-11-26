@@ -126,7 +126,10 @@ pub fn waiting() -> bool {
 }
 
 /// The thread ended: the loop closes the objects of the places it was given
-/// and had not closed, and marks them done.
+/// and had not closed, and marks them done. This is the failure path: the
+/// close of an object of tens of megabytes runs in one step of the loop at the
+/// service's level, as it did before the reaper, so the steps of that path
+/// pass the bound of a step. It happens once, when the thread is gone.
 pub fn close_open() {
     for (place, handle) in PLACES.open() {
         drop(Handle::<Memory>::from_raw(abi::Handle(handle)));
@@ -232,21 +235,33 @@ fn settle(nap: &Nap, child: u64, level: u8, waits: &Handle<Channel>, told: &mut 
     let began = rt::time::ticks_to_ns(rt::time::now());
     let until = began + SETTLE_NS;
     let mut naps = 0u32;
+    // Why the wait ended, for the steps build's line (the probe judges the
+    // deadline only: the other ends leave the pages to the queue).
+    let mut why = "deadline";
     while rt::time::ticks_to_ns(rt::time::now()) < until {
         let used = sys::process_memory(&child).map_or(0, |m| m.used);
-        if used <= SETTLED || PLACES.highest_open() > level || !nap.sleep(waits, told, until) {
+        if used <= SETTLED {
+            why = "drained";
+            break;
+        }
+        if PLACES.highest_open() > level {
+            why = "higher";
+            break;
+        }
+        if !nap.sleep(waits, told, until) {
+            why = "timer";
             break;
         }
         naps += 1;
     }
     #[cfg(feature = "steps")]
     rt::println!(
-        "posix-process: reaper waited {naps} pauses, {} ns, the child uses {}",
+        "posix-process: reaper waited {naps} pauses, {} ns, the child uses {} ended by {why}",
         rt::time::ticks_to_ns(rt::time::now()).saturating_sub(began),
         sys::process_memory(&child).map_or(0, |m| m.used)
     );
     #[cfg(not(feature = "steps"))]
-    let _ = naps;
+    let _ = (naps, why);
 }
 
 /// The thread's own timer, on the channel it waits on.

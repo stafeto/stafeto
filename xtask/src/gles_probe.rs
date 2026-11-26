@@ -588,6 +588,9 @@ pub fn process_service_verdict(lines: &[String]) -> Result<String, String> {
                 "child",
                 "uses",
                 used,
+                "ended",
+                "by",
+                why,
             ] => {
                 let (pauses, ns, used) = (
                     pauses
@@ -596,7 +599,7 @@ pub fn process_service_verdict(lines: &[String]) -> Result<String, String> {
                     ns.parse::<u64>().map_err(|e| format!("{line:?}: {e}"))?,
                     used.parse::<u64>().map_err(|e| format!("{line:?}: {e}"))?,
                 );
-                if used > 64 * 1024 {
+                if *why == "deadline" && used > 64 * 1024 {
                     return Err(format!(
                         "the reaper gave up after {pauses} pauses ({ns} ns): the process still used {used} bytes"
                     ));
@@ -723,8 +726,16 @@ fn scene_lines(lines: &[String]) -> &[String] {
 
 /// The run of the image under -icount, up to the demo's end and its marker.
 fn run_steps_image(machine: &qemu::Machine) -> Result<qemu::Outcome, String> {
+    run_image(machine, "boot-gles-steps.img", &STEPS_PROGRAMS)
+}
+
+fn run_image(
+    machine: &qemu::Machine,
+    name: &'static str,
+    programs: &'static [ImageProgram],
+) -> Result<qemu::Outcome, String> {
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image("boot-gles-steps.img", &STEPS_PROGRAMS, BOOT_PROFILE)?;
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::GPU);
@@ -1295,7 +1306,7 @@ mod tests {
             "service gap: 2 kind 64 900000 ticks of 900100".to_owned(),
             "posix-process: reaper level 28 1200000 ticks".to_owned(),
             "posix-process: reaper highest level 28".to_owned(),
-            "posix-process: reaper waited 29 pauses, 1886650 ns, the child uses 28672".to_owned(),
+            "posix-process: reaper waited 29 pauses, 1886650 ns, the child uses 28672 ended by drained".to_owned(),
             "service step: 1 kind 64 6500 ticks detail 4096".to_owned(),
             "service step: 1 kind 64 9900 ticks detail 32768".to_owned(),
         ];
@@ -1319,12 +1330,19 @@ mod tests {
         let mut highest = ok.clone();
         highest.push("posix-process: reaper highest level 52".to_owned());
         assert!(process_service_verdict(&highest).is_err());
-        let mut gave_up = ok;
+        let mut gave_up = ok.clone();
         gave_up.push(
-            "posix-process: reaper waited 100 pauses, 100000000 ns, the child uses 9932800"
+            "posix-process: reaper waited 100 pauses, 100000000 ns, the child uses 9932800 ended by deadline"
                 .to_owned(),
         );
         assert!(process_service_verdict(&gave_up).is_err());
+        // A wait that a higher place ended leaves the pages to the queue: not judged.
+        let mut yielded = ok;
+        yielded.push(
+            "posix-process: reaper waited 3 pauses, 3000000 ns, the child uses 9932800 ended by higher"
+                .to_owned(),
+        );
+        assert!(process_service_verdict(&yielded).is_ok());
     }
 
     fn load_lines(cube_lag_us: u64, cube_wake_us: u64) -> Vec<String> {
