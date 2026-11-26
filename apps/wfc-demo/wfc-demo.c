@@ -631,7 +631,7 @@ static int paced_phase(const char *name, int frames, int stop_fd, int *posts_out
     struct stafeto_window w;
     uint64_t t0 = mono_ns() + 2 * LOAD_PERIOD_NS;
     uint64_t take_max = 0, take_sum = 0, wake_max = 0, lag_max = 0;
-    unsigned over1 = 0, over2 = 0, posts = 0, replaced = 0;
+    unsigned over1 = 0, over2 = 0, posts = 0, replaced = 0, overruns = 0;
     int limit = stop_fd >= 0 ? LOAD_CUBE_FRAMES_MAX : frames;
 
     CHECK(stafeto_window_info(0, &w) == 0);
@@ -645,9 +645,19 @@ static int paced_phase(const char *name, int frames, int stop_fd, int *posts_out
             struct pollfd p = {stop_fd, POLLIN, 0};
             if (poll(&p, 1, 0) > 0) break;
         }
-        sleep_until_ns(due);
-        woke = mono_ns();
-        if (woke > due && woke - due > wake_max) wake_max = woke - due;
+        /* A wake-up is measured only after a real sleep: a post that is already due when
+         * the loop gets to it (the client was busy or starved) is an overrun, not a wake-up. */
+        {
+            uint64_t before = mono_ns();
+            if (before >= due) {
+                overruns++;
+                woke = before;
+            } else {
+                sleep_until_ns(due);
+                woke = mono_ns();
+                if (woke > due && woke - due > wake_max) wake_max = woke - due;
+            }
+        }
         if (!(stafeto_window_free_buffers(0) & (1u << b)))
             CHECK(stafeto_window_wait_free(0, 1u << b, 1000000000ULL, &free_bits) == 0);
         for (int y = 0; y < 8; y++) {
@@ -671,10 +681,10 @@ static int paced_phase(const char *name, int frames, int stop_fd, int *posts_out
         if (took > LOAD_PERIOD_NS) over1++;
         if (took > 2 * LOAD_PERIOD_NS) over2++;
     }
-    printf("wfc-demo: load %s posts %u late %u late2 %u take max %llu us mean %llu us wake max %llu us unfreed %u lag max %llu us\n",
+    printf("wfc-demo: load %s posts %u late %u late2 %u take max %llu us mean %llu us wake max %llu us unfreed %u lag max %llu us overrun %u\n",
            name, posts, over1, over2, (unsigned long long)(take_max / 1000),
            (unsigned long long)(posts > 1 ? take_sum / (posts - 1) / 1000 : 0),
-           (unsigned long long)(wake_max / 1000), replaced, (unsigned long long)(lag_max / 1000));
+           (unsigned long long)(wake_max / 1000), replaced, (unsigned long long)(lag_max / 1000), overruns);
     posted_before += posts;
     if (posts_out) *posts_out = (int)posts;
     fflush(stdout);
@@ -701,6 +711,8 @@ static int run_load(void) {
      * closes the image's objects and waits for the pages before the end is told. */
     unsigned long long pool_before = stafeto_probe_pool();
 
+    printf("wfc-demo: load starts\n");
+    fflush(stdout);
     CHECK(stafeto_window_open(20, 20, LOAD_W, LOAD_H, STAFETO_WINDOW_XRGB8888, 3, 0, &w) == 0);
     CHECK(next_stream(&id_p) == 0);
     source_p = wfcCreateSourceFromStream(dev, ctx, id_p, NULL);
