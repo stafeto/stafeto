@@ -1277,6 +1277,22 @@ impl Blocks {
         self.owner.iter().flatten().count()
     }
 
+    /// The numbers that no consumer holds and that wait for the switch's answer or for the sweep
+    /// (`Leaving`, or `Until` a round not yet reached): an ATTACH that finds no usable number
+    /// while this is above 0 can succeed once the sweep has gone on (`proto_net::SWEEPING`).
+    pub fn pending_sweep(&self) -> usize {
+        (0..MAX_CONSUMERS)
+            .filter(|&c| {
+                self.owner[c].is_none()
+                    && match self.number[c] {
+                        Number::Free => false,
+                        Number::Leaving => true,
+                        Number::Until(r) => self.swept.wrapping_sub(r) >= u32::MAX / 2,
+                    }
+            })
+            .count()
+    }
+
     /// The number of the round of the sweep the stack last heard of.
     pub fn swept_round(&self) -> u32 {
         self.swept
@@ -1611,6 +1627,37 @@ pub(crate) mod tests {
         b.detached(6, 0);
         b.swept(100);
         assert!(b.alloc(&mut map, 1000).is_none());
+    }
+
+    #[test]
+    fn the_wait_of_a_consumer_covers_two_rounds_of_the_sweep_of_the_default_table() {
+        let steps = crate::config::FLOWS_DEFAULT as u64 / SWEEP_STEP as u64;
+        let round_ns = steps * crate::ring::SWEEP_IDLE_NS;
+        assert!(proto_net::switch::SWEEP_WAIT_NS > 2 * round_ns);
+    }
+
+    #[test]
+    fn the_numbers_that_wait_for_the_sweep_are_counted() {
+        let (mut b, mut map) = (Blocks::new(), PortMap::new());
+        for _ in 0..8 {
+            b.alloc(&mut map, 0).unwrap();
+        }
+        assert_eq!(b.pending_sweep(), 0, "all held");
+        b.release(5, 0);
+        assert_eq!(b.pending_sweep(), 1, "left, the switch has not answered");
+        b.release(2, 0);
+        b.detached(5, 7);
+        assert_eq!(b.pending_sweep(), 2);
+        b.swept(8);
+        assert_eq!(b.pending_sweep(), 2, "half a round does not count");
+        b.swept(9);
+        assert_eq!(
+            b.pending_sweep(),
+            1,
+            "number 5 is usable, number 2 still leaves"
+        );
+        assert_eq!(b.alloc(&mut map, 1000).map(|a| a.0), Some(5));
+        assert_eq!(b.pending_sweep(), 1);
     }
 
     #[test]
