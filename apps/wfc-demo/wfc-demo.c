@@ -521,17 +521,155 @@ static int run_scene(int probe) {
     return 0;
 }
 
+/* The scenes of --gles (GLES_* of tools/wfc-ref/src/lib.rs). */
+#define GLES_SIZE 160
+#define GLES_CUBE_X 240
+#define GLES_CUBE_Y 120
+#define GLES_FIELD_X 440
+#define GLES_FIELD_Y 120
+#define BG_G 0x203040FF
+
+static pid_t pid_cube, pid_field;
+
+/* Starts `program` with its arguments and the write end of a pipe as the
+ * argument after `hold`; the read end is in *read_end. The demo keeps no write
+ * end, so a program that dies makes the read end end. */
+static pid_t start_holder(const char *program, const char *const *argv_head, int count, int *read_end) {
+    int fds[2];
+    char hold[16];
+    char *argv[16];
+    pid_t pid = 0;
+    if (pipe(fds) != 0) return -1;
+    snprintf(hold, sizeof hold, "%d", fds[1]);
+    for (int i = 0; i < count; i++) argv[i] = (char *)argv_head[i];
+    argv[count] = (char *)"--hold";
+    argv[count + 1] = hold;
+    argv[count + 2] = NULL;
+    if (posix_spawn(&pid, program, NULL, NULL, argv, environ) != 0) return -1;
+    close(fds[1]);
+    *read_end = fds[0];
+    return pid;
+}
+
+/* Waits for the byte the holder writes once it holds its last frame. */
+static int wait_held(int read_end) {
+    char byte = 0;
+    return read(read_end, &byte, 1) == 1 && byte == 'h' ? 0 : 1;
+}
+
+/* One element of the scene G: window `source`, `src` in its points, `dst` on the screen. */
+static void gles_element(WFCElement e, WFCSource source, WFCint rotation, const WFCint *dst) {
+    WFCfloat src[4] = {0, 0, GLES_SIZE, GLES_SIZE};
+    wfcSetElementAttribi(dev, e, WFC_ELEMENT_SOURCE, (WFCint)source);
+    wfcSetElementAttribfv(dev, e, WFC_ELEMENT_SOURCE_RECTANGLE, 4, src);
+    wfcSetElementAttribiv(dev, e, WFC_ELEMENT_DESTINATION_RECTANGLE, 4, dst);
+    wfcSetElementAttribi(dev, e, WFC_ELEMENT_SOURCE_ROTATION, rotation);
+    wfcSetElementAttribi(dev, e, WFC_ELEMENT_SOURCE_FLIP, 0);
+    wfcSetElementAttribi(dev, e, WFC_ELEMENT_SOURCE_SCALE_FILTER, WFC_SCALE_FILTER_NONE);
+    wfcSetElementAttribi(dev, e, WFC_ELEMENT_TRANSPARENCY_TYPES, 0);
+    wfcSetElementAttribi(dev, e, WFC_ELEMENT_MASK, 0);
+}
+
+/* Commits the scene and has the service compose it once, waiting until the frame
+ * is on the screen (the context is not active), then prints `line`. */
+static int gles_commit(const char *line) {
+    wfcCommit(dev, ctx, WFC_TRUE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    wfcCompose(dev, ctx, WFC_TRUE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    printf("wfc-demo: %s\n", line);
+    fflush(stdout);
+    snapshot_pause();
+    return 0;
+}
+
+/* The scenes of --gles: the cube's window alone at the middle, both windows as
+ * they are, and the cube turned and scaled by one half beside the field. */
+static int run_gles(void) {
+    static const char *const cube_argv[] = {"gles-cube", "--window-run", "--size", "160", "--frames", "6"};
+    static const char *const field_argv[] = {"gles3-demo", "--probe", "--size", "160"};
+    WFCNativeStreamType id_cube = 0, id_field = 0;
+    WFCSource source_cube, source_field;
+    WFCElement cube, field;
+    WFCint cube_at[4] = {GLES_CUBE_X, GLES_CUBE_Y, GLES_SIZE, GLES_SIZE};
+    WFCint field_at[4] = {GLES_FIELD_X, GLES_FIELD_Y, GLES_SIZE, GLES_SIZE};
+    WFCint turned_at[4] = {100, 160, GLES_SIZE / 2, GLES_SIZE / 2};
+    int cube_pipe = -1, field_pipe = -1, status = 0;
+
+    CHECK(describe_device() == 0);
+    CHECK(context_checks() == 0);
+    wfcSetContextAttribi(dev, ctx, WFC_CONTEXT_BG_COLOR, 0x000000FF);
+    pid_cube = start_holder("/bin/gles-cube", cube_argv, 6, &cube_pipe);
+    CHECK(pid_cube > 0);
+    CHECK(next_stream(&id_cube) == 0);
+    source_cube = wfcCreateSourceFromStream(dev, ctx, id_cube, NULL);
+    CHECK(source_cube != WFC_INVALID_HANDLE);
+    cube = wfcCreateElement(dev, ctx, NULL);
+    CHECK(cube != WFC_INVALID_HANDLE);
+    gles_element(cube, source_cube, WFC_ROTATION_0, cube_at);
+    wfcInsertElement(dev, cube, WFC_INVALID_HANDLE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    wfcCommit(dev, ctx, WFC_TRUE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    wfcActivate(dev, ctx);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    printf("wfc-demo: gles the window of the cube is an element of the active context\n");
+    fflush(stdout);
+    /* The cube checks the platform of EGL, swaps six frames and holds. */
+    CHECK(wait_held(cube_pipe) == 0);
+    printf("wfc-demo: gles the cube holds its last frame\n");
+    fflush(stdout);
+    snapshot_pause();
+
+    pid_field = start_holder("/bin/gles3-demo", field_argv, 4, &field_pipe);
+    CHECK(pid_field > 0);
+    CHECK(next_stream(&id_field) == 0);
+    CHECK(id_field != id_cube);
+    source_field = wfcCreateSourceFromStream(dev, ctx, id_field, NULL);
+    CHECK(source_field != WFC_INVALID_HANDLE);
+    field = wfcCreateElement(dev, ctx, NULL);
+    CHECK(field != WFC_INVALID_HANDLE);
+    gles_element(field, source_field, WFC_ROTATION_0, field_at);
+    wfcInsertElement(dev, field, cube);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    wfcCommit(dev, ctx, WFC_TRUE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    CHECK(wait_held(field_pipe) == 0);
+    printf("wfc-demo: gles both windows are shown as they are\n");
+    fflush(stdout);
+    snapshot_pause();
+
+    /* The scene G, composed on request: the windows hold their last frames. */
+    wfcDeactivate(dev, ctx);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    wfcSetContextAttribi(dev, ctx, WFC_CONTEXT_BG_COLOR, (WFCint)BG_G);
+    gles_element(cube, source_cube, WFC_ROTATION_90, turned_at);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    CHECK(gles_commit("gles scene G committed") == 0);
+
+    kill(pid_cube, SIGKILL);
+    kill(pid_field, SIGKILL);
+    waitpid(pid_cube, &status, 0);
+    waitpid(pid_field, &status, 0);
+    wfcDestroyContext(dev, ctx);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    CHECK(wfcDestroyDevice(dev) == WFC_ERROR_NONE);
+    printf("wfc-demo: the programs are gone and the device is destroyed\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    int probe = 0;
+    int probe = 0, gles = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--probe") == 0) probe = 1;
+        else if (strcmp(argv[i], "--gles") == 0) gles = 1;
         else if (strcmp(argv[i], "--quick") == 0) quick = 1;
         else if (strcmp(argv[i], "child") == 0) {
             /* The session of a spawned child is a clone with no scene mark. */
             return wfcCreateDevice(WFC_DEFAULT_DEVICE_ID, NULL) == WFC_INVALID_HANDLE ? 0 : 21;
         }
     }
-    int status = run_scene(probe);
-    if (status == 0 && probe) printf("wfc-demo: ok\n");
+    int status = gles ? run_gles() : run_scene(probe);
+    if (status == 0 && (probe || gles)) printf("wfc-demo: ok\n");
     return status;
 }
