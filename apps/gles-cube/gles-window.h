@@ -25,7 +25,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <EGL/eglext.h>
 #include <stafeto/window.h>
+
+#include "swap.h"
 
 extern char **environ;
 
@@ -219,7 +222,80 @@ static void *other_thread_main(void *argument)
 	if (eglDestroyContext(t->display, context) != EGL_TRUE ||
 	    eglDestroySurface(t->display, surface) != EGL_TRUE)
 		return NULL;
+	/* A thread that used EGL ends with eglReleaseThread. */
+	if (eglReleaseThread() != EGL_TRUE)
+		return NULL;
 	t->result = 0;
+	return NULL;
+}
+
+/* A second thread and the window surface: step 0, the surface is current in
+ * the main thread and the thread cannot take it (EGL_BAD_ACCESS); step 1, the
+ * main thread has released it, and the thread makes it current, draws, swaps
+ * and lets go. */
+struct surface_thread {
+	EGLDisplay display;
+	EGLConfig config;
+	EGLSurface surface;
+	int step;
+	int result;
+};
+
+static void *surface_thread_main(void *argument)
+{
+	struct surface_thread *t = argument;
+	static const EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+	t->result = 1;
+	if (eglBindAPI(EGL_OPENGL_ES_API) != EGL_TRUE)
+		return NULL;
+	EGLContext context = eglCreateContext(t->display, t->config, EGL_NO_CONTEXT, context_attributes);
+	if (context == EGL_NO_CONTEXT)
+		return NULL;
+	if (t->step == 0) {
+		if (eglMakeCurrent(t->display, t->surface, t->surface, context) != EGL_FALSE ||
+		    eglGetError() != EGL_BAD_ACCESS)
+			return NULL;
+	} else {
+		if (eglMakeCurrent(t->display, t->surface, t->surface, context) != EGL_TRUE)
+			return NULL;
+		glClearColor(0.2f, 0.4f, 0.6f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+		if (eglSwapBuffers(t->display, t->surface) != EGL_TRUE)
+			return NULL;
+		if (eglMakeCurrent(t->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) != EGL_TRUE)
+			return NULL;
+	}
+	if (eglDestroyContext(t->display, context) != EGL_TRUE || eglReleaseThread() != EGL_TRUE)
+		return NULL;
+	t->result = 0;
+	return NULL;
+}
+
+/* A thread asleep in stafeto_window_wait for as long as it takes, while the
+ * main thread swaps: the swaps leave it its bits. */
+struct waiter {
+	uint32_t seen;
+	int wakeups;
+	int stop;
+	int result;
+};
+
+static void *waiter_main(void *argument)
+{
+	struct waiter *w = argument;
+	w->result = 1;
+	for (;;) {
+		uint32_t bits = 0;
+		if (stafeto_window_wait(window_number, UINT64_MAX, &bits) != 0) {
+			w->result = errno ? errno : 2;
+			return NULL;
+		}
+		__atomic_or_fetch(&w->seen, bits, __ATOMIC_SEQ_CST);
+		__atomic_add_fetch(&w->wakeups, 1, __ATOMIC_SEQ_CST);
+		if (__atomic_load_n(&w->stop, __ATOMIC_SEQ_CST))
+			break;
+	}
+	w->result = 0;
 	return NULL;
 }
 
@@ -275,6 +351,51 @@ static void window_api_checks(EGLDisplay display, EGLSurface surface, EGLConfig 
 	CHECK(other.result == 0);
 	CHECK(eglGetCurrentContext() == context);
 	printf("gles-cube: api a second thread made its own pbuffer and context and drew\n");
+
+	/* The window surface in another thread: not while this one holds it. */
+	struct surface_thread moved = {display, config, surface, 0, 99};
+	CHECK(pthread_create(&thread, &attr, surface_thread_main, &moved) == 0);
+	CHECK(pthread_join(thread, NULL) == 0);
+	CHECK(moved.result == 0);
+	/* ... and after this one let it go, the other draws and swaps, and this one takes it back. */
+	CHECK(eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) == EGL_TRUE);
+	moved.step = 1;
+	moved.result = 99;
+	CHECK(pthread_create(&thread, &attr, surface_thread_main, &moved) == 0);
+	CHECK(pthread_join(thread, NULL) == 0);
+	CHECK(moved.result == 0);
+	CHECK(eglMakeCurrent(display, surface, surface, context) == EGL_TRUE);
+	glClearColor(0.6f, 0.4f, 0.2f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+	CHECK(eglSwapBuffers(display, surface) == EGL_TRUE);
+	printf("gles-cube: api a surface current in one thread is EGL_BAD_ACCESS in another and moves between threads\n");
+
+	/* A thread asleep in stafeto_window_wait gets its own bits while this one swaps. */
+	struct waiter waiter = {0, 0, 0, 99};
+	CHECK(pthread_create(&thread, &attr, waiter_main, &waiter) == 0);
+	struct timespec asleep = {0, 200000000};
+	nanosleep(&asleep, NULL);
+	for (int i = 0; i < 6; i++) {
+		CHECK(eglSwapInterval(display, i % 2 ? 0 : 1) == EGL_TRUE);
+		glClearColor(0.1f * (float)i, 0.2f, 0.3f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+		CHECK(eglSwapBuffers(display, surface) == EGL_TRUE);
+	}
+	/* One swap more, after the stop is set, ends the wait with the bits it makes. */
+	__atomic_store_n(&waiter.stop, 1, __ATOMIC_SEQ_CST);
+	CHECK(eglSwapInterval(display, 1) == EGL_TRUE);
+	CHECK(eglSwapBuffers(display, surface) == EGL_TRUE);
+	CHECK(pthread_join(thread, NULL) == 0);
+	CHECK(waiter.result == 0);
+	CHECK(waiter.wakeups >= 1);
+	CHECK(waiter.seen & (STAFETO_WINDOW_BUFFER(0) | STAFETO_WINDOW_BUFFER(1) | STAFETO_WINDOW_BUFFER(2)));
+	/* The events the window has were not eaten by the swaps: their bit reached the thread. */
+	struct stafeto_window_event events[STAFETO_WINDOW_EVENTS_MAX];
+	int count = stafeto_window_events(window_number, events, STAFETO_WINDOW_EVENTS_MAX, NULL);
+	CHECK(count >= 0);
+	CHECK(count == 0 || (waiter.seen & STAFETO_WINDOW_EVENTS));
+	printf("gles-cube: api a thread asleep in stafeto_window_wait got the bits of the swaps and the events bit stayed for it\n");
+	CHECK(pthread_attr_destroy(&attr) == 0);
 }
 
 static uint32_t crc_byte(uint32_t crc, uint8_t b)
@@ -326,10 +447,14 @@ static unsigned shown_buffer(void)
 	return 0;
 }
 
-/* Swaps the frame just drawn (the interval alternates 1 and 0) and at the
- * second and the last frame prints the CRC of the screen after a pause for
- * QEMU's screenshot. */
-static void window_present(EGLDisplay display, EGLSurface surface, int frame, int frames)
+/* Swaps the frame just drawn (the interval alternates 1 and 0). At the third
+ * frame the window must hold the rows of `pixels`, the frame read back before
+ * the swap, mirrored (glReadPixels gives rows from the bottom, the window has
+ * them from the top), and the frame must not be its own mirror, so that the
+ * check can tell the two orders apart. At the third and the last frame it
+ * prints the CRC of the screen after a pause for QEMU's screenshot. */
+static void window_present(EGLDisplay display, EGLSurface surface, int frame, int frames,
+			   const uint8_t *pixels, int size)
 {
 	struct timespec pause = {2, 500000000};
 	long long started = now_ms();
@@ -338,15 +463,63 @@ static void window_present(EGLDisplay display, EGLSurface surface, int frame, in
 	printf("gles-cube: time swap %d (interval %d) %lld ms\n", frame, frame % 2 ? 0 : 1,
 	       now_ms() - started);
 	if (frame == frames / 3 || frame == frames - 1) {
+		unsigned shown = shown_buffer();
+		if (frame == frames / 3) {
+			CHECK(swap_window_matches_readback((const unsigned char *)window_shape.pixels[shown],
+							   window_shape.stride, pixels, size, size));
+			CHECK(!swap_readback_is_symmetric(pixels, size, size));
+			printf("gles-cube: api the window shows the rows of the frame read back from the bottom up, and the frame is no mirror of itself\n");
+		}
 		printf("gles-cube: %s crc %08x\n", frame == frames - 1 ? "last" : "window",
-		       (unsigned)screen_crc(shown_buffer()));
+		       (unsigned)screen_crc(shown));
 		fflush(stdout);
 		nanosleep(&pause, NULL);
 	}
 }
 
-static void window_close(void)
+/* Four frames each of which clears a rectangle under the scissor test and is
+ * swapped with eglSwapBuffersWithDamageKHR over that rectangle: the buffer of
+ * the window the swap takes lacks what the swaps since its last fill changed,
+ * and after each swap the whole window must equal the frame read back. */
+static void window_damage_swaps(EGLDisplay display, EGLSurface surface, uint8_t *pixels, int size)
 {
+	static const float COLOURS[4][3] = {{1, 0, 1}, {0, 1, 1}, {1, 1, 0}, {1, 0.5f, 0}};
+	const char *extensions = eglQueryString(display, EGL_EXTENSIONS);
+	CHECK(extensions != NULL && strstr(extensions, "EGL_KHR_swap_buffers_with_damage") != NULL);
+	PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC swap_with_damage =
+		(PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC)eglGetProcAddress("eglSwapBuffersWithDamageKHR");
+	CHECK(swap_with_damage != NULL);
+	for (int i = 0; i < 4; i++) {
+		/* In the surface's coordinates: from the lower left. */
+		EGLint rect[4] = {size / 8 + i * size / 8, size / 4 + (i % 2) * size / 4, size / 4, size / 8};
+		glEnable(GL_SCISSOR_TEST);
+		glScissor(rect[0], rect[1], rect[2], rect[3]);
+		glClearColor(COLOURS[i][0], COLOURS[i][1], COLOURS[i][2], 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glDisable(GL_SCISSOR_TEST);
+		memset(pixels, 0xA5, (size_t)size * size * 4);
+		glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+		CHECK(glGetError() == GL_NO_ERROR);
+		CHECK(swap_with_damage(display, surface, rect, 1) == EGL_TRUE);
+		unsigned shown = shown_buffer();
+		CHECK(swap_window_matches_readback((const unsigned char *)window_shape.pixels[shown],
+						   window_shape.stride, pixels, size, size));
+	}
+	printf("gles-cube: api four swaps with damage over a cleared rectangle left the window equal to the frame\n");
+}
+
+/* The end of the window mode: eglTerminate with the surface and the context
+ * still current marks them for deletion; a swap then finds the display not
+ * initialized, and eglReleaseThread lets go of them. The window outlives its
+ * surface: it is closed after. */
+static void window_terminate(EGLDisplay display, EGLSurface surface)
+{
+	CHECK(eglTerminate(display) == EGL_TRUE);
+	CHECK(eglSwapBuffers(display, surface) == EGL_FALSE);
+	CHECK_ERROR(EGL_NOT_INITIALIZED);
+	CHECK(eglReleaseThread() == EGL_TRUE);
 	CHECK(stafeto_window_close(window_number) == 0);
 	window_number = -1;
+	printf("gles-cube: api eglTerminate with the surface current, a swap after it is EGL_NOT_INITIALIZED and eglReleaseThread lets go\n");
 }
+
