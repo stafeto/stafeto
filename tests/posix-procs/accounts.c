@@ -214,3 +214,20 @@ static void accounts(void) {
     expect("setpriority of a process that is none", setpriority(PRIO_PROCESS, 99999, 3) == -1 && errno == ESRCH, 1);
     printf("posix-procs: accounts ok\n");
 }
+
+static void kill_during_exec(void) {
+    char *argv[] = {"procs-child", "execloop", NULL};
+    char *envp[] = {NULL};
+    for (int round = 0; round < 3; round++) {
+        pid_t pid = -1;
+        struct timespec nap = {0, 20000000L * (round + 1)};
+        expect("spawn the exec loop", spawn_file(&pid, "/bin/procs-child", argv, envp, NULL), 0);
+        if (pid <= 0) return;
+        nanosleep(&nap, NULL);
+        expect("kill the exec loop", kill(pid, SIGKILL), 0);
+        /* The new image of an exec that was under way must not run on: the wait ends. */
+        alarm(60);
+        reap("the exec loop killed during an exec", pid, 0, SIGKILL);
+        alarm(0);
+    }
+}

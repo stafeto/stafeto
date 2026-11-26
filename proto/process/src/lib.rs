@@ -279,6 +279,11 @@ pub const SPAWN_SETSIGMASK: u32 = 0x08;
 pub const SPAWN_FLAGS: u32 =
     SPAWN_SETPGROUP | SPAWN_SETSID | SPAWN_RESETIDS | SPAWN_SETSIGDEF | SPAWN_SETSIGMASK;
 
+/// Bit 62 of the scheduling word of SpawnStart (bit 63 says the word names a
+/// scheduling): the spawn asked for a scheduling below the caller's top, so
+/// the child gets the ceiling of its level plus one.
+pub const START_LOWERED: u64 = 1 << 62;
+
 /// Records of the service at most: PID = index + RECORDS * generation.
 pub const RECORDS: usize = 256;
 /// How far below the process service's level its loop works while walks of

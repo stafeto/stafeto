@@ -33,7 +33,7 @@
 //! change of a level is one `thread_set_priority`.
 
 use crate::constants::*;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use posix_sync::{LayerLock, Woken};
 use posix_thread::{Block, effective_level, flag};
 use rt::abi::Policy;
@@ -55,6 +55,8 @@ const CHAIN_DEPTH: usize = 8;
 /// The level of the main thread when it started: the top of the levels of
 /// the application threads of the process.
 static TOP: AtomicU32 = AtomicU32::new(0);
+/// The top came from the parent's start word (the process started below it).
+static TOP_INHERITED: AtomicBool = AtomicBool::new(false);
 
 /// The main thread's level, once it is attached (`attach_resources`).
 pub(crate) fn set_top(level: u8) {
@@ -108,30 +110,18 @@ fn kernel_policy(policy: i32) -> Policy {
     }
 }
 
-/// The level of SCHED_OTHER under a process whose top level is `top`.
-fn other_level(top: u8) -> u8 {
-    // With room under the top for 32 levels of priorities, SCHED_OTHER is
-    // below them; a process with less room keeps it at the top.
-    if i32::from(top) > MAX_PRIORITY {
-        top - MAX_PRIORITY as u8
-    } else {
-        top
-    }
-}
-
 /// The base level and the kernel policy of `policy` and `priority`: EINVAL
-/// for a policy or priority out of range.
+/// for a policy or priority out of range, EPERM for a level the process's
+/// ceiling does not allow (`posix_thread::levels`).
 pub(crate) fn level_of(policy: i32, priority: i32) -> Result<(u8, Policy), i32> {
-    let top = top()?;
-    match policy {
-        SCHED_OTHER if priority == 0 => Ok((other_level(top), Policy::RoundRobin)),
-        SCHED_FIFO | SCHED_RR if (MIN_PRIORITY..=MAX_PRIORITY).contains(&priority) => {
-            // At least one above SCHED_OTHER, at most the top.
-            let level = (i32::from(top) - MAX_PRIORITY + priority).max(1) as u8;
-            Ok((level, kernel_policy(policy)))
-        }
-        _ => Err(EINVAL),
-    }
+    let ceiling = crate::ceiling().map_err(|_| EIO)?;
+    let level = posix_thread::levels::level_for(policy, priority, top()?, ceiling)?;
+    let kernel = if matches!(policy, SCHED_FIFO | SCHED_RR) {
+        kernel_policy(policy)
+    } else {
+        Policy::RoundRobin
+    };
+    Ok((level, kernel))
 }
 
 /// The scheduling the next thread of the calling thread starts with (an
@@ -220,31 +210,41 @@ pub fn thread_set(id: u64, policy: i32, priority: i32, tail: bool) -> Result<i32
 }
 
 /// The level a new process image starts at and the scheduling word its
-/// main thread applies to itself: the top level of the caller and `spec`
-/// (policy and priority), or the caller's own scheduling for None. A `spec`
-/// of SCHED_FIFO or SCHED_RR whose level is below the caller's top starts the
-/// image, its loader among it, at that level; the word keeps the priority
-/// asked for and carries the caller's top (bits 16 to 23), which is the
-/// child's reference for the levels of its priorities, so that its
-/// sched_getparam says what was asked and the main thread is at the level
-/// the process was placed at. EINVAL for a policy or priority out of range,
-/// EPERM for a rise the caller may not make.
+/// main thread applies to itself, for `spec` (policy and priority) or the
+/// caller's own scheduling for None (`posix_thread::levels::child_start`).
+/// A SCHED_FIFO or SCHED_RR `spec` whose level is below the caller's top
+/// starts the image, its loader among it, at that level and says so (the
+/// process service then gives it the ceiling of that level plus one); the
+/// word keeps the priority asked for and carries the caller's top (bits 16
+/// to 23), which is the child's reference for the levels of its priorities.
+/// A caller that itself started below its parent passes its top on, and a
+/// plain spawn or exec of it starts at its own level. EINVAL for a policy or
+/// priority out of range, EPERM for a rise the caller may not make.
 pub(crate) fn for_child(spec: Option<(i32, i32)>) -> Result<(u8, u64), i32> {
-    let own = unpack(crate::threads::own_block().sched.load(Ordering::Relaxed));
+    let block = crate::threads::own_block();
+    let own = unpack(block.sched.load(Ordering::Relaxed));
     let (policy, priority) = spec.unwrap_or(own);
     refused(posix_types::sporadic::Call::Spawn, policy)?;
-    let (level, _) = level_of(policy, priority)?;
     if spec.is_some() && !permitted(own, (policy, priority)) {
         return Err(EPERM);
     }
-    let top = top()?;
-    if spec.is_some() && matches!(policy, SCHED_FIFO | SCHED_RR) && level < top {
-        return Ok((
-            level,
-            START | pack(policy, priority) | u64::from(top) << TOP_SHIFT,
-        ));
+    let ceiling = crate::ceiling().map_err(|_| EIO)?;
+    let child = posix_thread::levels::child_start(
+        spec,
+        own,
+        block.base_level.load(Ordering::Relaxed) as u8,
+        top()?,
+        TOP_INHERITED.load(Ordering::Relaxed),
+        ceiling,
+    )?;
+    let mut word = START | pack(policy, priority);
+    if let Some(top) = child.top {
+        word |= u64::from(top) << TOP_SHIFT;
     }
-    Ok((top, START | pack(policy, priority)))
+    if child.lowered {
+        word |= proto_process::START_LOWERED;
+    }
+    Ok((child.level, word))
 }
 
 /// The POSIX policy of the calling thread.
@@ -274,6 +274,7 @@ pub(crate) fn start_apply(word: u64) {
     let parent_top = (word >> TOP_SHIFT & 0xFF) as u8;
     if parent_top != 0 {
         set_top(parent_top);
+        TOP_INHERITED.store(true, Ordering::Relaxed);
     }
     let Ok((level, kernel)) = level_of(policy, priority) else {
         return;

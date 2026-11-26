@@ -75,6 +75,7 @@ pub mod flag {
 }
 
 /// Independent fields of the resident scope word.
+pub mod levels;
 pub mod scope;
 
 /// The block of the POSIX layer for one thread: relibc's `os_specific`:
