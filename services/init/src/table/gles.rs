@@ -32,6 +32,10 @@ pub const PBUFFER_TABLE: &[Record] = &[
         connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
         root: true,
         quota: CUBE_QUOTA,
+        // A best-effort client that draws on the CPU: level 28, ceiling 29,
+        // below every interactive level, as the demo of scenes starts it.
+        priority: 28,
+        ceiling: 29,
         ..POSIX
     },
     entropy::RNG,
@@ -61,6 +65,10 @@ pub const WINDOW_TABLE: &[Record] = &[
         connects: &["ramfs", "pipe", "clock", "posix", "entropy", "gpu"],
         root: true,
         quota: CUBE_QUOTA,
+        // A best-effort client that draws on the CPU: level 28, ceiling 29,
+        // below every interactive level, as the demo of scenes starts it.
+        priority: 28,
+        ceiling: 29,
         ..POSIX
     },
     entropy::RNG,
