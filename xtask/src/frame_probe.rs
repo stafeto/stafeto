@@ -323,6 +323,68 @@ pub fn frame_cap_bands() -> u32 {
     band_cap(DEFAULT_PERIOD_NS, DEFAULT_CAP_PPM)
 }
 
+/// The bound of the latency from a post to its prepared image ready (`compositor::prep`), in
+/// ticks, for a transform of kind `kind` (a row of `compositor::PRICES`) into an image of `w`
+/// by `h` points, made by the worker at `level`: the response time by the formula of the frame
+/// (`bound`). The worker's own work is its pieces of `PIECE_ROWS` lines, a call of pixman each
+/// at the model's price, with the loss of the cache of paths once; the wake path of the post
+/// (the round trip of the request and the longest path of the kernel that is not preempted) and
+/// the step of the service that was running when the post came. The sources above the worker are
+/// the compositor itself, which makes `bands` bands of at most their gate in every period (the
+/// bands of the scene's frame, or at most the cap's `frame_cap_bands`), and, with `loaded`, the
+/// budgets on CPU 0 of the services of the table above `level` with their signs of life. None
+/// when the kind has no price or the shares leave the worker no CPU (the iteration does not
+/// settle).
+pub fn image_latency_bound(
+    level: u8,
+    kind: &str,
+    w: u32,
+    h: u32,
+    bands: u64,
+    loaded: bool,
+) -> Option<u64> {
+    use compositor::frame::DEFAULT_PERIOD_NS;
+    use compositor::prep::PIECE_ROWS;
+    let mut own = u64::from(compositor::kind_miss_ticks(kind)?);
+    let mut y = 0;
+    while y < h {
+        let rows = PIECE_ROWS.min(h - y);
+        own += compositor::kind_model_ticks(kind, w, rows)?;
+        y += rows;
+    }
+    let above = |r: &&init::table::Record| {
+        loaded && matches!(r.kind, Kind::Service(_)) && r.priority > level
+    };
+    let signs: u64 = TABLE
+        .iter()
+        .filter(above)
+        .map(|r| if r.budgets.is_empty() { 8_000 } else { 2_400 })
+        .sum();
+    own += C_IPC + KERNEL + STEP + signs;
+    let period = ticks_of(DEFAULT_PERIOD_NS);
+    let mut sources = vec![Source {
+        budget: bands * BAND,
+        period,
+        step: BAND,
+        wakes: 1,
+    }];
+    sources.extend(
+        TABLE
+            .iter()
+            .filter(above)
+            .filter(|r| r.program != "compositor")
+            .flat_map(|r| r.budgets.iter().map(move |b| (r, b)))
+            .filter(|(_, b)| b.cpu == 0)
+            .map(|(r, b)| Source {
+                budget: ticks_of(b.c_ns),
+                period: ticks_of(b.t_ns),
+                step: if b.low >= level { STEP } else { 0 },
+                wakes: wakes(r, b),
+            }),
+    );
+    bound(own, &sources, EVENTS, LIMIT)
+}
+
 /// The rows of the table of bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Row {
@@ -1144,6 +1206,32 @@ mod tests {
         // The driver stays on the bound of the calls.
         let driver = vec!["service wait: 12 kind 6 48001 ticks of 50000".to_owned()];
         assert!(check_waits(&driver, TABLE, "t").is_err());
+    }
+
+    /// The latency from a post to the prepared image of the cube's element (a turn by a quarter
+    /// and a stretch to half, 80 by 80 points, the nearest point) at the level of the holders
+    /// of the probes (28): with the bands of the scene P (a window of 160 by 100) in every
+    /// period and no load the bound is within a period; at the cap of the frame (47 bands a
+    /// period, which leaves the worker a quarter of the CPU) it is not, and with the loads of
+    /// the image (the budgets above the worker) the shares leave it no bound.
+    #[test]
+    fn the_image_of_a_post_is_ready_within_a_period_by_the_bound() {
+        let period = ticks_of(compositor::frame::DEFAULT_PERIOD_NS);
+        let kind = "scale-nearest-copy";
+        let idle = image_latency_bound(28, kind, 80, 80, p_bands(), false).expect("a bound");
+        assert!(idle < period, "{idle} ticks over {period}");
+        // A bigger target takes longer, a lower level has the sources of the levels above it.
+        let big = image_latency_bound(28, kind, 160, 160, p_bands(), false).expect("a bound");
+        assert!(big > idle);
+        let low = image_latency_bound(10, kind, 80, 80, p_bands(), true);
+        let high = image_latency_bound(28, kind, 80, 80, p_bands(), true);
+        assert!(low.is_none_or(|l| high.is_none_or(|h| l >= h)));
+        let capped = image_latency_bound(28, kind, 80, 80, u64::from(frame_cap_bands()), false)
+            .expect("a bound");
+        assert!(capped > period, "{capped} ticks at the cap");
+        println!(
+            "image latency bound at 28 (ticks of 16 ns, period {period}): scene P {idle}, 160 by 160 {big}, at the cap {capped}, with the loads {high:?}"
+        );
     }
 
     /// The numbers of the analysis for the image of the frame (the heartbeat 46 400).

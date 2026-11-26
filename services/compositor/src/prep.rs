@@ -276,6 +276,8 @@ pub struct Table {
     busy: AtomicU32,
     /// The service has put a free or an unmapping off until the worker lets go.
     waiting: AtomicBool,
+    /// The slots let go that the worker still held.
+    zombies: AtomicU32,
     /// The slots the worker could not draw in (the other image is a frame's).
     blocked: AtomicU64,
     /// The slots that have something drawn the service has not told.
@@ -316,6 +318,7 @@ impl Table {
             want: AtomicU64::new(0),
             busy: AtomicU32::new(0),
             waiting: AtomicBool::new(false),
+            zombies: AtomicU32::new(0),
             blocked: AtomicU64::new(0),
             published: AtomicU64::new(0),
             level: AtomicU8::new(1),
@@ -371,8 +374,12 @@ impl Table {
 
     /// The geometry of slot `slot`, which must be used.
     pub fn geometry(&self, slot: usize) -> Geometry {
+        *self.geometry_ref(slot)
+    }
+
+    fn geometry_ref(&self, slot: usize) -> &Geometry {
         // SAFETY: the service writes it only while the slot is not used.
-        unsafe { *self.slots[slot].geometry.get() }
+        unsafe { &*self.slots[slot].geometry.get() }
     }
 
     pub fn used(&self, slot: usize) -> bool {
@@ -387,28 +394,52 @@ impl Table {
             .sum()
     }
 
-    fn pages_range_free(&self, first: usize, n: usize) -> bool {
-        (first..first + n).all(|p| self.pages[p / 64].load(Relaxed) & (1 << (p % 64)) == 0)
-    }
-
+    /// The pages `first` and the `n` after it are in use (`on`) or free, a word of
+    /// the bitmap at a time.
     fn pages_set(&self, first: usize, n: usize, on: bool) {
-        for p in first..first + n {
-            let bit = 1u64 << (p % 64);
-            if on {
-                self.pages[p / 64].fetch_or(bit, Relaxed);
+        let mut p = first;
+        let end = first + n;
+        while p < end {
+            let bit = p % 64;
+            let take = (64 - bit).min(end - p);
+            let mask = if take == 64 {
+                u64::MAX
             } else {
-                self.pages[p / 64].fetch_and(!bit, Relaxed);
+                ((1u64 << take) - 1) << bit
+            };
+            if on {
+                self.pages[p / 64].fetch_or(mask, Relaxed);
+            } else {
+                self.pages[p / 64].fetch_and(!mask, Relaxed);
             }
+            p += take;
         }
     }
 
+    /// The first run of `n` free pages, found a word of the bitmap at a time.
     fn find_pages(&self, n: usize) -> Option<usize> {
-        let mut first = 0;
-        while first + n <= POOL_PAGES {
-            // The next used page at or after `first` bounds the try.
-            match (first..first + n).find(|&p| !self.pages_range_free(p, 1)) {
-                None => return Some(first),
-                Some(used) => first = used + 1,
+        let (mut p, mut start, mut run) = (0, 0, 0);
+        while p < POOL_PAGES {
+            let word = self.pages[p / 64].load(Relaxed) >> (p % 64);
+            let left = 64 - p % 64;
+            if word & 1 != 0 {
+                // Used pages: the run so far ends.
+                p += (word.trailing_ones() as usize).min(left);
+                run = 0;
+                continue;
+            }
+            if run == 0 {
+                start = p;
+            }
+            let zeros = if word == 0 {
+                left
+            } else {
+                word.trailing_zeros() as usize
+            };
+            run += zeros;
+            p += zeros;
+            if run >= n {
+                return (start + n <= POOL_PAGES).then_some(start);
             }
         }
         None
@@ -436,19 +467,26 @@ impl Table {
                 }
             }
         }
-        // The slots this scene shares.
+        // The slots this scene shares: of the slots the scenes still hold, the one
+        // with the element's key.
+        let mut held = [0u8; SLOTS];
+        let mut n = 0;
+        for s in 0..SLOTS {
+            if kept[s] && self.used(s) {
+                held[n] = s as u8;
+                n += 1;
+            }
+        }
         let mut map = NO_MAP;
         for (k, want) in wants.iter().enumerate().take(MAX_ELEMENTS) {
             let Some((key, place)) = want else {
                 continue;
             };
-            for s in 0..SLOTS {
-                if kept[s] && self.used(s) && self.slots[s].used.load(Relaxed) {
-                    let g = self.geometry(s);
-                    if g.key == *key && usize::from(g.place) == *place {
-                        map[k] = s as u8;
-                        break;
-                    }
+            for &s in &held[..n] {
+                let g = self.geometry_ref(usize::from(s));
+                if g.key == *key && usize::from(g.place) == *place {
+                    map[k] = s;
+                    break;
                 }
             }
         }
@@ -563,6 +601,7 @@ impl Table {
         self.published.fetch_and(!(1 << s), SeqCst);
         if self.holds(s) {
             slot.zombie.store(true, SeqCst);
+            self.zombies.fetch_add(1, SeqCst);
             self.waiting.store(true, SeqCst);
             // The worker may have let go between the look and the store.
             if !self.holds(s) {
@@ -576,12 +615,17 @@ impl Table {
     fn free_pages(&self, s: usize) {
         let g = self.geometry(s);
         self.pages_set(usize::from(g.page), 2 * usize::from(g.pages), false);
-        self.slots[s].zombie.store(false, SeqCst);
+        if self.slots[s].zombie.swap(false, SeqCst) {
+            self.zombies.fetch_sub(1, SeqCst);
+        }
     }
 
     /// The pages of the slots the worker held when they were let go, free now
     /// that it lets go. The number of slots still held.
     pub fn reap(&self) -> usize {
+        if self.zombies.load(SeqCst) == 0 {
+            return 0;
+        }
         let mut held = 0;
         for s in 0..SLOTS {
             if self.slots[s].zombie.load(SeqCst) {
@@ -703,19 +747,26 @@ impl Table {
         unsafe { core::slice::from_raw_parts(base.add(at), g.bytes()) }
     }
 
-    /// The target rectangles the worker drew since the last call, per slot.
-    pub fn take_drawn(&self, out: &mut [(usize, Rect); SLOTS]) -> usize {
-        let mut n = 0;
-        let mask = self.published.swap(0, SeqCst);
-        for s in 0..SLOTS {
-            if mask & (1 << s) != 0
-                && let Some(r) = unpack(self.slots[s].drawn.swap(EMPTY, SeqCst))
-            {
-                out[n] = (s, r);
-                n += 1;
+    /// The target rectangle the worker drew of the first slot that has one since the
+    /// last call: one slot a call, so that the service's step over an image stays
+    /// short (`drawn_waits` says more are left).
+    pub fn take_drawn(&self) -> Option<(usize, Rect)> {
+        loop {
+            let mask = self.published.load(SeqCst);
+            if mask == 0 {
+                return None;
+            }
+            let s = mask.trailing_zeros() as usize;
+            self.published.fetch_and(!(1 << s), SeqCst);
+            if let Some(r) = unpack(self.slots[s].drawn.swap(EMPTY, SeqCst)) {
+                return Some((s, r));
             }
         }
-        n
+    }
+
+    /// Whether some slot has a rectangle drawn that `take_drawn` has not given.
+    pub fn drawn_waits(&self) -> bool {
+        self.published.load(SeqCst) != 0
     }
 
     // ------------------------------------------------------------ the worker
@@ -952,11 +1003,14 @@ impl Table {
             };
         }
         let Some((g, win)) = self.hold(slot) else {
-            self.abandon(job);
+            // The window has nothing to read (it has not posted, or it is gone): the
+            // damage stays with the slot, and the slot wants the worker again when a
+            // post comes (`damage`), never before, or the worker would spin on it.
+            self.give_back(job, false);
             return Pass::Idle;
         };
         let Some(rect) = job.rect else {
-            self.abandon(job);
+            self.give_back(job, false);
             return Pass::Idle;
         };
         let end = (rect.y + rect.h).min(g.h);
@@ -1034,10 +1088,14 @@ impl Table {
         Pass::Published
     }
 
-    /// The pass leaves its image undrawn (a job of a higher level goes first, or
-    /// the slot is gone): what it took of the damage is given back, the image is
-    /// free for the next pass.
+    /// The pass leaves its image undrawn because a job of a higher level goes first:
+    /// what it took of the damage is given back, the image is free for the next pass,
+    /// and the slot wants the worker again.
     pub fn abandon(&self, job: &mut Job) {
+        self.give_back(job, true);
+    }
+
+    fn give_back(&self, job: &mut Job, rewant: bool) {
         if job.live {
             let s = &self.slots[job.slot];
             if let Some(rect) = job.rect {
@@ -1054,7 +1112,9 @@ impl Table {
                 if let Some(done) = job.done.take() {
                     add(&s.dirty[usize::from(job.target)], done);
                 }
-                self.want.fetch_or(1 << job.slot, SeqCst);
+                if rewant {
+                    self.want.fetch_or(1 << job.slot, SeqCst);
+                }
             }
             s.state.fetch_and(!DRAWING, AcqRel);
         }
@@ -1216,5 +1276,97 @@ mod tests {
         // 40 lines in pieces of 16 lines: three pieces, the last publishes.
         assert_eq!(passes, 3);
         assert_eq!(t.front_of(slot), Some(1));
+    }
+
+    #[test]
+    fn runs_of_pages_are_found_and_set_across_the_words_of_the_bitmap() {
+        let t = table();
+        assert_eq!(t.find_pages(POOL_PAGES), Some(0));
+        assert_eq!(t.find_pages(POOL_PAGES + 1), None);
+        t.pages_set(3, 70, true);
+        assert_eq!(t.pages_used(), 70);
+        // The first run that fits is before the used pages when it is short, after
+        // them when it is long.
+        assert_eq!(t.find_pages(3), Some(0));
+        assert_eq!(t.find_pages(4), Some(73));
+        assert_eq!(t.find_pages(POOL_PAGES - 73), Some(73));
+        assert_eq!(t.find_pages(POOL_PAGES - 72), None);
+        t.pages_set(3, 70, false);
+        assert_eq!(t.pages_used(), 0);
+        t.pages_set(0, POOL_PAGES, true);
+        assert_eq!(t.pages_used() as usize, POOL_PAGES);
+        assert_eq!(t.find_pages(1), None);
+        t.pages_set(127, 2, false);
+        assert_eq!(t.find_pages(2), Some(127));
+        assert_eq!(t.find_pages(3), None);
+    }
+
+    #[test]
+    fn a_slot_whose_window_has_posted_nothing_does_not_keep_the_worker_busy() {
+        let t = table();
+        let a = t.reserve(&[Some((key(8, 64, 40), 0))], &[], 28).unwrap();
+        let slot = usize::from(a[0]);
+        struct Nothing;
+        impl Maker for Nothing {
+            fn make(
+                &mut self,
+                _: &mut [u8],
+                _: u32,
+                _: bool,
+                _: (u32, u32),
+                _: &Element,
+                _: &Surface2<'_>,
+                _: Rect,
+            ) {
+            }
+        }
+        struct Window(Vec<u8>);
+        impl Reads for Window {
+            fn read(&self, _: usize, _: u8, _: usize) -> &[u8] {
+                &self.0
+            }
+        }
+        let win = Window(vec![0; 256 * 40]);
+        let mut job = Job::NONE;
+        // The window was not told to the table: the pass ends and the slot waits.
+        assert_eq!(t.piece(&mut job, slot, &mut Nothing, &win), Pass::Idle);
+        t.let_go();
+        assert_eq!(t.next(&job), None);
+        assert!(!t.work_waits());
+        // The post comes: the slot has its whole image to draw.
+        t.set_window(0, 8, Format::Xrgb, 256, 64, 40);
+        t.set_latest(0, 0);
+        t.damage(
+            slot,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+            },
+            28,
+        );
+        let mut passes = 0;
+        while let Some((s, _)) = t.next(&job) {
+            passes += 1;
+            assert!(passes < 10);
+            if t.piece(&mut job, s, &mut Nothing, &win) != Pass::More {
+                t.let_go();
+            }
+        }
+        assert_eq!(t.front_of(slot), Some(1));
+        let drawn = t.take_drawn().unwrap();
+        assert_eq!(
+            drawn,
+            (
+                slot,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 64,
+                    h: 40
+                }
+            )
+        );
     }
 }

@@ -2515,10 +2515,10 @@ impl Scene {
         // The group that takes the next layer, when it fits.
         let mut open: Option<usize> = None;
         for (k, e) in def.elements().iter().enumerate().skip(base.unwrap_or(0)) {
-            let Some((view, prepared)) = self.drawn(k, e) else {
+            let Some(prepared) = self.drawn(k, e) else {
                 continue;
             };
-            let Some(r) = elements::target_bounds(&view) else {
+            let Some(r) = elements::target_bounds(e) else {
                 continue;
             };
             if !touches(r) {
@@ -2531,7 +2531,11 @@ impl Scene {
                     .and_then(|p| self.window(p))
                     .is_some_and(|w| w.format == Format::Argb),
             };
-            let (first, second) = elements::classes(&view, argb);
+            // An element drawn from its image is a plain element of the target's size.
+            let (first, second) = match prepared {
+                Some(_) => elements::classes(&prep::view(e), argb),
+                None => elements::classes(e, argb),
+            };
             let (a, b) = (PRICES[first.row()], second.map(|c| PRICES[c.row()]));
             // The alpha or the mask is part of the one call of pixman the stretch
             // makes: it adds its rows and points, and no second call. A stretch that
@@ -3043,12 +3047,12 @@ impl Scene {
     /// something now: its target rectangle cut to the screen, when its window
     /// has a buffer taken and holds the source rectangle; None otherwise (it
     /// shows nothing).
-    /// What element `k` (`e`) of the working scene draws now: the element as the
-    /// bands draw it and, for one whose image the worker makes, the slot and the
-    /// image of it the frame holds. None when it draws nothing: its window has
-    /// nothing taken or does not hold the source rectangle, or its image was
-    /// never made.
-    pub fn drawn(&self, k: usize, e: &Element) -> Option<(Element, Option<(u8, u8)>)> {
+    /// Whether element `k` (`e`) of the working scene draws something now: its
+    /// window has a buffer taken and holds the source rectangle, and for an element
+    /// whose image the worker makes, an image was made. The inner value is the slot
+    /// and the image of the frame's hold for such an element, None for one drawn
+    /// from the window's own points.
+    pub fn drawn(&self, k: usize, e: &Element) -> Option<Option<(u8, u8)>> {
         let w = self.window(self.place_of(e.source)?)?;
         if w.current.is_none() || !elements::source_fits(e, w.rect.w, w.rect.h) {
             return None;
@@ -3059,15 +3063,16 @@ impl Scene {
                 return None;
             }
             let image = self.front[usize::from(slot)]?;
-            return Some((prep::view(e), Some((slot, image))));
+            return Some(Some((slot, image)));
         }
-        Some((*e, None))
+        Some(None)
     }
 
-    /// The place of element `k` of the working scene on the screen (`drawn`).
+    /// The place of element `k` of the working scene on the screen (`drawn`): its
+    /// target rectangle cut to the screen, which the image has as well.
     pub fn element_place_at(&self, k: usize, e: &Element) -> Option<Rect> {
-        self.drawn(k, e)
-            .and_then(|(view, _)| elements::target_bounds(&view))
+        self.drawn(k, e)?;
+        elements::target_bounds(e)
     }
 
     /// Whether the image slot `slot` holds is of ARGB8888 (and not XRGB8888).
@@ -3380,20 +3385,14 @@ fn compose_elements(
     let (x0, y0) = (i64::from(band.x), i64::from(band.y));
     let (x1, y1) = (x0 + i64::from(band.w), y0 + i64::from(band.h));
     let els = def.elements();
-    // What each element draws (`Scene::drawn`): as the element, or as its prepared
-    // image's view, and the slot and image of that.
-    let mut drawn = [None; MAX_ELEMENTS];
-    for (k, e) in els.iter().enumerate() {
-        drawn[k] = scene.drawn(k, e);
-    }
     let places = |k: usize, e: &Element| {
         let place = scene.place_of(e.source)?;
-        drawn[k].map(|_| (place, scene.window(place)))
+        scene.drawn(k, e).map(|_| (place, scene.window(place)))
     };
     // Whether an element copies and covers the band whole.
     let covers = |k: usize, e: &Element| {
         e.transparency == 0
-            && drawn[k].is_some()
+            && places(k, e).is_some()
             && i64::from(e.dx) <= x0
             && i64::from(e.dy) <= y0
             && i64::from(e.dx) + i64::from(e.dw) >= x1
@@ -3446,10 +3445,16 @@ fn compose_elements(
         };
         // The element as it is drawn: its prepared image's view when the worker
         // makes the image, with the image as the surface.
-        let Some((e, prepared)) = drawn[k] else {
+        let Some(prepared) = scene.drawn(k, e) else {
             continue;
         };
-        let e = &e;
+        let view;
+        let e = if prepared.is_some() {
+            view = prep::view(e);
+            &view
+        } else {
+            e
+        };
         let plain = elements::is_plain(e);
         let from = (
             ((i64::from(e.sx) >> 16) + dx) as u32,

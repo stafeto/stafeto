@@ -499,6 +499,7 @@ extern "C" fn worker_main(_: u64) -> ! {
     let me = sys::self_thread();
     let mut maker = px::Worker::new();
     let mut job = prep::Job::NONE;
+    let mut idle = 0u32;
     let mut level = 1;
     let mut set_level = |to: u8| {
         if to != level
@@ -533,8 +534,19 @@ extern "C" fn worker_main(_: u64) -> ! {
                 if TABLE.let_go() {
                     let _ = sys::notify(&tell, PREP);
                 }
+                // A pass that drew nothing, three times in a row, is no work: the
+                // worker never spins at a level above the clients that wait for the
+                // CPU, whatever the table says. It waits for the next wake.
+                idle += 1;
+                if idle >= 3 {
+                    idle = 0;
+                    set_level(1);
+                    let _ = sys::receive(&wait);
+                }
+                continue;
             }
         }
+        idle = 0;
     }
 }
 
@@ -611,6 +623,9 @@ fn main(_: u64) -> u64 {
     };
     TABLE.set_pool(IMAGES.0.get().cast());
     service.scene.set_prep(&TABLE);
+    // The worker starts here, before the first request: a thread is made at no
+    // step of the service.
+    service.start_worker();
     // The image of the pointer's picture is made here, before the first band
     // the pointer is in.
     service.raster.prepare(
@@ -2411,20 +2426,12 @@ impl Compositor {
             }
         }
         TABLE.reap();
-        let mut drawn = [(
-            0,
-            Rect {
-                x: 0,
-                y: 0,
-                w: 0,
-                h: 0,
-            },
-        ); prep::SLOTS];
-        let n = TABLE.take_drawn(&mut drawn);
-        for &(slot, _) in &drawn[..n] {
+        // One image a step: the raster wraps it now, so that no band does, and
+        // the screen is damaged where an element shows it. The rest wait for the
+        // service's own bit.
+        if let Some((slot, local)) = TABLE.take_drawn() {
             if let Some(image) = TABLE.front_of(slot) {
                 let g = TABLE.geometry(slot);
-                // The image the frame will read is wrapped now, so that no band makes it.
                 self.raster.prepare(
                     TABLE.image(slot, image),
                     g.stride(),
@@ -2437,9 +2444,12 @@ impl Compositor {
                     usize::MAX,
                 );
             }
+            if self.scene.images_drawn(&[(slot, local)]) > 0 {
+                self.kick();
+            }
         }
-        if self.scene.images_drawn(&drawn[..n]) > 0 {
-            self.kick();
+        if TABLE.drawn_waits() {
+            let _ = sys::notify(&self.notify, PREP);
         }
         if self.extra.iter().any(|e| e.dying) {
             let _ = sys::notify(&self.notify, WORK);

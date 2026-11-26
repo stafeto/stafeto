@@ -1487,17 +1487,9 @@ impl Rig {
                 }
             }
         }
-        let mut out = [(
-            0,
-            Rect {
-                x: 0,
-                y: 0,
-                w: 0,
-                h: 0,
-            },
-        ); prep::SLOTS];
-        let n = t.take_drawn(&mut out);
-        self.scene.images_drawn(&out[..n]);
+        while let Some(drawn) = t.take_drawn() {
+            self.scene.images_drawn(&[drawn]);
+        }
     }
 
     /// A frame over `fb` (kept from frame to frame): false when the scene had
