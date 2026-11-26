@@ -413,6 +413,32 @@ pub fn prep_steps(images: u64) -> u64 {
     images * STEP
 }
 
+/// The model bounds of the prepared images, as the report tells them (a model, not a measure): the
+/// latency from a post to the image of the cube's element ready at level 28, with the bands of the
+/// scene P in each period and no load, with another slot ahead, at the cap of the frame and with
+/// the loads; and the step a published image adds to the work of a period.
+pub fn image_model_report() -> String {
+    let kind = "scale-nearest-copy";
+    let p = p_bands();
+    let cap = u64::from(frame_cap_bands());
+    let ticks = |bound: Option<u64>| bound.map_or("none".to_owned(), |t| t.to_string());
+    format!(
+        "frame-probe: prepared images, model bounds (not measures), ticks of 16 ns: post to image at level 28 (80 by 80, scene P bands {p}): {}, behind another slot {}, at the cap of {cap} bands {}, with the loads {}; a published image adds {} ticks to the work of a period",
+        ticks(image_latency_bound(28, kind, (80, 80), &[], p, false)),
+        ticks(image_latency_bound(
+            28,
+            kind,
+            (80, 80),
+            &[(kind, 80, 80)],
+            p,
+            false
+        )),
+        ticks(image_latency_bound(28, kind, (80, 80), &[], cap, false)),
+        ticks(image_latency_bound(28, kind, (80, 80), &[], p, true)),
+        prep_steps(1),
+    )
+}
+
 /// The rows of the table of bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Row {
@@ -1126,6 +1152,9 @@ pub fn probe(args: &[String]) -> Result<(), String> {
         let steps = steps_verdict(&lines).map_err(|e| format!("frame-probe: {e}"))?;
         println!("frame-probe: the longest steps, ticks: {steps}");
     }
+    if timed {
+        println!("{}", image_model_report());
+    }
     println!(
         "frame-probe on {}: {} phases judged{}",
         crate::qemu::VIRT.name,
@@ -1269,6 +1298,18 @@ mod tests {
         println!(
             "image latency bound at 28 (model, ticks of 16 ns, period {period}): scene P {idle}, 160 by 160 {big}, behind another slot {behind}, at the cap {capped}, with the loads {high:?}"
         );
+    }
+
+    /// The report tells the bounds and none of them is missing.
+    #[test]
+    fn the_report_tells_the_model_bounds_of_the_images() {
+        let line = image_model_report();
+        assert!(
+            line.starts_with("frame-probe: prepared images, model bounds"),
+            "{line}"
+        );
+        assert!(!line.contains("none"), "{line}");
+        assert!(line.contains(&format!("adds {} ticks", prep_steps(1))));
     }
 
     /// An image the worker publishes in a period is a step of the service: the frame's own work
