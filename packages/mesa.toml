@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# Mesa 3D: EGL and OpenGL ES 2.0 and 3.x over the softpipe driver, which draws
+# with the processor. The package installs no file of its own:
+# tools/build-mesa.py builds one static archive from the pinned source archive
+# (target/mesa/lib/libmesa.a, with the headers of Khronos in
+# target/mesa/include) against the sysroot of relibc and the libc++ of the
+# package libcxx, and the programs that draw with OpenGL ES link it.
+# Format: docs/packages.md.
+
+name = "mesa"
+version = "26.3.1"
+kind = "optional"
+image = "games"
+release = "1"
+summary = "Mesa EGL and OpenGL ES on the softpipe driver, linked into programs"
+url = "https://archive.mesa3d.org/mesa-26.3.1.tar.xz"
+sha256 = "4e4e438eac7b840a9383988cbb7c08dad8041da544b9319fc26d319fa7348961"
+license = "MIT AND Apache-2.0 AND BSL-1.0 AND BSD-2-Clause AND BSD-3-Clause AND HPND-sell-variant AND LicenseRef-public-domain"
+license_file = "docs/license.rst"
+build_depends = ["libcxx"]
+build = "tools/build-mesa.py"
+files = []

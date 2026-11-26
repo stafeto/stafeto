@@ -111,6 +111,31 @@ them for the licence notes of the image.
   text is the three `LICENSE.TXT` files of libcxx, libcxxabi and libunwind.
   `python3 tools/test_build_libcxx.py` checks the site configuration, the patch
   of libunwind and the names the libraries leave undefined.
+- Mesa (`packages/mesa.toml`, 26.3.1: MIT with Apache-2.0, BSL-1.0, BSD-2-Clause,
+  BSD-3-Clause, HPND-sell-variant and public-domain files) is an optional package of the games
+  image that installs no file: programs that draw with EGL and OpenGL ES link it
+  (`apps/gles-cube` is the first). `tools/build-mesa.py` fetches the release
+  archive and libdrm 2.4.133 (copies are kept in `target/mesa-src/`), checks both
+  SHA-256 digests, applies the patches of `ports/mesa/patches` and builds with
+  meson and ninja one archive, `target/mesa/lib/libmesa.a`, of the softpipe driver,
+  the EGL of Mesa and its OpenGL ES 2 and 3 API, with the headers of Khronos in
+  `target/mesa/include`, against the sysroot of relibc and the libc++ of the
+  package `libcxx` (`cargo xtask mesa`). The host needs meson 1.5 or newer, ninja,
+  flex and bison (Homebrew's, as the macOS one is too old). The Python packages of the
+  generators (Mako, MarkupSafe, PyYAML, packaging) always come from a venv in
+  `target/mesa/venv`, installed with `--require-hashes --no-deps --only-binary :all:` from
+  `tools/mesa-requirements.txt` (hashes of the PyPI wheels for macOS arm64 and Linux
+  aarch64 and x86_64); a host meson older than 1.5 is replaced by the pinned one of
+  `tools/mesa-requirements-meson.txt`. The digest of both files is in the stamp.
+  `cargo xtask mesa-reference` (arm64 Linux only, `probe.yml` command `mesa-reference`)
+  builds the same Mesa for Linux and compares the CRCs of the cube.
+  `xtask/src/packages.rs` names it in `SERVICE_LIBRARIES` until a package with files links it in; its licence text is `target/mesa/NOTICES`
+  (Mesa's licence, the texts of MIT, Apache-2.0 and BSL-1.0, and the licence
+  heading of each file with other terms). `python3 tools/test_build_mesa.py`
+  checks the options (dropping `opengl=false` is refused, and the options as meson
+  configured them are compared again), the cross file, the patches (and that they apply
+  to the cached archive), the static libraries of the build tree, the checks for names
+  defined twice, shared with the C library or the C++ runtime, and left undefined.
 - FreeType (`packages/freetype.toml`, FTL, 2.14.3) is an optional package of the
   image kind `games` that installs no file: the package `lvgl` links it and
   names it in `build_depends`, so the notices of `lvgl` carry its licence.

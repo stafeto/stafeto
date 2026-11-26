@@ -1,0 +1,105 @@
+The targets of the API and of the driver are static libraries.
+SPDX-License-Identifier: MIT
+Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+libEGL, libGLESv2 and libgallium are shared_library targets in Mesa; the
+loader of stafeto knows one shared library, the C library, so they become
+static_library targets without their version scripts and sonames, and
+tools/build-mesa.py merges the archives of the build into one.
+
+diff --git a/src/egl/meson.build b/src/egl/meson.build
+index b055360..0f8cfed 100644
+--- a/src/egl/meson.build
++++ b/src/egl/meson.build
+@@ -190,7 +190,8 @@ if egl_native_platform != ''
+   c_args_for_egl += '-D_EGL_NATIVE_PLATFORM=_EGL_PLATFORM_@0@'.format(egl_native_platform.to_upper())
+ endif
+ 
+-libegl = shared_library(
++# stafeto: a static library; the program links the Mesa archives itself.
++libegl = static_library(
+   egl_lib_name,
+   files_egl,
+   c_args : [
+@@ -200,14 +201,8 @@ libegl = shared_library(
+   gnu_symbol_visibility : 'hidden',
+   include_directories : incs_for_egl,
+   link_with : [link_for_egl],
+-  link_args : [ld_args_bsymbolic, ld_args_gc_sections, link_args_for_egl],
+-  link_depends : [link_deps_for_egl],
+   dependencies : [deps_for_egl, dep_dl, dep_libdrm, dep_clock, dep_thread, idep_mesautil],
+-  install : true,
+-  version : egl_lib_version,
+-  soversion : egl_lib_soversion,
+-  name_prefix : host_machine.system() == 'windows' ? 'lib' : [],  # always use lib, but avoid warnings on !windows
+-  vs_module_defs : egl_def
++  install : false,
+ )
+ 
+ if with_glvnd
+diff --git a/src/gallium/targets/dri/meson.build b/src/gallium/targets/dri/meson.build
+index c526ffe..4753824 100644
+--- a/src/gallium/targets/dri/meson.build
++++ b/src/gallium/targets/dri/meson.build
+@@ -39,7 +39,8 @@ else
+   libgallium_name = 'gallium-@0@'.format(meson.project_version())
+ endif
+ 
+-libgallium_dri = shared_library(
++# stafeto: a static library; the program links the Mesa archives itself.
++libgallium_dri = static_library(
+   libgallium_name,
+   files('dri_target.c'),
+   include_directories : [
+@@ -47,8 +48,6 @@ libgallium_dri = shared_library(
+     inc_gallium_winsys, include_directories('../../frontends/dri'),
+   ],
+   gnu_symbol_visibility : 'hidden',
+-  link_args : [ld_args_build_id, ld_args_gc_sections, gallium_dri_ld_args],
+-  link_depends : gallium_dri_link_depends,
+   link_with : [
+     libmesa, libgalliumvl,
+     libgallium, libglapi, libpipe_loader_static, libws_null, libwsw, libswdri,
+@@ -63,8 +62,7 @@ libgallium_dri = shared_library(
+     driver_panfrost, driver_iris, driver_lima, driver_zink, driver_d3d12,
+     driver_asahi, driver_crocus, driver_rocket, driver_ethosu
+   ],
+-  install : true,
+-  name_suffix : libname_suffix,
++  install : false,
+ )
+ 
+ shared_glapi_lib = libgallium_dri
+diff --git a/src/mesa/glapi/es2api/meson.build b/src/mesa/glapi/es2api/meson.build
+index be999c1..03a8c14 100644
+--- a/src/mesa/glapi/es2api/meson.build
++++ b/src/mesa/glapi/es2api/meson.build
+@@ -22,25 +22,20 @@ gles2_def = custom_target(
+   command : gen_vs_module_defs_normal_command,
+ )
+ 
+-libgles2 = shared_library(
++# stafeto: a static library; the program links the Mesa archives itself.
++libgles2 = static_library(
+   'GLESv2' + get_option('gles-lib-suffix'),
+   ['libgles2_public.c', es2_glapi_mapi_tmp_h],
+-  vs_module_defs : gles2_def,
+   c_args : [
+     c_msvc_compat_args,
+     _es2_c_args,
+     gcc_lto_quirk,
+   ],
+   gnu_symbol_visibility : 'hidden',
+-  link_args : [ld_args_gc_sections],
+   include_directories : [inc_mesa, inc_src, inc_include],
+   link_with : shared_glapi_lib,
+   dependencies : [dep_thread, dep_libdrm, dep_m, dep_dl, idep_mesautilc11],
+-  soversion : host_machine.system() == 'windows' ? '' : '2',
+-  version : '2.0.0',
+-  darwin_versions : '3.0.0',
+-  name_prefix : host_machine.system() == 'windows' ? 'lib' : [],  # always use lib, but avoid warnings on !windows
+-  install : true,
++  install : false,
+ )
+ 
+ pkg.generate(

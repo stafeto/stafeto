@@ -195,7 +195,10 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # the clock, thread exit runs the cleanup handlers before the thread-local
 # destructors, setlocale and newlocale resolve "" from LC_ALL, LC_<category>
 # and LANG, atexit reports out of memory; tagged pin-dbedefc1.
-COMMIT = "dbedefc10041b685968df3d219c6832e7e7b5374"
+# Review of Mesa on relibc: secure_getenv answers NULL in the secure mode
+# (AT_SECURE), pthread_setaffinity_np and pthread_getaffinity_np answer
+# ENOTSUP for a thread other than the caller; tagged pin-658d58c2.
+COMMIT = "658d58c2330883a38add7efde7dc4849970abe5f"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

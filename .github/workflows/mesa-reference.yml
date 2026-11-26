@@ -1,0 +1,49 @@
+name: mesa-reference
+
+# The Linux reference of the cube: builds the Mesa of packages/mesa.toml for the
+# runner (arm64 Linux) with the options of the build for stafeto and runs
+# apps/gles-cube --pbuffer on it. The output (the CRC of each of ten frames) is
+# what `cargo xtask gles-pbuffer` is compared with (tools/build-mesa-reference.py).
+# Start only by hand: `gh workflow run mesa-reference.yml --ref my-branch`.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: mesa-reference-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  LLVM_VERSION: "23"
+
+jobs:
+  reference:
+    name: reference
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: ./.github/actions/setup
+        with:
+          qemu: "false"
+
+      - name: Build Mesa and run the cube
+        env:
+          CC: clang
+          CXX: clang++
+        run: python3 tools/build-mesa-reference.py
+
+      - name: Upload the output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mesa-reference
+          path: |
+            target/mesa-reference/gles-cube.txt
+            target/mesa-reference/comparison.txt
+            target/mesa-reference/build.log
+          if-no-files-found: ignore
+          retention-days: 30

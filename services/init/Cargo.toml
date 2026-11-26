@@ -81,6 +81,8 @@ table-relibc = []
 table-relibc-threads = []
 # The C++ probe (xtask cxx-probe): the services of posix-procs with the C++ probe as the program that runs.
 table-cxx-probe = []
+# The cube in a pbuffer (xtask gles-pbuffer): the services of the POSIX probes and apps/gles-cube with a quota above 64 MiB.
+table-gles-pbuffer = []
 # The probe of POSIX processes (posix-procs) and the records it spawns.
 table-posix-procs = []
 table-posix-lock-ring = []
