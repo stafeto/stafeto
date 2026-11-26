@@ -13,6 +13,17 @@ use proto_fs::{NodeInfo, Timestamp};
 /// The directory the service's volume is mounted at.
 pub const MOUNT: &[u8] = b"/data";
 
+// The name the RAM file service redirects (`proto_fs::DATA_MOUNT`, which init gives it as
+// `mount=data`) is the name of this mount, without its slash.
+const _: () = {
+    let mut i = 0;
+    assert!(MOUNT.len() == proto_fs::DATA_MOUNT.len() + 1 && MOUNT[0] == b'/');
+    while i < proto_fs::DATA_MOUNT.len() {
+        assert!(MOUNT[i + 1] == proto_fs::DATA_MOUNT[i]);
+        i += 1;
+    }
+};
+
 /// The path the service gets for an absolute path of the layer (the dots and the extra slashes are
 /// gone already, `posix_path::simplify`): `/data` and `/data/` are the root of the volume `/`,
 /// `/data/a/b` is `/a/b`, and a slash at the end goes. None for any other path, `/datax` and

@@ -416,7 +416,13 @@ impl ChangeJob {
                 if let Some(second) = second.as_deref_mut()
                     && !second.is_inert()
                 {
-                    match second.step(&mut ram.storage, identity)? {
+                    // A second path that meets the mount point of another service is across
+                    // two file systems.
+                    let step = match second.step(&mut ram.storage, identity) {
+                        Err(proto_fs::REDIRECT) => Err(proto_fs::CROSS_DEVICE),
+                        step => step,
+                    };
+                    match step? {
                         Progress::More => return Ok(()),
                         Progress::Found(_) | Progress::Missing(_) => {}
                     }

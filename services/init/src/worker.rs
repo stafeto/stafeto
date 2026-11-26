@@ -441,7 +441,12 @@ fn start_data(record: &Record, cpus: u8, spawned: &mut Spawned) -> Result<Kept, 
         own[8 * i..8 * i + 8].copy_from_slice(&pa.to_le_bytes());
         kept[i] = Some(object);
     }
-    set_args(record, &mut spawned.giver, &own[..8 * record.dma.len()])?;
+    // The RAM file service has no DMA: its extra arguments are the mount of the data volume.
+    let first = match table::first_args(table::TABLE, record.name) {
+        mount if !mount.is_empty() && record.dma.is_empty() => mount,
+        _ => &own[..8 * record.dma.len()],
+    };
+    set_args(record, &mut spawned.giver, first)?;
     Ok(kept)
 }
 

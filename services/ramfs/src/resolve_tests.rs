@@ -2505,3 +2505,92 @@ fn foreign_bucket_changes_keep_missing_proofs_and_reservations() {
     ram.storage.check_name_index();
     job.release(&mut ram.storage);
 }
+
+/// The path and the links of a redirect.
+type Redirected = (std::vec::Vec<u8>, u32);
+
+/// Walks `path` to its end and returns what the walk ended with.
+fn walk_to_end(r: &mut Ram<'_>, path: &[u8]) -> (Result<Token, u32>, Option<Redirected>) {
+    let mut job = Resolve::new(&mut r.storage, path, ROOT, OWNER, true).unwrap();
+    let result = finish(r, &mut job, OWNER);
+    let target = job.redirect().map(|(path, links)| (path.to_vec(), links));
+    job.release(&mut r.storage);
+    (result, target)
+}
+
+fn mounted() -> Ram<'static> {
+    let r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    assert!(r.storage.state.set_mount(proto_fs::DATA_MOUNT));
+    r
+}
+
+#[test]
+fn a_link_onto_the_mount_point_redirects_with_the_rest_of_the_path() {
+    let mut r = mounted();
+    let tmp = create(&mut r, ROOT, b"area", DIR, 0o755);
+    let absolute = create(&mut r, tmp, b"d", SYMLINK, 0o777);
+    r.storage
+        .write(absolute, ROOT_ACCOUNT, 0, b"/data")
+        .unwrap();
+    let relative = create(&mut r, tmp, b"r", SYMLINK, 0o777);
+    r.storage
+        .write(relative, ROOT_ACCOUNT, 0, b"../data/sub")
+        .unwrap();
+    for (path, want, links) in [
+        (&b"/area/d"[..], &b"/data"[..], 1),
+        (b"/area/d/a/b", b"/data/a/b", 1),
+        (b"/area/d/", b"/data/", 1),
+        (b"/area/r/file", b"/data/sub/file", 1),
+        (b"/area/../data/x", b"/data/x", 0),
+        (b"/data", b"/data", 0),
+    ] {
+        let (result, target) = walk_to_end(&mut r, path);
+        assert_eq!(result, Err(proto_fs::REDIRECT), "{path:?}");
+        assert_eq!(target, Some((want.to_vec(), links)), "{path:?}");
+    }
+    // The walk that has redirected redirects again on a repeat of the step.
+    let mut job = Resolve::new(&mut r.storage, b"/area/d/x", ROOT, OWNER, true).unwrap();
+    assert_eq!(finish(&mut r, &mut job, OWNER), Err(proto_fs::REDIRECT));
+    assert_eq!(job.step(&mut r.storage, OWNER), Err(proto_fs::REDIRECT));
+    job.release(&mut r.storage);
+}
+
+#[test]
+fn without_a_mount_nothing_redirects() {
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let plain = create(&mut r, ROOT, b"data", DIR, 0o755);
+    assert_eq!(walk_to_end(&mut r, b"/data"), (Ok(plain), None));
+    assert_eq!(
+        walk_to_end(&mut r, b"/data/x"),
+        (Err(proto_fs::NO_ENTRY), None)
+    );
+}
+
+#[test]
+fn the_mount_name_of_the_root_redirects_with_or_without_a_directory_and_no_other_name_does() {
+    let mut r = mounted();
+    let area = create(&mut r, ROOT, b"area", DIR, 0o755);
+    let inner = create(&mut r, area, b"data", DIR, 0o755);
+    let file = create(&mut r, ROOT, b"data2", REG, 0o644);
+    assert_eq!(walk_to_end(&mut r, b"/area/data").0, Ok(inner));
+    assert_eq!(walk_to_end(&mut r, b"/data2").0, Ok(file));
+    // The tree has no directory data: the name is the volume's all the same.
+    let (result, target) = walk_to_end(&mut r, b"/data/x");
+    assert_eq!(result, Err(proto_fs::REDIRECT));
+    assert_eq!(target, Some((b"/data/x".to_vec(), 0)));
+    create(&mut r, ROOT, b"data", DIR, 0o755);
+    assert_eq!(
+        walk_to_end(&mut r, b"/data").1,
+        Some((b"/data".to_vec(), 0))
+    );
+}
+
+#[test]
+fn the_mount_name_is_one_component() {
+    let r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    for bad in [&b""[..], b"a/b", b"..", b".", b"a\0b", &[b'x'; 25]] {
+        assert!(!r.storage.state.set_mount(bad), "{bad:?}");
+    }
+    assert!(r.storage.state.set_mount(b"vol"));
+    assert_eq!(r.storage.state.mount(), Some(&b"vol"[..]));
+}
