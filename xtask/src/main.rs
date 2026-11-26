@@ -15104,6 +15104,7 @@ fn ci_lints() -> Result<(), String> {
         "gles-cube",
         "--package",
         "deqp-egl",
+        "--package",
         "gles3-demo",
         "--package",
         "posix-procs",
