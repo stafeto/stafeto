@@ -373,7 +373,15 @@ pub fn fstatat(
                 fstatat_once(dirfd, Some(path), flags)
             })
         }
-        None => fstatat_once(dirfd, path, flags),
+        None => {
+            // A descriptor of the network stack answers for itself; the check of the flags is
+            // the same as below.
+            if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) == 0 && crate::fastnet::is_fast(dirfd)
+            {
+                return crate::fastnet::stat(dirfd);
+            }
+            fstatat_once(dirfd, path, flags)
+        }
     }
 }
 
