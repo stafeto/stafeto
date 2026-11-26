@@ -300,6 +300,106 @@ pub fn frame(which: usize) -> Vec<u32> {
     out
 }
 
+/// The windows of the scenes of `apps/wfc-demo --gles` (the cube of EGL and the
+/// field of cubes of OpenGL ES 3, 160 by 160 points each) and the places the
+/// demo gives them (`GLES_*` of wfc-demo.c).
+pub const GLES_SIZE: u32 = 160;
+pub const GLES_CUBE: u32 = 11;
+pub const GLES_FIELD: u32 = 12;
+pub const GLES_CUBE_AT: (i32, i32) = (240, 120);
+pub const GLES_FIELD_AT: (i32, i32) = (440, 120);
+/// The background of scene G, 0xRRGGBBAA as `wfcSetContextAttribi` has it.
+const GLES_BG: i32 = 0x2030_40FFu32 as i32;
+
+/// The record of the scenes of `--gles`, built through the library's calls as the
+/// demo makes them. Without `turned` the two windows stand as they are over
+/// black (the cube at the middle, the field to its right); with it (scene G) the
+/// cube's window is turned by 90 degrees and scaled by one half, at (100, 160).
+pub fn gles_scene(turned: bool) -> SceneCommit {
+    let mut svc = Keep::default();
+    let mut w = Wfc::create_device(0, &[], Setup::VIRTIO).expect("device");
+    let dev = w.device();
+    let ctx = w.create_on_screen_context(dev, 0, &[], &mut svc);
+    assert!(ctx != 0);
+    let info = |id| StreamInfo {
+        id,
+        width: GLES_SIZE,
+        height: GLES_SIZE,
+        format: FORMAT_XRGB8888,
+    };
+    let cube = w.create_source_from_stream(dev, ctx, Some(info(GLES_CUBE)), &[]);
+    let field = w.create_source_from_stream(dev, ctx, Some(info(GLES_FIELD)), &[]);
+    w.set_context_attrib_i(
+        dev,
+        ctx,
+        CONTEXT_BG_COLOR,
+        if turned { GLES_BG } else { 0xFF },
+    );
+    let whole = [0.0, 0.0, GLES_SIZE as f32, GLES_SIZE as f32];
+    let mut below = 0;
+    for (source, rotation, dst) in [
+        (
+            cube,
+            if turned { ROTATION_90 } else { ROTATION_0 },
+            if turned {
+                [100, 160, 80, 80]
+            } else {
+                [GLES_CUBE_AT.0, GLES_CUBE_AT.1, 160, 160]
+            },
+        ),
+        (
+            field,
+            ROTATION_0,
+            [GLES_FIELD_AT.0, GLES_FIELD_AT.1, 160, 160],
+        ),
+    ] {
+        let e = w.create_element(dev, ctx, &[]);
+        w.set_element_attrib_i(dev, e, ELEMENT_SOURCE, source as i32);
+        w.set_element_attrib_fv(dev, e, ELEMENT_SOURCE_RECTANGLE, Some(&whole));
+        w.set_element_attrib_iv(dev, e, ELEMENT_DESTINATION_RECTANGLE, Some(&dst));
+        w.set_element_attrib_i(dev, e, ELEMENT_SOURCE_ROTATION, rotation);
+        w.set_element_attrib_i(dev, e, ELEMENT_SOURCE_FLIP, 0);
+        w.set_element_attrib_i(dev, e, ELEMENT_SOURCE_SCALE_FILTER, SCALE_FILTER_NONE);
+        w.set_element_attrib_i(dev, e, ELEMENT_TRANSPARENCY_TYPES, 0);
+        w.set_element_attrib_i(dev, e, ELEMENT_GLOBAL_ALPHA, 255);
+        w.insert_element(dev, e, below);
+        below = e;
+    }
+    assert_eq!(w.get_error(dev), 0, "the demo's calls are all accepted");
+    w.commit(dev, ctx, false, &mut svc);
+    assert_eq!(w.get_error(dev), 0, "the commit is consistent");
+    svc.last.expect("a scene was committed")
+}
+
+/// The frame of `--gles` the host expects: `cube` and `field` are the two
+/// windows' points (160 by 160, 0x00RRGGBB, rows from the top) as QEMU's
+/// screenshot shows them in the scene that has them as they are; `turned` picks
+/// scene G. 640 by 400 points, 0x00RRGGBB.
+pub fn gles_frame(turned: bool, cube: &[u32], field: &[u32]) -> Vec<u32> {
+    let record = gles_scene(turned);
+    let bg = record.bg & 0x00FF_FFFF;
+    let elements: Vec<Element> = record.elements().to_vec();
+    let size = (GLES_SIZE, GLES_SIZE);
+    let mut out = Vec::with_capacity(WIDTH * HEIGHT);
+    for y in 0..HEIGHT as i32 {
+        for x in 0..WIDTH as i32 {
+            let mut value = bg;
+            for e in &elements {
+                if !meaning::covers(e, x, y) {
+                    continue;
+                }
+                let points = if e.source == GLES_CUBE { cube } else { field };
+                let fetch = |px: u32, py: u32| points[(py * GLES_SIZE + px) as usize] | 0xFF00_0000;
+                if let Some(s) = meaning::sample(e, x, y, size, fetch) {
+                    value = meaning::mix(e, s, 255, value);
+                }
+            }
+            out.push(value & 0x00FF_FFFF);
+        }
+    }
+    out
+}
+
 /// The CRC-32 of a frame's colours as the monitor takes it: the red, green and
 /// blue bytes of each point, row after row.
 pub fn crc(frame: &[u32]) -> u32 {
@@ -379,5 +479,63 @@ mod tests {
     #[test]
     fn the_crcs_are_stable() {
         assert_eq!(crcs(), crcs());
+    }
+
+    /// Two windows of points no two alike (the cube's values count from 1, the field's
+    /// from 0x10_0000).
+    fn windows() -> (Vec<u32>, Vec<u32>) {
+        let n = (GLES_SIZE * GLES_SIZE) as usize;
+        (
+            (0..n as u32).map(|i| 0x0001_0000 + i).collect(),
+            (0..n as u32).map(|i| 0x0010_0000 + i).collect(),
+        )
+    }
+
+    #[test]
+    fn the_windows_stand_as_they_are_before_the_scene_g() {
+        let (cube, field) = windows();
+        let frame = gles_frame(false, &cube, &field);
+        assert_eq!(frame.len(), WIDTH * HEIGHT);
+        for (x, y) in [(0usize, 0usize), (159, 0), (0, 159), (159, 159), (77, 31)] {
+            assert_eq!(
+                frame[(GLES_CUBE_AT.1 as usize + y) * WIDTH + GLES_CUBE_AT.0 as usize + x],
+                cube[y * 160 + x]
+            );
+            assert_eq!(
+                frame[(GLES_FIELD_AT.1 as usize + y) * WIDTH + GLES_FIELD_AT.0 as usize + x],
+                field[y * 160 + x]
+            );
+        }
+        assert_eq!(frame[0], 0);
+        assert_eq!(frame[WIDTH * 399 + 639], 0);
+    }
+
+    #[test]
+    fn the_scene_g_turns_and_halves_the_cube_and_keeps_the_field() {
+        let (cube, field) = windows();
+        let before = gles_frame(false, &cube, &field);
+        let g = gles_frame(true, &cube, &field);
+        assert_ne!(crc(&before), crc(&g));
+        // The field is where it was; the background is the scene's.
+        let at = |f: &[u32], x: usize, y: usize| f[y * WIDTH + x];
+        assert_eq!(at(&g, 440 + 5, 120 + 9), field[9 * 160 + 5]);
+        assert_eq!(at(&g, 0, 0), 0x0020_3040);
+        // The cube's old place is the background; its new one, 80 by 80 points at
+        // (100, 160), holds points of the cube's window only, turned: the corners differ.
+        assert_eq!(at(&g, 250, 130), 0x0020_3040);
+        let mut seen = std::collections::BTreeSet::new();
+        for y in 160..240 {
+            for x in 100..180 {
+                let p = at(&g, x, y);
+                assert!(cube.contains(&p), "({x}, {y}) is {p:06x}");
+                seen.insert(p);
+            }
+        }
+        assert!(seen.len() > 1000, "{} points", seen.len());
+        // A quarter turn: the point at the upper left of the new place is not the
+        // upper left of the window.
+        assert_ne!(at(&g, 100, 160), cube[0]);
+        assert_eq!(at(&g, 99, 160), 0x0020_3040);
+        assert_eq!(at(&g, 180, 239), 0x0020_3040);
     }
 }

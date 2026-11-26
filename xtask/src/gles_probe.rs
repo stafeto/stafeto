@@ -1,0 +1,798 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! The probe of the graphics of Mesa (`cargo xtask gles-probe`): EGL 1.5 and
+//! OpenGL ES 3 on Mesa's softpipe driver, drawn by C programs on relibc and shown
+//! by the composition service on QEMU's virtio-gpu-device. Three boots:
+//!
+//! 1. the cube into a pbuffer (`gles_pbuffer`): ten frames read back, each CRC-32
+//!    the one pinned in `gles_pbuffer::EXPECTED_CRCS`, which the same Mesa built for
+//!    Linux gives (tools/mesa-reference);
+//! 2. the scene (`boot-gles.img`, apps/wfc-demo `--gles`): the demo holds the scene
+//!    and starts `gles-cube --window-run --hold` and `gles3-demo --probe --hold`,
+//!    and shows their windows. The cube checks the platform of EGL (the checks of
+//!    `gles_window`), draws six frames into its window, and while it pauses at
+//!    the third frame and at the last the host's screenshot has the CRC-32 of the
+//!    screen the cube printed: the window, shown by the scene, holds what the
+//!    platform copied into it. The cube then holds its window and the screenshot has
+//!    its CRC-32 once more. `gles3-demo` (a vertex array object, a uniform block,
+//!    an instanced draw of 64 cubes) draws three frames into a pbuffer and the same
+//!    three into a window, each with the CRC-32 of the pbuffer's frame and the rows
+//!    of the window the mirror of the readback; the screenshot of its window has the
+//!    CRC-32 it printed. Last the demo turns the cube's window by 90 degrees and
+//!    scales it by one half with an element of libWFC (the stream of
+//!    `eglSwapBuffers` as a source of OpenWF Composition), and the host draws that
+//!    scene point by point (`tools/wfc-ref`, `gles_frame`) from the two windows as
+//!    its own screenshot of them shows them: the screenshot of the scene has that
+//!    frame's CRC-32;
+//! 3. the same scene under -icount (`boot-gles-steps.img`): the demo leaves out its
+//!    pauses, and the steps of the compositor and the driver, with the cube and the
+//!    field drawing, stay under 0.9 of term B and the portions under `PORTION_MAX`.
+
+use std::time::{Duration, Instant};
+
+use crate::gles_pbuffer::frame_line;
+use crate::gles_window::{End, SHOTS};
+use crate::gpu_probe::{self, Scratch};
+use crate::monitor::{Monitor, Ppm};
+use crate::qemu::{self, Input, Run};
+use crate::{
+    BOOT_PROFILE, INIT_STACK_SIZE, ImageProgram, POSIX_STACK_SIZE, Variant, build,
+    build_boot_image, run_until,
+};
+
+/// The image of the scene: the services of the POSIX probes, the driver, the
+/// compositor, the demo (started by init) and the two programs it starts (files).
+pub const PROGRAMS: [ImageProgram; 13] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-gles"]),
+    ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("pipe", "pipe", crate::PIPE_STACK_SIZE, &[]),
+    ("loader", "loader", 0, &[]),
+    ("virtio-gpu", "virtio-gpu", gpu_probe::GPU_STACK_SIZE, &[]),
+    (
+        "compositor",
+        "compositor",
+        crate::comp_probe::COMP_STACK_SIZE,
+        &[],
+    ),
+    ("wfc-demo", "wfc-demo", POSIX_STACK_SIZE, &[]),
+    // Files the demo spawns: the stack is the PT_GNU_STACK of their own build.
+    ("gles-cube", "gles-cube", 0, &[]),
+    ("gles3-demo", "gles3-demo", 0, &[]),
+    (
+        "virtio-rng",
+        "virtio-rng",
+        crate::entropy::RNG_STACK_SIZE,
+        &[],
+    ),
+    (
+        "entropy",
+        "entropy",
+        crate::entropy::ENTROPY_STACK_SIZE,
+        &[],
+    ),
+];
+
+/// The image of the run under -icount: the driver and the compositor count their
+/// steps, and the demo does not pause for the monitor.
+pub const STEPS_PROGRAMS: [ImageProgram; 13] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-gles-steps"]),
+    ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("pipe", "pipe", crate::PIPE_STACK_SIZE, &[]),
+    ("loader", "loader", 0, &[]),
+    (
+        "virtio-gpu",
+        "virtio-gpu",
+        gpu_probe::GPU_STACK_SIZE,
+        &["steps"],
+    ),
+    (
+        "compositor",
+        "compositor",
+        crate::comp_probe::COMP_STACK_SIZE,
+        &["steps"],
+    ),
+    ("wfc-demo", "wfc-demo", POSIX_STACK_SIZE, &[]),
+    ("gles-cube", "gles-cube", 0, &[]),
+    ("gles3-demo", "gles3-demo", 0, &[]),
+    (
+        "virtio-rng",
+        "virtio-rng",
+        crate::entropy::RNG_STACK_SIZE,
+        &[],
+    ),
+    (
+        "entropy",
+        "entropy",
+        crate::entropy::ENTROPY_STACK_SIZE,
+        &[],
+    ),
+];
+
+const WIDTH: usize = 640;
+const HEIGHT: usize = 400;
+/// The side of the two windows, and where the demo shows them (`GLES_*` of
+/// wfc-demo.c, `wfc_ref::GLES_*`).
+const SIZE: usize = wfc_ref::GLES_SIZE as usize;
+const CUBE_AT: (usize, usize) = (
+    wfc_ref::GLES_CUBE_AT.0 as usize,
+    wfc_ref::GLES_CUBE_AT.1 as usize,
+);
+const FIELD_AT: (usize, usize) = (
+    wfc_ref::GLES_FIELD_AT.0 as usize,
+    wfc_ref::GLES_FIELD_AT.1 as usize,
+);
+
+/// The lines of the field of cubes start with this.
+const FIELD: &str = "gles3-demo: ";
+/// The frames the field draws, and their CRC-32 as the program prints them once
+/// pinned: the frames are the same on every run of the same build; the value is
+/// pinned after agreeing runs (the three runs of the local machine agree; the
+/// repeats of probe.yml on the machines of GitHub are the second witness).
+pub const FIELD_FRAMES: usize = 3;
+pub const EXPECTED_FIELD_CRCS: Option<[u32; FIELD_FRAMES]> =
+    Some([0xbb63_7c2c, 0x463e_8d75, 0x1b38_eaa0]);
+
+const CUBE_HELD: &str = "gles-cube: held crc ";
+const FIELD_HELD: &str = "gles3-demo: held crc ";
+const LINE_ALONE: &str =
+    "wfc-demo: gles the window of the cube is an element of the active context";
+const LINE_CUBE: &str = "wfc-demo: gles the cube holds its last frame";
+const LINE_BOTH: &str = "wfc-demo: gles both windows are shown as they are";
+const LINE_G: &str = "wfc-demo: gles scene G committed";
+const LINE_GONE: &str = "wfc-demo: the programs are gone and the device is destroyed";
+const LINE_OK: &str = "wfc-demo: ok";
+const ENDED: &str = concat!("init: wfc-demo ended: exit code 0,", " not restarted");
+const ENDS: &str = "init: wfc-demo ended: ";
+
+/// The lines of the demo that come once each (besides the checks of the device).
+const DEMO_LINES: [&str; 6] = [LINE_ALONE, LINE_CUBE, LINE_BOTH, LINE_G, LINE_GONE, LINE_OK];
+
+/// The lines of the field's program that come once each, as the text after its
+/// prefix (`starts_with`, `ends_with`).
+const FIELD_ONCE: [(&str, &str); 1] = [("uniform block Scene of ", " bytes")];
+
+/// A line that ends the probe in failure: a check of a program that failed, a
+/// shader that did not compile, or the demo ending with a code other than 0.
+fn failure(line: &str) -> Option<String> {
+    let failed = crate::gles_window::failure(line).is_some()
+        || line.starts_with("gles3-demo: check failed")
+        || line.starts_with("gles3-demo: shader")
+        || line.starts_with("wfc-demo: check failed")
+        || (line.starts_with(ENDS) && line != ENDED);
+    failed.then(|| line.to_owned())
+}
+
+/// What the screenshots showed.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Seen {
+    /// The CRC-32 of the two screenshots the cube's `window crc` and `last crc`
+    /// lines asked for.
+    pub shots: [u32; 2],
+    /// The CRC-32 of the screen with the cube's window alone, its own `held crc`.
+    pub cube_held: u32,
+    /// The CRC-32 of the field's window in the screenshot with both windows, its own
+    /// `held crc`.
+    pub field_held: u32,
+    /// The CRC-32 of the screenshot with both windows as they are, and of the
+    /// scene G (the cube turned and halved).
+    pub both: u32,
+    pub scene_g: u32,
+}
+
+/// The points of a part of a screenshot, 0x00RRGGBB, rows from the top.
+fn crop(picture: &Ppm, at: (usize, usize)) -> Vec<u32> {
+    let mut points = Vec::with_capacity(SIZE * SIZE);
+    for y in at.1..at.1 + SIZE {
+        for x in at.0..at.0 + SIZE {
+            let p = &picture.rgb[3 * (y * WIDTH + x)..3 * (y * WIDTH + x) + 3];
+            points.push(u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]));
+        }
+    }
+    points
+}
+
+/// Where a screenshot differs from the host's frame: the number of points, the
+/// box around them and the first of them with both colours (0xRRGGBB).
+fn where_it_differs(picture: &Ppm, frame: &[u32]) -> String {
+    let mut count = 0usize;
+    let mut bounds = (usize::MAX, usize::MAX, 0usize, 0usize);
+    let mut first = None;
+    for (i, want) in frame.iter().enumerate() {
+        let got = &picture.rgb[3 * i..3 * i + 3];
+        let got = u32::from(got[0]) << 16 | u32::from(got[1]) << 8 | u32::from(got[2]);
+        if got != *want {
+            let (x, y) = (i % WIDTH, i / WIDTH);
+            count += 1;
+            bounds = (
+                bounds.0.min(x),
+                bounds.1.min(y),
+                bounds.2.max(x),
+                bounds.3.max(y),
+            );
+            first.get_or_insert((x, y, got, *want));
+        }
+    }
+    match first {
+        None => "no point differs".to_owned(),
+        Some((x, y, got, want)) => format!(
+            "{count} points differ, in the box x {}..{} y {}..{}; the first at ({x}, {y}): screen {got:06x}, host {want:06x}",
+            bounds.0, bounds.2, bounds.1, bounds.3
+        ),
+    }
+}
+
+fn take_picture(monitor: &mut Monitor, scratch: &Scratch) -> Result<Ppm, String> {
+    let picture = monitor.screendump(&scratch.picture())?;
+    if (picture.width, picture.height) != (WIDTH, HEIGHT) {
+        return Err(format!(
+            "the screenshot is {}x{}, 640x400 expected",
+            picture.width, picture.height
+        ));
+    }
+    Ok(picture)
+}
+
+/// The CRC-32 a program printed after `prefix`, eight hex digits.
+fn crc_after(line: &str, prefix: &str) -> Result<u32, String> {
+    gpu_probe::crc_of(line, prefix)
+}
+
+/// Waits for the first line that is `marker`, or a failure.
+fn wait_for(run: &mut Run, marker: &str, within: Duration) -> Result<String, String> {
+    let line = run.expect_line(
+        marker,
+        |l| l.starts_with(marker) || failure(l).is_some(),
+        within,
+    )?;
+    match failure(&line) {
+        Some(failed) => Err(failed),
+        None => Ok(line),
+    }
+}
+
+/// Follows the run: the screenshots at the cube's two pauses, the cube held, both
+/// windows as they are, and the scene G.
+fn drive(run: &mut Run, scratch: &Scratch) -> Result<Seen, String> {
+    // softpipe draws a frame in tens of milliseconds under TCG, and the compiler of
+    // GLSL runs first.
+    const WITHIN: Duration = Duration::from_secs(900);
+    let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
+    let mut shots = [0; 2];
+    for (shot, prefix) in shots.iter_mut().zip(SHOTS) {
+        let line = wait_for(run, prefix, WITHIN)?;
+        *shot = gpu_probe::compare_shot(&mut monitor, &scratch.picture(), &line, prefix)?;
+    }
+    let cube_line = wait_for(run, CUBE_HELD, WITHIN)?;
+    let cube_held = crc_after(&cube_line, CUBE_HELD)?;
+    wait_for(run, LINE_CUBE, WITHIN)?;
+    let alone = take_picture(&mut monitor, scratch)?;
+    if alone.crc32() != cube_held {
+        return Err(format!(
+            "the screenshot of the cube's window held by the scene is {:08x}, the cube printed {cube_held:08x}",
+            alone.crc32()
+        ));
+    }
+    let cube = crop(&alone, CUBE_AT);
+    let field_line = wait_for(run, FIELD_HELD, WITHIN)?;
+    let field_printed = crc_after(&field_line, FIELD_HELD)?;
+    wait_for(run, LINE_BOTH, WITHIN)?;
+    let both = take_picture(&mut monitor, scratch)?;
+    let field = crop(&both, FIELD_AT);
+    let field_held = wfc_ref::crc(&field);
+    if field_held != field_printed {
+        return Err(format!(
+            "the screenshot of the field's window is {field_held:08x}, the program printed {field_printed:08x}"
+        ));
+    }
+    if crop(&both, CUBE_AT) != cube {
+        return Err("the cube's window changed between the two screenshots".to_owned());
+    }
+    let wanted = wfc_ref::gles_frame(false, &cube, &field);
+    if both.crc32() != wfc_ref::crc(&wanted) {
+        return Err(format!(
+            "both windows as they are: QEMU's screenshot is {:08x}, the host's frame is {:08x}: {}",
+            both.crc32(),
+            wfc_ref::crc(&wanted),
+            where_it_differs(&both, &wanted)
+        ));
+    }
+    wait_for(run, LINE_G, WITHIN)?;
+    let turned = take_picture(&mut monitor, scratch)?;
+    let wanted = wfc_ref::gles_frame(true, &cube, &field);
+    if turned.crc32() != wfc_ref::crc(&wanted) {
+        return Err(format!(
+            "scene G (the cube's window turned by 90 degrees and scaled by one half): QEMU's screenshot is {:08x}, the host's frame is {:08x}: {}",
+            turned.crc32(),
+            wfc_ref::crc(&wanted),
+            where_it_differs(&turned, &wanted)
+        ));
+    }
+    if crop(&turned, FIELD_AT) != field {
+        return Err("the field's window changed in the scene G".to_owned());
+    }
+    let line = run.expect_line(ENDED, |l| l == ENDED || failure(l).is_some(), WITHIN)?;
+    if let Some(failed) = failure(&line) {
+        return Err(failed);
+    }
+    Ok(Seen {
+        shots,
+        cube_held,
+        field_held,
+        both: both.crc32(),
+        scene_g: turned.crc32(),
+    })
+}
+
+/// The lines of the field's program: the library is Mesa's softpipe with OpenGL ES 3,
+/// the uniform block is there, the three frames came once each in order with
+/// different CRC-32 and sums above 0, each frame of the window had the CRC-32 of the
+/// pbuffer's (the program checks it, and the lines say it), and the held CRC-32 is
+/// the last line. Returns the CRC-32 of the frames.
+pub fn field_verdict(lines: &[String]) -> Result<[u32; FIELD_FRAMES], String> {
+    let seen: Vec<&str> = lines.iter().filter_map(|l| l.strip_prefix(FIELD)).collect();
+    let find = |prefix: &str| {
+        seen.iter()
+            .find_map(|l| l.strip_prefix(prefix))
+            .ok_or_else(|| format!("the field's program printed no line {prefix:?}"))
+    };
+    if !find("EGL ")?.starts_with("1.5 ") {
+        return Err(format!("EGL is {:?}, 1.5 expected", find("EGL ")?));
+    }
+    let renderer = find("GL_RENDERER ")?;
+    if !renderer.contains("softpipe") {
+        return Err(format!("the renderer is {renderer:?}, softpipe expected"));
+    }
+    let version = find("GL_VERSION ")?;
+    if !version.contains("OpenGL ES 3.") || !version.contains("Mesa 26.3.1") {
+        return Err(format!(
+            "the version is {version:?}, OpenGL ES 3.x of Mesa 26.3.1 expected"
+        ));
+    }
+    for (start, end) in FIELD_ONCE {
+        let found = seen
+            .iter()
+            .filter(|l| l.starts_with(start) && l.ends_with(end))
+            .count();
+        if found != 1 {
+            return Err(format!(
+                "{found} lines {start:?} ... {end:?} of the field's program, 1 expected"
+            ));
+        }
+    }
+    if find("uniform block Scene of ")? != "208 bytes" {
+        return Err(format!(
+            "the uniform block is {:?}, 208 bytes expected",
+            find("uniform block Scene of ")?
+        ));
+    }
+    let frames: Vec<(usize, u32, u64)> = seen.iter().filter_map(|l| frame_line(l)).collect();
+    if frames.len() != FIELD_FRAMES {
+        return Err(format!(
+            "the field's program printed {} frame lines, {FIELD_FRAMES} expected",
+            frames.len()
+        ));
+    }
+    let mut crcs = [0u32; FIELD_FRAMES];
+    for (at, (number, crc, sum)) in frames.iter().enumerate() {
+        if *number != at {
+            return Err(format!("frame line {at} is the one of frame {number}"));
+        }
+        if *sum == 0 {
+            return Err(format!("frame {at} of the field is all zeros"));
+        }
+        crcs[at] = *crc;
+    }
+    let mut sorted = crcs;
+    sorted.sort_unstable();
+    if sorted.windows(2).any(|w| w[0] == w[1]) {
+        return Err("two frames of the turning field have the same CRC".to_owned());
+    }
+    if let Some(expected) = EXPECTED_FIELD_CRCS {
+        for (at, crc) in crcs.iter().enumerate() {
+            if *crc != expected[at] {
+                return Err(format!(
+                    "frame {at} of the field has the CRC {crc:08x}, {:08x} pinned",
+                    expected[at]
+                ));
+            }
+        }
+    }
+    for (at, crc) in crcs.iter().enumerate() {
+        let prefix = format!("window frame {at} crc ");
+        let mut mine = seen.iter().filter(|l| l.starts_with(&prefix));
+        let line = mine
+            .next()
+            .ok_or_else(|| format!("the field's program printed no line {prefix:?}"))?;
+        if mine.next().is_some() {
+            return Err(format!("two lines {prefix:?} of the field's program"));
+        }
+        let text = &line[prefix.len()..];
+        let wanted =
+            format!("{crc:08x} matches the pbuffer, and the window holds its rows mirrored");
+        if text != wanted {
+            return Err(format!(
+                "the window's frame {at}: {text:?}, {wanted:?} expected"
+            ));
+        }
+    }
+    let held: Vec<&&str> = seen.iter().filter(|l| l.starts_with("held crc ")).collect();
+    if held.len() != 1 || !seen.last().is_some_and(|l| l.starts_with("held crc ")) {
+        return Err(format!(
+            "the field's program held {} times and its last line is {:?}, one \"held crc\" line as the last expected",
+            held.len(),
+            seen.last()
+        ));
+    }
+    Ok(crcs)
+}
+
+/// Judges the lines of a run that need no screenshot: no check failed, the cube's
+/// lines are those of `gles_window` (ending in its held CRC-32; `shots` is what the
+/// screenshots at its two pauses had), the field's lines, each line of the demo came
+/// once, and the demo ended with the code 0.
+pub fn lines_verdict(lines: &[String], shots: [u32; 2]) -> Result<(), String> {
+    if let Some(failed) = lines.iter().find_map(|l| failure(l)) {
+        return Err(failed);
+    }
+    crate::gles_window::verdict_of(lines, shots, End::Held)?;
+    field_verdict(lines)?;
+    for marker in DEMO_LINES {
+        let found = lines.iter().filter(|l| l.as_str() == marker).count();
+        if found != 1 {
+            return Err(format!("{found} lines {marker:?}, 1 expected"));
+        }
+    }
+    if !lines.iter().any(|l| l == ENDED) {
+        return Err(format!("init never printed {ENDED:?}"));
+    }
+    Ok(())
+}
+
+/// `lines_verdict` and the screenshots: the CRC-32 the programs held are the ones
+/// the screenshots had, and the scene G is no picture of the windows as they are.
+pub fn verdict(lines: &[String], seen: &Seen) -> Result<(), String> {
+    lines_verdict(lines, seen.shots)?;
+    let held = |prefix: &str| {
+        lines
+            .iter()
+            .find_map(|l| l.strip_prefix(prefix))
+            .and_then(|crc| u32::from_str_radix(crc, 16).ok())
+            .ok_or_else(|| format!("no line {prefix:?}"))
+    };
+    if held(CUBE_HELD)? != seen.cube_held {
+        return Err(format!(
+            "the cube held {:08x}, the screenshot had {:08x}",
+            held(CUBE_HELD)?,
+            seen.cube_held
+        ));
+    }
+    if held(FIELD_HELD)? != seen.field_held {
+        return Err(format!(
+            "the field held {:08x}, the screenshot had {:08x}",
+            held(FIELD_HELD)?,
+            seen.field_held
+        ));
+    }
+    if seen.both == seen.scene_g {
+        return Err("the scene G looks like the windows as they are".to_owned());
+    }
+    Ok(())
+}
+
+/// The compositor's kinds that must come in the run: DESCRIBE, WINDOW_CREATE,
+/// ATTACH, POST, SCENE_COMMIT, and its own (a band, the end of a frame).
+const COMP_KINDS: [(usize, &str); 6] = [
+    (17, "Describe"),
+    (18, "WindowCreate"),
+    (19, "Attach"),
+    (20, "Post"),
+    (26, "SceneCommit"),
+    (65, "a band of a frame and the end of a frame"),
+];
+/// The driver's: SUBSCRIBE, COMMIT, PIPELINES and SOURCE (the compositor asks them
+/// when it opens the screen), and its own (the interrupt).
+const DRIVER_KINDS: [(usize, &str); 5] = [
+    (5, "Subscribe"),
+    (6, "Commit"),
+    (9, "Pipelines"),
+    (10, "Source"),
+    (65, "the interrupt"),
+];
+
+/// The steps of the compositor and of the driver while the cube and the field draw.
+pub fn steps_verdict(lines: &[String]) -> Result<(crate::wfc::Rows, crate::wfc::Rows), String> {
+    use crate::comp_probe::{COMP_TAG, DRIVER_TAG};
+    Ok((
+        crate::wfc::rows_of(lines, COMP_TAG, "compositor", &COMP_KINDS)?,
+        crate::wfc::rows_of(lines, DRIVER_TAG, "display driver", &DRIVER_KINDS)?,
+    ))
+}
+
+/// The run under -icount: the demo does not pause for the monitor, and the steps
+/// of the compositor and the driver are read from their lines.
+pub fn steps(machine: &qemu::Machine) -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-gles-steps.img", &STEPS_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    cmd.args(qemu::GPU);
+    cmd.args(qemu::ICOUNT);
+    let output = run_until(cmd, crate::BOOT_TIMEOUT * 8, Some(ENDS), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ENDED)?;
+    if let Some(failed) = output.lines.iter().find_map(|l| failure(l)) {
+        return Err(format!("gles-probe under -icount: {failed}"));
+    }
+    qemu::expect_marker(&output, LINE_OK)?;
+    // The screenshots are not taken here: the programs' own lines are judged.
+    lines_verdict(&output.lines, [1, 2]).map_err(|e| format!("gles-probe under -icount: {e}"))?;
+    let (comp, driver) = steps_verdict(&output.lines)?;
+    println!(
+        "{}",
+        crate::frame_probe::check_waits(
+            &output.lines,
+            init::table::gles::STEPS_TABLE,
+            "gles-probe"
+        )?
+    );
+    let text = |rows: &crate::wfc::Rows| -> String {
+        rows.iter()
+            .map(|(kind, ticks, _)| format!("kind {kind} {ticks}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    println!(
+        "gles-probe on {}: the cube and the field of cubes under -icount; the longest steps, ticks (0.9 of term B {}, portions {}): compositor {}; driver {}; {}",
+        machine.name,
+        gpu_probe::STEP_MAX,
+        crate::PORTION_MAX,
+        text(&comp),
+        text(&driver),
+        crate::comp_probe::band_report(&output.lines, crate::comp_probe::COMP_TAG)
+    );
+    Ok(())
+}
+
+/// `cargo xtask gles-probe [pbuffer|scene|steps]`: the three boots, or one.
+pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        None => probe(machine, true),
+        Some("pbuffer") => crate::gles_pbuffer::probe(machine),
+        Some("scene") => scene(machine),
+        Some("steps") => steps(machine),
+        Some(other) => Err(format!(
+            "gles-probe: unknown argument {other:?}; pbuffer, scene, steps or none"
+        )),
+    }
+}
+
+/// `cargo xtask gles-probe` and its boots in `test`.
+pub fn probe(machine: &qemu::Machine, with_steps: bool) -> Result<(), String> {
+    let started = Instant::now();
+    crate::gles_pbuffer::probe(machine)?;
+    scene(machine)?;
+    if with_steps && !machine.is_hvf() {
+        steps(machine)?;
+    }
+    println!(
+        "gles-probe on {}: ok in {} s",
+        machine.name,
+        started.elapsed().as_secs()
+    );
+    Ok(())
+}
+
+/// The scene boot: the screenshots against the guests' CRC lines and the host's
+/// frames.
+fn scene(machine: &qemu::Machine) -> Result<(), String> {
+    crate::mesa()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-gles.img", &PROGRAMS, BOOT_PROFILE)?;
+    let scratch = Scratch::new()?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(["-display", "none", "-serial", "stdio", "-monitor"]);
+    cmd.arg(format!(
+        "unix:{},server=on,wait=off",
+        scratch.socket().display()
+    ));
+    cmd.args(qemu::GPU);
+    let mut run = Run::start(cmd, Input::Null)?;
+    let driven = drive(&mut run, &scratch);
+    let outcome = run.stop();
+    let who = |e: String| format!("gles-probe on {}: {e}", machine.name);
+    let seen = driven.map_err(who)?;
+    verdict(&outcome.lines, &seen).map_err(who)?;
+    let field = field_verdict(&outcome.lines).map_err(who)?;
+    println!(
+        "gles-probe on {}: the cube of EGL in a window matched QEMU's screenshot at two frames and held ({:08x}); the field of 64 instanced cubes of OpenGL ES 3 drew frames {:08x}, {:08x}, {:08x} into a pbuffer and the same into a window, and its window matched the screenshot ({:08x}); scene G (the cube's window turned by 90 degrees and scaled by one half by an element of libWFC beside the field) matched the host's frame ({:08x}), the windows as they are ({:08x}); the platform of EGL refused what it must and a forked child could not swap: ok",
+        machine.name,
+        seen.cube_held,
+        field[0],
+        field[1],
+        field[2],
+        seen.field_held,
+        seen.scene_g,
+        seen.both
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CRC-32 the test's lines give frame `k`.
+    fn crc_of(k: usize) -> u32 {
+        EXPECTED_FIELD_CRCS.map_or(0x2000_0000 + k as u32 * 0x1111, |c| c[k])
+    }
+
+    fn field_lines() -> Vec<String> {
+        let mut lines = vec![
+            "gles3-demo: EGL 1.5 Mesa Project".to_owned(),
+            "gles3-demo: GL_RENDERER softpipe (LLVM none)".to_owned(),
+            "gles3-demo: GL_VERSION OpenGL ES 3.0 Mesa 26.3.1".to_owned(),
+            "gles3-demo: uniform block Scene of 208 bytes".to_owned(),
+        ];
+        for k in 0..FIELD_FRAMES {
+            lines.push(format!(
+                "gles3-demo: frame {k} crc {:08x} sum {}",
+                crc_of(k),
+                700_000 + k
+            ));
+        }
+        for k in 0..FIELD_FRAMES {
+            lines.push(format!(
+                "gles3-demo: window frame {k} crc {:08x} matches the pbuffer, and the window holds its rows mirrored",
+                crc_of(k),
+            ));
+        }
+        lines.push("gles3-demo: held crc 0badf00d".to_owned());
+        lines
+    }
+
+    #[test]
+    fn the_expected_field_passes() {
+        let crcs = field_verdict(&field_lines()).unwrap();
+        assert_eq!(crcs.len(), FIELD_FRAMES);
+    }
+
+    #[test]
+    fn a_doubled_frame_line_with_another_crc_is_refused() {
+        let mut lines = field_lines();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("frame 1 crc") && l.contains(" sum "))
+            .unwrap();
+        lines.insert(
+            at + 1,
+            "gles3-demo: frame 1 crc deadbeef sum 700001".to_owned(),
+        );
+        assert!(field_verdict(&lines).unwrap_err().contains("frame lines"));
+        // A CRC line that does not parse is no frame line, and the count falls short.
+        let mut lines = field_lines();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("frame 1 crc"))
+            .unwrap();
+        lines[at] = "gles3-demo: frame 1 crc zzzzzzzz sum 700001".to_owned();
+        assert!(field_verdict(&lines).unwrap_err().contains("frame lines"));
+    }
+
+    #[test]
+    fn a_window_frame_that_differs_from_the_pbuffers_is_refused() {
+        let mut lines = field_lines();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("window frame 2 crc"))
+            .unwrap();
+        lines[at] = lines[at].replace(&format!("{:08x}", crc_of(2)), "00000001");
+        assert!(
+            field_verdict(&lines)
+                .unwrap_err()
+                .contains("the window's frame 2")
+        );
+        let mut lines = field_lines();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("window frame 0 crc"))
+            .unwrap();
+        lines.remove(at);
+        assert!(
+            field_verdict(&lines)
+                .unwrap_err()
+                .contains("no line \"window frame 0 crc \"")
+        );
+    }
+
+    #[test]
+    fn frames_alike_empty_or_out_of_order_are_refused() {
+        let mut lines = field_lines();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("frame 2 crc"))
+            .unwrap();
+        lines[at] = format!("gles3-demo: frame 2 crc {:08x} sum 700002", crc_of(0));
+        assert!(field_verdict(&lines).unwrap_err().contains("same CRC"));
+        let mut lines = field_lines();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("frame 1 crc"))
+            .unwrap();
+        lines[at] = format!("gles3-demo: frame 1 crc {:08x} sum 0", crc_of(1));
+        assert!(field_verdict(&lines).unwrap_err().contains("all zeros"));
+        let mut lines = field_lines();
+        let a = lines
+            .iter()
+            .position(|l| l.contains("frame 0 crc"))
+            .unwrap();
+        lines.swap(a, a + 1);
+        assert!(field_verdict(&lines).unwrap_err().contains("frame line"));
+    }
+
+    #[test]
+    fn the_library_the_block_and_the_end_of_the_field_are_checked() {
+        let mut lines = field_lines();
+        lines[1] = "gles3-demo: GL_RENDERER llvmpipe".to_owned();
+        assert!(field_verdict(&lines).unwrap_err().contains("softpipe"));
+        let mut lines = field_lines();
+        lines[2] = "gles3-demo: GL_VERSION OpenGL ES 2.0 Mesa 26.3.1".to_owned();
+        assert!(field_verdict(&lines).unwrap_err().contains("OpenGL ES 3"));
+        let mut lines = field_lines();
+        lines[3] = "gles3-demo: uniform block Scene of 192 bytes".to_owned();
+        assert!(field_verdict(&lines).unwrap_err().contains("208 bytes"));
+        let mut lines = field_lines();
+        lines.pop();
+        assert!(field_verdict(&lines).unwrap_err().contains("held"));
+    }
+
+    #[test]
+    fn a_check_of_any_program_or_a_bad_end_is_a_failure() {
+        assert!(failure("gles3-demo: check failed at line 9: x (egl 0x3000 gl 0x0)").is_some());
+        assert!(failure("gles3-demo: shader did not compile: x").is_some());
+        assert!(failure("wfc-demo: check failed at line 9: x (errno 0, error 0)").is_some());
+        assert!(failure("gles-cube: check failed at line 9: x (egl 0x3000 gl 0x0)").is_some());
+        assert!(failure("init: wfc-demo ended: exit code 20, not restarted").is_some());
+        assert!(failure(ENDED).is_none());
+        assert!(failure("gles3-demo: held crc 0badf00d").is_none());
+    }
+
+    /// A copy of the platform that flips the rows fails the program's own check
+    /// (the window is not the mirror of the readback), and the run fails with it.
+    #[test]
+    fn a_window_that_does_not_mirror_the_readback_fails_the_run() {
+        let line = "gles-cube: check failed at line 478: swap_window_matches_readback(shown, size) (egl 0x3000 gl 0x0)";
+        assert!(failure(line).is_some());
+        let mut lines = vec![line.to_owned()];
+        lines.extend(field_lines());
+        assert!(
+            lines_verdict(&lines, [1, 2])
+                .unwrap_err()
+                .contains("check failed")
+        );
+    }
+
+    #[test]
+    fn the_images_name_the_programs_the_demo_starts() {
+        for table in [&PROGRAMS, &STEPS_PROGRAMS] {
+            for name in ["wfc-demo", "gles-cube", "gles3-demo", "compositor"] {
+                assert!(table.iter().any(|p| p.0 == name), "{name}");
+            }
+        }
+        assert!(PROGRAMS[0].3.contains(&"table-gles"));
+        assert!(STEPS_PROGRAMS[0].3.contains(&"table-gles-steps"));
+    }
+}

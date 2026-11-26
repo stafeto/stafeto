@@ -85,6 +85,10 @@ table-cxx-probe = []
 table-gles-pbuffer = []
 # The cube in a window of the composition service (xtask gles-window): the services of the POSIX probes, the display driver, the compositor and apps/gles-cube with a quota above 64 MiB.
 table-gles-window = []
+# The probe of the graphics of Mesa (xtask gles-probe): the services of the scene demo, which holds the scene, starts gles-cube and gles3-demo and shows their windows (the records have quotas above 64 MiB).
+table-gles = []
+# The same under -icount: the demo leaves out the pauses of the screenshots and the services count their steps.
+table-gles-steps = []
 # The probe of POSIX processes (posix-procs) and the records it spawns.
 table-posix-procs = []
 table-posix-lock-ring = []

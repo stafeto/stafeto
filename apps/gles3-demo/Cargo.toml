@@ -1,0 +1,17 @@
+[package]
+name = "gles3-demo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The field of cubes of stafeto: a C program on EGL 1.5 and OpenGL ES 3.0 (a vertex array object, a uniform block, an instanced draw of 64 cubes) that Mesa's softpipe driver runs on the processor, into a pbuffer and into a window of the composition service"
+build = "build.rs"
+
+[[bin]]
+name = "gles3-demo"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt", features = ["window"] }
