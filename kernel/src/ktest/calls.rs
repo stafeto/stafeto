@@ -1724,13 +1724,15 @@ fn hasten_cases(c: &Caller, child: Handle, ready: NonNull<Thread>) -> Result<(),
 }
 
 /// x1-x9 of a receive that took `count` posts of `bits` from the slot of
-/// label 0; x10 and x11, the label and the token, are 0.
-fn unlabeled(bits: u64, count: u32) -> [u64; 9] {
+/// label 0, which lends `level` (bits 32-37 of x1; 0 from a wait channel);
+/// x10 and x11, the label and the token, are 0.
+fn unlabeled(level: u8, bits: u64, count: u32) -> [u64; 9] {
     let n = Notification {
         source: Source::Unlabeled,
         label: 0,
         bits,
         count,
+        level,
     };
     n.to_words()[..9].try_into().expect("x1-x9")
 }
@@ -1882,10 +1884,10 @@ fn wait_channel_cases(c: &Caller) -> Result<(), &'static str> {
     for flags in [2, 3, 1 << 32, 1 << 63] {
         c.fails(create, &[40, flags], Error::InvalidArgs)?;
     }
-    for (flags, level) in [(abi::CHANNEL_WAIT, 10), (0, 40)] {
+    for (flags, level, told) in [(abi::CHANNEL_WAIT, 10, 0), (0, 40, 40)] {
         let h = c.created(create, &[40, flags])?;
         c.succeeds(notify, &[h.0, 1], &[])?;
-        c.succeeds(receive, &[h.0, NO_WAIT], &unlabeled(1, 1))?;
+        c.succeeds(receive, &[h.0, NO_WAIT], &unlabeled(told, 1, 1))?;
         let seen = priorities(c.thread);
         c.fails(receive, &[h.0, NO_WAIT], Error::WouldBlock)?;
         c.close(h)?;
@@ -1900,13 +1902,13 @@ fn wait_channel_cases(c: &Caller) -> Result<(), &'static str> {
 fn boost_levels(owner: &Caller, low: &Caller, h: Handle, r: Handle) -> Result<(), &'static str> {
     let (notify, receive) = (Call::Notify.number(), Call::Receive.number());
     owner.succeeds(notify, &[h.0, 1], &[])?;
-    low.succeeds(receive, &[r.0, NO_WAIT], &unlabeled(1, 1))?;
+    low.succeeds(receive, &[r.0, NO_WAIT], &unlabeled(30, 1, 1))?;
     check(
         priorities(low.thread) == (10, 30),
         "the boost of a receiver under ceiling 30 is not 30",
     )?;
     owner.succeeds(notify, &[h.0, 1], &[])?;
-    owner.succeeds(receive, &[h.0, NO_WAIT], &unlabeled(1, 1))?;
+    owner.succeeds(receive, &[h.0, NO_WAIT], &unlabeled(40, 1, 1))?;
     check(
         priorities(owner.thread) == (10, 40),
         "the boost of a receiver under ceiling 63 is not the notification's 40",
@@ -1920,13 +1922,15 @@ fn boost_levels(owner: &Caller, low: &Caller, h: Handle, r: Handle) -> Result<()
 }
 
 /// x1-x9 of a receive that took `count` posts of `bits` from the slot of
-/// the session with `label`, which x10 holds (`label_of`).
-fn labelled(label: u64, bits: u64, count: u32) -> [u64; 9] {
+/// the session with `label`, which x10 holds (`label_of`); the slot lends
+/// `level`.
+fn labelled(level: u8, label: u64, bits: u64, count: u32) -> [u64; 9] {
     let n = Notification {
         source: Source::Session,
         label,
         bits,
         count,
+        level,
     };
     n.to_words()[..9].try_into().expect("x1-x9")
 }
@@ -2042,7 +2046,7 @@ fn duplicate_results(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static st
     c.succeeds(
         Call::Receive.number(),
         &[receiver.0, NO_WAIT],
-        &labelled(7, 1, 1),
+        &labelled(30, 7, 1, 1),
     )?;
     let label = label_of(c);
     c.close(receiver)?;
@@ -2249,7 +2253,7 @@ fn holder_dies(c: &Caller, h: Handle, ch: NonNull<Channel>) -> Result<(), &'stat
         c.succeeds(
             Call::Receive.number(),
             &[h.0, NO_WAIT],
-            &labelled(0xD1E, CLIENT_GONE, 1),
+            &labelled(20, 0xD1E, CLIENT_GONE, 1),
         )?;
         let gone_at = cleanup::top();
         cleanup::drain();
@@ -2267,13 +2271,15 @@ fn holder_dies(c: &Caller, h: Handle, ch: NonNull<Channel>) -> Result<(), &'stat
 }
 
 /// x1-x9 of a receive that took the exit notification of a child whose
-/// exit channel carried `label`: bit 0, once (spec 7.9).
-fn exit_notice(label: u64) -> [u64; 9] {
+/// exit channel carried `label`: bit 0, once (spec 7.9); the slot lends
+/// `level`, the exit priority of the child.
+fn exit_notice(level: u8, label: u64) -> [u64; 9] {
     let n = Notification {
         source: Source::Exit,
         label,
         bits: 1,
         count: 1,
+        level,
     };
     n.to_words()[..9].try_into().expect("x1-x9")
 }
@@ -2306,7 +2312,7 @@ pub fn teardown_level_is_at_least_the_notice(_: &Boot) -> Result<(), &'static st
                 });
                 cleanup::drain();
                 c.close(child)?;
-                c.succeeds(Call::Receive.number(), &[h.0, NO_WAIT], &exit_notice(0))?;
+                c.succeeds(Call::Receive.number(), &[h.0, NO_WAIT], &exit_notice(20, 0))?;
                 check(
                     level == Ok(Some(20)),
                     "the teardown of a child that ended at 5 is not at its exit priority 20",
@@ -2335,7 +2341,7 @@ pub fn exit_notice_keeps_the_shell(_: &Boot) -> Result<(), &'static str> {
                 c.close(child)?;
                 cleanup::drain();
                 let kept = process::in_use() == processes + 2;
-                c.succeeds(Call::Receive.number(), &[h.0, NO_WAIT], &exit_notice(0))?;
+                c.succeeds(Call::Receive.number(), &[h.0, NO_WAIT], &exit_notice(10, 0))?;
                 cleanup::drain();
                 let gone = process::in_use() == processes + 1;
                 check(
@@ -2380,13 +2386,14 @@ pub fn notices_to_a_dying_parent_go_with_its_channel(_: &Boot) -> Result<(), &'s
 }
 
 /// x1-x9 of a receive that took `count` expiries of a timer made through
-/// a handle with no label.
-fn timer_notice(count: u32) -> [u64; 9] {
+/// a handle with no label; the slot lends `level`.
+fn timer_notice(level: u8, count: u32) -> [u64; 9] {
     let n = Notification {
         source: Source::Timer,
         label: 0,
         bits: 1,
         count,
+        level,
     };
     n.to_words()[..9].try_into().expect("x1-x9")
 }
@@ -2565,7 +2572,7 @@ pub fn past_deadline_fires_within_timer_set(_: &Boot) -> Result<(), &'static str
                     timers::posted(tm) && timers::deadline(tm).is_none(),
                     "a deadline in the past did not fire in timer_set",
                 )?;
-                c.succeeds(receive, &[h.0, NO_WAIT], &timer_notice(1))?;
+                c.succeeds(receive, &[h.0, NO_WAIT], &timer_notice(10, 1))?;
             }
             Ok(())
         })
@@ -5752,13 +5759,15 @@ fn take_line(line: u32) -> Result<(), &'static str> {
 }
 
 /// The notification of an interrupt of a binding made through a handle
-/// with `label`: bit 0, `count` deliveries.
-fn interrupt_notice(label: u64, count: u32) -> [u64; 9] {
+/// with `label`: bit 0, `count` deliveries; the slot lends `level`, the
+/// priority of the binding.
+fn interrupt_notice(level: u8, label: u64, count: u32) -> [u64; 9] {
     let n = Notification {
         source: Source::Interrupt,
         label,
         bits: 1,
         count,
+        level,
     };
     n.to_words()[..9].try_into().expect("x1-x9")
 }
@@ -5842,7 +5851,7 @@ pub fn delivery_masks_posts_and_ends(_: &Boot) -> Result<(), &'static str> {
         c.succeeds(
             Call::Receive.number(),
             &[h.0, NO_WAIT],
-            &interrupt_notice(IRQ_LABEL, 1),
+            &interrupt_notice(20, IRQ_LABEL, 1),
         )?;
         check(label_of(c) == IRQ_LABEL, "the notification lacks the label")?;
         check(
@@ -5871,7 +5880,7 @@ pub fn irq_ack_unmasks_the_line(_: &Boot) -> Result<(), &'static str> {
         c.succeeds(
             Call::Receive.number(),
             &[h.0, NO_WAIT],
-            &interrupt_notice(IRQ_LABEL, 1),
+            &interrupt_notice(20, IRQ_LABEL, 1),
         )
     })
 }
@@ -5934,7 +5943,7 @@ fn log_notice_once(c: &Caller, h: Handle) -> Result<(), &'static str> {
     c.succeeds(
         Call::Receive.number(),
         &[h.0, NO_WAIT],
-        &interrupt_notice(IRQ_LABEL, 1),
+        &interrupt_notice(20, IRQ_LABEL, 1),
     )?;
     c.fails(Call::Receive.number(), &[h.0, NO_WAIT], Error::WouldBlock)
 }
@@ -6251,7 +6260,7 @@ pub fn masked_line_waits_for_irq_ack(_: &Boot) -> Result<(), &'static str> {
         c.succeeds(
             Call::Receive.number(),
             &[h.0, NO_WAIT],
-            &interrupt_notice(IRQ_LABEL, 1),
+            &interrupt_notice(20, IRQ_LABEL, 1),
         )?;
         gic::set_pending(LINE);
         c.succeeds(Call::IrqAck.number(), &[b.0], &[])?;
@@ -6259,7 +6268,7 @@ pub fn masked_line_waits_for_irq_ack(_: &Boot) -> Result<(), &'static str> {
         c.succeeds(
             Call::Receive.number(),
             &[h.0, NO_WAIT],
-            &interrupt_notice(IRQ_LABEL, 1),
+            &interrupt_notice(20, IRQ_LABEL, 1),
         )
     })
 }
@@ -6507,7 +6516,7 @@ pub fn queued_notice_does_not_hold_the_line(_: &Boot) -> Result<(), &'static str
         c.succeeds(
             Call::Receive.number(),
             &[h.0, NO_WAIT],
-            &interrupt_notice(IRQ_LABEL, 1),
+            &interrupt_notice(20, IRQ_LABEL, 1),
         )
     })
 }
@@ -9296,7 +9305,7 @@ pub fn lpi_is_delivered_and_a_late_one_is_ended(_: &Boot) -> Result<(), &'static
         c.succeeds(
             Call::Receive.number(),
             &[h.0, NO_WAIT],
-            &interrupt_notice(IRQ_LABEL, 1),
+            &interrupt_notice(20, IRQ_LABEL, 1),
         )?;
         check(!irq_info_of(c, b)?.masked, "an LPI left its binding masked")?;
         // No irq_ack between the two: the LPI has no mask.
@@ -9305,7 +9314,7 @@ pub fn lpi_is_delivered_and_a_late_one_is_ended(_: &Boot) -> Result<(), &'static
         c.succeeds(
             Call::Receive.number(),
             &[h.0, NO_WAIT],
-            &interrupt_notice(IRQ_LABEL, 1),
+            &interrupt_notice(20, IRQ_LABEL, 1),
         )?;
         // The last handle closes; the mapping lives until the portion.
         c.close(b)?;
@@ -11333,6 +11342,8 @@ pub fn an_overrun_posts_one_notification_for_each_period(_: &Boot) -> Result<(),
             label: LABEL,
             bits: 1,
             count,
+            // The place's slot stands at the `low` of the budget.
+            level: 1,
         };
         for period in 0..2 {
             // The thread runs past its budget at a time of the test's own.
@@ -11502,6 +11513,7 @@ pub fn a_thread_that_ends_with_an_overrun_untold_leaves_it_to_the_next_thread(
                     label: LABEL,
                     bits: 1,
                     count: 1,
+                    level: 1,
                 },
             "the place did not hear of the overrun of the thread that ended",
         )
@@ -12101,4 +12113,358 @@ pub fn budget_notice_firing_is_measured(_: &Boot) -> Result<(), &'static str> {
         (channel::in_use(), crate::budget::in_use()) == counts,
         "a channel or a budget of the test stayed",
     )
+}
+
+/// A service of a process with `ceiling`, whose channel has a slot of label 0
+/// at `slot`, lends its levels or not (a wait channel), and a process of
+/// clients with the ceiling 63: the fixture of the tests of the level that
+/// `receive` tells (spec 6.6). The receivers and the clients are the body's
+/// threads, which go with the fixture.
+struct Lent {
+    service: NonNull<Process>,
+    client: NonNull<Process>,
+    channel: NonNull<Channel>,
+    /// The service's handle to the channel, with RECEIVE.
+    handle: Handle,
+}
+
+/// The threads a body of `with_lent` may make.
+type LentThreads = [Option<NonNull<Thread>>; 4];
+
+/// Builds a Lent, runs `body` and lets everything go.
+fn with_lent(
+    ceiling: u8,
+    slot: u8,
+    lends: bool,
+    body: impl FnOnce(&Lent, &mut LentThreads) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let counts = (process::in_use(), thread::in_use(), channel::in_use());
+    let made = [ceiling, CEILING].map(|c| process::create_root(QUOTA, 16, c));
+    let mut threads = [None; 4];
+    let result = match made {
+        [Ok(service), Ok(client)] => (|| {
+            let channel = channel::create_with(service, slot, lends).map_err(|_| "no channel")?;
+            let h = process::insert_handle(service, Object::Channel(channel), Rights::RECEIVE);
+            // SAFETY: the reference `create_with` handed out goes; the
+            // handle, if it went in, holds the channel.
+            unsafe { channel::release(channel, Rights::NONE, CAUSE) };
+            let handle = h.map_err(|_| "a handle did not go in")?;
+            body(
+                &Lent {
+                    service,
+                    client,
+                    channel,
+                    handle,
+                },
+                &mut threads,
+            )
+        })(),
+        _ => Err("no process"),
+    };
+    for t in threads.into_iter().flatten() {
+        // SAFETY: the test's references go, the kernel's first.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    for p in made.into_iter().flatten() {
+        // SAFETY: the test's reference goes.
+        unsafe { process::release(p, CAUSE) };
+    }
+    cleanup::drain();
+    result?;
+    check(
+        (process::in_use(), thread::in_use(), channel::in_use()) == counts,
+        "a process, a thread or a channel of the fixture stayed",
+    )
+}
+
+/// A thread of `p` at `base` that did not start.
+fn thread_at(p: NonNull<Process>, base: u8) -> Result<NonNull<Thread>, &'static str> {
+    thread::create(p, USER_VA, USER_VA, 0, base, Policy::Fifo).map_err(|_| "no thread")
+}
+
+/// The effective priority of `r`, which took a request at `base`, is the
+/// level its x1 tells, or its base when that is higher: the told value is
+/// what the boost took.
+fn boosted_to_what_was_told(r: &Thread, base: u8) -> Result<(), &'static str> {
+    let told = (r.regs.x[1] >> abi::LEVEL_SHIFT) as u8;
+    check(
+        r.sched.priority() == told.max(base),
+        "the receiver's priority is not the level its receive told",
+    )
+}
+
+/// The receiver of `l` at `base` takes the request of a client at `client`
+/// from the queue: x1 of its receive. `raise` lifts the client in the queue.
+/// The receiver keeps its base, and rises to the level the client gives
+/// when that is above it.
+fn level_from_the_queue(
+    l: &Lent,
+    threads: &mut LentThreads,
+    base: u8,
+    client: u8,
+    raise: Option<u8>,
+) -> Result<u64, &'static str> {
+    let t = *threads[0].insert(running_at(l.client, client)?);
+    let sent = channel::send(
+        t,
+        Via::Channel(l.channel),
+        Desc::from_send(0).expect("a send"),
+        &[],
+    );
+    check(sent == Ok(None), "the request did not queue")?;
+    if let Some(level) = raise {
+        sched::set_priority(t, level, Policy::Fifo, false).map_err(|_| "no raise")?;
+    }
+    let r = *threads[1].insert(thread_at(l.service, base)?);
+    thread::start(r).map_err(|_| "a thread did not start")?;
+    pick(r)?;
+    channel::receive(r, l.channel, false).map_err(|_| "the receive failed")?;
+    // SAFETY: the test holds the thread.
+    let r = unsafe { r.as_ref() };
+    check(
+        r.regs.x[0] == 0 && r.sched.base() == base,
+        "the receive failed or changed the base",
+    )?;
+    boosted_to_what_was_told(r, base)?;
+    Ok(r.regs.x[1])
+}
+
+/// The request of a client at `client` meets the receiver of `l` at `base`,
+/// which waits: with a thread above it ready when `slow`, which keeps the
+/// fast path from taking the meeting. Returns x1 of the receiver, and the
+/// receiver replies: the client's x1 must come back with no level.
+fn level_at_the_meeting(
+    l: &Lent,
+    threads: &mut LentThreads,
+    base: u8,
+    client: u8,
+    slow: bool,
+) -> Result<u64, &'static str> {
+    let r = *threads[1].insert(thread_at(l.service, base)?);
+    thread::start(r).map_err(|_| "a thread did not start")?;
+    pick(r)?;
+    channel::receive(r, l.channel, true).map_err(|_| "the receiver did not wait")?;
+    let t = *threads[0].insert(running_at(l.client, client)?);
+    if slow {
+        let above = *threads[2].insert(thread_at(l.client, 60)?);
+        thread::start(above).map_err(|_| "a thread did not start")?;
+    }
+    let sent = channel::send(
+        t,
+        Via::Channel(l.channel),
+        Desc::from_send(0).expect("a send"),
+        &[],
+    );
+    // The fast path returns the receiver it hands the CPU to; the slow path
+    // wakes the receiver and returns nothing.
+    check(
+        sent == Ok(if slow { None } else { Some(r) }),
+        "the request did not meet the receiver on the path the test built",
+    )?;
+    // SAFETY: the test holds the thread, which does not run.
+    let (x1, token) = unsafe { (r.as_ref().regs.x[1], r.as_ref().regs.x[11]) };
+    // SAFETY: as above.
+    boosted_to_what_was_told(unsafe { r.as_ref() }, base)?;
+    // SAFETY: as above.
+    unsafe {
+        (*r.as_ptr()).regs.x[0] = token;
+        (*r.as_ptr()).regs.x[1] = 0;
+    }
+    syscall::dispatch(r, Call::Reply.number());
+    // SAFETY: as above.
+    let (answer, got) = unsafe { (r.as_ref().regs.x[0], t.as_ref().regs.x) };
+    check(answer == 0, "the reply failed")?;
+    check(got[0] == 0 && got[1] == 0, "the reply came with a level")?;
+    Ok(x1)
+}
+
+/// The second half of `reply_receive` takes the request that queued: x1 of
+/// the receiver, with the first request replied to.
+fn level_after_reply_receive(
+    l: &Lent,
+    threads: &mut LentThreads,
+    base: u8,
+    client: u8,
+) -> Result<u64, &'static str> {
+    for slot in &mut threads[..2] {
+        let t = *slot.insert(running_at(l.client, client)?);
+        let sent = channel::send(
+            t,
+            Via::Channel(l.channel),
+            Desc::from_send(0).expect("a send"),
+            &[],
+        );
+        check(sent == Ok(None), "the request did not queue")?;
+    }
+    let r = *threads[2].insert(thread_at(l.service, base)?);
+    thread::start(r).map_err(|_| "a thread did not start")?;
+    pick(r)?;
+    channel::receive(r, l.channel, false).map_err(|_| "the first receive failed")?;
+    // SAFETY: the test holds the thread, which does not run.
+    let token = unsafe { r.as_ref() }.regs.x[11];
+    // SAFETY: as above.
+    unsafe {
+        let x = &mut (*r.as_ptr()).regs.x;
+        x[0] = token;
+        x[1] = 0;
+        x[10] = l.handle.0;
+    }
+    syscall::dispatch(r, Call::ReplyReceive.number());
+    // SAFETY: as above.
+    let r = unsafe { r.as_ref() };
+    check(
+        r.regs.x[0] == 0 && r.regs.x[11] != token && r.regs.x[11] != 0,
+        "reply_receive did not take the second request",
+    )?;
+    Ok(r.regs.x[1])
+}
+
+/// What `receive` tells of a request (spec 6.6): bits 32-37 of x1 hold the
+/// lower of the client's effective priority at the meeting and the ceiling
+/// of the receiver's process, on each way a request reaches a receiver (from
+/// the queue, to a waiting receiver on the fast path and on the slow path,
+/// and the second half of `reply_receive`), whatever the receiver's base,
+/// and the base stays as it was. A client raised in the queue tells the new
+/// level, a request in a wait channel tells its level too, and the reply to
+/// the client tells none.
+pub fn a_request_tells_its_level(_: &Boot) -> Result<(), &'static str> {
+    let told = |level: u8| u64::from(level) << abi::LEVEL_SHIFT;
+    // The receiver's base is 32, above its clients, and its ceiling 40.
+    for lends in [true, false] {
+        with_lent(40, 20, lends, |l, t| {
+            let x1 = level_from_the_queue(l, t, 32, 28, None)?;
+            check(
+                x1 == told(28),
+                "a request from the queue told another level",
+            )
+        })?;
+        with_lent(40, 20, lends, |l, t| {
+            let x1 = level_at_the_meeting(l, t, 32, 28, false)?;
+            check(
+                x1 == told(28),
+                "a request that met a waiting receiver told another level",
+            )
+        })?;
+        with_lent(40, 20, lends, |l, t| {
+            let x1 = level_at_the_meeting(l, t, 32, 28, true)?;
+            check(
+                x1 == told(28),
+                "a request of the slow path told another level",
+            )
+        })?;
+        with_lent(40, 20, lends, |l, t| {
+            let x1 = level_after_reply_receive(l, t, 32, 28)?;
+            check(
+                x1 == told(28),
+                "reply_receive took a request that told another level",
+            )
+        })?;
+    }
+    // A client above the receiver's ceiling tells the ceiling.
+    with_lent(40, 20, true, |l, t| {
+        let x1 = level_from_the_queue(l, t, 32, 50, None)?;
+        check(
+            x1 == told(40),
+            "a client at 50 told more than the ceiling 40",
+        )
+    })?;
+    with_lent(40, 20, true, |l, t| {
+        let x1 = level_at_the_meeting(l, t, 32, 50, false)?;
+        check(
+            x1 == told(40),
+            "a client at 50 told more than the ceiling 40 at a meeting",
+        )
+    })?;
+    // A client raised while it queued tells the level it has when it is taken.
+    with_lent(40, 20, true, |l, t| {
+        let x1 = level_from_the_queue(l, t, 32, 28, Some(36))?;
+        check(
+            x1 == told(36),
+            "a client raised in the queue told its old level",
+        )
+    })?;
+    // A receiver of a base below its client, and the client's own base,
+    // tell the client's level too.
+    with_lent(63, 20, true, |l, t| {
+        let x1 = level_from_the_queue(l, t, 5, 28, None)?;
+        check(
+            x1 == told(28),
+            "a receiver below its client told another level",
+        )
+    })
+}
+
+/// The level that a receive of a notification of the slot of label 0 tells:
+/// x1 of the receiver, which takes it from the queue or waits for it.
+fn level_of_a_notice(
+    l: &Lent,
+    threads: &mut LentThreads,
+    waits: bool,
+) -> Result<u64, &'static str> {
+    let r = *threads[0].insert(thread_at(l.service, 10)?);
+    thread::start(r).map_err(|_| "a thread did not start")?;
+    pick(r)?;
+    if waits {
+        channel::receive(r, l.channel, true).map_err(|_| "the receiver did not wait")?;
+        channel::notify(l.channel, 1, CAUSE).map_err(|_| "no notification")?;
+    } else {
+        channel::notify(l.channel, 1, CAUSE).map_err(|_| "no notification")?;
+        channel::receive(r, l.channel, false).map_err(|_| "the receive failed")?;
+    }
+    // SAFETY: the test holds the thread, which does not run.
+    let x = unsafe { r.as_ref() }.regs.x;
+    check(
+        x[0] == 0
+            && Notification::from_words(x[1..12].try_into().expect("x1-x11")).source
+                == Source::Unlabeled,
+        "the receiver did not take the notification",
+    )?;
+    Ok(x[1])
+}
+
+/// What `receive` tells of a notification (spec 6.6): bits 32-37 of x1 hold
+/// the lower of the slot's priority and the ceiling of the receiver's
+/// process in a channel that lends, from the queue and to a waiting
+/// receiver; 0 in a wait channel. The other bits are the source's.
+pub fn a_notification_tells_its_level(_: &Boot) -> Result<(), &'static str> {
+    let unlabeled = Source::Unlabeled.code() << abi::SOURCE_SHIFT;
+    for waits in [false, true] {
+        for (ceiling, slot, lends, level) in [
+            (63u8, 20u8, true, 20u8),
+            (40, 50, true, 40),
+            (63, 20, false, 0),
+            (40, 50, false, 0),
+        ] {
+            with_lent(ceiling, slot, lends, |l, t| {
+                let x1 = level_of_a_notice(l, t, waits)?;
+                check(
+                    x1 == unlabeled | u64::from(level) << abi::LEVEL_SHIFT,
+                    "a notification told another level",
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// The bits of the level are the kernel's (spec 6.6, 11): `send` and `reply`
+/// with a bit of 32-37 in the description fail with INVALID_ARGS and change
+/// x0 alone: `send` through a channel of the caller, `reply` with a token
+/// that names nothing (the description is checked first).
+pub fn a_sent_level_is_refused(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
+        let result = (|| {
+            for bits in [1u64 << 32, 1 << 37, 0x3F << 32, 28 << 32 | 8] {
+                c.fails(Call::Send.number(), &[h.0, bits], Error::InvalidArgs)?;
+                c.fails(Call::Reply.number(), &[1, bits], Error::InvalidArgs)?;
+            }
+            Ok(())
+        })();
+        c.close(h)?;
+        result
+    })
 }
