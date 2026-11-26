@@ -2597,7 +2597,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-deqp.img" => {
             let mut files = vec![
                 dir("/bin"),
-                file("/bin/deqp-egl", 0o755, ROOT, "deqp-egl"),
+                file("/bin/deqp", 0o755, ROOT, "deqp"),
                 dir("/dev"),
             ];
             files.extend(devices());

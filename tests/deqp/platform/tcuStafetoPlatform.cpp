@@ -5,6 +5,7 @@
 
 #include "egluGLContextFactory.hpp"
 #include "egluNativeDisplay.hpp"
+#include "egluNativePixmap.hpp"
 #include "egluNativeWindow.hpp"
 #include "eglwEnums.hpp"
 #include "eglwFunctions.hpp"
@@ -93,6 +94,38 @@ private:
     stafeto_window m_info;
 };
 
+// A pixmap with the handle of nullptr, as the platform nullws of dEQP has it:
+// the platform of EGL refuses pixmap surfaces (EGL_BAD_NATIVE_PIXMAP, no
+// EGL_PIXMAP_BIT), so the tests of the negative API reach EGL with it, and the
+// tests that need a working pixmap find the surface refused.
+class Pixmap : public eglu::NativePixmap
+{
+public:
+    static const Capability CAPABILITIES = CAPABILITY_CREATE_SURFACE_LEGACY;
+
+    Pixmap() : NativePixmap(CAPABILITIES)
+    {
+    }
+
+    eglw::EGLNativePixmapType getLegacyNative()
+    {
+        return nullptr;
+    }
+};
+
+class PixmapFactory : public eglu::NativePixmapFactory
+{
+public:
+    PixmapFactory() : NativePixmapFactory("stafeto", "Pixmap stub of stafeto", Pixmap::CAPABILITIES)
+    {
+    }
+
+    eglu::NativePixmap *createPixmap(eglu::NativeDisplay *, int, int) const
+    {
+        return new Pixmap();
+    }
+};
+
 class Display : public eglu::NativeDisplay
 {
 public:
@@ -147,6 +180,7 @@ public:
     DisplayFactory() : eglu::NativeDisplayFactory("stafeto", "Display of stafeto", Display::CAPABILITIES)
     {
         m_nativeWindowRegistry.registerFactory(new WindowFactory());
+        m_nativePixmapRegistry.registerFactory(new PixmapFactory());
     }
 
     eglu::NativeDisplay *createDisplay(const eglw::EGLAttrib * = nullptr) const

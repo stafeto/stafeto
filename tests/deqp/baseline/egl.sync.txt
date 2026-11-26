@@ -1,0 +1,58 @@
+# dEQP baseline of the set egl.sync (cargo xtask deqp-reference egl.sync)
+# module deqp-egl, platform x11_egl, patterns dEQP-EGL.functional.fence_sync.* dEQP-EGL.functional.reusable_sync.* dEQP-EGL.functional.wait_sync.*
+# VK-GL-CTS opengl-es-cts-3.2.14.1 (067e8832315e79817ede1c4863804e440f5d1c80)
+# Mesa 26.3.1 softpipe, shared libraries, clang
+# machine Linux 7.0.0-1020-azure aarch64
+# arguments --deqp-log-images=disable --deqp-log-shader-sources=disable
+# 51 cases: 51 pass, 0 fail, 0 not supported, 0 other, in 3 s
+dEQP-EGL.functional.fence_sync.invalid.create_invalid_attribs Pass
+dEQP-EGL.functional.fence_sync.invalid.create_invalid_context Pass
+dEQP-EGL.functional.fence_sync.invalid.create_invalid_display Pass
+dEQP-EGL.functional.fence_sync.invalid.create_invalid_type Pass
+dEQP-EGL.functional.fence_sync.invalid.destroy_invalid_display Pass
+dEQP-EGL.functional.fence_sync.invalid.destroy_invalid_sync Pass
+dEQP-EGL.functional.fence_sync.invalid.get_invalid_attribute Pass
+dEQP-EGL.functional.fence_sync.invalid.get_invalid_display Pass
+dEQP-EGL.functional.fence_sync.invalid.get_invalid_sync Pass
+dEQP-EGL.functional.fence_sync.invalid.get_invalid_value Pass
+dEQP-EGL.functional.fence_sync.invalid.wait_invalid_display Pass
+dEQP-EGL.functional.fence_sync.invalid.wait_invalid_sync Pass
+dEQP-EGL.functional.fence_sync.invalid.wait_server_invalid_display Pass
+dEQP-EGL.functional.fence_sync.invalid.wait_server_invalid_flag Pass
+dEQP-EGL.functional.fence_sync.invalid.wait_server_invalid_sync Pass
+dEQP-EGL.functional.fence_sync.valid.create_empty_attribs Pass
+dEQP-EGL.functional.fence_sync.valid.create_null_attribs Pass
+dEQP-EGL.functional.fence_sync.valid.destroy Pass
+dEQP-EGL.functional.fence_sync.valid.egl_fence_persistent_buffer Pass
+dEQP-EGL.functional.fence_sync.valid.get_condition Pass
+dEQP-EGL.functional.fence_sync.valid.get_status Pass
+dEQP-EGL.functional.fence_sync.valid.get_status_signaled Pass
+dEQP-EGL.functional.fence_sync.valid.get_type Pass
+dEQP-EGL.functional.fence_sync.valid.wait_forever Pass
+dEQP-EGL.functional.fence_sync.valid.wait_forever_flush Pass
+dEQP-EGL.functional.fence_sync.valid.wait_no_context Pass
+dEQP-EGL.functional.fence_sync.valid.wait_no_timeout Pass
+dEQP-EGL.functional.fence_sync.valid.wait_server Pass
+dEQP-EGL.functional.reusable_sync.invalid.create_invalid_attribs Pass
+dEQP-EGL.functional.reusable_sync.invalid.create_invalid_display Pass
+dEQP-EGL.functional.reusable_sync.invalid.create_invalid_type Pass
+dEQP-EGL.functional.reusable_sync.invalid.destroy_invalid_display Pass
+dEQP-EGL.functional.reusable_sync.invalid.destroy_invalid_sync Pass
+dEQP-EGL.functional.reusable_sync.invalid.get_invalid_attribute Pass
+dEQP-EGL.functional.reusable_sync.invalid.get_invalid_display Pass
+dEQP-EGL.functional.reusable_sync.invalid.get_invalid_sync Pass
+dEQP-EGL.functional.reusable_sync.invalid.get_invalid_value Pass
+dEQP-EGL.functional.reusable_sync.invalid.wait_invalid_display Pass
+dEQP-EGL.functional.reusable_sync.invalid.wait_invalid_sync Pass
+dEQP-EGL.functional.reusable_sync.invalid.wait_server_invalid_display Pass
+dEQP-EGL.functional.reusable_sync.invalid.wait_server_invalid_sync Pass
+dEQP-EGL.functional.reusable_sync.valid.create_empty_attribs Pass
+dEQP-EGL.functional.reusable_sync.valid.create_null_attribs Pass
+dEQP-EGL.functional.reusable_sync.valid.destroy Pass
+dEQP-EGL.functional.reusable_sync.valid.get_status Pass
+dEQP-EGL.functional.reusable_sync.valid.get_status_signaled Pass
+dEQP-EGL.functional.reusable_sync.valid.get_type Pass
+dEQP-EGL.functional.reusable_sync.valid.wait_forever Pass
+dEQP-EGL.functional.reusable_sync.valid.wait_forever_flush Pass
+dEQP-EGL.functional.reusable_sync.valid.wait_no_context Pass
+dEQP-EGL.functional.reusable_sync.valid.wait_no_timeout Pass

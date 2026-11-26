@@ -1,0 +1,36 @@
+# The departures of stafeto from Linux (plan G8, step 8.6): every case that
+# passes on Linux with the same Mesa and the same VK-GL-CTS and does not pass
+# on stafeto has a line here. `cargo xtask deqp` compares the run with
+# tests/deqp/baseline/<set>.txt and fails on
+#
+#   - a case that passes on Linux and does not pass here without a line, or
+#     with a line that names another status than the one it ended with;
+#   - a case that fails on Linux and crashes, times out or ends in an internal
+#     error here without a line that names that status;
+#   - a line of one case that now passes, or (after a run of every case of its
+#     sets) a pattern that matches cases passing on Linux and covered none.
+#
+# Format, one line each:
+#
+#   CASE | STATUS | CLASS | REASON | STEP
+#
+# CASE is a case name or a pattern: `*` stands for any run of characters in one
+# group of the names (no dot), `**` for any run at all. STATUS is the status
+# stafeto ends with, usually NotSupported. CLASS is posix (the layer of POSIX
+# under Mesa), mesa (Mesa or its platform), window (the windows: the
+# composition service, the window manager), config (the configurations the
+# platform offers) or harness (the test platform or the runner). STEP is the
+# step of the plan that returns the case: M<n> for the window manager, G<n>.<m>
+# for the graphics plan, or none for a difference the plan keeps.
+#
+# PROVISIONAL: the lines come from runs against baselines made in a Linux
+# container, off the runners.
+
+dEQP-EGL.functional.buffer_age.** | NotSupported | mesa | the platform does not offer EGL_EXT_buffer_age (plan 7.4: buffer_age is NotSupported) | none
+dEQP-EGL.functional.preserve_swap.** | NotSupported | window | the tests open a window of 480 by 480 points, and the screen of the display service is 640 by 400 | M1
+dEQP-EGL.functional.swap_buffers_with_damage.** | NotSupported | window | the tests open a window of 480 by 480 points, and the screen of the display service is 640 by 400 | M1
+dEQP-EGL.functional.fence_sync.** | NotSupported | window | every test opens a window of 480 by 480 points, and the screen of the display service is 640 by 400 | M1
+dEQP-EGL.functional.reusable_sync.invalid.wait_server_invalid_display | NotSupported | window | the test opens a window of 480 by 480 points, and the screen of the display service is 640 by 400 | M1
+dEQP-EGL.functional.reusable_sync.invalid.wait_server_invalid_sync | NotSupported | window | the test opens a window of 480 by 480 points, and the screen of the display service is 640 by 400 | M1
+dEQP-EGL.functional.create_surface.platform_window.* | NotSupported | mesa | the platform has no number for eglCreatePlatformWindowSurface (the framework finds no CAPABILITY_CREATE_SURFACE_PLATFORM; plan 3.2, question 1) | none
+dEQP-EGL.functional.create_surface.platform_ext_window.* | NotSupported | mesa | the platform has no number for eglCreatePlatformWindowSurfaceEXT (the framework finds no CAPABILITY_CREATE_SURFACE_PLATFORM; plan 3.2, question 1) | none
