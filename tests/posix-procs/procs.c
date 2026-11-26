@@ -3333,7 +3333,17 @@ static int proc_descriptions(void) {
 
 #include "pshared-key.c"
 
+/* A child that execs its own file again and again: a SIGKILL that lands in the middle of
+ * one exec must end the process: the new image's ExecCommit finds no load to commit. */
+static int execloop_role(void) {
+    for (;;) {
+        char *argv[] = {"procs-child", "execloop", NULL};
+        execv("/bin/procs-child", argv);
+    }
+}
+
 static int role(const char *name) {
+    if (strcmp(name, "execloop") == 0) return execloop_role();
 #if PROCFS
     if (strcmp(name, "proc-fd") == 0) return proc_fd_role();
     if (strcmp(name, "procdesc") == 0) return proc_descriptions();
@@ -5626,6 +5636,7 @@ int main(int argc, char **argv) {
 #if !CHANGE_STEPS
     printf("posix-procs: stage sched\n");
     spawned_scheduling();
+    kill_during_exec();
     printf("posix-procs: sched ok\n");
 #if PROCFS
     {

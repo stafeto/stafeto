@@ -241,3 +241,39 @@ default display is the way in.
   stay under 0.9 of term B and the portions under `PORTION_MAX`. The tables are
   `services/init/src/table/gles.rs` (the demo's record and the process service's
   pool have quotas above 64 MiB for the programs it starts).
+
+## Clock stamps
+
+With the variable `STAFETO_EGL_STAMPS` set in the environment of a program, each
+`eglSwapBuffers` of a window surface prints one line to the console:
+`egl-stamp: swap wait W draw D copy C post P ifwait I us timeout T`, the microseconds the
+swap spent waiting for a free buffer, in the driver's swap (which holds the copy),
+in the copy of the frame into the window's buffer (the `putImage` of the platform),
+in the post, and in the wait of `eglSwapInterval(1)` for the service to take the
+frame, and T, how many times that wait ran out (a second; the probe requires 0). With the variable unset a swap reads no clock and prints nothing.
+`gles-cube --stamps` sets the variable and prints the draw and the swap of each
+frame; `cargo xtask gles-probe load` (and `--hvf` for the host's processor) prints
+them per frame with a summary, beside the numbers of a client with no GLES.
+
+## The level of a client that draws
+
+A client that draws on the CPU is best-effort work and runs below every interactive
+level. The demo of scenes (SCHED_RR priority 30 in a caller whose top is 30) starts the
+cube and the field with that scheduling: `posix_spawn` puts a child whose level is below
+the caller's top at that level, 28, loader included, and that level is the child's top and
+its ceiling less one (the ceiling is 29). A record of the tables that runs the cube
+directly (the pbuffer and window probes) has priority 28 and ceiling 29. The process
+service ends such a process at its base level, so only the stages that stop its threads and
+children rise to the ceiling, and the pages of its image are released by the service's
+reaper thread at that level, never inside a step of the service's loop. `cargo xtask
+gles-probe load` judges the cube at that level under -icount: no late frame of a paced
+client beside it when none is late alone, none over two periods, a wake-up at most 2000 us
+longer, no wait of the swap interval that ran out and none over two periods.
+
+## Waits and threads
+
+`eglSwapInterval(1)` waits for the compositor to take the frame, a second at most, and
+the probe counts the waits that ran out. The wait for a free buffer has no limit: when the
+compositor stops answering, init's watchdog restarts it and the wait ends with the
+service's end. Mesa holds the display lock across the swap's wait (`eglapi.c`), so a
+multi-threaded real-time client makes its EGL calls from one thread.

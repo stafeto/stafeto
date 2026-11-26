@@ -31,7 +31,9 @@
  */
 
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
+#include <sched.h>
 #include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -545,7 +547,21 @@ static pid_t start_holder(const char *program, const char *const *argv_head, int
     argv[count] = (char *)"--hold";
     argv[count + 1] = hold;
     argv[count + 2] = NULL;
-    if (posix_spawn(&pid, program, NULL, NULL, argv, environ) != 0) return -1;
+    /* The holder is a best-effort client that draws on the CPU: SCHED_RR 30, which
+     * is level 28 for this program (top 30), the level and the top of the holder, below
+     * every interactive level, its load and its teardown too. */
+    posix_spawnattr_t attr;
+    struct sched_param param = {.sched_priority = 30};
+    if (posix_spawnattr_init(&attr) != 0) return -1;
+    if (posix_spawnattr_setschedpolicy(&attr, SCHED_RR) != 0 ||
+        posix_spawnattr_setschedparam(&attr, &param) != 0 ||
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSCHEDULER | POSIX_SPAWN_SETSCHEDPARAM) != 0) {
+        posix_spawnattr_destroy(&attr);
+        return -1;
+    }
+    int spawned = posix_spawn(&pid, program, NULL, &attr, argv, environ);
+    posix_spawnattr_destroy(&attr);
+    if (spawned != 0) return -1;
     close(fds[1]);
     *read_end = fds[0];
     return pid;
@@ -583,10 +599,181 @@ static int gles_commit(const char *line) {
     return 0;
 }
 
+/* The load of the cube beside a window with no GLES (--gles --quick, under -icount): a
+ * paced client of 60 Hz in a window of its own posts a moving stripe each period, first
+ * alone and then while the cube draws in its window. For each post it takes the time
+ * from the post to the free bit of the buffer the window showed before (the wait an
+ * eglSwapInterval(1) makes), and the lateness of its own wake-up. A frame is late when
+ * that time is over one period. The two lines are compared by the probe. */
+#define LOAD_PERIOD_NS 16666667ULL
+#define LOAD_W 160
+#define LOAD_H 100
+#define LOAD_CUBE_FRAMES_MAX 3000
+
+static uint64_t mono_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ULL + (uint64_t)t.tv_nsec;
+}
+
+static void sleep_until_ns(uint64_t at) {
+    struct timespec t = {(time_t)(at / 1000000000ULL), (long)(at % 1000000000ULL)};
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, NULL);
+}
+
+/* One phase of the paced client: `frames` posts, or posts until `stop_fd` is readable (the
+ * cube holds its last frame) at most LOAD_CUBE_FRAMES_MAX. Prints the phase's line. */
+/* The posts so far over all phases: the buffer a post uses goes on across the phases, so
+ * that a phase does not begin with the buffer the last one left on show. */
+static unsigned posted_before;
+
+static int paced_phase(const char *name, int frames, int stop_fd, int *posts_out) {
+    struct stafeto_window w;
+    uint64_t t0 = mono_ns() + 2 * LOAD_PERIOD_NS;
+    uint64_t take_max = 0, take_sum = 0, wake_max = 0, lag_max = 0;
+    unsigned over1 = 0, over2 = 0, posts = 0, replaced = 0, overruns = 0;
+    int limit = stop_fd >= 0 ? LOAD_CUBE_FRAMES_MAX : frames;
+
+    CHECK(stafeto_window_info(0, &w) == 0);
+    for (int k = 0; k < limit; k++) {
+        uint32_t free_bits = 0;
+        unsigned n = posted_before + (unsigned)k;
+        unsigned b = n % w.buffers, prev = (n + w.buffers - 1) % w.buffers;
+        uint64_t due = t0 + (uint64_t)k * LOAD_PERIOD_NS, woke, posted, took;
+
+        if (stop_fd >= 0) {
+            struct pollfd p = {stop_fd, POLLIN, 0};
+            if (poll(&p, 1, 0) > 0) break;
+        }
+        /* A wake-up is measured only after a real sleep: a post that is already due when
+         * the loop gets to it (the client was busy or starved) counts as an overrun and has no wake-up to measure. */
+        {
+            uint64_t before = mono_ns();
+            if (before >= due) {
+                overruns++;
+                woke = before;
+            } else {
+                sleep_until_ns(due);
+                woke = mono_ns();
+                if (woke > due && woke - due > wake_max) wake_max = woke - due;
+            }
+        }
+        if (!(stafeto_window_free_buffers(0) & (1u << b)))
+            CHECK(stafeto_window_wait_free(0, 1u << b, 1000000000ULL, &free_bits) == 0);
+        for (int y = 0; y < 8; y++) {
+            uint32_t *row = (uint32_t *)((char *)w.pixels[b] + (size_t)((k * 9 + y) % LOAD_H) * w.stride);
+            for (int x = 0; x < LOAD_W; x++) row[x] = 0x00C04020u | (uint32_t)(k & 0x3F) << 8;
+        }
+        CHECK(stafeto_window_post(0, b, NULL, 0) == 0);
+        posted = mono_ns();
+        posts++;
+        if (k == 0) continue;
+        if (stafeto_window_wait_free(0, 1u << prev, 1000000000ULL, &free_bits) != 0) {
+            replaced++;
+            continue;
+        }
+        took = mono_ns() - posted;
+        /* The release against the time the post was due: independent of the phase
+         * of the compositor's frame. */
+        if (posted + took > due && posted + took - due > lag_max) lag_max = posted + took - due;
+        take_sum += took;
+        if (took > take_max) take_max = took;
+        if (took > LOAD_PERIOD_NS) over1++;
+        if (took > 2 * LOAD_PERIOD_NS) over2++;
+    }
+    printf("wfc-demo: load %s posts %u late %u late2 %u take max %llu us mean %llu us wake max %llu us unfreed %u lag max %llu us overrun %u\n",
+           name, posts, over1, over2, (unsigned long long)(take_max / 1000),
+           (unsigned long long)(posts > 1 ? take_sum / (posts - 1) / 1000 : 0),
+           (unsigned long long)(wake_max / 1000), replaced, (unsigned long long)(lag_max / 1000), overruns);
+    posted_before += posts;
+    if (posts_out) *posts_out = (int)posts;
+    fflush(stdout);
+    return 0;
+}
+
+/* The bytes the process service has left in its pool (Pool, kind 33). */
+extern unsigned long long stafeto_probe_pool(void);
+
+static int run_load(void) {
+    static const char *const cube_argv[] = {"gles-cube", "--window-run", "--size", "160",
+                                            "--frames", "6", "--stamps"};
+    struct stafeto_window w;
+    WFCNativeStreamType id_p = 0, id_c = 0;
+    WFCSource source_p, source_c;
+    WFCElement plain, cube;
+    WFCint plain_at[4] = {20, 20, LOAD_W, LOAD_H};
+    WFCint cube_at[4] = {GLES_CUBE_X, GLES_CUBE_Y, GLES_SIZE, GLES_SIZE};
+    WFCfloat src[4] = {0, 0, LOAD_W, LOAD_H};
+    int cube_pipe = -1, status = 0, cube_posts = 0;
+    pid_t pid;
+    /* The pool before the cube starts: when the cube is killed and waited for, the
+     * quota of its process and the pages of its image are back: the service's reaper
+     * closes the image's objects and waits for the pages before the end is told. */
+    unsigned long long pool_before = stafeto_probe_pool();
+
+    printf("wfc-demo: load starts\n");
+    fflush(stdout);
+    CHECK(stafeto_window_open(20, 20, LOAD_W, LOAD_H, STAFETO_WINDOW_XRGB8888, 3, 0, &w) == 0);
+    CHECK(next_stream(&id_p) == 0);
+    source_p = wfcCreateSourceFromStream(dev, ctx, id_p, NULL);
+    CHECK(source_p != WFC_INVALID_HANDLE);
+    plain = wfcCreateElement(dev, ctx, NULL);
+    CHECK(plain != WFC_INVALID_HANDLE);
+    wfcSetElementAttribi(dev, plain, WFC_ELEMENT_SOURCE, (WFCint)source_p);
+    wfcSetElementAttribfv(dev, plain, WFC_ELEMENT_SOURCE_RECTANGLE, 4, src);
+    wfcSetElementAttribiv(dev, plain, WFC_ELEMENT_DESTINATION_RECTANGLE, 4, plain_at);
+    wfcInsertElement(dev, plain, WFC_INVALID_HANDLE);
+    wfcCommit(dev, ctx, WFC_TRUE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    wfcActivate(dev, ctx);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    pid = start_holder("/bin/gles-cube", cube_argv, 7, &cube_pipe);
+    CHECK(pid > 0);
+    CHECK(next_stream(&id_c) == 0);
+    source_c = wfcCreateSourceFromStream(dev, ctx, id_c, NULL);
+    CHECK(source_c != WFC_INVALID_HANDLE);
+    cube = wfcCreateElement(dev, ctx, NULL);
+    CHECK(cube != WFC_INVALID_HANDLE);
+    gles_element(cube, source_c, WFC_ROTATION_0, cube_at);
+    wfcInsertElement(dev, cube, plain);
+    wfcCommit(dev, ctx, WFC_TRUE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    CHECK(paced_phase("cube", 0, cube_pipe, &cube_posts) == 0);
+    CHECK(wait_held(cube_pipe) == 0);
+    printf("wfc-demo: load the cube held its last frame\n");
+    fflush(stdout);
+
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+    close(cube_pipe);
+    {
+        unsigned long long pool_after = stafeto_probe_pool();
+        printf("wfc-demo: load pool before %llu after %llu\n", pool_before, pool_after);
+        fflush(stdout);
+        CHECK(pool_before != 0 && pool_after == pool_before);
+    }
+    /* The quiet phase after the cube's, as many posts as the cube's phase had. */
+    wfcRemoveElement(dev, cube);
+    wfcCommit(dev, ctx, WFC_TRUE);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    CHECK(paced_phase("quiet", cube_posts, -1, NULL) == 0);
+    wfcDeactivate(dev, ctx);
+    wfcRemoveElement(dev, plain);
+    wfcDestroyElement(dev, cube);
+    wfcDestroyElement(dev, plain);
+    wfcDestroySource(dev, source_c);
+    wfcDestroySource(dev, source_p);
+    CHECK(wfcGetError(dev) == WFC_ERROR_NONE);
+    CHECK(stafeto_window_close(0) == 0);
+    printf("wfc-demo: load ok\n");
+    fflush(stdout);
+    return 0;
+}
+
 /* The scenes of --gles: the cube's window alone at the middle, both windows as
  * they are, and the cube turned and scaled by one half beside the field. */
 static int run_gles(void) {
-    static const char *const cube_argv[] = {"gles-cube", "--window-run", "--size", "160", "--frames", "6"};
+    static const char *const cube_argv[] = {"gles-cube", "--window-run", "--size", "160", "--frames", "6", "--stamps"};
     static const char *const field_argv[] = {"gles3-demo", "--probe", "--size", "160"};
     WFCNativeStreamType id_cube = 0, id_field = 0;
     WFCSource source_cube, source_field;
@@ -599,7 +786,8 @@ static int run_gles(void) {
     CHECK(describe_device() == 0);
     CHECK(context_checks() == 0);
     wfcSetContextAttribi(dev, ctx, WFC_CONTEXT_BG_COLOR, 0x000000FF);
-    pid_cube = start_holder("/bin/gles-cube", cube_argv, 6, &cube_pipe);
+    if (quick) CHECK(run_load() == 0);
+    pid_cube = start_holder("/bin/gles-cube", cube_argv, quick ? 7 : 6, &cube_pipe);
     CHECK(pid_cube > 0);
     CHECK(next_stream(&id_cube) == 0);
     source_cube = wfcCreateSourceFromStream(dev, ctx, id_cube, NULL);

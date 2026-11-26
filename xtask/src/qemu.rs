@@ -164,6 +164,16 @@ pub const HVF_V2: Machine = Machine {
     accel: "hvf,kernel-irqchip=off",
 };
 
+/// HVF_V2 with 1 GiB: the machine of the images of Mesa (`gles-probe load --hvf`), whose
+/// programs need more than 512 MiB.
+pub const HVF_V2_1G: Machine = Machine {
+    name: "HVF GICv2 1G",
+    machine: "virt,gic-version=2,highmem-ecam=off",
+    cpu: "host",
+    memory: "1G",
+    accel: "hvf,kernel-irqchip=off",
+};
+
 /// The GICv3 machine with its ITS named (QEMU's default with GICv3, written
 /// so that the machine says it): the network service drives a
 /// virtio-net-pci with a vector of MSI-X a queue through the kernel's ITS

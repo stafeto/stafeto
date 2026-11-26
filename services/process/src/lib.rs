@@ -20,6 +20,7 @@ pub mod loaders;
 pub mod placing;
 pub mod queue;
 pub mod queued;
+pub mod reaping;
 pub mod records;
 pub mod rejoin;
 pub mod roots;
