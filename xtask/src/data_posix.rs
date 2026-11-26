@@ -685,9 +685,11 @@ pub const FAST_WRITE_OP_TIME_RATIO_MAX: f64 = 1.35;
 /// of the 8 paired rounds): the lowest median measured standalone on the Mac and on the runners of
 /// GitHub, and the share of the lower of the two the check requires.
 pub const FAST_PAIRED_READ_RATIO_MAC: f64 = 2.39;
-/// The lowest median of 3 standalone runs on the Mac is 2.39 (2.45, 2.48, 2.39). PROVISIONAL: the
-/// runner value equals the Mac value until the repeats on GitHub are measured.
-pub const FAST_PAIRED_READ_RATIO_RUNNER: f64 = 2.39;
+/// The lowest median of 3 standalone runs on the Mac is 2.39 (2.45, 2.48, 2.39). On the runners
+/// 8 standalone runs gave 2.51 to 2.56 (probe.yml run 45883141202), and 3 runs of the whole guests-3
+/// group, with the other probes beside it, gave 2.52 to 2.55 (run 45883149960): the lowest group
+/// median stays 32 % above the bound 0.8 × 2.39 = 1.91.
+pub const FAST_PAIRED_READ_RATIO_RUNNER: f64 = 2.51;
 pub const FAST_READ_RATIO_SHARE: f64 = 0.8;
 /// The controls of 1,000 bytes (the old path) run at least this fast, in KiB/s: the speed of 0.6.0
 /// was 2,106 (write) and 1,352 (read) on 64 MiB.
