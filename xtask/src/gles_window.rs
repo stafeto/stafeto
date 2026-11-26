@@ -4,14 +4,21 @@
 //! The cube in a window (apps/gles-cube, `--window`): a static C program on
 //! relibc with the Mesa of tools/build-mesa.py, on QEMU's virtio-gpu-device
 //! with the composition service. The program starts its own file once (a
-//! program init starts cannot fork); the copy that draws opens a window of
-//! 160 by 160 points with three buffers, checks the API of the platform of
+//! program init starts cannot fork); the copy that draws opens a window with
+//! three buffers (its side, 160 points, comes from the arguments of the
+//! program's record in the table `table::gles::WINDOW_TABLE`, as does the
+//! number of frames), checks the API of the platform of
 //! EGL (a display not initialized, the format of the window against the
 //! configuration, the handles 0 and 6, a second surface over one window, the
 //! swap behaviour and interval, a swap with no current context, a swap in a
-//! forked child, two threads with two contexts), draws six frames of the cube
+//! forked child, two threads with two contexts, a surface current in one
+//! thread and moved to another, a thread asleep in `stafeto_window_wait` while
+//! the main thread swaps), draws six frames of the cube
 //! with softpipe, reads each back and swaps it into the window (the swap
-//! interval alternates 1 and 0). At the third frame and at the last it prints
+//! interval alternates 1 and 0). At the third frame the window must hold the
+//! rows of the frame read back, mirrored, and four swaps with damage over a
+//! scissored clear leave the window equal to the frame; the end is
+//! `eglTerminate` with the surface current. At the third frame and at the last it prints
 //! the CRC-32 of the screen it should show and sleeps; while it sleeps, xtask
 //! asks the monitor of QEMU for a `screendump` and takes the CRC-32 of the
 //! colours (`posix-window`'s way): the two are equal, so the copy of the frame
@@ -77,7 +84,7 @@ const ENDED: &str = "init: gles-cube ended: exit code 0, not restarted";
 
 /// The checks of the API, each a line the program prints once it passed
 /// (`starts_with` and `ends_with` of the line after the prefix).
-const API: [(&str, &str); 8] = [
+const API: [(&str, &str); 13] = [
     (
         "api a display not initialized",
         "answers EGL_NOT_INITIALIZED",
@@ -106,6 +113,26 @@ const API: [(&str, &str); 8] = [
     (
         "api a second thread made its own pbuffer",
         "and context and drew",
+    ),
+    (
+        "api a surface current in one thread is EGL_BAD_ACCESS in another",
+        "and moves between threads",
+    ),
+    (
+        "api a thread asleep in stafeto_window_wait got the bits of the swaps",
+        "the events bit stayed for it",
+    ),
+    (
+        "api the window shows the rows of the frame read back from the bottom up",
+        "the frame is no mirror of itself",
+    ),
+    (
+        "api four swaps with damage over a cleared rectangle",
+        "left the window equal to the frame",
+    ),
+    (
+        "api eglTerminate with the surface current",
+        "eglReleaseThread lets go",
     ),
 ];
 
@@ -205,6 +232,17 @@ pub fn verdict(lines: &[String], shots: [u32; 2]) -> Result<(), String> {
     if crcs.len() != FRAMES {
         return Err("two frames of the turning cube have the same CRC".to_owned());
     }
+    // The same Mesa draws the same frames into a window and into a pbuffer.
+    if let Some(expected) = crate::gles_pbuffer::EXPECTED_CRCS {
+        for (at, (_, crc, _)) in frames.iter().enumerate() {
+            if *crc != expected[at] {
+                return Err(format!(
+                    "frame {at} has the CRC {crc:08x}, {:08x} of the pbuffer probe expected",
+                    expected[at]
+                ));
+            }
+        }
+    }
     for k in 0..FRAMES {
         let interval = if k % 2 == 1 { 0 } else { 1 };
         let prefix = format!("time swap {k} (interval {interval}) ");
@@ -272,11 +310,22 @@ mod tests {
             "gles-cube: api a swap of a surface that is not current is EGL_BAD_SURFACE".to_owned(),
             "gles-cube: api a swap in a forked child is EGL_BAD_SURFACE".to_owned(),
             "gles-cube: api a second thread made its own pbuffer and context and drew".to_owned(),
+            "gles-cube: api a surface current in one thread is EGL_BAD_ACCESS in another and moves between threads"
+                .to_owned(),
+            "gles-cube: api a thread asleep in stafeto_window_wait got the bits of the swaps and the events bit stayed for it"
+                .to_owned(),
+            "gles-cube: api the window shows the rows of the frame read back from the bottom up, and the frame is no mirror of itself"
+                .to_owned(),
+            "gles-cube: api four swaps with damage over a cleared rectangle left the window equal to the frame"
+                .to_owned(),
+            "gles-cube: api eglTerminate with the surface current, a swap after it is EGL_NOT_INITIALIZED and eglReleaseThread lets go"
+                .to_owned(),
         ];
         for k in 0..FRAMES {
             lines.push(format!(
                 "gles-cube: frame {k} crc {:08x} sum {}",
-                0x1000_0000 + k as u32 * 0x1111,
+                crate::gles_pbuffer::EXPECTED_CRCS
+                    .map_or(0x1000_0000 + k as u32 * 0x1111, |c| c[k]),
                 900_000 + k
             ));
             lines.push(format!(
@@ -350,8 +399,13 @@ mod tests {
         assert!(verdict(&lines, [1, 2]).unwrap_err().contains("frame line"));
         let mut lines = run();
         let at = lines.iter().position(|l| l.contains("frame 4 ")).unwrap();
-        lines[at] = "gles-cube: frame 4 crc 10000000 sum 900004".to_owned();
-        assert!(verdict(&lines, [1, 2]).unwrap_err().contains("same CRC"));
+        let again = lines
+            .iter()
+            .find(|l| l.contains("frame 3 "))
+            .unwrap()
+            .clone();
+        lines[at] = again.replace("frame 3 ", "frame 4 ");
+        assert!(verdict(&lines, [1, 2]).is_err());
         let mut lines = run();
         let at = lines.iter().position(|l| l.contains("frame 1 ")).unwrap();
         lines[at] = "gles-cube: frame 1 crc 10001111 sum 0".to_owned();
@@ -371,6 +425,20 @@ mod tests {
             .unwrap();
         lines.remove(at);
         assert!(verdict(&lines, [1, 2]).unwrap_err().contains("time swap 3"));
+    }
+
+    #[test]
+    fn a_frame_that_differs_from_the_pbuffer_probes_is_refused() {
+        let mut lines = run();
+        let at = lines.iter().position(|l| l.contains("frame 2 ")).unwrap();
+        lines[at] = "gles-cube: frame 2 crc 00000001 sum 900002".to_owned();
+        if crate::gles_pbuffer::EXPECTED_CRCS.is_some() {
+            assert!(
+                verdict(&lines, [1, 2])
+                    .unwrap_err()
+                    .contains("pbuffer probe")
+            );
+        }
     }
 
     #[test]
@@ -402,5 +470,30 @@ mod tests {
             .unwrap();
         lines[at] = "gles-cube: GL_RENDERER llvmpipe".to_owned();
         assert!(verdict(&lines, [1, 2]).unwrap_err().contains("softpipe"));
+    }
+
+    /// The program asks for the stack it needs in its own file (a copy a spawn
+    /// starts gets 64 KiB otherwise, and the compiler of GLSL recurses deeper):
+    /// `PT_GNU_STACK` of the built `gles-cube` is the size the image gives the
+    /// program that init starts. Skipped when the program is not built.
+    #[test]
+    fn the_file_of_the_cube_asks_for_the_stack_of_the_image() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let Ok(elf) = std::fs::read(root.join("target/aarch64-unknown-none/release/gles-cube"))
+        else {
+            eprintln!("gles-cube is not built: the stack of its file is not read");
+            return;
+        };
+        let u16_at = |at: usize| u16::from_le_bytes(elf[at..at + 2].try_into().unwrap()) as usize;
+        let u32_at = |at: usize| u32::from_le_bytes(elf[at..at + 4].try_into().unwrap());
+        let u64_at = |at: usize| u64::from_le_bytes(elf[at..at + 8].try_into().unwrap()) as usize;
+        let (offset, size, count) = (u64_at(0x20), u16_at(0x36), u16_at(0x38));
+        let stack = (0..count)
+            .map(|k| offset + k * size)
+            .find(|&at| u32_at(at) == 0x6474_e551)
+            .map(|at| u64_at(at + 0x28))
+            .expect("the file has a PT_GNU_STACK");
+        assert!(stack >= 1024 * 1024, "{stack}");
+        assert_eq!(stack, crate::gles_pbuffer::CUBE_STACK_SIZE as usize);
     }
 }

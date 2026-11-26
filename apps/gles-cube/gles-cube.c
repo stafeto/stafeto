@@ -427,17 +427,24 @@ int main(int argc, char **argv)
 			print_ascii(pixels, size);
 #ifdef STAFETO_WINDOW
 		if (window)
-			window_present(display, surface, frame, frames);
+			window_present(display, surface, frame, frames, pixels, size);
 #endif
 	}
+#ifdef STAFETO_WINDOW
+	if (window)
+		window_damage_swaps(display, surface, pixels, size);
+#endif
 	free(pixels);
+#ifdef STAFETO_WINDOW
+	if (window) {
+		window_terminate(display, surface);
+		printf("gles-cube: ok\n");
+		return 0;
+	}
+#endif
 	CHECK(eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) == EGL_TRUE);
 	CHECK(eglDestroyContext(display, context) == EGL_TRUE);
 	CHECK(eglDestroySurface(display, surface) == EGL_TRUE);
-#ifdef STAFETO_WINDOW
-	if (window)
-		window_close();
-#endif
 	CHECK(eglTerminate(display) == EGL_TRUE);
 	printf("gles-cube: ok\n");
 	return 0;

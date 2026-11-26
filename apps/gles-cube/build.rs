@@ -21,6 +21,8 @@ fn run(cmd: &mut Command) {
 fn main() {
     println!("cargo:rerun-if-changed=gles-cube.c");
     println!("cargo:rerun-if-changed=gles-window.h");
+    println!("cargo:rerun-if-changed=../../ports/mesa/stafeto/swap.c");
+    println!("cargo:rerun-if-changed=../../ports/mesa/stafeto/swap.h");
     println!("cargo:rerun-if-changed=../../lib/posix-crt/window/stafeto/window.h");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_LIBCXX_DIR");
@@ -74,40 +76,52 @@ fn main() {
         mesa_lib.join("libmesa.a").display()
     );
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
-    run(Command::new(tools.join("clang"))
-        .args([
-            // The Linux C ABI relibc's headers describe.
-            "--target=aarch64-linux-gnu",
-            // Cortex-A53 erratum 835769 (the PinePhone's A64).
-            "-mfix-cortex-a53-835769",
-            "-nostdinc",
-            "-fstack-protector-strong",
-            "-fno-pic",
-            "-std=c11",
-            "-O2",
-            // malloc and the others are calls: a probe's allocation is never
-            // folded away.
-            "-fno-builtin",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            // The window mode (gles-window.h): the surface of EGL on a window of
-            // the composition service.
-            "-DSTAFETO_WINDOW",
-            "-isystem",
-        ])
-        .arg(sysroot.join("include"))
-        // The headers of Khronos lie outside the sysroot, <stafeto/window.h> too.
-        .arg("-isystem")
-        .arg(mesa.join("include"))
-        .arg("-isystem")
-        .arg(manifest.join("../../lib/posix-crt/window"))
-        .args(["-c", "gles-cube.c", "-o"])
-        .arg(out.join("gles-cube.o")));
+    let stafeto = manifest.join("../../ports/mesa/stafeto");
+    // gles-cube.c, and swap.c of the platform of stafeto, whose checks of the
+    // orientation of a frame the window mode shares with the host tests.
+    let compile = |source: &PathBuf, object: &str| {
+        run(Command::new(tools.join("clang"))
+            .args([
+                // The Linux C ABI relibc's headers describe.
+                "--target=aarch64-linux-gnu",
+                // Cortex-A53 erratum 835769 (the PinePhone's A64).
+                "-mfix-cortex-a53-835769",
+                "-nostdinc",
+                "-fstack-protector-strong",
+                "-fno-pic",
+                "-std=c11",
+                "-O2",
+                // malloc and the others are calls: a probe's allocation is never
+                // folded away.
+                "-fno-builtin",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                // The window mode (gles-window.h): the surface of EGL on a window of
+                // the composition service.
+                "-DSTAFETO_WINDOW",
+                "-isystem",
+            ])
+            .arg(sysroot.join("include"))
+            // The headers of Khronos lie outside the sysroot, <stafeto/window.h> too.
+            .arg("-isystem")
+            .arg(mesa.join("include"))
+            .arg("-isystem")
+            .arg(manifest.join("../../lib/posix-crt/window"))
+            .arg("-I")
+            .arg(&stafeto)
+            .arg("-c")
+            .arg(source)
+            .arg("-o")
+            .arg(out.join(object)));
+    };
+    compile(&manifest.join("gles-cube.c"), "gles-cube.o");
+    compile(&stafeto.join("swap.c"), "swap.o");
     run(Command::new(tools.join("llvm-ar"))
         .arg("crs")
         .arg(out.join("libglescube.a"))
-        .arg(out.join("gles-cube.o")));
+        .arg(out.join("gles-cube.o"))
+        .arg(out.join("swap.o")));
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-search=native={}", mesa_lib.display());
     println!("cargo:rustc-link-search=native={}", cxx_lib.display());
