@@ -235,7 +235,7 @@ them; `smoke:egl` runs the cases of one module. It is the job `deqp-smoke` of ci
 ## Results
 
 Run in QEMU (TCG, 1 GiB, the image with the compositor) on a Mac, against the
-provisional baselines (below):
+the baselines (below):
 
 | Run | Cases | Pass | Fail | NotSupported | Time |
 |---|---|---|---|---|---|
