@@ -24,7 +24,7 @@ fn absent(ticket: NamedTicket) -> NamedReply {
 
 impl PipeService {
     pub(super) fn named_room(&self) -> bool {
-        self.ops.counts().0 + self.named.count() < OPERATIONS
+        self.ops.live() + self.named.count() < OPERATIONS
     }
     fn named_answer(&self, ticket: NamedTicket, r: &mut Request<'_>, cap: bool) -> Answer {
         let Some(record) = self.named.get(ticket) else {
