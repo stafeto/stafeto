@@ -118,21 +118,7 @@ struct Held(UnsafeCell<Taker>);
 unsafe impl Sync for Held {}
 static STASH: Held = Held(UnsafeCell::new(Taker::new()));
 
-/// Clears a flag at the end of the scope.
-struct Flag(&'static AtomicBool);
-
-impl Flag {
-    /// Takes the flag; None when another thread has it.
-    fn take(flag: &'static AtomicBool) -> Option<Flag> {
-        (!flag.swap(true, Ordering::AcqRel)).then_some(Flag(flag))
-    }
-}
-
-impl Drop for Flag {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
+use comp_client::flag::Flag;
 
 fn level() -> u8 {
     (threads::own_block().base_level.load(Ordering::Relaxed) as u8).max(1)
