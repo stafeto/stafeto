@@ -1568,7 +1568,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 277;
+const INIT_TESTS: u32 = 278;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1853,10 +1853,16 @@ enum Variant {
     /// `LogWakeBreakTest` with the tests at EL0, where the writer on another CPU races the
     /// arming.
     LogWakeBreakEl0,
+    /// A request that tells the receiver's own base as its level
+    /// (`break-lent-level`), and a wait channel that lends a level
+    /// (`break-lent-notice`): the kernel tests of the level must catch each
+    /// (`cargo xtask lent-breaks`, and `budget-breaks`).
+    LentLevelTest,
+    LentNoticeTest,
 }
 
 impl Variant {
-    const ALL: [Variant; 81] = [
+    const ALL: [Variant; 83] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1938,6 +1944,8 @@ impl Variant {
         Variant::LogPostInCallBreakTest,
         Variant::LogWakeBreakEl0,
         Variant::LiftAgainReplyTest,
+        Variant::LentLevelTest,
+        Variant::LentNoticeTest,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -2029,6 +2037,8 @@ impl Variant {
             Variant::LogWakeBreakTest => Some("ktest,break-log-wake"),
             Variant::LogPostInCallBreakTest => Some("ktest,break-log-post-in-call"),
             Variant::LogWakeBreakEl0 => Some("ktest,el0-half,break-log-wake"),
+            Variant::LentLevelTest => Some("ktest,break-lent-level"),
+            Variant::LentNoticeTest => Some("ktest,break-lent-notice"),
         }
     }
 
@@ -2133,6 +2143,8 @@ impl Variant {
             Variant::LogSeenBreak => "stafeto-log-seen-break",
             Variant::LogWakeBreakTest => "stafeto-ktest-log-wake-break",
             Variant::LogPostInCallBreakTest => "stafeto-ktest-log-post-in-call-break",
+            Variant::LentLevelTest => "stafeto-ktest-lent-level",
+            Variant::LentNoticeTest => "stafeto-ktest-lent-notice",
             Variant::LogWakeBreakEl0 => "stafeto-ktest-el0-log-wake-break",
         }
     }
@@ -2693,6 +2705,7 @@ fn main() {
         Some("budget-hog") => budget_hog::run(&args[1..]),
         Some("service-budget") => service_budget::run(&args[1..]),
         Some("budget-breaks") => budget_hog::breaks(),
+        Some("lent-breaks") => budget_hog::lent_breaks(),
         Some("stint-visit-break") => {
             budget_hog::stint_visit_host_break().and_then(|()| budget_hog::stint_visit_break())
         }
