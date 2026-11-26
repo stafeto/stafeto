@@ -66,3 +66,33 @@ pub const WINDOW_TABLE: &[Record] = &[
     entropy::RNG,
     entropy::ENTROPY,
 ];
+
+/// The quota of the dEQP program: the framework, Mesa and its GLSL compiler
+/// are 20 MiB of code and data before the first case, and a case of the EGL
+/// module makes contexts and surfaces of a few MiB.
+const DEQP_QUOTA: u64 = 256 * 1024 * 1024;
+
+/// dEQP-EGL (xtask deqp): the services of the pbuffer probe and the module
+/// of VK-GL-CTS. The arguments of a batch of cases are the lines of
+/// /etc/deqp.args in the image (tests/deqp/platform/tcuStafetoMain.cpp), so
+/// the table holds none.
+pub const DEQP_TABLE: &[Record] = &[
+    RAM_FIFO_CLOCKED,
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + DEQP_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    Record {
+        name: "deqp-egl",
+        program: "deqp-egl",
+        args: b"deqp-egl\0",
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
+        root: true,
+        quota: DEQP_QUOTA,
+        ..POSIX
+    },
+    entropy::RNG,
+    entropy::ENTROPY,
+];

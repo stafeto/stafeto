@@ -60,6 +60,7 @@ mod cyrillic;
 mod data_image;
 mod data_posix;
 mod data_probe;
+mod deqp;
 mod disasm;
 mod display_probe;
 mod doom;
@@ -2212,6 +2213,9 @@ commands:
   mesa-reference build the same Mesa for Linux and run the cube on it, then compare its ten CRCs
             with the ones gles-pbuffer expects (tools/build-mesa-reference.py; arm64 Linux only,
             as on the runners of probe.yml)
+  deqp      build the test framework dEQP of VK-GL-CTS for stafeto (tools/build-deqp.py) into
+            target/deqp, then run its EGL groups info and create_context in QEMU in batches
+            of 200 cases, restarting the program after a crash, and print their counts
   gles-pbuffer run a cube on Mesa's softpipe in QEMU, with no compositor: ten frames
             drawn into a pbuffer, read back, and their CRCs
   gles-window run the cube in a window of the composition service in QEMU: the API checks of the
@@ -2723,6 +2727,7 @@ fn main() {
         Some("cxx-probe") => cxx_probe::probe(&qemu::VIRT),
         Some("mesa") => mesa(),
         Some("mesa-reference") => mesa_reference(),
+        Some("deqp") => deqp::probe(&qemu::VIRT_1G),
         Some("gles-pbuffer") => gles_pbuffer::probe(&qemu::VIRT_1G),
         Some("gles-window") => gles_window::probe(&qemu::VIRT_1G),
         Some("os-test") => match &args[1..] {
@@ -5446,6 +5451,7 @@ fn bash_terms() -> Result<(Vec<u8>, String), String> {
 static RELIBC_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static LIBCXX_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static MESA_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
+static DEQP_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static LIBC_SO_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static DYNAMIC_BUILT: Mutex<Vec<(String, ())>> = Mutex::new(Vec::new());
 static BUSYBOX_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
@@ -5474,6 +5480,16 @@ fn mesa() -> Result<(), String> {
     once(&MESA_BUILT, (), || {
         libcxx()?;
         run_cmd(&mut build_script(root().join("tools/build-mesa.py")))
+    })
+}
+
+/// The dEQP framework built (tools/build-deqp.py), once in a run of xtask,
+/// after Mesa: the platform of the tests is compiled with its headers and the
+/// program links its archive. CMake and ninja come from the host.
+fn deqp() -> Result<(), String> {
+    once(&DEQP_BUILT, (), || {
+        mesa()?;
+        run_cmd(&mut build_script(root().join("tools/build-deqp.py")))
     })
 }
 
@@ -11518,6 +11534,7 @@ fn host_tests() -> Result<(), String> {
         "tools/test_build_freetype.py",
         "tools/test_build_libcxx.py",
         "tools/test_build_mesa.py",
+        "tools/test_build_deqp.py",
         "tools/test_build_lvgl.py",
         "tools/test_lvgl_port.py",
         "tools/test_build_libc_so.py",
@@ -15078,6 +15095,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "gles-cube",
         "--package",
+        "deqp-egl",
+        "--package",
         "posix-procs",
         "--package",
         "os-test-run",
@@ -17879,6 +17898,7 @@ mod entropy_in_images_tests {
             ("posix_window::PROGRAMS", &crate::posix_window::PROGRAMS),
             ("cxx_probe::PROGRAMS", &crate::cxx_probe::PROGRAMS),
             ("gles_pbuffer::PROGRAMS", &crate::gles_pbuffer::PROGRAMS),
+            ("deqp::PROGRAMS", &crate::deqp::PROGRAMS),
             ("gles_window::PROGRAMS", &crate::gles_window::PROGRAMS),
             ("wfd::PROGRAMS", &crate::wfd::PROGRAMS),
             ("wfd::STEPS_PROGRAMS", &crate::wfd::STEPS_PROGRAMS),

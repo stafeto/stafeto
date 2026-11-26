@@ -1,0 +1,453 @@
+Writing test log into /dev/stdout
+dEQP Core 067e8832315e79817ede1c4863804e440f5d1c80 (0x067e8832) starting..
+  target implementation = 'stafeto'
+#sessionInfo releaseName 067e8832315e79817ede1c4863804e440f5d1c80
+#sessionInfo releaseId 0x067e8832
+#sessionInfo targetName "stafeto"
+#sessionInfo logFormatVersion "0.3.4"
+#sessionInfo commandLineParameters "--deqp-log-filename=/dev/stdout --deqp-log-flush=enable --deqp-watchdog=disable --deqp-caselist-file=/etc/deqp.cases"
+
+#beginSession
+
+Test case 'dEQP-EGL.info.version'..
+
+#beginTestCaseResult dEQP-EGL.info.version
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.info.version" Version="0.3.4" CaseType="SelfValidate">
+ <Text>1.5</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">14864</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  Pass (Pass)
+
+Test case 'dEQP-EGL.info.vendor'..
+
+#beginTestCaseResult dEQP-EGL.info.vendor
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.info.vendor" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Mesa Project</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1714</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  Pass (Pass)
+
+Test case 'dEQP-EGL.info.client_apis'..
+
+#beginTestCaseResult dEQP-EGL.info.client_apis
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.info.client_apis" Version="0.3.4" CaseType="SelfValidate">
+ <Text>OpenGL_ES </Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1594</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  Pass (Pass)
+
+Test case 'dEQP-EGL.info.extensions'..
+
+#beginTestCaseResult dEQP-EGL.info.extensions
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.info.extensions" Version="0.3.4" CaseType="SelfValidate">
+ <Text>EGL_EXT_config_select_group</Text>
+ <Text>EGL_EXT_surface_compression</Text>
+ <Text>EGL_EXT_swap_buffers_with_damage</Text>
+ <Text>EGL_KHR_cl_event2</Text>
+ <Text>EGL_KHR_config_attribs</Text>
+ <Text>EGL_KHR_context_flush_control</Text>
+ <Text>EGL_KHR_create_context</Text>
+ <Text>EGL_KHR_create_context_no_error</Text>
+ <Text>EGL_KHR_fence_sync</Text>
+ <Text>EGL_KHR_get_all_proc_addresses</Text>
+ <Text>EGL_KHR_gl_colorspace</Text>
+ <Text>EGL_KHR_gl_renderbuffer_image</Text>
+ <Text>EGL_KHR_gl_texture_2D_image</Text>
+ <Text>EGL_KHR_gl_texture_3D_image</Text>
+ <Text>EGL_KHR_gl_texture_cubemap_image</Text>
+ <Text>EGL_KHR_image_base</Text>
+ <Text>EGL_KHR_no_config_context</Text>
+ <Text>EGL_KHR_reusable_sync</Text>
+ <Text>EGL_KHR_surfaceless_context</Text>
+ <Text>EGL_KHR_swap_buffers_with_damage</Text>
+ <Text>EGL_EXT_pixel_format_float</Text>
+ <Text>EGL_KHR_wait_sync</Text>
+ <Text>EGL_MESA_configless_context</Text>
+ <Text>EGL_MESA_gl_interop</Text>
+ <Text>EGL_MESA_query_driver</Text>
+ <Text>EGL_MESA_x11_native_visual_id</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">3290</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  Pass (Pass)
+
+Test case 'dEQP-EGL.info.configs'..
+
+#beginTestCaseResult dEQP-EGL.info.configs
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.info.configs" Version="0.3.4" CaseType="SelfValidate">
+ <EglConfigSet Name="EGL-configs" Description="List of all EGL configs">
+  <EglConfig BufferSize="32" RedSize="8" GreenSize="8" BlueSize="8" LuminanceSize="0" AlphaSize="8" AlphaMaskSize="0" BindToTextureRGB="True" BindToTextureRGBA="True" ColorBufferType="EGL_RGB_BUFFER" ConfigCaveat="EGL_NONE" ConfigID="1" Conformant="EGL_OPENGL_ES2_BIT|EGL_OPENGL_ES3_BIT_KHR" DepthSize="0" Level="0" MaxPBufferWidth="4096" MaxPBufferHeight="4096" MaxPBufferPixels="0" MaxSwapInterval="1" MinSwapInterval="0" NativeRenderable="True" RenderableType="EGL_OPENGL_ES2_BIT|EGL_OPENGL_ES3_BIT_KHR" SampleBuffers="0" Samples="0" StencilSize="0" SurfaceTypes="EGL_PBUFFER_BIT|EGL_WINDOW_BIT|EGL_SWAP_BEHAVIOR_PRESERVED_BIT" TransparentType="EGL_NONE" TransparentRedValue="0" TransparentGreenValue="0" TransparentBlueValue="0" />
+  <EglConfig BufferSize="32" RedSize="8" GreenSize="8" BlueSize="8" LuminanceSize="0" AlphaSize="8" AlphaMaskSize="0" BindToTextureRGB="True" BindToTextureRGBA="True" ColorBufferType="EGL_RGB_BUFFER" ConfigCaveat="EGL_NONE" ConfigID="2" Conformant="EGL_OPENGL_ES2_BIT|EGL_OPENGL_ES3_BIT_KHR" DepthSize="16" Level="0" MaxPBufferWidth="4096" MaxPBufferHeight="4096" MaxPBufferPixels="0" MaxSwapInterval="1" MinSwapInterval="0" NativeRenderable="True" RenderableType="EGL_OPENGL_ES2_BIT|EGL_OPENGL_ES3_BIT_KHR" SampleBuffers="0" Samples="0" StencilSize="0" SurfaceTypes="EGL_PBUFFER_BIT|EGL_WINDOW_BIT|EGL_SWAP_BEHAVIOR_PRESERVED_BIT" TransparentType="EGL_NONE" TransparentRedValue="0" TransparentGreenValue="0" TransparentBlueValue="0" />
+  <EglConfig BufferSize="32" RedSize="8" GreenSize="8" BlueSize="8" LuminanceSize="0" AlphaSize="8" AlphaMaskSize="0" BindToTextureRGB="True" BindToTextureRGBA="True" ColorBufferType="EGL_RGB_BUFFER" ConfigCaveat="EGL_NONE" ConfigID="3" Conformant="EGL_OPENGL_ES2_BIT|EGL_OPENGL_ES3_BIT_KHR" DepthSize="24" Level="0" MaxPBufferWidth="4096" MaxPBufferHeight="4096" MaxPBufferPixels="0" MaxSwapInterval="1" MinSwapInterval="0" NativeRenderable="True" RenderableType="EGL_OPENGL_ES2_BIT|EGL_OPENGL_ES3_BIT_KHR" SampleBuffers="0" Samples="0" StencilSize="8" SurfaceTypes="EGL_PBUFFER_BIT|EGL_WINDOW_BIT|EGL_SWAP_BEHAVIOR_PRESERVED_BIT" TransparentType="EGL_NONE" TransparentRedValue="0" TransparentGreenValue="0" TransparentBlueValue="0" />
+  <EglConfig BufferSize="24" RedSize="8" GreenSize="8" BlueSize="8" LuminanceSize="0" AlphaSize="0" AlphaMaskSize="0" BindToTextureRGB="True" BindToTextureRGBA="False" ColorBufferType="EGL_RGB_BUFFER" ConfigCaveat="EGL_NONE" ConfigID="4" Conformant="EGL_OPENGL_ES2_BIT|EGL_OPENGL_ES3_BIT_KHR" DepthSize="0" Level="0" MaxPBufferWidth="4096" MaxPBufferHeight="4096" MaxPBufferPixels="0" MaxSwapInterval="1" MinSwapInterval="0" NativeRenderable="True" RenderableType="EGL_OPENGL_ES2_BIT|EGL_OPENGL_ES3_BIT_KHR" SampleBuffers="0" Samples="0" StencilSize="0" SurfaceTypes="EGL_PBUFFER_BIT|EGL_WINDOW_BIT|EGL_SWAP_BEHAVIOR_PRESERVED_BIT" TransparentType="EGL_NONE" TransparentRedValue="0" TransparentGreenValue="0" TransparentBlueValue="0" />
+  <EglConfig BufferSize="24" RedSize="8" GreenSize="8" BlueSize="8" LuminanceSize="0" AlphaSize="0" AlphaMaskSize="0" BindToTextureRGB="True" BindToTextureRGBA="False" ColorBufferType="EGL_RGB_BUFFER" ConfigCaveat="EGL_NONE" ConfigID="5" Conformant="EGL_OPENGL_ES2_BIT|EGL_OPENGL_ES3_BIT_KHR" DepthSize="16" Level="0" MaxPBufferWidth="4096" MaxPBufferHeight="4096" MaxPBufferPixels="0" MaxSwapInterval="1" MinSwapInterval="0" NativeRenderable="True" RenderableType="EGL_OPENGL_ES2_BIT|EGL_OPENGL_ES3_BIT_KHR" SampleBuffers="0" Samples="0" StencilSize="0" SurfaceTypes="EGL_PBUFFER_BIT|EGL_WINDOW_BIT|EGL_SWAP_BEHAVIOR_PRESERVED_BIT" TransparentType="EGL_NONE" TransparentRedValue="0" TransparentGreenValue="0" TransparentBlueValue="0" />
+  <EglConfig BufferSize="24" RedSize="8" GreenSize="8" BlueSize="8" LuminanceSize="0" AlphaSize="0" AlphaMaskSize="0" BindToTextureRGB="True" BindToTextureRGBA="False" ColorBufferType="EGL_RGB_BUFFER" ConfigCaveat="EGL_NONE" ConfigID="6" Conformant="EGL_OPENGL_ES2_BIT|EGL_OPENGL_ES3_BIT_KHR" DepthSize="24" Level="0" MaxPBufferWidth="4096" MaxPBufferHeight="4096" MaxPBufferPixels="0" MaxSwapInterval="1" MinSwapInterval="0" NativeRenderable="True" RenderableType="EGL_OPENGL_ES2_BIT|EGL_OPENGL_ES3_BIT_KHR" SampleBuffers="0" Samples="0" StencilSize="8" SurfaceTypes="EGL_PBUFFER_BIT|EGL_WINDOW_BIT|EGL_SWAP_BEHAVIOR_PRESERVED_BIT" TransparentType="EGL_NONE" TransparentRedValue="0" TransparentGreenValue="0" TransparentBlueValue="0" />
+</EglConfigSet>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">9990</Number>
+ <Result StatusCode="Pass"></Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  Pass ()
+
+Test case 'dEQP-EGL.functional.create_context.rgb565_no_depth_no_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgb565_no_depth_no_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgb565_no_depth_no_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">5000</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.rgb565_no_depth_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgb565_no_depth_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgb565_no_depth_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1806</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.rgb565_depth_no_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgb565_depth_no_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgb565_depth_no_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1770</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.rgb565_depth_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgb565_depth_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgb565_depth_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1710</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.rgb888_no_depth_no_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgb888_no_depth_no_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgb888_no_depth_no_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: { 4 }</Text>
+ <Text>Creating OpenGL ES 2 context with config ID 4</Text>
+ <Text>  Pass</Text>
+ <Text>Creating OpenGL ES 3 context with config ID 4</Text>
+ <Text>  Pass</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">37820</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  Pass (Pass)
+
+Test case 'dEQP-EGL.functional.create_context.rgb888_no_depth_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgb888_no_depth_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgb888_no_depth_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1970</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.rgb888_depth_no_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgb888_depth_no_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgb888_depth_no_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: { 5 }</Text>
+ <Text>Creating OpenGL ES 2 context with config ID 5</Text>
+ <Text>  Pass</Text>
+ <Text>Creating OpenGL ES 3 context with config ID 5</Text>
+ <Text>  Pass</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">16340</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  Pass (Pass)
+
+Test case 'dEQP-EGL.functional.create_context.rgb888_depth_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgb888_depth_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgb888_depth_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: { 6 }</Text>
+ <Text>Creating OpenGL ES 2 context with config ID 6</Text>
+ <Text>  Pass</Text>
+ <Text>Creating OpenGL ES 3 context with config ID 6</Text>
+ <Text>  Pass</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">16348</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  Pass (Pass)
+
+Test case 'dEQP-EGL.functional.create_context.rgba4444_no_depth_no_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgba4444_no_depth_no_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgba4444_no_depth_no_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1780</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.rgba4444_no_depth_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgba4444_no_depth_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgba4444_no_depth_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1926</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.rgba4444_depth_no_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgba4444_depth_no_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgba4444_depth_no_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1664</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.rgba4444_depth_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgba4444_depth_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgba4444_depth_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1750</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.rgba5551_no_depth_no_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgba5551_no_depth_no_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgba5551_no_depth_no_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1698</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.rgba5551_no_depth_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgba5551_no_depth_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgba5551_no_depth_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1684</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.rgba5551_depth_no_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgba5551_depth_no_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgba5551_depth_no_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1644</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.rgba5551_depth_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgba5551_depth_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgba5551_depth_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">1700</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.rgba8888_no_depth_no_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgba8888_no_depth_no_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgba8888_no_depth_no_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: { 1 }</Text>
+ <Text>Creating OpenGL ES 2 context with config ID 1</Text>
+ <Text>  Pass</Text>
+ <Text>Creating OpenGL ES 3 context with config ID 1</Text>
+ <Text>  Pass</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">18528</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  Pass (Pass)
+
+Test case 'dEQP-EGL.functional.create_context.rgba8888_no_depth_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgba8888_no_depth_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgba8888_no_depth_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">2160</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.rgba8888_depth_no_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgba8888_depth_no_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgba8888_depth_no_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: { 2 }</Text>
+ <Text>Creating OpenGL ES 2 context with config ID 2</Text>
+ <Text>  Pass</Text>
+ <Text>Creating OpenGL ES 3 context with config ID 2</Text>
+ <Text>  Pass</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">18468</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  Pass (Pass)
+
+Test case 'dEQP-EGL.functional.create_context.rgba8888_depth_stencil'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.rgba8888_depth_stencil
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.rgba8888_depth_stencil" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: { 3 }</Text>
+ <Text>Creating OpenGL ES 2 context with config ID 3</Text>
+ <Text>  Pass</Text>
+ <Text>Creating OpenGL ES 3 context with config ID 3</Text>
+ <Text>  Pass</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">17954</Number>
+ <Result StatusCode="Pass">Pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  Pass (Pass)
+
+Test case 'dEQP-EGL.functional.create_context.other'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.other
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.other" Version="0.3.4" CaseType="SelfValidate">
+ <Text>Compatible configs: {  }</Text>
+ <Text>No compatible configs found at teglSimpleConfigCase.cpp:81</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">2372</Number>
+ <Result StatusCode="NotSupported">No compatible configs found at teglSimpleConfigCase.cpp:81</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  NotSupported (No compatible configs found at teglSimpleConfigCase.cpp:81)
+
+Test case 'dEQP-EGL.functional.create_context.no_config'..
+
+#beginTestCaseResult dEQP-EGL.functional.create_context.no_config
+<?xml version="1.0" encoding="UTF-8"?>
+<TestCaseResult CasePath="dEQP-EGL.functional.create_context.no_config" Version="0.3.4" CaseType="SelfValidate">
+ <Text>eglBindAPI(EGL_OPENGL_API) failed, skipping</Text>
+ <Text>Creating OpenGL ES 1 context</Text>
+ <Text>  Unsupported</Text>
+ <Text>Creating OpenGL ES 2 context</Text>
+ <Text>  Pass</Text>
+ <Text>Creating OpenGL ES 3 context</Text>
+ <Text>  Pass</Text>
+ <Text>eglBindAPI(EGL_OPENVG_API) failed, skipping</Text>
+ <Number Name="TestDuration" Description="Test case duration in microseconds" Tag="Time" Unit="us">18086</Number>
+ <Result StatusCode="Pass">pass</Result>
+</TestCaseResult>
+
+#endTestCaseResult
+  Pass (pass)
+
+DONE!
+
+Test run totals:
+  Passed:        12/27 (44.4%)
+  Failed:        0/27 (0.0%)
+  Not supported: 15/27 (55.6%)
+  Warnings:      0/27 (0.0%)
+  Waived:        0/27 (0.0%)
+
+Run took 0.24 seconds
+
+#endSession
+init: deqp-egl ended: exit code 0, not restarted
