@@ -3757,6 +3757,11 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
     ]);
     // Diagnosis of the teardown of a process: lines when its last references go.
     let traced = std::env::var_os("STAFETO_TEARDOWN_TRACE").is_some();
+    if traced {
+        println!(
+            "xtask: STAFETO_TEARDOWN_TRACE is set: the kernel is built with the feature teardown-trace"
+        );
+    }
     match (variant.feature(), traced) {
         (Some(feature), true) => cmd.args(["--features", &format!("{feature},teardown-trace")]),
         (Some(feature), false) => cmd.args(["--features", feature]),
@@ -15188,6 +15193,22 @@ fn ci_lints() -> Result<(), String> {
             "clippy::undocumented_unsafe_blocks",
         ]));
     }
+    // The diagnosis feature of the teardown (STAFETO_TEARDOWN_TRACE) builds.
+    failed.lint(cargo().args([
+        "clippy",
+        "--package",
+        "kernel",
+        "--release",
+        "--target",
+        KERNEL_TARGET,
+        "--features",
+        "teardown-trace",
+        "--",
+        "-D",
+        "warnings",
+        "-D",
+        "clippy::undocumented_unsafe_blocks",
+    ]));
     failed.finish()
 }
 

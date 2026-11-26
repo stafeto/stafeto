@@ -560,12 +560,48 @@ pub fn client_services_verdict(lines: &[String]) -> Result<String, String> {
 pub fn process_service_verdict(lines: &[String]) -> Result<String, String> {
     let mut gap = 0;
     let mut closed = (0u64, 0u64);
+    let mut waited = (0u64, 0u64);
     let mut details: Vec<(u64, u64)> = Vec::new();
     for line in lines {
         let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
             ["service", "gap:", "1", "kind", _, g, "ticks", "of", _] => {
                 gap = gap.max(g.parse::<u64>().unwrap_or(0));
+            }
+            ["posix-process:", "reaper", "highest", "level", level] => {
+                let level = level.parse::<u64>().map_err(|e| format!("{line:?}: {e}"))?;
+                if level > 31 {
+                    return Err(format!(
+                        "the reaper closed an image object at level {level}, 31 at most"
+                    ));
+                }
+            }
+            [
+                "posix-process:",
+                "reaper",
+                "waited",
+                pauses,
+                "pauses,",
+                ns,
+                "ns,",
+                "the",
+                "child",
+                "uses",
+                used,
+            ] => {
+                let (pauses, ns, used) = (
+                    pauses
+                        .parse::<u64>()
+                        .map_err(|e| format!("{line:?}: {e}"))?,
+                    ns.parse::<u64>().map_err(|e| format!("{line:?}: {e}"))?,
+                    used.parse::<u64>().map_err(|e| format!("{line:?}: {e}"))?,
+                );
+                if used > 64 * 1024 {
+                    return Err(format!(
+                        "the reaper gave up after {pauses} pauses ({ns} ns): the process still used {used} bytes"
+                    ));
+                }
+                waited = waited.max((pauses, ns));
             }
             ["posix-process:", "reaper", "level", level, ticks, "ticks"] => {
                 let (level, ticks) = (
@@ -615,9 +651,11 @@ pub fn process_service_verdict(lines: &[String]) -> Result<String, String> {
         .map(|(d, t)| format!("detail {d:#x} {t}"))
         .collect();
     Ok(format!(
-        "the process service: the widest gap {gap} ticks; the reaper's longest close {} ticks at level {}; notice steps: {}",
+        "the process service: the widest gap {gap} ticks; the reaper's longest close {} ticks at level {}, longest wait {} pauses ({} ns); notice steps: {}",
         closed.1,
         closed.0,
+        waited.0,
+        waited.1,
         rows.join(", ")
     ))
 }
@@ -1256,12 +1294,16 @@ mod tests {
             "service gap: 1 kind 64 2113 ticks of 9641".to_owned(),
             "service gap: 2 kind 64 900000 ticks of 900100".to_owned(),
             "posix-process: reaper level 28 1200000 ticks".to_owned(),
+            "posix-process: reaper highest level 28".to_owned(),
+            "posix-process: reaper waited 29 pauses, 1886650 ns, the child uses 28672".to_owned(),
             "service step: 1 kind 64 6500 ticks detail 4096".to_owned(),
             "service step: 1 kind 64 9900 ticks detail 32768".to_owned(),
         ];
         let said = process_service_verdict(&ok).unwrap();
         assert!(
-            said.contains("gap 2113") && said.contains("1200000 ticks at level 28"),
+            said.contains("gap 2113")
+                && said.contains("1200000 ticks at level 28")
+                && said.contains("longest wait 29 pauses (1886650 ns)"),
             "{said}"
         );
         assert!(
@@ -1271,9 +1313,18 @@ mod tests {
         let mut wide = ok.clone();
         wide.push("service gap: 1 kind 64 1218768 ticks of 1230164".to_owned());
         assert!(process_service_verdict(&wide).is_err());
-        let mut high = ok;
+        let mut high = ok.clone();
         high.push("posix-process: reaper level 52 10 ticks".to_owned());
         assert!(process_service_verdict(&high).is_err());
+        let mut highest = ok.clone();
+        highest.push("posix-process: reaper highest level 52".to_owned());
+        assert!(process_service_verdict(&highest).is_err());
+        let mut gave_up = ok;
+        gave_up.push(
+            "posix-process: reaper waited 100 pauses, 100000000 ns, the child uses 9932800"
+                .to_owned(),
+        );
+        assert!(process_service_verdict(&gave_up).is_err());
     }
 
     fn load_lines(cube_lag_us: u64, cube_wake_us: u64) -> Vec<String> {

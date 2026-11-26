@@ -109,9 +109,12 @@ pub struct Record<P> {
     /// The ceiling of its process.
     pub ceiling: u8,
     /// The base level of its process: the priority of its first thread at
-    /// the start (the ceiling until the service sets it). The teardown of
-    /// the process runs at this level, apart from the stages that stop its
-    /// threads and children, which run at the ceiling (spec 7.7).
+    /// the start (the ceiling until the service sets it). The service kills
+    /// the process at this level (process_kill_at), so the stages of its
+    /// teardown after those that stop its threads and children run at it
+    /// (spec 7.7: R, the level of the cause); those two stages run at the
+    /// ceiling whatever R is, and the notice of its end keeps the level of
+    /// its exit place, the ceiling (`exit_place`).
     pub level: u8,
     /// The quota and the room for handles of its process, which a child
     /// it spawns from a file gets too (5c).

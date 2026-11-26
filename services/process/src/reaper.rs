@@ -20,7 +20,8 @@
 //! service, so that the next notice wakes it before anything below. The
 //! thread's stack and message buffer are its own.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use posix_process_service::reaping::Places;
 use proto_process::IMAGES;
 use rt::handle::{Channel, Handle, Memory, Process, Thread};
 use rt::sys::Received;
@@ -31,48 +32,28 @@ static STACK: Stack<STACK_SIZE> = Stack::new();
 /// The thread's message buffer, five pages after the main thread's.
 const BUFFER: usize = abi::INIT_MSGBUF as usize + 5 * 4096;
 
-struct Place {
-    /// The place is given and not taken yet.
-    used: AtomicBool,
-    handle: AtomicU64,
-    /// The handle of the process whose end freed the object (0 for none): its
-    /// memory account is what the thread watches after the close.
-    child: AtomicU64,
-    level: AtomicU8,
-    record: AtomicU16,
-    /// The object is for the exit of the record: the loop reports its end
-    /// when the last of its objects is back.
-    exit: AtomicBool,
-    done: AtomicBool,
-}
-
-static PLACES: [Place; IMAGES] = [const {
-    Place {
-        used: AtomicBool::new(false),
-        handle: AtomicU64::new(0),
-        child: AtomicU64::new(0),
-        level: AtomicU8::new(1),
-        record: AtomicU16::new(0),
-        exit: AtomicBool::new(false),
-        done: AtomicBool::new(false),
-    }
-}; IMAGES];
+static PLACES: Places<IMAGES> = Places::new();
 /// The channel the thread waits on, the copy of the loop's channel that
 /// tells the loop (label REAPED) and the level of the service.
 static WAITS: AtomicU64 = AtomicU64::new(0);
 static TELLS: AtomicU64 = AtomicU64::new(0);
 static THREAD: AtomicU64 = AtomicU64::new(0);
 static HIGH: AtomicU8 = AtomicU8::new(1);
-/// The longest close so far, in ticks (the steps build prints a new longest).
+/// The longest close so far, in ticks, and the highest level one was made
+/// at (the steps build prints a new longest of each).
 #[cfg(feature = "steps")]
 static LONGEST: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "steps")]
+static HIGHEST: AtomicU8 = AtomicU8::new(0);
 
 /// Starts the thread in `own`, the service's process, at `level`; `tells` is
-/// the copy of the loop's channel with NOTIFY and the label REAPED. The copy
-/// of the thread's channel the loop tells it through comes back.
+/// the copy of the loop's channel with NOTIFY and the label REAPED, `exit`
+/// the one with the label of the thread's end. The copy of the thread's
+/// channel the loop tells it through comes back.
 pub fn start(
     own: &Handle<Process>,
     tells: Handle<Channel>,
+    exit: Handle<Channel>,
     level: u8,
 ) -> Result<Handle<Channel>, abi::Error> {
     let waits = sys::channel_create(level)?;
@@ -83,9 +64,19 @@ pub fn start(
     // SAFETY: STACK is the thread's alone, and the page five after the main
     // thread's buffer is free.
     let thread = unsafe {
-        sys::thread_create(own, serve, STACK.top(), 0, level, abi::Policy::Fifo, BUFFER)
+        sys::thread_create_with(
+            own,
+            serve,
+            STACK.top(),
+            0,
+            level,
+            abi::Policy::Fifo,
+            BUFFER,
+            Some((&exit, level)),
+        )
     }?;
-    // The thread lives as long as the service.
+    // The exit place holds a slot of the channel until the thread goes.
+    let _ = exit.into_raw();
     THREAD.store(thread.into_raw().0, Ordering::Release);
     sys::thread_start(&Handle::<Thread>::borrowed(abi::Handle(
         THREAD.load(Ordering::Acquire),
@@ -95,8 +86,8 @@ pub fn start(
 
 /// Gives the thread `memory` to close at `level`, for the record `record`
 /// (`exit`: its end waits for it, and `child` is the handle of its process,
-/// whose memory account the thread watches until the pages are back). The object comes back when no place is
-/// free or the thread could not be told.
+/// whose memory account the thread watches until the pages are back). The
+/// object comes back when no place is free or the thread could not be told.
 pub fn give(
     wake: &Handle<Channel>,
     memory: Handle<Memory>,
@@ -105,25 +96,20 @@ pub fn give(
     record: usize,
     exit: bool,
 ) -> Result<(), Handle<Memory>> {
-    let Some(place) = PLACES.iter().position(|p| {
-        p.used
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-    }) else {
-        return Err(memory);
-    };
-    let slot = &PLACES[place];
-    slot.done.store(false, Ordering::Release);
-    slot.child.store(child, Ordering::Release);
-    slot.level.store(level.max(1), Ordering::Release);
-    slot.record.store(record as u16, Ordering::Release);
-    slot.exit.store(exit, Ordering::Release);
     let raw = memory.into_raw().0;
-    slot.handle.store(raw, Ordering::Release);
-    if sys::notify(wake, 1 << place).is_err() {
-        slot.handle.store(0, Ordering::Release);
-        slot.used.store(false, Ordering::Release);
+    let Some(place) = PLACES.give(raw, child, level, record, exit) else {
         return Err(Handle::from_raw(abi::Handle(raw)));
+    };
+    if sys::notify(wake, 1 << place).is_err() {
+        return Err(Handle::from_raw(abi::Handle(PLACES.undo(place))));
+    }
+    // A close of a higher level than the one the thread works at lifts it
+    // (never lowers it: idle it stands at the service's level): the close it
+    // is in the middle of does not run below what waits.
+    let thread = Handle::<Thread>::borrowed(abi::Handle(THREAD.load(Ordering::Acquire)));
+    let top = PLACES.highest_open();
+    if sys::thread_info(&thread).is_ok_and(|i| i.base < top) {
+        let _ = sys::thread_set_priority(&thread, top, abi::Policy::Fifo);
     }
     Ok(())
 }
@@ -131,25 +117,21 @@ pub fn give(
 /// A place the thread is done with: the record it was given for and whether
 /// its end waits for it; the place is free again. None when no place is done.
 pub fn take() -> Option<(usize, bool)> {
-    for slot in &PLACES {
-        if slot.used.load(Ordering::Acquire) && slot.done.load(Ordering::Acquire) {
-            let taken = (
-                usize::from(slot.record.load(Ordering::Acquire)),
-                slot.exit.load(Ordering::Acquire),
-            );
-            slot.done.store(false, Ordering::Relaxed);
-            slot.used.store(false, Ordering::Release);
-            return Some(taken);
-        }
-    }
-    None
+    PLACES.take()
 }
 
 /// Whether a place is done and not taken.
 pub fn waiting() -> bool {
-    PLACES
-        .iter()
-        .any(|p| p.used.load(Ordering::Acquire) && p.done.load(Ordering::Acquire))
+    PLACES.waiting()
+}
+
+/// The thread ended: the loop closes the objects of the places it was given
+/// and had not closed, and marks them done.
+pub fn close_open() {
+    for (place, handle) in PLACES.open() {
+        drop(Handle::<Memory>::from_raw(abi::Handle(handle)));
+        PLACES.finish(place);
+    }
 }
 
 extern "C" fn serve(_: u64) -> ! {
@@ -182,13 +164,14 @@ extern "C" fn serve(_: u64) -> ! {
         }
         let place = told.trailing_zeros() as usize;
         told &= told - 1;
-        if place < PLACES.len() {
+        if place < IMAGES {
             close(place, &me, nap.as_ref(), &waits, &mut told);
         }
     }
 }
 
-/// Closes the object of `place` at its level, then tells the loop.
+/// Closes the object of `place` at the highest level among the places that
+/// wait (its own at least), then tells the loop.
 fn close(
     place: usize,
     me: &Handle<Thread>,
@@ -196,41 +179,32 @@ fn close(
     waits: &Handle<Channel>,
     told: &mut u64,
 ) {
-    let slot = &PLACES[place];
-    let raw = slot.handle.swap(0, Ordering::Acquire);
-    if raw == 0 {
+    let Some(work) = PLACES.start(place) else {
+        // A notice of a place that holds nothing: given and closed already.
         return;
-    }
-    let level = slot.level.load(Ordering::Acquire);
+    };
+    let level = work.level.max(PLACES.highest_open());
     let _ = sys::thread_set_priority(me, level, abi::Policy::Fifo);
     #[cfg(feature = "steps")]
     let began = rt::time::now();
-    drop(Handle::<Memory>::from_raw(abi::Handle(raw)));
+    drop(Handle::<Memory>::from_raw(abi::Handle(work.handle)));
     #[cfg(feature = "steps")]
     {
         let took = rt::time::now().saturating_sub(began);
         if took > LONGEST.fetch_max(took, Ordering::Relaxed) {
             rt::println!("posix-process: reaper level {level} {took} ticks");
         }
+        if level > HIGHEST.fetch_max(level, Ordering::Relaxed) {
+            rt::println!("posix-process: reaper highest level {level}");
+        }
     }
-    let child = slot.child.load(Ordering::Acquire);
     // Only the last object of a process waits for its pages: the account of
     // the process holds the others' pages until they are closed too.
-    let more = PLACES.iter().enumerate().any(|(i, p)| {
-        i != place
-            && p.used.load(Ordering::Acquire)
-            && !p.done.load(Ordering::Acquire)
-            && p.handle.load(Ordering::Acquire) != 0
-            && p.child.load(Ordering::Acquire) == child
-    }) || *told != 0
-        && PLACES
-            .iter()
-            .enumerate()
-            .any(|(i, p)| *told >> i & 1 != 0 && p.child.load(Ordering::Acquire) == child);
-    if let (Some(nap), true, false) = (nap, child != 0, more) {
-        settle(nap, child, waits, told);
+    let more = PLACES.another_open(place, work.child);
+    if let (Some(nap), true, false) = (nap, work.child != 0, more) {
+        settle(nap, work.child, level, waits, told);
     }
-    slot.done.store(true, Ordering::Release);
+    PLACES.finish(place);
     let _ = sys::thread_set_priority(me, HIGH.load(Ordering::Acquire), abi::Policy::Fifo);
     let tells = Handle::<Channel>::borrowed(abi::Handle(TELLS.load(Ordering::Acquire)));
     let _ = sys::notify(&tells, 1);
@@ -241,34 +215,38 @@ fn close(
 const SETTLED: u64 = 64 * 1024;
 /// The label of the thread's timer on its channel.
 const TIMER_LABEL: u64 = 1 << 62;
-/// The most pauses of `settle`, and one pause in nanoseconds.
-const NAPS: u32 = 100;
+/// The longest `settle` waits, and one pause, in nanoseconds.
+const SETTLE_NS: u64 = 100_000_000;
 const NAP_NS: u64 = 1_000_000;
 
 /// Waits at the thread's level until the memory account of the process
 /// `child` has what it keeps for its shell: the close queues what is left
 /// of the object and of its payer's shell at that level, and the queue
 /// runs there only when nothing above wants the CPU, so the thread pauses
-/// (1 ms at a time, 100 ms at most) and looks again. The process ends in
+/// (1 ms at a time, until 100 ms of the clock went by since it began) and
+/// looks again. It stops at once for a place of a higher level than its own:
+/// that close must not wait behind this one's pages. The process ends in
 /// the record once its pages are back.
-fn settle(nap: &Nap, child: u64, waits: &Handle<Channel>, told: &mut u64) {
+fn settle(nap: &Nap, child: u64, level: u8, waits: &Handle<Channel>, told: &mut u64) {
     let child = Handle::<Process>::borrowed(abi::Handle(child));
-    #[cfg(feature = "steps")]
-    let began = rt::time::now();
-    let mut naps = 0;
-    while naps < NAPS {
+    let began = rt::time::ticks_to_ns(rt::time::now());
+    let until = began + SETTLE_NS;
+    let mut naps = 0u32;
+    while rt::time::ticks_to_ns(rt::time::now()) < until {
         let used = sys::process_memory(&child).map_or(0, |m| m.used);
-        if used <= SETTLED || !nap.sleep(waits, told) {
+        if used <= SETTLED || PLACES.highest_open() > level || !nap.sleep(waits, told, until) {
             break;
         }
         naps += 1;
     }
     #[cfg(feature = "steps")]
     rt::println!(
-        "posix-process: reaper waited {naps} pauses, {} ticks, the child uses {}",
-        rt::time::now().saturating_sub(began),
+        "posix-process: reaper waited {naps} pauses, {} ns, the child uses {}",
+        rt::time::ticks_to_ns(rt::time::now()).saturating_sub(began),
         sys::process_memory(&child).map_or(0, |m| m.used)
     );
+    #[cfg(not(feature = "steps"))]
+    let _ = naps;
 }
 
 /// The thread's own timer, on the channel it waits on.
@@ -283,10 +261,10 @@ impl Nap {
         Ok(Nap { timer })
     }
 
-    /// Sleeps a pause on `waits`; the places told meanwhile are added to
-    /// `told`. False when the timer or the channel failed.
-    fn sleep(&self, waits: &Handle<Channel>, told: &mut u64) -> bool {
-        let deadline = rt::time::ticks_to_ns(rt::time::now()) + NAP_NS;
+    /// Sleeps a pause (not past `until`) on `waits`; the places told meanwhile
+    /// are added to `told`. False when the timer or the channel failed.
+    fn sleep(&self, waits: &Handle<Channel>, told: &mut u64, until: u64) -> bool {
+        let deadline = (rt::time::ticks_to_ns(rt::time::now()) + NAP_NS).min(until);
         if sys::timer_set(&self.timer, deadline).is_err() {
             return false;
         }

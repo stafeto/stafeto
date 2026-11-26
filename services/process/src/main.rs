@@ -223,6 +223,8 @@ const REJOINED: u64 = 1 << 63 | 0xFFFB;
 /// loop that it closed an object of an image (`reaped`), a service label no
 /// record has.
 const REAPED: u64 = 1 << 63 | 0xFFFA;
+/// The label of the exit place of the reaper's thread: its end (`reaper_gone`).
+const REAPER_EXIT: u64 = 1 << 63 | 0xFFF9;
 /// The label of the notice that makes the next portion of a Create (the
 /// service's own place, as STEP is).
 const CREATING: u64 = 1 << 63 | 0xFFFD;
@@ -323,6 +325,9 @@ struct Birth {
     flags: u32,
     pgroup: u32,
     level: u8,
+    /// A SpawnStart with a scheduling below the caller's top: the child's
+    /// ceiling is its level plus one (`proto_process::START_LOWERED`).
+    lowered: bool,
     credentials: Credentials,
     page: PageStart,
 }
@@ -658,8 +663,10 @@ fn main(_: u64) -> u64 {
     // The thread that closes the objects of images at the level of the
     // process that freed them, and the notices through which it tells the
     // loop.
-    let reaping = sys::handle_label(&channel, Rights::NOTIFY, REAPED, level)
-        .and_then(|tells| reaper::start(&start.process, tells, level));
+    let reaping = sys::handle_label(&channel, Rights::NOTIFY, REAPED, level).and_then(|tells| {
+        let exit = sys::handle_label(&channel, Rights::NOTIFY, REAPER_EXIT, level)?;
+        reaper::start(&start.process, tells, exit, level)
+    });
     match reaping {
         Ok(wake) => {
             owner.reaper_wake = Some(wake);
@@ -2165,14 +2172,8 @@ impl Processes {
             return Delivery::Done;
         }
         if signal == SIGKILL {
-            #[cfg(feature = "steps")]
-            rt::println!(
-                "process: kill of record {target}: ceiling {} level {} service level {}",
-                record.ceiling,
-                record.level,
-                self.level
-            );
             let _ = sys::process_kill_at(&record.process, record.level);
+            self.abort_exec_in_flight(target);
             return Delivery::Done;
         }
         let Some(page) = self.pages.page(target) else {
@@ -2587,6 +2588,7 @@ impl Processes {
         if signal == SIGKILL {
             if let Some(record) = self.records.get(owner) {
                 let _ = sys::process_kill_at(&record.process, record.level);
+                self.abort_exec_in_flight(owner);
             }
             return Posted::Pending;
         }
@@ -3308,6 +3310,7 @@ impl Processes {
         }
         if signal == SIGKILL {
             let _ = sys::process_kill_at(&record.process, record.level);
+            self.abort_exec_in_flight(target);
             return Delivery::Done;
         }
         let Some(page) = self.pages.page(target) else {
@@ -3577,6 +3580,7 @@ impl Processes {
             flags: start.flags,
             pgroup: start.pgroup,
             level: start.level,
+            lowered: start.sched & proto_process::START_LOWERED != 0,
             credentials: loaders::child_credentials(parent.credentials, start.flags),
             page: PageStart::Spawn {
                 mask: start.mask,
@@ -3604,6 +3608,7 @@ impl Processes {
             flags: 0,
             pgroup: 0,
             level: start.level,
+            lowered: false,
             credentials: parent.credentials,
             page: PageStart::Fork {
                 ignored: start.ignored,
@@ -3672,11 +3677,11 @@ impl Processes {
                     .is_some_and(|link| link.sid == parent.sid && link.generation == generation)
             })
         };
-        // A child that starts below the level of its parent (a spawn with a
-        // scheduling that puts it there, posix-abi `for_child`) has the level
-        // and one above it as its ceiling: all of its work, the load and the
-        // teardown among it, stays below the parent's own.
-        let ceiling = if birth.level < parent.level {
+        // A child of a spawn with a scheduling below its parent's top has its
+        // level and one above it as its ceiling: all of its work, the load
+        // and the teardown among it, stays below the parent's own. A fork
+        // and a spawn with no such scheduling keep the parent's ceiling.
+        let ceiling = if birth.lowered {
             parent.ceiling.min(birth.level.saturating_add(1))
         } else {
             parent.ceiling
@@ -5312,6 +5317,11 @@ impl Service<0> for Processes {
             self.created();
             return;
         }
+        if n.source == Source::Exit && n.label == REAPER_EXIT {
+            rt::service::step_detail(DETAIL_REAPED);
+            self.reaper_gone();
+            return;
+        }
         if n.source == Source::Session && n.label == REAPED {
             rt::service::step_detail(DETAIL_REAPED);
             self.reaped();
@@ -5356,6 +5366,17 @@ impl Service<0> for Processes {
             }
             return;
         }
+        // A loader that ended: its place and SetId go, and a SpawnStart
+        // that waited for its Boot gets AGAIN. An old image that ended
+        // before its ExecCommit, by itself or by SIGKILL, takes the new
+        // process with it, whose quota comes back to the pool. This is done
+        // before the objects go to the reaper: while the end waits for them,
+        // no ExecCommit or ExecAbort of the load finds its place, so a kill
+        // of the old image cannot lose to the commit of the new one.
+        #[cfg(feature = "image-probe")]
+        self.abort_ended_load(index, Status::from_code(proto_process::AGAIN));
+        #[cfg(not(feature = "image-probe"))]
+        self.abort_load(index, Status::from_code(proto_process::AGAIN));
         // The first part: the image objects the process used go to the
         // reaper, and its end waits for them (`reaped`); with none to close
         // the end goes on at once.
@@ -5371,6 +5392,21 @@ impl Service<0> for Processes {
 }
 
 impl Processes {
+    /// An exec of the record in `index` is in flight (its new process made, its
+    /// ExecCommit not come): the load ends, and the new process with it. SIGKILL
+    /// of the old image takes the exec with it, so the new image cannot commit
+    /// after the kill and run on.
+    fn abort_exec_in_flight(&mut self, index: usize) {
+        let exec = self
+            .loaders
+            .of(index)
+            .and_then(|slot| self.loaders.get(slot))
+            .is_some_and(|p| p.parent == index && p.held.incoming.is_some());
+        if exec {
+            self.abort_load(index, Status::from_code(proto_process::AGAIN));
+        }
+    }
+
     /// The objects of the images that went out of the table (`Images::
     /// take_freed`) go to the reaper at the base level of the record in
     /// `index`; the loop closes one itself when the thread has no place or
@@ -5390,6 +5426,16 @@ impl Processes {
             }
         }
         handed
+    }
+
+    /// The thread of the reaper ended: no more objects go to it, the loop closes
+    /// the ones it had, and the ends of the processes that waited for them go on.
+    fn reaper_gone(&mut self) {
+        self.reaper_wake = None;
+        reaper::close_open();
+        while reaper::waiting() {
+            self.reaped();
+        }
     }
 
     /// The thread of the reaper closed objects (REAPED): the end of a
@@ -5437,14 +5483,6 @@ impl Processes {
                 *slot = None;
             }
         }
-        // A loader that ended: its place and SetId go, and a SpawnStart
-        // that waited for its Boot gets AGAIN. An old image that ended
-        // before its ExecCommit, by itself or by SIGKILL, takes the new
-        // process with it, whose quota comes back to the pool.
-        #[cfg(feature = "image-probe")]
-        self.abort_ended_load(index, Status::from_code(proto_process::AGAIN));
-        #[cfg(not(feature = "image-probe"))]
-        self.abort_load(index, Status::from_code(proto_process::AGAIN));
         // The end of a session's leader takes its terminal from the
         // session (XBD 11.1.3).
         if let Some(r) = self.records.get(index)
