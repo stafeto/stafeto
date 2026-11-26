@@ -77,6 +77,18 @@ const SHOWN_PAUSE_NS: i64 = 2_000_000;
 const PAGE: u64 = 4096;
 
 static STATE: AtomicU32 = AtomicU32::new(CLOSED);
+/// Raised by each successful open and given to the caller in
+/// `struct stafeto_window.generation`: a description tells which window it
+/// is the description of, so a window closed and opened again under the same
+/// number is another one.
+static GENERATION: AtomicU32 = AtomicU32::new(0);
+/// The label of the copy of the window's channel the service holds (0 before
+/// the service took one). Each try of WINDOW_CREATE has a label of its own,
+/// so that the end of a copy the service refused (CLIENT_GONE, which the
+/// kernel posts when the last copy of a labelled handle goes) is told from
+/// the end of the copy the service kept.
+static SERVICE_LABEL: AtomicU64 = AtomicU64::new(0);
+const LABEL_BASE: u64 = 0x5749_4e44_0000;
 /// The window's session, the window's own channel and its timer (raw
 /// handles, 0 for none).
 static SESSION: AtomicU64 = AtomicU64::new(0);
@@ -329,14 +341,26 @@ fn open_window(
     // handed on.
     let mut tries = 0;
     let mut reply = loop {
-        let notify = sys::handle_duplicate(&channel(), Rights::NOTIFY | Rights::TRANSFER)
-            .map_err(memory_errno)?;
+        // A labelled copy: the kernel tells the window's channel
+        // (CLIENT_GONE, from this session's slot) when the service's last
+        // copy goes, so a compositor that ends is known to the waits.
+        let label = LABEL_BASE + u64::from(tries);
+        let notify = sys::handle_label(
+            &channel(),
+            Rights::NOTIFY | Rights::TRANSFER,
+            label,
+            level(),
+        )
+        .map_err(memory_errno)?;
         let mut request = Writer::new();
         create.write(&mut request).map_err(|_| EIO)?;
         let reply =
             call(display, request.as_bytes(), [notify.erase()].into()).map_err(errno::kernel)?;
         match status_of(&reply) {
-            Status::Ok => break reply,
+            Status::Ok => {
+                SERVICE_LABEL.store(label, Ordering::Release);
+                break reply;
+            }
             status if status == proto_gpu::code(proto_gpu::CLEARING) && tries < CLEARING_TRIES => {
                 tries += 1;
                 crate::threads::sleep::pause(CLEARING_PAUSE_NS)?;
@@ -385,13 +409,14 @@ fn open_window(
     // SAFETY: no thread but this one knows the window yet (TAKING is clear).
     unsafe { *STASH.0.get() = Taker::new() };
     ACCOUNT.store(Buffers::new(buffers as usize).raw(), Ordering::Release);
+    let generation = GENERATION.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
     Ok(Window {
         width: w,
         height: h,
         stride,
         format,
         buffers,
-        reserved: 0,
+        generation,
         pixels: [pixels[0], pixels[1], pixels[2]],
     })
 }
@@ -436,18 +461,25 @@ fn account<R>(f: impl Fn(&mut Buffers) -> R) -> Option<R> {
 const WAKE: u64 = 1 << 32;
 
 /// What the channel brought: the service's bits go to the account (and wait
-/// there for `wait`); the timer's expiries, the wake and anything else are
+/// there for `wait`); CLIENT_GONE of the service's copy of the channel marks
+/// the window gone; the timer's expiries, the wake and anything else are
 /// passed over. Whether service bits came.
 fn absorb(got: &Received) -> bool {
     if let Received::Notification {
-        source: Source::Unlabeled,
+        source: Source::Session,
+        label,
         bits,
         ..
     } = got
-        && bits & u64::from(layout::BITS) != 0
+        && *label == SERVICE_LABEL.load(Ordering::Acquire)
     {
-        account(|buffers| buffers.bits(*bits));
-        return true;
+        if bits & rt::abi::CLIENT_GONE != 0 {
+            GONE.store(true, Ordering::Release);
+        }
+        if bits & u64::from(layout::BITS) != 0 {
+            account(|buffers| buffers.bits(*bits));
+            return true;
+        }
     }
     false
 }
@@ -462,12 +494,51 @@ fn drain() {
     let own = channel();
     let mut taken = 0;
     while let Ok(got) = sys::try_receive(&own) {
+        // What a waiter may sit on: the service's notifications and a timer's
+        // expiry. A wake of another thread is not echoed.
+        let matters = matches!(
+            got,
+            Received::Notification {
+                source: Source::Session | Source::Timer,
+                ..
+            }
+        );
         absorb(&got);
-        taken += 1;
+        if matters {
+            taken += 1;
+        }
     }
     if comp_client::account::should_wake(taken, WAITING.load(Ordering::Acquire)) {
         let _ = sys::notify(&own, WAKE);
     }
+}
+
+/// `stafeto_window_info`: the window as `open` described it (its size, the
+/// bytes of a line, the format, the number of buffers and where each lies in
+/// the process) and its generation; EBADF for a number that is no open window.
+/// The values are those of the open window, and a window closed and opened
+/// again has another generation.
+pub fn info(win: i32) -> Result<Window, i32> {
+    opened(win)?;
+    let before = GENERATION.load(Ordering::Acquire);
+    let shape = |k: usize| SHAPE[k].load(Ordering::Acquire);
+    let pixel = |k: usize| PIXELS[k].load(Ordering::Acquire) as usize;
+    let window = Window {
+        width: shape(0),
+        height: shape(1),
+        stride: shape(2),
+        format: shape(3),
+        buffers: shape(4),
+        generation: before,
+        pixels: [pixel(0), pixel(1), pixel(2)],
+    };
+    // A window closed, or closed and opened again, while the description was
+    // read has another generation or none.
+    opened(win)?;
+    if GENERATION.load(Ordering::Acquire) != before {
+        return Err(EBADF);
+    }
+    Ok(window)
 }
 
 /// `stafeto_window_free`: the free buffers by the account; 0 for a window
@@ -528,19 +599,93 @@ fn send_post(buffer: u32, rects: &[layout::Rect]) -> Result<(), i32> {
     }
 }
 
+/// What a wait is for: the bits that came (`stafeto_window_wait`) or a free
+/// buffer of a mask (`stafeto_window_wait_free`).
+#[derive(Clone, Copy)]
+enum Goal {
+    Bits,
+    Free(u32),
+}
+
+/// Whether the goal is reached: the bits it takes (the pending ones, once) or
+/// the free buffers of the mask (the bits stay for the program's wait).
+fn reached(goal: Goal) -> Option<u32> {
+    let got = match goal {
+        Goal::Bits => account(|buffers| buffers.take_pending()),
+        Goal::Free(mask) => account(|buffers| buffers.free() & mask),
+    };
+    got.filter(|&bits| bits != 0)
+}
+
 /// `stafeto_window_wait`: the bits that came on the window's channel, as
 /// the header says. The wait is `fast::wait`'s: a try without waiting, the
 /// signals, the entries deferred, a receive with a timer for the bound.
 pub fn wait(win: i32, timeout_ns: u64) -> Result<u32, i32> {
+    wait_for(win, timeout_ns, Goal::Bits)
+}
+
+/// `stafeto_window_wait_free`: waits until a buffer of `mask` is free by the
+/// account and returns the free ones among them. The bits the service sent
+/// stay for `wait` (events among them). While another thread holds the wait
+/// it takes what waits on the channel without blocking and pauses, so it does
+/// not depend on that thread running. EINVAL for a mask that is empty or names
+/// a bit that is no buffer of the window. The program's own wait looks beside
+/// it in the same way while it holds the wait, so it gets no EBUSY from it.
+pub fn wait_free(win: i32, mask: u32, timeout_ns: u64) -> Result<u32, i32> {
+    opened(win)?;
+    if !comp_client::account::mask_ok(mask, SHAPE[4].load(Ordering::Acquire)) {
+        return Err(EINVAL);
+    }
+    wait_for(win, timeout_ns, Goal::Free(mask))
+}
+
+/// A free-buffer wait holds `WAITING`.
+static FREE_HELD: AtomicBool = AtomicBool::new(false);
+
+struct FreeHeld;
+
+impl FreeHeld {
+    fn set() -> FreeHeld {
+        FREE_HELD.store(true, Ordering::Release);
+        FreeHeld
+    }
+}
+
+impl Drop for FreeHeld {
+    fn drop(&mut self) {
+        FREE_HELD.store(false, Ordering::Release);
+    }
+}
+
+/// The errno of a refusal of the kernel on the window's channel: a window
+/// closed meanwhile (by another thread) is EBADF.
+fn channel_errno(win: i32) -> i32 {
+    if opened(win).is_err() { EBADF } else { EIO }
+}
+
+/// The pause of a wait beside another waiter.
+const BESIDE_PAUSE_NS: i64 = 1_000_000;
+
+fn wait_for(win: i32, timeout_ns: u64, goal: Goal) -> Result<u32, i32> {
     opened(win)?;
     alive()?;
+    let until = crate::wait::now().saturating_add(timeout_ns);
     let Some(_waiting) = Flag::take(&WAITING) else {
-        return Err(EBUSY);
+        // A free-buffer wait (a swap) holds the wait: the program's wait looks
+        // beside it as the swap looks beside the program's, so a poll never
+        // gets EBUSY from a swap. Another wait of the program still does.
+        return match goal {
+            Goal::Bits if !FREE_HELD.load(Ordering::Acquire) => Err(EBUSY),
+            _ => wait_beside(win, until, goal),
+        };
     };
+    // Held by a free-buffer wait until this call ends.
+    let _free_held = matches!(goal, Goal::Free(_)).then(FreeHeld::set);
     let own = channel();
     let timer = Handle::<Timer>::borrowed(rt::abi::Handle(TIMER.load(Ordering::Acquire)));
-    let until = crate::wait::now().saturating_add(timeout_ns);
     let block = threads::own_block();
+    // No limit (UINT64_MAX): no timer is set, the receive waits for a bit.
+    let unlimited = timeout_ns == u64::MAX;
     loop {
         // Whatever waits on the channel, without blocking.
         loop {
@@ -553,15 +698,14 @@ pub fn wait(win: i32, timeout_ns: u64) -> Result<u32, i32> {
                     crate::signals::deliver_now();
                     return Err(EINTR);
                 }
-                Err(_) => return Err(EIO),
+                Err(_) => return Err(channel_errno(win)),
             }
         }
-        if let Some(bits) = account(|buffers| buffers.take_pending())
-            && bits != 0
-        {
+        alive()?;
+        if let Some(bits) = reached(goal) {
             return Ok(bits);
         }
-        if crate::wait::now() >= until {
+        if !unlimited && crate::wait::now() >= until {
             return Err(ETIMEDOUT);
         }
         let handled = block.handled.load(Ordering::SeqCst);
@@ -569,11 +713,18 @@ pub fn wait(win: i32, timeout_ns: u64) -> Result<u32, i32> {
             crate::signals::deliver_now();
             return Err(EINTR);
         }
-        sys::timer_set(&timer, until).map_err(|_| EIO)?;
+        if !unlimited {
+            sys::timer_set(&timer, until).map_err(|_| EIO)?;
+        }
+        let cancel = || {
+            if !unlimited {
+                let _ = sys::timer_cancel(&timer);
+            }
+        };
         let guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
         if block.handled.load(Ordering::SeqCst) != handled || crate::signals::pending_unblocked() {
             drop(guard);
-            let _ = sys::timer_cancel(&timer);
+            cancel();
             crate::signals::deliver_now();
             return Err(EINTR);
         }
@@ -583,14 +734,44 @@ pub fn wait(win: i32, timeout_ns: u64) -> Result<u32, i32> {
             Ok(got) => {
                 absorb(&got);
                 // The timer is armed no more once something else came.
-                let _ = sys::timer_cancel(&timer);
+                cancel();
             }
             Err(Error::Interrupted) => {
-                let _ = sys::timer_cancel(&timer);
+                cancel();
                 crate::signals::deliver_now();
                 return Err(EINTR);
             }
-            Err(_) => return Err(EIO),
+            Err(_) => return Err(channel_errno(win)),
+        }
+    }
+}
+
+/// The wait for a free buffer while another thread holds the wait: what
+/// waits on the channel is taken without blocking (`drain` wakes the other
+/// waiter, which looks again), and a short pause follows.
+fn wait_beside(win: i32, until: u64, goal: Goal) -> Result<u32, i32> {
+    let generation = GENERATION.load(Ordering::Acquire);
+    loop {
+        opened(win)?;
+        if GENERATION.load(Ordering::Acquire) != generation {
+            return Err(EBADF);
+        }
+        drain();
+        alive()?;
+        if let Some(bits) = reached(goal) {
+            return Ok(bits);
+        }
+        if crate::wait::now() >= until {
+            return Err(ETIMEDOUT);
+        }
+        if crate::signals::pending_unblocked() {
+            crate::signals::deliver_now();
+            return Err(EINTR);
+        }
+        if let Err(errno) = crate::threads::sleep::pause(BESIDE_PAUSE_NS)
+            && errno == EINTR
+        {
+            return Err(EINTR);
         }
     }
 }
@@ -677,6 +858,7 @@ fn release() {
         drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
     }
     ACCOUNT.store(0, Ordering::Release);
+    SERVICE_LABEL.store(0, Ordering::Release);
     for cell in &PIXELS {
         cell.store(0, Ordering::Release);
     }
@@ -710,6 +892,7 @@ pub unsafe fn after_fork() {
     for cell in &PIXELS {
         cell.store(0, Ordering::Release);
     }
+    SERVICE_LABEL.store(0, Ordering::Release);
     for flag in [&GONE, &WAITING, &TAKING, &DIRTY] {
         flag.store(false, Ordering::Release);
     }

@@ -71,6 +71,25 @@ pub unsafe extern "C" fn stafeto_window_open(
     }
 }
 
+/// Describes the open window `win` in `*out`, as `stafeto_window_open` did.
+///
+/// # Safety
+/// `out` is null or points to a writable `struct stafeto_window`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_window_info(win: c_int, out: *mut Window) -> c_int {
+    if out.is_null() {
+        return fail(EINVAL);
+    }
+    match window::info(win) {
+        Ok(described) => {
+            // SAFETY: the caller's pointer, checked for null.
+            unsafe { out.write(described) };
+            0
+        }
+        Err(errno) => fail(errno),
+    }
+}
+
 /// Posts `buffer` with the `count` rectangles `r` (none: the whole window).
 ///
 /// # Safety
@@ -113,6 +132,31 @@ pub unsafe extern "C" fn stafeto_window_wait(win: c_int, timeout_ns: u64, bits: 
             if !bits.is_null() {
                 // SAFETY: the caller's pointer, checked for null.
                 unsafe { bits.write(got) };
+            }
+            0
+        }
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Waits until a buffer of `mask` is free; `*free` (null allowed) gets the
+/// free ones among them. The bits of the service stay for
+/// `stafeto_window_wait`.
+///
+/// # Safety
+/// `free` is null or points to a writable `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_window_wait_free(
+    win: c_int,
+    mask: u32,
+    timeout_ns: u64,
+    free: *mut u32,
+) -> c_int {
+    match window::wait_free(win, mask, timeout_ns) {
+        Ok(got) => {
+            if !free.is_null() {
+                // SAFETY: the caller's pointer, checked for null.
+                unsafe { free.write(got) };
             }
             0
         }

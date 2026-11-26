@@ -58,7 +58,7 @@ pub struct Window {
     pub stride: u32,
     pub format: u32,
     pub buffers: u32,
-    pub reserved: u32,
+    pub generation: u32,
     pub pixels: [usize; BUFFERS_MAX],
 }
 
@@ -92,7 +92,7 @@ const _: () = {
     assert!(offset_of!(Window, stride) == 8);
     assert!(offset_of!(Window, format) == 12);
     assert!(offset_of!(Window, buffers) == 16);
-    assert!(offset_of!(Window, reserved) == 20);
+    assert!(offset_of!(Window, generation) == 20);
     assert!(offset_of!(Window, pixels) == 24);
     assert!(size_of::<Rect>() == 16 && align_of::<Rect>() == 4);
     assert!(offset_of!(Rect, y) == 4 && offset_of!(Rect, w) == 8 && offset_of!(Rect, h) == 12);

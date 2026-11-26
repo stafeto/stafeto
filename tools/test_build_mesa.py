@@ -17,6 +17,8 @@ import importlib.util
 import io
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -34,7 +36,7 @@ CROSS = builder.cross_file(
     Path("/llvm/bin/clang"), Path("/llvm/bin/clang++"), Path("/llvm/bin/llvm-ar"),
     Path("/llvm/bin/llvm-nm"), Path("/llvm/bin/llvm-strip"), Path("/llvm/bin/llvm-ranlib"),
     Path("/work/stub/libstub.a"), sysroot=Path("/sysroot"), libcxx=Path("/libcxx"),
-    port=Path("/port"))
+    port=Path("/port"), window=Path("/window"))
 
 
 class PackageTests(unittest.TestCase):
@@ -76,7 +78,9 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(options["llvm"], "disabled")
         self.assertEqual(options["shader-cache"], "disabled")
         self.assertEqual(options["platforms"], "")
-        self.assertEqual(options["egl-native-platform"], "surfaceless")
+        # The platform of EGL_DEFAULT_DISPLAY is the one of stafeto (the windows).
+        self.assertEqual(options["platform-stafeto"], "true")
+        self.assertEqual(options["egl-native-platform"], "stafeto")
         self.assertEqual(options["cpp_eh"], "none")
         self.assertEqual(options["cpp_rtti"], "false")
         self.assertEqual(options["default_library"], "static")
@@ -105,6 +109,14 @@ class OptionTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             builder.check_options({**builder.OPTIONS, "opengl": "true"})
 
+    def test_dropping_the_platform_of_stafeto_is_refused(self):
+        options = {k: v for k, v in builder.OPTIONS.items() if k != "platform-stafeto"}
+        with self.assertRaises(SystemExit) as caught:
+            builder.check_options(options)
+        self.assertIn("platform-stafeto", str(caught.exception))
+        with self.assertRaises(SystemExit):
+            builder.check_options({**builder.OPTIONS, "egl-native-platform": "surfaceless"})
+
     def test_dropping_the_shader_cache_option_is_refused(self):
         options = {k: v for k, v in builder.OPTIONS.items() if k != "shader-cache"}
         with self.assertRaises(SystemExit) as caught:
@@ -128,6 +140,9 @@ class CrossFileTests(unittest.TestCase):
         self.assertIn("'/sysroot/include'", CROSS)
         self.assertIn("'/libcxx/include/c++/v1'", CROSS)
         self.assertIn("-I/port/include", CROSS)
+        # <stafeto/window.h>, which the platform of stafeto includes, for C and C++.
+        self.assertRegex(CROSS, r"c_args = \[[^\]]*'-I/window'")
+        self.assertRegex(CROSS, r"cpp_args = \[[^\]]*'-I/window'")
         self.assertIn("'--target=aarch64-linux-gnu'", CROSS)
         self.assertIn("'-nostdinc++'", CROSS)
 
@@ -160,7 +175,8 @@ class PatchTests(unittest.TestCase):
             names,
             ["0001-detect-os-stafeto.patch", "0002-static-targets.patch",
              "0003-c11-threads-from-the-c-library.patch",
-             "0004-softpipe-texture-caches-on-first-use.patch"])
+             "0004-softpipe-texture-caches-on-first-use.patch",
+             "0005-egl-platform-stafeto.patch"])
         for name in names:
             self.assertRegex(name, r"^\d{4}-[a-z0-9-]+\.patch$")
 
@@ -189,6 +205,11 @@ class PatchTests(unittest.TestCase):
             ["src/gallium/drivers/softpipe/sp_context.c",
              "src/gallium/drivers/softpipe/sp_state_sampler.c",
              "src/gallium/drivers/softpipe/sp_tex_tile_cache.c"])
+        self.assertEqual(
+            touched["0005-egl-platform-stafeto.patch"],
+            ["meson.build", "meson.options", "src/egl/drivers/dri2/egl_dri2.c",
+             "src/egl/drivers/dri2/egl_dri2.h", "src/egl/main/egldisplay.c",
+             "src/egl/main/egldisplay.h", "src/egl/meson.build"])
 
     def test_the_detect_os_patch_puts_stafeto_before_linux(self):
         text = (ROOT / "ports/mesa/patches/0001-detect-os-stafeto.patch").read_text()
@@ -580,6 +601,216 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("runs-on: ubuntu-24.04-arm", text)
         self.assertIn("python3 tools/build-mesa-reference.py", text)
         self.assertNotIn("pull_request", text)
+
+
+STAFETO = ROOT / "ports" / "mesa" / "stafeto"
+
+
+def host_c_compiler():
+    for name in ("cc", "clang", "gcc"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+class PlatformTests(unittest.TestCase):
+    """The platform of stafeto (ports/mesa/stafeto) and its place in the build."""
+
+    def test_the_files_the_build_copies_exist_and_the_test_file_stays_out(self):
+        self.assertEqual(builder.PLATFORM_FILES, ["platform_stafeto.c", "swap.c", "swap.h"])
+        for name in builder.PLATFORM_FILES:
+            self.assertTrue((STAFETO / name).is_file(), name)
+        self.assertNotIn("swap_test.c", builder.PLATFORM_FILES)
+        self.assertTrue((STAFETO / "swap_test.c").is_file())
+
+    def test_the_sources_are_copied_into_the_directory_of_the_dri2_platforms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            (source / builder.PLATFORM_DIR).mkdir(parents=True)
+            builder.copy_platform(source)
+            copied = sorted(p.name for p in (source / builder.PLATFORM_DIR).iterdir())
+            self.assertEqual(copied, sorted(builder.PLATFORM_FILES))
+            self.assertEqual((source / builder.PLATFORM_DIR / "swap.c").read_bytes(),
+                             (STAFETO / "swap.c").read_bytes())
+
+    def test_the_meson_build_names_the_copied_files(self):
+        text = (ROOT / "ports/mesa/patches/0005-egl-platform-stafeto.patch").read_text()
+        for name in ("platform_stafeto.c", "swap.c"):
+            self.assertIn(f"+      'drivers/dri2/{name}',", text)
+        self.assertIn("+  if get_option('platform-stafeto')", text)
+        self.assertIn("'stafeto'", text)
+
+    def test_the_window_functions_the_platform_calls_are_those_the_archive_leaves_undefined(self):
+        text = (STAFETO / "platform_stafeto.c").read_text()
+        header = (ROOT / "lib/posix-crt/window/stafeto/window.h").read_text()
+        called = set(re.findall(r"\b(stafeto_window_\w+)\(", text))
+        self.assertEqual(called, builder.WINDOW_LIBRARY)
+        for name in called:
+            self.assertRegex(header, rf"\b{name}\(")
+        self.assertEqual(builder.UNDEFINED_OK, builder.WINDOW_LIBRARY)
+
+    def test_the_names_of_the_window_library_are_no_stray(self):
+        defined = {"main"}
+        undefined = set(builder.WINDOW_LIBRARY) | {"malloc"}
+        self.assertEqual(builder.strays(undefined, {"malloc"}), [])
+        self.assertEqual(builder.strays(undefined | {"stafeto_window_open"}, {"malloc"}),
+                         ["stafeto_window_open"])
+        self.assertTrue(defined)
+
+    def test_a_window_surface_keeps_what_the_window_surface_needs(self):
+        text = (STAFETO / "platform_stafeto.c").read_text()
+        # The handle of a window is its number plus 1 (eglapi.c refuses 0).
+        self.assertIn("handle - 1", text)
+        # The configurations say the swap behaviour can be preserved, and the
+        # two formats of the window.
+        self.assertIn("EGL_SWAP_BEHAVIOR_PRESERVED_BIT", text)
+        self.assertIn("STAFETO_WINDOW_XRGB8888", text)
+        self.assertIn("STAFETO_WINDOW_ARGB8888", text)
+        # A swap in a forked child.
+        self.assertIn("getpid()", text)
+        # The copy keeps the rows of the driver's picture (flip 0): the picture of
+        # a window-system framebuffer is top-down already. The guest checks the
+        # orientation against glReadPixels (a planted flip 1 fails it; swap_test.c
+        # holds the same fault for the host).
+        self.assertIn("BYTES_PER_POINT, 0, s->copy)", text)
+        # The wait for a free buffer takes no bit from the program's wait.
+        self.assertIn("stafeto_window_wait_free(", text)
+        self.assertNotIn("stafeto_window_wait(", text)
+        self.assertNotIn("stafeto_window_free_buffers(", text)
+        # The swap is no cancellation point.
+        self.assertIn("PTHREAD_CANCEL_DISABLE", text)
+        # A window has no images: the loader answers 0 for its buffers.
+        self.assertRegex(text, r"EGL_WINDOW_BIT\)\s+return 0;")
+
+
+@unittest.skipIf(host_c_compiler() is None, "no C compiler on the host")
+class SwapTests(unittest.TestCase):
+    """The tests of swap.c, built and run by the host's compiler."""
+
+    def build(self, directory, extra=(), swap_c=None):
+        out = Path(directory) / "swap_test"
+        source = swap_c or STAFETO / "swap.c"
+        result = subprocess.run(
+            [host_c_compiler(), "-std=c11", "-Wall", "-Wextra", "-Werror", "-O1", *extra,
+             f"-I{STAFETO}", str(source), str(STAFETO / "swap_test.c"), "-o", str(out)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return out
+
+    def run_tests(self, binary):
+        return subprocess.run([str(binary)], capture_output=True, text=True)
+
+    def test_the_tests_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_tests(self.build(tmp))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        passed = [line for line in result.stdout.splitlines() if line.startswith("ok ")]
+        self.assertGreaterEqual(len(passed), 20)
+        self.assertFalse([l for l in result.stdout.splitlines() if l.startswith("FAIL")])
+
+    def planted(self, old, new, name):
+        text = (STAFETO / "swap.c").read_text()
+        self.assertEqual(text.count(old), 1, old)
+        with tempfile.TemporaryDirectory() as tmp:
+            broken = Path(tmp) / "swap.c"
+            broken.write_text(text.replace(old, new))
+            result = self.run_tests(self.build(tmp, swap_c=broken))
+        self.assertNotEqual(result.returncode, 0, name)
+        return result.stdout
+
+    def test_a_rectangle_not_turned_over_fails_the_test_of_the_corners(self):
+        out = self.planted("long long y = (long long)height - ((long long)r.y + r.h);",
+                           "long long y = r.y + 0 * (long long)height;", "no flip of the height")
+        self.assertIn("FAIL test_gl_rectangle_is_turned_over", out)
+
+    def test_a_buffer_that_lacks_the_last_frames_only_fails_the_age_tests(self):
+        out = self.planted("plan->copy = swap_rect_union(h->pending[buffer], box);",
+                           "plan->copy = box;", "the damage of earlier frames forgotten")
+        self.assertIn("FAIL test_two_buffers_copy_the_damage_of_two_frames", out)
+
+    def test_a_copy_that_does_not_stop_at_the_source_fails(self):
+        out = self.planted("long long x1 = MIN((long long)r.x + r.w, (long long)covered.x + covered.w);",
+                           "long long x1 = (long long)r.x + r.w;", "no clip to the source")
+        self.assertIn("FAIL test_blit_stops_at_the_sources_edge", out)
+
+    def test_the_tests_run_under_the_sanitizers(self):
+        compiler = host_c_compiler()
+        probe = subprocess.run([compiler, "-fsanitize=address,undefined", "-x", "c", "-", "-o", "/dev/null"],
+                               input="int main(void){return 0;}", capture_output=True, text=True)
+        if probe.returncode != 0:
+            self.skipTest("the host's compiler has no sanitizers")
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_tests(self.build(tmp, extra=("-fsanitize=address,undefined",)))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+def clang_tool(name):
+    brew = Path("/opt/homebrew/opt/llvm/bin") / name
+    return str(brew) if brew.exists() else shutil.which(name)
+
+
+KHRONOS = ROOT / "target" / "mesa" / "include"
+OPENWF = ROOT / "ports" / "openwf" / "include"
+JOINT = """\
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <WF/wfc.h>
+#include <WF/wfd.h>
+#include <GLES2/gl2.h>
+#include <GLES3/gl3.h>
+%s
+int main(void)
+{
+    EGLDisplay d = EGL_NO_DISPLAY;
+    EGLSyncKHR s = (EGLSyncKHR)0;
+    WFCDevice c = WFC_INVALID_HANDLE;
+    WFDDevice w = WFD_INVALID_HANDLE;
+    (void)d; (void)s; (void)c; (void)w;
+    return 0;
+}
+"""
+
+
+class JointHeaderTests(unittest.TestCase):
+    """EGL's headers with OpenWF's in one program, in C and C++: the types the
+    three declare alike (EGLDisplay, EGLSyncKHR, EGLImageKHR) repeat without
+    a conflict, and the macros OpenWF defines for itself meet the real
+    khrplatform.h."""
+
+    def setUp(self):
+        if not (KHRONOS / "EGL" / "egl.h").exists():
+            self.skipTest("no headers of Khronos: build Mesa first (cargo xtask mesa)")
+        if clang_tool("clang") is None:
+            self.skipTest("no clang")
+
+    def compile(self, program, language, standard, source):
+        result = subprocess.run(
+            [clang_tool(program), "--target=aarch64-linux-gnu", "-ffreestanding", "-pedantic",
+             "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-x", language, f"-std={standard}",
+             f"-I{KHRONOS}", f"-I{OPENWF}", "-"],
+            input=source, capture_output=True, text=True)
+        return result
+
+    def test_the_headers_compile_together_in_every_standard(self):
+        for program, language, standard in (
+                ("clang", "c", "c99"), ("clang", "c", "c11"), ("clang", "c", "c17"),
+                ("clang++", "c++", "c++11"), ("clang++", "c++", "c++17")):
+            result = self.compile(program, language, standard, JOINT % "")
+            self.assertEqual(result.returncode, 0, f"{standard}: {result.stderr}")
+
+    def test_the_order_of_the_headers_does_not_matter(self):
+        reverse = JOINT.replace("#include <EGL/egl.h>\n#include <EGL/eglext.h>\n", "") \
+                       .replace("#include <GLES2/gl2.h>", "#include <EGL/egl.h>\n#include <EGL/eglext.h>\n#include <GLES2/gl2.h>")
+        for program, language, standard in (("clang", "c", "c11"), ("clang++", "c++", "c++17")):
+            result = self.compile(program, language, standard, reverse % "")
+            self.assertEqual(result.returncode, 0, f"{standard}: {result.stderr}")
+
+    def test_a_clashing_type_would_fail(self):
+        # The planted fault: an EGLDisplay of another type is refused.
+        clash = JOINT % "typedef int EGLDisplay;"
+        result = self.compile("clang", "c", "c11", clash)
+        self.assertNotEqual(result.returncode, 0)
 
 
 class VersionTests(unittest.TestCase):

@@ -10,7 +10,7 @@
 //! linked in, is 10 MiB or more.
 
 use super::ramfs::{PIPE, POSIX, POSIX_ABI_TABLE, RAM_FIFO_CLOCKED};
-use super::{Record, entropy};
+use super::{Record, comp, entropy};
 use crate::PAGE;
 
 /// The cube's quota: 128 MiB.
@@ -30,6 +30,35 @@ pub const PBUFFER_TABLE: &[Record] = &[
         program: "gles-cube",
         args: b"gles-cube\0--pbuffer\0--ascii\0\x33\0",
         connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
+        root: true,
+        quota: CUBE_QUOTA,
+        ..POSIX
+    },
+    entropy::RNG,
+    entropy::ENTROPY,
+];
+
+/// The window probe (xtask gles-window): the services of the POSIX probes, the
+/// display driver and the compositor (under the name `gpu`, which the cube's
+/// place `Display` meets) and the cube, which starts its own file once: the
+/// copy that draws makes a window, forks and swaps into it. The pool of the
+/// process service holds the quota of the copy a spawn makes and of the child
+/// of its fork, 128 MiB each.
+pub const WINDOW_TABLE: &[Record] = &[
+    RAM_FIFO_CLOCKED,
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 2 * CUBE_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    comp::DISPLAY,
+    comp::COMPOSITOR,
+    Record {
+        name: "gles-cube",
+        program: "gles-cube",
+        args: b"gles-cube\0--window\0--size\0\x31\x36\x30\0--frames\0\x36\0",
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy", "gpu"],
         root: true,
         quota: CUBE_QUOTA,
         ..POSIX

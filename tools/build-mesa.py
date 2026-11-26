@@ -37,9 +37,14 @@ What the build is (the decisions that belong to stafeto, plan G8 section 4):
     mutexes and condition variables;
   - the drivers: softpipe only, no LLVM, no desktop OpenGL (`opengl=false`:
     with it on, libGL and libGLESv2 hold the same names and the link of a
-    program fails with duplicates), no GLX, no GBM, no platforms (the platform
-    of EGL is surfaceless, the one without a window; the program asks for the
-    software path with LIBGL_ALWAYS_SOFTWARE=1);
+    program fails with duplicates), no GLX, no GBM, no platforms of Mesa's own.
+    The platform of EGL for EGL_DEFAULT_DISPLAY is the one of stafeto
+    (`platform-stafeto=true`, `egl-native-platform=stafeto`): its sources are
+    ports/mesa/stafeto/platform_stafeto.c and swap.c, copied into
+    src/egl/drivers/dri2 before meson runs, the windows of the composition
+    service as the windows of EGL, drawn by softpipe with no device and no
+    LIBGL_ALWAYS_SOFTWARE; the platform surfaceless stays reachable through
+    eglGetPlatformDisplay (pbuffers only);
   - C++ in Mesa (the GLSL compiler) is built without exceptions and run-time
     type information, so the runtime it needs is the libc++ of the program;
   - the targets of meson are static libraries and are merged into one
@@ -88,6 +93,16 @@ CACHE = ROOT / "target" / "mesa-src"
 RELIBC = ROOT / "target" / "relibc" / "sysroot"
 LIBCXX = ROOT / "target" / "libcxx"
 PORT = ROOT / "ports" / "mesa"
+# <stafeto/window.h>, which the platform of stafeto includes.
+WINDOW_INCLUDE = ROOT / "lib" / "posix-crt" / "window"
+# The files of ports/mesa/stafeto that the build copies into the tree of Mesa,
+# and where (the platform of stafeto and the arithmetic of its swaps).
+PLATFORM_FILES = ["platform_stafeto.c", "swap.c", "swap.h"]
+PLATFORM_DIR = Path("src") / "egl" / "drivers" / "dri2"
+# The functions of the window library (<stafeto/window.h>) the platform calls:
+# the program links them (the feature `window` of posix-crt), so the archive
+# leaves them undefined.
+WINDOW_LIBRARY = {"stafeto_window_info", "stafeto_window_post", "stafeto_window_wait_free"}
 # The Python packages the generators of Mesa import, and meson for a host
 # whose own is older than MESON_MINIMUM: requirements files with the hashes of
 # the wheels (the versions are in them and in the stamp).
@@ -109,7 +124,8 @@ OPTIONS = {
     "gallium-drivers": "softpipe",
     "vulkan-drivers": "",
     "platforms": "",
-    "egl-native-platform": "surfaceless",
+    "platform-stafeto": "true",
+    "egl-native-platform": "stafeto",
     "egl": "enabled",
     "gles1": "disabled",
     "gles2": "enabled",
@@ -143,7 +159,8 @@ REQUIRED = {
     "shader-cache": "disabled",
     "glvnd": "disabled",
     "platforms": "",
-    "egl-native-platform": "surfaceless",
+    "platform-stafeto": "true",
+    "egl-native-platform": "stafeto",
     "default_library": "static",
     "cpp_eh": "none",
     "cpp_rtti": "false",
@@ -229,8 +246,8 @@ PUBLIC_DOMAIN = [
      "src/util/fast_idiv_by_const.c", "/* Imported from:"),
 ]
 # Names the library may leave undefined besides the C library's and the C++
-# runtime's: none.
-UNDEFINED_OK: set[str] = set()
+# runtime's: the window library's.
+UNDEFINED_OK: set[str] = set(WINDOW_LIBRARY)
 
 
 def tool(name: str, brew_formula: str | None = None) -> Path:
@@ -274,17 +291,19 @@ def quote(items: list[str]) -> str:
 
 
 def cross_file(clang: Path, clangxx: Path, ar: Path, nm: Path, strip: Path, ranlib: Path,
-               stub: Path, sysroot: Path = RELIBC, libcxx: Path = LIBCXX, port: Path = PORT) -> str:
+               stub: Path, sysroot: Path = RELIBC, libcxx: Path = LIBCXX, port: Path = PORT,
+               window: Path = WINDOW_INCLUDE) -> str:
     """The cross file of meson. The compilers target aarch64-linux-gnu with
     the headers of relibc and, for C++, of libc++; `__stafeto__` is defined
     for both (detect_os.h of Mesa); alloca.h is included in every C file
     because relibc declares `alloca` only there; the link arguments hold the
-    stub archive of the C library's names."""
+    stub archive of the C library's names; <stafeto/window.h> is found in
+    `window`."""
     target = ["--target=aarch64-linux-gnu", *TARGET_FLAGS]
-    common = ["-D__stafeto__=1", "-include", "alloca.h", f"-I{port / 'include'}", "-nostdlibinc",
-              "-isystem", str(sysroot / "include")]
-    cpp = ["-D__stafeto__=1", "-include", "alloca.h", f"-I{port / 'include'}", "-nostdlibinc",
-           "-nostdinc++", "-isystem", str(libcxx / "include" / "c++" / "v1"),
+    common = ["-D__stafeto__=1", "-include", "alloca.h", f"-I{port / 'include'}", f"-I{window}",
+              "-nostdlibinc", "-isystem", str(sysroot / "include")]
+    cpp = ["-D__stafeto__=1", "-include", "alloca.h", f"-I{port / 'include'}", f"-I{window}",
+           "-nostdlibinc", "-nostdinc++", "-isystem", str(libcxx / "include" / "c++" / "v1"),
            "-isystem", str(sysroot / "include")]
     link = ["-fuse-ld=lld", "-static", "-nostdlib", "-nostartfiles", str(stub),
             "-Wl,--entry=main", "-Wl,--no-gc-sections"]
@@ -472,6 +491,13 @@ def apply_patches(source: Path, log: Path, port: Path = PORT) -> None:
         run(log, "patch", "-p1", "-N", "--no-backup-if-mismatch", "-s", "-i", patch, cwd=source)
 
 
+def copy_platform(source: Path, port: Path = PORT) -> None:
+    """The sources of the platform of stafeto into the tree (the meson.build
+    that the patches change names them)."""
+    for name in PLATFORM_FILES:
+        shutil.copy(port / "stafeto" / name, source / PLATFORM_DIR / name)
+
+
 def ensure_venv(files: list[Path], log: Path) -> Path:
     """The bin directory of the venv in target/mesa/venv with exactly what
     the requirements files name, installed by their hashes (made again when
@@ -609,6 +635,7 @@ def main() -> None:
     cache.mkdir(exist_ok=True)
     shutil.copy(libdrm_archive, cache / libdrm_archive.name)
     apply_patches(source, log)
+    copy_platform(source)
     # The stub of the C library's names, for meson's link probes.
     names = (archive_names(nm, RELIBC / "lib" / "libc.a")
              | archive_names(nm, RELIBC / "lib" / "libm.a"))
