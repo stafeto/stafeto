@@ -732,11 +732,11 @@ const DRIVER_KINDS: [(usize, &str); 6] = [
     (65, "the interrupt"),
 ];
 
-type Rows = Vec<(usize, u64, u64)>;
+pub(crate) type Rows = Vec<(usize, u64, u64)>;
 
 /// The steps of one service: every kind came, every row is under STEP_MAX and the
 /// rows of its own kind under PORTION_MAX.
-fn rows_of(
+pub(crate) fn rows_of(
     lines: &[String],
     tag: &str,
     name: &str,

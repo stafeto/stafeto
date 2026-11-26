@@ -165,6 +165,13 @@ screenshots need. The probe also judges the service's counters (no frame failed,
 bands grow, C is a frame shown straight), the trace of the display device and,
 under -icount, the longest steps of the compositor and the driver.
 
+With `--gles` (`cargo xtask gles-probe`, `table-gles`) the demo shows what Mesa
+draws: it starts `gles-cube` and `gles3-demo` (`docs/egl.md`), takes the stream of
+each window of EGL as the source of an element (the stream `eglSwapBuffers` fills
+is a window of the composition service), and commits the scene that turns the cube's
+window by 90 degrees and scales it by one half beside the field of cubes.
+`tools/wfc-ref` (`gles_frame`) draws that scene from the two windows' points.
+
 The demo goes on to check the API on the way: the calls before a device, the
 device and its attributes, a second device, the context and its refusals, the
 streams and sources, the defaults and refusals of an element, the order of the
