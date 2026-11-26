@@ -2407,13 +2407,14 @@ impl Driver<'_> {
             get(&st.park_given)
         );
         rt::println!(
-            "net: switch left {} looped {} budget_waits {} sum_tx {} sum_rx {} sum_soft {}",
+            "net: switch left {} looped {} budget_waits {} sum_tx {} sum_rx {} sum_soft {} sweeping {}",
             get(&st.left),
             get(&st.looped),
             get(&st.budget_waits),
             get(&st.sum_tx),
             get(&st.sum_rx),
-            get(&st.sum_soft)
+            get(&st.sum_soft),
+            self.side.blocks.pending_sweep()
         );
         let drops: [u32; 7] = core::array::from_fn(|i| get(&st.drops[i]));
         let refused: [u32; netd::switchlogic::route::Reason::COUNT] =

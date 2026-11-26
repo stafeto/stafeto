@@ -402,7 +402,10 @@ fn ask_attach(service: &Handle<Channel>, ring: &Handle<Memory>, label: u64) -> A
     match sw::Attached::read(reply.bytes(&mut buffer)) {
         Ok(attached) => Ok((attached, reply.handles.take::<Channel>(0).ok())),
         Err(status) => {
-            dbg(format_args!("fast: ATTACH refused: {status:?}\n"));
+            // SWEEPING is asked again (`attach` says so once and says the refusal if it ends).
+            if status.code() != proto_net::SWEEPING {
+                dbg(format_args!("fast: ATTACH refused: {status:?}\n"));
+            }
             Err((attach_refusal(status), Some(status)))
         }
     }
@@ -417,6 +420,8 @@ fn attach_refusal(status: Status) -> i32 {
         _ => match status.code() {
             proto_net::INVALID => NO_SWITCH,
             proto_net::NET_DOWN => ENETDOWN,
+            // After `sw::SWEEP_WAIT_NS` of asks: the table is larger than the default.
+            proto_net::SWEEPING => EBUSY,
             _ => refusal(status),
         },
     }
@@ -442,14 +447,33 @@ pub fn attach(out: &mut FastClaim) -> Result<(), i32> {
     let pages = layout.total() / PAGE;
     let ring = sys::mem_create(layout.total() as u64).map_err(|_| ENOMEM)?;
     let started = crate::wait::now();
+    let mut noted = false;
     let (attached, switch) = loop {
         let label = FAST_LABEL | (TRY.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff);
         match ask_attach(&service, &ring, label) {
             Ok(got) => {
                 posix_sync::receiver::activate(label);
+                dbg(format_args!(
+                    "fast: ATTACH ok consumer {} generation {}\n",
+                    got.0.consumer, got.0.generation
+                ));
                 break got;
             }
             Err((ENETDOWN, _)) if crate::wait::now() < started + ADDRESS_WAIT_NS => {}
+            Err((_, Some(status)))
+                if sw::attach_again(status, crate::wait::now().saturating_sub(started)) =>
+            {
+                if !noted {
+                    noted = true;
+                    dbg(format_args!("fast: ATTACH waits for the sweep\n"));
+                }
+            }
+            Err((errno, Some(status))) if status.code() == proto_net::SWEEPING => {
+                dbg(format_args!(
+                    "fast: ATTACH refused: {status:?} after the wait\n"
+                ));
+                return Err(errno);
+            }
             Err((errno, _)) => return Err(errno),
         }
         pause(crate::wait::now() + RETRY_NS, true)?;

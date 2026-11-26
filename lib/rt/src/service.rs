@@ -1005,19 +1005,28 @@ mod steps {
         // of the loop pays for it.
         LONGEST.record(kind, took, detail, n_preempt);
         if took > KIND_LONGEST[kind].fetch_max(took, Ordering::Relaxed) && printing {
-            // The count is left out when it is 0 (most steps): a reader takes a missing count as
-            // 0, and the console, which is slow, has less to write.
+            // The detail and the count are left out when they are 0 (most steps): a reader
+            // takes a missing word as 0, and the console, which is slow, has less to write.
+            // The console sends a line of up to 64 bytes (the newline included) as one piece
+            // (`console`), and the kernel owning the console writes pieces as they come, so a
+            // line within one piece cannot be cut by the line of another writer. With a tag of
+            // 2 digits, a kind of 2 and a time of 6 digits the line is 37 bytes up to `ticks`;
+            // ` preempts 1` makes 48 and ` wall 123456` 60 (61 with the newline), within the
+            // piece. A detail above 0 adds 10 bytes (` detail 64`): 58 without a wall and 70
+            // with one, so only a step that has both a detail and a wall can span two pieces,
+            // and the readers of a console take a marker inside a line for that case.
+            let d = crate::service::StepDetail(detail);
             if wall > took {
                 // The step's whole time less its waits, when the thread's CPU time is the
                 // shorter of the two: the line shows both.
                 crate::println!(
-                    "service step: {tag} kind {kind} {took} ticks detail {detail} preempts {n_preempt} wall {wall}"
+                    "service step: {tag} kind {kind} {took} ticks{d} preempts {n_preempt} wall {wall}"
                 );
             } else if n_preempt == 0 {
-                crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
+                crate::println!("service step: {tag} kind {kind} {took} ticks{d}");
             } else {
                 crate::println!(
-                    "service step: {tag} kind {kind} {took} ticks detail {detail} preempts {n_preempt}"
+                    "service step: {tag} kind {kind} {took} ticks{d} preempts {n_preempt}"
                 );
             }
         }
@@ -1202,6 +1211,21 @@ pub fn step_detail(value: u64) {
 /// (`Token::reply_receive_handles`): its token, its bytes (up to MESSAGE_MAX)
 /// and its handles. The loop owns one slot and each request fills it, so no
 /// reply is copied again on its way.
+/// ` detail D` of a step line when D is above 0; nothing when it is 0.
+#[cfg(feature = "step-stats")]
+pub(crate) struct StepDetail(pub(crate) u64);
+
+#[cfg(feature = "step-stats")]
+impl core::fmt::Display for StepDetail {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 == 0 {
+            Ok(())
+        } else {
+            write!(f, " detail {}", self.0)
+        }
+    }
+}
+
 struct Owed {
     /// Whether a reply waits for the next receive (`Service::OWES_REPLY`).
     #[cfg_attr(feature = "step-stats", allow(dead_code))]

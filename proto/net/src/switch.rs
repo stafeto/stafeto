@@ -6,7 +6,7 @@
 //!
 //! | Method | Request | Reply |
 //! |---|---|---|
-//! | ATTACH (39) | version (u32, `VERSION`), `rx_slots`, `tx_slots`, cell size (u32 each); two handles: the ring object (MAP_READ, MAP_WRITE) and a copy of the caller thread's channel (NOTIFY) with the label it wants | status, `Attached` (the last word says whether the device offloads the TCP sums: only then may a TX entry say `TX_SUM`); one handle: a copy of the switch thread's channel (NOTIFY alone) with the consumer's label. LIMIT_REACHED (no place, or the session has a consumer), INVALID (sizes, rights, the object is smaller than the layout), NET_DOWN (no address) |
+//! | ATTACH (39) | version (u32, `VERSION`), `rx_slots`, `tx_slots`, cell size (u32 each); two handles: the ring object (MAP_READ, MAP_WRITE) and a copy of the caller thread's channel (NOTIFY) with the label it wants | status, `Attached` (the last word says whether the device offloads the TCP sums: only then may a TX entry say `TX_SUM`); one handle: a copy of the switch thread's channel (NOTIFY alone) with the consumer's label. LIMIT_REACHED (no place, or the session has a consumer), SWEEPING (no number is usable yet, and some wait for the sweep of the flow table: ask again), INVALID (sizes, rights, the object is smaller than the layout), NET_DOWN (no address) |
 //! | PORT_HOLD (38) | protocol (u32, 6 or 17), first port, count (1..=`HOLD_MAX`), flags (u32, `REUSEPORT`); a handle: a copy of the identity session | status, place (u32, as SOCKET's description). NOT_ALLOWED (below 1024 without the superuser), IN_USE (the port is held), LIMIT_REACHED (no group) |
 //! | JOIN (40) | place (u32) | status. INVALID (the session has no consumer, or no such place) |
 //!
@@ -28,6 +28,23 @@ use crate::{Config, Method};
 use proto_wire::{Reader, Status, Writer};
 
 pub const VERSION: u32 = 3;
+
+/// How long a consumer asks ATTACH again while the service answers SWEEPING: every consumer
+/// number that is free waits for the sweep of the flow table, which ends the old flows of the
+/// consumer that held it, and a number comes back once the sweep has gone over the table twice
+/// since the switch detached it. The table has 16 384 places by default and a step of the sweep
+/// looks at 128 of them, one step in 100 ms when the line is quiet: a round is 128 steps, 12.8 s,
+/// two rounds 25.6 s at the most, and the answers between the stack and the switch take
+/// milliseconds. 30 s covers that with a margin of 4.4 s; the rounds are faster under load. A
+/// table configured above the default can need more: the consumer then takes the refusal as
+/// LIMIT_REACHED was taken before the status existed.
+pub const SWEEP_WAIT_NS: u64 = 30_000_000_000;
+
+/// Whether a consumer asks ATTACH again after the refusal `status`, `waited` nanoseconds after
+/// its first ask: for SWEEPING within `SWEEP_WAIT_NS`.
+pub fn attach_again(status: Status, waited: u64) -> bool {
+    status.code() == crate::SWEEPING && waited < SWEEP_WAIT_NS
+}
 pub const PAGE: usize = 4096;
 pub const LINE: usize = 64;
 /// The bytes of a cell and the longest frame in it.
@@ -477,6 +494,17 @@ pub fn read_join(mut body: Reader<'_>) -> Result<u32, Status> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attach_asks_again_for_a_sweeping_number_within_the_bound_only() {
+        let sweeping = crate::code(crate::SWEEPING);
+        assert!(attach_again(sweeping, 0));
+        assert!(attach_again(sweeping, SWEEP_WAIT_NS - 1));
+        assert!(!attach_again(sweeping, SWEEP_WAIT_NS));
+        assert!(!attach_again(crate::LIMIT, 0));
+        assert!(!attach_again(Status::UnknownMethod, 0));
+        assert!(!attach_again(crate::code(crate::NET_DOWN), 0));
+    }
+
     use super::*;
     use proto_wire::Header;
 
