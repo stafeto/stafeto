@@ -3334,7 +3334,7 @@ static int proc_descriptions(void) {
 #include "pshared-key.c"
 
 /* A child that execs its own file again and again: a SIGKILL that lands in the middle of
- * one exec must end the process, not lose to the new image's ExecCommit. */
+ * one exec must end the process: the new image's ExecCommit finds no load to commit. */
 static int execloop_role(void) {
     for (;;) {
         char *argv[] = {"procs-child", "execloop", NULL};
