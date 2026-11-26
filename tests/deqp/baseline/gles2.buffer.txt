@@ -1,0 +1,57 @@
+# provisional: made in an arm64 Linux container on a Mac not on a runner
+# dEQP baseline of the set gles2.buffer (cargo xtask deqp-reference gles2.buffer)
+# module deqp-gles2, platform surfaceless, patterns dEQP-GLES2.functional.buffer.*
+# VK-GL-CTS opengl-es-cts-3.2.14.1 (067e8832315e79817ede1c4863804e440f5d1c80)
+# Mesa 26.3.1 softpipe, shared libraries, clang
+# machine Linux 6.12.76-linuxkit aarch64
+# arguments --deqp-surface-type=pbuffer --deqp-surface-width=256 --deqp-surface-height=256 --deqp-gl-config-name=rgba8888d24s8ms0 --deqp-visibility=hidden --deqp-log-images=disable --deqp-log-shader-sources=disable
+# 49 cases: 49 pass, 0 fail, 0 not supported, 0 other, in 1 s
+dEQP-GLES2.functional.buffer.write.basic.array_dynamic_draw Pass
+dEQP-GLES2.functional.buffer.write.basic.array_static_draw Pass
+dEQP-GLES2.functional.buffer.write.basic.array_stream_draw Pass
+dEQP-GLES2.functional.buffer.write.basic.element_array_dynamic_draw Pass
+dEQP-GLES2.functional.buffer.write.basic.element_array_static_draw Pass
+dEQP-GLES2.functional.buffer.write.basic.element_array_stream_draw Pass
+dEQP-GLES2.functional.buffer.write.basic_subdata.array_dynamic_draw Pass
+dEQP-GLES2.functional.buffer.write.basic_subdata.array_static_draw Pass
+dEQP-GLES2.functional.buffer.write.basic_subdata.array_stream_draw Pass
+dEQP-GLES2.functional.buffer.write.basic_subdata.element_array_dynamic_draw Pass
+dEQP-GLES2.functional.buffer.write.basic_subdata.element_array_static_draw Pass
+dEQP-GLES2.functional.buffer.write.basic_subdata.element_array_stream_draw Pass
+dEQP-GLES2.functional.buffer.write.partial_specify.high_1 Pass
+dEQP-GLES2.functional.buffer.write.partial_specify.high_2 Pass
+dEQP-GLES2.functional.buffer.write.partial_specify.high_3 Pass
+dEQP-GLES2.functional.buffer.write.partial_specify.low_1 Pass
+dEQP-GLES2.functional.buffer.write.partial_specify.low_2 Pass
+dEQP-GLES2.functional.buffer.write.partial_specify.low_3 Pass
+dEQP-GLES2.functional.buffer.write.partial_specify.middle_1 Pass
+dEQP-GLES2.functional.buffer.write.partial_specify.middle_2 Pass
+dEQP-GLES2.functional.buffer.write.partial_specify.middle_3 Pass
+dEQP-GLES2.functional.buffer.write.partial_specify.whole_1 Pass
+dEQP-GLES2.functional.buffer.write.partial_specify.whole_2 Pass
+dEQP-GLES2.functional.buffer.write.partial_specify.whole_3 Pass
+dEQP-GLES2.functional.buffer.write.partial_specify.whole_4 Pass
+dEQP-GLES2.functional.buffer.write.random.0 Pass
+dEQP-GLES2.functional.buffer.write.random.1 Pass
+dEQP-GLES2.functional.buffer.write.random.2 Pass
+dEQP-GLES2.functional.buffer.write.random.3 Pass
+dEQP-GLES2.functional.buffer.write.random.4 Pass
+dEQP-GLES2.functional.buffer.write.random.5 Pass
+dEQP-GLES2.functional.buffer.write.random.6 Pass
+dEQP-GLES2.functional.buffer.write.random.7 Pass
+dEQP-GLES2.functional.buffer.write.random.8 Pass
+dEQP-GLES2.functional.buffer.write.random.9 Pass
+dEQP-GLES2.functional.buffer.write.recreate_store.different_size Pass
+dEQP-GLES2.functional.buffer.write.recreate_store.different_target_1 Pass
+dEQP-GLES2.functional.buffer.write.recreate_store.different_target_2 Pass
+dEQP-GLES2.functional.buffer.write.recreate_store.different_usage Pass
+dEQP-GLES2.functional.buffer.write.recreate_store.identical_1 Pass
+dEQP-GLES2.functional.buffer.write.recreate_store.identical_2 Pass
+dEQP-GLES2.functional.buffer.write.recreate_store.random_1 Pass
+dEQP-GLES2.functional.buffer.write.recreate_store.random_2 Pass
+dEQP-GLES2.functional.buffer.write.recreate_store.random_3 Pass
+dEQP-GLES2.functional.buffer.write.recreate_store.random_4 Pass
+dEQP-GLES2.functional.buffer.write.use.index_array.array Pass
+dEQP-GLES2.functional.buffer.write.use.index_array.element_array Pass
+dEQP-GLES2.functional.buffer.write.use.vertex_array.array Pass
+dEQP-GLES2.functional.buffer.write.use.vertex_array.element_array Pass

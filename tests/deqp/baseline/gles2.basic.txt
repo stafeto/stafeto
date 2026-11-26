@@ -1,0 +1,57 @@
+# provisional: made in an arm64 Linux container on a Mac not on a runner
+# dEQP baseline of the set gles2.basic (cargo xtask deqp-reference gles2.basic)
+# module deqp-gles2, platform surfaceless, patterns dEQP-GLES2.functional.prerequisite.* dEQP-GLES2.functional.implementation_limits.* dEQP-GLES2.functional.color_clear.* dEQP-GLES2.functional.depth_stencil_clear.*
+# VK-GL-CTS opengl-es-cts-3.2.14.1 (067e8832315e79817ede1c4863804e440f5d1c80)
+# Mesa 26.3.1 softpipe, shared libraries, clang
+# machine Linux 6.12.76-linuxkit aarch64
+# arguments --deqp-surface-type=pbuffer --deqp-surface-width=256 --deqp-surface-height=256 --deqp-gl-config-name=rgba8888d24s8ms0 --deqp-visibility=hidden --deqp-log-images=disable --deqp-log-shader-sources=disable
+# 49 cases: 49 pass, 0 fail, 0 not supported, 0 other, in 3 s
+dEQP-GLES2.functional.color_clear.complex_rgb Pass
+dEQP-GLES2.functional.color_clear.complex_rgba Pass
+dEQP-GLES2.functional.color_clear.long_masked_rgb Pass
+dEQP-GLES2.functional.color_clear.long_masked_rgba Pass
+dEQP-GLES2.functional.color_clear.long_rgb Pass
+dEQP-GLES2.functional.color_clear.long_rgba Pass
+dEQP-GLES2.functional.color_clear.masked_rgb Pass
+dEQP-GLES2.functional.color_clear.masked_rgba Pass
+dEQP-GLES2.functional.color_clear.masked_scissored_rgb Pass
+dEQP-GLES2.functional.color_clear.masked_scissored_rgba Pass
+dEQP-GLES2.functional.color_clear.multiple_rgb Pass
+dEQP-GLES2.functional.color_clear.multiple_rgba Pass
+dEQP-GLES2.functional.color_clear.scissored_rgb Pass
+dEQP-GLES2.functional.color_clear.scissored_rgba Pass
+dEQP-GLES2.functional.color_clear.short_scissored_rgb Pass
+dEQP-GLES2.functional.color_clear.single_rgb Pass
+dEQP-GLES2.functional.color_clear.single_rgba Pass
+dEQP-GLES2.functional.color_clear.subclears_rgb Pass
+dEQP-GLES2.functional.color_clear.subclears_rgba Pass
+dEQP-GLES2.functional.depth_stencil_clear.depth Pass
+dEQP-GLES2.functional.depth_stencil_clear.depth_scissored Pass
+dEQP-GLES2.functional.depth_stencil_clear.depth_scissored_masked Pass
+dEQP-GLES2.functional.depth_stencil_clear.depth_stencil Pass
+dEQP-GLES2.functional.depth_stencil_clear.depth_stencil_masked Pass
+dEQP-GLES2.functional.depth_stencil_clear.depth_stencil_scissored Pass
+dEQP-GLES2.functional.depth_stencil_clear.depth_stencil_scissored_masked Pass
+dEQP-GLES2.functional.depth_stencil_clear.stencil Pass
+dEQP-GLES2.functional.depth_stencil_clear.stencil_masked Pass
+dEQP-GLES2.functional.depth_stencil_clear.stencil_scissored Pass
+dEQP-GLES2.functional.depth_stencil_clear.stencil_scissored_masked Pass
+dEQP-GLES2.functional.implementation_limits.aliased_line_width_range Pass
+dEQP-GLES2.functional.implementation_limits.aliased_point_size_range Pass
+dEQP-GLES2.functional.implementation_limits.max_combined_texture_image_units Pass
+dEQP-GLES2.functional.implementation_limits.max_cube_map_texture_size Pass
+dEQP-GLES2.functional.implementation_limits.max_fragment_uniform_vectors Pass
+dEQP-GLES2.functional.implementation_limits.max_renderbuffer_size Pass
+dEQP-GLES2.functional.implementation_limits.max_texture_image_units Pass
+dEQP-GLES2.functional.implementation_limits.max_texture_size Pass
+dEQP-GLES2.functional.implementation_limits.max_varying_vectors Pass
+dEQP-GLES2.functional.implementation_limits.max_vertex_attribs Pass
+dEQP-GLES2.functional.implementation_limits.max_vertex_texture_image_units Pass
+dEQP-GLES2.functional.implementation_limits.max_vertex_uniform_vectors Pass
+dEQP-GLES2.functional.implementation_limits.num_compressed_texture_formats Pass
+dEQP-GLES2.functional.implementation_limits.num_shader_binary_formats Pass
+dEQP-GLES2.functional.implementation_limits.shader_compiler Pass
+dEQP-GLES2.functional.implementation_limits.subpixel_bits Pass
+dEQP-GLES2.functional.prerequisite.clear_color Pass
+dEQP-GLES2.functional.prerequisite.read_pixels Pass
+dEQP-GLES2.functional.prerequisite.state_reset Pass

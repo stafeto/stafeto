@@ -1,0 +1,29 @@
+# The departures of stafeto from Linux (plan G8, step 8.6): every case that
+# passes on Linux with the same Mesa and the same VK-GL-CTS and does not pass
+# on stafeto has a line here, with the reason and the step that returns it.
+# `cargo xtask deqp` compares the run with tests/deqp/baseline/<set>.txt and
+# fails on a case that passes on Linux, does not pass here and has no line.
+# A line of a case that passes here is stale and fails the run too.
+#
+# Format, one line each (the first field is a case or a prefix ending in `*`):
+#
+#   CASE | REASON | STEP
+#
+# STEP names the step of the plan that returns the case (`M1` for the window
+# manager, `G8.7`, and so on) or `never` for a difference that stays, which the
+# reason then explains.
+#
+# PROVISIONAL: the lines below come from the first run of deqp-smoke against
+# the provisional baselines (made in a Linux container, off the runners) and
+# from the 27 cases of dEQP-EGL.info and create_context of step G8.5. Sets that
+# no run has covered yet have no lines; the run of each set adds its own, and
+# the review of the departures (step G8.6) places each one.
+
+dEQP-EGL.functional.*.rgb565_* | the platform offers no 16-bit configuration: every configuration is XRGB8888 with a 24-bit depth and an 8-bit stencil buffer (docs/egl.md) | none
+dEQP-EGL.functional.*.rgba4444_* | the platform offers no 16-bit configuration: every configuration is XRGB8888 with a 24-bit depth and an 8-bit stencil buffer (docs/egl.md) | none
+dEQP-EGL.functional.*.rgba5551_* | the platform offers no 16-bit configuration: every configuration is XRGB8888 with a 24-bit depth and an 8-bit stencil buffer (docs/egl.md) | none
+dEQP-EGL.functional.*_no_depth_stencil | the platform has no configuration with a stencil buffer and no depth buffer: depth and stencil are 24 and 8 bits together | none
+dEQP-EGL.functional.*.other | the case asks for a colour format that no configuration of the platform has | none
+dEQP-EGL.functional.negative_api.copy_buffers | needs a pixmap surface, which the platform refuses (EGL_BAD_NATIVE_PIXMAP, no EGL_PIXMAP_BIT; plan 3.2) | none
+dEQP-EGL.functional.negative_api.create_window_surface | needs a native window; the image of dEQP runs no composition service, so the window call fails with a resource error | open
+dEQP-EGL.functional.negative_api.wait_native | needs a native window; the image of dEQP runs no composition service, so the window call fails with a resource error | open
