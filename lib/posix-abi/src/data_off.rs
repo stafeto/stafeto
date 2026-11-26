@@ -51,6 +51,7 @@ pub fn session() -> Option<rt::abi::Handle> {
 use crate::constants::{EBADF, EIO};
 use core::ffi::c_int;
 use posix_fs::DataTarget;
+pub use posix_fs::data::RawIov;
 
 const WIDE: usize = crate::names::MAX_PATH + 1;
 
@@ -136,11 +137,23 @@ pub fn pwrite(_handle: u32, _offset: u64, _bytes: &[u8]) -> Result<usize, i32> {
     Err(EBADF)
 }
 
-pub fn readv(_handle: u32, _offset: Option<u64>, _iov: &mut [&mut [u8]]) -> Result<usize, i32> {
+/// # Safety
+/// As the layer's: the buffers are writable.
+pub unsafe fn readv(
+    _handle: u32,
+    _offset: Option<u64>,
+    _iov: &[posix_fs::data::RawIov],
+) -> Result<usize, i32> {
     Err(EBADF)
 }
 
-pub fn writev(_handle: u32, _offset: Option<u64>, _iov: &[&[u8]]) -> Result<usize, i32> {
+/// # Safety
+/// As the layer's: the buffers are readable.
+pub unsafe fn writev(
+    _handle: u32,
+    _offset: Option<u64>,
+    _iov: &[posix_fs::data::RawIov],
+) -> Result<usize, i32> {
     Err(EBADF)
 }
 

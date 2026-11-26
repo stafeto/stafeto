@@ -606,6 +606,75 @@ pub fn write(number: c_int, bytes: &[u8]) -> Result<usize, c_int> {
     result
 }
 
+/// writev of a file of the data volume, the whole vector as one call of the layer (`data::writev`):
+/// None when `number` names no such file (the caller goes its own way). The call is a point of
+/// cancellation, runs in the hold of the descriptor as `write` does, and a limit on the size of a
+/// file gives SIGXFSZ with EFBIG when no byte went.
+///
+/// # Safety
+/// Each buffer with a length above 0 has a base readable for that length.
+pub unsafe fn writev_data(number: c_int, iov: &[data::RawIov]) -> Option<Result<usize, c_int>> {
+    data::data_target(number).filter(|d| !d.directory)?;
+    let fd = fd(number).ok()?;
+    let point = threads::cancel::Point::begin();
+    let held = shared::held(fd, |_, target| match target {
+        // SAFETY: the caller's promise.
+        posix_fs::Target::Data(d) if !d.directory => {
+            Ok(Some(unsafe { data::writev(d.handle, None, iov) }))
+        }
+        _ => Ok(None),
+    });
+    let result = match held {
+        Ok(Some(result)) => result,
+        Ok(None) => {
+            // The descriptor changed its kind since it was looked at: the caller goes its way.
+            point.finish();
+            return None;
+        }
+        Err(errno) => Err(errno),
+    };
+    let result = finish_file_size(result);
+    if result.is_ok_and(|n| n > 0) {
+        point.end();
+    } else {
+        point.finish();
+    }
+    Some(result)
+}
+
+/// readv of a file of the data volume, as `writev_data` for a read: the bytes read into the
+/// buffers in order, atomic against the other calls on the file.
+///
+/// # Safety
+/// Each buffer with a length above 0 has a base writable for that length.
+pub unsafe fn readv_data(number: c_int, iov: &[data::RawIov]) -> Option<Result<usize, c_int>> {
+    data::data_target(number).filter(|d| !d.directory)?;
+    let fd = fd(number).ok()?;
+    let point = threads::cancel::Point::begin();
+    let held = shared::held(fd, |_, target| match target {
+        // SAFETY: the caller's promise.
+        posix_fs::Target::Data(d) if !d.directory => {
+            Ok(Some(unsafe { data::readv(d.handle, None, iov) }))
+        }
+        _ => Ok(None),
+    });
+    let result = match held {
+        Ok(Some(result)) => result,
+        Ok(None) => {
+            // The descriptor changed its kind since it was looked at: the caller goes its way.
+            point.finish();
+            return None;
+        }
+        Err(errno) => Err(errno),
+    };
+    if result.is_ok_and(|n| n > 0) {
+        point.end();
+    } else {
+        point.finish();
+    }
+    Some(result)
+}
+
 pub fn lseek(number: c_int, offset: i64, origin: c_int) -> Result<i64, c_int> {
     if fastnet::above_table(number) {
         return fastnet::lseek_cold(number);

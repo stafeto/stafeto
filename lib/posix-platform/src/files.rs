@@ -6,7 +6,7 @@
 //! AArch64: struct stat of asm-generic, dirent64, struct termios, struct
 //! utsname, struct rlimit) on the layer's files (posix-fs).
 
-use super::sockets::{IoVec, input, output};
+use super::sockets::IoVec;
 use super::{call, value};
 use core::ffi::{c_char, c_int, c_ulong, c_void};
 use core::mem::{offset_of, size_of};
@@ -309,31 +309,37 @@ pub unsafe extern "C" fn stafeto_pread(fd: c_int, buf: *mut u8, len: usize, offs
 /// # Safety
 /// `buf` is writable for `len` bytes.
 unsafe fn data_pread(fd: c_int, buf: *mut u8, len: usize, offset: i64) -> Option<isize> {
-    let number = number(fd).ok()?;
-    let data = posix_abi::shared::held(number, |_, target| match target {
-        Target::Data(data) => Ok(Some(data)),
-        _ => Ok(None),
-    })
-    .ok()
-    .flatten()?;
+    // The kind of the descriptor is looked at without a hold; the call runs in the hold.
+    let data = posix_abi::data::data_target(fd)?;
     if data.directory {
         return Some(-(posix_abi::constants::EISDIR as isize));
     }
+    let number = number(fd).ok()?;
     let Ok(start) = u64::try_from(offset) else {
         return Some(-(EINVAL as isize));
     };
     // SAFETY: the caller's promise.
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    let mut done = 0;
-    while done < out.len() {
-        match posix_abi::data::pread(data.handle, start + done as u64, &mut out[done..]) {
-            Ok(0) => break,
-            Ok(n) => done += n,
-            Err(errno) if done == 0 => return Some(-(errno as isize)),
-            Err(_) => break,
+    let held = posix_abi::shared::held(number, |_, target| match target {
+        Target::Data(data) if !data.directory => {
+            let mut done = 0;
+            while done < out.len() {
+                match posix_abi::data::pread(data.handle, start + done as u64, &mut out[done..]) {
+                    Ok(0) => break,
+                    Ok(n) => done += n,
+                    Err(errno) if done == 0 => return Err(errno),
+                    Err(_) => break,
+                }
+            }
+            Ok(Some(done))
         }
+        _ => Ok(None),
+    });
+    match held {
+        Ok(Some(done)) => Some(done as isize),
+        Ok(None) => None,
+        Err(errno) => Some(-(errno as isize)),
     }
-    Some(done as isize)
 }
 
 /// Whether a read of a file that asked for `size` bytes and got `got` stopped at a full portion
@@ -436,13 +442,9 @@ unsafe fn data_pwrite(
     len: usize,
     offset: i64,
 ) -> Option<Result<isize, c_int>> {
+    // The kind of the descriptor is looked at without a hold; the call runs in the hold.
+    posix_abi::data::data_target(fd)?;
     let number = number(fd).ok()?;
-    let data = posix_abi::shared::held(number, |_, target| match target {
-        Target::Data(data) => Ok(Some(data)),
-        _ => Ok(None),
-    })
-    .ok()
-    .flatten()?;
     let Ok(start) = u64::try_from(offset) else {
         return Some(Err(EINVAL));
     };
@@ -452,92 +454,70 @@ unsafe fn data_pwrite(
     } else {
         unsafe { core::slice::from_raw_parts(buf, len) }
     };
-    Some(posix_abi::data::pwrite(data.handle, start, bytes).map(|n| n as isize))
-}
-
-/// The most parts of a vector call on the data volume the platform sends as one call of the layer
-/// (the array of parts lives on the caller's stack); a vector of more parts goes through relibc
-/// part by part, each part atomic by itself.
-const DATA_VECTOR_MAX: usize = 64;
-
-/// The file of the data volume `fd` names (not a directory), None for any other descriptor.
-fn data_file(fd: c_int) -> Option<posix_fs::DataTarget> {
-    let number = number(fd).ok()?;
-    posix_abi::shared::held(number, |_, target| match target {
-        Target::Data(data) if !data.directory => Ok(Some(data)),
+    let held = posix_abi::shared::held(number, |_, target| match target {
+        Target::Data(data) => Ok(Some(posix_abi::data::pwrite(data.handle, start, bytes))),
         _ => Ok(None),
-    })
-    .ok()
-    .flatten()
+    });
+    match held {
+        Ok(Some(result)) => Some(result.map(|n| n as isize)),
+        Ok(None) => None,
+        Err(errno) => Some(Err(errno)),
+    }
 }
 
-/// writev of a file of the data volume as one call of the layer (`posix_abi::data::writev`), atomic
-/// against the other calls on the file and with the end of an O_APPEND description taken once for
-/// the whole vector, which relibc's writev asks first: the bytes written, a negated errno, or
-/// `isize::MIN` for any other descriptor and for a vector of more than 64 parts (relibc then writes
-/// the parts its own way). A failure after some bytes is their count; a short count is a lapsed
-/// lease; the limit of the file size gives SIGXFSZ with EFBIG when no byte went.
+const _: () = assert!(size_of::<IoVec>() == size_of::<posix_abi::data::RawIov>());
+
+/// writev of a file of the data volume as one call of the layer (`posix_abi::writev_data`), which
+/// relibc's writev asks first: the bytes written, a negated errno, or `isize::MIN` for any other
+/// descriptor (relibc then writes the parts its own way). A short count is a lapsed lease; the
+/// limit of the file size gives SIGXFSZ with EFBIG when no byte went.
 ///
 /// # Safety
 /// `iov` is `iovcnt` readable struct iovec whose parts are readable; relibc checked the count (1 to
-/// IOV_MAX).
+/// IOV_MAX) and the sum of the lengths.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_writev_data(fd: c_int, iov: *const IoVec, iovcnt: c_int) -> isize {
-    let count = iovcnt.max(0) as usize;
-    if iov.is_null() || count == 0 || count > DATA_VECTOR_MAX {
+    if iov.is_null() || iovcnt < 1 {
         return isize::MIN;
     }
-    let Some(data) = data_file(fd) else {
+    // SAFETY: the caller's promise; IoVec and RawIov have one layout.
+    let parts = unsafe {
+        core::slice::from_raw_parts(iov.cast::<posix_abi::data::RawIov>(), iovcnt as usize)
+    };
+    // SAFETY: the caller's promise.
+    let Some(result) = call(|| Ok(unsafe { posix_abi::writev_data(fd, parts) }))
+        .ok()
+        .flatten()
+    else {
         return isize::MIN;
     };
-    let mut parts: [&[u8]; DATA_VECTOR_MAX] = [&[]; DATA_VECTOR_MAX];
-    for (k, part) in parts.iter_mut().enumerate().take(count) {
-        // SAFETY: the caller's promise.
-        let v = unsafe { &*iov.add(k) };
-        // SAFETY: the caller's promise.
-        *part = match unsafe { input(v.base, v.len) } {
-            Ok(bytes) => bytes,
-            Err(errno) => return -(errno as isize),
-        };
-    }
-    match posix_abi::finish_file_size(posix_abi::data::writev(data.handle, None, &parts[..count])) {
-        Ok(n) => n as isize,
-        Err(errno) => -(errno as isize),
-    }
+    value(result.map(|n| n as i64)) as isize
 }
 
-/// readv of a file of the data volume as one call of the layer (`posix_abi::data::readv`), atomic
-/// against the other calls on the file, which relibc's readv asks first: the bytes read into the
-/// parts in order (0 at the end of the file), a negated errno, or `isize::MIN` for any other
-/// descriptor and for a vector of more than 64 parts. A call whose lease lapsed returns the bytes
-/// moved so far.
+/// readv of a file of the data volume as one call of the layer (`posix_abi::readv_data`), which
+/// relibc's readv asks first: the bytes read into the parts in order (0 at the end of the file), a
+/// negated errno, or `isize::MIN` for any other descriptor.
 ///
 /// # Safety
 /// `iov` is `iovcnt` readable struct iovec whose parts are writable; relibc checked the count (1 to
-/// IOV_MAX).
+/// IOV_MAX) and the sum of the lengths.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_readv_data(fd: c_int, iov: *const IoVec, iovcnt: c_int) -> isize {
-    let count = iovcnt.max(0) as usize;
-    if iov.is_null() || count == 0 || count > DATA_VECTOR_MAX {
+    if iov.is_null() || iovcnt < 1 {
         return isize::MIN;
     }
-    let Some(data) = data_file(fd) else {
+    // SAFETY: the caller's promise; IoVec and RawIov have one layout.
+    let parts = unsafe {
+        core::slice::from_raw_parts(iov.cast::<posix_abi::data::RawIov>(), iovcnt as usize)
+    };
+    // SAFETY: the caller's promise.
+    let Some(result) = call(|| Ok(unsafe { posix_abi::readv_data(fd, parts) }))
+        .ok()
+        .flatten()
+    else {
         return isize::MIN;
     };
-    let mut parts: [&mut [u8]; DATA_VECTOR_MAX] = core::array::from_fn(|_| &mut [][..]);
-    for (k, part) in parts.iter_mut().enumerate().take(count) {
-        // SAFETY: the caller's promise.
-        let v = unsafe { &*iov.add(k) };
-        // SAFETY: the caller's promise.
-        *part = match unsafe { output(v.base, v.len) } {
-            Ok(bytes) => bytes,
-            Err(errno) => return -(errno as isize),
-        };
-    }
-    match posix_abi::data::readv(data.handle, None, &mut parts[..count]) {
-        Ok(n) => n as isize,
-        Err(errno) => -(errno as isize),
-    }
+    value(result.map(|n| n as i64)) as isize
 }
 
 /// # Safety

@@ -2122,13 +2122,17 @@ static int vec_alternating(unsigned count) {
     for (unsigned i = 0; i < count; i++) {
         fill_salt(big_buf, VEC_REC, 21u + (i & 1u));
         if (pwrite(fd, big_buf, VEC_REC, 0) != (ssize_t)VEC_REC) return 2;
+        /* A gap of 0 to 3 ms, never the same twice in a row, so the reads meet each pattern. */
+        unsigned gap = (i * 7u + 3u) % 4u;
+        if (gap) pause_ms(gap);
     }
     return close(fd) == 0 ? 0 : 3;
 }
 
 /* One process rewrites a file of 128 KiB with two patterns in turn while another reads it with
- * readv into two buffers of 64 KiB: every readv returns all 128 KiB of one pattern. The reader goes
- * on after `reads` calls until the writer has ended, so the calls overlap its writes. */
+ * readv into two buffers of 64 KiB: every readv returns all 128 KiB of one pattern, and the reads
+ * meet both patterns of the writer. The reader goes on after `reads` calls until the writer has
+ * ended, so the calls overlap its writes. */
 static int vec_read_body(unsigned writes, unsigned reads) {
     atomic_start();
     int fd = open("/data/vmix", O_RDWR | O_CREAT | O_EXCL, 0644);
@@ -2142,8 +2146,11 @@ static int vec_read_body(unsigned writes, unsigned reads) {
     int ended = 0, status = 0;
     for (unsigned i = 0; !ended || i < reads; i++) {
         struct iovec v[2] = {{big_buf, VEC_HALF}, {big_buf + VEC_HALF, VEC_HALF}};
-        DATA_CHECK(lseek(fd, 0, SEEK_SET) == 0);
-        ssize_t got = readv(fd, v, 2);
+        /* A description of its own at offset 0 for each call: readv moves the position. */
+        int rfd = open("/data/vmix", O_RDONLY);
+        DATA_CHECK(rfd >= 0);
+        ssize_t got = readv(rfd, v, 2);
+        DATA_CHECK(close(rfd) == 0);
         if (got != (ssize_t)VEC_REC) {
             printf("posix-data: a readv of 128 KiB returned %ld (read %u)\n", (long)got, i);
             return 20;
@@ -2165,8 +2172,8 @@ static int vec_read_body(unsigned writes, unsigned reads) {
     DATA_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     printf("posix-data: vector reads: %lu saw the first pattern, %lu the pattern of A, %lu the pattern of B\n", seen[0],
            seen[1], seen[2]);
-    if (seen[1] + seen[2] == 0) {
-        printf("posix-data: vector reads: no read overlapped the writes\n");
+    if (seen[1] == 0 || seen[2] == 0) {
+        printf("posix-data: vector reads: the reads did not meet both patterns of the writer\n");
         return 22;
     }
     DATA_CHECK(close(fd) == 0 && unlink("/data/vmix") == 0);
@@ -2174,7 +2181,7 @@ static int vec_read_body(unsigned writes, unsigned reads) {
 }
 
 static int check_readv_whole(void) { return vec_read_body(40 / atomic_less, 80 / atomic_less); }
-static int readv_inline_body(void) { return vec_read_body(4, 8); }
+static int readv_inline_body(void) { return vec_read_body(8, 8); }
 
 /* The vector calls of any size in the small: parts of 100, 0 and 5000 bytes, the position that
  * moves, the end of the file, the empty vector, a directory. */
@@ -2200,18 +2207,27 @@ static int check_vector_small(void) {
     DATA_CHECK(readv(fd, r, 0) == -1 && errno == EINVAL);
     errno = 0;
     DATA_CHECK(writev(fd, w, 0) == -1 && errno == EINVAL);
-    /* More buffers than the hook takes at once: each buffer still lands. */
-    static unsigned char many[70];
-    struct iovec m[70];
-    for (int k = 0; k < 70; k++) {
+    /* A sum of lengths above SSIZE_MAX is EINVAL before any byte moves. */
+    struct stat before, after;
+    DATA_CHECK(fstat(fd, &before) == 0);
+    struct iovec huge[2] = {{b, (size_t)SSIZE_MAX / 2 + 1}, {b, (size_t)SSIZE_MAX / 2 + 1}};
+    errno = 0;
+    DATA_CHECK(writev(fd, huge, 2) == -1 && errno == EINVAL);
+    errno = 0;
+    DATA_CHECK(readv(fd, huge, 2) == -1 && errno == EINVAL);
+    DATA_CHECK(fstat(fd, &after) == 0 && after.st_size == before.st_size);
+    /* IOV_MAX buffers go as one call. */
+    static unsigned char many[1024];
+    static struct iovec m[1024];
+    for (int k = 0; k < 1024; k++) {
         many[k] = (unsigned char)(k + 1);
         m[k].iov_base = &many[k];
         m[k].iov_len = 1;
     }
     DATA_CHECK(lseek(fd, 0, SEEK_SET) == 0);
-    DATA_CHECK(writev(fd, m, 70) == 70);
-    unsigned char back[70];
-    DATA_CHECK(pread(fd, back, 70, 0) == 70 && memcmp(back, many, 70) == 0);
+    DATA_CHECK(writev(fd, m, 1024) == 1024);
+    static unsigned char back[1024];
+    DATA_CHECK(pread(fd, back, 1024, 0) == 1024 && memcmp(back, many, 1024) == 0);
     DATA_CHECK(close(fd) == 0 && unlink("/data/vsmall") == 0);
     int dir = open("/data", O_RDONLY);
     DATA_CHECK(dir >= 0);
@@ -2314,22 +2330,32 @@ static int check_lapse(void) {
     return 0;
 }
 
-/* The vector forms of the lapse: a child calls writev or readv of two halves of 1 MiB again and
- * again until a call comes back short (the lease lapsed while the child was stopped). The count of
- * lapsed calls rises, so the call went through the layer's parts. */
+/* The vector forms of the lapse: a child calls writev or readv of 16 buffers of 64 KiB (1 MiB)
+ * again and again until the count of lapsed calls rises (the lease lapsed while the child was
+ * stopped): a writev then comes back short, a readv goes on without the lease and returns all of
+ * the 1 MiB, as `read` does. Each buffer on its own would be a call of one cell and no other
+ * caller would wait, so only the whole vector holds the file. */
 static int lapse_vector_child(int reading) {
     int fd = open("/data/lapse", reading ? O_RDONLY : O_WRONLY);
     if (fd < 0) return 1;
     fill_salt(big_buf, MIB, 42);
-    struct iovec v[2] = {{big_buf, MIB / 2}, {big_buf + MIB / 2, MIB / 2}};
+    struct iovec v[16];
+    for (int k = 0; k < 16; k++) {
+        v[k].iov_base = big_buf + (unsigned long)k * CELL_BYTES_C;
+        v[k].iov_len = CELL_BYTES_C;
+    }
     unsigned long long lapsed0 = dcounts().lapsed;
     for (int i = 0; i < 6000; i++) {
         if (lseek(fd, 0, SEEK_SET) != 0) return 5;
-        ssize_t r = reading ? readv(fd, v, 2) : writev(fd, v, 2);
-        if (r == (ssize_t)MIB) continue;
+        ssize_t r = reading ? readv(fd, v, 16) : writev(fd, v, 16);
         unsigned long long lapsed = dcounts().lapsed - lapsed0;
+        if (reading && r != (ssize_t)MIB) {
+            printf("posix-data: the stopped reader: a call returned %ld of 1 MiB\n", (long)r);
+            return 3;
+        }
+        if (r == (ssize_t)MIB && lapsed == 0) continue;
         printf("posix-data: the stopped %s: a call returned %ld of 1 MiB, lapsed calls %llu\n", reading ? "reader" : "writer", (long)r, lapsed);
-        if (r < 0 || (unsigned long)r % CELL_BYTES_C != 0) return 3;
+        if (r < 0 || (!reading && (unsigned long)r % CELL_BYTES_C != 0)) return 3;
         return lapsed >= 1 ? 0 : 4;
     }
     return 2;

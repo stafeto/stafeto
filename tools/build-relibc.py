@@ -201,8 +201,9 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # readv and writev of a file of the data volume ask the layer's
 # stafeto_readv_data and stafeto_writev_data first (the whole vector as one
 # call, atomic against the other calls on the file; platform interface 25);
-# tagged pin-c0ec05db.
-COMMIT = "c0ec05dbc73db4210f1079c432a29b93593b8abe"
+# a sum of the part lengths above SSIZE_MAX is EINVAL before any hook; tagged
+# pin-8db655d6.
+COMMIT = "8db655d659ef0993466af3d553fc4c39b579dd36"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
