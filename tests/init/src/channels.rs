@@ -247,6 +247,8 @@ fn notifications_merge_bits_and_count() -> Outcome {
         label: 0,
         bits: 0b101 | 1 << 40,
         count: 3,
+        // The slot of a channel that lends: its priority (spec 6.6).
+        level: QUIET,
     };
     check(
         got[0] == 0 && got[1..] == merged.to_words(),

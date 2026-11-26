@@ -8,7 +8,7 @@ use crate::channels::exit_channel;
 use crate::harness::*;
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 21] = [
+pub(crate) const TESTS: [Test; 22] = [
     ("send_checks_its_arguments", send_checks_its_arguments),
     (
         "request_carries_registers_and_label",
@@ -68,6 +68,10 @@ pub(crate) const TESTS: [Test; 21] = [
     (
         "notification_boost_outlives_an_older_reply",
         notification_boost_outlives_an_older_reply,
+    ),
+    (
+        "receive_tells_the_level_of_what_it_took",
+        receive_tells_the_level_of_what_it_took,
     ),
 ];
 
@@ -554,6 +558,60 @@ fn server_below_its_client_runs_at_the_client() -> Outcome {
         mark(1) == 1 && mark(2) == 1,
         "the thread at 20 or the service did not end",
     )
+}
+
+/// A service at HIGH that takes a request, a notification of the channel
+/// HANDLES[0] holds and a notification of the wait channel HANDLES[2] holds,
+/// each with `receive_lent`: the levels it was told are in `result(0)`, in
+/// that order, and it ends with mark 2.
+extern "C" fn level_server(_: u64) -> ! {
+    let (c, w) = (handle(0), handle(2));
+    let mut levels = [u64::MAX; 3];
+    if let Ok((Received::Message { token, .. }, level)) = sys::receive_lent(&c) {
+        levels[0] = level.into();
+        let _ = token.reply(&[]);
+    }
+    if let Ok((Received::Notification { .. }, level)) = sys::receive_lent(&c) {
+        levels[1] = level.into();
+    }
+    if let Ok((Received::Notification { .. }, level)) = sys::receive_lent(&w) {
+        levels[2] = level.into();
+    }
+    record(0, &levels);
+    MARKS[2].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Spec 6.6, 11 (the level of a receive): a service at 30 is told the level
+/// of its client in bits 32-37 of x1, 20 for a client at 20 whatever the
+/// service's own level, and the priority of the slot for a notification of a
+/// channel that lends (QUIET); a notification of a wait channel tells 0.
+fn receive_tells_the_level_of_what_it_took() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let w = wait_channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    HANDLES[1].store(c.raw().0, Relaxed);
+    HANDLES[2].store(w.raw().0, Relaxed);
+    let s = spawn(0, level_server, 0, HIGH, Policy::Fifo)?;
+    let k = spawn(1, client, 1, TEST_PRIORITY, Policy::Fifo)?;
+    let_run()?;
+    let asked = ended(1);
+    let posted = sys::notify(&c, 1).and(sys::notify(&w, 1));
+    let_run()?;
+    let levels = result(0);
+    for h in [k, s] {
+        close(h)?;
+    }
+    close(c)?;
+    close(w)?;
+    check(asked, "the client did not get its reply")?;
+    check(posted.is_ok(), "notify failed")?;
+    check(
+        levels[..3] == [u64::from(TEST_PRIORITY), u64::from(QUIET), 0],
+        "the service was not told 20 for a request of a client at 20, QUIET for the notification of a channel and 0 for a wait channel",
+    )?;
+    check(mark(2) == 1, "the service did not end")
 }
 
 /// The boost by a client ends with the reply to it (spec 6.6): a service
