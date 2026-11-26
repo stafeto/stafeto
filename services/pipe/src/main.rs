@@ -982,10 +982,14 @@ impl PipeService {
             None
         };
         if let Some(code) = refusal {
-            for &queue in &queues[..set.len] {
-                self.pipes.unwait(u32::from(queue), (label, key));
+            // Only the queues subscribed so far come off: none on the path
+            // of a larger set.
+            for queue in
+                pipe::watches::unique_queues(&queues[..set.len]).take(self.watches.registered(at))
+            {
+                self.pipes.unwait(queue, (label, key));
             }
-            self.watches.remove(label, key);
+            self.watches.remove_at(at);
             let finished = self.ops.finish(&mut s.data.long, label, key);
             self.over(s, finished);
             return status(code);
@@ -1054,11 +1058,14 @@ impl PipeService {
         rt::service::step_detail(set.len as u64);
         let ready = set.ready(|endpoint| self.pipes.readiness_endpoint(&s.data.held, endpoint));
         if cancel {
-            let queues = *self.watches.queues(label, key).unwrap();
-            for &queue in &queues[..set.len] {
-                self.pipes.unwait(u32::from(queue), (label, key));
+            let at = self.watches.place(label, key).unwrap();
+            let queues = *self.watches.queues_at(at).unwrap();
+            for queue in
+                pipe::watches::unique_queues(&queues[..set.len]).take(self.watches.registered(at))
+            {
+                self.pipes.unwait(queue, (label, key));
             }
-            self.watches.remove(label, key);
+            self.watches.remove_at(at);
             let finished = self.ops.finish(&mut s.data.long, label, key);
             self.over(s, finished);
             Self::watch_ready(r, ready)

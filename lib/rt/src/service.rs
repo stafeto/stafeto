@@ -2182,6 +2182,11 @@ impl<const N: usize> LongOps<N> {
         session.head.is_some()
     }
 
+    /// How many operations wait. O(1).
+    pub fn live(&self) -> usize {
+        N - self.free_len
+    }
+
     /// The operations that wait, and the handles they hold.
     pub fn counts(&self) -> (usize, usize) {
         let live = self.ops.iter().flatten().count();
@@ -2232,6 +2237,8 @@ mod long_portion_tests {
             "the last two go, none are left"
         );
         assert!(mine.is_empty() && ops.first(&mine).is_none());
+        assert_eq!(ops.live(), 1);
+        assert_eq!(ops.live(), ops.counts().0);
         assert!(ops.waits(8, kept), "another session's operation stays");
         assert!(!ops.gone_some(&mut mine, 4), "nothing left, nothing to do");
     }
