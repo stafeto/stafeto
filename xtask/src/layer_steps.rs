@@ -32,7 +32,7 @@ const LIMIT: std::time::Duration = std::time::Duration::from_secs(900);
 const STEP_TAG: &str = "18";
 
 /// The checks of the probe in scale mode, in the order it runs them.
-pub const CHECKS: [&str; 7] = [
+pub const CHECKS: [&str; 15] = [
     "sessions",
     "status counts the names of the layer",
     "a file at the end of a chain of 247 components",
@@ -40,14 +40,56 @@ pub const CHECKS: [&str; 7] = [
     "a path of 253 components is the lower set's after the chain",
     "a name of the last directory of the layer",
     "a merged listing of 1,024 names of the layer",
+    "a file made, written and removed at the depth of 240",
+    "a directory made and removed at the depth of 240",
+    "a directory below a chain of 8 lower directories",
+    "a directory of 1,024 names renamed and back",
+    "a directory renamed into the opaque directory and back",
+    "a directory of 2,000 marks removed and made again",
+    "a rename onto a directory of marks alone",
+    "status counts the names after the changes",
 ];
 
 /// The deliberate breaks, and whether the step gate must catch the break itself (the walk of the
 /// whole layer in one step is also caught by the watch of init, which kills the silent service).
-pub const BREAKS: [(&str, bool); 2] = [
+pub const BREAKS: [(&str, bool); 3] = [
     ("break-layerd-one-step", false),
     ("break-layerd-slots", true),
+    ("break-layerd-change-one-step", true),
 ];
+
+/// What the lower set of the run holds besides the system: a chain of directories with no
+/// counterpart in the layer (`/lowdeep/l1/.../l8`, below which the probe makes a directory, which
+/// copies them up; a stat of a lower path costs the service about 1,400 ticks for each component,
+/// so nine is the most one step of the gate holds), and a file in `/opq`, the directory of the layer that is opaque.
+fn lower_files() -> Vec<crate::rootfs::RootFile> {
+    let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+    let dir = |path: &'static str| crate::rootfs::RootFile {
+        path,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        source: None,
+    };
+    let mut files = vec![dir("/lowdeep")];
+    let mut path = String::from("/lowdeep");
+    for k in 1..=8 {
+        path.push_str(&format!("/l{k}"));
+        files.push(dir(leak(path.clone())));
+    }
+    files.push(dir("/opq"));
+    files.push(crate::rootfs::RootFile {
+        path: "/opq/lowfile",
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        source: Some(crate::rootfs::Source::Bytes(
+            "layer-steps-opq-lowfile",
+            b"hidden by the opaque directory\n",
+        )),
+    });
+    files
+}
 
 fn programs(layerd: &'static [&'static str]) -> Vec<ImageProgram> {
     layer_names::programs(layerd, &[])
@@ -70,7 +112,7 @@ fn boot(
         &programs(features),
         BOOT_PROFILE,
         &[("STAFETO_LAYER_NAMES_MODE", "scale")],
-        Vec::new(),
+        lower_files(),
     )?;
     let disk = layer_names::Disk(
         std::env::temp_dir().join(format!("stafeto-layer-steps-{}.img", std::process::id())),
@@ -146,9 +188,10 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
         "init: layer-names ended: exit code 0, not restarted",
     )?;
     let (names, deleted, steps) = index_line(&output.lines)?;
-    if names != crate::data_image::STEPS_NAMES as u32 || deleted != 0 {
+    let marks = (crate::data_image::STEPS_MARKS + crate::data_image::STEPS_MK2_MARKS) as u32;
+    if names != crate::data_image::STEPS_NAMES as u32 || deleted != marks {
         return Err(format!(
-            "the index holds {names} names and {deleted} marks, {} names were due",
+            "the index holds {names} names and {deleted} marks, {} names and {marks} marks were due",
             crate::data_image::STEPS_NAMES
         ));
     }

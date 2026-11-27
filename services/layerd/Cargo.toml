@@ -39,6 +39,9 @@ break-layerd-one-step = []
 # `break-layerd-slots`: a request of a listing looks at 4,096 slots of the index, so the step is over
 # 0.9 B and the step gate of `cargo xtask layer-steps breaks` alone catches it.
 break-layerd-slots = []
+# `break-layerd-change-one-step`: a change job does all its work in one step of the loop, so the longest
+# step grows with the change and the step gate alone catches it.
+break-layerd-change-one-step = []
 break-layerd-whiteout = []
 break-layerd-search = []
 break-layerd-no-mark = []

@@ -81,6 +81,27 @@ enum Phase {
     LinkClose,
 }
 
+impl Stage {
+    fn code(&self) -> u64 {
+        match self {
+            Stage::Ensure { .. } => 0,
+            Stage::Dir { .. } => 1,
+            Stage::File { .. } => 2,
+            Stage::Mark { .. } => 3,
+            Stage::IndexMark { .. } => 4,
+            Stage::DropMark { .. } => 5,
+            Stage::Opaque => 6,
+            Stage::UnlinkVictim { .. } => 7,
+            Stage::UnlinkDst => 8,
+            Stage::Retire => 9,
+            Stage::RenameMain => 10,
+            Stage::UnlinkOldLink => 11,
+            Stage::OpenFile => 12,
+            Stage::Attr => 13,
+        }
+    }
+}
+
 /// A directory the stages of a plan name.
 #[derive(Clone, Copy)]
 enum DirRef {
@@ -491,7 +512,28 @@ impl<V: Volume, L: Lower> ChangeJob<V, L> {
         match self.phase {
             Phase::PlainA | Phase::PlainB | Phase::WalkA | Phase::WalkB | Phase::WalkFull => 1000,
             Phase::Empty => 1400,
-            _ => 1200,
+            Phase::LowerA | Phase::LowerB => {
+                let leg = self.leg(self.phase == Phase::LowerB);
+                3000 + leg.plain[..leg.lpos].iter().filter(|&&c| c == b'/').count() as u64
+            }
+            Phase::Commit
+                if matches!(self.stages.get(self.pc), Some(Stage::Ensure { .. }))
+                    && self.sub == 1 =>
+            {
+                let leg = self.leg(matches!(
+                    self.stages.get(self.pc),
+                    Some(Stage::Ensure { b: true })
+                ));
+                3100 + leg.plain[..self.ens_pos]
+                    .iter()
+                    .filter(|&&c| c == b'/')
+                    .count() as u64
+            }
+            Phase::Commit => {
+                2000 + self.stages.get(self.pc).map_or(99, |s| s.code()) * 100
+                    + u64::from(self.dsub)
+            }
+            other => 1200 + other as u64,
         }
     }
 
@@ -600,6 +642,20 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
 
     /// One step of a change job.
     pub fn change_step(
+        &mut self,
+        c: &Client<'_>,
+        job: &mut ChangeJob<V, L>,
+        w: &mut Writer,
+    ) -> ChangeStep<V::Pass> {
+        let mut step = self.change_step_once(c, job, w);
+        // The deliberate break: the whole change in one step.
+        while cfg!(feature = "break-layerd-change-one-step") && matches!(step, ChangeStep::More) {
+            step = self.change_step_once(c, job, w);
+        }
+        step
+    }
+
+    fn change_step_once(
         &mut self,
         c: &Client<'_>,
         job: &mut ChangeJob<V, L>,

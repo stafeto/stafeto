@@ -428,6 +428,12 @@ pub fn make_layer_volume(path: &Path, size: u64) -> Result<(), String> {
 /// in front, is 505 of the 506 bytes the volume allows), and the rest is files in `d00`, `d01` and
 /// on.
 pub const STEPS_NAMES: usize = 8192;
+/// The marks of deletion of the scale volume: `/marks` holds `STEPS_MARKS` of them (the build
+/// reaches `STEPS_NAMES + STEPS_MARKS + STEPS_MK2_MARKS` entries, near the 10,240 the table takes)
+/// and `/mk2` holds `STEPS_MK2_MARKS`, a layer directory of marks alone for a rename to land on.
+/// `/opq` is an opaque directory.
+pub const STEPS_MARKS: usize = 2000;
+pub const STEPS_MK2_MARKS: usize = 5;
 pub const STEPS_LISTED: usize = 1024;
 pub const STEPS_CHAIN: usize = 246;
 /// The letter of the 200-byte name of `/long/` and the bytes of its file.
@@ -486,6 +492,37 @@ pub fn layer_steps_entries() -> Vec<LayerEntry> {
     names += 2;
     out.push(LayerEntry::dir("/.layers/00/etc", 0o755, 0, 0));
     names += 1;
+    // A directory of marks, an opaque directory and a directory of a few marks: the names count
+    // in `STEPS_NAMES`, the marks and the marker of the opaque directory do not.
+    out.push(LayerEntry::dir("/.layers/00/marks", 0o755, 0, 0));
+    for k in 0..STEPS_MARKS {
+        out.push(LayerEntry::file(
+            leak(format!("/.layers/00/marks/.wh.m{k:04}")),
+            0o644,
+            0,
+            0,
+            b"",
+        ));
+    }
+    out.push(LayerEntry::dir("/.layers/00/opq", 0o755, 0, 0));
+    out.push(LayerEntry::file(
+        "/.layers/00/opq/.wh..wh..opq",
+        0o644,
+        0,
+        0,
+        b"",
+    ));
+    out.push(LayerEntry::dir("/.layers/00/mk2", 0o755, 0, 0));
+    for k in 0..STEPS_MK2_MARKS {
+        out.push(LayerEntry::file(
+            leak(format!("/.layers/00/mk2/.wh.q{k}")),
+            0o644,
+            0,
+            0,
+            b"",
+        ));
+    }
+    names += 3;
     for k in 0..STEPS_LISTED {
         out.push(LayerEntry::file(
             leak(format!("/.layers/00/etc/x{k:04}")),
@@ -852,18 +889,19 @@ mod tests {
         );
     }
 
-    /// The scale volume has exactly the names the probe counts, directories before their entries, no
-    /// path twice and no directory over the 1,024 entries the volume allows.
+    /// The scale volume has exactly the names the probe counts, directories before their entries and
+    /// no path twice.
     #[test]
     fn the_scale_volume_has_8192_names_and_the_chain_the_volume_allows() {
         let entries = layer_steps_entries();
         let under = |dir: &str| entries.iter().filter(|e| e.path.starts_with(dir)).count();
+        // The names, the marks and the marker of the opaque directory.
         assert_eq!(
             entries
                 .iter()
                 .filter(|e| e.path.starts_with("/.layers/00/"))
                 .count(),
-            STEPS_NAMES
+            STEPS_NAMES + STEPS_MARKS + STEPS_MK2_MARKS + 1
         );
         let mut seen = std::collections::HashSet::new();
         for e in &entries {
