@@ -16,6 +16,7 @@ pub mod composition;
 pub mod descriptions;
 pub mod identity;
 pub mod index;
+pub mod jobs;
 pub mod listing;
 pub mod lookup;
 pub mod names;

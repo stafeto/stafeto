@@ -33,6 +33,9 @@ probe-restart = []
 # no stranger (`cargo xtask layer-restart breaks`).
 break-layerd-epoch = []
 break-layerd-one-step = []
+# `break-layerd-slots`: a request of a listing looks at 4,096 slots of the index, so the step is over
+# 0.9 B and the step gate of `cargo xtask layer-steps breaks` alone catches it.
+break-layerd-slots = []
 break-layerd-whiteout = []
 break-layerd-search = []
 

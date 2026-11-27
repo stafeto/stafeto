@@ -128,6 +128,21 @@ pub fn run() -> i32 {
         "a file at the end of a chain of 247 components",
         expect_bytes(&data, &names, deep, b"the end of the chain\n"),
     );
+    // A name of 200 bytes at two slashes is deferred by its length.
+    let mut long_name = [0u8; 512];
+    let long_path = chain(&mut long_name, 200, "n", "");
+    let mut full = [0u8; 512];
+    full[..6].copy_from_slice(b"/long/");
+    full[6..6 + long_path.len()].copy_from_slice(long_path.as_bytes());
+    t.check(
+        "a file with a name of 200 bytes",
+        expect_bytes(
+            &data,
+            &names,
+            core::str::from_utf8(&full[..6 + long_path.len()]).unwrap_or(""),
+            b"a long name\n",
+        ),
+    );
     // A path of 253 components: the walk goes through the 246 directories of the layer and the
     // 247th name is not there, so the whole path is the lower set's.
     let mut buffer = [0u8; 512];
@@ -143,7 +158,7 @@ pub fn run() -> i32 {
     // The last names of the table are found: a name of the last directory.
     t.check(
         "a name of the last directory of the layer",
-        match super::stat(&names, "/d06/n0768") {
+        match super::stat(&names, "/d06/n0766") {
             Ok(info) if info.kind == 2 => Ok(()),
             _ => Err(format_args!("not found")),
         },

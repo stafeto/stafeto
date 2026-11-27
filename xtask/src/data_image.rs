@@ -426,6 +426,9 @@ pub fn make_layer_volume(path: &Path, size: u64) -> Result<(), String> {
 pub const STEPS_NAMES: usize = 8192;
 pub const STEPS_LISTED: usize = 1024;
 pub const STEPS_CHAIN: usize = 246;
+/// The letter of the 200-byte name of `/long/` and the bytes of its file.
+pub const STEPS_LONG_NAME_CHAR: &str = "n";
+pub const STEPS_LONG_BYTES: &[u8] = b"a long name\n";
 /// The bytes of the file at the end of the chain.
 pub const STEPS_DEEP_BYTES: &[u8] = b"the end of the chain\n";
 
@@ -463,6 +466,20 @@ pub fn layer_steps_entries() -> Vec<LayerEntry> {
         STEPS_DEEP_BYTES,
     ));
     names += 1;
+    // A name of 200 bytes at two slashes: a path over `names::SYNC_BYTES` that the count of its
+    // slashes would let through.
+    out.push(LayerEntry::dir("/.layers/00/long", 0o755, 0, 0));
+    out.push(LayerEntry::file(
+        leak(format!(
+            "/.layers/00/long/{}",
+            STEPS_LONG_NAME_CHAR.repeat(200)
+        )),
+        0o644,
+        0,
+        0,
+        STEPS_LONG_BYTES,
+    ));
+    names += 2;
     out.push(LayerEntry::dir("/.layers/00/etc", 0o755, 0, 0));
     names += 1;
     for k in 0..STEPS_LISTED {

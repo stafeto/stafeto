@@ -53,6 +53,8 @@ pub struct Entry {
     pub uid: u32,
     pub gid: u32,
     pub mode: u16,
+    /// The top 16 bits of the hash of the key, compared before the name.
+    tag: u16,
 }
 
 const EMPTY: Entry = Entry {
@@ -66,6 +68,7 @@ const EMPTY: Entry = Entry {
     uid: 0,
     gid: 0,
     mode: 0,
+    tag: 0,
 };
 
 impl Entry {
@@ -126,12 +129,15 @@ pub struct Index {
     arena_len: usize,
     live: u32,
     marks: u32,
+    /// The seed of the hash, chosen at each start of the service (`reseed`): the names of a layer
+    /// cannot be made to collide offline.
+    seed: u32,
     pub root: Root,
 }
 
-fn hash(parent: u32, name: &[u8]) -> usize {
+fn hash(seed: u32, parent: u32, name: &[u8]) -> u32 {
     // FNV-1a over the id and the name, folded into the table.
-    let mut h: u32 = 0x811c_9dc5;
+    let mut h: u32 = 0x811c_9dc5 ^ seed;
     for b in parent.to_le_bytes().iter().chain(name) {
         h ^= u32::from(*b);
         h = h.wrapping_mul(0x0100_0193);
@@ -142,7 +148,7 @@ fn hash(parent: u32, name: &[u8]) -> usize {
     h ^= h >> 13;
     h = h.wrapping_mul(0xc2b2_ae35);
     h ^= h >> 16;
-    h as usize
+    h
 }
 
 impl Index {
@@ -153,6 +159,7 @@ impl Index {
             arena_len: 0,
             live: 0,
             marks: 0,
+            seed: 0,
             // All zeros, so that the static of the program is `.bss`: the build of the index
             // sets the attributes of the root from the volume.
             root: Root {
@@ -163,6 +170,13 @@ impl Index {
                 flags: 0,
             },
         }
+    }
+
+    /// Chooses the seed of the hash; the index is empty (the start of the service, before the
+    /// build).
+    pub fn reseed(&mut self, seed: u32) {
+        self.clear();
+        self.seed = seed;
     }
 
     /// Empties the index (the build starts again).
@@ -190,13 +204,16 @@ impl Index {
 
     /// The slot of (`parent`, `name`) within the probes.
     fn find(&self, parent: u32, name: &[u8]) -> Option<usize> {
-        let start = hash(parent, name);
+        let h = hash(self.seed, parent, name);
+        let (start, tag) = (h as usize, (h >> 16) as u16);
         for i in 0..PROBES {
             let slot = (start + i) & (SLOTS - 1);
             let e = &self.slots[slot];
             match e.kind {
                 Kind::Empty => return None,
-                _ if e.parent == parent && self.name_of(e) == name => return Some(slot),
+                _ if e.tag == tag && e.parent == parent && self.name_of(e) == name => {
+                    return Some(slot);
+                }
                 _ => {}
             }
         }
@@ -248,16 +265,17 @@ impl Index {
         if parent != 0 && self.entry(parent).is_none_or(|p| p.kind != Kind::Dir) {
             return Err(Error::Invalid);
         }
-        let start = hash(parent, name);
+        let h = hash(self.seed, parent, name);
+        let (start, tag) = (h as usize, (h >> 16) as u16);
         let mut free = None;
         for i in 0..PROBES {
             let slot = (start + i) & (SLOTS - 1);
-            let e = self.slots[slot];
+            let e = &self.slots[slot];
             if e.kind == Kind::Empty {
                 free = Some(slot);
                 break;
             }
-            if e.parent == parent && self.name_of(&e) == name {
+            if e.tag == tag && e.parent == parent && self.name_of(e) == name {
                 return Ok(self.replace(slot, f));
             }
         }
@@ -279,6 +297,7 @@ impl Index {
             uid: f.uid,
             gid: f.gid,
             mode: f.mode,
+            tag,
         };
         if f.kind == Kind::Whiteout {
             self.marks += 1;

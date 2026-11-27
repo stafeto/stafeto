@@ -109,6 +109,9 @@ pub struct Walked {
 /// that walks a path and then asks the data file service (the pass of a file, 16,500 ticks under
 /// -icount) has room for about four more components of the 0.9 B of a step, 420 ticks each.
 pub const SYNC_COMPONENTS: usize = 3;
+/// The paths of more bytes than this are walked in steps too: a few long names cost as much to
+/// make plain and to compare as many short ones.
+pub const SYNC_BYTES: usize = 96;
 
 /// A walk of a long path in progress: the path as it came, then the plain path (`normalize`, which
 /// takes a step of its own) and where the walk stands. A request whose path has more than
@@ -130,7 +133,7 @@ impl Prewalk {
     /// Whether `path` is long enough to be walked in steps: more slashes than a short path holds
     /// (a count of bytes, a step of the request that costs a fraction of making the path plain).
     pub fn long(path: &[u8]) -> bool {
-        path.iter().filter(|&&b| b == b'/').count() > SYNC_COMPONENTS
+        path.len() > SYNC_BYTES || path.iter().filter(|&&b| b == b'/').count() > SYNC_COMPONENTS
     }
 
     /// The walk of `path` with the real identifiers when `real`.

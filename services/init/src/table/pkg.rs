@@ -514,7 +514,7 @@ pub const DATAFS: Record = Record {
 
 /// The budget of the layer service's loop (`serve`): 50 us of each 10 ms on CPU 0 (0.5 %), at 34
 /// once spent no more than the 32 of `SERVICE_LOW`, above every program of POSIX. A request is a
-/// walk of a path over the index or a batch of a listing, 17,000 ticks at most under `-icount`
+/// walk of a path over the index or a batch of a listing, 17,546 ticks at most under `-icount`
 /// (the steps of `cargo xtask layer-steps`, 0.9 B), which is a few microseconds of a CPU of EC2:
 /// the budget takes eight of the longest steps of each period at the service's own level. The
 /// share is the 0.5 % that the table of EC2 left over its 74.5 % on CPU 0 (the data file service 1 %

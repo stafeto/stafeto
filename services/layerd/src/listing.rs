@@ -34,7 +34,11 @@ pub struct Listed {
 /// The slots of the index one request looks at in the first stage: 384 slots cost about 5,400
 /// ticks under `-icount` (14 for a slot, measured), and the entries of a reply (up to 46 of the
 /// message's 1 KiB) about 9,000 more: under 0.9 B with the rest of the step.
-pub const SLOTS_PER_READDIR: usize = 384;
+pub const SLOTS_PER_READDIR: usize = if cfg!(feature = "break-layerd-slots") {
+    4096
+} else {
+    384
+};
 
 /// The entries of the lower set one request reads, kept, dropped or replayed (never more than
 /// `LOWER_PER_READDIR`, which the protocol allows in a reply): each is a round trip to the RAM file

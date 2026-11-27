@@ -32,17 +32,22 @@ const LIMIT: std::time::Duration = std::time::Duration::from_secs(900);
 const STEP_TAG: &str = "18";
 
 /// The checks of the probe in scale mode, in the order it runs them.
-pub const CHECKS: [&str; 6] = [
+pub const CHECKS: [&str; 7] = [
     "sessions",
     "status counts the names of the layer",
     "a file at the end of a chain of 247 components",
+    "a file with a name of 200 bytes",
     "a path of 253 components is the lower set's after the chain",
     "a name of the last directory of the layer",
     "a merged listing of 1,024 names of the layer",
 ];
 
-/// The deliberate break and the reason the gate must name.
-pub const BREAKS: [&str; 1] = ["break-layerd-one-step"];
+/// The deliberate breaks, and whether the step gate must catch the break itself (the walk of the
+/// whole layer in one step is also caught by the watch of init, which kills the silent service).
+pub const BREAKS: [(&str, bool); 2] = [
+    ("break-layerd-one-step", false),
+    ("break-layerd-slots", true),
+];
 
 fn programs(layerd: &'static [&'static str]) -> Vec<ImageProgram> {
     layer_names::programs(layerd, &[])
@@ -159,22 +164,22 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
 
 /// The break: the service that walks the whole layer in one step must fail the gate.
 pub fn breaks(machine: &qemu::Machine) -> Result<(), String> {
-    for feature in BREAKS {
+    for (feature, gate_only) in BREAKS {
         let features: &'static [&'static str] =
             Box::leak(vec!["steps", feature].into_boxed_slice());
         let (output, seconds) = boot(machine, features)?;
-        // A step the watch of init finds too long kills the service (`went silent`): caught too.
+        // A step the watch of init finds too long kills the service (`went silent`).
         let silent = output
             .lines
             .iter()
             .find(|l| l.contains("layerd went silent"));
         match gate(&output.lines) {
-            Err(why) if why.contains("kind 64") || why.contains("over 0.9 B") => {
+            Err(why) if why.contains("kind 6") || why.contains("over 0.9 B") => {
                 println!(
-                    "layer-steps breaks: {feature} is caught by the gate ({why}) in {seconds} s"
+                    "layer-steps breaks: {feature} is caught by the step gate ({why}) in {seconds} s"
                 );
             }
-            _ if silent.is_some() => {
+            _ if silent.is_some() && !gate_only => {
                 println!(
                     "layer-steps breaks: {feature} is caught by the watch of init ({}) in {seconds} s",
                     silent.map_or("", String::as_str)

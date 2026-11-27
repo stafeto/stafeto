@@ -71,9 +71,9 @@ const SESSIONS_PER_PROCESS: usize = 16;
 const LABEL_STEP: u64 = 0x6c61_7967_0001;
 /// The label of the notification for the next step of a long walk (`Job`).
 const LABEL_WALK: u64 = 0x6c61_7967_0002;
-/// The requests whose walk goes on in steps at once. A request that finds the table full is walked
-/// in its own step, whatever the length of its path.
-const JOBS: usize = 8;
+/// The requests whose walk or calls go on in steps at once. A request that finds the table full, or
+/// its session at its share, is answered busy (`layerd::jobs`).
+const JOBS: usize = layerd::jobs::JOBS;
 /// Bit 63 marks the labels the service gives itself: a count of sessions that is never used twice.
 const OWN: u64 = 1 << 63;
 
@@ -148,10 +148,12 @@ fn touch(base: *mut u8, len: usize) {
     core::hint::black_box(base);
 }
 
-/// The epoch of an instance: the counter in units of 2^20 ticks (about 17 ms), 16 bits, never 0.
-/// A handle of an earlier instance carries another epoch unless the instances started a multiple
-/// of 2^36 ticks apart (about 18 minutes) to within 17 ms, and then its place and generation must
-/// match too (`proto_fs::names::handle`).
+/// The epoch of an instance: the counter in units of 2^20 ticks, 16 bits, never 0 (about 17 ms on
+/// the 62.5 MHz counter of QEMU, about 1 ms on a 1 GHz counter, where it wraps in about 69 s). A
+/// handle of an earlier instance carries another epoch unless the instances started a multiple of
+/// 2^36 ticks apart to within a unit, and then its place and generation must match too
+/// (`proto_fs::names::handle`); the POSIX client also counts the rebirths of its session and
+/// answers EIO for a description of an earlier one, so the epoch is a second line.
 const fn epoch_of(ticks: u64) -> u16 {
     let epoch = if cfg!(feature = "break-layerd-epoch") {
         1
@@ -243,6 +245,7 @@ fn main(_: u64) -> u64 {
     touch_stack();
     touch(INDEX.0.get().cast(), core::mem::size_of::<Index>());
     touch(SCAN.0.get().cast(), core::mem::size_of::<Scan>());
+    index.reseed(rt::time::now() as u32 ^ (rt::time::now() >> 32) as u32 ^ 0x5bd1_e995);
     let epoch = epoch_of(rt::time::now());
     let mut core = Core::new(
         index,
@@ -595,28 +598,39 @@ impl Layerd {
     }
 
     /// The request waits for its walk: a long path is walked `lookup::STEP` components in each step
-    /// of the loop, and the step that finishes the walk finishes the request (`walk_job`). None
-    /// when the path is short, the service does not answer yet, or the table of jobs is full: the
-    /// request then goes on in this step.
+    /// of the loop, and the step that finishes the walk finishes the request (`walk_job`). The
+    /// answer is `Deferred`, or busy (`STARTING`, which the clients ask again) when the table of
+    /// jobs has no place for the session (`jobs::place`): a long path is never walked inside the
+    /// step of its request. None when the service does not answer yet (the request then gives its
+    /// own refusal).
     fn defer_walk(
         &mut self,
         r: &mut Request<'_>,
         who: Vouched,
         label: u64,
         kind: JobKind,
-        walk: Prewalk,
+        stage: Stage,
     ) -> Option<Answer> {
         if !self.core.walkable() {
             return None;
         }
-        let place = self.jobs.iter().position(Option::is_none)?;
-        let pending = r.defer()?;
+        let held: [Option<u64>; JOBS] =
+            core::array::from_fn(|i| self.jobs[i].as_ref().map(|j| j.label));
+        let Ok(place) = layerd::jobs::place(&held, label) else {
+            if let Stage::Opening(cont) = stage {
+                self.core.open_abandon(cont);
+            }
+            return Some(st(l::STARTING));
+        };
+        let Some(pending) = r.defer() else {
+            return Some(Answer::Status(Status::BadSize));
+        };
         self.jobs[place] = Some(Job {
             pending,
             label,
             who,
             kind,
-            stage: Stage::Walking(walk),
+            stage,
         });
         let _ = sys::notify(&self.walk_step, 1);
         Some(Answer::Deferred)
@@ -766,7 +780,7 @@ impl Layerd {
                         who,
                         label,
                         JobKind::Open { flags },
-                        Prewalk::new(path, false),
+                        Stage::Walking(Prewalk::new(path, false)),
                     )
                 {
                     return deferred;
@@ -775,23 +789,23 @@ impl Layerd {
                     owner: label,
                     who: &who,
                 };
-                let opened = self.core.open(&c, flags, path, r.reply());
-                // What the longest OPEN was: 7300 a redirect or a description, 7301 a pass, 7302 a
-                // refusal (the detail of the line of the steps).
+                // The calls of the open of a file of the layer are steps of a job, whatever the
+                // path: the largest step is one exchange with the data file service.
+                let opened = self
+                    .core
+                    .open_walked(&c, flags, None, true, path, r.reply());
                 #[cfg(feature = "steps")]
                 rt::service::step_detail(match &opened {
-                    Ok(Done::Pass(_)) => 7301,
+                    Ok(Done::Continue(_)) => 7301,
                     Err(_) => 7302,
                     _ => 7300,
                 });
                 match opened {
                     Ok(Done::Written) => Answer::Reply(rt::handle::Outgoing::new()),
                     Ok(Done::Pass(pass)) => Answer::Reply([pass].into()),
-                    // `Core::open` runs the calls to their end.
-                    Ok(Done::Continue(cont)) => {
-                        self.core.open_abandon(cont);
-                        Answer::Status(Status::BadSize)
-                    }
+                    Ok(Done::Continue(cont)) => self
+                        .defer_walk(r, who, label, JobKind::Open { flags }, Stage::Opening(cont))
+                        .unwrap_or(Answer::Status(Status::BadSize)),
                     Err(status) => Answer::Status(status),
                 }
             }
@@ -809,7 +823,7 @@ impl Layerd {
                         who,
                         label,
                         JobKind::Stat { flags },
-                        Prewalk::new(path, false),
+                        Stage::Walking(Prewalk::new(path, false)),
                     )
                 {
                     return deferred;
@@ -834,7 +848,7 @@ impl Layerd {
                         who,
                         label,
                         JobKind::Access { bits, flags },
-                        Prewalk::new(path, flags & proto_data::ACCESS_REAL != 0),
+                        Stage::Walking(Prewalk::new(path, flags & proto_data::ACCESS_REAL != 0)),
                     )
                 {
                     return deferred;
@@ -854,8 +868,13 @@ impl Layerd {
                     return bad;
                 };
                 if Prewalk::long(path)
-                    && let Some(deferred) =
-                        self.defer_walk(r, who, label, JobKind::Readlink, Prewalk::new(path, false))
+                    && let Some(deferred) = self.defer_walk(
+                        r,
+                        who,
+                        label,
+                        JobKind::Readlink,
+                        Stage::Walking(Prewalk::new(path, false)),
+                    )
                 {
                     return deferred;
                 }
