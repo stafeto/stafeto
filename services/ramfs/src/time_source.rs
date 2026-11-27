@@ -25,22 +25,30 @@ impl Mode {
     }
 }
 
-/// The own arguments of the service: the time mode, and `mount=NAME` when init's table has the
-/// service of the volume that owns that name below the root. The words are apart by one space, in
-/// either order; no mount means no redirects.
-pub fn parse_args(args: &[u8]) -> Result<(Mode, Option<&[u8]>), Status> {
+/// The own arguments of the service: the time mode, `mount=NAME` when init's table has the service
+/// of the volume that owns that name below the root, and `layered` when the table has the layer
+/// service, which decides the names of the root for the programs: the service then refuses the
+/// writes of a POSIX session outside the names the layered root passes through
+/// (`proto_fs::names::PASS_THROUGH`). The words are apart by one space, in either order; no mount
+/// means no redirects.
+pub fn parse_args(args: &[u8]) -> Result<(Mode, Option<&[u8]>, bool), Status> {
     let mut mode = None;
     let mut mount = None;
+    let mut layered = false;
     for word in args.split(|&byte| byte == b' ') {
         if let Some(name) = word.strip_prefix(b"mount=") {
             if mount.replace(name).is_some() || name.is_empty() {
+                return Err(Status::BadSize);
+            }
+        } else if word == proto_fs::RAM_LAYERED_ARG {
+            if core::mem::replace(&mut layered, true) {
                 return Err(Status::BadSize);
             }
         } else if mode.replace(Mode::parse(word)?).is_some() {
             return Err(Status::BadSize);
         }
     }
-    Ok((mode.ok_or(Status::BadSize)?, mount))
+    Ok((mode.ok_or(Status::BadSize)?, mount, layered))
 }
 
 /// An unstable snapshot defers the step. Overflow refuses its effect.
@@ -220,15 +228,32 @@ mod tests {
     #[test]
     fn the_mount_is_an_optional_second_word() {
         let clocked = proto_fs::RAM_TIME_CLOCKED;
-        assert_eq!(parse_args(clocked), Ok((Mode::Clocked, None)));
+        assert_eq!(parse_args(clocked), Ok((Mode::Clocked, None, false)));
         assert_eq!(
             parse_args(b"time-clocked mount=data"),
-            Ok((Mode::Clocked, Some(&b"data"[..])))
+            Ok((Mode::Clocked, Some(&b"data"[..]), false))
         );
         assert_eq!(
             parse_args(b"mount=data time-legacy"),
-            Ok((Mode::Legacy, Some(&b"data"[..])))
+            Ok((Mode::Legacy, Some(&b"data"[..]), false))
         );
+        // The word `layered` comes once, in any place.
+        assert_eq!(
+            parse_args(b"time-clocked mount=data layered"),
+            Ok((Mode::Clocked, Some(&b"data"[..]), true))
+        );
+        assert_eq!(
+            parse_args(b"layered time-clocked"),
+            Ok((Mode::Clocked, None, true))
+        );
+        for bad in [
+            &b"time-clocked layered layered"[..],
+            b"layered",
+            b"time-clocked layered=1",
+            b"time-clocked Layered",
+        ] {
+            assert_eq!(parse_args(bad), Err(Status::BadSize), "{bad:?}");
+        }
         for bad in [
             &b""[..],
             b"mount=data",

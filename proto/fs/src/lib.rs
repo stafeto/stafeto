@@ -225,6 +225,11 @@ pub const DATA_MOUNT: &[u8] = b"data";
 /// The argument init gives the RAM file service in an image whose table has the data service, after
 /// the time mode: `mount=data`. With no such argument the service redirects nothing.
 pub const RAM_MOUNT_ARG: &[u8] = b"mount=data";
+/// The argument init gives the RAM file service in an image whose table has the layer service: a
+/// POSIX session cannot write a name outside the pass-through names of the layered root
+/// (`names::PASS_THROUGH`), so that a description of a lower directory writes nothing past the
+/// layers. The sessions of the boot profile are not refused.
+pub const RAM_LAYERED_ARG: &[u8] = b"layered";
 /// The links one walk may expand, and with a client that follows redirects, the sum of the links
 /// and the redirects of one call (POSIX {SYMLOOP_MAX} at its minimum is 8; this is the service's).
 pub const LINKS_MAX: u32 = 32;
