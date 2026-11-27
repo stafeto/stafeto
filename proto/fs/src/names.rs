@@ -64,7 +64,8 @@
 //! (at most `LOWER_PER_READDIR` in one reply) that no layer of the user hides or shadows; a
 //! directory with the opaque marker has no second stage. `cursor` is the position after the entries
 //! of the reply: its high half is the stage and its low half the position in the stage. SEEK_DIR
-//! returns a description to a cursor a reply gave and REWIND to the start. An entry is `ino` u64,
+//! returns a description to a cursor a reply gave and REWIND to the start. A reply may have `more`
+//! and no entry (the lower entries the layer hides took the request): the program asks again. An entry is `ino` u64,
 //! `kind` u32 (the kinds of `NodeInfo`), `name_len` u32 (1 to `NAME_MAX`) and the name.
 //!
 //! **Changes.** CHANGE carries `op` u32 (`ChangeOp`), `a` u64, `b` u64, then the first path (two
@@ -476,8 +477,9 @@ impl DirReply {
     }
 }
 
-/// The head of a READ_DIR reply read back: `more`, the cursor and the entries to walk. A reply with
-/// no entry has `more` 0 and one with `more` has an entry (BAD_SIZE otherwise).
+/// The head of a READ_DIR reply read back: `more`, the cursor and the entries to walk. A reply may
+/// have `more` and no entry (the entries of the lower set the layer hides took the request): the
+/// program asks again.
 pub fn read_dir_reply(bytes: &[u8]) -> Result<(bool, u64, DirEntries<'_>), Status> {
     let mut r = Reader::new(bytes);
     match Status::from_code(r.u32()?) {
@@ -491,9 +493,6 @@ pub fn read_dir_reply(bytes: &[u8]) -> Result<(bool, u64, DirEntries<'_>), Statu
     };
     let cursor = r.u64()?;
     let rest = r.bytes(r.left())?;
-    if more && rest.is_empty() {
-        return Err(Status::BadSize);
-    }
     Ok((more, cursor, DirEntries { rest }))
 }
 
@@ -769,9 +768,11 @@ mod tests {
         let got: Vec<_> = entries.map(|e| e.unwrap()).collect();
         assert_eq!(got.len(), 3);
         assert_eq!((got[2].ino, got[2].name), (12, &b"ccc"[..]));
-        // `more` with no entry is no reply; so is an unknown value of it.
+        // `more` with no entry is a reply (ask again); an unknown value of `more` is none.
         let empty = DirReply::new().unwrap();
-        let bytes = empty.finish(true, 0).unwrap();
+        let mut bytes = empty.finish(true, 0).unwrap();
+        assert!(read_dir_reply(&bytes[..DIR_HEAD]).unwrap().0);
+        bytes[4] = 2;
         assert!(read_dir_reply(&bytes[..DIR_HEAD]).is_err());
         let bytes = DirReply::new().unwrap().finish(false, 0).unwrap();
         let (more, _, mut entries) = read_dir_reply(&bytes[..DIR_HEAD]).unwrap();

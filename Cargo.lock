@@ -619,6 +619,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "layerd"
+version = "0.7.0-pre.0"
+dependencies = [
+ "abi",
+ "posix-fs",
+ "posix-perm",
+ "proto-data",
+ "proto-fs",
+ "proto-init",
+ "proto-layer",
+ "proto-process",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
