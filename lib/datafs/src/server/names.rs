@@ -418,6 +418,7 @@ impl Server {
         let written = fs.setattr(path, ATTR_TYPE, &record.to_bytes());
         if let Err(e) = written {
             if fs.remove(path).is_ok() {
+                fs.note_freed_blocks(2);
                 self.dirs_changed(-1);
             }
             return Err(status_of(e));
