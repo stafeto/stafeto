@@ -1292,6 +1292,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             .map_err(|_| Stop::Status(st(proto_fs::NO_SPACE)))?;
         if src_is_dir {
             self.table.retarget(src_id, new);
+            // The directory may have gone under an opaque one, or out from under one, or been made
+            // opaque: the directories below it follow.
+            self.index.refresh_hidden();
         }
         if src_lower.is_some() {
             self.index_mark(src_parent, a_leaf)?;

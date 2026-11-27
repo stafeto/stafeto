@@ -950,6 +950,24 @@ fn a_rename_that_takes_a_subtree_past_the_limit_on_paths_is_refused() {
 }
 
 #[test]
+fn the_build_lifts_how_far_each_directory_reaches() {
+    let mut v = volume();
+    let mut path = String::from("/.layers/00/etc");
+    for i in 0..5 {
+        path.push('/');
+        path.push_str(&format!("{i}").repeat(40));
+        v.dir(&path, 0o755, 0);
+    }
+    v.file(&format!("{path}/leaf"), 0o644, 0, b"x");
+    let mut world = World::new();
+    let mut core = world.core(v);
+    ready(&mut core);
+    let etc = core.index.lookup(0, b"etc").unwrap().0;
+    // Five levels of 41 bytes and "/leaf".
+    assert_eq!(core.index.reach(etc), 5 * 41 + 5);
+}
+
+#[test]
 fn the_build_leaves_out_a_directory_whose_path_the_volume_refuses() {
     let mut v = volume();
     let mut path = String::from("/.layers/00/etc");
@@ -1053,6 +1071,38 @@ fn the_index_says_whether_a_name_has_room_before_the_volume_is_touched() {
     // The name that failed has no room, and a name that is there does.
     assert!(!ix.has_room(0, format!("n{i}").as_bytes()));
     assert!(ix.has_room(0, b"n0"));
+}
+
+#[test]
+fn a_directory_below_an_opaque_one_keeps_the_lower_set_hidden_after_a_build_and_a_move() {
+    let mut v = volume();
+    v.dir("/.layers/00/opq/sub", 0o755, 0)
+        .file("/.layers/00/opq/sub/own", 0o644, 0, b"o");
+    let mut world = World::new();
+    let mut core = world.core(v);
+    ready(&mut core);
+    // The build: /opq is opaque, /opq/sub of the layer has the lower /opq/sub under it.
+    assert_eq!(listing(&mut core, "/opq/sub"), ["own"]);
+    assert_eq!(
+        open(&mut core, 0, f::READ_ONLY, "/opq/sub/lx").err(),
+        Some(st(f::NO_ENTRY))
+    );
+    // Moved out from under the opaque directory, it is a directory of the merged view again.
+    rename(&mut core, 0, "/opq/sub", "/etc/sub").unwrap();
+    let sub = core
+        .index
+        .lookup(core.index.lookup(0, b"etc").unwrap().0, b"sub")
+        .unwrap()
+        .0;
+    assert!(core.index.lower_visible(sub));
+    // And back under it, hidden.
+    rename(&mut core, 0, "/etc/sub", "/opq/sub2").unwrap();
+    let sub = core
+        .index
+        .lookup(core.index.lookup(0, b"opq").unwrap().0, b"sub2")
+        .unwrap()
+        .0;
+    assert!(!core.index.lower_visible(sub));
 }
 
 // ---------------------------------------------------------------------- rename

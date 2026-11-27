@@ -17,6 +17,9 @@ use crate::volume::{BATCH_BYTES, Volume, raw_entry};
 use proto_data::{DIRECTORY, KIND_DIRECTORY, READ};
 use proto_wire::Status;
 
+/// The directories one step of the pass of `index.lift` takes.
+const LIFTS_PER_STEP: usize = 64;
+
 pub const OPAQUE_NAME: &[u8] = b".wh..wh..opq";
 pub const WHITEOUT_PREFIX: &[u8] = b".wh.";
 const RESERVED: &[u8] = b".wh..wh.";
@@ -79,6 +82,9 @@ pub const ENTRIES_PER_STEP: usize = 24;
 
 pub struct Scan {
     queue: [u32; SLOTS],
+    /// Where the pass that lets each directory reach as far as its children stands (`index.lift`),
+    /// counting down the queue; 0 before the pass starts.
+    lifted: usize,
     /// The batch of the open directory (`Volume::read_dir_raw`) and how far it is taken; whether
     /// no more batches follow it.
     batch: [u8; BATCH_BYTES],
@@ -106,6 +112,7 @@ impl Scan {
     pub const fn new() -> Scan {
         Scan {
             queue: [0; SLOTS],
+            lifted: 0,
             batch: [0; BATCH_BYTES],
             batch_len: 0,
             batch_pos: 0,
@@ -134,6 +141,7 @@ impl Scan {
         self.started = false;
         self.steps = 0;
         self.skipped = 0;
+        self.lifted = 0;
     }
 
     fn push(&mut self, id: u32) {
@@ -168,7 +176,22 @@ impl Scan {
     ) -> Result<Progress, Failure> {
         let Some((id, n)) = self.dir else {
             if self.head == self.tail {
-                return Ok(Progress::Done);
+                // Every directory is listed: the directories reach as far as their children, the
+                // last first, a few in each step.
+                if self.lifted == 0 {
+                    self.lifted = self.tail;
+                }
+                let mut taken = 0;
+                while self.lifted > 1 && taken < LIFTS_PER_STEP {
+                    self.lifted -= 1;
+                    index.lift(self.queue[self.lifted % SLOTS]);
+                    taken += 1;
+                }
+                return Ok(if self.lifted > 1 {
+                    Progress::More
+                } else {
+                    Progress::Done
+                });
             }
             let id = self.queue[self.head % SLOTS];
             self.head += 1;
@@ -205,6 +228,7 @@ impl Scan {
             .open(path, READ | DIRECTORY, 0)
             .map_err(Failure::Volume)?;
         index.set_flags(id, 0, UNSCANNED);
+        index.inherit_hidden(id);
         self.open = Some((id, handle));
         self.dir = None;
         self.statted = false;
@@ -282,7 +306,7 @@ impl Scan {
                 gid: 0,
                 mode: 0,
             };
-            match index.insert(id, name, fields) {
+            match index.insert_shallow(id, name, fields) {
                 Ok(child) => {
                     if kind == Kind::Dir {
                         found_queue[found] = child;

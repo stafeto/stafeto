@@ -24,7 +24,7 @@ use crate::descriptions::{Lost, Refused, ShareError, Table};
 use crate::identity::Vouched;
 use crate::index::{Index, Kind};
 use crate::listing;
-use crate::lookup::{Outcome, Walk, normalize};
+use crate::lookup::{Outcome, Walk, normalize_dots};
 use crate::scan::{Failure, Progress, Scan};
 use crate::volume::{Lower, R, Volume};
 use posix_perm::{EXEC, READ, WRITE, permits};
@@ -104,6 +104,8 @@ pub struct Walked {
     pub(crate) trailing: bool,
     path: [u8; 512],
     len: usize,
+    /// The plain path holds a `..`.
+    dotted: bool,
 }
 
 /// The paths of more components than this are walked in steps of their own (`Prewalk`): a step
@@ -130,6 +132,7 @@ pub struct Prewalk {
     real: bool,
     /// A link at the end of the path is followed.
     follow: bool,
+    dotted: bool,
 }
 
 impl Prewalk {
@@ -154,6 +157,7 @@ impl Prewalk {
             cur: 0,
             real,
             follow,
+            dotted: false,
         }
     }
 }
@@ -605,7 +609,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         };
         let end = live.len() + plain.len();
         // A link's file has another name, and a path with a `..` does not name the chain.
-        let dotted = plain.split(|&b| b == b'/').any(|part| part == b"..");
+        let dotted = walked.dotted;
         let link = self.index.entry(id).is_some_and(|e| e.kind == Kind::Link);
         if id == 0 || dotted || link || plain.first() != Some(&b'/') || end > out.len() {
             return self.vpath(id, out);
@@ -624,7 +628,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     pub fn prewalk_step(&self, who: &Vouched, pw: &mut Prewalk) -> Option<Walked> {
         // The first step makes the path plain (about 13,000 ticks for a path of 253 components).
         if !pw.planned {
-            pw.len = normalize(&pw.raw[..pw.raw_len], &mut pw.path);
+            (pw.len, pw.dotted) = normalize_dots(&pw.raw[..pw.raw_len], &mut pw.path);
             pw.planned = true;
             return None;
         }
@@ -642,6 +646,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
                 trailing,
                 path: pw.path,
                 len: pw.len,
+                dotted: pw.dotted,
             }),
         }
     }
@@ -650,7 +655,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     /// when `real` (ACCESS with `ACCESS_REAL`) and the effective ones otherwise.
     pub(crate) fn walk(&self, c: &Client<'_>, path: &[u8], real: bool, follow: bool) -> Walked {
         let mut plain = [0u8; 512];
-        let len = normalize(path, &mut plain);
+        let (len, dotted) = normalize_dots(path, &mut plain);
         let walk = if follow {
             Walk::new(&plain[..len])
         } else {
@@ -663,6 +668,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             trailing,
             path: plain,
             len,
+            dotted,
         }
     }
 
@@ -1033,7 +1039,8 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     }
 
     /// READ_DIR: the reply is returned whole, with its length.
-    pub fn read_dir(&mut self, owner: u64, handle: u32) -> R<([u8; abi::MESSAGE_MAX], usize)> {
+    /// READ_DIR: the reply is written to the end of `out`, and its length is the answer.
+    pub fn read_dir_into(&mut self, owner: u64, handle: u32, out: &mut Writer) -> R<usize> {
         self.gate()?;
         let Core {
             table,
@@ -1045,7 +1052,8 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         let mut reply = DirReply::new()?;
         if desc.dir == crate::descriptions::GONE {
             let len = reply.len();
-            return Ok((reply.finish(false, 0)?, len));
+            reply.finish_into(false, 0, out)?;
+            return Ok(len);
         }
         let listed = listing::read_dir(
             index,
@@ -1059,7 +1067,18 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         // What the replies have given out, which SEEK_DIR may go back to and not past.
         desc.given = desc.given.max(desc.position);
         let len = reply.len();
-        Ok((reply.finish(listed.more, listed.cursor)?, len))
+        reply.finish_into(listed.more, listed.cursor, out)?;
+        Ok(len)
+    }
+
+    /// `read_dir_into` with the reply as an array (for the tests).
+    #[cfg(test)]
+    pub fn read_dir(&mut self, owner: u64, handle: u32) -> R<([u8; abi::MESSAGE_MAX], usize)> {
+        let mut w = Writer::new();
+        let len = self.read_dir_into(owner, handle, &mut w)?;
+        let mut bytes = [0u8; abi::MESSAGE_MAX];
+        bytes[..len].copy_from_slice(w.as_bytes());
+        Ok((bytes, len))
     }
 
     pub fn rewind(&mut self, owner: u64, handle: u32) -> R<()> {

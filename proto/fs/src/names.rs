@@ -493,6 +493,16 @@ impl DirReply {
         Ok(bytes)
     }
 
+    /// `finish`, written to the end of `out` (a service's reply): no 1 KiB array is made and
+    /// copied, only the bytes the entries took.
+    pub fn finish_into(self, more: bool, cursor: u64, out: &mut Writer) -> Result<(), Status> {
+        let src = self.w.as_bytes();
+        out.u32(0)?;
+        out.u32(u32::from(more))?;
+        out.u64(cursor)?;
+        out.bytes(&src[DIR_HEAD..])
+    }
+
     pub fn len(&self) -> usize {
         self.w.as_bytes().len()
     }
@@ -815,6 +825,26 @@ mod tests {
         ] {
             assert!(open_writes(flags), "{flags}");
         }
+    }
+
+    #[test]
+    fn a_reply_finished_into_a_writer_is_the_reply_finished_as_an_array() {
+        let build = || {
+            let mut reply = DirReply::new().unwrap();
+            reply
+                .push(&DirEntry {
+                    ino: 7,
+                    kind: 2,
+                    name: b"name",
+                })
+                .unwrap();
+            reply
+        };
+        let array = build().finish(true, 0x1234).unwrap();
+        let mut w = Writer::new();
+        build().finish_into(true, 0x1234, &mut w).unwrap();
+        assert_eq!(w.as_bytes(), &array[..w.as_bytes().len()]);
+        assert!(array[w.as_bytes().len()..].iter().all(|&b| b == 0));
     }
 
     #[test]

@@ -98,9 +98,14 @@ pub fn read_dir<L: Lower>(
             return Ok(listed(position, true));
         }
         let mut budget = SLOTS_PER_READDIR;
+        let key = index.dir_key(dir);
         while room(reply) {
             let from = (position.at - 2) as usize;
-            match index.next_child(dir, from, &mut budget) {
+            let found = match key {
+                Some(key) => index.next_child_of(key, from, &mut budget),
+                None => NextChild::End,
+            };
+            match found {
                 NextChild::End => {
                     // The names of the layer are done.
                     *position = Position { stage: 1, at: 0 };
@@ -176,6 +181,7 @@ pub fn read_dir<L: Lower>(
         return Ok(listed(position, true));
     }
     let mut taken = 0;
+    let key = index.dir_key(dir);
     while taken < LOWER_PER_STEP && room(reply) {
         let Some((ino, kind, len)) = lower.next(d, &mut name)? else {
             return Ok(listed(position, false));
@@ -187,7 +193,9 @@ pub fn read_dir<L: Lower>(
         if name == b"." || name == b".." {
             continue;
         }
-        if cfg!(not(feature = "break-layerd-whiteout")) && index.lookup(dir, name).is_some() {
+        if cfg!(not(feature = "break-layerd-whiteout"))
+            && key.is_some_and(|key| index.lookup_in(key, name).is_some())
+        {
             continue;
         }
         reply

@@ -944,11 +944,12 @@ impl Layerd {
                 let Ok(handle) = n::read_handle(body) else {
                     return bad;
                 };
-                match self.core.read_dir(label, handle) {
-                    Ok((bytes, len)) => {
-                        if r.reply().bytes(&bytes[..len]).is_err() {
-                            return bad;
-                        }
+                match self.core.read_dir_into(label, handle, r.reply()) {
+                    Ok(len) => {
+                        #[cfg(feature = "steps")]
+                        rt::service::step_detail(7600 + (len as u64 / 64));
+                        #[cfg(not(feature = "steps"))]
+                        let _ = len;
                         Answer::Reply(rt::handle::Outgoing::new())
                     }
                     Err(status) => Answer::Status(status),

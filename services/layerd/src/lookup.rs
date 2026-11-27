@@ -44,12 +44,18 @@ pub const STEP: usize = 16;
 /// `out` and their count; the result is never longer than `path`, so 512 bytes hold every path of
 /// the protocol.
 pub fn normalize(path: &[u8], out: &mut [u8; 512]) -> usize {
+    normalize_dots(path, out).0
+}
+
+/// `normalize`, and whether a `..` component is in the plain path (it then does not name the chain
+/// of the entry it leads to).
+pub fn normalize_dots(path: &[u8], out: &mut [u8; 512]) -> (usize, bool) {
     // A path that is plain already (no empty component, no `.` or `..`) is itself: one pass over
     // its bytes and a copy, where the general walk over its components costs 35 ticks a byte
     // under -icount (17,000 for a path of 253 components).
     if path.len() <= out.len() && is_plain(path) {
         out[..path.len()].copy_from_slice(path);
-        return path.len();
+        return (path.len(), false);
     }
     normalize_slow(path, out)
 }
@@ -79,7 +85,8 @@ fn is_plain(path: &[u8]) -> bool {
     true
 }
 
-fn normalize_slow(path: &[u8], out: &mut [u8; 512]) -> usize {
+fn normalize_slow(path: &[u8], out: &mut [u8; 512]) -> (usize, bool) {
+    let mut dotted = false;
     let mut len = 0;
     let mut last: &[u8] = b"";
     for part in path.split(|&b| b == b'/') {
@@ -87,6 +94,7 @@ fn normalize_slow(path: &[u8], out: &mut [u8; 512]) -> usize {
             b"" => continue,
             b"." => {}
             name => {
+                dotted |= name == b"..";
                 if len + 1 + name.len() <= out.len() {
                     out[len] = b'/';
                     out[len + 1..len + 1 + name.len()].copy_from_slice(name);
@@ -98,14 +106,14 @@ fn normalize_slow(path: &[u8], out: &mut [u8; 512]) -> usize {
     }
     if len == 0 {
         out[0] = b'/';
-        return 1;
+        return (1, dotted);
     }
     let directory = path.last() == Some(&b'/') || last == b"." || last == b"..";
     if directory && len < out.len() {
         out[len] = b'/';
         len += 1;
     }
-    len
+    (len, dotted)
 }
 
 /// The components of a plain path (`normalize`): the names between its slashes.
@@ -492,7 +500,7 @@ mod tests {
         for path in paths {
             let (mut fast, mut slow) = ([0u8; 512], [0u8; 512]);
             let a = normalize(path, &mut fast);
-            let b = normalize_slow(path, &mut slow);
+            let b = normalize_slow(path, &mut slow).0;
             assert_eq!(&fast[..a], &slow[..b], "{:?}", std::str::from_utf8(path));
         }
     }

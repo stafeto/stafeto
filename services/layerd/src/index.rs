@@ -35,14 +35,15 @@ pub const OPAQUE_EXTRA: usize = 13;
 #[repr(u8)]
 pub enum Kind {
     Empty = 0,
-    Whiteout = 1,
-    File = 2,
-    Dir = 3,
+    /// A name that was removed: the slot keeps its name for a probe that passes it. It follows
+    /// `Empty` so that "no entry" is one comparison (`kind < 2`) in the loops that look at slots.
+    Gone = 1,
+    Whiteout = 2,
+    File = 3,
+    Dir = 4,
     /// A symbolic link: littlefs has none, so the layer keeps it as the file `.wh..wh.lnk.<name>`
     /// whose bytes are the target.
-    Link = 4,
-    /// A name that was removed: the slot keeps its name for a probe that passes it.
-    Gone = 5,
+    Link = 5,
 }
 
 /// The directory is opaque: the lower set does not show through it.
@@ -51,6 +52,9 @@ pub const OPAQUE: u8 = 1;
 pub const HAS_CHILDREN: u8 = 2;
 /// The directory has not been listed yet by the build of the index (`scan`).
 pub const UNSCANNED: u8 = 4;
+/// A directory above this one is opaque (or has the flag itself): the lower set does not show
+/// through it either. Kept for each directory so that the question costs one look, whatever the depth.
+pub const NOLOWER: u8 = 8;
 
 /// An entry. The key of its place is (the key of its directory, its name). A directory has a key
 /// of its own that never changes (`dkey`, 1 to `SLOTS`), so a directory that moves to another place
@@ -139,7 +143,7 @@ pub struct Index {
     live: u32,
     marks: u32,
     /// The slot plus one of the directory with the key `k`, at `dslot[k]` (0 for a key in no use).
-    dslot: [u32; SLOTS + 1],
+    dslot: [u32; SLOTS],
     /// The keys issued so far, and the keys given back, which are used again first.
     keys_issued: u32,
     free_keys: [u32; SLOTS],
@@ -182,7 +186,7 @@ impl Index {
             arena_len: 0,
             live: 0,
             marks: 0,
-            dslot: [0; SLOTS + 1],
+            dslot: [0; SLOTS],
             keys_issued: 0,
             free_keys: [0; SLOTS],
             free_len: 0,
@@ -245,7 +249,7 @@ impl Index {
     /// The id of the directory `id` lies in (0 for the root, and for an id that is none).
     pub fn parent_of(&self, id: u32) -> u32 {
         match self.entry(id) {
-            Some(e) if e.pkey != 0 => self.dslot[e.pkey as usize],
+            Some(e) => self.dslot[e.pkey as usize & (SLOTS - 1)],
             _ => 0,
         }
     }
@@ -271,11 +275,17 @@ impl Index {
 
     /// The entry of `name` in the directory `parent`, with its id; a gone entry is none.
     pub fn lookup(&self, parent: u32, name: &[u8]) -> Option<(u32, &Entry)> {
-        let slot = self.find(self.dkey_of(parent)?, name)?;
+        self.lookup_in(self.dkey_of(parent)?, name)
+    }
+
+    /// `lookup` in the directory with the key `pkey`.
+    pub fn lookup_in(&self, pkey: u32, name: &[u8]) -> Option<(u32, &Entry)> {
+        let slot = self.find(pkey, name)?;
         Some((slot as u32 + 1, &self.slots[slot]))
     }
 
     /// The entry with id `id` (not the root).
+    #[inline]
     pub fn entry(&self, id: u32) -> Option<&Entry> {
         let slot = (id as usize).checked_sub(1)?;
         let e = self.slots.get(slot)?;
@@ -293,6 +303,16 @@ impl Index {
         let Some(pkey) = self.dkey_of(parent) else {
             return NextChild::End;
         };
+        self.next_child_of(pkey, from, budget)
+    }
+
+    /// The key of the directory `id` (0 for the root): a listing asks for it once.
+    pub fn dir_key(&self, id: u32) -> Option<u32> {
+        self.dkey_of(id)
+    }
+
+    /// `next_child` for the directory with the key `pkey`.
+    pub fn next_child_of(&self, pkey: u32, from: usize, budget: &mut usize) -> NextChild {
         let mut slot = from;
         while slot < SLOTS {
             if *budget == 0 {
@@ -314,7 +334,8 @@ impl Index {
             self.free_len -= 1;
             return Ok(self.free_keys[self.free_len]);
         }
-        if self.keys_issued as usize >= SLOTS {
+        // The keys are 1 to `SLOTS - 1`: 0 is the root, and `dslot` is indexed by a masked key.
+        if self.keys_issued as usize >= SLOTS - 1 {
             return Err(Error::NoSpace);
         }
         self.keys_issued += 1;
@@ -323,7 +344,7 @@ impl Index {
 
     fn give_back(&mut self, key: u32) {
         if key != 0 {
-            self.dslot[key as usize] = 0;
+            self.dslot[key as usize & (SLOTS - 1)] = 0;
             self.free_keys[self.free_len] = key;
             self.free_len += 1;
         }
@@ -332,7 +353,29 @@ impl Index {
     /// Inserts a name. A mark of deletion over a name of the layer changes nothing, and a name over
     /// a mark replaces it (the layer says the name is there). Returns the id.
     pub fn insert(&mut self, parent: u32, name: &[u8], f: Fields) -> Result<u32, Error> {
-        self.insert_with(parent, name, f, None)
+        self.insert_with(parent, name, f, None, false)
+    }
+
+    /// `insert` for the build of the index: only the directory the name lies in learns how far it
+    /// reaches (a walk up the index costs a level at a time, and a deep chain would take its depth in
+    /// one step); the directories above learn it from `lift`, which the build runs when it has
+    /// listed them all.
+    pub fn insert_shallow(&mut self, parent: u32, name: &[u8], f: Fields) -> Result<u32, Error> {
+        self.insert_with(parent, name, f, None, true)
+    }
+
+    /// The directory above `id` reaches as far as `id` does and its name: the build calls it for the
+    /// directories children first.
+    pub fn lift(&mut self, id: u32) {
+        let Some(e) = self.entry(id).copied() else {
+            return;
+        };
+        let parent = self.parent_of(id);
+        self.grow(
+            parent,
+            1 + usize::from(e.name_len) + usize::from(e.reach),
+            true,
+        );
     }
 
     /// `insert`, giving a directory the key `keep` (a directory that moved) when there is one.
@@ -342,6 +385,7 @@ impl Index {
         name: &[u8],
         f: Fields,
         keep: Option<u32>,
+        shallow: bool,
     ) -> Result<u32, Error> {
         let id = self.insert_raw(parent, name, f, keep)?;
         let extra = match f.kind {
@@ -349,12 +393,25 @@ impl Index {
             Kind::Whiteout => MARK_EXTRA,
             _ => 0,
         };
-        self.grow(parent, 1 + name.len() + extra);
+        self.grow(parent, 1 + name.len() + extra, shallow);
+        if !shallow && f.kind == Kind::Dir && self.flags(parent) & (OPAQUE | NOLOWER) != 0 {
+            self.set_flags(id, NOLOWER, 0);
+        }
         Ok(id)
     }
 
     /// The directory `at` and each one above it reach `add` bytes below themselves at least.
-    fn grow(&mut self, mut at: u32, mut add: usize) {
+    fn grow(&mut self, mut at: u32, mut add: usize, shallow: bool) {
+        if shallow {
+            // The build: the one directory the name lies in.
+            if let Some(e) = (at as usize)
+                .checked_sub(1)
+                .and_then(|slot| self.slots.get_mut(slot))
+            {
+                e.reach = e.reach.max(add.min(usize::from(u16::MAX)) as u16);
+            }
+            return;
+        }
         while at != 0 {
             let Some(slot) = (at as usize).checked_sub(1) else {
                 return;
@@ -362,7 +419,12 @@ impl Index {
             let Some(e) = self.slots.get_mut(slot) else {
                 return;
             };
+            let known = usize::from(e.reach) >= add;
             e.reach = e.reach.max(add.min(usize::from(u16::MAX)) as u16);
+            // The directories above reach further than this one already (an earlier name did it).
+            if shallow || known {
+                return;
+            }
             add += 1 + usize::from(e.name_len);
             at = self.parent_of(at);
         }
@@ -494,7 +556,7 @@ impl Index {
 
     fn place_key(&mut self, dkey: u32, slot: usize) {
         if dkey != 0 {
-            self.dslot[dkey as usize] = slot as u32 + 1;
+            self.dslot[dkey as usize & (SLOTS - 1)] = slot as u32 + 1;
         }
     }
 
@@ -574,12 +636,12 @@ impl Index {
         }
         // The new place first, so a refusal leaves the entry where it was.
         let keep = (e.kind == Kind::Dir).then_some(e.dkey);
-        let new = self.insert_with(parent, name, fields, keep)?;
+        let new = self.insert_with(parent, name, fields, keep, false)?;
         self.take_out(id, false);
         if let Some(slot) = (new as usize).checked_sub(1) {
             self.slots[slot].flags = e.flags & !UNSCANNED;
             self.slots[slot].reach = e.reach;
-            self.grow(parent, 1 + name.len() + usize::from(e.reach));
+            self.grow(parent, 1 + name.len() + usize::from(e.reach), false);
         }
         Ok(new)
     }
@@ -660,20 +722,45 @@ impl Index {
     /// up to the root is opaque. A directory made below an opaque one has none of the lower names
     /// either.
     pub fn lower_visible(&self, id: u32) -> bool {
-        let mut at = id;
-        for _ in 0..=SLOTS {
-            if self.flags(at) & OPAQUE != 0 {
-                return false;
+        self.flags(id) & (OPAQUE | NOLOWER) == 0
+    }
+
+    /// Sets and clears `NOLOWER` of every directory by the flags of the directory above it, until
+    /// nothing changes (a directory moved, or made opaque, with directories below it). A scan of
+    /// the table for each level of the tree: it is for the rare change that moves a subtree.
+    pub fn refresh_hidden(&mut self) {
+        loop {
+            let mut changed = false;
+            for slot in 0..SLOTS {
+                let e = self.slots[slot];
+                if e.kind != Kind::Dir {
+                    continue;
+                }
+                let above = if e.pkey == 0 {
+                    self.root.flags
+                } else {
+                    let up = self.dslot[e.pkey as usize & (SLOTS - 1)] as usize;
+                    up.checked_sub(1).map_or(0, |u| self.slots[u].flags)
+                };
+                let want = above & (OPAQUE | NOLOWER) != 0;
+                if want != (e.flags & NOLOWER != 0) {
+                    self.slots[slot].flags ^= NOLOWER;
+                    changed = true;
+                }
             }
-            if at == 0 {
-                return true;
+            if !changed {
+                return;
             }
-            if self.entry(at).is_none() {
-                return false;
-            }
-            at = self.parent_of(at);
         }
-        false
+    }
+
+    /// The directory `id` just started to be listed by the build: the directory above it has been
+    /// listed whole, so its flags are final.
+    pub fn inherit_hidden(&mut self, id: u32) {
+        let above = self.parent_of(id);
+        if self.flags(above) & (OPAQUE | NOLOWER) != 0 {
+            self.set_flags(id, NOLOWER, 0);
+        }
     }
 
     /// The owner, group and mode of a directory of the layer, the root included.
@@ -734,7 +821,8 @@ impl Index {
                 dest[1..].copy_from_slice(name);
             }
             end = start;
-            at = self.parent_of(at);
+            // The key 0 is the root, and `dslot[0]` is 0.
+            at = self.dslot[e.pkey as usize & (SLOTS - 1)];
             depth += 1;
             if depth > 4096 {
                 return None;
