@@ -383,6 +383,11 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         }
     }
 
+    /// The directories the build left out for a path past the volume's limit.
+    pub fn skipped(&self) -> u32 {
+        self.scan.skipped
+    }
+
     pub fn build_steps(&self) -> u32 {
         self.scan.steps
     }
@@ -646,6 +651,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         let mut info = node_from(&stat)?;
         if is_link {
             info.kind = 5;
+            info.permissions = 0o777;
         }
         n::write_info(&info, w)
     }

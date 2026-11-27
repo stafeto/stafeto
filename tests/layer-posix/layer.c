@@ -429,6 +429,27 @@ static int dotdot_out_of_tmp(void) {
     return 0;
 }
 
+/* A link below a pass-through name that leads into the root, met by a path against a descriptor of
+ * the directory (the file service walks it from the descriptor): the walk is routed through the
+ * layer service, so a read sees the merged view and a write to a lower file is refused. */
+static int link_below_a_pass_through_directory(void) {
+    struct stat st;
+    LP_CHECK(mkdir("/tmp/ld", 0755) == 0);
+    LP_CHECK(symlink("/etc", "/tmp/ld/l") == 0);
+    int d = open("/tmp/ld", O_RDONLY | O_DIRECTORY);
+    LP_CHECK(d >= 0);
+    LP_CHECK(FAILS(openat(d, "l/layer-hidden", O_RDONLY), ENOENT));
+    int fd = openat(d, "l/layer-own", O_RDONLY);
+    LP_CHECK(fd >= 0 && fd_has_bytes(fd, OWN_BYTES));
+    close(fd);
+    LP_CHECK(fstatat(d, "l/layer-own", &st, 0) == 0 && st.st_dev == LAYERED_DEVICE);
+    LP_CHECK(FAILS(openat(d, "l/layer-lower", O_WRONLY), EROFS));
+    LP_CHECK(has_bytes("/etc/layer-lower", "lower of etc\n"));
+    close(d);
+    LP_CHECK(unlink("/tmp/ld/l") == 0 && rmdir("/tmp/ld") == 0);
+    return 0;
+}
+
 static int current_directory(void) {
     char cwd[64];
     LP_CHECK(chdir("/etc") == 0);
@@ -653,8 +674,8 @@ static int writes_to_the_lower_set_are_refused(void) {
 static int attributes_of_descriptions(void) {
     struct stat st;
     struct timespec times[2] = {{1, 0}, {1, 0}};
-    const char *paths[] = {"/etc/layer-lower", "/plain", "/etc"};
-    for (int i = 0; i < 3; i++) {
+    const char *paths[] = {"/etc/layer-lower", "/plain"};
+    for (int i = 0; i < 2; i++) {
         int fd = open(paths[i], O_RDONLY);
         LP_CHECK(fd >= 0);
         LP_CHECK(FAILS(fchmod(fd, 0777), EROFS));
@@ -1017,6 +1038,27 @@ static int removed_directories(void) {
     return 0;
 }
 
+static int opaque_directory_stays_removed(void) {
+    struct stat st;
+    /* /lowdir is a directory of the layer over a lower one (opaque): removing it must not bring the
+     * lower one back, and nor must moving it. */
+    LP_CHECK(unlink("/lowdir/u1") == 0 && rmdir("/lowdir") == 0);
+    LP_CHECK(FAILS(stat("/lowdir", &st), ENOENT) && FAILS(open("/lowdir/l1", O_RDONLY), ENOENT));
+    LP_CHECK(mkdir("/lowdir", 0755) == 0 && listed("/lowdir", "l1", 0));
+    LP_CHECK(rmdir("/lowdir") == 0);
+    LP_CHECK(FAILS(stat("/lowdir", &st), ENOENT) && FAILS(open("/lowdir/l2", O_RDONLY), ENOENT));
+    LP_CHECK(listed("/", "lowdir", 0));
+    LP_CHECK(mkdir("/lowdir", 0755) == 0 && put_file("/lowdir/n", "n\n", 0644) == 0);
+    LP_CHECK(rename("/lowdir", "/lowdir2") == 0);
+    LP_CHECK(FAILS(stat("/lowdir", &st), ENOENT) && FAILS(open("/lowdir/l1", O_RDONLY), ENOENT));
+    LP_CHECK(has_bytes("/lowdir2/n", "n\n") && listed("/lowdir2", "l1", 0) && listed("/lowdir2", "n", 1));
+    /* A directory moved onto an opaque one over a lower directory is opaque too. */
+    LP_CHECK(mkdir("/lowdir", 0755) == 0 && mkdir("/lowsrc", 0755) == 0 && put_file("/lowsrc/s", "s\n", 0644) == 0);
+    LP_CHECK(rename("/lowsrc", "/lowdir") == 0);
+    LP_CHECK(listed("/lowdir", "s", 1) && listed("/lowdir", "l1", 0));
+    return 0;
+}
+
 static int renames(void) {
     struct stat before, st;
     char buf[64];
@@ -1105,6 +1147,13 @@ static int symbolic_links(void) {
     LP_CHECK(symlink("recreated-elsewhere", "/etc/layer-hidden") == 0);
     LP_CHECK(readlink("/etc/layer-hidden", buf, sizeof buf) == 19);
     LP_CHECK(unlink("/etc/layer-hidden") == 0 && FAILS(lstat("/etc/layer-hidden", &st), ENOENT));
+    /* A change through a link of the lower set (to /lower): the directory is made canonical first. */
+    LP_CHECK(mkdir("/lowlink/w-ld", 0755) == 0 && stat("/lower/w-ld", &st) == 0 && S_ISDIR(st.st_mode));
+    LP_CHECK(put_file("/lowlink/w-ld/f", "ld\n", 0644) == 0 && has_bytes("/lower/w-ld/f", "ld\n"));
+    LP_CHECK(rename("/lowlink/w-ld/f", "/lowlink/w-ld/g") == 0 && has_bytes("/lower/w-ld/g", "ld\n"));
+    LP_CHECK(symlink("g", "/lowlink/w-ld/h") == 0 && has_bytes("/lower/w-ld/h", "ld\n"));
+    LP_CHECK(unlink("/lowlink/w-ld/h") == 0 && unlink("/lowlink/w-ld/g") == 0 && rmdir("/lowlink/w-ld") == 0);
+    LP_CHECK(FAILS(stat("/lower/w-ld", &st), ENOENT));
     return 0;
 }
 
@@ -1233,6 +1282,10 @@ static int changes_against_descriptions(void) {
     LP_CHECK(unlinkat(merged, "w-atl", 0) == 0 && renameat(merged, "w-at", merged, "w-at2") == 0);
     LP_CHECK(fchmodat(merged, "w-at2", 0600, 0) == 0 && fstatat(merged, "w-at2", &st, 0) == 0 && (st.st_mode & 07777) == 0600);
     LP_CHECK(unlinkat(merged, "w-at2", 0) == 0);
+    /* The attributes of a merged directory by its description are those of the directory. */
+    struct timespec dt[2] = {{7, 0}, {8, 0}};
+    LP_CHECK(fchmod(merged, 0755) == 0 && fchown(merged, 0, 0) == 0 && futimens(merged, dt) == 0);
+    LP_CHECK(fstat(merged, &st) == 0 && (st.st_mode & 07777) == 0755 && st.st_mtime == 8);
     /* Against a directory of the lower set alone. */
     fd = openat(lower, "w-new2", O_CREAT | O_WRONLY, 0644);
     LP_CHECK(fd >= 0 && close(fd) == 0 && listed("/lowpriv", "w-new2", 1));
@@ -1240,6 +1293,16 @@ static int changes_against_descriptions(void) {
     LP_CHECK(unlinkat(lower, "w-new2", 0) == 0);
     close(merged);
     close(lower);
+    /* A path against a descriptor of a directory below /tmp, through a link into the root: the write
+     * is the layer's own. */
+    LP_CHECK(mkdir("/tmp/wd", 0755) == 0 && symlink("/etc", "/tmp/wd/l") == 0);
+    int td = open("/tmp/wd", O_RDONLY | O_DIRECTORY);
+    LP_CHECK(td >= 0);
+    fd = openat(td, "l/w-fd", O_CREAT | O_WRONLY, 0644);
+    LP_CHECK(fd >= 0 && close(fd) == 0 && stat("/etc/w-fd", &st) == 0 && st.st_dev == LAYERED_DEVICE);
+    LP_CHECK(unlinkat(td, "l/w-fd", 0) == 0 && FAILS(stat("/etc/w-fd", &st), ENOENT));
+    close(td);
+    LP_CHECK(unlink("/tmp/wd/l") == 0 && rmdir("/tmp/wd") == 0);
     /* The last file: its number, which the second boot compares with the numbers it makes. */
     fd = open("/etc/w-marker", O_CREAT | O_RDWR, 0644);
     LP_CHECK(fd >= 0 && fstat(fd, &st) == 0);
@@ -1355,6 +1418,7 @@ static int first(void) {
     run_check("paths against a lower directory", paths_against_a_lower_directory);
     run_check("the pass-through names are the services' own", pass_through_names);
     run_check("a path out of a pass-through directory is the root's", dotdot_out_of_tmp);
+    run_check("a link below a pass-through directory is routed through the layer", link_below_a_pass_through_directory);
     run_check("chdir and fchdir", current_directory);
     run_check("realpath", real_paths);
     run_check("a forked child shares the directory description", fork_shares_the_description);
@@ -1388,6 +1452,7 @@ static int write_first(void) {
     run_check("directories are made and removed", directories);
     run_check("names are deleted from the layer and from the lower set", deletions);
     run_check("directories are removed and made again opaque", removed_directories);
+    run_check("an opaque directory removed or moved stays removed", opaque_directory_stays_removed);
     run_check("names are renamed inside the layer", renames);
     run_check("symbolic links of the layer", symbolic_links);
     run_check("hard links, reserved names and long paths", reserved_names_and_limits);

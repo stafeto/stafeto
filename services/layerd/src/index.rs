@@ -22,6 +22,11 @@ pub const SLOTS: usize = 8192;
 pub const PROBES: usize = 8;
 pub const ARENA: usize = 256 * 1024;
 pub const NAME_MAX: usize = 255;
+/// The bytes a link's file name (`.wh..wh.lnk.`) and a mark (`.wh.`) add to a name, and the marker of
+/// an opaque directory (`/.wh..wh..opq`) to a directory.
+const LINK_EXTRA: usize = 12;
+const MARK_EXTRA: usize = 4;
+pub const OPAQUE_EXTRA: usize = 13;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -53,6 +58,10 @@ pub struct Entry {
     pkey: u32,
     /// The key of this entry when it is a directory, else 0.
     dkey: u32,
+    /// For a directory: the most bytes any name below it adds to its path (a slash and the name at
+    /// each level, a link's file name and a mark with their prefixes). It only grows, so a rename
+    /// that would take a subtree past the volume's limit on paths is refused with no scan.
+    reach: u16,
     name_at: u32,
     name_len: u8,
     pub kind: Kind,
@@ -67,6 +76,7 @@ pub struct Entry {
 const EMPTY: Entry = Entry {
     pkey: 0,
     dkey: 0,
+    reach: 0,
     name_at: 0,
     name_len: 0,
     kind: Kind::Empty,
@@ -305,6 +315,71 @@ impl Index {
         f: Fields,
         keep: Option<u32>,
     ) -> Result<u32, Error> {
+        let id = self.insert_raw(parent, name, f, keep)?;
+        let extra = match f.kind {
+            Kind::Link => LINK_EXTRA,
+            Kind::Whiteout => MARK_EXTRA,
+            _ => 0,
+        };
+        self.grow(parent, 1 + name.len() + extra);
+        Ok(id)
+    }
+
+    /// The directory `at` and each one above it reach `add` bytes below themselves at least.
+    fn grow(&mut self, mut at: u32, mut add: usize) {
+        while at != 0 {
+            let Some(slot) = (at as usize).checked_sub(1) else {
+                return;
+            };
+            let Some(e) = self.slots.get_mut(slot) else {
+                return;
+            };
+            e.reach = e.reach.max(add.min(usize::from(u16::MAX)) as u16);
+            add += 1 + usize::from(e.name_len);
+            at = self.parent_of(at);
+        }
+    }
+
+    /// Whether `insert` of `name` in `parent` would find a place: a free slot within the probes (or the
+    /// name's own) and room in the arena. The service asks before it touches the volume.
+    pub fn has_room(&self, parent: u32, name: &[u8]) -> bool {
+        let Some(pkey) = self.dkey_of(parent) else {
+            return false;
+        };
+        let start = hash(pkey, name);
+        let mut slot_free = false;
+        for i in 0..PROBES {
+            let e = &self.slots[(start + i) & (SLOTS - 1)];
+            match e.kind {
+                Kind::Empty => {
+                    slot_free = true;
+                    break;
+                }
+                Kind::Gone => {
+                    if e.pkey == pkey && self.name_of(e) == name {
+                        return true;
+                    }
+                    slot_free = true;
+                }
+                _ if e.pkey == pkey && self.name_of(e) == name => return true,
+                _ => {}
+            }
+        }
+        slot_free && self.arena_len + name.len() <= ARENA
+    }
+
+    /// The most bytes a name below the directory `id` adds to its path.
+    pub fn reach(&self, id: u32) -> usize {
+        self.entry(id).map_or(0, |e| usize::from(e.reach))
+    }
+
+    fn insert_raw(
+        &mut self,
+        parent: u32,
+        name: &[u8],
+        f: Fields,
+        keep: Option<u32>,
+    ) -> Result<u32, Error> {
         if name.is_empty() || name.len() > NAME_MAX || f.kind == Kind::Empty {
             return Err(Error::Invalid);
         }
@@ -325,6 +400,7 @@ impl Index {
                         let dkey = self.key_for(f.kind, keep)?;
                         self.slots[slot] = Entry {
                             dkey,
+                            reach: 0,
                             kind: f.kind,
                             flags: if f.kind == Kind::Dir { UNSCANNED } else { 0 },
                             layer: f.layer,
@@ -358,6 +434,7 @@ impl Index {
         self.slots[slot] = Entry {
             pkey,
             dkey,
+            reach: 0,
             name_at: at as u32,
             name_len: name.len() as u8,
             kind: f.kind,
@@ -470,6 +547,8 @@ impl Index {
         self.take_out(id, false);
         if let Some(slot) = (new as usize).checked_sub(1) {
             self.slots[slot].flags = e.flags & !UNSCANNED;
+            self.slots[slot].reach = e.reach;
+            self.grow(parent, 1 + name.len() + usize::from(e.reach));
         }
         Ok(new)
     }
@@ -492,6 +571,9 @@ impl Index {
             }
             (Kind::File | Kind::Dir | Kind::Link, Kind::Whiteout)
             | (Kind::Whiteout, Kind::Whiteout) => {}
+            // Both a file `x` and the file of a link `x` on the volume (a cut in a rename): the file
+            // wins, whichever the listing gave first.
+            (Kind::File | Kind::Dir, Kind::Link) => {}
             _ => {
                 let dkey = if old.kind == f.kind {
                     old.dkey

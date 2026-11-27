@@ -84,6 +84,8 @@ pub struct Scan {
     started: bool,
     /// The steps taken (for the probe's report).
     pub steps: u32,
+    /// The directories left unlisted because their path passes the volume's limit.
+    pub skipped: u32,
 }
 
 impl Scan {
@@ -95,6 +97,7 @@ impl Scan {
             open: None,
             started: false,
             steps: 0,
+            skipped: 0,
         }
     }
 
@@ -104,6 +107,7 @@ impl Scan {
         self.open = None;
         self.started = false;
         self.steps = 0;
+        self.skipped = 0;
     }
 
     fn push(&mut self, id: u32) {
@@ -148,8 +152,15 @@ impl Scan {
             let id = self.queue[self.head % SLOTS];
             self.head += 1;
             let mut path = [0u8; 512];
-            let n = Self::volume_path(index, root, id, &mut path)
-                .ok_or(Failure::Volume(proto_data::code(proto_data::NAME_TOO_LONG)))?;
+            // A directory whose path the volume would refuse is left out of the index and told
+            // of (`skipped`), so that one over-long name does not stop the build.
+            let n = match Self::volume_path(index, root, id, &mut path) {
+                Some(n) if n <= proto_data::MAX_PATH => n,
+                _ => {
+                    self.skipped += 1;
+                    return Ok(Progress::More);
+                }
+            };
             let stat = volume.stat(&path[..n]).map_err(Failure::Volume)?;
             if stat.kind != proto_data::KIND_DIRECTORY {
                 return Err(Failure::Volume(proto_data::code(proto_data::NOT_DIRECTORY)));

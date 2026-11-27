@@ -710,6 +710,23 @@ fn metadata_once(
     {
         return Ok(());
     }
+    // A directory description of the layer service: its attributes are those of the path it kept.
+    if path.is_empty()
+        && at_flags & AT_EMPTY_PATH != 0
+        && let Some(abs) = crate::layer::described(dirfd)?
+    {
+        return match crate::layer::attributes(op, &abs, true, args)? {
+            crate::layer::Changed::Done => Ok(()),
+            crate::layer::Changed::Elsewhere(abs) => metadata_once(
+                op,
+                named,
+                AT_FDCWD,
+                abs.bytes(),
+                at_flags & !AT_EMPTY_PATH,
+                args,
+            ),
+        };
+    }
     if !path.is_empty()
         && let Some(abs) = crate::layer::route(dirfd, path)?
     {

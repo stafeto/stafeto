@@ -18,6 +18,9 @@ bench = false
 [features]
 # Deliberate break (`cargo xtask budget-breaks`): the service takes no budget from its start data, so its request thread runs unbound.
 break-budget-unbound = []
+# Deliberate break (`cargo xtask layer-posix breaks`): a POSIX walk of a layered image that starts at
+# a descriptor expands a link or a `..` that reaches the root itself, and the write guard is off.
+break-layered-guard = []
 # Read-only retained-session observation for the owner-death regression.
 auth-probe = []
 # A bounded receive pause for genuine queued-request signal cancellation.

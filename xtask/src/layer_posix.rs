@@ -43,7 +43,7 @@ const DISK_BYTES: u64 = 64 << 20;
 const LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The checks of the probe, in the order it runs them: the line of each is `layer-posix: <check> ok`.
-pub const CHECKS: [&str; 29] = [
+pub const CHECKS: [&str; 30] = [
     "a file of the layer of the user is read",
     "a lower file is read",
     "a name of the layer shadows the lower one",
@@ -58,6 +58,7 @@ pub const CHECKS: [&str; 29] = [
     "paths against a lower directory",
     "the pass-through names are the services' own",
     "a path out of a pass-through directory is the root's",
+    "a link below a pass-through directory is routed through the layer",
     "chdir and fchdir",
     "realpath",
     "a forked child shares the directory description",
@@ -76,7 +77,7 @@ pub const CHECKS: [&str; 29] = [
 ];
 
 /// The deliberate breaks, the program each is a feature of and the check each one fails.
-pub const BREAKS: [(&str, &str, &str); 4] = [
+pub const BREAKS: [(&str, &str, &str); 5] = [
     (
         "break-layer-route",
         "layer-posix",
@@ -86,6 +87,13 @@ pub const BREAKS: [(&str, &str, &str); 4] = [
         "break-layer-clone",
         "layer-posix",
         "a forked child shares the directory description",
+    ),
+    // The file service expands a link that reaches the root from a descriptor itself, and its write
+    // guard is off.
+    (
+        "break-layered-guard",
+        "ramfs",
+        "a link below a pass-through directory is routed through the layer",
     ),
     (
         "break-layer-fd-guard",
@@ -104,12 +112,13 @@ const PASSED_REREAD: &str = "layer-posix: reread checks passed";
 
 /// The checks of the write phase (`cargo xtask layer-posix write`): the changes of names on the
 /// layer, in the order the probe runs them.
-pub const WRITE_CHECKS: [&str; 12] = [
+pub const WRITE_CHECKS: [&str; 13] = [
     "a file is created and written",
     "a file of the layer is rewritten",
     "directories are made and removed",
     "names are deleted from the layer and from the lower set",
     "directories are removed and made again opaque",
+    "an opaque directory removed or moved stays removed",
     "names are renamed inside the layer",
     "symbolic links of the layer",
     "hard links, reserved names and long paths",

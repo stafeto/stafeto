@@ -387,7 +387,7 @@ impl Resolve {
             }
             let mut replacement = [0; MAX_PATH];
             storage.read(link, 0, &mut replacement[..len])?;
-            if self.bounces(storage) {
+            if self.bounces(storage) || (replacement[0] == b'/' && self.reaches_root(storage)) {
                 return self.bounce_link(&replacement[..len]);
             }
             replacement[len..len + rest].copy_from_slice(&self.path[self.end..self.length]);
@@ -441,6 +441,19 @@ impl Resolve {
                 let parent_component = name == b"..";
                 if parent_component && self.bounces(storage) {
                     return self.bounce_parent();
+                }
+                // A walk from a directory other than the root (a descriptor) that goes up to the
+                // root leaves the pass-through names: the layer service routes what is left.
+                if parent_component
+                    && self.current != ROOT
+                    && directory_parent == ROOT
+                    && self.reaches_root(storage)
+                {
+                    let rest_at = self.end.min(self.length);
+                    let mut rest = [0; MAX_PATH];
+                    let rest_len = self.length - rest_at;
+                    rest[..rest_len].copy_from_slice(&self.path[rest_at..self.length]);
+                    return self.redirect_to(b"", &rest[..rest_len]);
                 }
                 if self.final_component() {
                     self.capture_edge(storage, false)?;
@@ -559,6 +572,16 @@ impl Resolve {
         self.bounce = true;
     }
 
+    /// A walk of a POSIX session of a layered image that does not start at the root (a path against
+    /// a descriptor) still bounces where it reaches the root: by an absolute link or by a `..`
+    /// from a directory just below it. The break leaves the walk to expand them itself.
+    fn reaches_root(&self, storage: &Storage<'_>) -> bool {
+        self.bounce
+            && !self.inert
+            && storage.state.layered()
+            && !cfg!(feature = "break-layered-guard")
+    }
+
     fn bounces(&self, storage: &Storage<'_>) -> bool {
         self.bounce && self.base == ROOT && !self.inert && storage.state.layered()
     }
@@ -667,7 +690,7 @@ impl Resolve {
     /// (or the root, for a name of the root itself) must be one of the pass-through names or lie
     /// below one; the root takes the creation of a pass-through directory alone.
     fn layered_refusal(&self, storage: &Storage<'_>, missing: bool) -> Result<(), u32> {
-        if !self.guard || !storage.state.layered() {
+        if !self.guard || !storage.state.layered() || cfg!(feature = "break-layered-guard") {
             return Ok(());
         }
         let writes = match self.intent {

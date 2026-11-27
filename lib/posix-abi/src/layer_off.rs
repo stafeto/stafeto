@@ -88,6 +88,10 @@ pub fn check_exec(_abs: &Abs) -> Result<Abs, i32> {
     Err(EIO)
 }
 
+pub fn described(_dirfd: c_int) -> Result<Option<Abs>, i32> {
+    Ok(None)
+}
+
 pub fn descriptor_path(_target: LayerTarget, _out: &mut [u8; WIDE]) -> Result<usize, i32> {
     Err(EBADF)
 }

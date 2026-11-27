@@ -38,8 +38,9 @@
 //!   pass of a writable description of the data file service, which `ADOPT` takes, so the writes are
 //!   the data file service's. A name of the lower set is EROFS until the copy up: the service says it.
 //!   The directory part of a path of a change is canonical: a link of a layer of the user in it is a
-//!   redirect that routes by the path (followed here), and a link of the lower set is resolved here
-//!   first (`canonical_leaf`). A path a link led out of the root goes on at the service that owns it.
+//!   redirect that routes by the path (followed here), and a link of the lower set is answered with a
+//!   redirect to the RAM file service for the path: the directory part is made canonical here
+//!   (`canonical_leaf`) and the change is asked again. A path a link led out of the root goes on at the service that owns it.
 //! * Redirects that route by the path. The service answers a link of a layer of the user with one, and
 //!   the RAM file service of a layered image answers every link and every `..` of the walk of a
 //!   POSIX session with one: the path they carry is routed again, from the start (`run`), and the
@@ -506,6 +507,21 @@ pub fn route(dirfd: c_int, path: &[u8]) -> Result<Option<Abs>, i32> {
     }
     let abs = Abs::from(absolute, path.last() == Some(&b'/')).ok_or(ENAMETOOLONG)?;
     Ok(Some(abs))
+}
+
+/// The path the layer kept for the description `dirfd` names, when it is a directory description of
+/// the layer service (its attributes are changed by a request for that path). None for any other
+/// descriptor; EOPNOTSUPP for a description that crossed an exec (its path is not known).
+pub fn described(dirfd: c_int) -> Result<Option<Abs>, i32> {
+    let Ok(fd) = u32::try_from(dirfd) else {
+        return Ok(None);
+    };
+    let target = crate::shared::with_fd(fd, |files| files.target(fd).map_err(crate::error))?;
+    let Target::Layer(layer) = target else {
+        return Ok(None);
+    };
+    let path = DIRS.path_of(layer.handle).ok_or(EOPNOTSUPP)?;
+    Ok(Some(Abs::from(path.bytes(), false).ok_or(ENAMETOOLONG)?))
 }
 
 /// The canonical path of the description `target` (a path kept at its open).

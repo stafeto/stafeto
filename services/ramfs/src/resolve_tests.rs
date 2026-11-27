@@ -2914,3 +2914,57 @@ fn a_layered_root_sends_a_link_and_a_parent_back_to_the_merged_view() {
     r.storage.state.set_layered(false);
     assert_eq!(bounced(&mut r, b"/lib/libc", true), None);
 }
+
+/// A walk of a POSIX session of a layered image that starts at a directory below the root (a path
+/// against a descriptor) bounces where it reaches the root: by an absolute link, and by a `..` from
+/// a directory just below it; a walk that stays below it is expanded as it was.
+#[test]
+fn a_walk_from_a_descriptor_bounces_where_it_reaches_the_root() {
+    use crate::resolve::Intent;
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let etc = r.storage.lookup(ROOT, b"etc").unwrap();
+    create(&mut r, etc, b"passwd", REG, 0o644);
+    let tmp = r.storage.lookup(ROOT, b"tmp").unwrap();
+    let a = create(&mut r, tmp, b"a", DIR, 0o777);
+    create(&mut r, a, b"f", REG, 0o644);
+    let link = |r: &mut Ram<'_>, parent, name: &[u8], text: &[u8]| {
+        let l = create(r, parent, name, SYMLINK, 0o777);
+        r.storage.write(l, ROOT_ACCOUNT, 0, text).unwrap();
+    };
+    link(&mut r, tmp, b"abs", b"/etc");
+    link(&mut r, tmp, b"near", b"a/f");
+    r.storage.state.set_layered(true);
+    let from = |r: &mut Ram<'_>, path: &[u8], guarded: bool| {
+        let mut resolver = Resolve::with_intent(
+            &mut r.storage,
+            path,
+            tmp,
+            ADMIN,
+            Intent::Lookup { follow: true },
+        )
+        .unwrap();
+        if guarded {
+            resolver.guard_layered(false);
+        }
+        let result = intent_ready(r, &mut resolver, ADMIN);
+        let found = (result == Err(proto_fs::REDIRECT))
+            .then(|| resolver.redirect().map(|(p, links)| (p.to_vec(), links)))
+            .flatten();
+        let ended = result.is_ok();
+        resolver.release(&mut r.storage);
+        (found, ended)
+    };
+    assert_eq!(
+        from(&mut r, b"abs/passwd", true).0,
+        Some((b"/etc/passwd".to_vec(), 1))
+    );
+    assert_eq!(
+        from(&mut r, b"a/../../etc/passwd", true).0,
+        Some((b"/etc/passwd".to_vec(), 0))
+    );
+    assert_eq!(from(&mut r, b"..", true).0, Some((b"/".to_vec(), 0)));
+    // Below the pass-through names the walk goes on by itself, and the boot profile is not bounced.
+    assert!(from(&mut r, b"near", true).1);
+    assert!(from(&mut r, b"a/f", true).1);
+    assert_eq!(from(&mut r, b"abs/passwd", false).0, None);
+}

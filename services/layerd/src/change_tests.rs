@@ -877,6 +877,157 @@ fn a_directory_made_below_an_opaque_one_has_none_of_the_lower_names() {
     assert!(node(&core, "/.layers/00/lowlink/.wh..wh..opq").is_some());
 }
 
+#[test]
+fn removing_or_moving_an_opaque_directory_keeps_the_deleted_lower_one_deleted() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    // /gone: delete the lower directory, make an opaque one over it, remove that one: the lower
+    // directory stays deleted (a mark is made again).
+    unlink(&mut core, 0, "/gone/x").unwrap();
+    rmdir(&mut core, 0, "/gone").unwrap();
+    mkdir(&mut core, 0, "/gone", 0o755).unwrap();
+    rmdir(&mut core, 0, "/gone").unwrap();
+    assert!(node(&core, "/.layers/00/.wh.gone").is_some());
+    assert_eq!(
+        open(&mut core, 0, f::READ_ONLY, "/gone/x").err(),
+        Some(st(f::NO_ENTRY))
+    );
+    assert!(!listing(&mut core, "/").contains(&"gone".to_owned()));
+    // Moving an opaque directory: a mark at the old name, and no lower content at the new one.
+    mkdir(&mut core, 0, "/gone", 0o755).unwrap();
+    open(&mut core, 0, creating(f::WRITE_ONLY, 0o600), "/gone/own").unwrap();
+    rename(&mut core, 0, "/gone", "/moved").unwrap();
+    assert!(node(&core, "/.layers/00/.wh.gone").is_some());
+    assert_eq!(
+        open(&mut core, 0, f::READ_ONLY, "/gone/x").err(),
+        Some(st(f::NO_ENTRY))
+    );
+    assert_eq!(listing(&mut core, "/moved"), ["own"]);
+    // A directory moved onto an opaque one over a lower directory is opaque too.
+    rmdir(&mut core, 0, "/empty").unwrap();
+    mkdir(&mut core, 0, "/empty", 0o755).unwrap();
+    mkdir(&mut core, 0, "/src", 0o755).unwrap();
+    open(&mut core, 0, creating(f::WRITE_ONLY, 0o600), "/src/s").unwrap();
+    rename(&mut core, 0, "/src", "/empty").unwrap();
+    assert_eq!(listing(&mut core, "/empty"), ["s"]);
+    assert!(node(&core, "/.layers/00/empty/.wh..wh..opq").is_some());
+    // rmdir of it marks the lower directory again.
+    unlink(&mut core, 0, "/empty/s").unwrap();
+    rmdir(&mut core, 0, "/empty").unwrap();
+    assert!(node(&core, "/.layers/00/.wh.empty").is_some());
+}
+
+#[test]
+fn a_rename_that_takes_a_subtree_past_the_limit_on_paths_is_refused() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    // /etc/dA with five levels of 80 bytes below it: 405 bytes under the directory.
+    mkdir(&mut core, 0, "/etc/dA", 0o755).unwrap();
+    let mut path = String::from("/etc/dA");
+    for i in 0..5 {
+        path.push('/');
+        path.push_str(&format!("{i}").repeat(80));
+        mkdir(&mut core, 0, &path, 0o755).unwrap();
+    }
+    let long = "n".repeat(80);
+    assert_eq!(
+        rename(&mut core, 0, "/etc/dA", &format!("/etc/{long}")).err(),
+        Some(st(f::NAME_TOO_LONG))
+    );
+    assert!(node(&core, "/.layers/00/etc/dA").is_some());
+    rename(&mut core, 0, "/etc/dA", "/etc/dB").unwrap();
+    assert!(
+        core.index.reach(
+            core.index
+                .lookup(core.index.lookup(0, b"etc").unwrap().0, b"dB")
+                .unwrap()
+                .0
+        ) >= 405
+    );
+}
+
+#[test]
+fn the_build_leaves_out_a_directory_whose_path_the_volume_refuses() {
+    let mut v = volume();
+    let mut path = String::from("/.layers/00/etc");
+    for _ in 0..6 {
+        path.push('/');
+        path.push_str(&"q".repeat(90));
+        v.dir(&path, 0o755, 0);
+    }
+    let mut world = World::new();
+    let mut core = world.core(v);
+    ready(&mut core);
+    assert_eq!(core.skipped(), 1);
+    // The rest of the layer is served.
+    assert!(
+        open(&mut core, 0, f::READ_ONLY, "/etc/own.conf")
+            .unwrap()
+            .1
+            .is_some()
+    );
+}
+
+#[test]
+fn a_link_over_a_file_and_a_file_over_a_link_leave_one_name_and_an_empty_target_is_refused() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    assert_eq!(
+        symlink(&mut core, 0, "/shared/e", "").err(),
+        Some(st(f::NO_ENTRY))
+    );
+    symlink(&mut core, 0, "/shared/ln", "rootfile").unwrap();
+    // A link over a file: the file's own entry goes, one name stays and it is a link.
+    rename(&mut core, 0, "/shared/ln", "/shared/rootfile").unwrap();
+    assert!(node(&core, "/.layers/00/shared/rootfile").is_none());
+    assert!(node(&core, "/.layers/00/shared/.wh..wh.lnk.rootfile").is_some());
+    assert_eq!(
+        readlink(&mut core, 0, "/shared/rootfile").unwrap(),
+        b"rootfile"
+    );
+    // A file over a link: the link's file goes.
+    open(&mut core, 0, creating(f::WRITE_ONLY, 0o600), "/shared/f").unwrap();
+    rename(&mut core, 0, "/shared/f", "/shared/rootfile").unwrap();
+    assert!(node(&core, "/.layers/00/shared/.wh..wh.lnk.rootfile").is_none());
+    assert!(node(&core, "/.layers/00/shared/rootfile").is_some());
+    // A cut that left both: the file wins at the start.
+    let mut v = core.volume;
+    v.file("/.layers/00/shared/.wh..wh.lnk.rootfile", 0o644, 0, b"x");
+    let mut again = World::new();
+    let mut core = again.core(v);
+    ready(&mut core);
+    let shared = core.index.lookup(0, b"shared").unwrap().0;
+    assert_eq!(
+        core.index.lookup(shared, b"rootfile").map(|(_, e)| e.kind),
+        Some(Kind::File)
+    );
+}
+
+#[test]
+fn the_index_says_whether_a_name_has_room_before_the_volume_is_touched() {
+    let mut ix = Box::new(Index::new());
+    assert!(ix.has_room(0, b"x"));
+    assert!(!ix.has_room(99, b"x"));
+    let f = crate::index::Fields {
+        kind: Kind::File,
+        layer: 0,
+        number: 0,
+        uid: 0,
+        gid: 0,
+        mode: 0,
+    };
+    let mut i = 0;
+    while ix.insert(0, format!("n{i}").as_bytes(), f).is_ok() {
+        i += 1;
+    }
+    // The name that failed has no room, and a name that is there does.
+    assert!(!ix.has_room(0, format!("n{i}").as_bytes()));
+    assert!(ix.has_room(0, b"n0"));
+}
+
 // ---------------------------------------------------------------------- rename
 
 #[test]
@@ -1074,7 +1225,7 @@ fn a_symbolic_link_is_a_file_of_the_layer_and_a_path_through_it_is_a_redirect() 
     let file = node(&core, "/.layers/00/shared/.wh..wh.lnk.ln").unwrap();
     assert_eq!(
         (file.data.as_slice(), file.uid, file.mode),
-        (&b"rootfile"[..], 1000, 0o777)
+        (&b"rootfile"[..], 1000, 0o644)
     );
     assert!(file.ino & UPPER_INO_TAG != 0);
     // The listing shows the link as a link under its own name, and no file `.wh..wh.lnk.`.
@@ -1088,7 +1239,7 @@ fn a_symbolic_link_is_a_file_of_the_layer_and_a_path_through_it_is_a_redirect() 
         b"rootfile"
     );
     let info = n::read_info(&stat(&mut core, 0, "/shared/ln", n::STAT_NO_FOLLOW).unwrap()).unwrap();
-    assert_eq!((info.kind, info.size), (5, 8));
+    assert_eq!((info.kind, info.size, info.permissions), (5, 8, 0o777));
     let reply = stat(&mut core, 0, "/shared/ln", 0).unwrap();
     assert_eq!(
         redirect_of(&reply),
@@ -1211,10 +1362,25 @@ fn a_link_of_the_layer_in_a_directory_part_is_a_redirect_of_the_path_it_was_in()
     assert!(node(&core, "/.layers/00/etc/own.conf").is_some());
     // The link itself is removed; it is not followed.
     unlink(&mut core, 0, "/shared/dl").unwrap();
-    // A link of the lower set in the directory part is no canonical path.
+    // A link of the lower set in the directory part: a redirect to the RAM file service for the
+    // path (the client resolves the directory and asks again), for either path of a rename.
+    let reply = change(&mut core, 0, ChangeOp::Mkdir, 0o755, "/lowlink/d", "").unwrap();
     assert_eq!(
-        mkdir(&mut core, 0, "/lowlink/d", 0o755).err(),
-        Some(st(f::INVALID_ARGUMENT))
+        redirect_of(&reply),
+        Some((f::REDIRECT_RAM, 0, b"/lowlink/d".to_vec()))
+    );
+    let reply = change(
+        &mut core,
+        0,
+        ChangeOp::Rename,
+        0,
+        "/etc/own.conf",
+        "/lowlink/o",
+    )
+    .unwrap();
+    assert_eq!(
+        redirect_of(&reply),
+        Some((f::REDIRECT_RAM, 1, b"/lowlink/o".to_vec()))
     );
     // An open that creates meets it as a redirect to the RAM file service, which expands it.
     let (reply, _) = open(&mut core, 0, creating(f::WRITE_ONLY, 0o600), "/lowlink/x").unwrap();

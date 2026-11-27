@@ -35,8 +35,9 @@
 //! The paths of CHANGE are canonical: the POSIX layer resolves the links of the directory part
 //! first. A link of the layer in the directory part is answered with a redirect that routes by the
 //! path (`Redirect.index` says which of the two paths), and a link of the lower set there is
-//! INVALID_ARGUMENT (an open that creates meets it as a redirect to the RAM file service, which
-//! expands it).
+//! answered with a redirect to the RAM file service (`Redirect.index` again): the client resolves
+//! the directory part there (its canonical path) and asks again. An open that creates meets such a
+//! link as the same redirect, which the RAM file service expands itself.
 
 use crate::index::{Fields, HAS_CHILDREN, Kind, NAME_MAX, NextChild, OPAQUE, UNSCANNED};
 use crate::lookup::{Outcome, STEP, Step, Walk, normalize};
@@ -78,7 +79,9 @@ pub(crate) enum Stop {
         end: usize,
     },
     /// A link of the lower set in the directory part of the path.
-    LowerLink,
+    LowerLink {
+        which: u32,
+    },
 }
 
 impl From<Status> for Stop {
@@ -401,7 +404,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                     };
                     match ls.kind {
                         1 => {}
-                        5 => return Err(Stop::LowerLink),
+                        5 => return Err(Stop::LowerLink { which }),
                         _ => return fail(proto_fs::NOT_DIRECTORY),
                     }
                     let attr = posix_perm::Attr {
@@ -453,12 +456,17 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         if let Some(pid) = p.up
             && let Some((id, e)) = self.index.lookup(pid, leaf)
         {
-            let (kind, flags) = (e.kind, e.flags);
+            let kind = e.kind;
             match kind {
                 Kind::Whiteout => hidden = true,
                 Kind::File | Kind::Dir | Kind::Link => {
-                    let shows = p.visible && !(kind == Kind::Dir && flags & OPAQUE != 0);
-                    let lower = if shows { self.lower_stat(full)? } else { None };
+                    // What the lower set has under the name depends on the directory alone: an opaque
+                    // directory of the layer still hides a lower name that a removal must keep hidden.
+                    let lower = if p.visible {
+                        self.lower_stat(full)?
+                    } else {
+                        None
+                    };
                     return Ok(Leaf::Upper { id, kind, lower });
                 }
                 _ => {}
@@ -527,6 +535,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     fn put_dir(&mut self, parent: u32, name: &[u8], own: Created, opaque: bool) -> R<u32> {
         let Created { uid, gid, mode } = own;
         let (live, live_len) = self.child_path(parent, name, false)?;
+        if !self.index.has_room(parent, name) {
+            return Err(st(proto_fs::NO_SPACE));
+        }
         let (work, work_len) = self.work_path();
         let (work, live) = (&work[..work_len], &live[..live_len]);
         self.volume.mkdir(work, 0o700).map_err(from_volume)?;
@@ -589,6 +600,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         let Created { uid, gid, mode } = own;
         let link = kind == Kind::Link;
         let (live, live_len) = self.child_path(parent, name, link)?;
+        if !self.index.has_room(parent, name) {
+            return Err(st(proto_fs::NO_SPACE));
+        }
         let ino = self.alloc_ino()?;
         let (work, work_len) = self.work_path();
         let (work, live) = (&work[..work_len], &live[..live_len]);
@@ -650,6 +664,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         mark[WHITEOUT_PREFIX.len()..WHITEOUT_PREFIX.len() + name.len()].copy_from_slice(name);
         let mark = &mark[..WHITEOUT_PREFIX.len() + name.len()];
         let (live, live_len) = self.child_path(parent, mark, false)?;
+        if !self.index.has_room(parent, name) {
+            return Err(st(proto_fs::NO_SPACE));
+        }
         let (work, work_len) = self.work_path();
         let (work, live) = (&work[..work_len], &live[..live_len]);
         let h = self
@@ -776,7 +793,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             }) => self
                 .write_link_redirect(which, walked.path(), id, start, end, w)
                 .map(|()| Some(Done::Written)),
-            Err(Stop::LowerLink) => Self::redirect(walked.path(), proto_fs::REDIRECT_RAM, w)
+            Err(Stop::LowerLink { .. }) => Self::redirect(walked.path(), proto_fs::REDIRECT_RAM, w)
                 .map(|()| Some(Done::Written)),
         }
     }
@@ -807,7 +824,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                     return fail(proto_fs::ALREADY_EXISTS);
                 }
                 if ls.kind == 5 && flags & proto_fs::NO_FOLLOW == 0 {
-                    return Err(Stop::LowerLink);
+                    return Err(Stop::LowerLink { which: 0 });
                 }
                 if n::open_writes(flags) {
                     return fail(proto_fs::READ_ONLY_FILESYSTEM);
@@ -913,7 +930,18 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 let (buf, len) = plain(if which == 0 { req.first } else { req.second });
                 self.write_link_redirect(which, &buf[..len], id, start, end, w)
             }
-            Err(Stop::LowerLink) => Err(st(proto_fs::INVALID_ARGUMENT)),
+            Err(Stop::LowerLink { which }) => {
+                // The directory part has a link of the lower set: the client resolves the
+                // directory at the RAM file service and asks again with the canonical path.
+                let (buf, len) = plain(if which == 0 { req.first } else { req.second });
+                Redirect {
+                    target: proto_fs::REDIRECT_RAM,
+                    index: which,
+                    links: 0,
+                    path: &buf[..len],
+                }
+                .write(w)
+            }
         }
     }
 
@@ -966,7 +994,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         if leaf.len() + LINK_PREFIX.len() > NAME_MAX || req.second.len() > MAX_PATH {
             return fail(proto_fs::NAME_TOO_LONG);
         }
-        if parts.trailing {
+        if parts.trailing || req.second.is_empty() {
             return fail(proto_fs::NO_ENTRY);
         }
         let p = self.find_parent(c, 0, path, parts.parent_len)?;
@@ -981,8 +1009,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         self.child_path(0, &path[1..parts.len], true)?;
         let created = posix_perm::creation(who, &p.attr, posix_perm::Kind::File, LINK_MODE, 0);
         let dir = self.ensure_parent(&p, parent)?;
+        // The file of a link is 0644 on the volume; `stat` reports 0777 (`LINK_MODE`).
         let created = Created {
-            mode: LINK_MODE,
+            mode: 0o644,
             ..created
         };
         self.put_file(dir, leaf, Kind::Link, created, req.second)?;
@@ -1113,8 +1142,12 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             Leaf::Upper { id, kind, lower } => (id, kind, lower),
         };
         let src_is_dir = src_kind == Kind::Dir;
-        // A directory with a lower one under it moves with it, which waits for the copy up.
-        if src_is_dir && src_lower.is_some_and(|s| s.kind == 1) {
+        // A directory with a lower one showing through it moves with it, which waits for the copy
+        // up. An opaque directory has no lower content: it moves, with a mark at the old name.
+        if src_is_dir
+            && src_lower.is_some_and(|s| s.kind == 1)
+            && self.index.flags(src_id) & OPAQUE == 0
+        {
             return fail(proto_fs::CROSS_DEVICE);
         }
         if (a.trailing || b.trailing) && !src_is_dir {
@@ -1127,6 +1160,16 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         }
         if src_is_dir && b_full.starts_with(a_full) && b_full.get(a_full.len()) == Some(&b'/') {
             return fail(proto_fs::INVALID_ARGUMENT);
+        }
+        // What lies below the directory must still fit the volume's limit on paths at its new place.
+        if src_is_dir
+            && self.live_path().len()
+                + b_full.len()
+                + self.index.reach(src_id)
+                + crate::index::OPAQUE_EXTRA
+                > d::MAX_PATH
+        {
+            return fail(proto_fs::NAME_TOO_LONG);
         }
         let pb = self.find_parent(c, 1, b_path, b.parent_len)?;
         let dst = self.leaf_state(&pb, b_parent, b_leaf)?;
@@ -1207,20 +1250,39 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             )
             .map_err(denial)?;
         }
-        // The checks are done: make what the new name needs.
+        // The index must have room for the new name before the volume is touched.
+        if let Some(up) = pb.up
+            && !self.index.has_room(up, b_leaf)
+        {
+            return fail(proto_fs::NO_SPACE);
+        }
+        // The checks are done: make what the new name needs. The order keeps every cut safe: the
+        // opaque marker on the source, the mark of the target name (the lower directory stays
+        // hidden when the target directory goes), the removal of the target, the move, and the mark
+        // of the target name goes after it.
         let to = self.ensure_parent(&pb, b_parent)?;
+        if src_is_dir && dst_lower_dir && self.index.flags(src_id) & OPAQUE == 0 {
+            self.mark_opaque(src_id)?;
+        }
         let mut old_dst = None;
+        let mut dst_marked = false;
         if let Some((id, kind)) = dst_up {
             if kind == Kind::Dir {
+                if dst_lower_dir {
+                    self.put_mark(to, b_leaf)?;
+                    dst_marked = true;
+                }
                 self.retire_dir(id)?;
             } else {
                 let mut vp = [0u8; 512];
                 let n = self.vpath(id, &mut vp)?;
+                // A link over a file: the file goes first, so a cut never leaves both (a file over
+                // a link leaves both, and the scan lets the file win).
+                if src_kind == Kind::Link && kind != Kind::Link {
+                    self.volume.unlink(&vp[..n]).map_err(from_volume)?;
+                }
                 old_dst = Some((vp, n, id, kind));
             }
-        }
-        if src_is_dir && dst_lower_dir && self.index.flags(src_id) & OPAQUE == 0 {
-            self.mark_opaque(src_id)?;
         }
         if src_lower.is_some() {
             self.put_mark(src_parent, a_leaf)?;
@@ -1232,11 +1294,14 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             .rename(&old_vp[..old_len], &new_vp[..new_len])
             .map_err(from_volume)?;
         if let Some((vp, n, id, kind)) = old_dst {
-            // A file of the other sort (a link and a file) is not replaced by the rename.
-            if (kind == Kind::Link) != (src_kind == Kind::Link) {
+            // A file over a link: the link's file is not replaced by the rename.
+            if src_kind != Kind::Link && kind == Kind::Link {
                 let _ = self.volume.unlink(&vp[..n]);
             }
             self.index.remove(id);
+        }
+        if dst_marked {
+            self.drop_mark(to, b_leaf);
         }
         if let Leaf::Missing { hidden: true, .. } = dst {
             if let Some((mark, _)) = self.index.lookup(to, b_leaf) {

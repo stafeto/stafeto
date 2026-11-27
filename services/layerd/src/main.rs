@@ -793,6 +793,12 @@ impl Service<0> for Layerd {
                     ),
                     other => rt::println!("layerd: not serving: {other:?}"),
                 }
+                if self.core.skipped() != 0 {
+                    rt::println!(
+                        "layerd: {} directories left out: their path passes the volume's limit",
+                        self.core.skipped()
+                    );
+                }
                 if let Err(why) = rt::service::ready(&self.parent) {
                     rt::println!("layerd: READY refused: {why:?}");
                 }
