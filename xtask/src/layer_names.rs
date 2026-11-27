@@ -253,7 +253,7 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     Ok(())
 }
 
-/// The steps of the service under `-icount` on one CPU, told and not judged: the probe passes and
+/// The steps of the service under `-icount` on one CPU, told only: the probe passes and
 /// the longest step of each kind goes to the console. The kinds 64 and up of the loop's table are
 /// one kind (63) for the methods of the names, since their numbers are 70 and over. Part G of the
 /// split gives the main loop its bound; this part reports where it stands (the open of a directory
@@ -271,7 +271,7 @@ pub fn steps(machine: &qemu::Machine) -> Result<(), String> {
     }
     let over: Vec<&(usize, u64, u64)> = rows.iter().filter(|r| r.1 > crate::TERM_B).collect();
     println!(
-        "layer-names-probe steps on {} under -icount: steps of the layer service (kind, ticks, detail) {rows:?}; past term B ({}): {over:?} (told, not judged) in {seconds} s: ok",
+        "layer-names-probe steps on {} under -icount: steps of the layer service (kind, ticks, detail) {rows:?}; past term B ({}): {over:?} (told only) in {seconds} s: ok",
         machine.name,
         crate::TERM_B
     );
