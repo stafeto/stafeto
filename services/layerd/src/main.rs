@@ -17,8 +17,11 @@
 //! and VERIFY_SESSION (71). A session is bound at birth to the process the copy of the identity
 //! session names (Vouch), and serves LIST and STATUS of proto_layer and the names OPEN, STAT,
 //! FSTAT, READ_DIR, REWIND, SEEK_DIR, CLOSE, BIND, ACCESS, READLINK and CHANGE (read only). The
-//! other methods of proto_layer that carry a selector answer NOT_FOUND; the rest, CLONE, CLONE_MORE
-//! and WAIT are not served (UNKNOWN_METHOD).
+//! other methods of proto_layer that carry a selector answer NOT_FOUND. CLONE makes a session for
+//! a child of a fork or a spawn that shares the descriptions it names (one position for the
+//! holders, as POSIX shares an open file description), and CLONE_MORE adds descriptions to it
+//! until the child sends its first request; the clone is unbound until the child's BIND. WAIT is
+//! not served (UNKNOWN_METHOD).
 
 #![no_std]
 #![no_main]
@@ -220,6 +223,7 @@ fn main(_: u64) -> u64 {
         step,
         notary: notary::Notary::new(),
         next_label: 1,
+        next_birth: 1,
         sessions: [const { None }; SESSIONS],
         ready: false,
     };
@@ -242,6 +246,11 @@ fn main(_: u64) -> u64 {
 /// changes.
 struct Record {
     label: u64,
+    /// The label of the session this one was cloned from (0 for none) and the birth number
+    /// CLONE gave it: CLONE_MORE names the clone by them while the child has sent nothing.
+    parent: u64,
+    birth: u32,
+    started: bool,
     /// The process the session was made for (Vouch's pid): the share of sessions it may hold.
     pid: u32,
     binding: Binding,
@@ -259,12 +268,13 @@ struct Layerd {
     step: Handle<Channel>,
     notary: notary::Notary,
     next_label: u64,
+    next_birth: u32,
     sessions: [Option<Record>; SESSIONS],
     ready: bool,
 }
 
 /// The numbers of the methods the service takes: LIST, STATUS and the methods of proto_layer that
-/// name a layer (NOT_FOUND), SESSION, and the names but CLONE, CLONE_MORE and WAIT.
+/// name a layer (NOT_FOUND), SESSION, and the names but WAIT.
 const METHODS: &[u16] = &[
     l::Method::List as u16,
     l::Method::Status as u16,
@@ -285,6 +295,8 @@ const METHODS: &[u16] = &[
     NameMethod::Rewind as u16,
     NameMethod::SeekDir as u16,
     NameMethod::Close as u16,
+    NameMethod::Clone as u16,
+    NameMethod::CloneMore as u16,
     NameMethod::Access as u16,
     NameMethod::Readlink as u16,
     NameMethod::Change as u16,
@@ -339,6 +351,9 @@ impl Layerd {
         self.next_label += 1;
         self.sessions[place] = Some(Record {
             label,
+            parent: 0,
+            birth: 0,
+            started: false,
             pid: who.pid,
             binding: Binding::Bound(who),
             identity: Some(brought),
@@ -397,10 +412,97 @@ impl Layerd {
             return st(proto_fs::ACCESS_DENIED);
         };
         if let Some(rec) = self.sessions[place].as_mut() {
+            // A clone is counted for the process that made it until the child binds it: from then
+            // on it is the child's.
+            rec.pid = who.pid;
             rec.binding = Binding::Bound(who);
             rec.identity = Some(brought);
         }
         Answer::Status(Status::Ok)
+    }
+
+    /// CLONE: a session for a child of the caller, unbound, that holds a share of each description
+    /// the request names. The caller's pid pays for the place until the child binds it.
+    fn clone_session(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
+        let mut handles = [0u32; n::CLONE_MAX];
+        let Ok(count) = n::read_clone(r.body(), &mut handles) else {
+            return Answer::Status(Status::BadSize);
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let Some(parent) = self.sessions[place].as_ref() else {
+            return st(proto_fs::AUTHENTICATING);
+        };
+        let (parent_label, pid) = (parent.label, parent.pid);
+        let held = self
+            .sessions
+            .iter()
+            .flatten()
+            .filter(|rec| rec.pid == pid)
+            .count();
+        let free = self.sessions.iter().position(Option::is_none);
+        let (true, Some(free)) = (held < SESSIONS_PER_PROCESS, free) else {
+            return st(proto_fs::TOO_MANY_FILES_IN_SYSTEM);
+        };
+        let label = OWN | self.next_label;
+        let Ok(copy) = sys::handle_label(
+            &self.channel,
+            Rights::SEND | Rights::TRANSFER,
+            label,
+            self.level,
+        ) else {
+            return st(proto_fs::TOO_MANY_FILES_IN_SYSTEM);
+        };
+        if let Err(status) = self.core.share(parent_label, &handles[..count], label) {
+            return Answer::Status(status);
+        }
+        self.next_label += 1;
+        let birth = self.next_birth;
+        self.next_birth = self.next_birth.wrapping_add(1).max(1);
+        self.sessions[free] = Some(Record {
+            label,
+            parent: parent_label,
+            birth,
+            started: false,
+            pid,
+            binding: Binding::Unbound,
+            identity: None,
+        });
+        if n::write_clone_reply(birth, r.reply()).is_err() {
+            self.core.gone(label);
+            self.sessions[free] = None;
+            return Answer::Status(Status::BadSize);
+        }
+        Answer::Reply([copy.erase()].into())
+    }
+
+    /// CLONE_MORE: more descriptions for the clone `birth` the caller made, while the child has
+    /// sent nothing (INVALID_ARGUMENT after that, BAD_FD for a birth the caller did not make).
+    fn clone_more(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
+        let mut handles = [0u32; n::CLONE_MAX];
+        let Ok((birth, count)) = n::read_clone_more(r.body(), &mut handles) else {
+            return Answer::Status(Status::BadSize);
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let Some(parent) = self.sessions[place].as_ref().map(|rec| rec.label) else {
+            return st(proto_fs::AUTHENTICATING);
+        };
+        let Some(clone) = self
+            .sessions
+            .iter()
+            .flatten()
+            .find(|rec| rec.parent == parent && rec.birth == birth)
+        else {
+            return st(proto_fs::BAD_FD);
+        };
+        if clone.started {
+            return st(proto_fs::INVALID_ARGUMENT);
+        }
+        let to = clone.label;
+        status_of(self.core.share(parent, &handles[..count], to))
     }
 
     /// The look at the binding of a session before a request: the generation of the process's
@@ -426,6 +528,9 @@ impl Layerd {
             return st(proto_fs::AUTHENTICATING);
         };
         self.look(place);
+        if let Some(rec) = self.sessions[place].as_mut() {
+            rec.started = true;
+        }
         let who: Option<Vouched> = self.sessions[place]
             .as_ref()
             .and_then(|rec| rec.binding.bound().copied());
@@ -434,6 +539,8 @@ impl Layerd {
         let bad = Answer::Status(Status::BadSize);
         match method {
             NameMethod::Bind => self.bind(place, r),
+            NameMethod::Clone => self.clone_session(place, r),
+            NameMethod::CloneMore => self.clone_more(place, r),
             NameMethod::Open => {
                 let who = match needs(&who) {
                     Ok(w) => w,

@@ -453,6 +453,11 @@ mod tests {
     }
 
     #[test]
+    fn the_codes_the_client_keeps_are_the_services() {
+        assert_eq!(STARTING, proto_layer::STARTING);
+    }
+
+    #[test]
     fn the_statuses_become_the_errno_of_a_name() {
         assert_eq!(errno_of(proto_fs::NO_ENTRY), errno::ENOENT);
         assert_eq!(errno_of(proto_fs::READ_ONLY_FILESYSTEM), errno::EROFS);

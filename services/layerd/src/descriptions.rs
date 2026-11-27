@@ -7,6 +7,12 @@
 //! (`proto_fs::names::handle`): a handle of an earlier instance answers STALE, a handle of
 //! another session or one that closed answers BAD_FD. A session holds `PER_SESSION` descriptions
 //! at most and the service `PLACES`; a session that goes frees what it held.
+//!
+//! A description is shared across a fork or a spawn, as POSIX shares an open file description: a
+//! session made by CLONE holds the descriptions of its parent that it names, and a description is
+//! one place with one position, so what one holder reads the others do not read again. The
+//! description goes when its last holder lets go of it (CLOSE or the end of its session); a
+//! description has `HOLDERS` holders at most.
 
 use proto_fs::names::{handle, split_handle};
 
@@ -15,6 +21,8 @@ pub const PER_SESSION: usize = 16;
 /// The descriptions the sessions of one process hold together (the pid Vouch named), so that one
 /// process fills neither the table of the service nor the places of the others.
 pub const PER_PROCESS: usize = 32;
+/// The sessions that hold one description at once: the creator and the clones of its forks.
+pub const HOLDERS: usize = 8;
 const _: () = assert!(PLACES <= proto_fs::names::PLACES_MAX);
 
 /// Where a listing stands: the stage and the position in it (`proto_fs::names::cursor`).
@@ -25,8 +33,8 @@ pub struct Position {
 }
 
 pub struct Description<D> {
-    /// The label of the session that holds it.
-    pub owner: u64,
+    /// The labels of the sessions that hold it (0 for an empty place).
+    holders: [u64; HOLDERS],
     /// The process the session was bound to when the description was made.
     pub pid: u32,
     /// The id of the directory in the index (0 is the root of the layer).
@@ -36,6 +44,30 @@ pub struct Description<D> {
     pub given: Position,
     /// The directory of the lower set, open from the first request of the second stage.
     pub lower: Option<D>,
+}
+
+impl<D> Description<D> {
+    fn holds(&self, owner: u64) -> bool {
+        self.holders.contains(&owner)
+    }
+
+    fn add_holder(&mut self, owner: u64) -> bool {
+        match self.holders.iter_mut().find(|h| **h == 0) {
+            Some(free) => {
+                *free = owner;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `owner` lets go; whether nobody holds the description now.
+    fn drop_holder(&mut self, owner: u64) -> bool {
+        for h in self.holders.iter_mut().filter(|h| **h == owner) {
+            *h = 0;
+        }
+        self.holders.iter().all(|h| *h == 0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,7 +112,7 @@ impl<D> Table<D> {
         self.slots
             .iter()
             .flatten()
-            .filter(|d| d.owner == owner)
+            .filter(|d| d.holds(owner))
             .count()
     }
 
@@ -103,8 +135,10 @@ impl<D> Table<D> {
             .ok_or(Refused::Full)?;
         // Generation 0 is skipped, so a handle with generation 0 and place 0 is never given.
         self.generations[place] = self.generations[place].wrapping_add(1).max(1);
+        let mut holders = [0; HOLDERS];
+        holders[0] = owner;
         self.slots[place] = Some(Description {
-            owner,
+            holders,
             pid,
             dir,
             position: Position::default(),
@@ -121,26 +155,72 @@ impl<D> Table<D> {
         }
         let place = usize::from(place);
         match self.slots.get_mut(place) {
-            Some(Some(d)) if d.owner == owner && self.generations[place] == generation => Ok(d),
+            Some(Some(d)) if d.holds(owner) && self.generations[place] == generation => Ok(d),
             _ => Err(Lost::Bad),
         }
     }
 
-    /// Frees a description; what it held (the lower directory) comes back to be closed.
-    pub fn close(&mut self, owner: u64, h: u32) -> Result<Description<D>, Lost> {
+    /// `owner` lets go of a description; the description itself comes back, to be closed, when
+    /// `owner` was its last holder.
+    pub fn close(&mut self, owner: u64, h: u32) -> Result<Option<Description<D>>, Lost> {
         self.get(owner, h)?;
         let (place, _, _) = split_handle(h);
-        self.slots[usize::from(place)].take().ok_or(Lost::Bad)
+        let place = usize::from(place);
+        let last = self.slots[place]
+            .as_mut()
+            .is_some_and(|d| d.drop_holder(owner));
+        Ok(if last { self.slots[place].take() } else { None })
     }
 
-    /// The session `owner` went: its descriptions, one by one.
-    pub fn take_owned(&mut self, owner: u64) -> Option<Description<D>> {
-        let place = self
-            .slots
-            .iter()
-            .position(|d| d.as_ref().is_some_and(|d| d.owner == owner))?;
-        self.slots[place].take()
+    /// The session `to` takes a share of each description of `handles` that `from` holds, all or
+    /// none: a handle `from` does not hold is `Lost`, a session that would hold more than
+    /// `PER_SESSION` or a description that would have more than `HOLDERS` holders is `Full`.
+    pub fn share(&mut self, from: u64, handles: &[u32], to: u64) -> Result<(), ShareError> {
+        let mut fresh = 0;
+        for (i, &h) in handles.iter().enumerate() {
+            if handles[..i].contains(&h) {
+                continue;
+            }
+            let d = self.get(from, h).map_err(ShareError::Lost)?;
+            if !d.holds(to) {
+                if d.holders.iter().all(|x| *x != 0) {
+                    return Err(ShareError::Full);
+                }
+                fresh += 1;
+            }
+        }
+        if self.held_by(to) + fresh > PER_SESSION {
+            return Err(ShareError::Full);
+        }
+        for &h in handles {
+            let d = self.get(from, h).map_err(ShareError::Lost)?;
+            if !d.holds(to) {
+                d.add_holder(to);
+            }
+        }
+        Ok(())
     }
+
+    /// The session `owner` went: the descriptions it was the last holder of, one by one (the
+    /// others lose one holder and live on).
+    pub fn take_owned(&mut self, owner: u64) -> Option<Description<D>> {
+        for place in 0..PLACES {
+            let Some(d) = self.slots[place].as_mut() else {
+                continue;
+            };
+            if d.holds(owner) && d.drop_holder(owner) {
+                return self.slots[place].take();
+            }
+        }
+        None
+    }
+}
+
+/// Why a share of descriptions was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShareError {
+    Lost(Lost),
+    Full,
 }
 
 #[cfg(test)]
@@ -195,5 +275,66 @@ mod tests {
         assert_eq!(freed, PER_SESSION);
         assert_eq!(t.held_by(1), 0);
         assert!(t.make(99, 5000, 0).is_ok());
+    }
+
+    #[test]
+    fn a_clone_shares_a_description_and_it_goes_with_its_last_holder() {
+        let mut t = Table::<u8>::new(3);
+        let a = t.make(1, 100, 5).unwrap();
+        let b = t.make(1, 100, 6).unwrap();
+        // The session 2 takes a share of both: one description each, held by two.
+        assert_eq!(t.share(1, &[a, b], 2), Ok(()));
+        assert_eq!(t.count(), 2);
+        assert_eq!(t.get(2, a).unwrap().dir, 5);
+        // The position is one: what a holder reads, the other has read.
+        t.get(1, a).unwrap().position.at = 7;
+        assert_eq!(t.get(2, a).unwrap().position.at, 7);
+        // A holder lets go: the description lives on for the other, and is BAD_FD for the one gone.
+        assert!(t.close(1, a).unwrap().is_none());
+        assert_eq!(t.get(1, a).err(), Some(Lost::Bad));
+        assert_eq!(t.get(2, a).unwrap().dir, 5);
+        // The last holder frees it, and the place is free for the next description.
+        assert!(t.close(2, a).unwrap().is_some());
+        assert_eq!(t.count(), 1);
+        // A session that goes frees what it alone held and only lets go of the rest.
+        assert!(t.take_owned(1).is_none());
+        assert_eq!(t.count(), 1);
+        assert!(t.take_owned(2).is_some());
+        assert_eq!(t.count(), 0);
+        assert!(t.take_owned(2).is_none());
+    }
+
+    #[test]
+    fn a_share_is_all_or_none_and_has_its_limits() {
+        let mut t = Table::<u8>::new(3);
+        let a = t.make(1, 100, 5).unwrap();
+        let b = t.make(1, 100, 6).unwrap();
+        // A handle the session does not hold, and a handle of another epoch.
+        assert_eq!(t.share(2, &[a], 3), Err(ShareError::Lost(Lost::Bad)));
+        assert_eq!(
+            t.share(1, &[a, 0x0001_0000], 2),
+            Err(ShareError::Lost(Lost::Stale))
+        );
+        // Nothing was given by the refused call.
+        assert_eq!(t.held_by(2), 0);
+        // A handle twice, and a share the target holds already, count once.
+        assert_eq!(t.share(1, &[a, a], 2), Ok(()));
+        assert_eq!(t.share(1, &[a, b], 2), Ok(()));
+        assert_eq!(t.held_by(2), 2);
+        // A description has HOLDERS holders at most.
+        for to in 3..=HOLDERS as u64 {
+            assert_eq!(t.share(1, &[a], to), Ok(()));
+        }
+        assert_eq!(t.share(1, &[a], 99), Err(ShareError::Full));
+        assert_eq!(t.held_by(99), 0);
+        // A session holds PER_SESSION descriptions at most, the shared ones included.
+        let mut t = Table::<u8>::new(3);
+        let mut handles = [0u32; PER_SESSION];
+        for h in handles.iter_mut() {
+            *h = t.make(1, 100, 1).unwrap();
+        }
+        let extra = t.make(5, 200, 1).unwrap();
+        assert_eq!(t.share(1, &handles, 2), Ok(()));
+        assert_eq!(t.share(5, &[extra], 2), Err(ShareError::Full));
     }
 }

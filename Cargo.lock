@@ -1053,6 +1053,7 @@ dependencies = [
  "posix-path",
  "proto-data",
  "proto-fs",
+ "proto-layer",
  "proto-net",
  "proto-pipe",
  "proto-tty",
