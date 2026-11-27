@@ -787,6 +787,11 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                     .get(..2)
                     .map_or(0, |b| u16::from_le_bytes([b[0], b[1]])),
             );
+            #[cfg(feature = "probe-lapse")]
+            let disk_before = volume.as_mut().map(|fs| {
+                let d = &fs.device().device;
+                (d.reads, d.writes)
+            });
             // The handle of a WINDOW the request thread passed on is the worker's from here: it is
             // kept, or it closes at the end of this job.
             let offered = (job.kind == REQUEST && window_method(request) && job.aux != 0)
@@ -911,6 +916,28 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             #[cfg(feature = "steps")]
             if job.kind == REQUEST {
                 longest_job(request, began);
+            }
+            // The facts of a lapse that jobs waited for, said after the job of the first waiter: the
+            // probe of the lease (`cargo xtask data-posix atomic`) judges them.
+            #[cfg(feature = "probe-lapse")]
+            if let Some(l) = server.lapse_told(job.queued_at.load(Acquire)) {
+                let now = now_ns();
+                let (reads, writes) = match (disk_before, volume.as_mut()) {
+                    (Some((r, w)), Some(fs)) => {
+                        let d = &fs.device().device;
+                        (d.reads - r, d.writes - w)
+                    }
+                    _ => (0, 0),
+                };
+                let us = |ns: i128| ns / 1_000;
+                rt::println!(
+                    "datafs: lease lapse {}: last answer {} us after the waiter was queued, lapse {} us after the expiry, waiter chosen {} us after the lapse, waiter job {} us, {reads} disk reads, {writes} disk writes",
+                    l.count,
+                    us(i128::from(l.answered) - i128::from(l.queued)),
+                    us(i128::from(l.at) - i128::from(l.expiry)),
+                    us(i128::from(l.ran) - i128::from(l.at)),
+                    us(i128::from(now) - i128::from(l.ran)),
+                );
             }
             // The gap of a lease a part ran under counts from the answer to it, and the request
             // thread learns which leases are live.
@@ -1375,6 +1402,13 @@ fn next_job(server: &mut Server, volume: &mut Option<Volume>) -> Option<usize> {
         if (now == QUEUED || now == PARKED) && now != wanted {
             at.store(wanted, Release);
         }
+    }
+    // The instant a job that waited for a lapse is chosen, for the probe of the lease.
+    #[cfg(feature = "probe-lapse")]
+    if let Some(i) = choice.run {
+        // SAFETY: the job is QUEUED: the main thread does not touch it until it is DONE.
+        let queued = unsafe { (*job(i)).queued_at.load(Acquire) };
+        server.lapse_waiter_ran(queued, now_ns());
     }
     choice.run
 }

@@ -1091,3 +1091,57 @@ fn with_a_waiter_the_wake_up_is_when_the_client_time_reaches_the_bound() {
     assert_eq!(at, 400_000_000 + 600_000_000 + 1);
     assert!(at < 400_000_000 + LEASE_GAP_NS + 1);
 }
+
+#[test]
+fn the_lapse_with_a_waiter_keeps_the_facts_the_probe_judges() {
+    let mut fx = fixture();
+    let lease = fx.write_lease(A, fx.ha);
+    assert_eq!(fx.rig.server.lapse().count, 0);
+    // The last part is answered at 0.2 s; a reader of the file is queued at 0.5 s.
+    fx.at(200_000_000);
+    fx.rig.server.set_job_queued(200_000_000);
+    fx.part(A, Method::PwriteFrom, fx.ha, 10, lease, true)
+        .unwrap();
+    fx.rig.server.leases_stamp(200_000_000);
+    let waiter = read_job(fx.hb);
+    let queued = [Candidate {
+        id: 0,
+        ticket: 1,
+        owner: B,
+        queued_at: 500_000_000,
+        request: &waiter,
+    }];
+    // Before the gap is over nothing lapses and nothing is kept.
+    fx.sweep(900_000_000, &queued);
+    assert_eq!(fx.rig.server.lease_count(), 1);
+    assert_eq!(fx.rig.server.lapse().count, 0);
+    // The sweep at 1.25 s ends the lease: 50 ms past the gap.
+    fx.sweep(1_250_000_000, &queued);
+    assert_eq!(fx.rig.server.lease_count(), 0);
+    let l = fx.rig.server.lapse();
+    assert_eq!(
+        (l.count, l.answered, l.queued, l.at, l.ran),
+        (1, 200_000_000, 500_000_000, 1_250_000_000, 0)
+    );
+    // Another job's pick is not the waiter; the waiter's is, once.
+    assert!(!fx.rig.server.lapse_waiter_ran(1, 1_260_000_000));
+    assert!(fx.rig.server.lapse_waiter_ran(500_000_000, 1_260_000_000));
+    assert_eq!(fx.rig.server.lapse().ran, 1_260_000_000);
+    assert!(!fx.rig.server.lapse_waiter_ran(500_000_000, 1_300_000_000));
+    assert_eq!(fx.rig.server.lapse().ran, 1_260_000_000);
+    // The record is told once, to the waiter's own job, and carries the instant the timer was set for.
+    assert_eq!(fx.rig.server.lapse_told(1), None);
+    let told = fx.rig.server.lapse_told(500_000_000).unwrap();
+    // (the sweep at 0.9 s set it: the client time of 0.2 s reaches its bound at 1 s)
+    assert_eq!(told.expiry, 1_000_000_001);
+    assert_eq!(fx.rig.server.lapse_told(500_000_000), None);
+}
+
+#[test]
+fn a_lapse_nobody_waited_for_leaves_no_facts() {
+    let mut fx = fixture();
+    fx.write_lease(A, fx.ha);
+    fx.sweep(2 * LEASE_GAP_NS, &[]);
+    assert_eq!(fx.rig.server.lease_count(), 0);
+    assert_eq!(fx.rig.server.lapse().count, 0);
+}

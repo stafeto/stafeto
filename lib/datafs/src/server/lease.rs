@@ -32,13 +32,23 @@
 //! than W (`docs/data.md`), as before. A job that waits for a file waits at most
 //!
 //! ```text
-//! W_lease <= W + sum over the holders ahead [ n_i * (T_part + T_job) + LEASE_CLIENT_MAX ]
+//! W_lease <= W + sum over the holders ahead [ n_i * (T_part + T_job) + LEASE_CLIENT_MAX ] + T_tail
 //! ```
 //!
 //! where a holder ahead is a lease on the file, or an older waiting call that takes a lease (a new
 //! read lease does not queue behind a waiting writer, so it is not ahead of it), `n_i` is the number of
 //! parts the holder has left, `ceil(count / 64 KiB)`, `T_part` is one job of a part and `T_job` one
 //! job of another file that runs between two parts.
+//!
+//! `T_tail` is the cost of the tail of a rewrite that stopped. When a call that rewrites a file from
+//! the middle lapses, the first seek, read, sync or close of the file's shared handle makes littlefs
+//! write out everything past the last byte written (`lfs_file_flush`: a copy of
+//! `size - stop_position`) in one job. The copy has no bound of its own but `FILE_MAX`, it is about
+//! a second per MiB of the file past the stopped write on QEMU (a Mac with Apple silicon; the GitHub
+//! runners take 2.6 times as long), and it stalls the jobs of other files too, since the worker is
+//! one thread. A file that is only appended to or made again has no tail. The root fix, a copy in
+//! slices, is issue #626. The lapse itself comes within the wake of the timer after the gap, and the
+//! waiter is chosen at once after it (`Server::lapse`).
 
 use super::*;
 
@@ -99,6 +109,45 @@ impl Lease {
         answered: 0,
         client: 0,
         expiry: 0,
+    };
+}
+
+/// The last lapse of a lease that jobs of its file waited for, for the probes: the instants are on
+/// the clock `set_mono` gives, in nanoseconds (all 0 before the first one).
+///
+/// The waiter is the oldest job of the file that was queued when the sweep ended the lease; it is
+/// found again by its `queued_at`. A waiter that leaves the queue without being chosen (its session
+/// goes) leaves `ran` at 0 and no line is told, and when two leases lapse in one sweep the later
+/// one overwrites the record: the probes run one lapse at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lapse {
+    /// The answer to the last part of the lease.
+    pub answered: u64,
+    /// The instant the worker's timer was set to look at the lease (`expiry`): the gap after the
+    /// answer, or, with a waiter, the sooner instant the client time reaches its bound.
+    pub expiry: u64,
+    /// The instant the oldest waiting job was queued.
+    pub queued: u64,
+    /// The instant the sweep ended the lease.
+    pub at: u64,
+    /// The instant the waiter was chosen to run (0 until it is).
+    pub ran: u64,
+    /// How many lapses with a waiter there have been.
+    pub count: u64,
+    /// The record of the lapse was told (`lapse_told`).
+    pub told: bool,
+}
+
+impl Lapse {
+    /// No lapse yet (a constant, as `Lease::EMPTY` is: `Server::new` is a `const fn`).
+    pub(super) const EMPTY: Lapse = Lapse {
+        answered: 0,
+        expiry: 0,
+        queued: 0,
+        at: 0,
+        ran: 0,
+        count: 0,
+        told: false,
     };
 }
 
@@ -294,12 +343,14 @@ impl Server {
             // The next part of this lease, if it is queued, and who waits for the file.
             let mut part_at = None;
             let mut waiting = false;
+            let mut oldest_waiter = u64::MAX;
             for j in &jobs[..n] {
                 let w = self.wants(j.owner, j.request);
                 if w.holder == Some(slot) {
                     part_at = Some(j.queued_at);
                 } else if w.node == Some(usize::from(l.node)) && (l.write || w.write) {
                     waiting = true;
+                    oldest_waiter = oldest_waiter.min(j.queued_at);
                 }
             }
             // The gap runs to the arrival of the queued part, or to the present when none is queued:
@@ -324,6 +375,17 @@ impl Server {
                 self.leases[slot].expiry = l.answered.saturating_add(step);
             }
             if lapsed {
+                if waiting {
+                    self.lapse = Lapse {
+                        answered: l.answered,
+                        expiry: l.expiry,
+                        queued: oldest_waiter,
+                        at: self.mono,
+                        ran: 0,
+                        count: self.lapse.count + 1,
+                        told: false,
+                    };
+                }
                 if l.sync && l.write {
                     let _ = self.sync_node(fs, usize::from(l.node));
                 }
@@ -340,6 +402,32 @@ impl Server {
             .filter(|l| l.used)
             .map(|l| l.expiry)
             .min()
+    }
+
+    /// The last lapse that jobs waited for.
+    pub fn lapse(&self) -> Lapse {
+        self.lapse
+    }
+
+    /// The job queued at `queued_at` was chosen to run at `now`: when it is the waiter of the last
+    /// lapse (the job that was the oldest waiter, not chosen yet), the instant is kept and the answer
+    /// is true.
+    pub fn lapse_waiter_ran(&mut self, queued_at: u64, now: u64) -> bool {
+        let first = self.lapse.count != 0 && self.lapse.ran == 0 && self.lapse.queued == queued_at;
+        if first {
+            self.lapse.ran = now;
+        }
+        first
+    }
+
+    /// The record of the last lapse once its waiter has run: the worker tells it after the job.
+    pub fn lapse_told(&mut self, queued_at: u64) -> Option<Lapse> {
+        let l = self.lapse;
+        if l.ran == 0 || l.told || l.queued != queued_at {
+            return None;
+        }
+        self.lapse.told = true;
+        Some(self.lapse)
     }
 
     /// The parts that were answered `UNLEASED` so far (they could not take a lease): for the probes.
