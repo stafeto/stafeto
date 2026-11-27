@@ -25,8 +25,39 @@ pub fn route(_dirfd: c_int, _path: &[u8]) -> Result<Option<Abs>, i32> {
     Ok(None)
 }
 
-pub fn refuse_write(_dirfd: c_int, _path: &[u8]) -> Result<(), i32> {
-    Ok(())
+/// What a change of a path of the root came to.
+pub enum Changed {
+    Done,
+    Elsewhere(Abs),
+}
+
+pub fn unlink(_abs: &Abs, _directory: bool) -> Result<Changed, i32> {
+    Err(EIO)
+}
+
+pub fn mkdir(_abs: &Abs, _mode: u32) -> Result<Changed, i32> {
+    Err(EIO)
+}
+
+pub fn symlink(_target: &[u8], _abs: &Abs) -> Result<Changed, i32> {
+    Err(EIO)
+}
+
+pub fn rename(_from: &Abs, _to: &Abs) -> Result<(), i32> {
+    Err(EIO)
+}
+
+pub fn link(_from: &Abs, _to: &Abs) -> Result<(), i32> {
+    Err(EIO)
+}
+
+pub fn attributes(
+    _op: proto_fs::ChangeOp,
+    _abs: &Abs,
+    _follow: bool,
+    _args: [u64; 4],
+) -> Result<Changed, i32> {
+    Err(EIO)
 }
 
 pub fn open(_abs: &Abs, _flags: c_int, _mode: u32, _umask: u32) -> Result<c_int, i32> {

@@ -356,6 +356,10 @@ pub const LAYER_POSIX_VOLUME_ENTRIES: &[LayerEntry] = &[
     LayerEntry::file("/.layers/00/many/own", 0o644, 0, 0, b"own of many\n"),
     LayerEntry::dir("/.layers/00/private", 0o700, 0, 0),
     LayerEntry::file("/.layers/00/private/f", 0o644, 0, 0, b"private\n"),
+    // A sticky directory of everyone with a name of root's in it, for the write probe.
+    LayerEntry::dir("/.layers/00/world", 0o1777, 0, 0),
+    LayerEntry::file("/.layers/00/world/rootfile", 0o644, 0, 0, b"root's\n"),
+    LayerEntry::dir("/.layers/00/world/rootdir", 0o755, 0, 0),
 ];
 
 /// The bytes of `/etc/layer-own` of the layer and of `/lower/shadowed`, which the probe reads.

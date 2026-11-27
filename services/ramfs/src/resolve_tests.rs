@@ -2882,13 +2882,19 @@ fn a_layered_root_sends_a_link_and_a_parent_back_to_the_merged_view() {
     assert_eq!(bounced(&mut r, b"/abs/libc", true), to(b"/usr/lib/libc"));
     // A link in a directory: the text follows the directory, and the `..` it begins with take
     // the directory's last names.
-    assert_eq!(bounced(&mut r, b"/usr/bin/up/libc", true), to(b"/usr/lib/libc"));
+    assert_eq!(
+        bounced(&mut r, b"/usr/bin/up/libc", true),
+        to(b"/usr/lib/libc")
+    );
     assert_eq!(bounced(&mut r, b"/usr/bin/up2", true), to(b"/etc/passwd"));
     assert_eq!(bounced(&mut r, b"/usr/bin/self/lib", true), to(b"/usr/lib"));
     // A link below the pass-through names bounces too: the layer service routes the new path (a
     // path out of them is the root's).
     assert_eq!(bounced(&mut r, b"/tmp/near", true), to(b"/tmp/far"));
-    assert_eq!(bounced(&mut r, b"/tmp/out/passwd", true), to(b"/etc/passwd"));
+    assert_eq!(
+        bounced(&mut r, b"/tmp/out/passwd", true),
+        to(b"/etc/passwd")
+    );
     // A `..` in the path (the POSIX layer takes them out first, but a walk that meets one) goes
     // to the directory above, with what is left of the path.
     assert_eq!(

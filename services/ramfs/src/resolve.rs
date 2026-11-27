@@ -667,7 +667,7 @@ impl Resolve {
     /// (or the root, for a name of the root itself) must be one of the pass-through names or lie
     /// below one; the root takes the creation of a pass-through directory alone.
     fn layered_refusal(&self, storage: &Storage<'_>, missing: bool) -> Result<(), u32> {
-        if !self.guard || !storage.state.layered() || cfg!(feature = "break-layered-guard") {
+        if !self.guard || !storage.state.layered() {
             return Ok(());
         }
         let writes = match self.intent {

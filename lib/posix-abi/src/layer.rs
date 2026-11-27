@@ -32,8 +32,19 @@
 //!   own call, and the `st_dev` of every answer is the root's one number. A program is never run
 //!   from a layer of the user (EACCES, as for `/data`): the path of an exec or a spawn is asked
 //!   with STAT first, so that a name the layers delete is ENOENT.
-//! * Writes are the service's EROFS for a path it decides, and the file service's own refusal for
-//!   the rest (its `layered` argument): no call of this module writes a name.
+//! * Changes. `unlink`, `rmdir`, `mkdir`, `symlink`, `rename`, `link`, `chmod`, `chown` and
+//!   `utimensat` of a path of the root are CHANGE requests to the service (`change`); an open that
+//!   creates sends its mode (the creation mask applied) in the flags. A file opened for writing is a
+//!   pass of a writable description of the data file service, which `ADOPT` takes, so the writes are
+//!   the data file service's. A name of the lower set is EROFS until the copy up: the service says it.
+//!   The directory part of a path of a change is canonical: a link of a layer of the user in it is a
+//!   redirect that routes by the path (followed here), and a link of the lower set is resolved here
+//!   first (`canonical_leaf`). A path a link led out of the root goes on at the service that owns it.
+//! * Redirects that route by the path. The service answers a link of a layer of the user with one, and
+//!   the RAM file service of a layered image answers every link and every `..` of the walk of a
+//!   POSIX session with one: the path they carry is routed again, from the start (`run`), and the
+//!   redirects and links of one call are at most `LINKS_MAX` (ELOOP past it). The path of an
+//!   `exec` is made canonical first (`check_exec`), because the loader does not follow a redirect.
 //! * Listings. A directory description of the service lists through batches of READ_DIR kept here
 //!   (`posix_fs::layer::Listing`); a reply with `more` and no entry is read over and the call asks
 //!   again. The position of the stream (`telldir`) counts the entries given, and a position other
@@ -88,6 +99,7 @@ const WIDE: usize = crate::names::MAX_PATH + 1;
 
 /// An absolute path of the layered root made plain, with the slash of its end noted: what the
 /// service gets.
+#[derive(Clone)]
 pub struct Abs {
     bytes: [u8; WIDE],
     len: usize,
@@ -492,20 +504,6 @@ pub fn route(dirfd: c_int, path: &[u8]) -> Result<Option<Abs>, i32> {
     Ok(Some(abs))
 }
 
-/// A change of names or attributes at `path` is refused when the path belongs to the layered root
-/// (EROFS, as the service answers a write it decides): the RAM file service never sees a name only a
-/// layer of the user has, and a description of the service has no place there. The guard of the
-/// RAM file service stays under this for any call that gets past it.
-pub fn refuse_write(dirfd: c_int, path: &[u8]) -> Result<(), i32> {
-    if cfg!(feature = "break-layer-refuse") {
-        return Ok(());
-    }
-    match route(dirfd, path)? {
-        Some(_) => Err(EROFS),
-        None => Ok(()),
-    }
-}
-
 /// The canonical path of the description `target` (a path kept at its open).
 pub fn descriptor_path(target: LayerTarget, out: &mut [u8; WIDE]) -> Result<usize, i32> {
     let path = DIRS.path_of(target.handle).ok_or(EOPNOTSUPP)?;
@@ -525,167 +523,296 @@ enum Answered {
     Redirect { target: u32, path: Abs },
 }
 
-fn ask_path(request: &[u8], trailing_slash: bool) -> Result<Answered, i32> {
-    let got = call(request)?;
+/// Why an attempt on a path did not end the call.
+enum Next {
+    /// The errno of the failure.
+    Errno(i32),
+    /// The path goes on as this one, after the links the redirect says it had expanded: a link of
+    /// a layer of the user.
+    Again(Abs, u32),
+    /// A call to the RAM file service ended its walk in a redirect that routes by the path (a
+    /// link of the lower set, or a `..`): the redirect is asked for.
+    Ram,
+}
+
+impl From<i32> for Next {
+    fn from(errno: i32) -> Next {
+        Next::Errno(errno)
+    }
+}
+
+/// The failure of a call to the RAM file service as the next move of the loop.
+fn ram(errno: i32) -> Next {
+    if errno == crate::EREDIRECT {
+        Next::Ram
+    } else {
+        Next::Errno(errno)
+    }
+}
+
+/// The path a redirect that routes by the path names, as the paths of the layer are: simple.
+fn rerouted(path: &[u8], trailing_slash: bool) -> Result<Abs, i32> {
+    if path.is_empty() || path.len() > proto_fs::MAX_PATH {
+        return Err(EIO);
+    }
+    let mut plain = [0u8; WIDE];
+    let len = posix_path::simplify(path, &mut plain);
+    Abs::from(&plain[..len], trailing_slash || path.last() == Some(&b'/')).ok_or(ENAMETOOLONG)
+}
+
+/// Runs `attempt` on `abs`, and again on the path a redirect that routes by the path gives (from
+/// the layer service for a link of a layer of the user, from the RAM file service for a link of the
+/// lower set or a `..`), until the call ends. A redirect counts as the links it expanded and one more;
+/// the sum is at most `LINKS_MAX` (ELOOP past it). `follow` says whether the call follows a link at
+/// the end of its path, as the RAM file service's walk did.
+fn run<T>(
+    abs: &Abs,
+    follow: bool,
+    mut attempt: impl FnMut(&Abs) -> Result<T, Next>,
+) -> Result<T, i32> {
+    let mut at = abs.clone();
+    let mut used = 0u32;
+    loop {
+        let (path, links) = match attempt(&at) {
+            Ok(done) => return Ok(done),
+            Err(Next::Errno(errno)) => return Err(errno),
+            Err(Next::Again(path, links)) => (path, links),
+            Err(Next::Ram) => {
+                let mut found = [0u8; proto_fs::MAX_PATH];
+                let asked = crate::shared::with_files(|files| Ok(files.transport()))?
+                    .files()
+                    .redirect_of(None, at.bytes(), follow, &mut found)
+                    .map_err(|status| match status {
+                        proto_wire::Status::Kernel(Error::Interrupted) => EINTR,
+                        _ => EIO,
+                    })?;
+                match asked {
+                    Some(redirect)
+                        if redirect.index == 0
+                            && redirect.target == proto_fs::REDIRECT_BY_PATH
+                            && redirect.length > 0 =>
+                    {
+                        let path = rerouted(&found[..redirect.length], at.trailing_slash)?;
+                        (path, redirect.links)
+                    }
+                    _ => return Err(EIO),
+                }
+            }
+        };
+        used = used.saturating_add(1 + links);
+        if used > proto_fs::LINKS_MAX {
+            return Err(ELOOP);
+        }
+        at = path;
+    }
+}
+
+/// Where a path that is not the layered root's goes: the data file service for a name below
+/// `/data`, the RAM file service for the others.
+fn elsewhere(path: &Abs) -> u32 {
+    let first = path.bytes().strip_prefix(b"/").unwrap_or(path.bytes());
+    if first.split(|&b| b == b'/').next() == Some(&b"data"[..]) {
+        proto_fs::REDIRECT_DATA
+    } else {
+        proto_fs::REDIRECT_RAM
+    }
+}
+
+/// Asks the service about `abs` (the request `build` writes): a path that is no longer the root's
+/// (a link of the layer led out of it) is a redirect to the service that owns it; a reply that
+/// routes by the path is the next move of the loop.
+fn ask(
+    abs: &Abs,
+    build: impl FnOnce(&Abs, &mut Writer) -> Result<(), i32>,
+) -> Result<Answered, Next> {
+    if !pure::belongs(abs.bytes()) {
+        return Ok(Answered::Redirect {
+            target: elsewhere(abs),
+            path: abs.clone(),
+        });
+    }
+    let mut w = Writer::new();
+    build(abs, &mut w)?;
+    let got = call(w.as_bytes())?;
     match proto_fs::Redirect::read_reply(got.raw.bytes()) {
         None => Ok(Answered::Done(got)),
         Some(Ok(redirect)) if redirect.index == 0 => {
-            let path = Abs::redirected(redirect.path, trailing_slash).ok_or(EIO)?;
+            if redirect.target == proto_fs::REDIRECT_BY_PATH {
+                let path = rerouted(redirect.path, abs.trailing_slash)?;
+                return Err(Next::Again(path, redirect.links));
+            }
+            let path = Abs::redirected(redirect.path, abs.trailing_slash).ok_or(EIO)?;
             Ok(Answered::Redirect {
                 target: redirect.target,
                 path,
             })
         }
-        Some(_) => Err(EIO),
+        Some(_) => Err(Next::Errno(EIO)),
     }
+}
+
+/// The data file service's volume path of a redirect to it.
+fn volume_of(path: &Abs) -> Result<crate::data::Vol, i32> {
+    crate::data::route(crate::names::AT_FDCWD, path.bytes())?.ok_or(EIO)
 }
 
 /// stat of a path of the root. A name of a layer of the user is answered by the service with the
 /// attributes the data file service keeps; a lower name by the file service, the links followed
 /// as `follow` says. The device is the root's.
 pub fn stat(abs: &Abs, follow: bool) -> Result<proto_fs::NodeInfo, i32> {
-    let mut w = Writer::new();
-    n::write_stat(
-        if follow { 0 } else { n::STAT_NO_FOLLOW },
-        abs.bytes(),
-        &mut w,
-    )
-    .map_err(write_failed)?;
-    match ask_path(w.as_bytes(), abs.trailing_slash)? {
-        Answered::Done(got) => {
-            let info = n::read_info(got.raw.bytes()).map_err(|_| EIO)?;
-            if abs.trailing_slash && info.kind != 1 {
-                return Err(ENOTDIR);
+    run(abs, follow, |at| {
+        let flags = if follow { 0 } else { n::STAT_NO_FOLLOW };
+        match ask(at, |a, w| {
+            n::write_stat(flags, a.bytes(), w).map_err(write_failed)
+        })? {
+            Answered::Done(got) => {
+                let info = n::read_info(got.raw.bytes()).map_err(|_| EIO)?;
+                if at.trailing_slash && info.kind != 1 {
+                    return Err(ENOTDIR.into());
+                }
+                Ok(pure::stamp(info))
             }
-            Ok(pure::stamp(info))
+            Answered::Redirect { target, path } => {
+                let flags = if follow {
+                    0
+                } else {
+                    crate::names::AT_SYMLINK_NOFOLLOW
+                };
+                let info = match target {
+                    proto_fs::REDIRECT_RAM => {
+                        crate::names::fstatat_ram(crate::names::AT_FDCWD, path.bytes(), flags)
+                            .map_err(ram)?
+                    }
+                    proto_fs::REDIRECT_DATA => crate::data::stat(&volume_of(&path)?)?,
+                    _ => return Err(EIO.into()),
+                };
+                Ok(pure::stamp(info))
+            }
         }
-        Answered::Redirect { target, path } => {
-            let flags = if follow {
-                0
-            } else {
-                crate::names::AT_SYMLINK_NOFOLLOW
-            };
-            let info = match target {
-                proto_fs::REDIRECT_RAM => {
-                    crate::names::fstatat_ram(crate::names::AT_FDCWD, path.bytes(), flags)?
-                }
-                proto_fs::REDIRECT_DATA => {
-                    let vol =
-                        crate::data::route(crate::names::AT_FDCWD, path.bytes())?.ok_or(EIO)?;
-                    crate::data::stat(&vol)?
-                }
-                _ => return Err(EIO),
-            };
-            Ok(pure::stamp(info))
-        }
-    }
+    })
 }
 
 /// access of a path of the root: `bits` as `R_OK`, `W_OK` and `X_OK` (0 for `F_OK`), with the real
 /// identifiers unless `effective`.
 pub fn access(abs: &Abs, bits: c_int, effective: bool) -> Result<(), i32> {
-    let flags = if effective {
-        0
-    } else {
-        proto_data::ACCESS_REAL
-    };
-    let mut w = Writer::new();
-    n::write_access(bits as u32 & 7, flags, abs.bytes(), &mut w).map_err(write_failed)?;
-    match ask_path(w.as_bytes(), abs.trailing_slash)? {
-        Answered::Done(_) => {
-            // A regular file of a layer of the user is never executable here: no program runs from
-            // a layer of the user.
-            if bits & 1 != 0 && stat(abs, true)?.kind != 1 {
-                return Err(EACCES);
+    run(abs, true, |at| {
+        let flags = if effective {
+            0
+        } else {
+            proto_data::ACCESS_REAL
+        };
+        match ask(at, |a, w| {
+            n::write_access(bits as u32 & 7, flags, a.bytes(), w).map_err(write_failed)
+        })? {
+            Answered::Done(_) => {
+                // A regular file of a layer of the user is never executable here: no program runs
+                // from a layer of the user.
+                if bits & 1 != 0 && stat(at, true)?.kind != 1 {
+                    return Err(EACCES.into());
+                }
+                Ok(())
             }
-            Ok(())
+            Answered::Redirect { target, path } => match target {
+                proto_fs::REDIRECT_RAM => crate::names::faccessat_ram(
+                    crate::names::AT_FDCWD,
+                    path.bytes(),
+                    bits,
+                    if effective {
+                        crate::names::AT_EACCESS
+                    } else {
+                        0
+                    },
+                )
+                .map_err(ram),
+                proto_fs::REDIRECT_DATA => {
+                    Ok(crate::data::access(&volume_of(&path)?, bits, effective)?)
+                }
+                _ => Err(EIO.into()),
+            },
         }
-        Answered::Redirect { target, path } => match target {
-            proto_fs::REDIRECT_RAM => crate::names::faccessat_ram(
-                crate::names::AT_FDCWD,
-                path.bytes(),
-                bits,
-                if effective {
-                    crate::names::AT_EACCESS
-                } else {
-                    0
-                },
-            ),
-            proto_fs::REDIRECT_DATA => {
-                let vol = crate::data::route(crate::names::AT_FDCWD, path.bytes())?.ok_or(EIO)?;
-                crate::data::access(&vol, bits, effective)
-            }
-            _ => Err(EIO),
-        },
-    }
+    })
 }
 
-/// readlink of a path of the root: a name of a layer of the user is no link (the service says
-/// EINVAL), a lower name is the file service's.
+/// readlink of a path of the root: the text of a link of a layer of the user, EINVAL for a name of
+/// a layer that is no link, and a lower name is the file service's.
 pub fn readlink(abs: &Abs, out: &mut [u8]) -> Result<usize, i32> {
-    let mut w = Writer::new();
-    n::write_readlink(abs.bytes(), &mut w).map_err(write_failed)?;
-    match ask_path(w.as_bytes(), false)? {
-        Answered::Done(_) => Err(EINVAL),
-        Answered::Redirect { target, path } => match target {
-            proto_fs::REDIRECT_RAM => {
-                crate::names::readlinkat_ram(crate::names::AT_FDCWD, path.bytes(), out)
+    run(abs, false, |at| {
+        match ask(at, |a, w| {
+            n::write_readlink(a.bytes(), w).map_err(write_failed)
+        })? {
+            Answered::Done(got) => {
+                let mut reader = Reader::new(got.raw.bytes());
+                reader.u32().map_err(|_| EIO)?;
+                let text = reader.bytes(reader.left()).map_err(|_| EIO)?;
+                let length = text.len().min(out.len());
+                out[..length].copy_from_slice(&text[..length]);
+                Ok(length)
             }
-            proto_fs::REDIRECT_DATA => {
-                let vol = crate::data::route(crate::names::AT_FDCWD, path.bytes())?.ok_or(EIO)?;
-                crate::data::stat(&vol).and(Err(EINVAL))
-            }
-            _ => Err(EIO),
-        },
-    }
+            Answered::Redirect { target, path } => match target {
+                proto_fs::REDIRECT_RAM => {
+                    crate::names::readlinkat_ram(crate::names::AT_FDCWD, path.bytes(), out)
+                        .map_err(ram)
+                }
+                proto_fs::REDIRECT_DATA => {
+                    Err(crate::data::stat(&volume_of(&path)?).and(Err(EINVAL))?)
+                }
+                _ => Err(EIO.into()),
+            },
+        }
+    })
 }
 
-/// The canonical path of a directory of the root the caller may search, with the links of the lower
-/// set resolved by the file service: ENOTDIR for a file, ENOENT for a name the layers delete.
+/// The canonical path of a directory of the root the caller may search, with the links resolved: a
+/// link of a layer of the user by the service, a link of the lower set by the file service. ENOTDIR
+/// for a file, ENOENT for a name the layers delete.
 pub fn directory(abs: &Abs, out: &mut [u8; WIDE]) -> Result<usize, i32> {
-    let mut w = Writer::new();
-    n::write_stat(0, abs.bytes(), &mut w).map_err(write_failed)?;
-    match ask_path(w.as_bytes(), false)? {
-        Answered::Done(got) => {
-            let info = n::read_info(got.raw.bytes()).map_err(|_| EIO)?;
-            if info.kind != 1 {
-                return Err(ENOTDIR);
+    run(abs, true, |at| {
+        match ask(at, |a, w| {
+            n::write_stat(0, a.bytes(), w).map_err(write_failed)
+        })? {
+            Answered::Done(got) => {
+                let info = n::read_info(got.raw.bytes()).map_err(|_| EIO)?;
+                if info.kind != 1 {
+                    return Err(ENOTDIR.into());
+                }
+                access(at, 1, true)?;
+                Ok(plain(at, out)?)
             }
-            access(abs, 1, true)?;
-            plain(abs, out)
+            Answered::Redirect { target, path } => match target {
+                proto_fs::REDIRECT_RAM => {
+                    crate::names::directory_path_ram(path.bytes(), out).map_err(ram)
+                }
+                proto_fs::REDIRECT_DATA => Ok(crate::data::directory(&volume_of(&path)?, out)?),
+                _ => Err(EIO.into()),
+            },
         }
-        Answered::Redirect { target, path } => match target {
-            proto_fs::REDIRECT_RAM => crate::names::directory_path_ram(path.bytes(), out),
-            proto_fs::REDIRECT_DATA => {
-                let vol = crate::data::route(crate::names::AT_FDCWD, path.bytes())?.ok_or(EIO)?;
-                crate::data::directory(&vol, out)
-            }
-            _ => Err(EIO),
-        },
-    }
+    })
 }
 
-/// The canonical path of a path of the root (realpath): the path must exist and be searchable.
+/// The canonical path of a path of the root (realpath): the path must exist and be searchable. A
+/// directory of the layer of the user is the path itself; a path through links of any layer is the
+/// path they lead to.
 pub fn realpath(abs: &Abs, out: &mut [u8; WIDE]) -> Result<usize, i32> {
-    let mut w = Writer::new();
-    n::write_stat(0, abs.bytes(), &mut w).map_err(write_failed)?;
-    match ask_path(w.as_bytes(), abs.trailing_slash)? {
-        Answered::Done(got) => {
-            let info = n::read_info(got.raw.bytes()).map_err(|_| EIO)?;
-            if abs.trailing_slash && info.kind != 1 {
-                return Err(ENOTDIR);
+    run(abs, true, |at| {
+        match ask(at, |a, w| {
+            n::write_stat(0, a.bytes(), w).map_err(write_failed)
+        })? {
+            Answered::Done(got) => {
+                let info = n::read_info(got.raw.bytes()).map_err(|_| EIO)?;
+                if at.trailing_slash && info.kind != 1 {
+                    return Err(ENOTDIR.into());
+                }
+                Ok(plain(at, out)?)
             }
-            plain(abs, out)
+            Answered::Redirect { target, path } => match target {
+                proto_fs::REDIRECT_RAM => {
+                    crate::names::realpath_ram(path.bytes(), out).map_err(ram)
+                }
+                proto_fs::REDIRECT_DATA => Ok(crate::data::realpath(&volume_of(&path)?, out)?),
+                _ => Err(EIO.into()),
+            },
         }
-        Answered::Redirect { target, path } => match target {
-            proto_fs::REDIRECT_RAM => crate::names::realpath_ram(path.bytes(), out),
-            proto_fs::REDIRECT_DATA => {
-                let vol = crate::data::route(crate::names::AT_FDCWD, path.bytes())?.ok_or(EIO)?;
-                crate::data::realpath(&vol, out)
-            }
-            _ => Err(EIO),
-        },
-    }
+    })
 }
 
 /// The path without its slash at the end, in `out`.
@@ -696,22 +823,228 @@ fn plain(abs: &Abs, out: &mut [u8; WIDE]) -> Result<usize, i32> {
     Ok(bytes.len())
 }
 
-/// Whether the program at `abs` may be run: a name of the lower set is the loader's to open; a
-/// name of a layer of the user is never run (EACCES, as for `/data`); a name the layers delete or
-/// never had is ENOENT, and a directory of the path that is closed is EACCES.
+/// Whether the program at `abs` may be run: a name of the lower set is the loader's to open (the
+/// path it opens has no link: the loader's session does not follow a redirect that routes by the
+/// path); a name of a layer of the user is never run (EACCES, as for `/data`); a name the layers
+/// delete or never had is ENOENT, and a directory of the path that is closed is EACCES.
 pub fn check_exec(abs: &Abs) -> Result<Abs, i32> {
-    let mut w = Writer::new();
-    n::write_stat(0, abs.bytes(), &mut w).map_err(write_failed)?;
-    match ask_path(w.as_bytes(), abs.trailing_slash)? {
-        Answered::Done(_) => Err(EACCES),
-        Answered::Redirect { target, path } => match target {
-            proto_fs::REDIRECT_RAM => Ok(path),
-            _ => Err(EACCES),
-        },
+    run(abs, true, |at| {
+        match ask(at, |a, w| {
+            n::write_stat(0, a.bytes(), w).map_err(write_failed)
+        })? {
+            Answered::Done(_) => Err(EACCES.into()),
+            Answered::Redirect {
+                target: proto_fs::REDIRECT_RAM,
+                path,
+            } => {
+                let mut canonical = [0u8; WIDE];
+                let len = crate::names::realpath_ram(path.bytes(), &mut canonical).map_err(ram)?;
+                Abs::from(&canonical[..len], false).ok_or(Next::Errno(ENAMETOOLONG))
+            }
+            Answered::Redirect { .. } => Err(EACCES.into()),
+        }
+    })
+}
+
+// ---------------------------------------------------------------- changes
+
+/// What a change of a path of the root came to.
+pub enum Changed {
+    Done,
+    /// A link led the path out of the layered root: the call goes on at the service that owns
+    /// this path (the caller runs it again with it).
+    Elsewhere(Abs),
+}
+
+/// The path `abs` made canonical in its directory part: the parent directory resolved by
+/// `directory` (every link, of the layers and of the lower set), the name last, not followed. The
+/// path of the root itself stays.
+fn canonical_leaf(abs: &Abs) -> Result<Abs, i32> {
+    let bytes = abs.bytes();
+    let trimmed = if bytes.len() > 1 && bytes.ends_with(b"/") {
+        &bytes[..bytes.len() - 1]
+    } else {
+        bytes
+    };
+    let at = trimmed.iter().rposition(|&b| b == b'/').unwrap_or(0);
+    if at == 0 {
+        return Ok(abs.clone());
+    }
+    let parent = Abs::from(&trimmed[..at], false).ok_or(ENAMETOOLONG)?;
+    let mut dir = [0u8; WIDE];
+    let len = directory(&parent, &mut dir)?;
+    let leaf = &trimmed[at + 1..];
+    if len + 1 + leaf.len() > proto_fs::MAX_PATH {
+        return Err(ENAMETOOLONG);
+    }
+    let mut joined = [0u8; WIDE];
+    joined[..len].copy_from_slice(&dir[..len]);
+    let mut total = len;
+    if len > 1 || dir[0] != b'/' {
+        joined[total] = b'/';
+        total += 1;
+    }
+    joined[total..total + leaf.len()].copy_from_slice(leaf);
+    total += leaf.len();
+    if abs.trailing_slash && total < proto_fs::MAX_PATH {
+        joined[total] = b'/';
+        total += 1;
+    }
+    Abs::from(&joined[..total], abs.trailing_slash).ok_or(ENAMETOOLONG)
+}
+
+/// One CHANGE for the paths `first` and `second` (the text of a symbolic link rides in `text`): the
+/// redirects of the service, which says which path (`index`) they are for, are followed here. A
+/// path that a link of a layer led out of the root ends the call with `Elsewhere` (for the first
+/// path; a rename that leaves the root is EXDEV).
+fn change(
+    op: n::ChangeOp,
+    a: u64,
+    b: u64,
+    first: &Abs,
+    second: Option<&Abs>,
+    text: Option<&[u8]>,
+) -> Result<Changed, i32> {
+    let mut paths = [first.clone(), second.unwrap_or(first).clone()];
+    let mut used = 0u32;
+    loop {
+        if !pure::belongs(paths[0].bytes()) {
+            return Ok(Changed::Elsewhere(paths[0].clone()));
+        }
+        if second.is_some() && !pure::belongs(paths[1].bytes()) {
+            return Err(EXDEV);
+        }
+        let mut w = Writer::new();
+        n::Change {
+            op,
+            a,
+            b,
+            first: paths[0].bytes(),
+            second: match (text, second) {
+                (Some(text), _) => text,
+                (None, Some(_)) => paths[1].bytes(),
+                (None, None) => b"",
+            },
+        }
+        .write(&mut w)
+        .map_err(write_failed)?;
+        let got = call(w.as_bytes())?;
+        let redirect = match proto_fs::Redirect::read_reply(got.raw.bytes()) {
+            None => return Ok(Changed::Done),
+            Some(Ok(redirect)) => redirect,
+            Some(Err(_)) => return Err(EIO),
+        };
+        let which = redirect.index as usize;
+        if which > 1 || (which == 1 && second.is_none()) {
+            return Err(EIO);
+        }
+        paths[which] = match redirect.target {
+            // A link of a layer of the user in the directory part.
+            proto_fs::REDIRECT_BY_PATH => {
+                used = used.saturating_add(1 + redirect.links);
+                rerouted(redirect.path, paths[which].trailing_slash)?
+            }
+            // A link of the lower set in the directory part: the directory is resolved here.
+            proto_fs::REDIRECT_RAM => {
+                used = used.saturating_add(1);
+                let canonical = canonical_leaf(&paths[which])?;
+                if canonical.bytes() == paths[which].bytes() {
+                    return Err(ELOOP);
+                }
+                canonical
+            }
+            _ => return Err(EIO),
+        };
+        if used > proto_fs::LINKS_MAX {
+            return Err(ELOOP);
+        }
     }
 }
 
+/// `unlink` (`directory` false) and `rmdir` of a path of the root.
+pub fn unlink(abs: &Abs, directory: bool) -> Result<Changed, i32> {
+    let op = if directory {
+        n::ChangeOp::Rmdir
+    } else {
+        n::ChangeOp::Unlink
+    };
+    change(op, 0, 0, abs, None, None)
+}
+
+/// `mkdir` of a path of the root with the mode the creation mask has been applied to.
+pub fn mkdir(abs: &Abs, mode: u32) -> Result<Changed, i32> {
+    change(
+        n::ChangeOp::Mkdir,
+        u64::from(mode & 0o7777),
+        0,
+        abs,
+        None,
+        None,
+    )
+}
+
+/// `symlink`: the link `abs` with the text `target`.
+pub fn symlink(target: &[u8], abs: &Abs) -> Result<Changed, i32> {
+    change(n::ChangeOp::Symlink, 0, 0, abs, None, Some(target))
+}
+
+/// `rename` of a path of the root to another one: a name of the lower set and a name that a link
+/// leads out of the root are EXDEV.
+pub fn rename(from: &Abs, to: &Abs) -> Result<(), i32> {
+    match change(n::ChangeOp::Rename, 0, 0, from, Some(to), None)? {
+        Changed::Done => Ok(()),
+        Changed::Elsewhere(_) => Err(EXDEV),
+    }
+}
+
+/// `link` of paths of the root: the volume of the layers has no links (EMLINK).
+pub fn link(from: &Abs, to: &Abs) -> Result<(), i32> {
+    match change(n::ChangeOp::Link, 0, 0, from, Some(to), None)? {
+        Changed::Done => Ok(()),
+        Changed::Elsewhere(_) => Err(EXDEV),
+    }
+}
+
+/// `chmod`, `chown` and `utimensat` of a path of the root (a name of the lower set is EROFS until
+/// the copy up): `args` are the layer's (`names::metadata`). The links of the path are resolved
+/// here (the last one too, unless `follow` is false: `lchown`, `AT_SYMLINK_NOFOLLOW`).
+pub fn attributes(
+    op: proto_fs::ChangeOp,
+    abs: &Abs,
+    follow: bool,
+    args: [u64; 4],
+) -> Result<Changed, i32> {
+    let (op, a, b) = match op {
+        proto_fs::ChangeOp::Chmod => (n::ChangeOp::Chmod, args[0], 0),
+        proto_fs::ChangeOp::Chown => (n::ChangeOp::Chown, args[0], args[1]),
+        proto_fs::ChangeOp::Times => (
+            n::ChangeOp::Utimens,
+            posix_fs::data::time_spec(args[0], args[1]).word() as u64,
+            posix_fs::data::time_spec(args[2], args[3]).word() as u64,
+        ),
+        _ => return Err(EINVAL),
+    };
+    // The last name is looked through when the call follows links: the path of its target.
+    let target = if follow {
+        let mut resolved = [0u8; WIDE];
+        match realpath(abs, &mut resolved) {
+            Ok(len) => Abs::from(&resolved[..len], false).ok_or(ENAMETOOLONG)?,
+            Err(error) => return Err(error),
+        }
+    } else {
+        abs.clone()
+    };
+    change(op, a, b, &target, None, None)
+}
+
 // ---------------------------------------------------------------- descriptions
+
+/// What an attempt to open a path came to: a descriptor of another service (the RAM file service,
+/// the data file service), or the reply of the layer service and the path it was given.
+enum Opened {
+    Fd(c_int),
+    Reply(Got, Abs),
+}
 
 /// open of a path of the root: `flags` are the layer's, the mode and the creation mask are the
 /// caller's. The descriptor is the lowest free one.
@@ -733,28 +1066,39 @@ pub fn open(abs: &Abs, flags: c_int, mode: u32, umask: u32) -> Result<c_int, i32
     if flags & !known != 0 {
         return Err(EINVAL);
     }
-    let wire = pure::open_flags(flags & !(O_SYNC | O_SEARCH))?;
-    let mut w = Writer::new();
-    n::write_open(wire, abs.bytes(), &mut w).map_err(write_failed)?;
-    let got = match ask_path(w.as_bytes(), abs.trailing_slash)? {
-        Answered::Done(got) => got,
-        Answered::Redirect { target, path } => {
-            return match target {
+    let mut wire = pure::open_flags(flags & !(O_SYNC | O_SEARCH))?;
+    // The mode of a file the service creates goes with the flags, the creation mask applied.
+    if flags & O_CREAT != 0 {
+        wire = n::with_permissions(wire, mode & !umask & 0o7777);
+    }
+    let follow = flags & O_NOFOLLOW == 0 && flags & (O_CREAT | O_EXCL) != O_CREAT | O_EXCL;
+    let opened = run(abs, follow, |at| {
+        match ask(at, |a, w| {
+            n::write_open(wire, a.bytes(), w).map_err(write_failed)
+        })? {
+            Answered::Done(got) => Ok(Opened::Reply(got, at.clone())),
+            Answered::Redirect { target, path } => match target {
                 proto_fs::REDIRECT_RAM => {
                     let fd =
-                        crate::open_image(path.bytes(), flags & !(O_SYNC | O_SEARCH), mode, umask)?;
+                        crate::open_image(path.bytes(), flags & !(O_SYNC | O_SEARCH), mode, umask)
+                            .map_err(ram)?;
                     mark(fd);
-                    Ok(fd)
+                    Ok(Opened::Fd(fd))
                 }
                 // A name the layered root passes through to the data file service.
-                proto_fs::REDIRECT_DATA => {
-                    let vol =
-                        crate::data::route(crate::names::AT_FDCWD, path.bytes())?.ok_or(EIO)?;
-                    crate::data::open(&vol, flags, mode, umask)
-                }
-                _ => Err(EIO),
-            };
+                proto_fs::REDIRECT_DATA => Ok(Opened::Fd(crate::data::open(
+                    &volume_of(&path)?,
+                    flags,
+                    mode,
+                    umask,
+                )?)),
+                _ => Err(EIO.into()),
+            },
         }
+    })?;
+    let (got, abs) = match opened {
+        Opened::Fd(fd) => return Ok(fd),
+        Opened::Reply(got, abs) => (got, abs),
     };
     match n::OpenAnswer::read(got.raw.bytes()).map_err(|_| EIO)? {
         n::OpenAnswer::Pass => {

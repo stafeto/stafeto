@@ -393,7 +393,13 @@ fn unlinkat_once(dirfd: c_int, path: &[u8], flags: c_int) -> Result<(), c_int> {
     if let Some(vol) = crate::data::route(dirfd, path)? {
         return crate::data::unlink(&vol, flags & AT_REMOVEDIR != 0);
     }
-    crate::layer::refuse_write(dirfd, path)?;
+    if let Some(abs) = crate::layer::route(dirfd, path)? {
+        return match crate::layer::unlink(&abs, flags & AT_REMOVEDIR != 0)? {
+            crate::layer::Changed::Done => Ok(()),
+            // A link led the path out of the layered root: the call goes on at its owner.
+            crate::layer::Changed::Elsewhere(abs) => unlinkat_once(AT_FDCWD, abs.bytes(), flags),
+        };
+    }
     let placed = place(dirfd, path)?;
     let remove_directory = flags & AT_REMOVEDIR != 0;
     check_virtual(
@@ -420,7 +426,14 @@ fn mkdirat_once(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), 
     if let Some(vol) = crate::data::route(dirfd, path)? {
         return crate::data::mkdir(&vol, mode, umask);
     }
-    crate::layer::refuse_write(dirfd, path)?;
+    if let Some(abs) = crate::layer::route(dirfd, path)? {
+        return match crate::layer::mkdir(&abs, mode & !umask)? {
+            crate::layer::Changed::Done => Ok(()),
+            crate::layer::Changed::Elsewhere(abs) => {
+                mkdirat_once(AT_FDCWD, abs.bytes(), mode, umask)
+            }
+        };
+    }
     let placed = place(dirfd, path)?;
     // A name of the terminal exists even with a slash after it.
     check_virtual(Named::Mkdir, &placed, None, false)?;
@@ -431,11 +444,10 @@ fn mkdirat_once(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), 
 
 /// Create a FIFO inode; its ring is allocated only by a later open.
 fn mkfifoat_once(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
-    // The volume keeps files and directories alone.
-    if crate::data::route(dirfd, path)?.is_some() {
+    // The volume keeps files and directories alone, and so do the layers of the user.
+    if crate::data::route(dirfd, path)?.is_some() || crate::layer::route(dirfd, path)?.is_some() {
         return Err(EPERM);
     }
-    crate::layer::refuse_write(dirfd, path)?;
     let placed = place(dirfd, path)?;
     check_virtual(Named::Mkdir, &placed, None, false)?;
     let mut create = request(ChangeOp::Mkfifo, &placed);
@@ -446,10 +458,9 @@ fn mkfifoat_once(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(),
 /// Create the node of kind socket that a bound socket of the pipe service
 /// names; EEXIST for a name in use.
 fn mksockat_once(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
-    if crate::data::route(dirfd, path)?.is_some() {
+    if crate::data::route(dirfd, path)?.is_some() || crate::layer::route(dirfd, path)?.is_some() {
         return Err(EPERM);
     }
-    crate::layer::refuse_write(dirfd, path)?;
     let placed = place(dirfd, path)?;
     check_virtual(Named::Mkdir, &placed, None, false)?;
     let mut create = request(ChangeOp::Mksock, &placed);
@@ -520,10 +531,18 @@ pub(crate) fn faccessat_ram(
 /// rename: `renameat2` without flags.
 pub fn renameat(old_dirfd: c_int, old: &[u8], new_dirfd: c_int, new: &[u8]) -> Result<(), c_int> {
     // Both names on the volume, or neither (EXDEV across the mount).
-    crate::layer::refuse_write(old_dirfd, old)?;
-    crate::layer::refuse_write(new_dirfd, new)?;
     if let Some((from, to)) = crate::data::pair(old_dirfd, old, new_dirfd, new)? {
         return crate::data::rename(&from, &to);
+    }
+    // Both names of the layered root, or neither: a name of the root and one of another service
+    // are EXDEV.
+    match (
+        crate::layer::route(old_dirfd, old)?,
+        crate::layer::route(new_dirfd, new)?,
+    ) {
+        (Some(from), Some(to)) => return crate::layer::rename(&from, &to),
+        (Some(_), None) | (None, Some(_)) => return Err(EXDEV),
+        (None, None) => {}
     }
     let first = place(old_dirfd, old)?;
     let second = place(new_dirfd, new)?;
@@ -545,10 +564,16 @@ pub fn linkat(
     if flags & !AT_SYMLINK_FOLLOW != 0 {
         return Err(EINVAL);
     }
-    crate::layer::refuse_write(old_dirfd, old)?;
-    crate::layer::refuse_write(new_dirfd, new)?;
     if let Some((from, _)) = crate::data::pair(old_dirfd, old, new_dirfd, new)? {
         return crate::data::link(&from);
+    }
+    match (
+        crate::layer::route(old_dirfd, old)?,
+        crate::layer::route(new_dirfd, new)?,
+    ) {
+        (Some(from), Some(to)) => return crate::layer::link(&from, &to),
+        (Some(_), None) | (None, Some(_)) => return Err(EXDEV),
+        (None, None) => {}
     }
     let first = place(old_dirfd, old)?;
     let second = place(new_dirfd, new)?;
@@ -572,7 +597,12 @@ fn symlinkat_once(target: &[u8], new_dirfd: c_int, linkpath: &[u8]) -> Result<()
     if crate::data::route(new_dirfd, linkpath)?.is_some() {
         return Err(EPERM);
     }
-    crate::layer::refuse_write(new_dirfd, linkpath)?;
+    if let Some(abs) = crate::layer::route(new_dirfd, linkpath)? {
+        return match crate::layer::symlink(target, &abs)? {
+            crate::layer::Changed::Done => Ok(()),
+            crate::layer::Changed::Elsewhere(abs) => symlinkat_once(target, AT_FDCWD, abs.bytes()),
+        };
+    }
     let placed = place(new_dirfd, linkpath)?;
     check_virtual(Named::Symlink, &placed, None, false)?;
     let mut symlink = request(ChangeOp::Symlink, &placed);
@@ -675,21 +705,21 @@ fn metadata_once(
     if at_flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(EINVAL);
     }
-    // A file of a layer of the user that the root passed is read only here like a lower one.
-    if path.is_empty()
-        && !cfg!(feature = "break-layer-fd-guard")
-        && crate::data::data_target(dirfd)
-            .is_some_and(|d| posix_fs::layer::is_marked_data(d.handle))
-    {
-        return Err(EROFS);
-    }
     if (!path.is_empty() || at_flags & AT_EMPTY_PATH != 0)
         && crate::data::change(op, dirfd, path, args)?
     {
         return Ok(());
     }
-    if !path.is_empty() {
-        crate::layer::refuse_write(dirfd, path)?;
+    if !path.is_empty()
+        && let Some(abs) = crate::layer::route(dirfd, path)?
+    {
+        return match crate::layer::attributes(op, &abs, at_flags & AT_SYMLINK_NOFOLLOW == 0, args)?
+        {
+            crate::layer::Changed::Done => Ok(()),
+            crate::layer::Changed::Elsewhere(abs) => {
+                metadata_once(op, named, AT_FDCWD, abs.bytes(), at_flags, args)
+            }
+        };
     }
     let (placed, itself) = metadata_target(dirfd, path, at_flags)?;
     if !itself {
