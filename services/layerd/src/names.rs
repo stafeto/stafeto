@@ -24,7 +24,7 @@ use crate::descriptions::{Lost, Refused, ShareError, Table};
 use crate::identity::Vouched;
 use crate::index::{Index, Kind};
 use crate::listing;
-use crate::lookup::{Outcome, Walk, normalize_dots};
+use crate::lookup::{Hidden, Outcome, Walk, normalize_dots};
 use crate::scan::{Failure, Progress, Scan};
 use crate::volume::{Lower, R, Volume};
 use posix_perm::{EXEC, READ, WRITE, permits};
@@ -125,6 +125,8 @@ pub struct Walked {
     len: usize,
     /// The plain path holds a `..`.
     dotted: bool,
+    /// The lower set is hidden from the directory the outcome names (`Walk::hidden`).
+    pub(crate) hidden: bool,
 }
 
 /// The paths of more components than this are walked in steps of their own (`Prewalk`): a step
@@ -148,6 +150,7 @@ pub struct Prewalk {
     len: usize,
     pos: usize,
     cur: u32,
+    hidden: Hidden,
     real: bool,
     /// A link at the end of the path is followed.
     follow: bool,
@@ -174,6 +177,7 @@ impl Prewalk {
             len: 0,
             pos: 0,
             cur: 0,
+            hidden: Hidden::default(),
             real,
             follow,
             dotted: false,
@@ -678,12 +682,12 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             pw.planned = true;
             return None;
         }
-        let mut walk = Walk::resume(&pw.path[..pw.len], pw.pos, pw.cur);
+        let mut walk = Walk::resume(&pw.path[..pw.len], pw.pos, pw.cur, pw.hidden);
         if !pw.follow {
             walk = walk.no_follow();
         }
         let step = walk.advance(self.index, who.identity(pw.real), crate::lookup::STEP);
-        (pw.pos, pw.cur) = walk.state();
+        (pw.pos, pw.cur, pw.hidden) = walk.state();
         let trailing = walk.trailing_slash();
         match step {
             crate::lookup::Step::More => None,
@@ -693,6 +697,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
                 path: pw.path,
                 len: pw.len,
                 dotted: pw.dotted,
+                hidden: walk.hidden(),
             }),
         }
     }
@@ -708,13 +713,21 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             Walk::new(&plain[..len]).no_follow()
         };
         let trailing = walk.trailing_slash();
-        let outcome = walk.run(self.index, c.who.identity(real)).0;
+        let mut walk = walk;
+        let outcome = loop {
+            if let crate::lookup::Step::Done(o) =
+                walk.advance(self.index, c.who.identity(real), crate::lookup::STEP)
+            {
+                break o;
+            }
+        };
         Walked {
             outcome,
             trailing,
             path: plain,
             len,
             dotted,
+            hidden: walk.hidden(),
         }
     }
 
@@ -831,7 +844,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             // is the service's own table: ENFILE.
             let handle = self
                 .table
-                .make(c.owner, c.who.pid, id)
+                .make(c.owner, c.who.pid, id, walked.hidden)
                 .map_err(|_: Refused| st(proto_fs::TOO_MANY_FILES_IN_SYSTEM))?;
             OpenAnswer::Directory { handle }.write(w)?;
             return Ok(Done::Written);
@@ -1105,6 +1118,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             index,
             lower,
             desc.dir,
+            desc.hidden,
             &mut desc.position,
             &mut desc.lower,
             &mut desc.replayed,

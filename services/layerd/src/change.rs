@@ -382,14 +382,14 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 Ok(Parent {
                     up: Some(id),
                     attr,
-                    visible: self.index.lower_visible(id),
+                    visible: !walk.hidden(),
                     deepest: id,
                     miss: 0,
                 })
             }
             Outcome::Lower => {
                 let (cur, start) = walk.missed();
-                if !self.index.lower_visible(cur) {
+                if walk.hidden() {
                     return fail(proto_fs::NO_ENTRY);
                 }
                 let mut pos = start;
@@ -1292,9 +1292,6 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             .map_err(|_| Stop::Status(st(proto_fs::NO_SPACE)))?;
         if src_is_dir {
             self.table.retarget(src_id, new);
-            // The directory may have gone under an opaque one, or out from under one, or been made
-            // opaque: the directories below it follow.
-            self.index.refresh_hidden();
         }
         if src_lower.is_some() {
             self.index_mark(src_parent, a_leaf)?;

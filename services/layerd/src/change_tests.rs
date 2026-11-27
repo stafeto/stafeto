@@ -1074,35 +1074,46 @@ fn the_index_says_whether_a_name_has_room_before_the_volume_is_touched() {
 }
 
 #[test]
-fn a_directory_below_an_opaque_one_keeps_the_lower_set_hidden_after_a_build_and_a_move() {
+fn the_walk_carries_whether_the_lower_set_shows_through_a_directory() {
     let mut v = volume();
     v.dir("/.layers/00/opq/sub", 0o755, 0)
-        .file("/.layers/00/opq/sub/own", 0o644, 0, b"o");
+        .file("/.layers/00/opq/sub/own", 0o644, 0, b"o")
+        .dir("/.layers/00/etc/mv", 0o755, 0)
+        .dir("/.layers/00/etc/mv/c", 0o755, 0)
+        .file("/.layers/00/etc/mv/c/f", 0o644, 0, b"f");
     let mut world = World::new();
     let mut core = world.core(v);
     ready(&mut core);
-    // The build: /opq is opaque, /opq/sub of the layer has the lower /opq/sub under it.
+    // The build: /opq is opaque, so the lower /opq/sub/lx and /opq/l1 are hidden from it and below.
     assert_eq!(listing(&mut core, "/opq/sub"), ["own"]);
+    for path in ["/opq/sub/lx", "/opq/l1", "/opq/sub/../l1", "/etc/../opq/l1"] {
+        assert_eq!(
+            open(&mut core, 0, f::READ_ONLY, path).err(),
+            Some(st(f::NO_ENTRY)),
+            "{path}"
+        );
+    }
+    // A `..` out of the opaque directory shows the lower set again.
+    let out = open(&mut core, 0, f::READ_ONLY, "/opq/sub/../../etc/hostname");
+    assert!(
+        matches!(out, Ok((ref reply, None)) if is_redirect(reply).is_some()),
+        "{out:?}"
+    );
+    // A directory moved below the opaque one is hidden from the lower set there, and what is in it.
+    rename(&mut core, 0, "/etc/mv", "/opq/mv").unwrap();
+    assert_eq!(listing(&mut core, "/opq/mv"), ["c"]);
     assert_eq!(
-        open(&mut core, 0, f::READ_ONLY, "/opq/sub/lx").err(),
+        open(&mut core, 0, f::READ_ONLY, "/opq/mv/c/zz").err(),
         Some(st(f::NO_ENTRY))
     );
-    // Moved out from under the opaque directory, it is a directory of the merged view again.
-    rename(&mut core, 0, "/opq/sub", "/etc/sub").unwrap();
-    let sub = core
-        .index
-        .lookup(core.index.lookup(0, b"etc").unwrap().0, b"sub")
-        .unwrap()
-        .0;
-    assert!(core.index.lower_visible(sub));
-    // And back under it, hidden.
-    rename(&mut core, 0, "/etc/sub", "/opq/sub2").unwrap();
-    let sub = core
-        .index
-        .lookup(core.index.lookup(0, b"opq").unwrap().0, b"sub2")
-        .unwrap()
-        .0;
-    assert!(!core.index.lower_visible(sub));
+    // And moved out again it is seen as a directory of the merged view.
+    rename(&mut core, 0, "/opq/mv", "/etc/mv").unwrap();
+    assert_eq!(listing(&mut core, "/etc/mv"), ["c"]);
+    let out = open(&mut core, 0, f::READ_ONLY, "/etc/mv/c/zz");
+    assert!(
+        matches!(out, Ok((ref reply, None)) if is_redirect(reply).is_some()),
+        "{out:?}"
+    );
 }
 
 // ---------------------------------------------------------------------- rename

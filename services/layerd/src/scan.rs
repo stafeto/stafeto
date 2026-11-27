@@ -242,7 +242,6 @@ impl Scan {
             .open(path, READ | DIRECTORY, 0)
             .map_err(Failure::Volume)?;
         index.set_flags(id, 0, UNSCANNED);
-        index.inherit_hidden(id);
         self.open = Some((id, handle));
         self.dir = None;
         self.statted = false;

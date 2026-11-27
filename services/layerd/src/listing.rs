@@ -72,6 +72,7 @@ pub fn read_dir<L: Lower>(
     index: &Index,
     lower: &mut L,
     dir: u32,
+    hidden: bool,
     position: &mut Position,
     open: &mut Option<L::Dir>,
     replayed: &mut u32,
@@ -141,7 +142,7 @@ pub fn read_dir<L: Lower>(
         return Ok(listed(position, true));
     }
     // Stage 1: the lower set, unless the directory is opaque.
-    if !index.lower_visible(dir) {
+    if hidden {
         return Ok(listed(position, false));
     }
     // The open of the lower directory, the replay to the position a seek or an earlier request

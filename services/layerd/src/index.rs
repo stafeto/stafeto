@@ -65,10 +65,6 @@ pub const OPAQUE: u8 = 1;
 pub const HAS_CHILDREN: u8 = 2;
 /// The directory has not been listed yet by the build of the index (`scan`).
 pub const UNSCANNED: u8 = 4;
-/// A directory above this one is opaque (or has the flag itself): the lower set does not show
-/// through it either. Kept for each directory so that the question costs one look, whatever the depth.
-pub const NOLOWER: u8 = 8;
-
 /// An entry. The key of its place is (the key of its directory, its name). A directory has a key
 /// of its own that never changes (`dkey`, 1 to `SLOTS`), so a directory that moves to another place
 /// of the table (a rename) keeps its children, which name it by that key.
@@ -515,9 +511,6 @@ impl Index {
             _ => 0,
         };
         self.grow(parent, 1 + name.len() + extra, shallow);
-        if !shallow && f.kind == Kind::Dir && self.flags(parent) & (OPAQUE | NOLOWER) != 0 {
-            self.set_flags(id, NOLOWER, 0);
-        }
         Ok(id)
     }
 
@@ -827,51 +820,6 @@ impl Index {
             self.root.flags
         } else {
             self.entry(id).map_or(0, |e| e.flags)
-        }
-    }
-
-    /// Whether the lower set shows through the directory `id` (0 is the root): no directory from it
-    /// up to the root is opaque. A directory made below an opaque one has none of the lower names
-    /// either.
-    pub fn lower_visible(&self, id: u32) -> bool {
-        self.flags(id) & (OPAQUE | NOLOWER) == 0
-    }
-
-    /// Sets and clears `NOLOWER` of every directory by the flags of the directory above it, until
-    /// nothing changes (a directory moved, or made opaque, with directories below it). A scan of
-    /// the table for each level of the tree: it is for the rare change that moves a subtree.
-    pub fn refresh_hidden(&mut self) {
-        loop {
-            let mut changed = false;
-            for slot in 0..SLOTS {
-                let e = self.slots[slot];
-                if e.kind != Kind::Dir {
-                    continue;
-                }
-                let above = if e.pkey == 0 {
-                    self.root.flags
-                } else {
-                    let up = self.dslot[e.pkey as usize & (SLOTS - 1)] as usize;
-                    up.checked_sub(1).map_or(0, |u| self.slots[u].flags)
-                };
-                let want = above & (OPAQUE | NOLOWER) != 0;
-                if want != (e.flags & NOLOWER != 0) {
-                    self.slots[slot].flags ^= NOLOWER;
-                    changed = true;
-                }
-            }
-            if !changed {
-                return;
-            }
-        }
-    }
-
-    /// The directory `id` just started to be listed by the build: the directory above it has been
-    /// listed whole, so its flags are final.
-    pub fn inherit_hidden(&mut self, id: u32) {
-        let above = self.parent_of(id);
-        if self.flags(above) & (OPAQUE | NOLOWER) != 0 {
-            self.set_flags(id, NOLOWER, 0);
         }
     }
 

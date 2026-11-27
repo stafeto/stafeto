@@ -33,7 +33,7 @@
 //! after the redirect, and a path is open when both pass (a directory the layer of the user opened
 //! with `chmod` wider than its lower one stays closed, section 4 of the decision).
 
-use crate::index::{Index, Kind};
+use crate::index::{Index, Kind, OPAQUE};
 use posix_perm::{EXEC, Identity, permits};
 
 /// The components one step of the walk takes: a measure of its work.
@@ -152,10 +152,47 @@ pub enum Step {
     Done(Outcome),
 }
 
+/// The directories deep a walk carries the bit of: a path holds at most 253 components.
+const HIDDEN_DEPTH: usize = 256;
+
+/// Whether the lower set shows through the directory a walk is in: the bit of the directory
+/// (set when it or a directory above it is opaque) and the bits of the directories above it, which
+/// a `..` goes back to. A walk carries it from one step to the next, so that the question
+/// costs no look at the index above the directory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hidden {
+    bits: [u64; HIDDEN_DEPTH / 64],
+    depth: u16,
+    now: bool,
+    started: bool,
+}
+
+impl Hidden {
+    fn push(&mut self) {
+        let at = usize::from(self.depth);
+        if at < HIDDEN_DEPTH {
+            let (word, bit) = (at / 64, at % 64);
+            self.bits[word] = (self.bits[word] & !(1 << bit)) | (u64::from(self.now) << bit);
+            self.depth += 1;
+        }
+    }
+
+    fn pop(&mut self) {
+        if self.depth > 0 {
+            self.depth -= 1;
+            let at = usize::from(self.depth);
+            self.now = self.bits[at / 64] >> (at % 64) & 1 != 0;
+        }
+    }
+}
+
 pub struct Walk<'p> {
     path: &'p [u8],
     pos: usize,
     cur: u32,
+    hidden: Hidden,
+    /// The bit of the directory the outcome names (see `hidden`).
+    result: bool,
     /// A link at the end of the path is followed.
     follow: bool,
     /// Where a walk that ended with `Outcome::Lower` stopped: the directory of the layer and the
@@ -170,6 +207,8 @@ impl<'p> Walk<'p> {
             path,
             pos: 0,
             cur: 0,
+            hidden: Hidden::default(),
+            result: false,
             follow: true,
             miss: (0, 0),
         }
@@ -189,19 +228,28 @@ impl<'p> Walk<'p> {
 
     /// A walk of `path` that went on to the byte `pos` of it, in the directory `cur`: the state a
     /// walk of several requests keeps (`pos` and `cur` of an earlier one of the same path).
-    pub fn resume(path: &'p [u8], pos: usize, cur: u32) -> Walk<'p> {
+    pub fn resume(path: &'p [u8], pos: usize, cur: u32, hidden: Hidden) -> Walk<'p> {
         Walk {
             path,
             pos,
             cur,
+            hidden,
+            result: false,
             follow: true,
             miss: (0, 0),
         }
     }
 
     /// Where the walk stands: the byte of the path and the directory it has reached.
-    pub fn state(&self) -> (usize, u32) {
-        (self.pos, self.cur)
+    pub fn state(&self) -> (usize, u32, Hidden) {
+        (self.pos, self.cur, self.hidden)
+    }
+
+    /// Whether the lower set is hidden from the directory the outcome names (an outcome of the
+    /// layer: the directory itself and the ones above it; a miss: the directory the name is
+    /// missing from).
+    pub fn hidden(&self) -> bool {
+        self.result
     }
 
     /// Whether the path ends with a slash: the name must be a directory.
@@ -211,12 +259,17 @@ impl<'p> Walk<'p> {
 
     /// Takes at most `budget` components (`STEP`).
     pub fn advance(&mut self, index: &Index, who: Identity<'_>, budget: usize) -> Step {
+        if !self.hidden.started {
+            self.hidden.started = true;
+            self.hidden.now = index.flags(0) & OPAQUE != 0;
+        }
         for _ in 0..budget {
             // The next component: skip slashes, read the name.
             while self.pos < self.path.len() && self.path[self.pos] == b'/' {
                 self.pos += 1;
             }
             if self.pos >= self.path.len() {
+                self.result = self.hidden.now;
                 return Step::Done(Outcome::Upper(self.cur));
             }
             let start = self.pos;
@@ -241,6 +294,7 @@ impl<'p> Walk<'p> {
             }
             if name == b".." {
                 self.cur = index.parent_of(self.cur);
+                self.hidden.pop();
                 continue;
             }
             if self.cur == 0 && proto_fs::names::PASS_THROUGH.contains(&name) {
@@ -260,16 +314,25 @@ impl<'p> Walk<'p> {
                     });
                 }
                 Some((id, e)) if last => {
+                    self.result = self.hidden.now || e.flags & OPAQUE != 0;
                     return Step::Done(if e.kind == Kind::File && self.trailing_slash() {
                         Outcome::NotDir
                     } else {
                         Outcome::Upper(id)
                     });
                 }
-                Some((id, e)) if e.kind == Kind::Dir => self.cur = id,
+                Some((id, e)) if e.kind == Kind::Dir => {
+                    self.hidden.push();
+                    self.hidden.now |= e.flags & OPAQUE != 0;
+                    self.cur = id;
+                }
                 Some(_) => return Step::Done(Outcome::NotDir),
-                None if !index.lower_visible(self.cur) => return Step::Done(Outcome::Absent),
+                None if self.hidden.now => {
+                    self.result = true;
+                    return Step::Done(Outcome::Absent);
+                }
                 None => {
+                    self.result = false;
                     self.miss = (self.cur, start);
                     return Step::Done(Outcome::Lower);
                 }
@@ -346,6 +409,43 @@ mod tests {
         let mut out = [0u8; 512];
         let n = normalize(path, &mut out);
         out[..n].to_vec()
+    }
+
+    #[test]
+    fn the_hidden_bit_goes_down_with_the_walk_up_with_dots_and_across_resumed_steps() {
+        let ix = world();
+        let hidden_after = |path: &[u8], budget: usize| {
+            // One component at a time: the state a job keeps between its steps.
+            let (mut pos, mut cur, mut bits) = (0, 0, Hidden::default());
+            loop {
+                let mut w = Walk::resume(path, pos, cur, bits);
+                let step = w.advance(&ix, who(0), budget);
+                (pos, cur, bits) = w.state();
+                if let Step::Done(o) = step {
+                    return (o, w.hidden());
+                }
+            }
+        };
+        let etc = id(&ix, 0, b"etc");
+        let opaque = id(&ix, 0, b"opaque");
+        for budget in [1, 2, 8] {
+            assert_eq!(hidden_after(b"/etc/zz", budget), (Outcome::Lower, false));
+            assert_eq!(hidden_after(b"/opaque/zz", budget), (Outcome::Absent, true));
+            assert_eq!(
+                hidden_after(b"/opaque", budget),
+                (Outcome::Upper(opaque), true)
+            );
+            assert_eq!(hidden_after(b"/etc", budget), (Outcome::Upper(etc), false));
+            // Out of the opaque directory by `..`: the lower set shows through again.
+            assert_eq!(
+                hidden_after(b"/opaque/../etc/zz", budget),
+                (Outcome::Lower, false)
+            );
+            assert_eq!(
+                hidden_after(b"/etc/../opaque/zz", budget),
+                (Outcome::Absent, true)
+            );
+        }
     }
 
     #[test]
