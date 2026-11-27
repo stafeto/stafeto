@@ -256,6 +256,12 @@ impl Env<'_> {
                 frame_max_us: s.frame_max_us,
                 band_max_us: s.band_max_us,
             };
+            // The compositor tells one logged late frame per reading STATS: read
+            // once more for each further late frame, so every one is told before
+            // the phase line.
+            for _ in 1..u64::from(counters.late).min(LATE_LOG_SIZE) {
+                Self::stats(&display, false)?;
+            }
             rt::println!("{}", PhaseLine(phase, &counters));
             rt::println!("{}", HistLine(phase, &s.hist));
             rt::println!(
