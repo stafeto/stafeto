@@ -259,42 +259,86 @@ impl Default for Listing {
 }
 
 /// The descriptions of the file service that the layered root opened (`REDIRECT` of the layer
-/// service): a `stat` of one reports the layered device, as a `stat` of its path does. One bit for
-/// each number the service has (`proto_fs::OPEN_FD_MASK`); the bit goes when the description does.
-static MARKED: [core::sync::atomic::AtomicU64; 32] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 32];
-const _: () = assert!(MARKED.len() * 64 > proto_fs::OPEN_FD_MASK as usize);
+/// service): a `stat` of one reports the layered device, as a `stat` of its path does. The place of
+/// each number the service has (`proto_fs::OPEN_FD_MASK`) holds the generation of the description
+/// marked there, 0 for none: a number the service gives again to another description has another
+/// generation, so a mark that outlives its description marks nothing.
+static MARKED: [core::sync::atomic::AtomicU64; proto_fs::OPEN_FD_MASK as usize + 1] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; proto_fs::OPEN_FD_MASK as usize + 1];
 
-fn bit(fd: u32) -> (usize, u64) {
-    let fd = (fd & proto_fs::OPEN_FD_MASK) as usize;
-    (fd / 64, 1 << (fd % 64))
+fn place(fd: u32) -> &'static core::sync::atomic::AtomicU64 {
+    &MARKED[(fd & proto_fs::OPEN_FD_MASK) as usize]
 }
 
-/// The description `fd` of the file service is one of the layered root.
-pub fn mark_ram(fd: u32) {
-    let (word, mask) = bit(fd);
-    MARKED[word].fetch_or(mask, core::sync::atomic::Ordering::AcqRel);
+/// The description `fd` of the file service, of this `generation`, is one of the layered root.
+pub fn mark_ram(fd: u32, generation: u64) {
+    place(fd).store(generation, core::sync::atomic::Ordering::Release);
 }
 
-/// The description `fd` of the file service is gone (or was never the layered root's).
+/// The description `fd` of the file service is gone.
 pub fn unmark_ram(fd: u32) {
-    let (word, mask) = bit(fd);
-    MARKED[word].fetch_and(!mask, core::sync::atomic::Ordering::AcqRel);
+    place(fd).store(0, core::sync::atomic::Ordering::Release);
 }
 
-/// Whether the description `fd` of the file service is one of the layered root.
-pub fn is_marked_ram(fd: u32) -> bool {
-    let (word, mask) = bit(fd);
-    MARKED[word].load(core::sync::atomic::Ordering::Acquire) & mask != 0
+/// Whether the description `fd` of this `generation` is one of the layered root.
+pub fn is_marked_ram(fd: u32, generation: u64) -> bool {
+    generation != 0 && place(fd).load(core::sync::atomic::Ordering::Acquire) == generation
+}
+
+/// The descriptions of the data file service that the layered root adopted (the pass of a file of a
+/// layer of the user): a `stat` of one reports the layered device, as a `stat` of its path does.
+/// Their handles are kept as handle plus one (0 is a free place), `MARKED_DATA` at most; a handle
+/// that finds no place keeps the device of the data file service. A mark goes with the description,
+/// but does not cross an exec (the loader's word of `Names::Data` has no room for it).
+const MARKED_DATA: usize = 64;
+static DATA_MARKS: [core::sync::atomic::AtomicU64; MARKED_DATA] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MARKED_DATA];
+
+/// The description `handle` of the data file service is one of the layered root: false when the
+/// table of marks is full.
+pub fn mark_data(handle: u32) -> bool {
+    let want = u64::from(handle) + 1;
+    DATA_MARKS.iter().any(|slot| {
+        slot.compare_exchange(
+            0,
+            want,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+            || slot.load(core::sync::atomic::Ordering::Acquire) == want
+    })
+}
+
+/// The description `handle` of the data file service is gone.
+pub fn unmark_data(handle: u32) {
+    let want = u64::from(handle) + 1;
+    for slot in &DATA_MARKS {
+        let _ = slot.compare_exchange(
+            want,
+            0,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        );
+    }
+}
+
+/// Whether the description `handle` of the data file service is one of the layered root.
+pub fn is_marked_data(handle: u32) -> bool {
+    let want = u64::from(handle) + 1;
+    DATA_MARKS
+        .iter()
+        .any(|slot| slot.load(core::sync::atomic::Ordering::Acquire) == want)
 }
 
 /// The bit that marks a number of the file service in the word of `Names::File` an exec carries:
 /// the numbers have eleven bits, and the loader passes the word as it is.
 pub const MARK_WORD: u32 = 1 << 30;
 
-/// The word of `Names::File` for the description `fd`, with the mark of the layered root.
-pub fn mark_word(fd: u32) -> u32 {
-    if is_marked_ram(fd) {
+/// The word of `Names::File` for the description `fd` of this `generation`, with the mark of the
+/// layered root when it has one.
+pub fn mark_word(fd: u32, generation: u64) -> u32 {
+    if is_marked_ram(fd, generation) {
         fd | MARK_WORD
     } else {
         fd
@@ -550,23 +594,52 @@ mod tests {
     }
 
     #[test]
-    fn the_mark_of_a_description_of_the_file_service_lives_until_it_closes() {
+    fn the_mark_of_a_description_of_the_file_service_is_of_its_generation() {
         // Numbers the other tests of this process do not use.
         let (a, b) = (1500, 1501);
-        assert!(!is_marked_ram(a));
-        mark_ram(a);
-        assert!(is_marked_ram(a) && !is_marked_ram(b));
-        assert_eq!(mark_word(a), a | MARK_WORD);
-        assert_eq!(mark_word(b), b);
+        assert!(!is_marked_ram(a, 7));
+        mark_ram(a, 7);
+        assert!(is_marked_ram(a, 7) && !is_marked_ram(b, 7));
+        // The number given again to another description has another generation: no mark.
+        assert!(!is_marked_ram(a, 8) && !is_marked_ram(a, 0));
+        assert_eq!(mark_word(a, 7), a | MARK_WORD);
+        assert_eq!(mark_word(a, 8), a);
+        assert_eq!(mark_word(b, 7), b);
         assert_eq!(unmark_word(a | MARK_WORD), (a, true));
         assert_eq!(unmark_word(b), (b, false));
         unmark_ram(a);
-        assert!(!is_marked_ram(a));
+        assert!(!is_marked_ram(a, 7));
         // The numbers of the service have eleven bits: the mark bit is clear in every one.
         assert_eq!(proto_fs::OPEN_FD_MASK & MARK_WORD, 0);
-        mark_ram(2047);
-        assert!(is_marked_ram(2047));
+        mark_ram(2047, 3);
+        assert!(is_marked_ram(2047, 3));
         unmark_ram(2047);
+    }
+
+    #[test]
+    fn the_mark_of_an_adopted_description_goes_with_it_and_the_table_is_bounded() {
+        let base = 0x7000_0000;
+        assert!(!is_marked_data(base));
+        assert!(mark_data(base));
+        // Marked twice is one place.
+        assert!(mark_data(base));
+        assert!(is_marked_data(base) && !is_marked_data(base + 1));
+        unmark_data(base);
+        assert!(!is_marked_data(base));
+        // A full table refuses the next handle, and a place freed takes it.
+        for i in 0..MARKED_DATA as u32 {
+            assert!(mark_data(base + i));
+        }
+        assert!(!mark_data(base + MARKED_DATA as u32));
+        unmark_data(base + 3);
+        assert!(mark_data(base + MARKED_DATA as u32));
+        for i in 0..=MARKED_DATA as u32 {
+            unmark_data(base + i);
+        }
+        assert!(!is_marked_data(base + 1));
+        // The handle 0 is a handle like another.
+        assert!(mark_data(0) && is_marked_data(0));
+        unmark_data(0);
     }
 
     #[test]

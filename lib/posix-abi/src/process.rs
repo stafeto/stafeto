@@ -1148,7 +1148,9 @@ impl Shadow {
                     posix_fs::Target::Error => Names::Error,
                     // The mark of a description of the layered root rides in the word, so that
                     // the new image reports the same `st_dev`.
-                    posix_fs::Target::Ram(n) => Names::File(posix_fs::layer::mark_word(n.fd())),
+                    posix_fs::Target::Ram(n) => {
+                        Names::File(posix_fs::layer::mark_word(n.fd(), n.generation()))
+                    }
                     posix_fs::Target::Pipe(n) => Names::Pipe(n),
                     posix_fs::Target::Net(n) => Names::Net {
                         description: n.description,

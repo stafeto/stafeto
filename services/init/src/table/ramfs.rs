@@ -1410,6 +1410,39 @@ pub const LAYER_NAMES_TABLE: &[Record] = &[
     super::entropy::ENTROPY,
 ];
 
+/// The probe of the POSIX layer on the layered root (tests/layer-posix): the tables of the names
+/// probe with a POSIX process of the root that waits for the layer service and reaches every path of
+/// the root through it (the layer takes the sessions at its first call). The probe starts its own
+/// file for fork, spawn and exec, and a set-ID variant. The volume is made offline
+/// (`data_image::make_layer_posix_volume`).
+pub const LAYER_POSIX_TABLE: &[Record] = &[
+    RAM_FIFO_CLOCKED,
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 10 * PROCS_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    super::pkg::BLK_DATADISK,
+    super::pkg::DATAFS_CLOCKED,
+    super::pkg::LAYERD,
+    Record {
+        name: "layer-posix",
+        program: "layer-posix",
+        args: b"layer-posix\0",
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
+        root: true,
+        quota: PROCS_QUOTA,
+        waits: &[super::Wait {
+            service: "layerd",
+            deadline_ms: 30_000,
+        }],
+        ..POSIX
+    },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
+];
+
 /// The probe of the screen and the keys on libc.so (tests/display-run and
 /// tests/posix-so/dyn/display-probe.c, sub-project 3 part 3b): the RAM
 /// files, the process and clock services, the pipe service, the input

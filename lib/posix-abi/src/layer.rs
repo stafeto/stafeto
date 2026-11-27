@@ -450,6 +450,11 @@ fn base_path(dirfd: c_int) -> Result<Option<pure::DirPath>, i32> {
 /// `dirfd` when that is a description of the service or a directory of the file service outside
 /// the pass-through names. None for any other path, in a build with no layer service too.
 pub fn route(dirfd: c_int, path: &[u8]) -> Result<Option<Abs>, i32> {
+    // The break: no path goes to the layer service, and the file service answers them all as it
+    // would in an image with no layers (`cargo xtask layer-posix breaks`).
+    if cfg!(feature = "break-layer-route") {
+        return Ok(None);
+    }
     if path.is_empty() || path.len() > crate::names::MAX_PATH {
         return Ok(None);
     }
@@ -725,7 +730,12 @@ pub fn open(abs: &Abs, flags: c_int, mode: u32, umask: u32) -> Result<c_int, i32
     match n::OpenAnswer::read(got.raw.bytes()).map_err(|_| EIO)? {
         n::OpenAnswer::Pass => {
             let pass = got.handle.ok_or(EIO)?;
-            crate::data::adopt(pass, flags & O_CLOEXEC != 0)
+            let fd = crate::data::adopt(pass, flags & O_CLOEXEC != 0)?;
+            // The file is of the root's device (`fstat` of it says so, as `stat` of its path).
+            if let Some(data) = crate::data::data_target(fd) {
+                pure::mark_data(data.handle);
+            }
+            Ok(fd)
         }
         n::OpenAnswer::Directory { handle } => {
             let target = LayerTarget { handle };
@@ -748,7 +758,15 @@ fn mark(fd: c_int) {
     if let Ok(Target::Ram(ram) | Target::Random(ram)) =
         crate::shared::with_fd(fd, |files| files.target(fd).map_err(crate::error))
     {
-        pure::mark_ram(ram.fd());
+        pure::mark_ram(ram.fd(), ram.generation());
+    }
+}
+
+/// A new image's descriptors `fds` came with the mark of the layered root (the word of
+/// `Names::File`): the descriptions they name are marked, with the generation they have here.
+pub fn mark_inherited(fds: &[u32]) {
+    for &fd in fds {
+        mark(fd as c_int);
     }
 }
 
@@ -800,8 +818,11 @@ pub fn fstat(handle: u32) -> Result<proto_fs::NodeInfo, i32> {
 /// the number of entries given before, 0 for `rewinddir`, or SEEK_CUR 0 to read it).
 pub fn seek(target: LayerTarget, offset: i64, whence: i32) -> Result<u64, i32> {
     match (whence, offset) {
+        // An explicit seek (`rewinddir`, `seekdir`) asks the service even when the layer's count
+        // stands where it is told to go: the position is the description's, which another holder
+        // of it may have moved.
         (0, at) if at >= 0 => {
-            position_listing(target.handle, at.cast_unsigned())?;
+            position_listing(target.handle, at.cast_unsigned(), true)?;
             Ok(at.cast_unsigned())
         }
         (1, 0) => Ok(DIRS.index_of(target.handle).unwrap_or(0)),
@@ -922,7 +943,7 @@ impl Dirs {
 /// the listing again (REWIND) and reads on to it. The first entry that does not fit is put back.
 pub fn entries(handle: u32, out: &mut [u8], position: Option<u64>) -> Result<usize, i32> {
     let standing = DIRS.index_of(handle);
-    position_listing(handle, position.or(standing).unwrap_or(0))?;
+    position_listing(handle, position.or(standing).unwrap_or(0), false)?;
     posix_change::dirent::fill(
         out,
         |name| {
@@ -946,11 +967,11 @@ pub fn entries(handle: u32, out: &mut [u8], position: Option<u64>) -> Result<usi
     )
 }
 
-/// The listing of `handle` stands at entry `want`: as it is when it stands there already, or
-/// started over (REWIND) and read on to the entry.
-fn position_listing(handle: u32, want: u64) -> Result<(), i32> {
+/// The listing of `handle` stands at entry `want`: as it is when it stands there already (unless
+/// `force`), or started over (REWIND) and read on to the entry.
+fn position_listing(handle: u32, want: u64, force: bool) -> Result<(), i32> {
     let standing = DIRS.index_of(handle);
-    if standing == Some(want) || (standing.is_none() && want == 0) {
+    if !force && (standing == Some(want) || (standing.is_none() && want == 0)) {
         return Ok(());
     }
     let mut w = Writer::new();
@@ -994,7 +1015,8 @@ fn next_entry(handle: u32) -> Result<Option<pure::Entry>, i32> {
 pub fn clone_for_child(
     held: impl IntoIterator<Item = pure::Held>,
 ) -> Result<Option<Handle<Channel>>, i32> {
-    if session().is_none() {
+    // The break: a child gets no session, so the descriptions it inherits answer nothing.
+    if session().is_none() || cfg!(feature = "break-layer-clone") {
         return Ok(None);
     }
     let plan = pure::clone_plan(held);

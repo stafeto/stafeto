@@ -1694,6 +1694,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-display") as usize
     + cfg!(feature = "table-data-posix") as usize
     + cfg!(feature = "table-layer-names") as usize
+    + cfg!(feature = "table-layer-posix") as usize
     + cfg!(feature = "table-posix-window") as usize
     + cfg!(feature = "table-wfc") as usize
     + cfg!(feature = "table-wfc-steps") as usize
@@ -1812,6 +1813,7 @@ const _: () = assert!(
     feature = "table-posix-display",
     feature = "table-data-posix",
     feature = "table-layer-names",
+    feature = "table-layer-posix",
     feature = "table-posix-window",
     feature = "table-wfc",
     feature = "table-wfc-steps",
@@ -2037,6 +2039,8 @@ pub const TABLE: &[Record] = ramfs::POSIX_DISPLAY_TABLE;
 pub const TABLE: &[Record] = ramfs::DATA_POSIX_TABLE;
 #[cfg(feature = "table-layer-names")]
 pub const TABLE: &[Record] = ramfs::LAYER_NAMES_TABLE;
+#[cfg(feature = "table-layer-posix")]
+pub const TABLE: &[Record] = ramfs::LAYER_POSIX_TABLE;
 #[cfg(feature = "table-posix-window")]
 pub const TABLE: &[Record] = window::TABLE;
 #[cfg(feature = "table-wfc")]
@@ -2147,6 +2151,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     ramfs::POSIX_DISPLAY_TABLE,
     ramfs::DATA_POSIX_TABLE,
     ramfs::LAYER_NAMES_TABLE,
+    ramfs::LAYER_POSIX_TABLE,
     ramfs::DISPLAY_TABLE,
     ramfs::LOADER_CHANNELS_TABLE,
     ramfs::POSIX_POLL_TABLE,
@@ -2197,7 +2202,9 @@ mod tests {
     fn the_layered_argument_goes_with_the_layer_service() {
         assert_eq!(
             RAM_LAYERED_FIRST,
-            [RAM_MOUNT_FIRST, proto_fs::RAM_LAYERED_ARG, b" "].concat().as_slice()
+            [RAM_MOUNT_FIRST, proto_fs::RAM_LAYERED_ARG, b" "]
+                .concat()
+                .as_slice()
         );
         let mut layered = 0;
         for table in all_tables() {

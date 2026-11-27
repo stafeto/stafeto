@@ -23,6 +23,11 @@ data = ["dep:proto-data"]
 # passes and the redirects to `/data`. libc.so does not have it until the shell image takes it; a
 # static program has it when it asks.
 layer = ["data"]
+# Deliberate breakage (cargo xtask layer-posix breaks): no path is routed to the layer service.
+break-layer-route = ["layer"]
+# Deliberate breakage (cargo xtask layer-posix breaks): a fork or a spawn gives the child no session
+# with the layer service, so the directory descriptions it inherits answer nothing.
+break-layer-clone = ["layer"]
 # Read-only resident named-open witness, absent from shipped builds.
 fifo-probe = []
 # threads::set_level, the levels of rtbench 2's threads (tests/rtbench-posix).

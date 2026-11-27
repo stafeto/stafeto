@@ -305,7 +305,13 @@ pub(crate) fn descriptor_information(
         return crate::procfs::description_stat(id);
     }
     if let Target::Data(data) = target {
-        return crate::data::fstat(data.handle);
+        let info = crate::data::fstat(data.handle)?;
+        // A file of a layer of the user that the layered root passed is of the root's device.
+        return Ok(if posix_fs::layer::is_marked_data(data.handle) {
+            posix_fs::layer::stamp(info)
+        } else {
+            info
+        });
     }
     if let Target::Layer(layer) = target {
         return crate::layer::fstat(layer.handle);
@@ -316,7 +322,7 @@ pub(crate) fn descriptor_information(
     // A description the layered root opened (a lower file) is of the root's one device, as its
     // path is.
     Ok(match target {
-        Target::Ram(ram) if posix_fs::layer::is_marked_ram(ram.fd()) => {
+        Target::Ram(ram) if posix_fs::layer::is_marked_ram(ram.fd(), ram.generation()) => {
             posix_fs::layer::stamp(info)
         }
         _ => info,

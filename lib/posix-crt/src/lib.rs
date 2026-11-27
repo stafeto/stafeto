@@ -318,6 +318,34 @@ pub unsafe extern "C" fn stafeto_start_handles(out: *mut u64) {
     }
 }
 
+/// The numbers of the descriptors the start area names whose descriptions the layered root opened
+/// (the mark in the word of `Names::File`), and how many.
+fn layered_marks(area: &proto_loader::Start) -> ([u32; proto_loader::DESCRIPTORS], usize) {
+    use proto_loader::{DESCRIPTOR, DESCRIPTORS, Descriptor, Names};
+    let mut out = [0; DESCRIPTORS];
+    let mut found = 0;
+    let count = (area.descriptor_count as usize).min(DESCRIPTORS);
+    // SAFETY: the loader wrote `count` descriptors at `descriptors` in the area, which stays
+    // mapped.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(area.descriptors as *const u8, count * DESCRIPTOR) };
+    for d in bytes
+        .as_chunks::<DESCRIPTOR>()
+        .0
+        .iter()
+        .filter_map(|c| Descriptor::read(c))
+    {
+        if let Names::File(n) = d.names
+            && posix_fs::layer::unmark_word(n).1
+            && found < DESCRIPTORS
+        {
+            out[found] = d.fd;
+            found += 1;
+        }
+    }
+    (out, found)
+}
+
 /// The descriptors the start area names (proto_loader::Descriptor), as
 /// the layer's files take them.
 fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::DESCRIPTORS] {
@@ -343,17 +371,12 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
             Names::Input => InheritedTarget::Ready(Target::Input),
             Names::Output => InheritedTarget::Ready(Target::Output),
             Names::Error => InheritedTarget::Ready(Target::Error),
-            Names::File(n) => {
-                // A description the layered root opened carries its mark in the word.
-                let (fd, layered) = posix_fs::layer::unmark_word(n);
-                if layered {
-                    posix_fs::layer::mark_ram(fd);
-                }
-                InheritedTarget::RawRam {
-                    fd,
-                    random_hint: false,
-                }
-            }
+            // A description the layered root opened carries its mark in the word (`layered_marks`
+            // applies it once the descriptions are known).
+            Names::File(n) => InheritedTarget::RawRam {
+                fd: posix_fs::layer::unmark_word(n).0,
+                random_hint: false,
+            },
             Names::Pipe(n) => InheritedTarget::Ready(Target::Pipe(n)),
             Names::Net {
                 description,
@@ -572,6 +595,9 @@ fn loaded_main() -> u64 {
     // service's root (the genuine one passes with its descriptions, a forged one leaves the slot
     // empty); the service checks the identity only through the process service. SAFETY: as above.
     unsafe { posix_abi::layer::init(one(Slot::Layer).map(Handle::from_raw)) };
+    // The descriptions the layered root opened, which this image inherited, report its device.
+    let (marked, count) = layered_marks(&area);
+    posix_abi::layer::mark_inherited(&marked[..count]);
     posix_abi::fork::at_child(forked);
     // SAFETY: the platform's umask takes any mask.
     unsafe { stafeto_umask(area.umask) };

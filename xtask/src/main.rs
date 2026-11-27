@@ -92,6 +92,7 @@ mod jobs;
 mod kernel_size;
 mod keys;
 mod layer_names;
+mod layer_posix;
 mod layer_probe;
 mod linux_guest;
 mod log_quiet;
@@ -2595,6 +2596,7 @@ commands:
   posix-random-net-two the same with two stack instances of the network service on two CPUs: a socket homed on the second instance survives
   posix-random-net-two-steps the same under -icount, the steps of both instances
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
+  layer-posix run the C probe of the POSIX layer on the layered root (open, read, stat, readdir, chdir, openat, fork, spawn and exec of the descriptions of the layer service, the rights of another user, EROFS for writes, the session in the slot of a set-ID program) over the layer service on a volume made offline, in QEMU; with the argument breaks: the probe built with each deliberate break of the layer (no path routed to the service, no session for a child), which it must catch
   layer-names-probe run the probe of the names of the layered root (a POSIX program of the root that speaks to the layer service directly: TakeRoot, SESSION, redirects of lower names, the pass of a file of the layer and its bytes, merged listings, marks of deletion, an opaque directory, the numbers of stat, EACCES for another user and EROFS) over a volume made offline, in QEMU; with the argument breaks: the same against the layer service built with each deliberate break, which it must catch; with the argument steps: under -icount on one CPU with the steps of the service told
   data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU; with an argument: write, cap, full, restart, throughput, fast (64 MiB through the window against the bounds of the plan), atomic (atomicity, lease, signals, fork, restart of the large calls), steps (the service's steps and the CPU time of its parts under -icount, on one CPU and on two), atomic-break FEATURE (the atomic probe on a service with a deliberate break, which it must catch)
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
@@ -3042,6 +3044,7 @@ fn main() {
         Some("posix-display") => posix_display::probe(&qemu::VIRT),
         Some("data-posix") => data_posix::command(&args[1..], &qemu::VIRT),
         Some("layer-names-probe") => layer_names::command(&args[1..], &qemu::VIRT),
+        Some("layer-posix") => layer_posix::command(&args[1..], &qemu::VIRT),
         Some("posix-window") => posix_window::probe(&qemu::VIRT),
         Some("wfc-probe") => wfc::command(&args[1..], &qemu::VIRT),
         Some("wfd-probe") => wfd::probe(&qemu::VIRT),
@@ -11397,6 +11400,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("layer-names-probe breaks", || {
             layer_names::breaks(&qemu::VIRT)
         }),
+        // The POSIX layer on the layered root: the paths, descriptions, fork, spawn and exec, the
+        // rights, the refusals of writes and the session in the slot of a set-ID program.
+        job("layer-posix", || layer_posix::probe(&qemu::VIRT)),
+        job("layer-posix breaks", || layer_posix::breaks(&qemu::VIRT)),
         job("vi-dialog", vi_dialog::vi_dialog),
         // The window library of C programs against QEMU's screenshots.
         job("posix-window", || posix_window::probe(&qemu::VIRT)),
@@ -15166,6 +15173,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "posix-data-probe",
         "--package",
+        "layer-posix-probe",
+        "--package",
         "posix-window-probe",
         "--package",
         "wfd-demo",
@@ -17973,6 +17982,10 @@ mod entropy_in_images_tests {
             (
                 "layer_names::programs",
                 Box::leak(crate::layer_names::plain_programs().into_boxed_slice()),
+            ),
+            (
+                "layer_posix::programs",
+                Box::leak(crate::layer_posix::plain_programs().into_boxed_slice()),
             ),
             ("posix_window::PROGRAMS", &crate::posix_window::PROGRAMS),
             ("cxx_probe::PROGRAMS", &crate::cxx_probe::PROGRAMS),

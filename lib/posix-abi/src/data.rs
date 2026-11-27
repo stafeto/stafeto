@@ -852,6 +852,7 @@ fn insert_description(target: DataTarget, flags: c_int) -> Result<c_int, i32> {
 /// a service that went has closed what the session held.
 pub fn close_description(handle: u32) {
     LISTINGS.forget(handle);
+    posix_fs::layer::unmark_data(handle);
     // A process with no session (the old one died with its instance) holds nothing the service
     // knows: the close succeeds with no call, and no session is taken for it.
     let mut w = Writer::new();
