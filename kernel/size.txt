@@ -4,4 +4,4 @@
 # build` and the host test `kernel_size_record` print the difference from
 # these numbers. When the growth is intended, set the line to the size that
 # the build prints.
-stafeto 311360
+stafeto 217093

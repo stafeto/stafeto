@@ -28,7 +28,7 @@ is never writable and executable at once, and long operations run in
 bounded portions. Device interrupts reach drivers as notifications, and
 a driver gets contiguous, optionally uncached memory for DMA. The kernel
 drives no device with DMA. A fault ends only its own process. The kernel
-image is 311,360 bytes, as measured by `cargo xtask kernel-size`; it has no size
+image is 217,093 bytes, as measured by `cargo xtask kernel-size`; it has no size
 limit. `cargo xtask build` prints the size and its difference from the record
 in `kernel/size.txt`, and fails on a growth of more than 4 KiB.
 The longest stretch the kernel runs without taking an interrupt (term B of the
