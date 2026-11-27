@@ -64,7 +64,7 @@ SOURCES = [
     "pixman-bits-image", "pixman-combine32",
     "pixman-conical-gradient", "pixman-edge", "pixman-edge-accessors",
     "pixman-fast-path", "pixman-filter", "pixman-glyph", "pixman-general",
-    "pixman-gradient-walker", "pixman-image", "pixman-implementation",
+    "pixman-gradient-walker", "pixman-image",
     "pixman-linear-gradient", "pixman-matrix", "pixman-mips", "pixman-noop",
     "pixman-ppc", "pixman-radial-gradient", "pixman-region16",
     "pixman-region32", "pixman-region64f", "pixman-riscv",
@@ -161,8 +161,13 @@ def main() -> None:
             obj = WORK / "obj" / f"{name}.o"
             run(log, *cc, "-c", source / "pixman" / f"{name}.S", "-o", obj)
             objects.append(obj)
+    # pixman-implementation.c through ports/pixman/implementation.c: its one cache
+    # of the fast paths found is the calling thread's (shim.c, pxs_cache).
+    obj = WORK / "obj" / "pixman-implementation.o"
+    run(log, *cc, f"-I{PORT}", "-c", PORT / "implementation.c", "-o", obj)
+    objects.append(obj)
     shim = WORK / "obj" / "shim.o"
-    run(log, *cc, "-fno-builtin", "-fno-math-errno", "-c", PORT / "shim.c", "-o", shim)
+    run(log, *cc, f"-I{PORT}", "-fno-builtin", "-fno-math-errno", "-c", PORT / "shim.c", "-o", shim)
     objects.append(shim)
     OUTPUT.unlink(missing_ok=True)
     run(log, ar, "rcs", OUTPUT, *objects)

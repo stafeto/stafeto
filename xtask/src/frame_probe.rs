@@ -327,6 +327,122 @@ pub fn frame_cap_bands() -> u32 {
     band_cap(DEFAULT_PERIOD_NS, DEFAULT_CAP_PPM)
 }
 
+/// The bound of the latency from a post to its prepared image ready (`compositor::prep`), in
+/// ticks, for a transform of kind `kind` (a row of `compositor::PRICES`) into an image of `w`
+/// by `h` points, made by the worker at `level`. It is a model bound (the response time by the
+/// formula of the frame over the prices of the model), not a measure. The terms:
+///
+/// - the worker's own work: its pieces of `compositor::prep::PIECE_POINTS` points (whole lines),
+///   a call of pixman each at the model's price, with the loss of the cache of paths once;
+/// - `B_worker`, the blocking by a pass of a lower level that is in its piece when the post comes:
+///   the longest piece of the dearest kind (the nearest point or the bilinear mean, copied);
+/// - the passes of the other slots at or above `level` that come first (`others`: kind and size
+///   of each), each its whole work;
+/// - the wake path of the post (the round trip of the request and the longest path of the kernel
+///   that is not preempted) and the step of the service that was running when it came;
+/// - the sources above the worker: the compositor itself, which makes `bands` bands of at most their
+///   gate in every period (the bands of the scene's frame, or at most the cap's `frame_cap_bands`),
+///   and, with `loaded`, the budgets on CPU 0 of the services of the table above `level` with
+///   their signs of life. The worker's own time is outside the budgets of the clients: it runs at
+///   the poster's level on the service's own account, not on the poster's budget.
+///
+/// None when a kind has no price or the shares leave the worker no CPU (the iteration does not
+/// settle).
+pub fn image_latency_bound(
+    level: u8,
+    kind: &str,
+    (w, h): (u32, u32),
+    others: &[(&str, u32, u32)],
+    bands: u64,
+    loaded: bool,
+) -> Option<u64> {
+    use compositor::frame::DEFAULT_PERIOD_NS;
+    use compositor::prep::piece_rows;
+    let work = |kind: &str, w: u32, h: u32| -> Option<u64> {
+        let mut own = u64::from(compositor::kind_miss_ticks(kind)?);
+        let mut y = 0;
+        while y < h {
+            let rows = piece_rows(w).min(h - y);
+            own += compositor::kind_model_ticks(kind, w, rows)?;
+            y += rows;
+        }
+        Some(own)
+    };
+    let mut own = work(kind, w, h)?;
+    for (k, ow, oh) in others {
+        own += work(k, *ow, *oh)?;
+    }
+    let piece = |kind: &str| compositor::kind_model_ticks(kind, w, piece_rows(w)).unwrap_or(0);
+    own += piece("scale-nearest-copy").max(piece("scale-bilinear-copy"));
+    let above = |r: &&init::table::Record| {
+        loaded && matches!(r.kind, Kind::Service(_)) && r.priority > level
+    };
+    let signs: u64 = TABLE
+        .iter()
+        .filter(above)
+        .map(|r| if r.budgets.is_empty() { 8_000 } else { 2_400 })
+        .sum();
+    own += C_IPC + KERNEL + STEP + signs;
+    let period = ticks_of(DEFAULT_PERIOD_NS);
+    let mut sources = vec![Source {
+        budget: bands * BAND,
+        period,
+        step: BAND,
+        wakes: 1,
+    }];
+    sources.extend(
+        TABLE
+            .iter()
+            .filter(above)
+            .filter(|r| r.program != "compositor")
+            .flat_map(|r| r.budgets.iter().map(move |b| (r, b)))
+            .filter(|(_, b)| b.cpu == 0)
+            .map(|(r, b)| Source {
+                budget: ticks_of(b.c_ns),
+                period: ticks_of(b.t_ns),
+                step: if b.low >= level { STEP } else { 0 },
+                wakes: wakes(r, b),
+            }),
+    );
+    bound(own, &sources, EVENTS, LIMIT)
+}
+
+/// The service's own steps that prepared images add to the work of a frame's period, ticks: each
+/// image the worker publishes is one step of the service (PREP: the raster wraps the image and
+/// the screen is damaged), and the end of the frame that frees buffers and lets go of the images
+/// is another (`Scene::end`, counted in the `2 * STEP` of the frame already). The terms of a row
+/// that has `images` published in the period are `own(row) + prep_steps(images)`; the rows P, D
+/// and F, which have none, are as they were.
+pub fn prep_steps(images: u64) -> u64 {
+    images * STEP
+}
+
+/// The model bounds of the prepared images, as the report tells them (a model, not a measure): the
+/// latency from a post to the image of the cube's element ready at level 28, with the bands of the
+/// scene P in each period and no load, with another slot ahead, at the cap of the frame and with
+/// the loads; and the step a published image adds to the work of a period.
+pub fn image_model_report() -> String {
+    let kind = "scale-nearest-copy";
+    let p = p_bands();
+    let cap = u64::from(frame_cap_bands());
+    let ticks = |bound: Option<u64>| bound.map_or("none".to_owned(), |t| t.to_string());
+    format!(
+        "frame-probe: prepared images, model bounds (not measures), ticks of 16 ns: post to image at level 28 (80 by 80, scene P bands {p}): {}, behind another slot {}, at the cap of {cap} bands {}, with the loads {}; a published image adds {} ticks to the work of a period",
+        ticks(image_latency_bound(28, kind, (80, 80), &[], p, false)),
+        ticks(image_latency_bound(
+            28,
+            kind,
+            (80, 80),
+            &[(kind, 80, 80)],
+            p,
+            false
+        )),
+        ticks(image_latency_bound(28, kind, (80, 80), &[], cap, false)),
+        ticks(image_latency_bound(28, kind, (80, 80), &[], p, true)),
+        prep_steps(1),
+    )
+}
+
 /// The rows of the table of bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Row {
@@ -499,14 +615,15 @@ fn late_lines(lines: &[String], phase: Phase) -> Vec<LateLine> {
         .collect()
 }
 
-/// Whether the one late frame of a phase is excused: the wait for the emulated device is the
+/// Whether the late frames of a phase (one or two) are excused: the wait for the emulated device is the
 /// host's (QEMU serves the display device on its main loop thread, so on a loaded host the
 /// wait counts the instructions that pass until that thread has run), and the rest of the
 /// frame is inside the analysis. Ok(false) is no late frame. Ok(true) holds only when the
-/// phase has the CPU load, the one late frame is told as the device's, take and compose are
+/// phase has the CPU load, every late frame is told as the device's, take and compose are
 /// under the bound less the kernel path, the driver and a step, the periods skipped are the
-/// ones that frame covers, the window was late or missed once at most, as the late frame's
-/// length explains (frames between 2T - POST_US and 2T accept either outcome), and no step of
+/// ones those frames cover, the window was late or missed once for each at most, as the frames'
+/// lengths explain (a frame that shows by 2T may make it late, a longer one may make it miss),
+/// and no step of
 /// the display driver was longer than its term.
 fn host_late(
     lines: &[String],
@@ -523,31 +640,47 @@ fn host_late(
         return no("no excuse in a phase with no load".to_owned());
     }
     let told = late_lines(lines, phase);
-    let (1, [late]) = (p.late, told.as_slice()) else {
+    if told.len() as u64 != p.late {
         return no(format!(
-            "{} late frames and {} told: only one told frame is excused",
+            "{} late frames and {} told: only the told frames are excused",
             p.late,
             told.len()
         ));
-    };
-    if late.cause != "device" {
-        return no(format!("the longest phase is the {}'s", late.cause));
+    }
+    if p.late > 2 {
+        return no(format!("{} late frames: at most 2 are excused", p.late));
     }
     let limit = us(bound.saturating_sub(KERNEL + DRIVER + STEP));
-    if late.take_us + late.compose_us > limit {
-        return no(format!(
-            "take {} us and compose {} us over {limit} us of the bound",
-            late.take_us, late.compose_us
-        ));
+    let mut periods = 0;
+    let (mut a, mut b) = (0, 0);
+    for late in &told {
+        if late.cause != "device" {
+            return no(format!("the longest phase is the {}'s", late.cause));
+        }
+        if late.take_us + late.compose_us > limit {
+            return no(format!(
+                "take {} us and compose {} us over {limit} us of the bound",
+                late.take_us, late.compose_us
+            ));
+        }
+        periods += (late.frame_us / PERIOD_US).saturating_sub(1);
+        if late.frame_us + POST_US <= 2 * PERIOD_US {
+            a += 1;
+        } else {
+            b += 1;
+        }
     }
-    let periods = (late.frame_us / PERIOD_US).saturating_sub(1);
     if p.skipped > periods {
         return no(format!(
-            "skipped {} over the {periods} the frame of {} us covers",
-            p.skipped, late.frame_us
+            "skipped {} over the {periods} the frames of {} us cover",
+            p.skipped,
+            told.iter()
+                .map(|l| l.frame_us.to_string())
+                .collect::<Vec<_>>()
+                .join(" and ")
         ));
     }
-    if wlate + wmissed > 1 {
+    if wlate + wmissed > p.late {
         return no(format!("the window late {wlate} missed {wmissed}"));
     }
     if wtaken != p.frames {
@@ -556,17 +689,14 @@ fn host_late(
             p.frames
         ));
     }
-    let shown = late.frame_us + POST_US;
-    if wlate == 1 && shown > 2 * PERIOD_US {
+    if wlate > a {
         return no(format!(
-            "the window late with a frame of {} us: the lateness is the window's own",
-            late.frame_us
+            "the window late {wlate} with {a} frames that can explain it: the lateness is the window's own"
         ));
     }
-    if wmissed == 1 && shown <= 2 * PERIOD_US {
+    if wmissed > b {
         return no(format!(
-            "the window missed with a frame of {} us: the buffer came back in time for the post",
-            late.frame_us
+            "the window missed {wmissed} with {b} frames long enough: the buffer came back in time for the post"
         ));
     }
     let driver = crate::longest_steps(lines, crate::comp_probe::DRIVER_TAG);
@@ -583,10 +713,14 @@ fn host_late(
 
 /// The words of a phase's report for its late frame, when one is excused.
 fn excused_report(lines: &[String], phase: Phase) -> String {
-    let frame = late_lines(lines, phase).first().map_or(0, |l| l.frame_us);
+    let frames: Vec<String> = late_lines(lines, phase)
+        .iter()
+        .map(|l| ms(l.frame_us))
+        .collect();
     format!(
-        "late 1 (the device's, {} ms: emulator main loop, excused)",
-        ms(frame)
+        "late {} (the device's, {} ms: emulator main loop, excused)",
+        frames.len(),
+        frames.join(" and ")
     )
 }
 
@@ -1066,6 +1200,9 @@ pub fn probe(args: &[String]) -> Result<(), String> {
         let steps = steps_verdict(&lines).map_err(|e| format!("frame-probe: {e}"))?;
         println!("frame-probe: the longest steps, ticks: {steps}");
     }
+    if timed {
+        println!("{}", image_model_report());
+    }
     println!(
         "frame-probe on {}: {} phases judged{}",
         crate::qemu::VIRT.name,
@@ -1174,6 +1311,62 @@ mod tests {
         // The driver stays on the bound of the calls.
         let driver = vec!["service wait: 12 kind 6 48001 ticks of 50000".to_owned()];
         assert!(check_waits(&driver, TABLE, "t").is_err());
+    }
+
+    /// The latency from a post to the prepared image of the cube's element (a turn by a quarter
+    /// and a stretch to half, 80 by 80 points, the nearest point) at the level of the holders
+    /// of the probes (28), by the model: with the bands of the scene P (a window of 160 by 100)
+    /// in every period and no load the bound is within a period; with the pass of another slot
+    /// ahead of it it is longer; at the cap of the frame (47 bands a period, which leaves the
+    /// worker a quarter of the CPU) it is not within a period; with the budgets of the services
+    /// above the worker the bound is longer than with none.
+    #[test]
+    fn the_image_of_a_post_is_ready_within_a_period_by_the_bound() {
+        let period = ticks_of(compositor::frame::DEFAULT_PERIOD_NS);
+        let kind = "scale-nearest-copy";
+        let p = p_bands();
+        let idle = image_latency_bound(28, kind, (80, 80), &[], p, false).expect("a bound");
+        assert!(idle < period, "{idle} ticks over {period}");
+        // A bigger target takes longer, and so does a pass of another slot ahead of it.
+        let big = image_latency_bound(28, kind, (160, 160), &[], p, false).expect("a bound");
+        assert!(big > idle);
+        let behind =
+            image_latency_bound(28, kind, (80, 80), &[(kind, 80, 80)], p, false).expect("a bound");
+        assert!(behind > idle);
+        // The budgets of the services above the worker add to the wait; a lower level has
+        // more of them above it.
+        let high = image_latency_bound(28, kind, (80, 80), &[], p, true);
+        let low = image_latency_bound(10, kind, (80, 80), &[], p, true);
+        assert!(high.is_none_or(|h| h >= idle));
+        assert!(low.is_none_or(|l| high.is_none_or(|h| l >= h)));
+        let capped =
+            image_latency_bound(28, kind, (80, 80), &[], u64::from(frame_cap_bands()), false)
+                .expect("a bound");
+        assert!(capped > period, "{capped} ticks at the cap");
+        println!(
+            "image latency bound at 28 (model, ticks of 16 ns, period {period}): scene P {idle}, 160 by 160 {big}, behind another slot {behind}, at the cap {capped}, with the loads {high:?}"
+        );
+    }
+
+    /// The report tells the bounds and none of them is missing.
+    #[test]
+    fn the_report_tells_the_model_bounds_of_the_images() {
+        let line = image_model_report();
+        assert!(
+            line.starts_with("frame-probe: prepared images, model bounds"),
+            "{line}"
+        );
+        assert!(!line.contains("none"), "{line}");
+        assert!(line.contains(&format!("adds {} ticks", prep_steps(1))));
+    }
+
+    /// An image the worker publishes in a period is a step of the service: the frame's own work
+    /// grows by `STEP` for each, and the rows with none are unchanged.
+    #[test]
+    fn a_published_image_adds_a_step_to_the_work_of_the_period() {
+        assert_eq!(prep_steps(0), 0);
+        assert_eq!(prep_steps(3), 3 * STEP);
+        assert_eq!(own(Row::P) + prep_steps(1), own(Row::P) + STEP);
     }
 
     /// The numbers of the analysis for the image of the frame (the heartbeat 46 400).
@@ -1519,7 +1712,7 @@ mod tests {
             let e = verdict(&with_late(phase, &[LATE_DEVICE], 1, 0), true).unwrap_err();
             assert!(e.starts_with(&format!("{phase}: late 1")), "{e}");
         }
-        let cases: [(Vec<String>, &str); 6] = [
+        let cases: [(Vec<String>, &str); 8] = [
             // The cause is the compose.
             (
                 with_late(
@@ -1532,10 +1725,28 @@ mod tests {
                 ),
                 "the longest phase is the compose's",
             ),
-            // Two late frames.
+            // Three late frames.
             (
-                with_late("cpu", &[LATE_DEVICE, LATE_DEVICE], 2, 0),
-                "2 late frames",
+                with_late("cpu", &[LATE_DEVICE, LATE_DEVICE, LATE_DEVICE], 3, 0),
+                "at most 2 are excused",
+            ),
+            // Two late frames with one line told.
+            (
+                with_late("cpu", &[LATE_DEVICE], 2, 0),
+                "2 late frames and 1 told",
+            ),
+            // Two late frames, one of them the compose's.
+            (
+                with_late(
+                    "cpu",
+                    &[
+                        LATE_DEVICE,
+                        "compositor: late frame period 7 take 38 us compose 19000 us device 413 us frame 19451 us (the longest: compose)",
+                    ],
+                    2,
+                    0,
+                ),
+                "the longest phase is the compose's",
             ),
             // One late frame with no line.
             (with_late("cpu", &[], 1, 0), "0 told"),
@@ -1574,10 +1785,7 @@ mod tests {
         ];
         for (lines, why) in cases {
             let e = verdict(&lines, true).unwrap_err();
-            assert!(
-                e.starts_with("cpu: late 1") || e.starts_with("cpu: late 2"),
-                "{e}"
-            );
+            assert!(e.starts_with("cpu: late "), "{e}");
             assert!(e.contains(why), "{e}: wanted {why}");
         }
         let long = "compositor: late frame period 7 take 38 us compose 414 us device 33586 us frame 34039 us (the longest: device)";
@@ -1615,6 +1823,16 @@ mod tests {
             window(0, 1, 240),
             "came back in time for the post",
         );
+        // Two device frames in the phases with no load.
+        for phase in ["idle", "full"] {
+            let e = verdict(&with_late(phase, &[D23, D28], 2, 0), true).unwrap_err();
+            assert!(e.starts_with(&format!("{phase}: late 2")), "{e}");
+        }
+        // Two told frames with the window late twice and one of them too long for it.
+        let mut lines = with_late("cpu", &[D23, D34], 2, 0);
+        replace_line(&mut lines, "frame-load: window cpu ", &window(2, 0, 240));
+        let e = verdict(&lines, true).unwrap_err();
+        assert!(e.contains("the lateness is the window's own"), "{e}");
         // Missed once in the phases with no load.
         for phase in ["idle", "full"] {
             let mut lines = with_late(phase, &[long], 1, 0);
@@ -1628,6 +1846,46 @@ mod tests {
         }
     }
 
+    const D23: &str = "compositor: late frame period 7 take 38 us compose 413 us device 22571 us frame 23022 us (the longest: device)";
+    const D28: &str = "compositor: late frame period 9 take 38 us compose 414 us device 27761 us frame 28213 us (the longest: device)";
+    const D34: &str = "compositor: late frame period 9 take 38 us compose 414 us device 33586 us frame 34039 us (the longest: device)";
+
+    #[test]
+    fn two_late_device_frames_are_excused_in_a_loaded_phase() {
+        let run = |told: &[&str], late: u32, missed: u32| {
+            let mut lines = with_late("files", told, 2, 0);
+            replace_line(
+                &mut lines,
+                "frame-load: window files ",
+                &format!(
+                    "frame-load: window files id 1 interval 1 posts 234 taken 234 replaced 0 late {late} missed {missed} late-max-us 11985"
+                ),
+            );
+            let at = lines
+                .iter()
+                .position(|l| l.starts_with("frame-load: phase files "))
+                .unwrap();
+            lines[at] = lines[at].replace("frames 240", "frames 234");
+            verdict(&lines, true)
+        };
+        let said = run(&[D23, D28], 2, 0).unwrap();
+        let line = said
+            .iter()
+            .find(|l| l.starts_with("frame-probe: files: "))
+            .unwrap();
+        assert!(
+            line.contains("late 2 (the device's, 23.02 and 28.21 ms: emulator main loop, excused)"),
+            "{line}"
+        );
+        assert!(run(&[D23, D34], 1, 1).is_ok());
+        // One of the two lines is missing.
+        let e = run(&[D23], 2, 0).unwrap_err();
+        assert!(e.contains("2 late frames and 1 told"), "{e}");
+        // Two told device frames and the window late twice with one too long for it.
+        let e = run(&[D23, D34], 2, 0).unwrap_err();
+        assert!(e.contains("the lateness is the window's own"), "{e}");
+    }
+
     #[test]
     fn the_late_lines_are_those_between_the_phase_before_and_the_phase() {
         let mut lines = with_late("net", &[LATE_DEVICE], 1, 0);
@@ -1639,6 +1897,13 @@ mod tests {
         assert_eq!(late_lines(&lines, Phase::Net).len(), 1);
         assert_eq!(late_lines(&lines, Phase::Cpu).len(), 1);
         assert_eq!(late_lines(&lines, Phase::Files).len(), 0);
+        let mut two = with_late("files", &[D23, D28], 2, 0);
+        let net = two
+            .iter()
+            .position(|l| l.starts_with("frame-load: phase net "))
+            .unwrap();
+        two.insert(net, LATE_DEVICE.to_owned());
+        assert_eq!(late_lines(&two, Phase::Files).len(), 2);
         let one = &late_lines(&lines, Phase::Net)[0];
         assert_eq!(
             (
