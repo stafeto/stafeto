@@ -489,8 +489,17 @@ fn hidden(path: &[u8]) -> bool {
     within(path, ORPHANS)
 }
 
-fn visible(path: &[u8]) -> Res<()> {
-    if hidden(path) {
+/// The directory of the layers of the layered root (the layer service's own, step C3): the
+/// service's native client reaches it, no session of a program does, whatever the identity of the
+/// program (the superuser would write a layer past the index of the service).
+pub const LAYERS: &[u8] = b"/.layers";
+
+/// `Ok` for a path the caller may name: not the orphans' directory, and not the layers' unless
+/// the caller is a native client (`native`).
+fn visible(path: &[u8], native: bool) -> Res<()> {
+    let layers =
+        cfg!(not(feature = "break-datafs-layers-visible")) && !native && within(path, LAYERS);
+    if hidden(path) || layers {
         Err(p::code(p::NO_ENTRY))
     } else {
         Ok(())
@@ -1044,12 +1053,13 @@ impl Server {
         // An unbound session has no identity: the methods it may make read none, and a change that
         // made one read it would see nobody, never the superuser.
         let caller = who.unwrap_or(Caller::NOBODY);
+        let native = self.sessions[si].binding == Binding::Service;
         let mut path = [0u8; MAX_PATH];
         match method {
             Method::Open => {
                 let (flags, mode, raw) = p::read_open(r)?;
                 let n = canonical(raw, &mut path)?;
-                visible(&path[..n])?;
+                visible(&path[..n], native)?;
                 self.do_open(fs, si, &caller, (flags, mode, None), &path[..n], w)
             }
             Method::Close => {
@@ -1142,7 +1152,7 @@ impl Server {
                 }
                 let (flags, mode, ino, raw) = p::read_open_numbered(r)?;
                 let n = canonical(raw, &mut path)?;
-                visible(&path[..n])?;
+                visible(&path[..n], native)?;
                 self.do_open(fs, si, &caller, (flags, mode, Some(ino)), &path[..n], w)
             }
             Method::Seek => {
@@ -1227,7 +1237,7 @@ impl Server {
             }
             Method::Stat => {
                 let n = canonical(r.bytes(r.left())?, &mut path)?;
-                visible(&path[..n])?;
+                visible(&path[..n], native)?;
                 let found = self.lookup(fs, &caller, false, &path[..n])?;
                 let (info, entry) = found.last.ok_or_else(|| p::code(p::NO_ENTRY))?;
                 let mut attr = entry.attr;
@@ -1266,12 +1276,12 @@ impl Server {
             Method::Mkdir => {
                 let (mode, raw) = p::read_mode_path(r)?;
                 let n = canonical(raw, &mut path)?;
-                visible(&path[..n])?;
+                visible(&path[..n], native)?;
                 self.do_mkdir(fs, &caller, mode, &path[..n])
             }
             Method::Unlink | Method::Rmdir => {
                 let n = canonical(r.bytes(r.left())?, &mut path)?;
-                visible(&path[..n])?;
+                visible(&path[..n], native)?;
                 self.do_remove(fs, &caller, method == Method::Rmdir, &path[..n])
             }
             Method::Rename => {
@@ -1279,12 +1289,12 @@ impl Server {
                 let mut other = [0u8; MAX_PATH];
                 let n = canonical(from, &mut path)?;
                 let m = canonical(to, &mut other)?;
-                self.do_rename(fs, &caller, &path[..n], &other[..m])
+                self.do_rename(fs, &caller, native, &path[..n], &other[..m])
             }
             Method::Readdir => {
                 let di = self.find(si, r.u32()?)?;
                 r.finish()?;
-                self.do_readdir(fs, di, w)
+                self.do_readdir(fs, di, native, w)
             }
             Method::Rewind => {
                 let di = self.find(si, r.u32()?)?;
@@ -1346,19 +1356,19 @@ impl Server {
             Method::Chmod => {
                 let (mode, raw) = p::read_mode_path(r)?;
                 let n = canonical(raw, &mut path)?;
-                visible(&path[..n])?;
+                visible(&path[..n], native)?;
                 self.change_mode(fs, &caller, true, &path[..n], mode)
             }
             Method::Chown => {
                 let (uid, gid, raw) = p::read_chown(r)?;
                 let n = canonical(raw, &mut path)?;
-                visible(&path[..n])?;
+                visible(&path[..n], native)?;
                 self.change_owner(fs, &caller, true, &path[..n], uid, gid)
             }
             Method::Utimens => {
                 let (atime, mtime, raw) = p::read_utimens(r)?;
                 let n = canonical(raw, &mut path)?;
-                visible(&path[..n])?;
+                visible(&path[..n], native)?;
                 self.change_times(fs, &caller, true, &path[..n], atime, mtime)
             }
             Method::Fchmod => {
@@ -1382,7 +1392,7 @@ impl Server {
             Method::Access => {
                 let (bits, flags, raw) = p::read_access(r)?;
                 let n = canonical(raw, &mut path)?;
-                visible(&path[..n])?;
+                visible(&path[..n], native)?;
                 let real = flags & p::ACCESS_REAL != 0;
                 let found = self.lookup(fs, &caller, real, &path[..n])?;
                 let (info, entry) = found.last.ok_or_else(|| p::code(p::NO_ENTRY))?;
