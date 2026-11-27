@@ -47,6 +47,10 @@
 //! the others. A write flag or a create flag is `READ_ONLY_FILESYSTEM` until the service
 //! writes names.
 //!
+//! A file OPEN creates (`CREATE` and the name is not there) gets the mode in the bits 16 to 27 of
+//! `flags` (`with_permissions`), the creation mask of the process already applied; any of those
+//! bits without `CREATE` is INVALID_ARGUMENT.
+//!
 //! **Numbers.** `st_dev` of the whole root is one number, `DEVICE`, which the POSIX layer puts in
 //! every stat of a path of the layered root (the service answers 0 in the `device` field). `st_ino`
 //! of a name of the lower set is the number the RAM file service gives; that of a file of a layer
@@ -195,6 +199,21 @@ pub const STAT_NO_FOLLOW: u32 = 1;
 /// The forms of an OK answer of OPEN.
 pub const OPEN_PASS: u32 = 1;
 pub const OPEN_DIRECTORY: u32 = 2;
+/// The mode of a file OPEN creates rides in the bits 16 to 27 of the flags (`OPEN_PERMISSIONS_SHIFT`),
+/// with the creation mask of the process applied, and only with `CREATE`.
+pub const OPEN_PERMISSIONS_SHIFT: u32 = 16;
+const OPEN_PERMISSIONS: u32 = 0o7777 << OPEN_PERMISSIONS_SHIFT;
+
+/// The flags of an OPEN that creates with `mode` (the twelve bits 07777).
+pub const fn with_permissions(flags: u32, mode: u32) -> u32 {
+    flags | (mode & 0o7777) << OPEN_PERMISSIONS_SHIFT
+}
+
+/// The mode an OPEN carries in its flags.
+pub const fn permissions_of(flags: u32) -> u32 {
+    (flags & OPEN_PERMISSIONS) >> OPEN_PERMISSIONS_SHIFT
+}
+
 /// The flags OPEN takes: the access mode and the flags of this crate.
 const OPEN_MODE: u32 = 3;
 const OPEN_FLAGS: u32 = OPEN_MODE
@@ -236,7 +255,13 @@ pub fn write_open(flags: u32, path: &[u8], w: &mut Writer) -> Result<(), Status>
 pub fn read_open<'a>(mut body: Reader<'a>) -> Result<(u32, &'a [u8]), Status> {
     let flags = body.u32()?;
     let path = check_path(body.bytes(body.left())?)?;
-    if flags & !OPEN_FLAGS != 0 || flags & OPEN_MODE == OPEN_MODE {
+    let known = OPEN_FLAGS
+        | if flags & crate::CREATE != 0 {
+            OPEN_PERMISSIONS
+        } else {
+            0
+        };
+    if flags & !known != 0 || flags & OPEN_MODE == OPEN_MODE {
         return Err(Status::from_code(crate::INVALID_ARGUMENT));
     }
     Ok((flags, path))
@@ -790,6 +815,34 @@ mod tests {
         ] {
             assert!(open_writes(flags), "{flags}");
         }
+    }
+
+    #[test]
+    fn a_create_carries_its_mode_in_the_flags_and_nothing_else_does() {
+        let flags = with_permissions(crate::READ_WRITE | crate::CREATE, 0o640);
+        assert_eq!(permissions_of(flags), 0o640);
+        let mut w = Writer::new();
+        write_open(flags, b"/etc/new", &mut w).unwrap();
+        let mut r = Reader::new(w.as_bytes());
+        assert_eq!(Header::read(&mut r), Ok(NameMethod::Open.header()));
+        assert_eq!(read_open(r), Ok((flags, &b"/etc/new"[..])));
+        // The mode bits without CREATE, and bit 28 with it, are refused.
+        for bad in [
+            with_permissions(crate::READ_WRITE, 0o640),
+            flags | 1 << 28,
+        ] {
+            let mut w = Writer::new();
+            w.u32(bad).unwrap();
+            w.bytes(b"/x").unwrap();
+            assert_eq!(
+                read_open(Reader::new(w.as_bytes())),
+                Err(Status::from_code(crate::INVALID_ARGUMENT)),
+                "{bad:#x}"
+            );
+        }
+        assert_eq!(permissions_of(crate::READ_WRITE | crate::CREATE), 0);
+        assert!(!open_writes(with_permissions(crate::READ_ONLY | crate::CREATE, 0o644)));
+        assert!(open_writes(flags));
     }
 
     #[test]
