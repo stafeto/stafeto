@@ -91,6 +91,7 @@ mod input_probe;
 mod jobs;
 mod kernel_size;
 mod keys;
+mod layer_names;
 mod layer_probe;
 mod linux_guest;
 mod log_quiet;
@@ -2594,6 +2595,7 @@ commands:
   posix-random-net-two the same with two stack instances of the network service on two CPUs: a socket homed on the second instance survives
   posix-random-net-two-steps the same under -icount, the steps of both instances
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
+  layer-names-probe run the probe of the names of the layered root (a POSIX program of the root that speaks to the layer service directly: TakeRoot, SESSION, redirects of lower names, the pass of a file of the layer and its bytes, merged listings, marks of deletion, an opaque directory, the numbers of stat, EACCES for another user and EROFS) over a volume made offline, in QEMU; with the argument breaks: the same against the layer service built with each deliberate break, which it must catch; with the argument steps: under -icount on one CPU with the steps of the service told
   data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU; with an argument: write, cap, full, restart, throughput, fast (64 MiB through the window against the bounds of the plan), atomic (atomicity, lease, signals, fork, restart of the large calls), steps (the service's steps and the CPU time of its parts under -icount, on one CPU and on two), atomic-break FEATURE (the atomic probe on a service with a deliberate break, which it must catch)
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
   wfc-probe run the scene demo on OpenWF Composition (<WF/wfc.h>) in QEMU with the compositor: two scenes of three elements (a stretch, quarter turns, a flip, the filters none and faster, a global alpha and a mask) over the windows of two producers, and a third scene of the window of the first revision shown straight, committed in turn 100 times and each composed on request, QEMU's screenshot compared with the CRC of the host's reference (tools/wfc-ref), then the scene changed 100 times on an active context with every screenshot one of the two and both of them among the shots; then scene D (the bilinear filter: two stretches, a flip, a quarter turn) committed once, its screenshot compared and its frame time printed; the counters of the service (no frame failed, bands grow, scene C a frame shown straight) and the device's trace; then the steps of the compositor and the driver under -icount
@@ -3039,6 +3041,7 @@ fn main() {
         Some("posix-random-net-two-steps") => entropy::random_net_two(true),
         Some("posix-display") => posix_display::probe(&qemu::VIRT),
         Some("data-posix") => data_posix::command(&args[1..], &qemu::VIRT),
+        Some("layer-names-probe") => layer_names::command(&args[1..], &qemu::VIRT),
         Some("posix-window") => posix_window::probe(&qemu::VIRT),
         Some("wfc-probe") => wfc::command(&args[1..], &qemu::VIRT),
         Some("wfd-probe") => wfd::probe(&qemu::VIRT),
@@ -11389,6 +11392,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             data_posix::probe(data_posix::Mode::Atomic, &qemu::VIRT)
         }),
         job("data-steps", || data_posix::steps(&qemu::VIRT)),
+        // The names of the layered root over the live layer on the volume, read only.
+        job("layer-names-probe", || layer_names::probe(&qemu::VIRT)),
+        job("layer-names-probe breaks", || {
+            layer_names::breaks(&qemu::VIRT)
+        }),
         job("vi-dialog", vi_dialog::vi_dialog),
         // The window library of C programs against QEMU's screenshots.
         job("posix-window", || posix_window::probe(&qemu::VIRT)),
@@ -11724,6 +11732,8 @@ fn host_tests() -> Result<(), String> {
         "virtio-blk",
         "--package",
         "pkgd",
+        "--package",
+        "layerd",
         "--package",
         "netd",
         "--package",
@@ -14877,6 +14887,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "pkgd",
         "--package",
+        "layerd",
+        "--package",
         "netd",
         "--package",
         "neighbour-learn",
@@ -15092,8 +15104,12 @@ fn ci_lints() -> Result<(), String> {
         "pkg",
         "--package",
         "runas",
+        "--package",
+        "layerd",
+        "--package",
+        "layer-names",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/calibrate,compositor/irq-trace,compositor/late-open,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/calibrate,compositor/irq-trace,compositor/late-open,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash,layerd/steps,layerd/break-layerd-whiteout,layerd/break-layerd-search",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -17954,6 +17970,10 @@ mod entropy_in_images_tests {
             ("pkg_slot::PROGRAMS", &crate::pkg_slot::PROGRAMS),
             ("posix_display::PROGRAMS", &crate::posix_display::PROGRAMS),
             ("data_posix::PROGRAMS", &crate::data_posix::PROGRAMS),
+            (
+                "layer_names::programs",
+                Box::leak(crate::layer_names::plain_programs().into_boxed_slice()),
+            ),
             ("posix_window::PROGRAMS", &crate::posix_window::PROGRAMS),
             ("cxx_probe::PROGRAMS", &crate::cxx_probe::PROGRAMS),
             ("gles_pbuffer::PROGRAMS", &crate::gles_pbuffer::PROGRAMS),

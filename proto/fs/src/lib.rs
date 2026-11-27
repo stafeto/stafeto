@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 22 of the bounded RAM file service. Numbers are little endian.
+//! Version 23 of the bounded RAM file service. Numbers are little endian.
 //! Ordinary sessions first Bind with a genuine Process identity capability,
 //! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
@@ -71,6 +71,11 @@
 //! cannot, takes REDIRECT as "not here" (EXDEV) and may ask the walk again with a ResolveStart for
 //! the redirect itself. A client of proto_fs 21 gets BAD_VERSION from a service of 22 (series 0.7
 //! is one break), and the RAM file service of 22 refuses it the same way.
+//!
+//! Version 23 adds the names of the layered root, the methods 70 to 85 of the layer service
+//! (`names`), which the RAM file service does not serve (UNKNOWN_METHOD), the statuses COPYING
+//! and STALE and the answer of OPEN that carries a pass of a description. A client of 22 gets
+//! BAD_VERSION from a service of 23, as the series is one break.
 //!
 //! OPEN: flags u32, proof u64. Reply: status, fd u32, optional RANDOM_DEVICE u32.
 //! LOOKUP/INFO_PATH: proof u64. Reply: status then metadata/NodeInfo.
@@ -142,6 +147,8 @@ pub use wait::{
 mod fifo;
 pub use fifo::{FifoAck, FifoGrant};
 
+pub mod names;
+
 mod layers;
 pub use layers::{IMAGE_LAYER_FIRST, LAYER_NUMBER_MAX, LayerOp, LayerReply, LayerStart, LayerStep};
 
@@ -155,7 +162,7 @@ use proto_wire::{HEADER_LEN, Header, Status};
 pub const RAM_TIME_LEGACY: &[u8] = b"time-legacy";
 /// Explicit startup mode requiring the shared Clock realtime page.
 pub const RAM_TIME_CLOCKED: &[u8] = b"time-clocked";
-pub const VERSION: u16 = 22;
+pub const VERSION: u16 = 23;
 /// Original descriptor custody keys and sixteen independent Control keys.
 pub const JOB_KEY_PLACES: usize = 48;
 pub const MAX_PATH: usize = 511;
@@ -415,6 +422,13 @@ pub const BAD_LAYER: u32 = 336;
 pub const BAD_MODE: u32 = 337;
 /// The walk reached the name another service owns (`DATA_MOUNT`): the reply carries a `Redirect`.
 pub const REDIRECT: u32 = 338;
+/// The layer service is copying the file up into the live layer (or another request began the copy
+/// and it is not done): the reply carries a ticket u64, which WAIT names, and the request is sent
+/// again when WAIT is answered (`names`).
+pub const COPYING: u32 = 339;
+/// A handle of the layer service is of an earlier instance of it: the description is gone with that
+/// instance (`names`).
+pub const STALE: u32 = 340;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenKey {

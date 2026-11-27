@@ -42,6 +42,14 @@ pub trait Service<const K: usize> {
     /// The numbers of its methods: a request of another gets
     /// UNKNOWN_METHOD.
     const METHODS: &'static [u16];
+
+    /// The version a request of `method` must carry. The default is `VERSION` for every method;
+    /// a service that speaks two protocols on one channel (the layer service: its own protocol
+    /// and the names of proto_fs) says which method is of which.
+    fn version_of(method: u16) -> u16 {
+        let _ = method;
+        Self::VERSION
+    }
     /// What the service keeps for each client besides handles and
     /// deferred replies.
     type Data: Default;
@@ -1312,7 +1320,7 @@ fn request<S: Service<K>, const K: usize>(
     owed: &mut Owed,
 ) {
     let header = match Header::read(&mut Reader::new(bytes)) {
-        Ok(header) if header.version != S::VERSION => Err(Status::BadVersion),
+        Ok(header) if header.version != S::version_of(header.method) => Err(Status::BadVersion),
         Ok(header) if !S::METHODS.contains(&header.method) => Err(Status::UnknownMethod),
         other => other,
     };
