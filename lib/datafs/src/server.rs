@@ -568,7 +568,7 @@ impl Server {
             mono: 0,
             job_queued: 0,
             unleased: 0,
-            lapse: lease::Lapse::NONE,
+            lapse: lease::Lapse::EMPTY,
             #[cfg(test)]
             fail_reopen: false,
             #[cfg(test)]

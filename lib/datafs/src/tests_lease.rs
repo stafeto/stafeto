@@ -1129,6 +1129,12 @@ fn the_lapse_with_a_waiter_keeps_the_facts_the_probe_judges() {
     assert_eq!(fx.rig.server.lapse().ran, 1_260_000_000);
     assert!(!fx.rig.server.lapse_waiter_ran(500_000_000, 1_300_000_000));
     assert_eq!(fx.rig.server.lapse().ran, 1_260_000_000);
+    // The record is told once, to the waiter's own job, and carries the instant the timer was set for.
+    assert_eq!(fx.rig.server.lapse_told(1), None);
+    let told = fx.rig.server.lapse_told(500_000_000).unwrap();
+    // (the sweep at 0.9 s set it: the client time of 0.2 s reaches its bound at 1 s)
+    assert_eq!(told.expiry, 1_000_000_001);
+    assert_eq!(fx.rig.server.lapse_told(500_000_000), None);
 }
 
 #[test]

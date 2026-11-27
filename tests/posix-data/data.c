@@ -2361,11 +2361,32 @@ static int lapse_writer(void) {
     return 2;
 }
 
-static int check_lapse(void) {
+/* The wait of a job that goes first after a lapse of a write lease: the gap of 1 s, and the tail
+ * of the rewrite that stopped. littlefs writes out everything past the last byte written (the
+ * copy of `size - stop position`) at the first seek, read, sync or close of the shared handle, in
+ * one job (issue 626, `lib/datafs/src/server/lease.rs`). The cost per MiB of the tail: about
+ * 1,000 ms on a Mac with Apple silicon under QEMU (docs/data.md), 2.6 times that on the GitHub
+ * runners, and a margin of 20 per cent: 3,120 ms. */
+#define LAPSE_GAP_MS 1000ULL
+#define TAIL_MS_PER_MIB 3120ULL
+
+/* The free space of /data in KiB, for the lines of the checks that write a lot. */
+static unsigned long long free_kib(void) {
+    struct statvfs v;
+    if (statvfs("/data", &v) != 0) return 0;
+    return (unsigned long long)v.f_bavail * v.f_frsize / 1024;
+}
+
+/* A writer stopped in the middle of a rewrite of a file of `prefill_mib` MiB (0: a file that grows):
+ * another caller of the file waits for its lease, then for the work of its own job, up to `max_ms`. */
+static int lapse_rewrite(unsigned prefill_mib, unsigned long long max_ms) {
     /* A file a failed run left behind would fake a second failure (EEXIST). */
     unlink("/data/lapse");
+    printf("posix-data: free space %llu KiB before the stop\n", free_kib());
     int fd = open("/data/lapse", O_RDWR | O_CREAT | O_EXCL, 0644);
     DATA_CHECK(fd >= 0);
+    fill_salt(big_buf, MIB, 42);
+    for (unsigned k = 0; k < prefill_mib; k++) DATA_CHECK(pwrite(fd, big_buf, MIB, (off_t)k * (off_t)MIB) == (ssize_t)MIB);
     pid_t pid = fork();
     DATA_CHECK(pid >= 0);
     if (pid == 0) _exit(lapse_writer());
@@ -2382,13 +2403,22 @@ static int check_lapse(void) {
         DATA_CHECK(kill(pid, SIGCONT) == 0);
         attempts++;
     }
-    printf("posix-data: a read of the file of a stopped writer answered after %llu ms (attempt %d)\n", waited, attempts);
+    printf("posix-data: a read of the file of %u MiB of a stopped writer answered after %llu ms (attempt %d, bound %llu ms)\n",
+           prefill_mib, waited, attempts, max_ms);
     if (waited < 800) kill(pid, SIGKILL);
     DATA_CHECK(wait_ok(pid) == 0 || waited < 800);
-    DATA_CHECK(waited >= 800 && waited <= 2500);
+    DATA_CHECK(waited >= 800 && waited <= max_ms);
     DATA_CHECK(close(fd) == 0 && unlink("/data/lapse") == 0);
     return 0;
 }
+
+static int check_lapse(void) { return lapse_rewrite(0, 2500); }
+
+/* The known defect of issue 626: a stopped rewrite of a file that is filled already leaves a tail
+ * of 1 to 2 MiB (the writer rewrites the first MiB of 2), and the waiter's job writes it out. The
+ * service says the disk reads and writes of that job with the lapse (`lease lapse N`). The bound is
+ * the gap and the tail at its dearest; it comes down when the copy goes in slices. */
+static int check_lapse_tail(void) { return lapse_rewrite(2, LAPSE_GAP_MS + 2 * TAIL_MS_PER_MIB); }
 
 /* The vector forms of the lapse: a child calls writev or readv of 16 buffers of 64 KiB (1 MiB)
  * again and again until the count of lapsed calls rises (the lease lapsed while the child was
@@ -2407,8 +2437,9 @@ static int lapse_vector_child(int reading) {
     unsigned long long lapsed0 = dcounts().lapsed;
     for (int i = 0; i < 6000; i++) {
         /* A writer makes the file again each time: the job that goes first after the lapse then
-         * has no tail of the old file to write out (littlefs writes it when the file is read), and
-         * its wait is the gap plus one job. */
+         * has no tail of the old file to write out (littlefs writes it out on any seek, read, sync
+         * or close of the shared handle), and its wait is the gap plus one job. The tail has its
+         * own check, `check_lapse_tail`. */
         if (!reading && ftruncate(fd, 0) != 0) return 6;
         if (lseek(fd, 0, SEEK_SET) != 0) return 5;
         ssize_t r = reading ? readv(fd, v, 16) : writev(fd, v, 16);
@@ -2642,7 +2673,7 @@ static int check_exit_body(void) {
 }
 
 /* The handler writes to the file the interrupted call is writing: it waits for the lease, which
- * lapses; the handler's write is done and nothing hangs, and the call that was interrupted comes back
+ * lapses, and for the tail of the rewrite of the 3 MiB file (at most 3 MiB, `TAIL_MS_PER_MIB`); the handler's write is done and nothing hangs, and the call that was interrupted comes back
  * with the parts it had done. */
 static int check_handler_write_body(void) {
     DATA_CHECK(arm_signal() == 0);
@@ -2667,7 +2698,7 @@ static int check_handler_write_body(void) {
     h_mode = 0;
     printf("posix-data: the call returned %ld of %lu; the handler (live %llu) wrote %ld after %llu ms\n", (long)r, MIB,
            h_live, (long)h_wrote, h_ms);
-    DATA_CHECK(h_live >= 1 && h_wrote == 1000 && h_ms < 4000);
+    DATA_CHECK(h_live >= 1 && h_wrote == 1000 && h_ms < LAPSE_GAP_MS + 3 * TAIL_MS_PER_MIB);
     DATA_CHECK(r >= 0 && (r == (ssize_t)MIB || ((unsigned long)r % CELL_BYTES_C == 0)));
     /* What the call wrote is its pattern (this call and the calls before it), and the handler's bytes
      * are at 2 MiB. */
@@ -2788,6 +2819,7 @@ static int scm_receiver(int sock) {
 }
 
 static int check_fork_and_scm_body(void) {
+    printf("posix-data: free space %llu KiB before the fork check\n", free_kib());
     int fd = open("/data/fork-big", O_RDWR | O_CREAT | O_EXCL, 0644);
     DATA_CHECK(fd >= 0);
     pthread_t t;
@@ -2943,6 +2975,7 @@ static int atomic_run(void) {
     run_check("readv of 2 x 64 KiB never mixes", check_readv_whole);
     run_check("writev lease lapses after 1 s", check_lapse_writev);
     run_check("readv lease lapses after 1 s", check_lapse_readv);
+    run_check("lease lapse waits for its tail", check_lapse_tail);
     run_check("siglongjmp out of a handler returns the cell", check_jump);
     run_check("thread exit mid-call returns the cell", check_exit);
     run_check("handler write during a long write", check_handler_write);
