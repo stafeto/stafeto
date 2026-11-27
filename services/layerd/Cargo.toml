@@ -22,8 +22,20 @@ bench = false
 # a layer of the user deleted shows again (`cargo xtask layer-names breaks`).
 # `break-layerd-search`: the walk of a path does not check the right to search the directories of
 # the layer of the user.
+# `probe-restart`: an OPEN of a name that ends in `/.die` ends the service with the exit code 1 (init
+# starts it again), for `cargo xtask layer-restart`.
+# `break-layerd-one-step`: the build of the index walks the whole layer in one step of the loop, so
+# the longest step grows with the layer (`cargo xtask layer-steps breaks`).
 [features]
 steps = ["rt/step-stats"]
+probe-restart = []
+# `break-layerd-epoch`: every instance carries the one epoch, so a handle of an earlier instance is
+# no stranger (`cargo xtask layer-restart breaks`).
+break-layerd-epoch = []
+break-layerd-one-step = []
+# `break-layerd-slots`: a request of a listing looks at 4,096 slots of the index, so the step is over
+# 0.9 B and the step gate of `cargo xtask layer-steps breaks` alone catches it.
+break-layerd-slots = []
 break-layerd-whiteout = []
 break-layerd-search = []
 
@@ -37,6 +49,5 @@ proto-process = { path = "../../proto/process" }
 proto-wire = { path = "../../proto/wire" }
 
 [target.'cfg(target_os = "none")'.dependencies]
-posix-fs = { path = "../../lib/posix-fs" }
 proto-init = { path = "../../proto/init" }
 rt = { path = "../../lib/rt" }

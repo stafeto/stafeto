@@ -646,7 +646,6 @@ name = "layerd"
 version = "0.7.0-pre.0"
 dependencies = [
  "abi",
- "posix-fs",
  "posix-perm",
  "proto-data",
  "proto-fs",

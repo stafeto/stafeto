@@ -9,8 +9,9 @@
 //! lists the entries of the same directory of the lower set, read through the RAM file service's
 //! `READ_DIR_FD` of the service's session, and drops an entry the index has a name or a mark for
 //! (the layer of the user shadows or deletes it); a directory with the opaque marker has no
-//! stage 1. A request takes at most `LOWER_PER_READDIR` entries of the lower set, kept or dropped,
-//! so the cost of a step does not depend on how many names the layer deletes. The position of a
+//! stage 1. A request takes at most `LOWER_PER_STEP` entries of the lower set, kept or dropped,
+//! so the cost of a step does not depend on how many names the layer deletes; the open of the
+//! lower directory and the replay to a position a seek left are requests of their own. The position of a
 //! description is (stage, position in the stage): in stage 0 the number of the slot of the index
 //! after the last entry given plus two (positions 0 and 1 are `.` and `..`), in stage 1 the number
 //! of entries of the lower set taken so far. A reply with `more` and no entry always moved the
@@ -30,9 +31,20 @@ pub struct Listed {
     pub cursor: u64,
 }
 
-/// The slots of the index one request looks at in the first stage: 512 slots cost about 7,000
-/// ticks under `-icount` (14 for a slot, measured), under 0.9 B with the rest of the step.
-pub const SLOTS_PER_READDIR: usize = 512;
+/// The slots of the index one request looks at in the first stage: 384 slots cost about 5,400
+/// ticks under `-icount` (14 for a slot, measured), and the entries of a reply (up to 46 of the
+/// message's 1 KiB) about 9,000 more: under 0.9 B with the rest of the step.
+pub const SLOTS_PER_READDIR: usize = if cfg!(feature = "break-layerd-slots") {
+    4096
+} else {
+    384
+};
+
+/// The entries of the lower set one request reads, kept, dropped or replayed (never more than
+/// `LOWER_PER_READDIR`, which the protocol allows in a reply): each is a round trip to the RAM file
+/// service, about 3,000 ticks of the service's own time under `-icount`.
+pub const LOWER_PER_STEP: usize = 4;
+const _: () = assert!(LOWER_PER_STEP <= LOWER_PER_READDIR);
 
 const DIRECTORY: u32 = 1;
 const REGULAR: u32 = 2;
@@ -61,6 +73,7 @@ pub fn read_dir<L: Lower>(
     dir: u32,
     position: &mut Position,
     open: &mut Option<L::Dir>,
+    replayed: &mut u32,
     reply: &mut DirReply,
 ) -> R<Listed> {
     if position.stage == 0 {
@@ -116,46 +129,58 @@ pub fn read_dir<L: Lower>(
                 }
             }
         }
-        if position.stage == 0 {
-            return Ok(listed(position, true));
-        }
+        // The end of the names of the layer is the end of the request too: the lower set starts
+        // with a request of its own.
+        return Ok(listed(position, true));
     }
     // Stage 1: the lower set, unless the directory is opaque.
     if index.flags(dir) & OPAQUE != 0 {
         return Ok(listed(position, false));
     }
+    // The open of the lower directory, the replay to the position a seek or an earlier request
+    // left, and the entries themselves are steps of their own: each costs round trips to the RAM
+    // file service, and a request does one of them. A reply of the first two has `more` and no
+    // entry; the position does not move, the state of the description does.
     if open.is_none() {
         let mut path = [0u8; 512];
         let n = index.path_of(dir, &mut path).ok_or(Status::BadSize)?;
-        match lower.open_dir(&path[..n]) {
-            Ok(mut d) => {
-                // Back to the position a seek or an earlier request left.
-                let mut name = [0u8; 256];
-                for _ in 0..position.at {
-                    if lower.next(&mut d, &mut name)?.is_none() {
-                        break;
-                    }
-                }
+        return match lower.open_dir(&path[..n]) {
+            Ok(d) => {
                 *open = Some(d);
+                *replayed = 0;
+                Ok(listed(position, true))
             }
             // The directory is only in the layer of the user: nothing below it.
             Err(Status::Unknown(proto_fs::NO_ENTRY | proto_fs::NOT_DIRECTORY)) => {
-                return Ok(listed(position, false));
+                Ok(listed(position, false))
             }
-            Err(e) => return Err(e),
-        }
+            Err(e) => Err(e),
+        };
     }
     let Some(d) = open.as_mut() else {
         return Ok(listed(position, false));
     };
-    let mut taken = 0;
     let mut name = [0u8; 256];
-    while taken < LOWER_PER_READDIR && room(reply) {
+    if *replayed < position.at {
+        let mut steps = 0;
+        while *replayed < position.at && steps < LOWER_PER_STEP {
+            if lower.next(d, &mut name)?.is_none() {
+                // The directory is shorter than the position said: nothing more below it.
+                return Ok(listed(position, false));
+            }
+            *replayed += 1;
+            steps += 1;
+        }
+        return Ok(listed(position, true));
+    }
+    let mut taken = 0;
+    while taken < LOWER_PER_STEP && room(reply) {
         let Some((ino, kind, len)) = lower.next(d, &mut name)? else {
             return Ok(listed(position, false));
         };
         taken += 1;
         position.at += 1;
+        *replayed += 1;
         let name = &name[..len];
         if name == b"." || name == b".." {
             continue;
@@ -182,8 +207,9 @@ pub fn rewind<L: Lower>(
     lower: &mut L,
     position: &mut Position,
     open: &mut Option<L::Dir>,
+    replayed: &mut u32,
 ) -> R<()> {
-    seek(lower, position, Position::default(), open, 0)
+    seek(lower, position, Position::default(), open, replayed, 0)
 }
 
 /// Puts a description at a cursor a reply gave. A stage other than 0 and 1 is INVALID_ARGUMENT, and
@@ -195,6 +221,7 @@ pub fn seek<L: Lower>(
     position: &mut Position,
     given: Position,
     open: &mut Option<L::Dir>,
+    replayed: &mut u32,
     cursor: u64,
 ) -> R<()> {
     let (stage, at) = proto_fs::names::split_cursor(cursor);
@@ -206,6 +233,7 @@ pub fn seek<L: Lower>(
     if let Some(d) = open.take() {
         lower.close_dir(d);
     }
+    *replayed = 0;
     *position = wanted;
     Ok(())
 }

@@ -94,6 +94,8 @@ mod keys;
 mod layer_names;
 mod layer_posix;
 mod layer_probe;
+mod layer_restart;
+mod layer_steps;
 mod linux_guest;
 mod log_quiet;
 mod lvgl;
@@ -1138,10 +1140,25 @@ pub(crate) fn aws_qemu_programs() -> &'static [ImageProgram] {
     static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
         let mut programs = aws_programs().to_vec();
-        programs[0].3 = &["table-aws-qemu"];
+        programs[0].3 = if layered_root() {
+            &["table-aws-qemu", "layered-root"]
+        } else {
+            &["table-aws-qemu"]
+        };
         programs.extend(SHELL_SERVICES_LAST.iter().filter(|p| p.0 == "virtio-rng"));
         programs
     })
+}
+
+/// Whether the shell images are built with the layer service: `STAFETO_LAYERED_ROOT=1` gives init
+/// its feature `layered-root` (the tables with `layerd` and the launcher that waits for it), adds the
+/// program `layerd` and builds `libc.so` with the feature `layer` (`tools/build-libc-so.py`). Off
+/// until the layered root is complete (step C4 of the layered file system): the packaged static
+/// programs (BusyBox, Dropbear, nginx and the rest) take the feature `layer` of `posix-crt` the same
+/// way, and none of them has it yet, so a layered image of today serves their paths from the file
+/// service alone.
+pub(crate) fn layered_root() -> bool {
+    std::env::var("STAFETO_LAYERED_ROOT").as_deref() == Ok("1")
 }
 
 /// The programs of the shell on EC2 (init's table `table-aws`): the shell
@@ -1153,7 +1170,16 @@ fn aws_programs() -> &'static [ImageProgram] {
         let packages =
             packages::of_image("boot-aws.img").unwrap_or_else(|e| panic!("the image of EC2: {e}"));
         let mut programs = SHELL_SERVICES.to_vec();
-        programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-aws"]);
+        programs[0] = (
+            "init",
+            "init",
+            INIT_STACK_SIZE,
+            if layered_root() {
+                &["table-aws", "layered-root"]
+            } else {
+                &["table-aws"]
+            },
+        );
         programs.extend(package_programs(&packages));
         programs.extend(SHELL_SERVICES_LAST.iter().take(2));
         // The entropy service seeds from the boot page (init's `entropy::SEED_TABLE`);
@@ -1169,6 +1195,9 @@ fn aws_programs() -> &'static [ImageProgram] {
         // data file service and the host key service.
         programs.push(("nvme-blk", "nvme-blk", blk_probe::BLK_STACK_SIZE, &[]));
         programs.push(("datafsd", "datafsd", 32 * 1024, &[]));
+        if layered_root() {
+            programs.push(("layerd", "layerd", LAYERD_STACK_SIZE, &[]));
+        }
         programs.push(("datakey", "datakey", 128 * 1024, &[]));
         // The service of the power button (init's record `power`): the PL061 pin the EC2
         // button is wired to asks init to stop the system.
@@ -2597,6 +2626,8 @@ commands:
   posix-random-net-two-steps the same under -icount, the steps of both instances
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
   layer-posix run the C probe of the POSIX layer on the layered root (open, read, stat, readdir, chdir, openat, fork, spawn and exec of the descriptions of the layer service, the rights of another user, EROFS for writes, the session in the slot of a set-ID program) over the layer service on a volume made offline, in QEMU; with the argument breaks: the probe built with each deliberate break of the layer (no path routed to the service, no session for a child, no guard in the RAM file service), which it must catch; with the argument ash: BusyBox's ash on the layered root (`ls -la /etc` and reads of names of the layers)
+  layer-steps run the steps of the layer service at the scale of its limits under -icount on one CPU (a volume of 8,192 names in the live layer: a chain of 246 directories with a file at its end, a path of 253 components, a merged listing of 1,024 names): the probe passes and no step of the service is over 0.9 B; with the argument breaks: the service that walks the whole layer in one step, which the gate must fail
+  layer-restart run the probe of the restarts of the layer service and the data file service (the layer service ends on an OPEN of /.die and after the data file service ended, both come back: the old session is dead, a description of the old instance answers STALE, a file the data file service holds is read on, a new session lists and reads as before); with the argument breaks: the layer service whose instances all carry one epoch, which the probe must fail
   layer-names-probe run the probe of the names of the layered root (a POSIX program of the root that speaks to the layer service directly: TakeRoot, SESSION, redirects of lower names, the pass of a file of the layer and its bytes, merged listings, marks of deletion, an opaque directory, the numbers of stat, EACCES for another user and EROFS) over a volume made offline, in QEMU; with the argument breaks: the same against the layer service built with each deliberate break, which it must catch; with the argument steps: under -icount on one CPU with the steps of the service told
   data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU; with an argument: write, cap, full, restart, throughput, fast (64 MiB through the window against the bounds of the plan), atomic (atomicity, lease, signals, fork, restart of the large calls), steps (the service's steps and the CPU time of its parts under -icount, on one CPU and on two), atomic-break FEATURE (the atomic probe on a service with a deliberate break, which it must catch)
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
@@ -3044,6 +3075,8 @@ fn main() {
         Some("posix-display") => posix_display::probe(&qemu::VIRT),
         Some("data-posix") => data_posix::command(&args[1..], &qemu::VIRT),
         Some("layer-names-probe") => layer_names::command(&args[1..], &qemu::VIRT),
+        Some("layer-steps") => layer_steps::command(&args[1..], &qemu::VIRT),
+        Some("layer-restart") => layer_restart::command(&args[1..], &qemu::VIRT),
         Some("layer-posix") => layer_posix::command(&args[1..], &qemu::VIRT),
         Some("posix-window") => posix_window::probe(&qemu::VIRT),
         Some("wfc-probe") => wfc::command(&args[1..], &qemu::VIRT),
@@ -3327,7 +3360,7 @@ const NVME_BREAKS: [&str; 10] = [
 /// The deliberate breaks of the data volume (`cargo xtask datafs-breaks`): each is a feature of
 /// `lib/datafs` that does one wrong thing, and its host tests (a cut of the power at every sector of a
 /// workload, the table of a new volume, the protocol) pass without it and fail with it.
-const DATAFS_BREAKS: [&str; 13] = [
+const DATAFS_BREAKS: [&str; 14] = [
     "break-datafs-sync",
     "break-datafs-consistent",
     "break-datafs-busy",
@@ -3341,6 +3374,7 @@ const DATAFS_BREAKS: [&str; 13] = [
     "break-datafs-lease-renew",
     "break-datafs-lease-deref",
     "break-datafs-append-end",
+    "break-datafs-layers-visible",
 ];
 
 /// The breaks to run: every one of `DATAFS_BREAKS`, or only the ones `named` (each must be one of
@@ -7565,6 +7599,11 @@ const VOUCH_TICKS_MAX: u64 = 8_000;
 /// print their numbers.
 const TERM_B: u64 = 20_410;
 
+/// The stack of the main thread of the layer service: the table of its sessions (192 records with
+/// their identities), the table of its descriptions and of its jobs live in the frame of `main`,
+/// which 128 KiB no longer holds.
+pub(crate) const LAYERD_STACK_SIZE: u32 = 192 * 1024;
+
 /// The bound on the kernel itself: the longest row of the `B on` line of
 /// `kernel_tests` (icount build) may not pass it. The longest paths at
 /// the time are first_map (16 738 on 512M) and release (16 060 on 2G);
@@ -11400,6 +11439,18 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("layer-names-probe breaks", || {
             layer_names::breaks(&qemu::VIRT)
         }),
+        // The steps of the layer service at the scale of its limits (8,192 names, a path of 253
+        // components, a merged listing of 1,024 names), none over 0.9 B; the break that walks the
+        // layer in one step must fail the gate.
+        job("layer-steps", || layer_steps::probe(&qemu::VIRT)),
+        job("layer-steps breaks", || layer_steps::breaks(&qemu::VIRT)),
+        // The layer service and the data file service end and come back under a program that
+        // keeps working (STALE for the descriptions of the old instance); the break that gives
+        // every instance one epoch must fail it.
+        job("layer-restart", || layer_restart::probe(&qemu::VIRT)),
+        job("layer-restart breaks", || {
+            layer_restart::breaks(&qemu::VIRT)
+        }),
         // The POSIX layer on the layered root: the paths, descriptions, fork, spawn and exec, the
         // rights, the refusals of writes and the session in the slot of a set-ID program.
         job("layer-posix", || layer_posix::probe(&qemu::VIRT)),
@@ -15117,7 +15168,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "layer-names",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/calibrate,compositor/irq-trace,compositor/late-open,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash,layerd/steps,layerd/break-layerd-whiteout,layerd/break-layerd-search",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/calibrate,compositor/irq-trace,compositor/late-open,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash,layerd/steps,layerd/probe-restart,layerd/break-layerd-whiteout,layerd/break-layerd-search,layerd/break-layerd-one-step,layerd/break-layerd-slots,layerd/break-layerd-epoch,datafsd/probe-restart,datafsd/break-datafs-layers-visible",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -17983,6 +18034,14 @@ mod entropy_in_images_tests {
             (
                 "layer_names::programs",
                 Box::leak(crate::layer_names::plain_programs().into_boxed_slice()),
+            ),
+            (
+                "layer_restart::programs",
+                Box::leak(crate::layer_restart::plain_programs().into_boxed_slice()),
+            ),
+            (
+                "layer_steps::programs",
+                Box::leak(crate::layer_steps::plain_programs().into_boxed_slice()),
             ),
             (
                 "layer_posix::programs",

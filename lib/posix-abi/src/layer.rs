@@ -50,7 +50,7 @@
 use crate::constants::*;
 use core::cell::UnsafeCell;
 use core::ffi::c_int;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use posix_fs::layer as pure;
 use posix_fs::layer::errno_of;
 use posix_fs::{LayerTarget, Target};
@@ -221,6 +221,9 @@ fn take_session(root: &Handle<Channel>) -> Result<Handle<Channel>, Attempt> {
     let mut reply = match rt::sys::send_handles(root, &request, [copy]) {
         Ok(reply) => reply,
         Err(refused) if refused.error == Error::Interrupted => return Err(Attempt::Retry),
+        // The root is of an instance that ended: init starts a new one, which registers its own root
+        // with the process service, replacing this one.
+        Err(refused) if refused.error == Error::PeerClosed => return Err(Attempt::Retry),
         Err(refused) => {
             why!("SESSION not sent to the root: {:?}", refused.error);
             return Err(Attempt::Failed(EIO));
@@ -294,6 +297,12 @@ fn ensure() -> Result<rt::abi::Handle, i32> {
     }
 }
 
+/// The sessions of this process that died with their instances. A description of the service
+/// records the count when it is made (`Dir::born`), and a description of an earlier session answers
+/// EIO here at once (`current`), whatever epoch the service's handle carries: the epoch of the new
+/// instance (which answers STALE) is the second line.
+static REBIRTHS: AtomicU32 = AtomicU32::new(0);
+
 /// The session died with its instance: a later call takes a session of the new one. The handle is
 /// parked, never closed, so that a thread that read it before never sends to another channel under
 /// its number.
@@ -302,6 +311,7 @@ fn forget(raw: rt::abi::Handle) {
         .compare_exchange(raw.0, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
+        REBIRTHS.fetch_add(1, Ordering::AcqRel);
         CLOSE_FAILED.store(false, Ordering::Release);
         DIRS.with(|cells| {
             for dir in cells.iter_mut().flatten() {
@@ -837,6 +847,7 @@ pub fn close_description(handle: u32) {
 
 /// fstat of the description: the attributes of its directory, the device the root's.
 pub fn fstat(handle: u32) -> Result<proto_fs::NodeInfo, i32> {
+    DIRS.current(handle)?;
     let mut w = Writer::new();
     n::write_handle(NameMethod::Fstat, handle, &mut w).map_err(write_failed)?;
     let got = call(w.as_bytes())?;
@@ -846,6 +857,7 @@ pub fn fstat(handle: u32) -> Result<proto_fs::NodeInfo, i32> {
 /// lseek of a description (every one is a directory): a position the listing counts (SEEK_SET with
 /// the number of entries given before, 0 for `rewinddir`, or SEEK_CUR 0 to read it).
 pub fn seek(target: LayerTarget, offset: i64, whence: i32) -> Result<u64, i32> {
+    DIRS.current(target.handle)?;
     match (whence, offset) {
         // An explicit seek (`rewinddir`, `seekdir`) asks the service even when the layer's count
         // stands where it is told to go: the position is the description's, which another holder
@@ -863,6 +875,8 @@ pub fn seek(target: LayerTarget, offset: i64, whence: i32) -> Result<u64, i32> {
 /// of each that has been read.
 struct Dir {
     handle: u32,
+    /// `REBIRTHS` when the description was made.
+    born: u32,
     path: Option<pure::DirPath>,
     listing: pure::Listing,
 }
@@ -898,6 +912,7 @@ impl Dirs {
         self.with(|cells| {
             if let Some(old) = cells.iter_mut().flatten().find(|d| d.handle == handle) {
                 old.path = path;
+                old.born = REBIRTHS.load(Ordering::Acquire);
                 old.listing.restart();
                 return true;
             }
@@ -905,6 +920,7 @@ impl Dirs {
                 Some(free) => {
                     *free = Some(Dir {
                         handle,
+                        born: REBIRTHS.load(Ordering::Acquire),
                         path,
                         listing: pure::Listing::new(),
                     });
@@ -923,6 +939,17 @@ impl Dirs {
                 }
             }
         });
+    }
+
+    /// EIO for a description made under a session that has died since; a description the table does
+    /// not know (it came through an exec) is the service's to judge.
+    fn current(&self, handle: u32) -> Result<(), i32> {
+        self.with(
+            |cells| match cells.iter().flatten().find(|d| d.handle == handle) {
+                Some(d) if d.born != REBIRTHS.load(Ordering::Acquire) => Err(EIO),
+                _ => Ok(()),
+            },
+        )
     }
 
     fn path_of(&self, handle: u32) -> Option<pure::DirPath> {
@@ -953,6 +980,7 @@ impl Dirs {
             {
                 *free = Some(Dir {
                     handle,
+                    born: REBIRTHS.load(Ordering::Acquire),
                     path: None,
                     listing: pure::Listing::new(),
                 });
@@ -971,6 +999,7 @@ impl Dirs {
 /// The position of the stream is the listing's own: a position other than where it stands starts
 /// the listing again (REWIND) and reads on to it. The first entry that does not fit is put back.
 pub fn entries(handle: u32, out: &mut [u8], position: Option<u64>) -> Result<usize, i32> {
+    DIRS.current(handle)?;
     let standing = DIRS.index_of(handle);
     position_listing(handle, position.or(standing).unwrap_or(0), false)?;
     posix_change::dirent::fill(

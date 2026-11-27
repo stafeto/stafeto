@@ -43,7 +43,7 @@ const DISK_BYTES: u64 = 64 << 20;
 const LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The checks of the probe, in the order it runs them: the line of each is `layer-posix: <check> ok`.
-pub const CHECKS: [&str; 29] = [
+pub const CHECKS: [&str; 30] = [
     "a file of the layer of the user is read",
     "a lower file is read",
     "a name of the layer shadows the lower one",
@@ -73,10 +73,11 @@ pub const CHECKS: [&str; 29] = [
     "a description of the service has no path after exec",
     "a set-ID program is given the service's session",
     "a set-ID program keeps the genuine session and binds it",
+    "the directory of the layers is hidden from programs",
 ];
 
 /// The deliberate breaks, the program each is a feature of and the check each one fails.
-pub const BREAKS: [(&str, &str, &str); 6] = [
+pub const BREAKS: [(&str, &str, &str); 7] = [
     (
         "break-layer-route",
         "layer-posix",
@@ -105,6 +106,12 @@ pub const BREAKS: [(&str, &str, &str); 6] = [
         "loader",
         "a set-ID program is given the service's session",
     ),
+    // The data file service shows `/.layers` to every session, so a program sees the layers.
+    (
+        "break-datafs-layers-visible",
+        "datafsd",
+        "the directory of the layers is hidden from programs",
+    ),
 ];
 
 /// The image's programs; the probe is built with `probe` features and the RAM file service with
@@ -113,6 +120,7 @@ fn programs(
     probe: &'static [&'static str],
     ramfs: &'static [&'static str],
     loader: &'static [&'static str],
+    datafs: &'static [&'static str],
 ) -> Vec<ImageProgram> {
     vec![
         ("init", "init", INIT_STACK_SIZE, &["table-layer-posix"][..]),
@@ -132,8 +140,8 @@ fn programs(
             crate::blk_probe::BLK_STACK_SIZE,
             &[],
         ),
-        ("datafsd", "datafsd", 32 * 1024, &[]),
-        ("layerd", "layerd", 128 * 1024, &[]),
+        ("datafsd", "datafsd", 32 * 1024, datafs),
+        ("layerd", "layerd", crate::LAYERD_STACK_SIZE, &[]),
         (
             "layer-posix",
             "layer-posix-probe",
@@ -158,7 +166,7 @@ fn programs(
 /// The programs of the plain image, for the check of the stacks of every list of programs.
 #[cfg(test)]
 pub fn plain_programs() -> Vec<ImageProgram> {
-    programs(&[], &[], &[])
+    programs(&[], &[], &[], &[])
 }
 
 /// The disk of the run: a file of the process's name, removed at the end.
@@ -183,7 +191,7 @@ pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
 
 /// The image of the shell: the C probe's services with BusyBox's probe in its place.
 fn ash_programs() -> Vec<ImageProgram> {
-    let mut list = programs(&[], &[], &[]);
+    let mut list = programs(&[], &[], &[], &[]);
     list[0].3 = &["table-layer-ash"];
     let at = list
         .iter()
@@ -339,12 +347,13 @@ fn boot(
     probe: &'static [&'static str],
     ramfs: &'static [&'static str],
     loader: &'static [&'static str],
+    datafs: &'static [&'static str],
 ) -> Result<(qemu::Outcome, u64), String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
     let image = write_boot_image_files(
         IMAGE,
-        &programs(probe, ramfs, loader),
+        &programs(probe, ramfs, loader, datafs),
         BOOT_PROFILE,
         &[],
         Vec::new(),
@@ -431,7 +440,7 @@ pub fn read_lines(lines: &[String]) -> Result<(), String> {
 }
 
 pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
-    let (output, seconds) = boot(machine, &[], &[], &[])?;
+    let (output, seconds) = boot(machine, &[], &[], &[], &[])?;
     read_lines(&output.lines)?;
     qemu::expect_stopped_on(
         &output,
@@ -451,9 +460,10 @@ pub fn breaks(machine: &qemu::Machine) -> Result<(), String> {
     for (feature, program, check) in BREAKS {
         let features: &'static [&'static str] = Box::leak(vec![feature].into_boxed_slice());
         let (output, seconds) = match program {
-            "ramfs" => boot(machine, &["break-layer-refuse"], features, &[])?,
-            "loader" => boot(machine, &[], &[], features)?,
-            _ => boot(machine, features, &[], &[])?,
+            "ramfs" => boot(machine, &["break-layer-refuse"], features, &[], &[])?,
+            "loader" => boot(machine, &[], &[], features, &[])?,
+            "datafsd" => boot(machine, &[], &[], &[], features)?,
+            _ => boot(machine, features, &[], &[], &[])?,
         };
         let mine = mine(&output.lines);
         if mine.iter().any(|l| *l == &PASSED[PREFIX.len()..]) {
@@ -580,9 +590,9 @@ mod tests {
     fn every_break_names_a_check_of_the_probe() {
         for (feature, program, check) in BREAKS {
             assert!(CHECKS.contains(&check), "{feature}");
-            assert!(feature.starts_with("break-layer"));
+            assert!(feature.starts_with("break-layer") || feature == "break-datafs-layers-visible");
             assert!(
-                ["layer-posix", "ramfs", "loader"].contains(&program),
+                ["layer-posix", "ramfs", "loader", "datafsd"].contains(&program),
                 "{feature}"
             );
         }

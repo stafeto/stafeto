@@ -30,6 +30,8 @@ break-datafs-gpt-order = []
 break-datafs-relocate-order = []
 break-datafs-ctz-hints = []
 break-datafs-trust-prog = []
+# `break-datafs-layers-visible`: the directory `/.layers` of the layered root is visible to every session.
+break-datafs-layers-visible = []
 # The deliberate breaks of the leases (tests_lease.rs): `break-datafs-lease-hold` no lease holds a
 # job back; `break-datafs-lease-place` a part of the holder keeps its own place in the queue;
 # `break-datafs-lease-reader` a new read lease does not wait behind a writer that waits;

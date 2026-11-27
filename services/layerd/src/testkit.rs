@@ -322,6 +322,8 @@ pub struct FakeLower {
     pub nodes: BTreeMap<Vec<u8>, (u32, u64)>,
     pub opened: usize,
     pub closed: usize,
+    /// The entries `next` gave (and the ones it found at the end), for the cost of a request.
+    pub nexts: usize,
 }
 
 pub struct LowerDir {
@@ -375,6 +377,7 @@ impl Lower for FakeLower {
     }
 
     fn next(&mut self, dir: &mut LowerDir, name: &mut [u8; 256]) -> R<Option<(u64, u32, usize)>> {
+        self.nexts += 1;
         let Some((ino, kind, n)) = dir.entries.get(dir.pos) else {
             return Ok(None);
         };

@@ -417,6 +417,108 @@ pub fn make_layer_volume(path: &Path, size: u64) -> Result<(), String> {
     make_layer_volume_of(path, size, LAYER_VOLUME_ENTRIES)
 }
 
+/// The sizes of the volume of the scale probe (`make_layer_steps_volume`): the live layer holds
+/// `STEPS_NAMES` names, the directory `/etc` of it `STEPS_LISTED` of them (the merged listing over
+/// the lower `/etc`), the chain of directories `STEPS_CHAIN` deep with a file at its end (a path of
+/// `STEPS_CHAIN + 1` components: the datafs path of the file, with the 11 bytes of `/.layers/00`
+/// in front, is 505 of the 506 bytes the volume allows), and the rest is files in `d00`, `d01` and
+/// on.
+pub const STEPS_NAMES: usize = 8192;
+pub const STEPS_LISTED: usize = 1024;
+pub const STEPS_CHAIN: usize = 246;
+/// The letter of the 200-byte name of `/long/` and the bytes of its file.
+pub const STEPS_LONG_NAME_CHAR: &str = "n";
+pub const STEPS_LONG_BYTES: &[u8] = b"a long name\n";
+/// The bytes of the file at the end of the chain.
+pub const STEPS_DEEP_BYTES: &[u8] = b"the end of the chain\n";
+
+/// The entries of the scale volume: exactly `STEPS_NAMES` names in the live layer (directories,
+/// files and no mark of deletion), the chain, and a directory `/etc` of `STEPS_LISTED` files
+/// `x0000` and on.
+pub fn layer_steps_entries() -> Vec<LayerEntry> {
+    fn leak(text: String) -> &'static str {
+        Box::leak(text.into_boxed_str())
+    }
+    let mut out = vec![
+        LayerEntry::dir("/.layers", 0o700, 0, 0),
+        LayerEntry::dir("/.layers/00", 0o755, 0, 0),
+        LayerEntry::dir("/.layers/work", 0o700, 0, 0),
+        LayerEntry::file(
+            "/.layers/COMPOSITION",
+            0o600,
+            0,
+            0,
+            b"STAFLAYR 1\nnext 01\nino 9000\nlower -\nlayer 00 live unsealed - -\n",
+        ),
+    ];
+    let mut names = 0;
+    let mut dir = String::from("/.layers/00");
+    for _ in 0..STEPS_CHAIN {
+        dir.push_str("/a");
+        out.push(LayerEntry::dir(leak(dir.clone()), 0o755, 0, 0));
+        names += 1;
+    }
+    out.push(LayerEntry::file(
+        leak(format!("{dir}/f")),
+        0o644,
+        0,
+        0,
+        STEPS_DEEP_BYTES,
+    ));
+    names += 1;
+    // A name of 200 bytes at two slashes: a path over `names::SYNC_BYTES` that the count of its
+    // slashes would let through.
+    out.push(LayerEntry::dir("/.layers/00/long", 0o755, 0, 0));
+    out.push(LayerEntry::file(
+        leak(format!(
+            "/.layers/00/long/{}",
+            STEPS_LONG_NAME_CHAR.repeat(200)
+        )),
+        0o644,
+        0,
+        0,
+        STEPS_LONG_BYTES,
+    ));
+    names += 2;
+    out.push(LayerEntry::dir("/.layers/00/etc", 0o755, 0, 0));
+    names += 1;
+    for k in 0..STEPS_LISTED {
+        out.push(LayerEntry::file(
+            leak(format!("/.layers/00/etc/x{k:04}")),
+            0o644,
+            0,
+            0,
+            b"",
+        ));
+        names += 1;
+    }
+    let mut d = 0;
+    while names < STEPS_NAMES {
+        let path = leak(format!("/.layers/00/d{d:02}"));
+        out.push(LayerEntry::dir(path, 0o755, 0, 0));
+        names += 1;
+        let mut k = 0;
+        while k < 1024 && names < STEPS_NAMES {
+            out.push(LayerEntry::file(
+                leak(format!("{path}/n{k:04}")),
+                0o644,
+                0,
+                0,
+                b"",
+            ));
+            names += 1;
+            k += 1;
+        }
+        d += 1;
+    }
+    out
+}
+
+/// The volume of the scale probe (`layer_steps_entries`).
+pub fn make_layer_steps_volume(path: &Path, size: u64) -> Result<(), String> {
+    make_layer_volume_of(path, size, &layer_steps_entries())
+}
+
 /// The volume of the probe of the POSIX layer (`LAYER_POSIX_VOLUME_ENTRIES`).
 pub fn make_layer_posix_volume(path: &Path, size: u64) -> Result<(), String> {
     make_layer_volume_of(path, size, LAYER_POSIX_VOLUME_ENTRIES)
@@ -426,7 +528,7 @@ fn make_layer_volume_of(path: &Path, size: u64, entries: &[LayerEntry]) -> Resul
     use datafs::attr::{ATTR_COUNTER_TYPE, ATTR_FORMAT_TYPE, ATTR_TYPE, Attr, VOLUME_FORMAT};
     make(path, size)?;
     let mut state = Box::new(Storage::new());
-    let (mut fs, _, _) = volume::open(FileDevice::open(path)?, &mut state, SEED)
+    let (mut fs, _, _) = volume::open(Quick(FileDevice::open(path)?), &mut state, SEED)
         .map_err(|r| format!("{}: datafs refused the file: {}", path.display(), r.text()))?;
     let record = |mode: u32, uid: u32, gid: u32, ino: u64| {
         Attr {
@@ -482,6 +584,7 @@ fn make_layer_volume_of(path: &Path, size: u64, entries: &[LayerEntry]) -> Resul
         .map_err(|e| format!("{}: unmount: {e:?}", path.display()))?;
     fs.into_device()
         .device
+        .0
         .flush()
         .map_err(|_| format!("{}: flush failed", path.display()))
 }
@@ -743,6 +846,48 @@ mod tests {
                 .iter()
                 .any(|e| e.path.ends_with(".wh.f16"))
         );
+    }
+
+    /// The scale volume has exactly the names the probe counts, directories before their entries, no
+    /// path twice and no directory over the 1,024 entries the volume allows.
+    #[test]
+    fn the_scale_volume_has_8192_names_and_the_chain_the_volume_allows() {
+        let entries = layer_steps_entries();
+        let under = |dir: &str| entries.iter().filter(|e| e.path.starts_with(dir)).count();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.path.starts_with("/.layers/00/"))
+                .count(),
+            STEPS_NAMES
+        );
+        let mut seen = std::collections::HashSet::new();
+        for e in &entries {
+            assert!(seen.insert(e.path), "{} twice", e.path);
+            let parent = e.path.rsplit_once('/').map_or("", |(p, _)| p);
+            assert!(parent.is_empty() || seen.contains(parent), "{}", e.path);
+            assert!(e.path.len() <= 506, "{}", e.path);
+        }
+        assert_eq!(under("/.layers/00/etc/"), STEPS_LISTED);
+        for d in ["d00", "d01"] {
+            assert_eq!(under(&format!("/.layers/00/{d}/")), 1024);
+        }
+        let deep = entries
+            .iter()
+            .find(|e| e.path.ends_with("/a/f"))
+            .expect("the file at the end of the chain");
+        assert_eq!(deep.path.len(), 11 + 2 * STEPS_CHAIN + 2);
+        assert_eq!(deep.bytes, Some(STEPS_DEEP_BYTES));
+    }
+
+    /// The scale volume is made on a disk of the size of the probe's (`layer_steps::DISK_BYTES`),
+    /// with the deepest path the volume holds and the directories at its limit of entries.
+    #[test]
+    fn the_scale_volume_is_made_on_a_disk_of_the_probes_size() {
+        let path = temp("steps");
+        let made = make_layer_steps_volume(&path, 128 << 20);
+        let _ = std::fs::remove_file(&path);
+        made.unwrap();
     }
 
     #[test]

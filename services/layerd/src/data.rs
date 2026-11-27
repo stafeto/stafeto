@@ -4,7 +4,7 @@
 //! The calls to the data file service: the session of a native client (init gives the label
 //! `proto_data::SERVICE`, so the service is user 0 there), one call at a time from the loop.
 
-use layerd::volume::{R, Visit, Volume};
+use layerd::volume::{BATCH_BYTES, R, Visit, Volume};
 use proto_data as p;
 use proto_data::Method;
 use proto_wire::{Status, Writer};
@@ -27,7 +27,14 @@ impl Data {
     ) -> R<(sys::Reply, Buf)> {
         let mut w = Writer::new();
         build(&mut w)?;
-        let reply = sys::send(&self.session, w.as_bytes()).map_err(Status::Kernel)?;
+        let reply = match sys::send(&self.session, w.as_bytes()) {
+            Ok(reply) => reply,
+            Err(abi::Error::PeerClosed) => {
+                rt::println!("layerd: the data file service went, ending for a new instance");
+                sys::process_exit(crate::DATA_GONE)
+            }
+            Err(e) => return Err(Status::Kernel(e)),
+        };
         let mut buf = Buf {
             bytes: [0; abi::MESSAGE_MAX],
             len: 0,
@@ -112,6 +119,19 @@ impl Volume for Data {
             visit(e.ino, e.kind, e.name);
         }
         Ok(entries.more)
+    }
+
+    fn read_dir_raw(&mut self, handle: u32, out: &mut [u8; BATCH_BYTES]) -> R<(usize, bool)> {
+        let buf = self.call(|w| p::handle_call(Method::Readdir, handle, w))?;
+        let mut r = p::reply(&buf.bytes[..buf.len])?;
+        let more = match r.u32()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Status::BadSize),
+        };
+        let rest = r.bytes(r.left())?;
+        out[..rest.len()].copy_from_slice(rest);
+        Ok((rest.len(), more))
     }
 
     fn export(&mut self, handle: u32) -> R<Self::Pass> {
