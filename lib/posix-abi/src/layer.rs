@@ -487,7 +487,9 @@ pub fn descriptor_path(target: LayerTarget, out: &mut [u8; WIDE]) -> Result<usiz
     Ok(bytes.len())
 }
 
-/// What a request with a path answered.
+/// What a request with a path answered. The two forms live on the caller's stack for one call (the
+/// layer has no heap to box them in), so the difference in size costs nothing a box would save.
+#[allow(clippy::large_enum_variant)]
 enum Answered {
     /// The service decided: the reply, with the handle it carried.
     Done(Got),
@@ -1103,14 +1105,4 @@ pub fn session_for_exec() -> Option<rt::abi::Handle> {
         return None;
     }
     Some(raw)
-}
-
-/// The directory descriptions of `target` kind that a descriptor of this process names, for the
-/// callers that look for one: the layer target of `fd`.
-pub fn layer_target(fd: c_int) -> Option<LayerTarget> {
-    let fd = u32::try_from(fd).ok()?;
-    match crate::shared::with_fd(fd, |files| files.target(fd).map_err(crate::error)) {
-        Ok(Target::Layer(l)) => Some(l),
-        _ => None,
-    }
 }

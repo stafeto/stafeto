@@ -67,10 +67,6 @@ pub fn close_description(_handle: u32) {}
 
 pub fn mark_inherited(_fds: &[u32]) {}
 
-pub fn layer_target(_fd: c_int) -> Option<LayerTarget> {
-    None
-}
-
 /// # Safety
 /// Startup, on the only thread.
 pub unsafe fn init(_session: Option<Handle<Channel>>) {}
