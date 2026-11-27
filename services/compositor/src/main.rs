@@ -98,6 +98,8 @@ const BUF_AT: usize = 0x11_0000_0000;
 /// page table, the one the service's own buffer of the first revision used
 /// to need, so the gap and the cursor's four pages cost no page-table page.
 const POOL_AT: usize = 0x12_0000_0000;
+// The buffers of every window (48 MiB at 16 windows) end before the pool.
+const _: () = assert!(BUF_AT + MAX_WINDOWS * proto_comp::BUFFERS * BUFFER_MAX as usize <= POOL_AT);
 /// Where the service maps the cursor's picture (source 3 of the driver),
 /// past the pool inside the same 2 MiB span.
 const CURSOR_AT: usize = 0x12_0010_0000;
@@ -1803,7 +1805,7 @@ impl Compositor {
 
     /// The places that cannot take a new window: those whose pages are
     /// still being unmapped.
-    fn taken(&self) -> u8 {
+    fn taken(&self) -> u16 {
         let mut mask = 0;
         for (i, e) in self.extra.iter().enumerate() {
             if e.dying {

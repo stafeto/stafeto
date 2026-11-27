@@ -239,20 +239,20 @@ pub const fn line_bytes(format: u32, width: u32) -> Option<u32> {
     }
 }
 
-/// The id of a window: its place in the service's table (3 bits) and the
+/// The id of a window: its place in the service's table (4 bits) and the
 /// count of windows made at that place (`generation`, 1 to ID_GENERATION_MAX,
 /// above the place), so the id of a window that went is no window's again and
 /// is below 2^27, a positive `i32`. It is what WINDOW_CREATE answers, what LIST
 /// and the events CREATE and CLOSE carry and what MANAGE and an element name.
-pub const ID_GENERATION_MAX: u32 = (1 << 24) - 1;
+pub const ID_GENERATION_MAX: u32 = (1 << 23) - 1;
 pub const fn window_id(place: u32, generation: u32) -> u32 {
-    generation << 3 | place
+    generation << 4 | place
 }
 pub const fn id_place(id: u32) -> u32 {
-    id & 7
+    id & 15
 }
 pub const fn id_generation(id: u32) -> u32 {
-    id >> 3
+    id >> 4
 }
 
 /// The bit the service sends a window's channel when its ring has events;
@@ -1156,7 +1156,7 @@ pub const INTERVAL_MAX: u32 = 4;
 pub const RESET: u32 = 1;
 
 /// The most windows STATS' reply holds records of: MAX_WINDOWS of the service.
-pub const STATS_WINDOWS: usize = 8;
+pub const STATS_WINDOWS: usize = 16;
 /// The buckets of the histogram of the time of a frame: 32 of T/16 up to 2 T,
 /// and one for what is more.
 pub const BUCKETS: usize = 33;
@@ -1811,10 +1811,12 @@ mod tests {
             assert_eq!(back, reply);
             assert_eq!(back.windows(), &windows[..]);
         }
-        // The longest reply is the 464 bytes of the design.
-        assert_eq!(STATS_MAX, 464);
-        let full = StatsReply::new(sample_stats(), &(1..=8).map(window).collect::<Vec<_>>());
-        assert_eq!(reply_bytes(&full.unwrap()).len(), 464);
+        // The longest reply is 720 bytes: 16 records of 32 bytes after 208.
+        assert_eq!(STATS_MAX, 720);
+        // A message is at most 1 024 bytes.
+        assert!(STATS_MAX <= 1_024);
+        let full = StatsReply::new(sample_stats(), &(1..=16).map(window).collect::<Vec<_>>());
+        assert_eq!(reply_bytes(&full.unwrap()).len(), 720);
     }
 
     #[test]
@@ -1833,14 +1835,14 @@ mod tests {
         let mut wrong = bytes.clone();
         wrong[at] = 3;
         assert_eq!(StatsReply::read(&wrong), Err(Status::BadSize));
-        // A count past 8 is more than 464 bytes can hold.
+        // A count past 16 is more than 720 bytes can hold.
         let mut nine = bytes.clone();
-        nine[at] = 9;
-        nine.resize(4 + (COUNTERS + BUCKETS + 1) * 4 + 9 * WINDOW_STATS_LEN, 0);
+        nine[at] = 17;
+        nine.resize(4 + (COUNTERS + BUCKETS + 1) * 4 + 17 * WINDOW_STATS_LEN, 0);
         assert!(nine.len() > STATS_MAX);
         assert_eq!(StatsReply::read(&nine), Err(Status::BadSize));
         assert_eq!(StatsReply::read(&[0; 3]), Err(Status::BadSize));
-        assert!(StatsReply::new(sample_stats(), &[WindowStats::default(); 9]).is_err());
+        assert!(StatsReply::new(sample_stats(), &[WindowStats::default(); 17]).is_err());
         // A refusal is its status alone.
         let refused = proto_wire::reply(code(NOT_ALLOWED));
         assert_eq!(StatsReply::read(&refused), Err(code(NOT_ALLOWED)));
@@ -2089,8 +2091,16 @@ mod tests {
         assert_eq!(id_generation(id), 77);
         assert_ne!(window_id(5, 78), id);
         // The greatest id is a positive i32 and is not NO_WINDOW.
-        let top = window_id(7, ID_GENERATION_MAX);
+        let top = window_id(15, ID_GENERATION_MAX);
         assert!(top < 1 << 27 && top as i32 > 0);
         assert_ne!(top, NO_WINDOW);
+        // The places above 7 and the greatest generation round-trip.
+        assert_eq!(id_place(top), 15);
+        assert_eq!(id_generation(top), ID_GENERATION_MAX);
+        for place in 8..16 {
+            let id = window_id(place, 3);
+            assert_eq!(id_place(id), place);
+            assert_eq!(id_generation(id), 3);
+        }
     }
 }

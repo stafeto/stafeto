@@ -74,17 +74,17 @@ mod imp {
     const REPEAT_PAD: i32 = 2;
     /// The images kept: the screen's, the pointer's picture, the pool of the
     /// window of the first revision and the buffers of the windows: three buffers
-    /// of each of eight windows, 24, are all the service can hold at once, 27 in
-    /// all. A table smaller than the buffers a frame names in turn (eight windows
-    /// of two buffers and the screen are 17) makes every operation of a band
+    /// of each of sixteen windows, 48, are all the service can hold at once, 51 in
+    /// all. A table smaller than the buffers a frame names in turn (sixteen windows
+    /// of two buffers and the screen are 33) makes every operation of a band
     /// make an image again and drop another, which costs a band thousands of ticks
     /// and fragments the arena.
     /// The table is `kept::Kept`: the lookup of a surface the caller numbers is one
     /// comparison when the slot it was last found in still holds it.
-    pub const KEPT: usize = 32;
+    pub const KEPT: usize = 64;
     /// The hints: 0 is the target of the operations, 1 to HINTS - 1 the sources by
     /// the numbers their caller gives them (`NO_HINT` is none).
-    pub const HINTS: usize = 32;
+    pub const HINTS: usize = 64;
     pub const DST_HINT: usize = 0;
     pub const NO_HINT: usize = usize::MAX;
 
