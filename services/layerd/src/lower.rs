@@ -8,7 +8,6 @@
 
 use layerd::volume::{Lower, R};
 use posix_fs::{Directory, FileKind, FsError, PosixFs};
-use proto_fs::NodeInfo;
 use proto_wire::Status;
 
 pub struct Ram {
@@ -42,12 +41,6 @@ fn kind(k: FileKind) -> u32 {
 
 impl Lower for Ram {
     type Dir = Directory;
-
-    /// A link at the end of the path is followed in every case: the session of the RAM file
-    /// service answers the node the link names.
-    fn stat(&mut self, path: &[u8], _no_follow: bool) -> R<NodeInfo> {
-        self.files.stat_information(path).map_err(status)
-    }
 
     fn open_dir(&mut self, path: &[u8]) -> R<Directory> {
         match self.files.opendir(path) {

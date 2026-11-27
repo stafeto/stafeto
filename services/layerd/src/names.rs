@@ -25,7 +25,7 @@ use crate::descriptions::{Lost, Refused, Table};
 use crate::identity::Vouched;
 use crate::index::{Index, Kind};
 use crate::listing;
-use crate::lookup::{Outcome, Walk};
+use crate::lookup::{Outcome, Walk, normalize};
 use crate::scan::{Failure, Progress, Scan};
 use crate::volume::{Lower, R, Volume};
 use posix_perm::{EXEC, READ, WRITE, permits};
@@ -85,6 +85,20 @@ pub struct Core<'a, V: Volume, L: Lower> {
     live: [u8; 16],
     live_len: usize,
     table: Table<L::Dir>,
+}
+
+/// The result of a walk and the plain path it walked, which a redirect carries.
+struct Walked {
+    outcome: Outcome,
+    trailing: bool,
+    path: [u8; 512],
+    len: usize,
+}
+
+impl Walked {
+    fn path(&self) -> &[u8] {
+        &self.path[..self.len]
+    }
 }
 
 /// The mapping of a status of the volume to the status of the names.
@@ -462,10 +476,20 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             .ok_or_else(|| st(proto_fs::NAME_TOO_LONG))
     }
 
-    fn walk(&self, c: &Client<'_>, path: &[u8]) -> (Outcome, bool) {
-        let walk = Walk::new(path);
+    /// The walk of `path` after it is made plain (`lookup::normalize`), with the real identifiers
+    /// when `real` (ACCESS with `ACCESS_REAL`) and the effective ones otherwise.
+    fn walk(&self, c: &Client<'_>, path: &[u8], real: bool) -> Walked {
+        let mut plain = [0u8; 512];
+        let len = normalize(path, &mut plain);
+        let walk = Walk::new(&plain[..len]);
         let trailing = walk.trailing_slash();
-        (walk.run(self.index, c.who.identity(false)).0, trailing)
+        let outcome = walk.run(self.index, c.who.identity(real)).0;
+        Walked {
+            outcome,
+            trailing,
+            path: plain,
+            len,
+        }
     }
 
     /// A failure of a walk, as a status.
@@ -510,15 +534,18 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         w: &mut Writer,
     ) -> R<Done<V::Pass>> {
         self.gate()?;
-        let (outcome, trailing) = self.walk(c, path);
+        let walked = self.walk(c, path, false);
+        let (outcome, trailing) = (walked.outcome, walked.trailing);
         // The names the root passes through are the services' own, writes included. A name of
         // the lower set is read only in this part: the RAM file service would write it below the
-        // layers, so a write or a create is refused here.
+        // layers, so a write or a create is refused here (whether the name exists is the RAM
+        // file service's to say, and a create of a name that may be there is as much a write).
         let writes = n::open_writes(flags);
-        if outcome == Outcome::Lower && writes {
+        let creates = flags & proto_fs::CREATE != 0;
+        if (writes || creates) && matches!(outcome, Outcome::Lower | Outcome::Absent) {
             return Err(st(proto_fs::READ_ONLY_FILESYSTEM));
         }
-        if let Some(done) = Self::redirect_for(outcome, path, w) {
+        if let Some(done) = Self::redirect_for(outcome, walked.path(), w) {
             return done.map(|()| Done::Written);
         }
         let Outcome::Upper(id) = outcome else {
@@ -526,6 +553,10 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         };
         if writes {
             return Err(st(proto_fs::READ_ONLY_FILESYSTEM));
+        }
+        // A create of a name of the layer opens it for reading, and with EXCLUSIVE it is there.
+        if creates && flags & proto_fs::EXCLUSIVE != 0 {
+            return Err(st(proto_fs::ALREADY_EXISTS));
         }
         let is_dir = id == 0 || self.index.entry(id).is_some_and(|e| e.kind == Kind::Dir);
         if is_dir {
@@ -536,10 +567,12 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             if !permits(c.who.identity(false), &attr, READ) {
                 return Err(st(proto_fs::ACCESS_DENIED));
             }
-            let handle = self.table.make(c.owner, id).map_err(|r| match r {
-                Refused::PerSession => st(proto_fs::TOO_MANY_OPEN_FILES),
-                Refused::Full => st(proto_fs::TOO_MANY_FILES_IN_SYSTEM),
-            })?;
+            // Every limit of the descriptions, of the session, of the process and of the service,
+            // is the service's own table: ENFILE.
+            let handle = self
+                .table
+                .make(c.owner, c.who.pid, id)
+                .map_err(|_: Refused| st(proto_fs::TOO_MANY_FILES_IN_SYSTEM))?;
             OpenAnswer::Directory { handle }.write(w)?;
             return Ok(Done::Written);
         }
@@ -563,32 +596,25 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         Ok(Done::Pass(pass))
     }
 
-    /// STAT: the node information of the name; the redirect for the names the service has no
-    /// attributes of.
-    pub fn stat(&mut self, c: &Client<'_>, flags: u32, path: &[u8], w: &mut Writer) -> R<()> {
+    /// STAT: the node information of a name of the layer. A name of the lower set, and the names
+    /// the root passes through, are a redirect: the RAM file service answers with the rights of the
+    /// caller's own session and follows the links as the flags say.
+    pub fn stat(&mut self, c: &Client<'_>, _flags: u32, path: &[u8], w: &mut Writer) -> R<()> {
         self.gate()?;
-        let (outcome, trailing) = self.walk(c, path);
-        match outcome {
-            Outcome::PassThrough { .. } => Self::redirect_for(outcome, path, w).unwrap_or(Ok(())),
-            Outcome::Lower => {
-                let mut info = self.lower.stat(path, flags & n::STAT_NO_FOLLOW != 0)?;
-                if trailing && info.kind != 1 {
-                    return Err(st(proto_fs::NOT_DIRECTORY));
-                }
-                info.device = 0;
-                n::write_info(&info, w)
-            }
-            Outcome::Upper(id) => {
-                let mut vp = [0u8; 512];
-                let len = self.vpath(id, &mut vp)?;
-                let stat = self.volume.stat(&vp[..len]).map_err(from_volume)?;
-                if trailing && stat.kind != d::KIND_DIRECTORY {
-                    return Err(st(proto_fs::NOT_DIRECTORY));
-                }
-                n::write_info(&node_from(&stat)?, w)
-            }
-            _ => Err(Self::refusal(outcome)),
+        let walked = self.walk(c, path, false);
+        if let Some(done) = Self::redirect_for(walked.outcome, walked.path(), w) {
+            return done;
         }
+        let Outcome::Upper(id) = walked.outcome else {
+            return Err(Self::refusal(walked.outcome));
+        };
+        let mut vp = [0u8; 512];
+        let len = self.vpath(id, &mut vp)?;
+        let stat = self.volume.stat(&vp[..len]).map_err(from_volume)?;
+        if walked.trailing && stat.kind != d::KIND_DIRECTORY {
+            return Err(st(proto_fs::NOT_DIRECTORY));
+        }
+        n::write_info(&node_from(&stat)?, w)
     }
 
     /// ACCESS: whether the bits are allowed; a name of the lower set is the RAM file service's.
@@ -601,12 +627,13 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         w: &mut Writer,
     ) -> R<()> {
         self.gate()?;
-        let (outcome, _) = self.walk(c, path);
-        if let Some(done) = Self::redirect_for(outcome, path, w) {
+        // The path is walked with the identifiers the bits are checked with.
+        let walked = self.walk(c, path, flags & d::ACCESS_REAL != 0);
+        if let Some(done) = Self::redirect_for(walked.outcome, walked.path(), w) {
             return done;
         }
-        let Outcome::Upper(id) = outcome else {
-            return Err(Self::refusal(outcome));
+        let Outcome::Upper(id) = walked.outcome else {
+            return Err(Self::refusal(walked.outcome));
         };
         if bits & WRITE != 0 {
             return Err(st(proto_fs::READ_ONLY_FILESYSTEM));
@@ -628,11 +655,11 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     /// READLINK: the layer of the user holds no link in this part, so a name of it is no link.
     pub fn readlink(&mut self, c: &Client<'_>, path: &[u8], w: &mut Writer) -> R<()> {
         self.gate()?;
-        let (outcome, _) = self.walk(c, path);
-        if let Some(done) = Self::redirect_for(outcome, path, w) {
+        let walked = self.walk(c, path, false);
+        if let Some(done) = Self::redirect_for(walked.outcome, walked.path(), w) {
             return done;
         }
-        match outcome {
+        match walked.outcome {
             Outcome::Upper(_) => Err(st(proto_fs::INVALID_ARGUMENT)),
             other => Err(Self::refusal(other)),
         }
@@ -681,6 +708,8 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             &mut desc.lower,
             &mut reply,
         )?;
+        // What the replies have given out, which SEEK_DIR may go back to and not past.
+        desc.given = desc.given.max(desc.position);
         let len = reply.len();
         Ok((reply.finish(listed.more, listed.cursor)?, len))
     }
@@ -696,7 +725,13 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         self.gate()?;
         let Core { table, lower, .. } = self;
         let desc = table.get(owner, handle).map_err(Self::lost)?;
-        listing::seek(lower, &mut desc.position, &mut desc.lower, cursor)
+        listing::seek(
+            lower,
+            &mut desc.position,
+            desc.given,
+            &mut desc.lower,
+            cursor,
+        )
     }
 
     pub fn close(&mut self, owner: u64, handle: u32) -> R<()> {

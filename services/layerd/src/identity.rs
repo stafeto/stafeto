@@ -121,6 +121,12 @@ pub(crate) fn tests_who(uid: u32) -> WhoReply {
     tests::who(7, 1, 1, uid)
 }
 
+/// The same for the process `pid`.
+#[cfg(test)]
+pub(crate) fn tests_who_of(pid: u32, uid: u32) -> WhoReply {
+    tests::who(pid, 2, 1, uid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

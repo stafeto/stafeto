@@ -1,17 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The walk of a path through the index (sections 4 and 5.1): a probe for each component, at most
-//! `STEP` components in one step of the service (a path of 253 components is 16 steps). The walk
-//! decides which service the path belongs to:
+//! The walk of a path through the index (sections 4 and 5.1): a probe for each component. `STEP`
+//! (16) components is the measure of the walk's work: a step of the walk takes that many, and the
+//! whole path runs in one request of the service (a path of 253 components is 16 steps of the walk
+//! in one request). The walk decides which service the path belongs to:
 //!
 //! - a name of the layer of the user (`Upper`): a directory or a file of the live layer;
 //! - the mark of deletion of a name, or a name below an opaque directory that the layer does not
 //!   hold (`Absent`): ENOENT, whatever the lower set has;
 //! - a name the index does not hold (`Lower`): the whole path goes to the RAM file service, which
-//!   checks the rights on the lower attributes. A path with a `..` that comes after the walk left
-//!   the index goes the same way whole: `..` is lexical only inside the indexed part;
+//!   checks the rights on the lower attributes;
 //! - a name below the root that `PASS_THROUGH` lists (`PassThrough`).
+//!
+//! A path is made plain before the walk (`normalize`): `.` and empty components go and `..` takes
+//! the component before it, lexically, so the walk meets no `..` and the path a redirect carries has
+//! none either (a `..` the walk met after it left the index would let `/bin/../etc/x` reach a name
+//! the layer deleted or shadowed). The departure: a lower symbolic link to a directory is not
+//! looked through for `..` (`/lowlink/..` is the parent of the link's name, not of its target); a
+//! later part makes the RAM file service answer `..` with a redirect to route by the path, and
+//! removes this.
 //!
 //! Each directory of the layer the walk goes through is checked for the right to search with
 //! `posix_perm::permits` on the attributes the index keeps (`Denied` is EACCES). The service checks
@@ -22,8 +30,42 @@
 use crate::index::{Index, Kind, OPAQUE};
 use posix_perm::{EXEC, Identity, permits};
 
-/// The components one step takes at most.
+/// The components one step of the walk takes: a measure of its work.
 pub const STEP: usize = 16;
+
+/// The path made plain: `.` and empty components dropped, `..` taking the component before it (at
+/// the root it takes nothing), and a slash at the end kept when the path ended with a slash, `.` or
+/// `..` (a directory is meant). The bytes at the start of `out` and their count; the result is never
+/// longer than `path`, so 512 bytes hold every path of the protocol.
+pub fn normalize(path: &[u8], out: &mut [u8; 512]) -> usize {
+    let mut len = 0;
+    let mut last: &[u8] = b"";
+    for part in path.split(|&b| b == b'/') {
+        match part {
+            b"" => continue,
+            b"." => {}
+            b".." => len = out[..len].iter().rposition(|&b| b == b'/').unwrap_or(0),
+            name => {
+                if len + 1 + name.len() <= out.len() {
+                    out[len] = b'/';
+                    out[len + 1..len + 1 + name.len()].copy_from_slice(name);
+                    len += 1 + name.len();
+                }
+            }
+        }
+        last = part;
+    }
+    if len == 0 {
+        out[0] = b'/';
+        return 1;
+    }
+    let directory = path.last() == Some(&b'/') || last == b"." || last == b"..";
+    if directory && len < out.len() {
+        out[len] = b'/';
+        len += 1;
+    }
+    len
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -186,6 +228,55 @@ mod tests {
 
     fn id(ix: &Index, parent: u32, name: &[u8]) -> u32 {
         ix.lookup(parent, name).unwrap().0
+    }
+
+    fn plain(path: &[u8]) -> std::vec::Vec<u8> {
+        let mut out = [0u8; 512];
+        let n = normalize(path, &mut out);
+        out[..n].to_vec()
+    }
+
+    #[test]
+    fn a_path_is_made_plain_before_the_walk() {
+        for (path, want) in [
+            ("/", "/"),
+            ("//", "/"),
+            ("/a/b", "/a/b"),
+            ("/a//b/./c", "/a/b/c"),
+            ("/a/b/..", "/a/"),
+            ("/a/b/../c", "/a/c"),
+            ("/bin/../etc/x", "/etc/x"),
+            ("/..", "/"),
+            ("/../a", "/a"),
+            ("/a/../..", "/"),
+            ("/a/", "/a/"),
+            ("/a/.", "/a/"),
+            ("/a/./", "/a/"),
+            ("/tmp/..", "/"),
+        ] {
+            assert_eq!(plain(path.as_bytes()), want.as_bytes(), "{path}");
+        }
+        // Never longer than the path.
+        let long: std::vec::Vec<u8> = (0..255).flat_map(|_| *b"/a").collect();
+        assert!(plain(&long).len() <= long.len());
+    }
+
+    #[test]
+    fn a_dot_dot_after_a_lower_name_meets_the_marks_and_the_search_checks_of_the_layer() {
+        let ix = world();
+        let walk_plain = |path: &[u8], uid: u32| {
+            let mut out = [0u8; 512];
+            let n = normalize(path, &mut out);
+            walk(&ix, &out[..n], uid)
+        };
+        // /bin is the lower set's; /etc/motd is deleted and /priv is closed in the layer.
+        assert_eq!(walk_plain(b"/bin/../etc/motd", 0), Outcome::Absent);
+        assert_eq!(walk_plain(b"/bin/../priv/x", 1000), Outcome::Denied);
+        assert_eq!(walk_plain(b"/tmp/../etc/motd", 0), Outcome::Absent);
+        assert!(matches!(
+            walk_plain(b"/data/../etc/hostname", 0),
+            Outcome::Upper(_)
+        ));
     }
 
     #[test]

@@ -5,7 +5,6 @@
 
 use crate::volume::{Lower, R, Visit, Volume};
 use proto_data as d;
-use proto_fs::{NodeInfo, Timestamp};
 use proto_wire::Status;
 use std::collections::BTreeMap;
 use std::string::String;
@@ -350,31 +349,6 @@ impl FakeLower {
 
 impl Lower for FakeLower {
     type Dir = LowerDir;
-
-    fn stat(&mut self, path: &[u8], _no_follow: bool) -> R<NodeInfo> {
-        let path = if path.len() > 1 {
-            path.strip_suffix(b"/").unwrap_or(path)
-        } else {
-            path
-        };
-        let (kind, ino) = *self.nodes.get(path).ok_or(st(proto_fs::NO_ENTRY))?;
-        Ok(NodeInfo {
-            kind,
-            permissions: 0o755,
-            device: 1,
-            special_device: 0,
-            inode: ino,
-            links: 1,
-            uid: 0,
-            gid: 0,
-            size: 7,
-            block_size: 4096,
-            blocks: 1,
-            access_time: Timestamp::ZERO,
-            modify_time: Timestamp::ZERO,
-            change_time: Timestamp::ZERO,
-        })
-    }
 
     fn open_dir(&mut self, path: &[u8]) -> R<LowerDir> {
         match self.nodes.get(path) {

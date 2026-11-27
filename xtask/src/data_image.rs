@@ -238,7 +238,7 @@ const UPPER_INO_TAG: u64 = 1 << 62;
 ///
 /// Under `/.layers/00`: `etc/.wh.layer-hidden` (a mark of deletion of a lower file), `etc/layer-note`
 /// (a name the lower set does not have), `etc/layer-own` (0640, owner 1000:1000, the number
-/// `UPPER_INO_TAG | 5`), `lower/shadowed` (shadows the lower file of the same name) with
+/// `UPPER_INO_TAG | 5`), `etc/layer-secret` (0600, owner 0), `lower/shadowed` (shadows the lower file of the same name) with
 /// `lower/.wh.hidden`, `lowdir` (the marker `.wh..wh..opq` over a lower directory, and its own
 /// `u1`) and `private` (0700, owner 0, with `f`).
 pub const LAYER_VOLUME_ENTRIES: &[LayerEntry] = &[
@@ -263,6 +263,7 @@ pub const LAYER_VOLUME_ENTRIES: &[LayerEntry] = &[
         LAYER_OWN_BYTES,
     )
     .numbered(UPPER_INO_TAG | 5),
+    LayerEntry::file("/.layers/00/etc/layer-secret", 0o600, 0, 0, b"secret\n"),
     LayerEntry::dir("/.layers/00/lower", 0o755, 0, 0),
     LayerEntry::file("/.layers/00/lower/.wh.hidden", 0o644, 0, 0, b""),
     LayerEntry::file(

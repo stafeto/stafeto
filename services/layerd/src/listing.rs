@@ -13,7 +13,9 @@
 //! so the cost of a step does not depend on how many names the layer deletes. The position of a
 //! description is (stage, position in the stage): in stage 0 the number of the slot of the index
 //! after the last entry given plus two (positions 0 and 1 are `.` and `..`), in stage 1 the number
-//! of entries of the lower set taken so far.
+//! of entries of the lower set taken so far. A reply with `more` and no entry always moved the
+//! position on (the slots it looked at, or the lower entries it took and dropped), so a program
+//! that asks again reaches the end.
 
 use crate::descriptions::Position;
 use crate::index::{Index, Kind, NextChild, OPAQUE};
@@ -181,24 +183,29 @@ pub fn rewind<L: Lower>(
     position: &mut Position,
     open: &mut Option<L::Dir>,
 ) -> R<()> {
-    seek(lower, position, open, 0)
+    seek(lower, position, Position::default(), open, 0)
 }
 
-/// Puts a description at a cursor a reply gave. A stage other than 0 and 1 is INVALID_ARGUMENT.
+/// Puts a description at a cursor a reply gave. A stage other than 0 and 1 is INVALID_ARGUMENT, and
+/// so is a position past `given`, the furthest the replies of this description have gone: the
+/// cursor of a reply is what the service names, and a number the replies never gave points into
+/// the table or the lower directory at a place nobody asked to see.
 pub fn seek<L: Lower>(
     lower: &mut L,
     position: &mut Position,
+    given: Position,
     open: &mut Option<L::Dir>,
     cursor: u64,
 ) -> R<()> {
     let (stage, at) = proto_fs::names::split_cursor(cursor);
-    if stage > 1 {
+    let wanted = Position { stage, at };
+    if stage > 1 || wanted > given {
         return Err(Status::from_code(proto_fs::INVALID_ARGUMENT));
     }
     // The lower directory is read again from its start up to `at`, when the next request asks.
     if let Some(d) = open.take() {
         lower.close_dir(d);
     }
-    *position = Position { stage, at };
+    *position = wanted;
     Ok(())
 }

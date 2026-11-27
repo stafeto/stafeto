@@ -307,6 +307,19 @@ fn status_is(opened: &Opened, want: u32) -> bool {
     matches!(opened, Opened::Status(s) if *s == want)
 }
 
+/// Whether STAT of `path` answers a redirect to the RAM file service with the plain `want`.
+fn stat_redirect_is(s: &Handle<Channel>, path: &str, want: &str) -> bool {
+    let mut w = Writer::new();
+    if n::write_stat(0, path.as_bytes(), &mut w).is_err() {
+        return false;
+    }
+    let Some(a) = call(s, w.as_bytes(), rt::handle::Outgoing::new()) else {
+        return false;
+    };
+    matches!(proto_fs::Redirect::read_reply(a.all()),
+        Some(Ok(r)) if r.target == proto_fs::REDIRECT_RAM && r.path == want.as_bytes())
+}
+
 fn redirect_is(opened: &Opened, path: &str) -> bool {
     matches!(opened, Opened::Redirect { target, path: p, len }
         if *target == proto_fs::REDIRECT_RAM && &p[..*len] == path.as_bytes())
@@ -351,9 +364,9 @@ extern "C" fn main(
                 if s.flags == 0
                     && s.live == 0
                     && s.frozen == 0
-                    && s.added == 9
+                    && s.added == 10
                     && s.deleted == 2
-                    && s.names == 11 =>
+                    && s.names == 12 =>
             {
                 Ok(())
             }
@@ -416,12 +429,8 @@ extern "C" fn main(
     // Numbers.
     t.check(
         "stat numbers",
-        match (
-            stat(&names, "/etc/layer-own"),
-            stat(&names, "/lower/keep"),
-            stat(&names, "/"),
-        ) {
-            (Ok(own), Ok(keep), Ok(root_info)) => {
+        match (stat(&names, "/etc/layer-own"), stat(&names, "/")) {
+            (Ok(own), Ok(root_info)) => {
                 if own.inode != (UPPER_INO_TAG | 5)
                     || own.device != 0
                     || own.uid != 1000
@@ -432,12 +441,6 @@ extern "C" fn main(
                     Err(format_args!(
                         "the file of the layer: number, device, owner, mode or size"
                     ))
-                } else if keep.inode == 0
-                    || keep.inode & (UPPER_INO_TAG | 1 << 63) != 0
-                    || keep.device != 0
-                    || keep.kind != 2
-                {
-                    Err(format_args!("the lower file: number or device"))
                 } else if root_info.kind != 1 || root_info.device != 0 {
                     Err(format_args!("the root"))
                 } else {
@@ -445,6 +448,19 @@ extern "C" fn main(
                 }
             }
             _ => Err(format_args!("a stat failed")),
+        },
+    );
+    // A lower name is not stat'ed here: the answer is a redirect, and the RAM file service gives
+    // the numbers and checks the rights of the caller's own session.
+    t.check(
+        "a stat of a lower name is a redirect",
+        if stat_redirect_is(&names, "/lower/keep", "/lower/keep")
+            && stat_redirect_is(&names, "/bin", "/bin")
+            && stat_redirect_is(&names, "/bin/../lower/keep", "/lower/keep")
+        {
+            Ok(())
+        } else {
+            Err(format_args!("not a redirect to the RAM file service"))
         },
     );
     // The merged listing of /etc: the layer's names, the lower names, no mark of deletion.
@@ -496,6 +512,20 @@ extern "C" fn main(
             Ok(())
         } else {
             Err(format_args!("a deleted name opens or stats"))
+        }
+    });
+    // `..` is resolved before the walk: a path through a lower name meets the marks and the
+    // shadows of the layer all the same, and a redirect carries the path plain.
+    t.check("a dot dot is resolved before the walk", {
+        let hidden = open(&names, proto_fs::READ_ONLY, "/bin/../etc/layer-hidden");
+        let below = open(&names, proto_fs::READ_ONLY, "/tmp/../lowdir/l1");
+        let kept = open(&names, proto_fs::READ_ONLY, "/bin/../lower/./keep");
+        if !status_is(&hidden, proto_fs::NO_ENTRY) || !status_is(&below, proto_fs::NO_ENTRY) {
+            Err(format_args!("a deleted name opens through a dot dot"))
+        } else if !redirect_is(&kept, "/lower/keep") {
+            Err(format_args!("the redirect does not carry the plain path"))
+        } else {
+            expect_bytes(&data, &names, "/bin/../lower/shadowed", b"upper shadow\n")
         }
     });
     t.check(
@@ -600,6 +630,13 @@ extern "C" fn main(
             _ => Err(format_args!("not a pass")),
         },
     );
+    t.check(
+        "the superuser reads a closed file",
+        match open(&names, proto_fs::READ_ONLY, "/etc/layer-secret") {
+            Opened::Pass(_) => Ok(()),
+            _ => Err(format_args!("not a pass")),
+        },
+    );
     // User 1000 from here on, on the old session and on a new one.
     // SAFETY: plain calls of relibc.
     let dropped =
@@ -627,6 +664,7 @@ extern "C" fn main(
         t.check(shown, {
             let a = open(s, proto_fs::READ_ONLY, "/private/f");
             let b = open(s, proto_fs::READ_ONLY, "/private/lower");
+            let dots = open(s, proto_fs::READ_ONLY, "/bin/../private/lower");
             let c = open(
                 s,
                 proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY,
@@ -634,6 +672,7 @@ extern "C" fn main(
             );
             if status_is(&a, proto_fs::ACCESS_DENIED)
                 && status_is(&b, proto_fs::ACCESS_DENIED)
+                && status_is(&dots, proto_fs::ACCESS_DENIED)
                 && status_is(&c, proto_fs::ACCESS_DENIED)
                 && stat(s, "/private/f") == Err(proto_fs::ACCESS_DENIED)
             {
@@ -645,6 +684,30 @@ extern "C" fn main(
             }
         });
     }
+    t.check("a file whose own mode denies the read is denied", {
+        let a = open(&names, proto_fs::READ_ONLY, "/etc/layer-secret");
+        if status_is(&a, proto_fs::ACCESS_DENIED) {
+            Ok(())
+        } else {
+            Err(format_args!(
+                "a 0600 file of the superuser opens for user 1000"
+            ))
+        }
+    });
+    // A lower directory closed to the user (0700, the lower set's rights) is the RAM file
+    // service's to refuse: the layer answers a redirect and its session checks the rights.
+    t.check(
+        "a closed lower directory is left to the RAM file service",
+        if redirect_is(
+            &open(&names, proto_fs::READ_ONLY, "/lowpriv/f"),
+            "/lowpriv/f",
+        ) && stat_redirect_is(&names, "/lowpriv/f", "/lowpriv/f")
+        {
+            Ok(())
+        } else {
+            Err(format_args!("not a redirect"))
+        },
+    );
     t.check(
         "the owner reads the file of the layer",
         expect_bytes(

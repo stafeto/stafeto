@@ -56,6 +56,8 @@ const STOPPED: u64 = 5;
 /// the layered root, and the root's own. A session of a process that never sends a request holds
 /// a place of the table of identities only.
 const SESSIONS: usize = 192;
+/// The sessions one process holds at most (one for the process and some for its clones).
+const SESSIONS_PER_PROCESS: usize = 16;
 
 /// The label of the notification the service sends itself for the next step of the build.
 const LABEL_STEP: u64 = 0x6c61_7967_0001;
@@ -240,6 +242,8 @@ fn main(_: u64) -> u64 {
 /// changes.
 struct Record {
     label: u64,
+    /// The process the session was made for (Vouch's pid): the share of sessions it may hold.
+    pid: u32,
     binding: Binding,
     identity: Option<Handle<Channel>>,
 }
@@ -312,7 +316,15 @@ impl Layerd {
         let Some(who) = self.notary.vouch(&brought).as_ref().and_then(vouched_from) else {
             return st(proto_fs::ACCESS_DENIED);
         };
-        let Some(place) = self.sessions.iter().position(Option::is_none) else {
+        // A process takes `SESSIONS_PER_PROCESS` of the table and no more, so that none fills it.
+        let held = self
+            .sessions
+            .iter()
+            .flatten()
+            .filter(|rec| rec.pid == who.pid)
+            .count();
+        let place = self.sessions.iter().position(Option::is_none);
+        let (true, Some(place)) = (held < SESSIONS_PER_PROCESS, place) else {
             return st(proto_fs::TOO_MANY_FILES_IN_SYSTEM);
         };
         let label = OWN | self.next_label;
@@ -327,6 +339,7 @@ impl Layerd {
         self.next_label += 1;
         self.sessions[place] = Some(Record {
             label,
+            pid: who.pid,
             binding: Binding::Bound(who),
             identity: Some(brought),
         });
@@ -534,7 +547,22 @@ impl Layerd {
     }
 
     /// LIST, STATUS and the methods of proto_layer that name a layer.
-    fn layer(&mut self, method: l::Method, r: &mut Request<'_>) -> Answer {
+    fn layer(&mut self, method: l::Method, label: u64, r: &mut Request<'_>) -> Answer {
+        // The methods that name a layer are the superuser's (NOT_ALLOWED for any other, as for the
+        // ones this part serves later), whatever layer they name.
+        if !matches!(method, l::Method::List | l::Method::Status) {
+            if let Some(place) = self.slot_of(label) {
+                self.look(place);
+            }
+            let root = self
+                .slot_of(label)
+                .and_then(|p| self.sessions[p].as_ref())
+                .and_then(|rec| rec.binding.bound())
+                .is_some_and(|v| v.ids.euid == 0);
+            if !root {
+                return st(l::NOT_ALLOWED);
+            }
+        }
         match method {
             l::Method::List => {
                 let Ok(first) = l::read_word(r.body()) else {
@@ -619,7 +647,7 @@ impl Service<0> for Layerd {
             return if m == l::Method::Session {
                 st(proto_fs::INVALID_ARGUMENT)
             } else {
-                self.layer(m, r)
+                self.layer(m, r.label(), r)
             };
         }
         match NameMethod::from_number(method) {

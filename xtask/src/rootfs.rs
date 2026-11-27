@@ -2630,6 +2630,20 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                     ROOT,
                     Source::Bytes("layer-lower-shadowed", b"lower shadowed\n"),
                 ),
+                // A lower directory closed to other users (0700).
+                RootFile {
+                    path: "/lowpriv",
+                    mode: 0o700,
+                    uid: 0,
+                    gid: 0,
+                    source: None,
+                },
+                of(
+                    "/lowpriv/f",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("layer-lowpriv-f", b"lower closed\n"),
+                ),
                 dir("/private"),
                 of(
                     "/private/lower",

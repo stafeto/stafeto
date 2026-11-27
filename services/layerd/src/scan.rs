@@ -103,7 +103,11 @@ impl Scan {
         self.tail += 1;
     }
 
-    /// The path of a directory of the layer on the volume: `root` and the path inside the layer.
+    /// The path of a directory of the layer on the volume, `root` (`/.layers/NN`) and the path
+    /// inside the layer in 512 bytes, the volume's own limit with room to spare (`proto_data::MAX_PATH`
+    /// is 506). A directory whose path does not fit is NAME_TOO_LONG, which fails the
+    /// build (`Failure::Volume`), and so does a name the volume would refuse; the names the layer
+    /// holds were made through the volume, so they fit it.
     pub fn volume_path(index: &Index, root: &[u8], id: u32, out: &mut [u8; 512]) -> Option<usize> {
         let n = root.len();
         out.get_mut(..n)?.copy_from_slice(root);

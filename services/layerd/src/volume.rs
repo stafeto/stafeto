@@ -42,8 +42,6 @@ pub trait Volume {
 pub trait Lower {
     type Dir;
 
-    /// The node information of `path`; a link at the end of it is followed unless `no_follow`.
-    fn stat(&mut self, path: &[u8], no_follow: bool) -> R<proto_fs::NodeInfo>;
     fn open_dir(&mut self, path: &[u8]) -> R<Self::Dir>;
     /// The next entry: the number, the kind of `NodeInfo` and the name copied to `name`; None at
     /// the end. `.` and `..` are among them.

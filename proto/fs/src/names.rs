@@ -206,11 +206,11 @@ const OPEN_FLAGS: u32 = OPEN_MODE
     | crate::APPEND
     | crate::NO_FOLLOW;
 
-/// Whether the flags of an OPEN ask for a change: an access for writing, or a create, a cut or an
-/// append.
+/// Whether the flags of an OPEN write: an access for writing, a cut, or the legacy flag that stands
+/// for a create, a cut and an append at once. An append with read access writes nothing, and a
+/// create (`CREATE`) writes only when the name is not there: the service decides that one.
 pub const fn open_writes(flags: u32) -> bool {
-    flags & OPEN_MODE != crate::READ_ONLY
-        || flags & (crate::CHANGES | crate::CREATE | crate::TRUNCATE | crate::APPEND) != 0
+    flags & OPEN_MODE != crate::READ_ONLY || flags & (crate::CHANGES | crate::TRUNCATE) != 0
 }
 
 /// A path of a request: BAD_SIZE for one that is empty, relative, over `MAX_PATH` bytes or holds a
@@ -708,12 +708,14 @@ mod tests {
         assert!(!open_writes(
             crate::READ_ONLY | crate::DIRECTORY_ONLY | crate::NO_FOLLOW
         ));
+        // A create of a name that may be there and an append with read access write nothing by
+        // themselves: the service decides the first, the second is a read.
+        assert!(!open_writes(crate::READ_ONLY | crate::CREATE));
+        assert!(!open_writes(crate::READ_ONLY | crate::APPEND));
         for flags in [
             crate::WRITE_ONLY,
             crate::READ_WRITE,
-            crate::CREATE,
             crate::TRUNCATE,
-            crate::APPEND,
             crate::CHANGES,
         ] {
             assert!(open_writes(flags), "{flags}");

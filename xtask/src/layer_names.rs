@@ -33,7 +33,7 @@ const DISK_BYTES: u64 = 64 << 20;
 const LIMIT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// The checks of the probe, in the order it runs them: the line of each is `layer-names: <check> ok`.
-pub const CHECKS: [&str; 18] = [
+pub const CHECKS: [&str; 23] = [
     "sessions",
     "status",
     "a lower file is a redirect",
@@ -41,15 +41,20 @@ pub const CHECKS: [&str; 18] = [
     "the pass of a file of the layer",
     "a file of the layer shadows the lower one",
     "stat numbers",
+    "a stat of a lower name is a redirect",
     "merged listing of a directory",
     "a name of the layer is listed once over the lower one",
     "the names a layer deleted are gone",
+    "a dot dot is resolved before the walk",
     "an opaque directory lists only its own names",
     "rewind fstat and close",
     "read only",
     "the superuser searches a closed directory",
+    "the superuser reads a closed file",
     "search denied for user 1000 on the session of before",
     "search denied for user 1000 on a new session",
+    "a file whose own mode denies the read is denied",
+    "a closed lower directory is left to the RAM file service",
     "the owner reads the file of the layer",
     "a lower file stays reachable",
 ];
