@@ -936,12 +936,13 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                 };
                 let us = |ns: i128| ns / 1_000;
                 rt::println!(
-                    "datafs: lease lapse {}: last answer {} us after the waiter was queued, lapse {} us after the expiry, waiter chosen {} us after the lapse, waiter job {} us, {reads} disk reads, {writes} disk writes",
+                    "datafs: lease lapse {}: last answer {} us after the waiter was queued, lapse {} us after the expiry, waiter chosen {} us after the lapse, waiter job {} us, {reads} disk reads, {writes} disk writes, {} tail steps",
                     l.count,
                     us(i128::from(l.answered) - i128::from(l.queued)),
                     us(i128::from(l.at) - i128::from(l.expiry)),
                     us(i128::from(l.ran) - i128::from(l.at)),
                     us(i128::from(now) - i128::from(l.ran)),
+                    l.steps,
                 );
             }
             // The gap of a lease a part ran under counts from the answer to it, and the request
@@ -962,6 +963,13 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
                 STOP_JOBS.fetch_add(1, Release);
             }
             let _ = sys::notify(wake, 1);
+            // One step of a copy of a tail after each job: the jobs of other files wait for at
+            // most one step, and a job that waits for the file itself is not left behind.
+            if let Some(fs) = volume.as_mut()
+                && !STOPPING.load(Acquire)
+            {
+                server.tail_step(fs);
+            }
         }
         // Jobs that wait for a lease run when it lapses: the worker wakes at the first expiry.
         // (Without the timer the heartbeat of the request thread wakes the worker for a job that
@@ -977,6 +985,12 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             loop {
                 let _ = sys::receive(&kicks);
             }
+        }
+        // The queue is empty (or holds only jobs that wait for a copy): the copy of a tail goes on.
+        if let Some(fs) = volume.as_mut()
+            && server.tail_step(fs)
+        {
+            continue;
         }
         // The queue is empty. The first job after READY makes the hidden directory of the orphans: the
         // commit takes a block, and the first allocation of a volume scans the allocator's window (a
@@ -1393,6 +1407,11 @@ fn next_job(server: &mut Server, volume: &mut Option<Volume>) -> Option<usize> {
     // The leases whose time is over end first, except those whose next part is queued.
     if !STOPPING.load(Acquire) {
         server.leases_sweep(fs, &seen[..n]);
+        // The jobs that would flush a file with the tail of a rewrite wait for its copy, which the
+        // loop runs in steps (`Server::tail_step`).
+        server.tails_start(fs, &seen[..n]);
+    } else {
+        server.tails_finish(fs);
     }
     let choice = server.pick(&seen[..n]);
     // The jobs that wait for a lease are marked, so that the request thread and the heartbeat see them.

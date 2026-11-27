@@ -41,13 +41,13 @@
 //! job of another file that runs between two parts.
 //!
 //! `T_tail` is the cost of the tail of a rewrite that stopped. When a call that rewrites a file from
-//! the middle lapses, the first seek, read, sync or close of the file's shared handle makes littlefs
-//! write out everything past the last byte written (`lfs_file_flush`: a copy of
-//! `size - stop_position`) in one job. The copy has no bound of its own but `FILE_MAX`, it is about
-//! a second per MiB of the file past the stopped write on QEMU (a Mac with Apple silicon; the GitHub
-//! runners take 2.6 times as long), and it stalls the jobs of other files too, since the worker is
-//! one thread. A file that is only appended to or made again has no tail. The root fix, a copy in
-//! slices, is issue #626. The lapse itself comes within the wake of the timer after the gap, and the
+//! the middle lapses, littlefs has to write out everything past the last byte written
+//! (`lfs_file_flush`: a copy of `size - stop_position`). The copy has no bound of its own but
+//! `FILE_MAX`, it is about a second per MiB of the file past the stopped write on QEMU (a Mac with
+//! Apple silicon; the GitHub runners take 2.6 times as long). The service runs it in steps of
+//! `TAIL_SLICE_BLOCKS` blocks between its jobs (`tail.rs`, issue #626): the waiter for the file waits
+//! for all the steps, and the jobs of other files for one. A file that is only appended to or made
+//! again has no tail. The lapse itself comes within the wake of the timer after the gap, and the
 //! waiter is chosen at once after it (`Server::lapse`).
 
 use super::*;
@@ -136,6 +136,9 @@ pub struct Lapse {
     pub count: u64,
     /// The record of the lapse was told (`lapse_told`).
     pub told: bool,
+    /// The steps of a copy of a tail (`tail.rs`) the worker ran between the lapse and the choice
+    /// of the waiter: the waiter of a file with a tail waits for them.
+    pub steps: u32,
 }
 
 impl Lapse {
@@ -148,6 +151,7 @@ impl Lapse {
         ran: 0,
         count: 0,
         told: false,
+        steps: 0,
     };
 }
 
@@ -185,6 +189,9 @@ struct Wants {
     /// The lease the job runs under (a live lease of its session).
     holder: Option<usize>,
     takes: bool,
+    /// The node whose unfinished tail (`tail.rs`) the job would flush, and whether the job is a
+    /// write that goes on where the last one stopped, which does not flush it.
+    flushes: Option<(usize, bool)>,
 }
 
 impl Server {
@@ -387,12 +394,18 @@ impl Server {
                         ran: 0,
                         count: self.lapse.count + 1,
                         told: false,
+                        steps: 0,
                     };
                 }
                 if l.sync && l.write {
                     let _ = self.sync_node(fs, usize::from(l.node));
                 }
                 self.lease_end(fs, slot);
+                // The writer is gone for now: nobody goes on where it stopped, so the tail of a
+                // rewrite is copied at once, in steps (`tail.rs`).
+                if l.write {
+                    self.tail_begin_unleased(fs, usize::from(l.node));
+                }
             }
         }
     }
@@ -467,6 +480,12 @@ impl Server {
         self.job_queued = ns;
     }
 
+    /// The node whose unfinished tail the request would flush, and whether it is a write that goes
+    /// on where the last one stopped (which does not flush it).
+    pub(super) fn flush_of(&self, owner: u64, request: &[u8]) -> Option<(usize, bool)> {
+        self.wants(owner, request).flushes
+    }
+
     /// The node and the lease of a request, as far as the request names them.
     fn wants(&self, owner: u64, request: &[u8]) -> Wants {
         let none = Wants::default();
@@ -497,9 +516,14 @@ impl Server {
             let Ok(n) = canonical(raw, &mut path) else {
                 return none;
             };
+            let node = self.node_at(&path[..n]);
             return Wants {
-                node: self.node_at(&path[..n]),
+                node,
                 write: method == Method::Open,
+                // An open with truncation runs the flush of the file.
+                flushes: node
+                    .filter(|_| method == Method::Open)
+                    .map(|ni| (ni, false)),
                 ..none
             };
         }
@@ -527,14 +551,39 @@ impl Server {
             | Method::Fstat
             | Method::Seek => {
                 let Ok(handle) = r.u32() else { return none };
+                let node = file_node(handle);
+                // What runs the flush of the node: every read and truncation, and a write that
+                // does not go on where the last write of the node stopped.
+                let flushes = node.and_then(|ni| match method {
+                    Method::Read | Method::Pread | Method::Truncate => Some((ni, false)),
+                    Method::Write | Method::Pwrite => {
+                        let d = &self.descriptions[self.find(si, handle).ok()?];
+                        let (start, append) = if method == Method::Pwrite {
+                            (u32::try_from(r.u64().ok()?).ok(), false)
+                        } else {
+                            (Some(d.pos), d.append)
+                        };
+                        Some((ni, !append && start.is_some() && self.nodes[ni].at == start))
+                    }
+                    _ => None,
+                });
                 Wants {
-                    node: file_node(handle),
+                    node,
                     write: matches!(
                         method,
                         Method::Write | Method::Pwrite | Method::Truncate | Method::Seek
                     ),
+                    flushes,
                     ..none
                 }
+            }
+            // The close of the last description and the sync of a node run its flush.
+            Method::Close | Method::Fsync => {
+                let Ok(handle) = r.u32() else { return none };
+                let flushes = file_node(handle)
+                    .filter(|&ni| method == Method::Fsync || self.nodes[ni].refs <= 1)
+                    .map(|ni| (ni, false));
+                Wants { flushes, ..none }
             }
             Method::ReadInto | Method::PreadInto | Method::WriteFrom | Method::PwriteFrom => {
                 let Ok(part) = p::read_part(method, r) else {
@@ -550,13 +599,30 @@ impl Server {
                         write: self.leases[slot].write,
                         holder: Some(slot),
                         takes: false,
+                        flushes: None,
                     };
                 }
+                let node = file_node(part.part.handle);
+                let flushes = node.and_then(|ni| {
+                    if !write {
+                        return Some((ni, false));
+                    }
+                    let d = &self.descriptions[self.find(si, part.part.handle).ok()?];
+                    let positional = method == Method::PwriteFrom;
+                    let start = if positional {
+                        u32::try_from(part.part.offset).ok()
+                    } else {
+                        Some(d.pos)
+                    };
+                    let append = d.append && !positional;
+                    Some((ni, !append && start.is_some() && self.nodes[ni].at == start))
+                });
                 Wants {
-                    node: file_node(part.part.handle),
+                    node,
                     write,
                     holder: None,
                     takes: part.part.lease == 0 && part.part.flags & p::MORE != 0,
+                    flushes,
                 }
             }
             _ => none,
@@ -568,6 +634,12 @@ impl Server {
     fn held_back(&self, w: &Wants) -> bool {
         if cfg!(feature = "break-datafs-lease-hold") {
             return false;
+        }
+        // A job that would flush a node whose tail is being copied waits for the copy.
+        if let Some((ni, _)) = w.flushes
+            && self.nodes[ni].tail == tail::Tail::Running
+        {
+            return true;
         }
         let Some(node) = w.node else { return false };
         if w.holder.is_some() {

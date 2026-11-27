@@ -361,6 +361,10 @@ fn a_lease_lapses_after_a_gap_and_a_late_part_is_not_run() {
     assert_eq!(pick(&fx.rig, &job), None);
     fx.sweep(500_000_000 + LEASE_GAP_NS, &[]);
     assert_eq!(fx.rig.server.lease_count(), 0);
+    // The rewrite from the middle left a tail: the reader waits for its copy, which the worker
+    // runs in steps (`tests_tail.rs`), and then goes.
+    assert_eq!(pick(&fx.rig, &job), None);
+    while fx.rig.server.tail_step(&mut fx.rig.fs) {}
     assert_eq!(pick(&fx.rig, &job), Some(0));
     // The late part is not run: nothing is written, the answer says LAPSED and 0 bytes, with MORE
     // or without.
@@ -456,6 +460,9 @@ fn the_client_time_of_a_lease_is_bounded_while_jobs_wait_for_the_file() {
         0,
         "the bound fired with a waiter"
     );
+    // The tail of the rewrite is copied first (`tests_tail.rs`).
+    assert_eq!(pick(&fx.rig, &[(B, read_job(fx.hb))]), None);
+    while fx.rig.server.tail_step(&mut fx.rig.fs) {}
     assert_eq!(pick(&fx.rig, &[(B, read_job(fx.hb))]), Some(0));
 }
 
