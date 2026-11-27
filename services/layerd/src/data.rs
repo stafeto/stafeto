@@ -27,7 +27,14 @@ impl Data {
     ) -> R<(sys::Reply, Buf)> {
         let mut w = Writer::new();
         build(&mut w)?;
-        let reply = sys::send(&self.session, w.as_bytes()).map_err(Status::Kernel)?;
+        let reply = match sys::send(&self.session, w.as_bytes()) {
+            Ok(reply) => reply,
+            Err(abi::Error::PeerClosed) => {
+                rt::println!("layerd: the data file service went, ending for a new instance");
+                sys::process_exit(crate::DATA_GONE)
+            }
+            Err(e) => return Err(Status::Kernel(e)),
+        };
         let mut buf = Buf {
             bytes: [0; abi::MESSAGE_MAX],
             len: 0,

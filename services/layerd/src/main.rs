@@ -32,13 +32,11 @@ mod notary;
 
 use abi::Rights;
 use core::cell::UnsafeCell;
-use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering::{Acquire, Release};
 use layerd::identity::{Binding, Vouched, vouched_from};
 use layerd::index::Index;
 use layerd::names::{Client, Core, Done, State};
 use layerd::scan::Scan;
-use posix_fs::{PosixFs, StartupFiles};
 use proto_fs::names::{self as n, NameMethod};
 use proto_init::ServiceArgs;
 use proto_layer as l;
@@ -53,7 +51,14 @@ rt::entry!(main);
 const NO_START_DATA: u64 = 1;
 const NOT_CONNECTED: u64 = 2;
 const NOT_REGISTERED: u64 = 3;
+/// The budget the table gave the loop was refused by the kernel: the loop would run without a
+/// limit, so the service does not start.
+const BUDGET: u64 = 4;
 const STOPPED: u64 = 5;
+/// The data file service went (its session answered PEER_CLOSED): the live layer, the index and
+/// every pass are of an instance that is gone, so the service ends and init starts a new one, which
+/// connects to the new instance of the data file service and builds its index again.
+pub const DATA_GONE: u64 = 6;
 
 /// The sessions the loop and the table of identities keep: a session for each process that uses
 /// the layered root, and the root's own. A session of a process that never sends a request holds
@@ -67,6 +72,41 @@ const LABEL_STEP: u64 = 0x6c61_7967_0001;
 /// Bit 63 marks the labels the service gives itself: a count of sessions that is never used twice.
 const OWN: u64 = 1 << 63;
 
+/// The handle of the loop's own budget, kept for the steps build.
+#[cfg(feature = "steps")]
+static SERVE_BUDGET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Under the feature `steps`, a line when the CPU the loop's budget has charged has grown by 1 ms
+/// since the last line: `layerd: serve ran <us> us in <ms> ms since the start`. The share the loop
+/// takes of CPU 0 is the first number over the second; its budget is 50 us in each 10 ms (0.5 %).
+#[cfg(feature = "steps")]
+fn serve_line() {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static START: AtomicU64 = AtomicU64::new(0);
+    let raw = SERVE_BUDGET.load(Acquire);
+    if raw == 0 {
+        return;
+    }
+    let budget = Handle::<rt::handle::Budget>::borrowed(abi::Handle(raw));
+    let Ok(info) = sys::budget_info(&budget) else {
+        return;
+    };
+    let now = rt::time::ticks_to_ns(rt::time::now());
+    let _ = START.compare_exchange(0, now, Relaxed, Relaxed);
+    let ran = rt::time::ticks_to_ns(info.ran);
+    if ran < LAST.load(Relaxed) + 1_000_000 {
+        return;
+    }
+    LAST.store(ran, Relaxed);
+    rt::println!(
+        "layerd: serve ran {} us in {} ms since the start, {} overruns",
+        ran / 1000,
+        (now - START.load(Relaxed)) / 1_000_000,
+        info.overruns
+    );
+}
+
 struct Cell<T>(UnsafeCell<T>);
 
 // SAFETY: every cell is used from the one thread of the loop (the registrar thread only reads
@@ -75,13 +115,6 @@ unsafe impl<T> Sync for Cell<T> {}
 
 static INDEX: Cell<Index> = Cell(UnsafeCell::new(Index::new()));
 static SCAN: Cell<Scan> = Cell(UnsafeCell::new(Scan::new()));
-static FILES: Cell<MaybeUninit<PosixFs>> = Cell(UnsafeCell::new(MaybeUninit::uninit()));
-
-#[repr(C, align(4096))]
-struct Pages([[u8; posix_fs::DESCRIPTOR_PAGE_BYTES]; posix_fs::DESCRIPTOR_PAGES]);
-static PAGES: Cell<Pages> = Cell(UnsafeCell::new(Pages(
-    [[0; posix_fs::DESCRIPTOR_PAGE_BYTES]; posix_fs::DESCRIPTOR_PAGES],
-)));
 
 /// The registrar thread: the root goes to the process service, tried until it is there.
 static PARENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -110,29 +143,13 @@ fn touch(base: *mut u8, len: usize) {
     core::hint::black_box(base);
 }
 
-/// The files of the RAM file service (the boot profile), made once.
-fn connect_files(parent: &Handle<Channel>) -> Option<&'static mut PosixFs> {
-    let startup = StartupFiles::connect(parent, false).ok()?;
-    // SAFETY: FILES and PAGES are used by nobody else and this runs once, before the loop.
-    unsafe {
-        let fs = &mut *FILES.0.get();
-        PosixFs::initialize_at(
-            fs.as_mut_ptr(),
-            startup,
-            b"/",
-            None,
-            false,
-            &mut posix_fs::Late::new(),
-        )
-        .ok()?;
-        let fs = fs.assume_init_mut();
-        let pages = &raw mut (*PAGES.0.get()).0;
-        for k in 0..posix_fs::DESCRIPTOR_PAGES {
-            let page = (&raw mut (*pages)[k]).cast::<u8>();
-            fs.add_page(k, core::ptr::NonNull::new_unchecked(page));
-        }
-        Some(fs)
-    }
+/// The epoch of an instance: the counter in units of 2^20 ticks (about 17 ms), 16 bits, never 0.
+/// A handle of an earlier instance carries another epoch unless the instances started a multiple
+/// of 2^36 ticks apart (about 18 minutes) to within 17 ms, and then its place and generation must
+/// match too (`proto_fs::names::handle`).
+const fn epoch_of(ticks: u64) -> u16 {
+    let epoch = (ticks >> 20) as u16;
+    if epoch == 0 { 1 } else { epoch }
 }
 
 fn main(_: u64) -> u64 {
@@ -142,9 +159,10 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = s.take::<Resource>("console") {
         rt::console::set(console);
     }
+    let serve = rt::budget::take(&mut s, rt::budget::SERVE);
     let args = ServiceArgs::read(s.args()).ok();
     let level = sys::thread_info(&s.thread).map_or(1, |info| info.base);
-    let Some(files) = connect_files(&s.parent) else {
+    let Ok(files) = rt::fs::Files::connect(&s.parent) else {
         rt::println!("layerd: no file service");
         return NOT_CONNECTED;
     };
@@ -197,8 +215,7 @@ fn main(_: u64) -> u64 {
     let (index, scan) = unsafe { (&mut *INDEX.0.get(), &mut *SCAN.0.get()) };
     touch(INDEX.0.get().cast(), core::mem::size_of::<Index>());
     touch(SCAN.0.get().cast(), core::mem::size_of::<Scan>());
-    touch(PAGES.0.get().cast(), core::mem::size_of::<Pages>());
-    let epoch = (rt::time::now() as u16) | 1;
+    let epoch = epoch_of(rt::time::now());
     let mut core = Core::new(
         index,
         scan,
@@ -227,6 +244,17 @@ fn main(_: u64) -> u64 {
         sessions: [const { None }; SESSIONS],
         ready: false,
     };
+    // The loop is this thread: it works under its budget from here on, and a budget the kernel
+    // refuses is a start error, since the thread would run without a limit.
+    match rt::budget::bind("layerd", rt::budget::SERVE, serve, &s.thread) {
+        Err(_) => return BUDGET,
+        #[cfg(feature = "steps")]
+        Ok(Some(kept)) => {
+            SERVE_BUDGET.store(kept.raw().0, Release);
+            core::mem::forget(kept);
+        }
+        Ok(_) => {}
+    }
     // The first step of the build, or READY at once for a service that has nothing to build.
     let _ = sys::notify(&service.step, 1);
     let config = Config {
@@ -767,6 +795,8 @@ impl Service<0> for Layerd {
     /// The client of a label went (a session that never sent a request included): its
     /// descriptions close and its identity copy goes.
     fn closed(&mut self, label: u64) {
+        #[cfg(feature = "steps")]
+        serve_line();
         self.core.gone(label);
         if let Some(place) = self.slot_of(label) {
             self.sessions[place] = None;

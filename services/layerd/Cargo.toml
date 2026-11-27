@@ -37,6 +37,5 @@ proto-process = { path = "../../proto/process" }
 proto-wire = { path = "../../proto/wire" }
 
 [target.'cfg(target_os = "none")'.dependencies]
-posix-fs = { path = "../../lib/posix-fs" }
 proto-init = { path = "../../proto/init" }
 rt = { path = "../../lib/rt" }

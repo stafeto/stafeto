@@ -45,6 +45,11 @@ pub const LAYERS_DIR: &[u8] = b"/.layers";
 pub const COMPOSITION: &[u8] = b"/.layers/COMPOSITION";
 pub const COMPOSITION_TMP: &[u8] = b"/.layers/COMPOSITION.tmp";
 pub const WORK_DIR: &[u8] = b"/.layers/work";
+/// The longest path and name the volume holds, and the names the emptying of a directory takes
+/// in a batch.
+const PATH_MAX: usize = d::MAX_PATH;
+const NAME_MAX: usize = d::NAME_MAX;
+const BATCH: usize = 8;
 
 /// Where the service stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -299,19 +304,27 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             }
             Err(e) => return Err(e),
         }
-        self.remove_inside(WORK_DIR, 0)
+        self.remove_inside(WORK_DIR)
     }
 
-    fn remove_inside(&mut self, dir: &[u8], depth: usize) -> R<()> {
-        // The names of one batch, then their removal; the listing starts again until it is empty.
+    /// Removes everything below `root`, depth first with no recursion: the path of the directory
+    /// being emptied is one buffer, a directory that is found is entered, and an empty one is
+    /// removed and left. The depth is the longest path the volume holds (`PATH_MAX`), and a name is
+    /// as long as the volume allows.
+    fn remove_inside(&mut self, root: &[u8]) -> R<()> {
+        let mut path = [0u8; PATH_MAX];
+        let mut len = root.len();
+        path[..len].copy_from_slice(root);
         loop {
-            let mut names = [[0u8; 64]; 8];
-            let mut lens = [0usize; 8];
-            let mut kinds = [0u32; 8];
+            // The names of one batch of the directory, then their removal; a listing that finds
+            // the directory empty ends it.
+            let mut names = [[0u8; NAME_MAX]; BATCH];
+            let mut lens = [0usize; BATCH];
+            let mut kinds = [0u32; BATCH];
             let mut count = 0;
-            let h = self.volume.open(dir, d::READ | d::DIRECTORY, 0)?;
+            let h = self.volume.open(&path[..len], d::READ | d::DIRECTORY, 0)?;
             let more = self.volume.read_dir(h, &mut |_, kind, name| {
-                if name == b"." || name == b".." || count == 8 || name.len() > 64 {
+                if name == b"." || name == b".." || count == BATCH || name.len() > NAME_MAX {
                     return;
                 }
                 names[count][..name.len()].copy_from_slice(name);
@@ -322,27 +335,28 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             let _ = self.volume.close(h);
             more?;
             if count == 0 {
-                return Ok(());
+                if len == root.len() {
+                    return Ok(());
+                }
+                self.volume.rmdir(&path[..len])?;
+                while path[len - 1] != b'/' {
+                    len -= 1;
+                }
+                len -= 1;
+                continue;
             }
             for i in 0..count {
-                let mut path = [0u8; 160];
-                let dl = dir.len();
-                if dl + 1 + lens[i] > path.len() {
+                let at = len + 1 + lens[i];
+                if at > PATH_MAX {
                     return Err(st(d::NAME_TOO_LONG));
                 }
-                path[..dl].copy_from_slice(dir);
-                path[dl] = b'/';
-                path[dl + 1..dl + 1 + lens[i]].copy_from_slice(&names[i][..lens[i]]);
-                let path = &path[..dl + 1 + lens[i]];
+                path[len] = b'/';
+                path[len + 1..at].copy_from_slice(&names[i][..lens[i]]);
                 if kinds[i] == d::KIND_DIRECTORY {
-                    if depth >= 4 {
-                        return Err(st(d::NOT_EMPTY));
-                    }
-                    self.remove_inside(path, depth + 1)?;
-                    self.volume.rmdir(path)?;
-                } else {
-                    self.volume.unlink(path)?;
+                    len = at;
+                    break;
                 }
+                self.volume.unlink(&path[..at])?;
             }
         }
     }
@@ -706,6 +720,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             desc.dir,
             &mut desc.position,
             &mut desc.lower,
+            &mut desc.replayed,
             &mut reply,
         )?;
         // What the replies have given out, which SEEK_DIR may go back to and not past.
@@ -718,7 +733,12 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         self.gate()?;
         let Core { table, lower, .. } = self;
         let desc = table.get(owner, handle).map_err(Self::lost)?;
-        listing::rewind(lower, &mut desc.position, &mut desc.lower)
+        listing::rewind(
+            lower,
+            &mut desc.position,
+            &mut desc.lower,
+            &mut desc.replayed,
+        )
     }
 
     pub fn seek_dir(&mut self, owner: u64, handle: u32, cursor: u64) -> R<()> {
@@ -730,6 +750,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             &mut desc.position,
             desc.given,
             &mut desc.lower,
+            &mut desc.replayed,
             cursor,
         )
     }

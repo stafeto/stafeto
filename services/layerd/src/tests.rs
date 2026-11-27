@@ -6,6 +6,7 @@
 use crate::composition::Composition;
 use crate::identity::{Vouched, vouched_from};
 use crate::index::Index;
+use crate::listing;
 use crate::names::{Client, Core, Done, State};
 use crate::scan::Scan;
 use crate::testkit::{FakeLower, FakeVolume};
@@ -204,6 +205,38 @@ fn a_start_empties_the_work_directory() {
     assert_eq!(core.state, State::Starting);
     assert!(core.volume.children(b"/.layers/work").is_empty());
     assert!(core.volume.nodes.contains_key(b"/.layers/work".as_slice()));
+}
+
+#[test]
+fn a_start_empties_a_work_directory_of_any_depth_and_of_long_names() {
+    let mut v = volume();
+    // Twelve levels (the first version stopped at four), a file at each level, and names of 200
+    // bytes in a directory of more files than one batch holds.
+    let mut dir = String::from("/.layers/work");
+    for level in 0..12 {
+        dir.push_str(&format!("/d{level}"));
+        v.dir(&dir, 0o700, 0);
+        v.file(&format!("{dir}/f"), 0o600, 0, b"x");
+    }
+    let long = "n".repeat(200);
+    v.dir("/.layers/work/wide", 0o700, 0);
+    for k in 0..20 {
+        v.file(&format!("/.layers/work/wide/{k:02}{long}"), 0o600, 0, b"y");
+    }
+    let mut world = World::new();
+    let mut core = world.core(v);
+    core.prepare();
+    assert_eq!(core.state, State::Starting);
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+    assert!(core.volume.nodes.contains_key(b"/.layers/work".as_slice()));
+    assert_eq!(
+        core.volume
+            .nodes
+            .keys()
+            .filter(|k| k.starts_with(b"/.layers/work/"))
+            .count(),
+        0
+    );
 }
 
 #[test]
@@ -564,6 +597,63 @@ fn a_reply_takes_at_most_eight_entries_of_the_lower_set() {
     // passwd (12) of the lower set is shadowed, motd (11) deleted: 3 + 20 remain... and the
     // lower inodes 13, 14 and 100..119.
     assert_eq!(lower_seen, 2 + 20);
+}
+
+/// The replies of a listing to its end: the cursor after each, its names, and the reads of the
+/// lower directory and the opens the request made.
+fn drain(
+    core: &mut Core<'_, FakeVolume, FakeLower>,
+    owner: u64,
+    h: u32,
+) -> Vec<(u64, Vec<Vec<u8>>, usize, usize)> {
+    let mut out = Vec::new();
+    loop {
+        let (opened, nexts) = (core.lower.opened, core.lower.nexts);
+        let (bytes, len) = core.read_dir(owner, h).unwrap();
+        let (opened, nexts) = (core.lower.opened - opened, core.lower.nexts - nexts);
+        let (more, cursor, entries) = n::read_dir_reply(&bytes[..len]).unwrap();
+        let names = entries.map(|e| e.unwrap().name.to_vec()).collect();
+        out.push((cursor, names, opened, nexts));
+        if !more {
+            return out;
+        }
+    }
+}
+
+#[test]
+fn a_request_does_one_of_the_open_the_replay_and_a_few_reads_of_the_lower_directory() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let (reply, _) = open(&mut core, 0, f::READ_ONLY, "/etc").unwrap();
+    let h = handle_of(&reply);
+    let owner = 40;
+    let replies = drain(&mut core, owner, h);
+    // The open is a request of its own, with no entry and no read.
+    let opens: Vec<_> = replies.iter().filter(|r| r.2 == 1).collect();
+    assert_eq!(opens.len(), 1);
+    assert!(opens[0].1.is_empty() && opens[0].3 == 0);
+    assert!(replies.iter().all(|r| r.3 <= listing::LOWER_PER_STEP + 1));
+    // Past a cursor of the lower set a seek reopens the directory, replays up to the cursor a few
+    // reads at a time (requests with no entry), and lists what followed the cursor the first time.
+    let at = replies
+        .iter()
+        .position(|r| n::split_cursor(r.0).0 == 1 && r.0 > n::cursor(1, 6))
+        .expect("a reply past the sixth entry of the lower set");
+    let rest: Vec<Vec<u8>> = replies[at + 1..].iter().flat_map(|r| r.1.clone()).collect();
+    assert!(!rest.is_empty());
+    core.seek_dir(owner, h, replies[at].0).unwrap();
+    let again = drain(&mut core, owner, h);
+    assert_eq!(again.iter().filter(|r| r.2 == 1).count(), 1);
+    assert!(again.iter().all(|r| r.3 <= listing::LOWER_PER_STEP + 1));
+    assert!(
+        again
+            .iter()
+            .any(|r| r.1.is_empty() && r.3 > 0 && r.0 == replies[at].0),
+        "the replay took requests of its own"
+    );
+    let replayed: Vec<Vec<u8>> = again.iter().flat_map(|r| r.1.clone()).collect();
+    assert_eq!(replayed, rest);
 }
 
 #[test]
