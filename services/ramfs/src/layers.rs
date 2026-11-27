@@ -783,6 +783,16 @@ impl Storage<'_> {
             if entry.mode & 0o7000 != 0 || entry.uid != 0 || entry.gid != 0 {
                 return self.check_failed(index, refuse(BAD_MODE, i as u32));
             }
+            // The name below the root that another service owns (init's `mount=`) is no name of
+            // the tree: a walk to it redirects, so an entry at it or below it could never be
+            // reached.
+            if let Some(mount) = self.state.mount()
+                && path
+                    .strip_prefix(b"/")
+                    .is_some_and(|rest| rest.split(|&byte| byte == b'/').next() == Some(mount))
+            {
+                return self.check_failed(index, refuse(CONFLICT, i as u32));
+            }
             let job = &mut self.state.layers.job;
             if !entry.is_directory() {
                 let slot = &mut job.first_of_file[entry.file as usize];

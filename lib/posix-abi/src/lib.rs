@@ -199,6 +199,12 @@ pub fn probe_queued() -> u64 {
         .queued
 }
 
+/// The code of a walk of the RAM file service that ended at a name another service owns
+/// (`FsError::Redirect`), a value no errno has. It lives between the service's answer and
+/// `names::follow_path`, which takes the redirect and turns what is left into EXDEV before the
+/// call returns; no call hands it to its caller.
+pub const EREDIRECT: c_int = 0x4000_0001;
+
 /// The errno of a file error.
 pub fn error(error: FsError) -> c_int {
     match error {
@@ -234,6 +240,7 @@ pub fn error(error: FsError) -> c_int {
         FsError::NotEmpty => ENOTEMPTY,
         FsError::Busy => EBUSY,
         FsError::CrossDevice => EXDEV,
+        FsError::Redirect => EREDIRECT,
         FsError::NotSupported => EOPNOTSUPP,
         FsError::Io => EIO,
     }
@@ -288,6 +295,15 @@ pub fn open_policy(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result<c
 }
 
 fn open_policy_inner(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result<c_int, c_int> {
+    // A link of the RAM file service onto /data ends the walk of the service in a redirect: the
+    // open then runs against the path it names (names::follow_path).
+    let follows = flags & O_NOFOLLOW == 0 && flags & (O_CREAT | O_EXCL) != O_CREAT | O_EXCL;
+    names::follow_path(names::AT_FDCWD, name, follows, |_, name| {
+        open_policy_once(name, flags, mode, umask)
+    })
+}
+
+fn open_policy_once(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result<c_int, c_int> {
     // The files under /proc are made when they are opened (procfs).
     #[cfg(feature = "procfs")]
     if let Some(path) = procfs::absolute(name).filter(procfs::Absolute::is_under) {
@@ -355,16 +371,25 @@ pub fn openat_policy(
     if let Some(vol) = data::route(dirfd, name)? {
         return data::open(&vol, flags, mode, umask);
     }
+    let given = flags;
     let flags = flags & !(O_SYNC | O_SEARCH);
     let point = threads::cancel::Point::begin();
+    let follows = flags & O_NOFOLLOW == 0 && flags & (O_CREAT | O_EXCL) != O_CREAT | O_EXCL;
     let result = (|| {
         if name.is_empty() {
             return Err(ENOENT);
         }
-        let proto_fs::Base::Fd { fd, generation } = names::descriptor_base(dirfd)? else {
-            return Err(EBADF);
-        };
-        shared::open_from(Some((fd, generation)), name, flags, mode, umask).map(|fd| fd as c_int)
+        names::follow_path(dirfd, name, follows, |at, name| {
+            // The path of a redirect is absolute and starts at the root.
+            if at == names::AT_FDCWD {
+                return open_policy_once(name, given, mode, umask);
+            }
+            let proto_fs::Base::Fd { fd, generation } = names::descriptor_base(at)? else {
+                return Err(EBADF);
+            };
+            shared::open_from(Some((fd, generation)), name, flags, mode, umask)
+                .map(|fd| fd as c_int)
+        })
     })();
     if result.is_ok() {
         point.end();

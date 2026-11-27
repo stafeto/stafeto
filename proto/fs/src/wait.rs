@@ -443,7 +443,7 @@ mod tests {
     }
     #[test]
     fn wait_method_numbers_and_version_are_exact() {
-        assert_eq!(crate::VERSION, 21);
+        assert_eq!(crate::VERSION, 22);
         for (number, method) in [
             (54, Method::WaitStart),
             (55, Method::WaitQuery),

@@ -296,9 +296,18 @@ fn main(_: u64) -> u64 {
         return 7;
     };
     let period_ns = args.period_ns;
-    let Ok(mode) = ramfs::time_source::Mode::parse(args.own) else {
+    let Ok((mode, mount)) = ramfs::time_source::parse_args(args.own) else {
         return 7;
     };
+    // The name is copied: the arguments stay borrowed from the start data.
+    let mut mount_name = [0u8; ramfs::storage::MOUNT_MAX];
+    let mount_len = mount.map_or(0, |name| name.len().min(mount_name.len()));
+    if let Some(name) = mount {
+        if name.len() > mount_name.len() {
+            return 7;
+        }
+        mount_name[..name.len()].copy_from_slice(name);
+    }
     let Ok(time_source) = clock_page::TimeSource::attach(mode, &start.parent, &start.process)
     else {
         return 8;
@@ -328,6 +337,9 @@ fn main(_: u64) -> u64 {
         &mut *pointer
     };
     state.initialize();
+    if mount_len != 0 && !state.set_mount(&mount_name[..mount_len]) {
+        return 7;
+    }
     // SAFETY: initialization writes directly into exclusive aligned permanent storage.
     let locks = unsafe {
         let pointer = (*LOCKS.0.get()).as_mut_ptr();
@@ -6292,6 +6304,34 @@ impl Fs {
         match result {
             Ok(Progress::More) => status(proto_fs::RESOLVING),
             Ok(Progress::Found(_) | Progress::Missing(_)) => Answer::Status(Status::Ok),
+            Err(proto_fs::REDIRECT) => {
+                // The walk reached the name another service owns: the job is over, it made no
+                // description, and the reply names the path to continue with and which of the
+                // job's paths it was (the second is walked only after the first is found).
+                let mut target = [0u8; proto_fs::MAX_PATH];
+                let mut length = 0;
+                let mut links = 0;
+                let mut index = 0;
+                let second = path.second.as_ref().and_then(|second| second.redirect());
+                if let Some((bytes, used)) = second.or_else(|| path.resolver.redirect()) {
+                    index = u32::from(second.is_some());
+                    length = bytes.len();
+                    links = used;
+                    target[..length].copy_from_slice(bytes);
+                }
+                self.cancel_job(id, r.label(), Some(fds));
+                let redirect = proto_fs::Redirect {
+                    target: proto_fs::REDIRECT_BY_PATH,
+                    index,
+                    links,
+                    path: &target[..length],
+                };
+                if redirect.write(r.reply()).is_err() {
+                    status(proto_fs::INVALID_ARGUMENT)
+                } else {
+                    Answer::Reply(Outgoing::new())
+                }
+            }
             Err(code) => {
                 self.cancel_job(id, r.label(), Some(fds));
                 status(code)

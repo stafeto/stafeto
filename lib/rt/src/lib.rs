@@ -198,6 +198,21 @@ impl<const N: usize> Stack<N> {
     pub fn top(&self) -> usize {
         self.0.get() as usize + N
     }
+
+    /// The bytes of the stack a thread has used, counted from the top to the lowest byte that is
+    /// no longer zero: exact for a stack that began as zeroed `.bss` and whose deepest frame
+    /// holds a nonzero byte (a lower bound otherwise). Read it after the thread has ended; of a
+    /// thread that runs it is the use so far.
+    pub fn used(&self) -> usize {
+        let base = self.0.get().cast::<u8>();
+        for at in 0..N {
+            // SAFETY: `at` is inside the array; a volatile read, since another thread may write.
+            if unsafe { base.add(at).read_volatile() } != 0 {
+                return N - at;
+            }
+        }
+        0
+    }
 }
 
 impl<const N: usize> Default for Stack<N> {
