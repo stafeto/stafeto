@@ -1501,7 +1501,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                         return self.plan_copy(job, ls, kind);
                     }
                 };
-                // A name of the lower set that is not there is opened, not made, without CREATE.
+                // Without CREATE a name that is not there is NO_ENTRY.
                 if class == Class::Create && job.flags & proto_fs::CREATE == 0 {
                     return fail(proto_fs::NO_ENTRY);
                 }
@@ -2735,7 +2735,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     ) -> F<Option<u32>> {
         let (Created { uid, gid, mode }, lower) = made;
         // The deliberate break `break-layerd-copy-counter-ino`: a directory of a copy takes a
-        // number of the counter, not the lower one.
+        // number of the counter and loses the lower one.
         let lower = lower.filter(|_| !cfg!(feature = "break-layerd-copy-counter-ino"));
         match job.dsub {
             0 => {

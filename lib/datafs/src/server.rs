@@ -1180,7 +1180,7 @@ impl Server {
                 }
                 let (flags, mode, ino, raw) = p::read_open_numbered(r)?;
                 // The deliberate break `break-datafs-numbered-any`: only the numbers of the
-                // counter of the layered file service (bit 62) are taken, not those of the lower set.
+                // counter of the layered file service (bit 62) are taken, and those of the lower set are refused.
                 if cfg!(feature = "break-datafs-numbered-any") && ino & p::INO_NUMBERED == 0 {
                     return Err(p::code(p::INVALID));
                 }
