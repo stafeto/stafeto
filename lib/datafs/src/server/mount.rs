@@ -438,6 +438,7 @@ pub fn recover_orphans<D: Device>(fs: &mut Fs<'_, D>) -> Result<Recovered, Error
             }
             None => {
                 if fs.remove(entry).is_ok() {
+                    fs.note_freed_blocks(2);
                     done.removed += 1;
                 } else {
                     done.failed += 1;
