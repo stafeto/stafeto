@@ -22,10 +22,15 @@
 //! of the copy done in its own job, as before, and the files stay correct in every case: littlefs
 //! finishes a half done flush in whatever call comes next (`lfs_file_flush_step`).
 //!
-//! The bound for `docs/data.md`: a job of another file waits for one step, `T_slice`, the copy of
-//! `TAIL_SLICE_BLOCKS` blocks. The job that waits for the node itself waits for the whole tail,
-//! as many steps as the tail has blocks divided by `TAIL_SLICE_BLOCKS`, with a job of another file
-//! between two of them.
+//! The bound for `docs/data.md`. One step runs after every job of the worker and when the queue is
+//! empty, so a job of another file with k jobs ahead of it waits for k steps as well as the k jobs
+//! (`W` counts each job as `T_job + T_slice`, `T_slice` being the copy of `TAIL_SLICE_BLOCKS`
+//! blocks). The steps take turns across the nodes that have a tail, so several tails give no more
+//! than one step after a job and do not starve the other files, and the jobs of other files cannot
+//! starve a tail, which gets its step after every one of them. A job that waits for a node waits for
+//! the steps of every tail that runs, its own included: `ceil(blocks of all the tails / 16)` steps,
+//! with a job of another file between two. When the service stops, `tails_finish` runs every copy
+//! whole before the jobs that are queued (the stop must run them all inside its time).
 
 use super::*;
 
@@ -52,6 +57,7 @@ impl Server {
     /// The handle of node `ni` has been flushed whole (a sync, a truncation, a close).
     pub(super) fn tail_done(&mut self, ni: usize) {
         self.nodes[ni].tail = Tail::None;
+        self.nodes[ni].tail_err = None;
     }
 
     /// Starts the copy for node `ni` when its handle holds a tail.
@@ -84,8 +90,10 @@ impl Server {
             return;
         }
         for j in jobs.iter().take(CANDIDATES_MAX) {
-            if let Some((ni, false)) = self.flush_of(j.owner, j.request) {
-                self.tail_begin_unleased(fs, ni);
+            for (ni, continues) in self.flush_of(j.owner, j.request).into_iter().flatten() {
+                if !continues {
+                    self.tail_begin_unleased(fs, ni);
+                }
             }
         }
     }
@@ -96,8 +104,8 @@ impl Server {
     }
 
     /// One step of the copy of one node that has one, the one after the last that ran. Whether a
-    /// step ran. A step that fails or ends the copy leaves the node in `None`; a failure shows
-    /// again in the job that flushes the node.
+    /// step ran. A step that ends the copy leaves the node in `None`; a step that fails does too and keeps its
+    /// error on the node, which the next job that flushes it answers (the close included).
     pub fn tail_step<D: Device>(&mut self, fs: &mut Fs<'_, D>) -> bool {
         let count = self.nodes.len();
         for k in 1..=count {
@@ -114,8 +122,18 @@ impl Server {
             {
                 self.tail_steps += 1;
             }
-            if !matches!(fs.flush_step(file, TAIL_SLICE_BLOCKS), Ok(true)) {
-                self.nodes[ni].tail = Tail::None;
+            let n = &mut self.nodes[ni];
+            match fs.flush_step(file, TAIL_SLICE_BLOCKS) {
+                Ok(true) => {}
+                Ok(false) => n.tail = Tail::None,
+                // The error stays on the node for the jobs that waited for the copy (a read, a
+                // write, a sync, a truncation, the close), and the position of the file is no
+                // longer the one the node knew.
+                Err(e) => {
+                    n.tail = Tail::None;
+                    n.tail_err = Some(e);
+                    n.at = None;
+                }
             }
             return true;
         }

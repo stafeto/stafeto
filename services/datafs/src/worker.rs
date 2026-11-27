@@ -97,6 +97,9 @@ mod stretch {
                 Some(method) => {
                     rt::println!("datafs: worker wall stretch {method:?} {took} ticks")
                 }
+                None if number == u64::from(super::TAIL_STEP_KIND) => {
+                    rt::println!("datafs: worker wall stretch TailStep {took} ticks")
+                }
                 None => rt::println!("datafs: worker wall stretch other {took} ticks"),
             }
         }
@@ -968,7 +971,7 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
             if let Some(fs) = volume.as_mut()
                 && !STOPPING.load(Acquire)
             {
-                server.tail_step(fs);
+                tail_slice(server, fs);
             }
         }
         // Jobs that wait for a lease run when it lapses: the worker wakes at the first expiry.
@@ -988,7 +991,7 @@ fn serve(mut volume: Option<Volume>, mut clock: Clock, wake: &Handle<Channel>) -
         }
         // The queue is empty (or holds only jobs that wait for a copy): the copy of a tail goes on.
         if let Some(fs) = volume.as_mut()
-            && server.tail_step(fs)
+            && tail_slice(server, fs)
         {
             continue;
         }
@@ -1113,6 +1116,32 @@ const REPORT_QUIET_NS: u64 = 100_000_000;
 #[cfg(feature = "steps")]
 fn now_quiet(last_job: u64) -> bool {
     rt::time::ticks_to_ns(rt::time::now()).saturating_sub(last_job) >= REPORT_QUIET_NS
+}
+
+/// The kind of stretch a step of the copy of a tail has in the steps build (no method of the
+/// protocol has this number).
+#[cfg(feature = "steps")]
+const TAIL_STEP_KIND: u16 = u16::MAX;
+
+/// One step of the copy of a tail (`Server::tail_step`): whether one ran. The steps build measures
+/// it as a stretch of its own and says the longest so far, `datafs: tail step longest N us`.
+fn tail_slice(server: &mut Server, fs: &mut Volume) -> bool {
+    #[cfg(feature = "steps")]
+    let began = rt::time::now();
+    #[cfg(feature = "steps")]
+    stretch::begin(TAIL_STEP_KIND);
+    let ran = server.tail_step(fs);
+    #[cfg(feature = "steps")]
+    {
+        stretch::end();
+        static LONGEST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let us = rt::time::ticks_to_ns(rt::time::now().saturating_sub(began)) / 1000;
+        if ran && us > LONGEST.load(Relaxed) {
+            LONGEST.store(us, Relaxed);
+            rt::println!("datafs: tail step longest {us} us");
+        }
+    }
+    ran
 }
 
 /// The longest job of each method so far, in microseconds, under the feature `steps` (the probe of

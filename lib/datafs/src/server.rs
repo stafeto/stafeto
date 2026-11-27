@@ -188,6 +188,10 @@ struct Node {
     wrote_at: i64,
     /// What the handle is known to hold past the last byte written (`tail.rs`).
     tail: tail::Tail,
+    /// The error of a step of the copy that failed, for the next job that flushes the node: the
+    /// close of the last description gives it too, though littlefs closes a file that failed with
+    /// no sync.
+    tail_err: Option<Error>,
     path: PathBuf,
 }
 
@@ -202,6 +206,7 @@ impl Node {
         wrote: false,
         wrote_at: 0,
         tail: tail::Tail::None,
+        tail_err: None,
         path: PathBuf::EMPTY,
     };
 }
@@ -848,6 +853,11 @@ impl Server {
         } else {
             fs.close(File(n.slot))
         };
+        // A step of the copy of the tail failed and the rewrite is lost: the close says so.
+        let closed = match n.tail_err {
+            Some(e) => Err(e),
+            None => closed,
+        };
         if n.orphan && fs.remove(n.path.get()).is_ok() {
             fs.note_freed_file(size);
         }
@@ -979,6 +989,10 @@ impl Server {
         let n = &mut self.nodes[ni];
         if n.broken {
             return Err(p::code(p::IO));
+        }
+        if let Some(e) = n.tail_err.take() {
+            n.at = None;
+            return Err(status_of(e));
         }
         let file = File(n.slot);
         if n.at != Some(pos) {
@@ -1240,6 +1254,10 @@ impl Server {
                 }
                 if self.nodes[ni].broken {
                     return Err(p::code(p::IO));
+                }
+                if let Some(e) = self.nodes[ni].tail_err.take() {
+                    self.nodes[ni].at = None;
+                    return Err(status_of(e));
                 }
                 let file = File(self.nodes[ni].slot);
                 self.nodes[ni].at = None;
@@ -1973,9 +1991,12 @@ impl Server {
     /// The file is synced and its attribute written (the time of the writes, the set-ID bits
     /// cleared): what FSYNC and a description with SYNC make durable.
     fn sync_node<D: Device>(&mut self, fs: &mut Fs<'_, D>, ni: usize) -> Res<()> {
-        let n = &self.nodes[ni];
+        let n = &mut self.nodes[ni];
         if n.broken {
             return Err(p::code(p::IO));
+        }
+        if let Some(e) = n.tail_err.take() {
+            return Err(status_of(e));
         }
         volume(fs.sync(File(n.slot)))?;
         self.tail_done(ni);

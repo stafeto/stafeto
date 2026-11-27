@@ -2417,14 +2417,16 @@ static int lapse_writer(void) {
     return 2;
 }
 
-/* The wait of a job that goes first after a lapse of a write lease: the gap of 1 s, and the tail
- * of the rewrite that stopped. littlefs writes out everything past the last byte written (the
- * copy of `size - stop position`) at the first seek, read, sync or close of the shared handle, in
- * one job (issue 626, `lib/datafs/src/server/lease.rs`). The cost per MiB of the tail: about
- * 1,000 ms on a Mac with Apple silicon under QEMU (docs/data.md), 2.6 times that on the GitHub
- * runners, and a margin of 20 per cent: 3,120 ms. */
+/* The wait of a job that goes first after a lapse of a write lease: the gap of 1 s, the lateness of
+ * the lapse (a quarter of a second), and the tail of the rewrite that stopped. The service copies
+ * the tail in steps of 64 KiB, one after every job (issue 626, `lib/datafs/src/server/tail.rs`), and
+ * the waiter for the file waits for all of them. The cost of a step with the jobs between steps:
+ * 44 to 60 ms measured on a Mac with Apple silicon under QEMU; the bound is 100 ms. */
 #define LAPSE_GAP_MS 1000ULL
-#define TAIL_MS_PER_MIB 3120ULL
+#define LAPSE_LATE_MS 250ULL
+#define TAIL_STEP_MS 100ULL
+#define TAIL_STEPS_PER_MIB 16ULL
+#define LAPSE_BOUND_MS(tail_mib) (LAPSE_GAP_MS + LAPSE_LATE_MS + (tail_mib) * TAIL_STEPS_PER_MIB * TAIL_STEP_MS)
 
 /* The free space of /data in KiB, for the lines of the checks that write a lot. */
 static unsigned long long free_kib(void) {
@@ -2474,7 +2476,7 @@ static int check_lapse(void) { return lapse_rewrite(0, 2500); }
  * of 1 to 2 MiB (the writer rewrites the first MiB of 2), and the waiter's job writes it out. The
  * service says the disk reads and writes of that job with the lapse (`lease lapse N`). The bound is
  * the gap and the tail at its dearest; it comes down when the copy goes in slices. */
-static int check_lapse_tail(void) { return lapse_rewrite(2, LAPSE_GAP_MS + 2 * TAIL_MS_PER_MIB); }
+static int check_lapse_tail(void) { return lapse_rewrite(2, LAPSE_BOUND_MS(2)); }
 
 /* The vector forms of the lapse: a child calls writev or readv of 16 buffers of 64 KiB (1 MiB)
  * again and again until the count of lapsed calls rises (the lease lapsed while the child was
@@ -2729,7 +2731,7 @@ static int check_exit_body(void) {
 }
 
 /* The handler writes to the file the interrupted call is writing: it waits for the lease, which
- * lapses, and for the tail of the rewrite of the 3 MiB file (at most 3 MiB, `TAIL_MS_PER_MIB`); the handler's write is done and nothing hangs, and the call that was interrupted comes back
+ * lapses, and for the tail of the rewrite of the 3 MiB file (at most 3 MiB, `LAPSE_BOUND_MS`); the handler's write is done and nothing hangs, and the call that was interrupted comes back
  * with the parts it had done. */
 static int check_handler_write_body(void) {
     DATA_CHECK(arm_signal() == 0);
@@ -2754,7 +2756,7 @@ static int check_handler_write_body(void) {
     h_mode = 0;
     printf("posix-data: the call returned %ld of %lu; the handler (live %llu) wrote %ld after %llu ms\n", (long)r, MIB,
            h_live, (long)h_wrote, h_ms);
-    DATA_CHECK(h_live >= 1 && h_wrote == 1000 && h_ms < LAPSE_GAP_MS + 3 * TAIL_MS_PER_MIB);
+    DATA_CHECK(h_live >= 1 && h_wrote == 1000 && h_ms < LAPSE_BOUND_MS(3));
     DATA_CHECK(r >= 0 && (r == (ssize_t)MIB || ((unsigned long)r % CELL_BYTES_C == 0)));
     /* What the call wrote is its pattern (this call and the calls before it), and the handler's bytes
      * are at 2 MiB. */

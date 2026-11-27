@@ -19,6 +19,8 @@ use std::string::{String, ToString};
 use std::vec::Vec;
 
 const MIB: usize = 1 << 20;
+/// A session of the superuser, which the reserve of free blocks does not hold back.
+const SU: u64 = 77;
 
 fn big() -> Rig {
     let mut rig = Rig::on(MemDevice::new(16_384));
@@ -506,8 +508,8 @@ fn a_cut_between_the_steps_of_a_copy_leaves_the_old_file_or_the_new() {
     assert!(olds > 0, "no cut ever left the old file");
 }
 
-/// A call that runs while a copy is half done (the unlink or the rename of an open file is not
-/// known to flush, so `pick` lets it run) finishes the copy in its own job and sees the right bytes.
+/// A call that runs while a copy is half done (the tests call it directly, with no `pick` before it:
+/// a read, a write and a close) finishes the copy in its own job and sees the right bytes.
 #[test]
 fn a_call_that_meets_a_half_done_copy_finishes_it_and_sees_the_right_bytes() {
     for call in 0..3 {
@@ -551,5 +553,86 @@ fn a_call_that_meets_a_half_done_copy_finishes_it_and_sees_the_right_bytes() {
             all.extend_from_slice(&r[4..]);
         }
         assert!(all == want, "call {call}");
+    }
+}
+
+/// A rewrite on a volume with too little room for the copy of its tail: a step fails, and the jobs
+/// that waited for the copy get the error, the close of the last description included (littlefs
+/// closes a file that failed with no sync, so the service keeps the error of the step).
+#[test]
+fn a_step_that_runs_out_of_room_answers_its_error_to_the_close_and_to_a_read() {
+    for last in ["close", "read", "fsync"] {
+        let mut rig = Rig::on(MemDevice::new(1_280));
+        rig.mkdir(ROOT, b"/d", 0o777).unwrap();
+        rig.bind(SU, crate::tests_perm::user(0, 0, &[]));
+        let old = pattern(0, 150_000);
+        let h = make(&mut rig, SU, b"/d/f", &old);
+        // Fill the volume as the superuser up to 12 blocks: enough for the first block of the
+        // rewrite, far from enough for the tail of 37 blocks.
+        let g = rig
+            .open(ROOT, b"/d/g", p::READ | p::WRITE | p::CREATE, 0o666)
+            .unwrap();
+        while rig.fs.free_blocks().unwrap() > 12 {
+            rig.write(ROOT, g, &[1u8; 900]).unwrap();
+        }
+        rig.ok(SU, |w| p::pwrite(h, 10, b"Q", w));
+        let request = match last {
+            "close" => req(|w| p::handle_call(p::Method::Close, h, w)),
+            "fsync" => req(|w| p::handle_call(p::Method::Fsync, h, w)),
+            _ => pread(h, 10, 20),
+        };
+        let log = serve(
+            &mut rig,
+            std::vec![Job {
+                who: SU,
+                name: "last",
+                request
+            }],
+        );
+        let done = log.iter().find(|d| d.name == "last").unwrap();
+        assert!(
+            done.answer.is_err(),
+            "{last}: the answer is {:?}",
+            done.answer
+        );
+        assert!(rig.server.tail_steps > 0, "{last}");
+    }
+}
+
+/// The unlink and the rename of an open file wait for the stepped copy of its tail, and the rename
+/// over an open file waits for the copy of the file it replaces.
+#[test]
+fn an_unlink_and_a_rename_of_an_open_file_wait_for_the_stepped_copy() {
+    for call in 0..3 {
+        let mut rig = big();
+        let old = pattern(0, 300_000);
+        let h = make(&mut rig, OWNER, b"/d/f", &old);
+        let _other = make(&mut rig, OWNER, b"/d/s", &pattern(9, 2000));
+        rig.ok(OWNER, |w| p::pwrite(h, 10, b"x", w));
+        let (name, request) = match call {
+            0 => (
+                "unlink",
+                req(|w| p::path_call(p::Method::Unlink, b"/d/f", w)),
+            ),
+            1 => ("rename", req(|w| p::rename(b"/d/f", b"/d/n", w))),
+            _ => ("rename over", req(|w| p::rename(b"/d/s", b"/d/f", w))),
+        };
+        let log = serve(
+            &mut rig,
+            std::vec![Job {
+                who: OWNER,
+                name,
+                request
+            }],
+        );
+        let names: Vec<&str> = log.iter().map(|d| d.name.as_str()).collect();
+        let at = names.iter().position(|n| *n == name).unwrap();
+        assert!(
+            at >= 4 && names[..at].iter().all(|n| *n == "step"),
+            "{name}: {names:?}"
+        );
+        assert!(log[at].answer.is_ok(), "{name}: {:?}", log[at].answer);
+        // The job itself copied nothing: a few reads for the names, none for a tail.
+        assert!(log[at].reads < 80, "{name}: {} reads", log[at].reads);
     }
 }

@@ -270,7 +270,9 @@ int64_t datafs_window_free(const struct datafs *d)
 
 // Walks the file system once and fills the allocator's window from it, at a point where no
 // operation is half done (littlefs counts the blocks of the open files in the walk, so a file that
-// is written and awaits its sync keeps its blocks). The window is dropped first, so the walk is made
+// is written and awaits its sync keeps its blocks; so does a file whose flush of the tail is half
+// done between two steps: the part copied is counted through f->block and f->pos, the old list
+// through the directory entry). The window is dropped first, so the walk is made
 // whether or not the window was full. lfs_fs_gc compacts no metadata here (`compact_thresh` is
 // off), so the walk only reads.
 int datafs_walk(struct datafs *d, void *ctx)

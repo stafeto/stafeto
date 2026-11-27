@@ -32,23 +32,26 @@
 //! than W (`docs/data.md`), as before. A job that waits for a file waits at most
 //!
 //! ```text
-//! W_lease <= W + sum over the holders ahead [ n_i * (T_part + T_job) + LEASE_CLIENT_MAX ] + T_tail
+//! W_lease <= W + sum over the holders ahead [ n_i * (T_part + T_job + 2 * T_slice) + LEASE_CLIENT_MAX ] + T_tail
 //! ```
 //!
 //! where a holder ahead is a lease on the file, or an older waiting call that takes a lease (a new
 //! read lease does not queue behind a waiting writer, so it is not ahead of it), `n_i` is the number of
-//! parts the holder has left, `ceil(count / 64 KiB)`, `T_part` is one job of a part and `T_job` one
-//! job of another file that runs between two parts.
+//! parts the holder has left, `ceil(count / 64 KiB)`, `T_part` is one job of a part, `T_job` one
+//! job of another file that runs between two parts and `T_slice` one step of a copy of a tail (a step
+//! runs after every job, so one after the part and one after the job between).
 //!
 //! `T_tail` is the cost of the tail of a rewrite that stopped. When a call that rewrites a file from
 //! the middle lapses, littlefs has to write out everything past the last byte written
 //! (`lfs_file_flush`: a copy of `size - stop_position`). The copy has no bound of its own but
 //! `FILE_MAX`, it is about a second per MiB of the file past the stopped write on QEMU (a Mac with
 //! Apple silicon; the GitHub runners take 2.6 times as long). The service runs it in steps of
-//! `TAIL_SLICE_BLOCKS` blocks between its jobs (`tail.rs`, issue #626): the waiter for the file waits
-//! for all the steps, and the jobs of other files for one. A file that is only appended to or made
-//! again has no tail. The lapse itself comes within the wake of the timer after the gap, and the
-//! waiter is chosen at once after it (`Server::lapse`).
+//! `TAIL_SLICE_BLOCKS` blocks, one step after every job and in the idle time (`tail.rs`, issue #626).
+//! The waiter for the file waits for the steps of every tail that runs, since the steps take turns
+//! across the tails: `T_tail` is the sum of the tails running, in steps, each with the job that runs
+//! before it. A file that is only appended to or made again has no tail. The lapse itself comes
+//! within the wake of the timer after the gap, and the waiter is chosen at once after it
+//! (`Server::lapse`), when it has no tail to wait for.
 
 use super::*;
 
@@ -192,6 +195,8 @@ struct Wants {
     /// The node whose unfinished tail (`tail.rs`) the job would flush, and whether the job is a
     /// write that goes on where the last one stopped, which does not flush it.
     flushes: Option<(usize, bool)>,
+    /// A second node it would flush: the file a rename replaces.
+    flushes_too: Option<usize>,
 }
 
 impl Server {
@@ -482,8 +487,9 @@ impl Server {
 
     /// The node whose unfinished tail the request would flush, and whether it is a write that goes
     /// on where the last one stopped (which does not flush it).
-    pub(super) fn flush_of(&self, owner: u64, request: &[u8]) -> Option<(usize, bool)> {
-        self.wants(owner, request).flushes
+    pub(super) fn flush_of(&self, owner: u64, request: &[u8]) -> [Option<(usize, bool)>; 2] {
+        let w = self.wants(owner, request);
+        [w.flushes, w.flushes_too.map(|ni| (ni, false))]
     }
 
     /// The node and the lease of a request, as far as the request names them.
@@ -499,6 +505,32 @@ impl Server {
         let Some(method) = Method::from_number(header.method) else {
             return none;
         };
+        // The unlink of an open file and the rename of one (or over one) move its node, which
+        // syncs it: they wait for the stepped copy of its tail as an open with truncation does.
+        if matches!(method, Method::Unlink | Method::Rename) {
+            let (mut first, mut second) = ([0u8; MAX_PATH], [0u8; MAX_PATH]);
+            let (a, b) = if method == Method::Unlink {
+                match r.bytes(r.left()) {
+                    Ok(raw) => (canonical(raw, &mut first).ok(), None),
+                    Err(_) => return none,
+                }
+            } else {
+                match p::read_rename(r) {
+                    Ok((from, to)) => (
+                        canonical(from, &mut first).ok(),
+                        canonical(to, &mut second).ok(),
+                    ),
+                    Err(_) => return none,
+                }
+            };
+            return Wants {
+                flushes: a
+                    .and_then(|n| self.node_at(&first[..n]))
+                    .map(|ni| (ni, false)),
+                flushes_too: b.and_then(|n| self.node_at(&second[..n])),
+                ..none
+            };
+        }
         // The calls that name a path need no session: the file is the one at the path.
         if matches!(method, Method::Stat | Method::Open) {
             let mut path = [0u8; MAX_PATH];
@@ -600,6 +632,7 @@ impl Server {
                         holder: Some(slot),
                         takes: false,
                         flushes: None,
+                        flushes_too: None,
                     };
                 }
                 let node = file_node(part.part.handle);
@@ -623,6 +656,7 @@ impl Server {
                     holder: None,
                     takes: part.part.lease == 0 && part.part.flags & p::MORE != 0,
                     flushes,
+                    flushes_too: None,
                 }
             }
             _ => none,
@@ -636,8 +670,10 @@ impl Server {
             return false;
         }
         // A job that would flush a node whose tail is being copied waits for the copy.
-        if let Some((ni, _)) = w.flushes
-            && self.nodes[ni].tail == tail::Tail::Running
+        if [w.flushes.map(|(ni, _)| ni), w.flushes_too]
+            .into_iter()
+            .flatten()
+            .any(|ni| self.nodes[ni].tail == tail::Tail::Running)
         {
             return true;
         }

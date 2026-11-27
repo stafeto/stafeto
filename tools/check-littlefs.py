@@ -37,7 +37,7 @@ UPSTREAM = {
 }
 # The two files the change touches, with the change.
 CHANGED = {
-    "lfs.c": "7786b2a5f18ae12f8ca1055198070e34ecbaffd5b56ad632e2b04b0756687e17",
+    "lfs.c": "ff1199db116f6bf5d53f283308504b8c47af5af2b33d8d471f450ebced9d524a",
     "lfs.h": "c9f7c2b7c76eee3be0634c41daf2b0738d68d5e2ca65037844338f74083dd68b",
 }
 PATCH = "stafeto-changes.patch"

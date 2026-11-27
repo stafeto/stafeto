@@ -800,10 +800,9 @@ const LAPSE_LATE_US: i64 = 250_000;
 
 /// What the choice of the waiter may add for each step of the copy of a tail that ran between the
 /// lapse and the choice (`lib/datafs/src/server/tail.rs`): the waiter of a file with a tail waits for the
-/// whole copy, in steps of 64 KiB with jobs of other files between them. The first run measured
-/// 60 ms a step (961 ms for the 16 steps of a tail of 1 MiB on the Mac under QEMU); the bound is
-/// that of any other wait of a lapse until the measurements of more runs say what it can come down to.
-const LAPSE_STEP_US: i64 = 250_000;
+/// whole copy, in steps of 64 KiB with jobs of other files between them. The runs measured 44 to 60 ms
+/// a step on the Mac under QEMU; `TAIL_STEP_MS` of `tests/posix-data/data.c` is the same bound.
+const LAPSE_STEP_US: i64 = 100_000;
 
 /// One lapse the service said (`datafs: lease lapse N: last answer A us after the waiter was queued,
 /// lapse B us after the expiry, waiter chosen C us after the lapse, waiter job D us, R disk reads, W

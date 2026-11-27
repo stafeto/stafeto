@@ -3618,12 +3618,19 @@ static int lfs_file_flush_blocks(lfs_t *lfs, lfs_file_t *file,
             };
             lfs_cache_drop(lfs, &lfs->rcache);
             lfs_size_t copied = 0;
+            lfs_size_t limit = 0;
+            if (blocks > 0) {
+                // the position of the file is kept from here on, so that an
+                // error inside the step leaves the file as a step that ended
+                file->flush_pos = pos;
+                file->flags |= LFS_F_FLUSHING;
+                limit = (blocks > lfs->file_max / lfs->cfg->block_size)
+                        ? lfs->file_max : blocks * lfs->cfg->block_size;
+            }
 
             while (file->pos < file->ctz.size) {
-                if (blocks > 0 && copied >= blocks * lfs->cfg->block_size) {
+                if (blocks > 0 && copied >= limit) {
                     // this step is over: leave the file where it is
-                    file->flush_pos = pos;
-                    file->flags |= LFS_F_FLUSHING;
                     lfs_cache_drop(lfs, &lfs->rcache);
                     return 1;
                 }
