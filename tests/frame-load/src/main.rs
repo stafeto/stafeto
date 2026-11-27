@@ -60,6 +60,8 @@ const WAKE_LATE_NS: u64 = 100_000_000;
 /// long before its end.
 const SETTLE_NS: u64 = 50_000_000;
 const READ_BEFORE_END_NS: u64 = 5_000_000;
+/// The size of the compositor's log of late frames (compositor::frame::LATE_LOG).
+const LATE_LOG_SIZE: u64 = 4;
 const WAIT_NS: u64 = 60_000_000_000;
 /// How long after the last phase the conductor says `done`.
 const DONE_AFTER_NS: u64 = 2_000_000_000;
@@ -254,6 +256,12 @@ impl Env<'_> {
                 frame_max_us: s.frame_max_us,
                 band_max_us: s.band_max_us,
             };
+            // The compositor tells one logged late frame per reading STATS: read
+            // once more for each further late frame, so every one is told before
+            // the phase line.
+            for _ in 1..u64::from(counters.late).min(LATE_LOG_SIZE) {
+                Self::stats(&display, false)?;
+            }
             rt::println!("{}", PhaseLine(phase, &counters));
             rt::println!("{}", HistLine(phase, &s.hist));
             rt::println!(
