@@ -3,7 +3,7 @@
 
 //! A data volume and a lower set in memory, for the tests of the service.
 
-use crate::volume::{Lower, LowerStat, R, Visit, Volume};
+use crate::volume::{Bulk, CELL, Lower, LowerStat, R, Visit, Volume};
 use proto_data as d;
 use proto_wire::Status;
 use std::collections::BTreeMap;
@@ -182,6 +182,38 @@ impl FakeVolume {
             .collect()
     }
 
+    fn mkdir_at(&mut self, path: &[u8], mode: u32, number: Option<u64>) -> R<()> {
+        if self.nodes.contains_key(path) {
+            return Err(st(d::EXISTS));
+        }
+        let parent = match path.iter().rposition(|&b| b == b'/') {
+            Some(0) => b"/".to_vec(),
+            Some(i) => path[..i].to_vec(),
+            None => return Err(st(d::INVALID)),
+        };
+        if !self.nodes.get(&parent).is_some_and(|n| n.dir) {
+            return Err(st(d::NO_ENTRY));
+        }
+        let ino = number.unwrap_or_else(|| self.fresh());
+        self.nodes.insert(
+            path.to_vec(),
+            Node {
+                dir: true,
+                mode,
+                uid: 0,
+                gid: 0,
+                ino,
+                data: Vec::new(),
+                times: (0, 0),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn handle_path(&self, handle: u32) -> Option<Vec<u8>> {
+        self.handles.get(&handle).map(|(p, _)| p.clone())
+    }
+
     pub fn calls_of(&self, name: &str) -> usize {
         self.calls.iter().filter(|c| *c == name).count()
     }
@@ -301,31 +333,12 @@ impl Volume for FakeVolume {
 
     fn mkdir(&mut self, path: &[u8], mode: u32) -> R<()> {
         self.check("mkdir")?;
-        if self.nodes.contains_key(path) {
-            return Err(st(d::EXISTS));
-        }
-        let parent = match path.iter().rposition(|&b| b == b'/') {
-            Some(0) => b"/".to_vec(),
-            Some(i) => path[..i].to_vec(),
-            None => return Err(st(d::INVALID)),
-        };
-        if !self.nodes.get(&parent).is_some_and(|n| n.dir) {
-            return Err(st(d::NO_ENTRY));
-        }
-        let ino = self.fresh();
-        self.nodes.insert(
-            path.to_vec(),
-            Node {
-                dir: true,
-                mode,
-                uid: 0,
-                gid: 0,
-                ino,
-                data: Vec::new(),
-                times: (0, 0),
-            },
-        );
-        Ok(())
+        self.mkdir_at(path, mode, None)
+    }
+
+    fn mkdir_numbered(&mut self, path: &[u8], mode: u32, ino: u64) -> R<()> {
+        self.check("mkdir_numbered")?;
+        self.mkdir_at(path, mode, Some(ino))
     }
 
     fn rename(&mut self, from: &[u8], to: &[u8]) -> R<()> {
@@ -444,6 +457,20 @@ pub struct FakeLower {
     pub limit: usize,
     /// The poll after which a resolve fails with INVALID_ARGUMENT, counted over all of them.
     pub fail_at: Option<usize>,
+    /// The bytes of a file, the text of a link, and the times of a name (access and modification,
+    /// nanoseconds; 4,000 and 5,000 where none is set).
+    pub data: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub texts: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub times: BTreeMap<Vec<u8>, (i64, i64)>,
+    /// The reads of links in flight, as the stats are.
+    pub links: usize,
+}
+
+/// A read of a link in flight.
+pub struct FakeLink {
+    path: Vec<u8>,
+    left: u32,
+    spent: bool,
 }
 
 pub struct LowerDir {
@@ -479,6 +506,22 @@ impl FakeLower {
 
     pub fn link(&mut self, path: &str, ino: u64) -> &mut Self {
         self.nodes.insert(path.as_bytes().to_vec(), (5, ino));
+        self
+    }
+
+    pub fn bytes(&mut self, path: &str, data: &[u8]) -> &mut Self {
+        self.data.insert(path.as_bytes().to_vec(), data.to_vec());
+        self
+    }
+
+    pub fn text(&mut self, path: &str, text: &str) -> &mut Self {
+        self.texts
+            .insert(path.as_bytes().to_vec(), text.as_bytes().to_vec());
+        self
+    }
+
+    pub fn times_of(&mut self, path: &str, atime: i64, mtime: i64) -> &mut Self {
+        self.times.insert(path.as_bytes().to_vec(), (atime, mtime));
         self
     }
 
@@ -544,12 +587,15 @@ impl FakeLower {
                 .get(path)
                 .copied()
                 .unwrap_or((if kind == 1 { 0o755 } else { 0o644 }, 0, 0));
+        let (atime, mtime) = self.times.get(path).copied().unwrap_or((4_000, 5_000));
         Ok(LowerStat {
             kind,
             mode,
             uid,
             gid,
             ino,
+            atime,
+            mtime,
         })
     }
 }
@@ -557,6 +603,7 @@ impl FakeLower {
 impl Lower for FakeLower {
     type Dir = LowerDir;
     type Probe = FakeProbe;
+    type Link = FakeLink;
 
     fn open_dir_start(&mut self, path: &[u8]) -> R<LowerDir> {
         self.begin()?;
@@ -613,8 +660,40 @@ impl Lower for FakeLower {
         }
     }
 
-    fn readlink(&mut self, _: &[u8], _: &mut [u8]) -> R<usize> {
-        Err(st(proto_fs::INVALID_ARGUMENT))
+    fn readlink_start(&mut self, path: &[u8]) -> R<FakeLink> {
+        self.begin()?;
+        self.links += 1;
+        Ok(FakeLink {
+            path: path.to_vec(),
+            left: self.delay,
+            spent: false,
+        })
+    }
+
+    fn readlink_poll(&mut self, link: &mut FakeLink, out: &mut [u8; 512]) -> R<Option<usize>> {
+        assert!(!link.spent, "poll of a spent read");
+        self.polls += 1;
+        if link.left > 0 {
+            link.left -= 1;
+            return Ok(None);
+        }
+        link.spent = true;
+        self.live -= 1;
+        match (self.nodes.get(&link.path), self.texts.get(&link.path)) {
+            (Some((5, _)), Some(text)) => {
+                out[..text.len()].copy_from_slice(text);
+                Ok(Some(text.len()))
+            }
+            (None, _) => Err(st(proto_fs::NO_ENTRY)),
+            _ => Err(st(proto_fs::INVALID_ARGUMENT)),
+        }
+    }
+
+    fn readlink_cancel(&mut self, link: FakeLink) {
+        if !link.spent {
+            self.live -= 1;
+            self.cancelled += 1;
+        }
     }
 
     fn stat_start(&mut self, path: &[u8], _follow: bool) -> R<FakeProbe> {
@@ -719,4 +798,130 @@ pub fn scale_set(
         put(ix, dir, &std::format!("m{k:04}"), Kind::Whiteout)?;
     }
     Ok(out)
+}
+
+/// The calls of a copy over the tree of the volume and the lower set the test holds (`Core`'s own
+/// two), with a cell of its own.
+pub struct FakeBulk<'a> {
+    pub volume: &'a mut FakeVolume,
+    pub lower: &'a mut FakeLower,
+    pub cell: Vec<u8>,
+    fds: BTreeMap<u32, Vec<u8>>,
+    next: u32,
+    /// The calls made, by name, and the reads of the lower file as (offset, count).
+    pub calls: Vec<String>,
+    pub reads: Vec<(u64, usize)>,
+    /// The call that fails (by name), with the status.
+    pub fail: Option<(&'static str, Status)>,
+    /// The writes of a cell, as (offset, count).
+    pub writes: Vec<(u64, usize)>,
+    /// A write that stops short: the count it does (None for all).
+    pub short: Option<usize>,
+}
+
+impl<'a> FakeBulk<'a> {
+    pub fn new(volume: &'a mut FakeVolume, lower: &'a mut FakeLower) -> FakeBulk<'a> {
+        FakeBulk {
+            volume,
+            lower,
+            cell: vec![0; CELL],
+            fds: BTreeMap::new(),
+            next: 1,
+            calls: Vec::new(),
+            reads: Vec::new(),
+            fail: None,
+            writes: Vec::new(),
+            short: None,
+        }
+    }
+
+    fn call(&mut self, name: &'static str) -> R<()> {
+        self.calls.push(name.into());
+        match self.fail {
+            Some((n, status)) if n == name => Err(status),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn open_fds(&self) -> usize {
+        self.fds.len()
+    }
+}
+
+impl Bulk for FakeBulk<'_> {
+    fn open_lower(&mut self, path: &[u8]) -> R<u32> {
+        self.call("open_lower")?;
+        match self.lower.nodes.get(path) {
+            Some((2, _)) => {}
+            Some(_) => return Err(st(proto_fs::INVALID_ARGUMENT)),
+            None => return Err(st(proto_fs::NO_ENTRY)),
+        }
+        let fd = self.next;
+        self.next += 1;
+        self.fds.insert(fd, path.to_vec());
+        Ok(fd)
+    }
+
+    fn read_lower(&mut self, fd: u32, offset: u64, at: usize, len: usize) -> R<usize> {
+        self.call("read_lower")?;
+        assert!(len <= proto_fs::READ_PORTION && at.is_multiple_of(4096) && at + len <= CELL);
+        self.reads.push((offset, len));
+        let path = self.fds.get(&fd).ok_or(st(proto_fs::BAD_FD))?;
+        let data = self.lower.data.get(path).map(Vec::as_slice).unwrap_or(&[]);
+        let from = (offset as usize).min(data.len());
+        let n = len.min(data.len() - from);
+        self.cell[at..at + n].copy_from_slice(&data[from..from + n]);
+        Ok(n)
+    }
+
+    fn cell(&self) -> &[u8] {
+        &self.cell
+    }
+
+    fn close_lower(&mut self, fd: u32) {
+        let _ = self.call("close_lower");
+        self.fds.remove(&fd);
+    }
+
+    fn open_work(&mut self, path: &[u8], mode: u32, ino: u64) -> R<u32> {
+        self.call("open_work")?;
+        self.volume
+            .open_numbered(path, d::WRITE | d::CREATE | d::EXCLUSIVE, mode, ino)
+    }
+
+    fn write_cell(&mut self, handle: u32, offset: u64, count: usize) -> R<usize> {
+        self.call("write_cell")?;
+        self.writes.push((offset, count));
+        let count = self.short.map_or(count, |s| s.min(count));
+        let path = self.volume.handle_path(handle).ok_or(st(d::BAD_HANDLE))?;
+        let node = self.volume.nodes.get_mut(&path).ok_or(st(d::NO_ENTRY))?;
+        assert_eq!(node.data.len() as u64, offset, "the cells go in order");
+        node.data.extend_from_slice(&self.cell[..count]);
+        Ok(count)
+    }
+
+    fn fsync(&mut self, handle: u32) -> R<()> {
+        self.call("fsync")?;
+        self.volume.fsync(handle)
+    }
+
+    fn chown(&mut self, path: &[u8], uid: u32, gid: u32) -> R<()> {
+        self.call("chown")?;
+        self.volume.chown(path, uid, gid)
+    }
+
+    fn chmod(&mut self, path: &[u8], mode: u32) -> R<()> {
+        self.call("chmod")?;
+        self.volume.chmod(path, mode)
+    }
+
+    fn utimens(&mut self, path: &[u8], atime: i64, mtime: i64) -> R<()> {
+        self.call("utimens")?;
+        self.volume.utimens(path, atime, mtime)
+    }
+
+    fn close(&mut self, handle: u32) -> R<()> {
+        self.call("close")?;
+        self.volume.close(handle)
+    }
 }

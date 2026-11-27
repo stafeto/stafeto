@@ -119,6 +119,8 @@ pub struct Core<'a, V: Volume, L: Lower> {
     pub(crate) resolving: u32,
     /// What the changes keep between requests (`change`).
     pub(crate) writes: crate::change::Writes,
+    /// The copies up (`copy`).
+    pub copies: crate::copy::Table,
 }
 
 /// The result of a walk and the plain path it walked, which a redirect carries.
@@ -219,6 +221,11 @@ impl Walked {
         matches!(self.outcome, Outcome::Lower | Outcome::Absent)
     }
 
+    /// The walk ended at a name of the lower set: an OPEN for writing copies it up.
+    pub fn is_lower(&self) -> bool {
+        self.outcome == Outcome::Lower
+    }
+
     /// The path ended with a slash.
     pub fn trailing(&self) -> bool {
         self.trailing
@@ -304,6 +311,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             table: Table::new(epoch),
             resolving: 0,
             writes: crate::change::Writes::default(),
+            copies: crate::copy::Table::new(),
         }
     }
 
@@ -821,16 +829,14 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         }
         // The names the root passes through are the services' own, writes included. A name that
         // the layer of the user does not hold is made in the layer when it is not there (in the
-        // lower set too), and a write to a name of the lower set is refused until the copy up.
+        // lower set too), and a name of the lower set that is opened for writing is copied up
+        // first (the answer is COPYING, `copy`).
         let writes = n::open_writes(flags);
-        if creates
-            && matches!(outcome, Outcome::Lower | Outcome::Absent)
+        let makes = creates && matches!(outcome, Outcome::Lower | Outcome::Absent);
+        if (makes || writes && outcome == Outcome::Lower)
             && let Some(done) = self.create_and_open(c, flags, &walked, w)?
         {
             return Ok(done);
-        }
-        if writes && outcome == Outcome::Lower {
-            return Err(st(proto_fs::READ_ONLY_FILESYSTEM));
         }
         if let Some(done) = Self::redirect_for(outcome, walked.path(), w) {
             return done.map(|()| Done::Written);

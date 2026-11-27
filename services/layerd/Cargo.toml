@@ -42,6 +42,19 @@ break-layerd-slots = []
 # `break-layerd-change-one-step`: a change job does all its work in one step of the loop, so the longest
 # step grows with the change and the step gate alone catches it.
 break-layerd-change-one-step = []
+# The deliberate breaks of the copy up (`cargo xtask layer-posix copy breaks`, `layer-steps breaks`
+# and the host tests): `break-layerd-copy-counter-ino` the copy of a file and the directories of its
+# path take numbers of the counter, not the lower numbers (`st_ino` changes with the copy);
+# `break-layerd-copy-attrs` the worker does not give the copy the owner, mode and times of the
+# lower file; `break-layerd-copy-in-loop` the loop moves the bytes of the copy in its own step (the
+# step gate of `layer-steps breaks` catches it); `break-layerd-copy-elf` the worker copies a program
+# too; `break-layerd-copy-recheck` the commit does not walk the name again, so a name deleted or made
+# during the copy is overwritten by the copy.
+break-layerd-copy-counter-ino = []
+break-layerd-copy-attrs = []
+break-layerd-copy-in-loop = []
+break-layerd-copy-elf = []
+break-layerd-copy-recheck = []
 break-layerd-whiteout = []
 break-layerd-search = []
 break-layerd-no-mark = []

@@ -20,8 +20,15 @@
 //! other methods of proto_layer that carry a selector answer NOT_FOUND. CLONE makes a session for
 //! a child of a fork or a spawn that shares the descriptions it names (one position for the
 //! holders, as POSIX shares an open file description), and CLONE_MORE adds descriptions to it
-//! until the child sends its first request; the clone is unbound until the child's BIND. WAIT is
-//! not served (UNKNOWN_METHOD).
+//! until the child sends its first request; the clone is unbound until the child's BIND.
+//!
+//! The copy up (step C4 part A). A request that writes a file of the lower set is a change job that
+//! makes the directories of the path in the layer, takes a place in the table of copies
+//! (`layerd::copy`) and answers COPYING with the ticket; the bytes are copied by the worker thread
+//! (`worker`) with sessions of its own, so the loop never waits for a disk. WAIT is a deferred reply
+//! that the commit job answers: when the worker has ended a copy the loop walks the name again under
+//! the lock and either makes the copy visible (the rename into the layer and the index entry in one
+//! step) or hands it to the reaper, and answers the waiters with 0 or the failure.
 
 #![no_std]
 #![no_main]
@@ -29,11 +36,13 @@
 mod data;
 mod lower;
 mod notary;
+mod worker;
 
 use abi::Rights;
 use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Release};
 use layerd::changejob::{ChangeJob, ChangeStep};
+use layerd::copy::{self, Waiters};
 use layerd::identity::{Binding, Vouched, vouched_from};
 use layerd::index::Index;
 use layerd::names::{Client, Core, Done, OpenCont, Prewalk, State};
@@ -72,6 +81,8 @@ const SESSIONS_PER_PROCESS: usize = 16;
 const LABEL_STEP: u64 = 0x6c61_7967_0001;
 /// The label of the notification for the next step of a long walk (`Job`).
 const LABEL_WALK: u64 = 0x6c61_7967_0002;
+/// The label of the notification the worker thread gives when it has ended a copy.
+const LABEL_COPY: u64 = 0x6c61_7967_0003;
 /// The requests whose walk or calls go on in steps at once. A request that finds the table full, or
 /// its session at its share, is answered busy (`layerd::jobs`).
 const JOBS: usize = layerd::jobs::JOBS;
@@ -123,9 +134,11 @@ static INDEX: Cell<Index> = Cell(UnsafeCell::new(Index::new()));
 static SCAN: Cell<Scan> = Cell(UnsafeCell::new(Scan::new()));
 static WORKERS: Cell<layerd::reaper::Workers> =
     Cell(UnsafeCell::new(layerd::reaper::Workers::new()));
-/// The change jobs, one for each place of the table of jobs.
+/// The change jobs, one for each place of the table of jobs and one more: the commit job that
+/// makes a finished copy visible (the place `JOBS`).
 type Change = ChangeJob<data::Data, lower::Ram>;
-static CHANGES: Cell<[Change; JOBS]> = Cell(UnsafeCell::new([const { Change::new() }; JOBS]));
+static CHANGES: Cell<[Change; JOBS + 1]> =
+    Cell(UnsafeCell::new([const { Change::new() }; JOBS + 1]));
 
 /// The registrar thread: the root goes to the process service, tried until it is there.
 static PARENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -219,6 +232,36 @@ fn main(_: u64) -> u64 {
     ) else {
         return NOT_REGISTERED;
     };
+    // The worker thread of the copies up: sessions of its own with the two file services, and the
+    // notification it gives the loop when a copy has ended.
+    let Ok(worker_files) = rt::fs::Files::connect(&s.parent) else {
+        rt::println!("layerd: no second session with the file service for the copies");
+        return NOT_CONNECTED;
+    };
+    let Ok(worker_data) = rt::service::connect(&s.parent, "datafs") else {
+        rt::println!("layerd: no second session with the data file service for the copies");
+        return NOT_CONNECTED;
+    };
+    let Ok(copied) = sys::handle_label(
+        &channel,
+        Rights::NOTIFY | Rights::TRANSFER,
+        LABEL_COPY,
+        level,
+    ) else {
+        return NOT_REGISTERED;
+    };
+    let kick = match worker::start(worker::Start {
+        process: &s.process,
+        files: worker_files,
+        data: worker_data,
+        done: copied,
+    }) {
+        Ok(kick) => kick,
+        Err(why) => {
+            rt::println!("layerd: no thread for the copies: {why}");
+            return NOT_CONNECTED;
+        }
+    };
     PARENT.store(s.parent.raw().0, Release);
     CHANNEL.store(channel.raw().0, Release);
     LEVEL.store(u64::from(level), Release);
@@ -269,7 +312,7 @@ fn main(_: u64) -> u64 {
         scan,
         workers,
         data::Data { session },
-        lower::Ram { files },
+        lower::Ram::new(files),
         epoch,
     );
     core.prepare();
@@ -291,6 +334,9 @@ fn main(_: u64) -> u64 {
         jobs: [const { None }; JOBS],
         next_job: 0,
         changes,
+        commit: false,
+        kick,
+        waiters: Waiters::new(),
         reap_turn: false,
         notary: notary::Notary::new(),
         next_label: 1,
@@ -382,7 +428,13 @@ struct Layerd {
     walk_step: Handle<Channel>,
     jobs: [Option<Job>; JOBS],
     next_job: usize,
-    changes: &'static mut [Change; JOBS],
+    changes: &'static mut [Change; JOBS + 1],
+    /// The commit job (the last of `changes`) has a copy to make visible.
+    commit: bool,
+    /// The kick of the worker thread.
+    kick: Handle<Channel>,
+    /// The WAIT requests that wait for a copy.
+    waiters: Waiters<rt::service::Pending, { copy::WAITERS }>,
     /// The next step of the loop goes to the reaper when it has work (the jobs and the reaper
     /// take turns).
     reap_turn: bool,
@@ -420,6 +472,7 @@ const METHODS: &[u16] = &[
     NameMethod::Access as u16,
     NameMethod::Readlink as u16,
     NameMethod::Change as u16,
+    NameMethod::Wait as u16,
 ];
 
 fn st(code: u32) -> Answer {
@@ -704,24 +757,32 @@ impl Layerd {
     /// dropped (its reply goes to nobody, the description it holds closes).
     fn walk_job(&mut self) {
         // The jobs and the reaper take turns: a step is one or the other.
-        if self.core.reaping() && (self.reap_turn || !self.jobs.iter().any(Option::is_some)) {
+        if self.core.reaping() && (self.reap_turn || !self.has_jobs()) {
             self.reap_turn = false;
             #[cfg(feature = "steps")]
             rt::service::step_detail(1300);
-            if self.core.reap_step() || self.jobs.iter().any(Option::is_some) {
+            if self.core.reap_step() || self.has_jobs() {
                 let _ = sys::notify(&self.walk_step, 1);
             }
             return;
         }
         self.reap_turn = true;
-        // A change job that does not hold the lock waits while another one does.
-        let Some(place) = (0..JOBS)
-            .map(|k| (self.next_job + k) % JOBS)
+        // A change job that does not hold the lock waits while another one does. The commit job
+        // of a finished copy is the place after the last of the table.
+        let Some(place) = (0..=JOBS)
+            .map(|k| (self.next_job + k) % (JOBS + 1))
             .find(|&i| self.runnable(i))
         else {
             return;
         };
-        self.next_job = (place + 1) % JOBS;
+        self.next_job = (place + 1) % (JOBS + 1);
+        if place == JOBS {
+            self.commit_job();
+            if self.has_jobs() || self.core.reaping() {
+                let _ = sys::notify(&self.walk_step, 1);
+            }
+            return;
+        }
         let gone = self.jobs[place]
             .as_ref()
             .is_some_and(|job| self.slot_of(job.label).is_none());
@@ -746,12 +807,20 @@ impl Layerd {
                 self.jobs[place] = self.advance(place, job);
             }
         }
-        if self.jobs.iter().any(Option::is_some) || self.core.reaping() {
+        if self.has_jobs() || self.core.reaping() {
             let _ = sys::notify(&self.walk_step, 1);
         }
     }
 
+    /// A job of the table or the commit job has work.
+    fn has_jobs(&self) -> bool {
+        self.commit || self.jobs.iter().any(Option::is_some)
+    }
+
     fn runnable(&self, place: usize) -> bool {
+        if place == JOBS {
+            return self.commit && (self.changes[JOBS].holds_lock() || !self.core.change_locked());
+        }
         match self.jobs[place].as_ref().map(|j| &j.stage) {
             None => false,
             Some(Stage::Changing) => self.changes[place].holds_lock() || !self.core.change_locked(),
@@ -785,6 +854,95 @@ impl Layerd {
                     Ok(Done::Continue(_)) => unreachable!(),
                     Err(status) => job.pending.answer(&proto_wire::reply(status), none()),
                 };
+                // A change that reserved a copy has a copy for the worker.
+                self.pump();
+            }
+        }
+    }
+
+    /// The copies the table has queued go to the worker thread, as many as it takes.
+    fn pump(&mut self) {
+        let mut sent = false;
+        while let Some(order) = self.core.copies.next_order() {
+            worker::publish(&order);
+            sent = true;
+        }
+        if sent {
+            self.copy_line("queued");
+            let _ = sys::notify(&self.kick, 1);
+            #[cfg(feature = "break-layerd-copy-in-loop")]
+            worker::inline();
+        }
+    }
+
+    /// The counters of the copies, a line when something happened: the probes read it.
+    fn copy_line(&self, what: &str) {
+        let t = &self.core.copies;
+        rt::println!(
+            "layerd: copies {what}: {} reserved, {} made visible, {} dropped, {} failed",
+            t.reserved,
+            t.committed,
+            t.dropped,
+            t.failed
+        );
+    }
+
+    /// The worker has ended copies: the table is told, and the commit job starts for the first.
+    fn copies_ended(&mut self) {
+        while let Some(ended) = worker::collect() {
+            if !self.core.copies.ended(ended) {
+                rt::println!("layerd: a copy that is not in work ended");
+            }
+        }
+        self.next_commit();
+    }
+
+    /// The commit job takes the next copy the worker ended, when it has none.
+    fn next_commit(&mut self) {
+        if self.commit {
+            return;
+        }
+        if self.core.commit_start(&mut self.changes[JOBS], JOBS as u8) {
+            self.commit = true;
+            let _ = sys::notify(&self.walk_step, 1);
+        }
+    }
+
+    /// One step of the commit job.
+    fn commit_job(&mut self) {
+        let root = Vouched::root();
+        let c = Client {
+            owner: 0,
+            who: &root,
+        };
+        #[cfg(feature = "steps")]
+        rt::service::step_detail(self.changes[JOBS].detail());
+        let mut w = proto_wire::Writer::new();
+        match self.core.change_step(&c, &mut self.changes[JOBS], &mut w) {
+            ChangeStep::Wait | ChangeStep::More => {}
+            ChangeStep::Done(_) => {
+                let of = self.changes[JOBS].commit_of();
+                self.core.commit_done(&mut self.changes[JOBS]);
+                self.commit = false;
+                if let Some((place, generation)) = of {
+                    let ticket = copy::ticket_of(place, generation);
+                    let code = match self.core.copy_wait(ticket) {
+                        copy::Wait::Over(code) => code,
+                        copy::Wait::Pending => 0,
+                    };
+                    while let Some(pending) = self.waiters.take(ticket) {
+                        let status = if code == 0 {
+                            Status::Ok
+                        } else {
+                            Status::Unknown(code)
+                        };
+                        let _ =
+                            pending.answer(&proto_wire::reply(status), rt::handle::Outgoing::new());
+                    }
+                }
+                self.copy_line("over");
+                self.next_commit();
+                self.pump();
             }
         }
     }
@@ -816,8 +974,11 @@ impl Layerd {
                 };
                 match kind {
                     JobKind::Open { flags } => {
-                        // An OPEN that creates a name the layer does not hold is a change job.
-                        if flags & proto_fs::CREATE != 0 && walked.is_missing() {
+                        // An OPEN that creates a name the layer does not hold is a change job, and so
+                        // is one that writes a name of the lower set (it is copied up first).
+                        if (flags & proto_fs::CREATE != 0 && walked.is_missing())
+                            || (n::open_writes(flags) && walked.is_lower())
+                        {
                             return match self.changes[place].start_create(
                                 place as u8,
                                 flags,
@@ -1078,6 +1239,38 @@ impl Layerd {
                 }
                 self.defer_at(r, place, who, label, JobKind::Change, Stage::Changing)
             }
+            NameMethod::Wait => {
+                if let Err(a) = needs(&who) {
+                    return a;
+                }
+                let Ok(ticket) = n::read_wait(body) else {
+                    return bad;
+                };
+                match self.core.copy_wait(ticket) {
+                    copy::Wait::Over(0) => Answer::Status(Status::Ok),
+                    copy::Wait::Over(code) => st(code),
+                    copy::Wait::Pending => {
+                        // The reply waits for the end of the copy; no place for it is a request to
+                        // ask again.
+                        if self.waiters.len() >= copy::WAITERS {
+                            return st(l::STARTING);
+                        }
+                        let Some(pending) = r.defer() else {
+                            return bad;
+                        };
+                        match self.waiters.add(ticket, pending) {
+                            Ok(()) => Answer::Deferred,
+                            Err(pending) => {
+                                let _ = pending.answer(
+                                    &proto_wire::reply(Status::Unknown(l::STARTING)),
+                                    rt::handle::Outgoing::new(),
+                                );
+                                Answer::Deferred
+                            }
+                        }
+                    }
+                }
+            }
             NameMethod::Fstat => {
                 let Ok(handle) = n::read_handle(body) else {
                     return bad;
@@ -1252,6 +1445,12 @@ impl Service<0> for Layerd {
             #[cfg(feature = "steps")]
             rt::service::step_detail(1000);
             self.walk_job();
+            return;
+        }
+        if notice.label == LABEL_COPY {
+            #[cfg(feature = "steps")]
+            rt::service::step_detail(1100);
+            self.copies_ended();
             return;
         }
         #[cfg(feature = "steps")]

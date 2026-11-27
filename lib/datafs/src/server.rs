@@ -536,6 +536,7 @@ pub fn needs_blocks(request: &[u8]) -> bool {
             | Method::WriteFrom
             | Method::PwriteFrom
             | Method::Mkdir
+            | Method::MkdirNumbered
             | Method::Truncate
             | Method::Rename
             | Method::OpenNumbered,
@@ -1178,6 +1179,11 @@ impl Server {
                     return Err(p::code(p::PERMISSION));
                 }
                 let (flags, mode, ino, raw) = p::read_open_numbered(r)?;
+                // The deliberate break `break-datafs-numbered-any`: only the numbers of the
+                // counter of the layered file service (bit 62) are taken, not those of the lower set.
+                if cfg!(feature = "break-datafs-numbered-any") && ino & p::INO_NUMBERED == 0 {
+                    return Err(p::code(p::INVALID));
+                }
                 let n = canonical(raw, &mut path)?;
                 visible(&path[..n], native)?;
                 self.do_open(fs, si, &caller, (flags, mode, Some(ino)), &path[..n], w)
@@ -1309,7 +1315,20 @@ impl Server {
                 let (mode, raw) = p::read_mode_path(r)?;
                 let n = canonical(raw, &mut path)?;
                 visible(&path[..n], native)?;
-                self.do_mkdir(fs, &caller, mode, &path[..n])
+                self.do_mkdir(fs, &caller, mode, None, &path[..n])
+            }
+            Method::MkdirNumbered => {
+                // Only a native client names the number of a directory: the layered file service.
+                if !p::is_service(owner) {
+                    return Err(p::code(p::PERMISSION));
+                }
+                let (mode, ino, raw) = p::read_mkdir_numbered(r)?;
+                if cfg!(feature = "break-datafs-numbered-any") && ino & p::INO_NUMBERED == 0 {
+                    return Err(p::code(p::INVALID));
+                }
+                let n = canonical(raw, &mut path)?;
+                visible(&path[..n], native)?;
+                self.do_mkdir(fs, &caller, mode, Some(ino), &path[..n])
             }
             Method::Unlink | Method::Rmdir => {
                 let n = canonical(r.bytes(r.left())?, &mut path)?;

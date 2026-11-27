@@ -3360,7 +3360,7 @@ const NVME_BREAKS: [&str; 10] = [
 /// The deliberate breaks of the data volume (`cargo xtask datafs-breaks`): each is a feature of
 /// `lib/datafs` that does one wrong thing, and its host tests (a cut of the power at every sector of a
 /// workload, the table of a new volume, the protocol) pass without it and fail with it.
-const DATAFS_BREAKS: [&str; 15] = [
+const DATAFS_BREAKS: [&str; 16] = [
     "break-datafs-sync",
     "break-datafs-consistent",
     "break-datafs-busy",
@@ -3376,6 +3376,7 @@ const DATAFS_BREAKS: [&str; 15] = [
     "break-datafs-append-end",
     "break-datafs-layers-visible",
     "break-datafs-tail-whole",
+    "break-datafs-numbered-any",
 ];
 
 /// The breaks to run: every one of `DATAFS_BREAKS`, or only the ones `named` (each must be one of
@@ -15176,7 +15177,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "layer-names",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/calibrate,compositor/irq-trace,compositor/late-open,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash,layerd/steps,layerd/probe-restart,layerd/break-layerd-whiteout,layerd/break-layerd-search,layerd/break-layerd-no-mark,layerd/break-layerd-sticky,layerd/break-layerd-one-step,layerd/break-layerd-change-one-step,layerd/break-layerd-slots,layerd/break-layerd-epoch,datafsd/probe-restart,datafsd/break-datafs-layers-visible",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/calibrate,compositor/irq-trace,compositor/late-open,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash,layerd/steps,layerd/probe-restart,layerd/break-layerd-whiteout,layerd/break-layerd-search,layerd/break-layerd-no-mark,layerd/break-layerd-sticky,layerd/break-layerd-one-step,layerd/break-layerd-change-one-step,layerd/break-layerd-slots,layerd/break-layerd-epoch,layerd/break-layerd-copy-counter-ino,layerd/break-layerd-copy-attrs,layerd/break-layerd-copy-in-loop,layerd/break-layerd-copy-elf,layerd/break-layerd-copy-recheck,datafsd/probe-restart,datafsd/break-datafs-layers-visible",
         "--target",
         PROGRAM_TARGET,
         "--",

@@ -28,6 +28,23 @@ pub struct Vouched {
 }
 
 impl Vouched {
+    /// The service itself: user 0, for the work it does on its own account (a copy made visible).
+    pub const fn root() -> Vouched {
+        Vouched {
+            pid: 0,
+            index: 0,
+            generation: 0,
+            ids: Ids {
+                uid: 0,
+                euid: 0,
+                gid: 0,
+                egid: 0,
+            },
+            groups: [0; GROUPS_MAX],
+            group_count: 0,
+        }
+    }
+
     pub fn identity(&self, real: bool) -> Identity<'_> {
         Identity::of(self.ids, &self.groups[..self.group_count], real)
     }

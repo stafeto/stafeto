@@ -37,6 +37,8 @@ pub trait Volume {
     fn fsync(&mut self, handle: u32) -> R<()>;
     fn stat(&mut self, path: &[u8]) -> R<Stat>;
     fn mkdir(&mut self, path: &[u8], mode: u32) -> R<()>;
+    /// MKDIR with the number `ino` for the new directory (a native client's request).
+    fn mkdir_numbered(&mut self, path: &[u8], mode: u32, ino: u64) -> R<()>;
     fn rename(&mut self, from: &[u8], to: &[u8]) -> R<()>;
     fn unlink(&mut self, path: &[u8]) -> R<()>;
     fn rmdir(&mut self, path: &[u8]) -> R<()>;
@@ -88,7 +90,8 @@ pub fn raw_entry(batch: &[u8], at: usize) -> Option<(u64, u32, &[u8], usize)> {
 }
 
 /// What the lower set says of a name: the kind of `NodeInfo` (1 directory, 2 file, 5 symbolic
-/// link, others for the rest), the mode, the owner and the number.
+/// link, others for the rest), the mode, the owner, the number and the times (nanoseconds, in the
+/// words of `proto_data::TimeSpec`, which a copy gives its copy).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LowerStat {
     pub kind: u32,
@@ -96,6 +99,8 @@ pub struct LowerStat {
     pub uid: u32,
     pub gid: u32,
     pub ino: u64,
+    pub atime: i64,
+    pub mtime: i64,
 }
 
 /// The lower set: the tree of the RAM file service as the boot profile of the service sees it. A
@@ -113,6 +118,8 @@ pub trait Lower {
     type Dir;
     /// A stat in flight.
     type Probe;
+    /// A read of a link in flight.
+    type Link;
 
     /// Starts the open of the directory at `path`; the directory is not open until `open_dir_poll`
     /// says so.
@@ -124,8 +131,14 @@ pub trait Lower {
     fn next(&mut self, dir: &mut Self::Dir, name: &mut [u8; 256]) -> R<Option<(u64, u32, usize)>>;
     /// Closes a directory, open or still being opened.
     fn close_dir(&mut self, dir: Self::Dir);
-    /// The text of the link at `path`, copied to `out`.
-    fn readlink(&mut self, path: &[u8], out: &mut [u8]) -> R<usize>;
+    /// Starts the read of the text of the link at `path`; the text is not there until
+    /// `readlink_poll` says so.
+    fn readlink_start(&mut self, path: &[u8]) -> R<Self::Link>;
+    /// One step of the read: the length of the text, copied to `out`, when it is in, None while the
+    /// service works. An answer or an error spends the preparation.
+    fn readlink_poll(&mut self, link: &mut Self::Link, out: &mut [u8; 512]) -> R<Option<usize>>;
+    /// Gives a read that is not answered back.
+    fn readlink_cancel(&mut self, link: Self::Link);
     /// Starts the stat of `path`; a link at the end is looked at (not followed) when `follow` is
     /// false.
     fn stat_start(&mut self, path: &[u8], follow: bool) -> R<Self::Probe>;
@@ -136,3 +149,31 @@ pub trait Lower {
     /// Gives a stat that is not answered back.
     fn stat_cancel(&mut self, probe: Self::Probe);
 }
+
+/// The bytes of a copy of a lower file, moved by the worker thread of the service: its own sessions
+/// with the data file service and with the RAM file service, and a window of one object of
+/// `proto_data::WINDOW_BYTES` that is the place of both (a cell of `CELL` bytes of it). Each call is
+/// one round trip. A status is the status of the reply.
+pub trait Bulk {
+    /// Opens the lower file at `path` (the canonical path of the lower set) for reading.
+    fn open_lower(&mut self, path: &[u8]) -> R<u32>;
+    /// Reads up to `len` bytes (at most `proto_fs::READ_PORTION`) at `offset` of the lower file
+    /// `fd` into the cell at `at` (a whole page); the count read.
+    fn read_lower(&mut self, fd: u32, offset: u64, at: usize, len: usize) -> R<usize>;
+    /// The bytes of the cell.
+    fn cell(&self) -> &[u8];
+    fn close_lower(&mut self, fd: u32);
+    /// Makes the file at `path` on the volume with the number `ino` (CREATE and EXCLUSIVE).
+    fn open_work(&mut self, path: &[u8], mode: u32, ino: u64) -> R<u32>;
+    /// Writes `count` bytes of the cell at `offset` of the file `handle` as one part with no
+    /// lease; the count written.
+    fn write_cell(&mut self, handle: u32, offset: u64, count: usize) -> R<usize>;
+    fn fsync(&mut self, handle: u32) -> R<()>;
+    fn chown(&mut self, path: &[u8], uid: u32, gid: u32) -> R<()>;
+    fn chmod(&mut self, path: &[u8], mode: u32) -> R<()>;
+    fn utimens(&mut self, path: &[u8], atime: i64, mtime: i64) -> R<()>;
+    fn close(&mut self, handle: u32) -> R<()>;
+}
+
+/// The bytes of a cell of a copy.
+pub const CELL: usize = proto_data::CELL_BYTES;
