@@ -13,7 +13,7 @@
 //! directory come from its stat; those of the files the listing does not need.
 
 use crate::index::{Fields, Index, Kind, OPAQUE, SLOTS, UNSCANNED};
-use crate::volume::Volume;
+use crate::volume::{BATCH_BYTES, Volume, raw_entry};
 use proto_data::{DIRECTORY, KIND_DIRECTORY, READ};
 use proto_wire::Status;
 
@@ -74,8 +74,22 @@ pub enum Progress {
     Done,
 }
 
+/// The entries of a batch one step takes into the index.
+pub const ENTRIES_PER_STEP: usize = 24;
+
 pub struct Scan {
     queue: [u32; SLOTS],
+    /// The batch of the open directory (`Volume::read_dir_raw`) and how far it is taken; whether
+    /// no more batches follow it.
+    batch: [u8; BATCH_BYTES],
+    batch_len: usize,
+    batch_pos: usize,
+    batch_last: bool,
+    /// The directory whose start is in progress: its id and the length of its path in `dir_path`,
+    /// and whether its attributes have been read.
+    dir: Option<(u32, usize)>,
+    dir_path: [u8; 512],
+    statted: bool,
     head: usize,
     tail: usize,
     /// The directory that is open: its id and the handle.
@@ -92,6 +106,13 @@ impl Scan {
     pub const fn new() -> Scan {
         Scan {
             queue: [0; SLOTS],
+            batch: [0; BATCH_BYTES],
+            batch_len: 0,
+            batch_pos: 0,
+            batch_last: false,
+            dir: None,
+            dir_path: [0; 512],
+            statted: false,
             head: 0,
             tail: 0,
             open: None,
@@ -104,6 +125,11 @@ impl Scan {
     pub fn reset(&mut self) {
         self.head = 0;
         self.tail = 0;
+        self.batch_len = 0;
+        self.batch_pos = 0;
+        self.batch_last = false;
+        self.dir = None;
+        self.statted = false;
         self.open = None;
         self.started = false;
         self.steps = 0;
@@ -132,6 +158,59 @@ impl Scan {
         Some(n + inside)
     }
 
+    /// The start of a directory, a step for each part: its path (a deep path takes the longest
+    /// walk up the index), its attributes (STAT), its description (OPEN).
+    fn start_directory<V: Volume>(
+        &mut self,
+        index: &mut Index,
+        volume: &mut V,
+        root: &[u8],
+    ) -> Result<Progress, Failure> {
+        let Some((id, n)) = self.dir else {
+            if self.head == self.tail {
+                return Ok(Progress::Done);
+            }
+            let id = self.queue[self.head % SLOTS];
+            self.head += 1;
+            // A directory whose path the volume would refuse is left out of the index and told
+            // of (`skipped`), so that one over-long name does not stop the build.
+            let n = match Self::volume_path(index, root, id, &mut self.dir_path) {
+                Some(n) if n <= proto_data::MAX_PATH => n,
+                _ => {
+                    self.skipped += 1;
+                    return Ok(Progress::More);
+                }
+            };
+            self.dir = Some((id, n));
+            self.statted = false;
+            return Ok(Progress::More);
+        };
+        let path = &self.dir_path[..n];
+        if !self.statted {
+            let stat = volume.stat(path).map_err(Failure::Volume)?;
+            if stat.kind != proto_data::KIND_DIRECTORY {
+                return Err(Failure::Volume(proto_data::code(proto_data::NOT_DIRECTORY)));
+            }
+            index.set_attr(
+                id,
+                stat.ino,
+                stat.uid,
+                stat.gid,
+                (stat.mode & 0o7777) as u16,
+            );
+            self.statted = true;
+            return Ok(Progress::More);
+        }
+        let handle = volume
+            .open(path, READ | DIRECTORY, 0)
+            .map_err(Failure::Volume)?;
+        index.set_flags(id, 0, UNSCANNED);
+        self.open = Some((id, handle));
+        self.dir = None;
+        self.statted = false;
+        Ok(Progress::More)
+    }
+
     /// One step. `root` is the path of the layer on the volume, `/.layers/NN`.
     pub fn step<V: Volume>(
         &mut self,
@@ -146,82 +225,75 @@ impl Scan {
             self.push(0);
         }
         let Some((id, handle)) = self.open else {
-            if self.head == self.tail {
-                return Ok(Progress::Done);
-            }
-            let id = self.queue[self.head % SLOTS];
-            self.head += 1;
-            let mut path = [0u8; 512];
-            // A directory whose path the volume would refuse is left out of the index and told
-            // of (`skipped`), so that one over-long name does not stop the build.
-            let n = match Self::volume_path(index, root, id, &mut path) {
-                Some(n) if n <= proto_data::MAX_PATH => n,
-                _ => {
-                    self.skipped += 1;
-                    return Ok(Progress::More);
-                }
-            };
-            let stat = volume.stat(&path[..n]).map_err(Failure::Volume)?;
-            if stat.kind != proto_data::KIND_DIRECTORY {
-                return Err(Failure::Volume(proto_data::code(proto_data::NOT_DIRECTORY)));
-            }
-            index.set_attr(
-                id,
-                stat.ino,
-                stat.uid,
-                stat.gid,
-                (stat.mode & 0o7777) as u16,
-            );
-            let handle = volume
-                .open(&path[..n], READ | DIRECTORY, 0)
-                .map_err(Failure::Volume)?;
-            index.set_flags(id, 0, UNSCANNED);
-            self.open = Some((id, handle));
-            return Ok(Progress::More);
+            return self.start_directory(index, volume, root);
         };
-        let mut failure = None;
-        let mut found_queue = [0u32; 64];
+        // A batch of the directory in the stash: read in one step, taken in steps of
+        // `ENTRIES_PER_STEP` entries (an insertion is about 450 ticks under -icount, a batch of a
+        // directory of short names holds 48 entries).
+        if self.batch_pos == self.batch_len && !self.batch_last {
+            self.batch_pos = 0;
+            self.batch_len = 0;
+            match volume.read_dir_raw(handle, &mut self.batch) {
+                Ok((len, more)) => {
+                    self.batch_len = len;
+                    self.batch_last = !more;
+                }
+                Err(e) => {
+                    let _ = volume.close(handle);
+                    self.open = None;
+                    return Err(Failure::Volume(e));
+                }
+            }
+            if self.batch_len > 0 {
+                return Ok(Progress::More);
+            }
+        }
+        let mut found_queue = [0u32; ENTRIES_PER_STEP];
         let mut found = 0;
-        let mut opaque = false;
-        let more = {
-            let index_ref = &mut *index;
-            let mut visit = |ino: u64, kind: u32, name: &[u8]| {
-                if failure.is_some() || name == b"." || name == b".." {
-                    return;
-                }
-                let (name, kind) = match special(name) {
-                    Special::Opaque => {
-                        opaque = true;
-                        return;
-                    }
-                    Special::Reserved => return,
-                    Special::Whiteout(target) => (target, Kind::Whiteout),
-                    Special::Link(target) => (target, Kind::Link),
-                    Special::None if kind == KIND_DIRECTORY => (name, Kind::Dir),
-                    Special::None => (name, Kind::File),
-                };
-                let fields = Fields {
-                    kind,
-                    layer,
-                    number: ino,
-                    uid: 0,
-                    gid: 0,
-                    mode: 0,
-                };
-                match index_ref.insert(id, name, fields) {
-                    Ok(child) => {
-                        if kind == Kind::Dir && found < found_queue.len() {
-                            found_queue[found] = child;
-                            found += 1;
-                        }
-                    }
-                    Err(_) => failure = Some(Failure::NoSpace),
-                }
+        let mut taken = 0;
+        let mut failure = None;
+        while taken < ENTRIES_PER_STEP {
+            let Some((ino, kind, name, next)) =
+                raw_entry(&self.batch[..self.batch_len], self.batch_pos)
+            else {
+                break;
             };
-            volume.read_dir(handle, &mut visit)
-        };
-        if opaque {
-            index.set_flags(id, OPAQUE, 0);
+            self.batch_pos = next;
+            taken += 1;
+            if name == b"." || name == b".." {
+                continue;
+            }
+            let (name, kind) = match special(name) {
+                Special::Opaque => {
+                    index.set_flags(id, OPAQUE, 0);
+                    continue;
+                }
+                Special::Reserved => continue,
+                Special::Whiteout(target) => (target, Kind::Whiteout),
+                Special::Link(target) => (target, Kind::Link),
+                Special::None if kind == KIND_DIRECTORY => (name, Kind::Dir),
+                Special::None => (name, Kind::File),
+            };
+            let fields = Fields {
+                kind,
+                layer,
+                number: ino,
+                uid: 0,
+                gid: 0,
+                mode: 0,
+            };
+            match index.insert(id, name, fields) {
+                Ok(child) => {
+                    if kind == Kind::Dir {
+                        found_queue[found] = child;
+                        found += 1;
+                    }
+                }
+                Err(_) => {
+                    failure = Some(Failure::NoSpace);
+                    break;
+                }
+            }
         }
         if let Some(f) = failure {
             let _ = volume.close(handle);
@@ -231,17 +303,13 @@ impl Scan {
         for &child in &found_queue[..found] {
             self.push(child);
         }
-        match more {
-            Ok(true) => {}
-            Ok(false) => {
-                let _ = volume.close(handle);
-                self.open = None;
-            }
-            Err(e) => {
-                let _ = volume.close(handle);
-                self.open = None;
-                return Err(Failure::Volume(e));
-            }
+        // The batch is taken and no more follow: the directory is done.
+        if self.batch_pos >= self.batch_len && self.batch_last {
+            let _ = volume.close(handle);
+            self.open = None;
+            self.batch_len = 0;
+            self.batch_pos = 0;
+            self.batch_last = false;
         }
         Ok(Progress::More)
     }

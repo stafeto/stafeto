@@ -799,6 +799,60 @@ fn numbers_come_in_blocks_and_a_restart_skips_what_it_had_not_given_out() {
 }
 
 #[test]
+fn the_layers_directory_is_the_native_clients_and_no_program_sees_it() {
+    let mut rig = Rig::new();
+    // The layer service (a native client) makes the directory and puts a file in it.
+    rig.mkdir(ROOT, b"/.layers", 0o755).unwrap();
+    rig.mkdir(ROOT, b"/.layers/00", 0o755).unwrap();
+    rig.put(ROOT, b"/.layers/00/f", 0o644, b"layer");
+    rig.put(ROOT, b"/visible", 0o644, b"x");
+    assert_eq!(
+        rig.names(ROOT, b"/").unwrap(),
+        [".", "..", ".layers", "visible"]
+    );
+    assert_eq!(rig.names(ROOT, b"/.layers/00").unwrap(), [".", "..", "f"]);
+    // The superuser of a program does not see it: every way in answers NO_ENTRY and the list
+    // of the root has no such name.
+    rig.bind(77, user(0, 0, &[]));
+    let gone = Err(p::code(p::NO_ENTRY));
+    assert_eq!(rig.names(77, b"/").unwrap(), [".", "..", "visible"]);
+    assert_eq!(rig.names(77, b"/.layers").map(drop), gone);
+    assert_eq!(rig.stat(77, b"/.layers").map(drop), gone);
+    assert_eq!(rig.stat(77, b"/.layers/00/f").map(drop), gone);
+    assert_eq!(rig.open(77, b"/.layers/00/f", p::READ, 0).map(drop), gone);
+    assert_eq!(
+        rig.open(77, b"/.layers/00/g", p::WRITE | p::CREATE, 0o644)
+            .map(drop),
+        gone
+    );
+    assert_eq!(rig.mkdir(77, b"/.layers/01", 0o755), gone);
+    assert_eq!(rig.chmod(77, b"/.layers/00/f", 0o777), gone);
+    assert_eq!(rig.chown(77, b"/.layers/00/f", 5, 5), gone);
+    for method in [p::Method::Unlink, p::Method::Rmdir] {
+        assert_eq!(
+            rig.call(77, |w| p::path_call(method, b"/.layers/00/f", w))
+                .map(drop),
+            gone
+        );
+    }
+    assert_eq!(
+        rig.call(77, |w| p::rename(b"/visible", b"/.layers/x", w))
+            .map(drop),
+        gone
+    );
+    assert_eq!(
+        rig.call(77, |w| p::rename(b"/.layers/00/f", b"/y", w))
+            .map(drop),
+        gone
+    );
+    // A name that only begins with the same letters is an ordinary name.
+    rig.put(77, b"/.layersx", 0o644, b"y");
+    assert!(rig.stat(77, b"/.layersx").is_ok());
+    // The native client still reaches everything.
+    assert!(rig.stat(ROOT, b"/.layers/00/f").is_ok());
+}
+
+#[test]
 fn a_native_client_has_no_file_size_limit_and_a_bound_one_stops_short_at_its_limit() {
     let mut rig = Rig::new();
     rig.mkdir(ROOT, b"/d", 0o777).unwrap();

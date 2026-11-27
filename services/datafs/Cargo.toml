@@ -39,6 +39,7 @@ break-datafs-stop = []
 break-datafs-lease-hold = ["datafs/break-datafs-lease-hold"]
 break-datafs-lease-reader = ["datafs/break-datafs-lease-reader"]
 break-datafs-append-end = ["datafs/break-datafs-append-end"]
+break-datafs-layers-visible = ["datafs/break-datafs-layers-visible"]
 break-datafs-cell-kept = []
 
 [dependencies]

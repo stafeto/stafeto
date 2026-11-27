@@ -315,10 +315,17 @@ mod tests {
         // The table of the shell on EC2, with its record `power`.
         let table: Vec<Record> = aws::TABLE.to_vec();
         let waves = waves(&table);
+        // The layer service, with the feature `layered-root`, is a client of the data file service
+        // and stops with the programs.
+        let first = if cfg!(feature = "layered-root") {
+            vec!["posix", "busybox-probe", "layerd", "datakey", "power"]
+        } else {
+            vec!["posix", "busybox-probe", "datakey", "power"]
+        };
         assert_eq!(
             waves,
             [
-                vec!["posix", "busybox-probe", "datakey", "power"],
+                first,
                 vec!["tty", "net", "pkgd", "datafs"],
                 vec!["ramfs", "entropy", "blk", "datadisk"],
                 vec!["clock", "pipe"],

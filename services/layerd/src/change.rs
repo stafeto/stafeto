@@ -524,7 +524,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
 
     fn scrub(&mut self, path: &[u8], dir: bool) {
         if dir {
-            let _ = self.remove_inside(path, 0);
+            let _ = self.remove_inside(path);
             let _ = self.volume.rmdir(path);
         } else {
             let _ = self.volume.unlink(path);
@@ -866,36 +866,13 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     ) -> R<V::Pass> {
         let mut vp = [0u8; 512];
         let len = self.vpath(id, &mut vp)?;
-        let access = flags & 3;
-        let writes = n::open_writes(flags);
-        let reads = access != proto_fs::WRITE_ONLY;
         if check {
-            let stat = self.volume.stat(&vp[..len]).map_err(from_volume)?;
-            let mut bits = 0;
-            if reads {
-                bits |= posix_perm::READ;
-            }
-            if writes {
-                bits |= WRITE;
-            }
-            if !permits(c.who.identity(false), &attr_of(&stat), bits) {
-                return Err(st(proto_fs::ACCESS_DENIED));
-            }
+            self.open_rights(c, &vp[..len], flags)?;
         }
-        let mut wire = 0;
-        if reads {
-            wire |= d::READ;
-        }
-        if writes {
-            wire |= d::WRITE;
-            if flags & proto_fs::TRUNCATE != 0 {
-                wire |= d::TRUNCATE;
-            }
-            if flags & proto_fs::APPEND != 0 {
-                wire |= d::APPEND;
-            }
-        }
-        let handle = self.volume.open(&vp[..len], wire, 0).map_err(from_volume)?;
+        let handle = self
+            .volume
+            .open(&vp[..len], Self::wire_flags(flags), 0)
+            .map_err(from_volume)?;
         let pass = self.volume.export(handle);
         let _ = self.volume.close(handle);
         pass.map_err(from_volume)

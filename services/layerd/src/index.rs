@@ -18,8 +18,11 @@
 //! the flags OPAQUE (the directory holds the file `.wh..wh..opq`: the lower set shows through it
 //! no more) and HAS_CHILDREN (a name of the layer lies in it).
 
-pub const SLOTS: usize = 8192;
-pub const PROBES: usize = 8;
+/// The table holds 8,192 names of a layer with room to spare: 16,384 places and 32 probes took
+/// more than 9,000 names of a layer in a host test before the first miss (8,192 places and 8 probes
+/// took 2,777: an open table at an eighth of its places is the most a short probe holds).
+pub const SLOTS: usize = 16384;
+pub const PROBES: usize = 32;
 pub const ARENA: usize = 256 * 1024;
 pub const NAME_MAX: usize = 255;
 /// The bytes a link's file name (`.wh..wh.lnk.`) and a mark (`.wh.`) add to a name, and the marker of
@@ -71,6 +74,8 @@ pub struct Entry {
     pub uid: u32,
     pub gid: u32,
     pub mode: u16,
+    /// The top 16 bits of the hash of the key, compared before the name.
+    tag: u16,
 }
 
 const EMPTY: Entry = Entry {
@@ -86,6 +91,7 @@ const EMPTY: Entry = Entry {
     uid: 0,
     gid: 0,
     mode: 0,
+    tag: 0,
 };
 
 /// What `next_child` found: an entry (the position after it and its id), the end of the slots
@@ -138,12 +144,23 @@ pub struct Index {
     keys_issued: u32,
     free_keys: [u32; SLOTS],
     free_len: usize,
+    /// The seed of the hash, chosen at each start of the service (`reseed`): the names of a layer
+    /// cannot be made to collide offline.
+    seed: u32,
     pub root: Root,
 }
 
-fn hash(parent: u32, name: &[u8]) -> usize {
+const EMPTY_ROOT: Root = Root {
+    number: 0,
+    uid: 0,
+    gid: 0,
+    mode: 0,
+    flags: 0,
+};
+
+fn hash(seed: u32, parent: u32, name: &[u8]) -> u32 {
     // FNV-1a over the key and the name, folded into the table.
-    let mut h: u32 = 0x811c_9dc5;
+    let mut h: u32 = 0x811c_9dc5 ^ seed;
     for b in parent.to_le_bytes().iter().chain(name) {
         h ^= u32::from(*b);
         h = h.wrapping_mul(0x0100_0193);
@@ -154,7 +171,7 @@ fn hash(parent: u32, name: &[u8]) -> usize {
     h ^= h >> 13;
     h = h.wrapping_mul(0xc2b2_ae35);
     h ^= h >> 16;
-    h as usize
+    h
 }
 
 impl Index {
@@ -169,6 +186,7 @@ impl Index {
             keys_issued: 0,
             free_keys: [0; SLOTS],
             free_len: 0,
+            seed: 0,
             // All zeros, so that the static of the program is `.bss`: the build of the index
             // sets the attributes of the root from the volume.
             root: Root {
@@ -181,6 +199,13 @@ impl Index {
         }
     }
 
+    /// Chooses the seed of the hash; the index is empty (the start of the service, before the
+    /// build).
+    pub fn reseed(&mut self, seed: u32) {
+        self.clear();
+        self.seed = seed;
+    }
+
     /// Empties the index (the build starts again).
     pub fn clear(&mut self) {
         self.slots.fill(EMPTY);
@@ -190,7 +215,7 @@ impl Index {
         self.marks = 0;
         self.keys_issued = 0;
         self.free_len = 0;
-        self.root = Index::new().root;
+        self.root = EMPTY_ROOT;
     }
 
     /// The names of a layer (files and directories) and the marks of deletion.
@@ -227,14 +252,17 @@ impl Index {
 
     /// The slot of (`pkey`, `name`) within the probes.
     fn find(&self, pkey: u32, name: &[u8]) -> Option<usize> {
-        let start = hash(pkey, name);
+        let h = hash(self.seed, pkey, name);
+        let (start, tag) = (h as usize, (h >> 16) as u16);
         for i in 0..PROBES {
             let slot = (start + i) & (SLOTS - 1);
             let e = &self.slots[slot];
             match e.kind {
                 Kind::Empty => return None,
                 Kind::Gone => {}
-                _ if e.pkey == pkey && self.name_of(e) == name => return Some(slot),
+                _ if e.tag == tag && e.pkey == pkey && self.name_of(e) == name => {
+                    return Some(slot);
+                }
                 _ => {}
             }
         }
@@ -346,7 +374,8 @@ impl Index {
         let Some(pkey) = self.dkey_of(parent) else {
             return false;
         };
-        let start = hash(pkey, name);
+        let h = hash(self.seed, pkey, name);
+        let (start, tag) = (h as usize, (h >> 16) as u16);
         let mut slot_free = false;
         for i in 0..PROBES {
             let e = &self.slots[(start + i) & (SLOTS - 1)];
@@ -356,12 +385,12 @@ impl Index {
                     break;
                 }
                 Kind::Gone => {
-                    if e.pkey == pkey && self.name_of(e) == name {
+                    if e.tag == tag && e.pkey == pkey && self.name_of(e) == name {
                         return true;
                     }
                     slot_free = true;
                 }
-                _ if e.pkey == pkey && self.name_of(e) == name => return true,
+                _ if e.tag == tag && e.pkey == pkey && self.name_of(e) == name => return true,
                 _ => {}
             }
         }
@@ -384,7 +413,8 @@ impl Index {
             return Err(Error::Invalid);
         }
         let pkey = self.dkey_of(parent).ok_or(Error::Invalid)?;
-        let start = hash(pkey, name);
+        let h = hash(self.seed, pkey, name);
+        let (start, tag) = (h as usize, (h >> 16) as u16);
         let mut free = None;
         for i in 0..PROBES {
             let slot = (start + i) & (SLOTS - 1);
@@ -395,7 +425,7 @@ impl Index {
                     break;
                 }
                 Kind::Gone => {
-                    if e.pkey == pkey && self.name_of(&e) == name {
+                    if e.tag == tag && e.pkey == pkey && self.name_of(&e) == name {
                         // The same name again: the slot and the name in the arena are taken up.
                         let dkey = self.key_for(f.kind, keep)?;
                         self.slots[slot] = Entry {
@@ -417,7 +447,7 @@ impl Index {
                     }
                     free.get_or_insert(slot);
                 }
-                _ if e.pkey == pkey && self.name_of(&e) == name => {
+                _ if e.tag == tag && e.pkey == pkey && self.name_of(&e) == name => {
                     return self.replace(slot, f, keep);
                 }
                 _ => {}
@@ -435,6 +465,7 @@ impl Index {
             pkey,
             dkey,
             reach: 0,
+            tag,
             name_at: at as u32,
             name_len: name.len() as u8,
             kind: f.kind,
@@ -693,8 +724,15 @@ impl Index {
             let e = self.entry(at)?;
             let name = self.name_of(e);
             let start = end.checked_sub(name.len() + 1)?;
-            out[start] = b'/';
-            out[start + 1..end].copy_from_slice(name);
+            let dest = out.get_mut(start..end)?;
+            dest[0] = b'/';
+            if name.len() <= 8 {
+                for (to, from) in dest[1..].iter_mut().zip(name) {
+                    *to = *from;
+                }
+            } else {
+                dest[1..].copy_from_slice(name);
+            }
             end = start;
             at = self.parent_of(at);
             depth += 1;
@@ -708,6 +746,15 @@ impl Index {
     }
 }
 
+/// An index on the heap, made without a copy on the stack (the table is over 700 KiB, more than the
+/// stack of a test thread holds): every field of an empty index is zero.
+#[cfg(test)]
+pub fn boxed() -> std::boxed::Box<Index> {
+    // SAFETY: all-zero bytes are an empty index: `EMPTY` has kind 0 (`Kind::Empty`) and zeros, the
+    // counters, the seed, the keys and the root are zeros.
+    unsafe { std::boxed::Box::<Index>::new_zeroed().assume_init() }
+}
+
 impl Default for Index {
     fn default() -> Self {
         Index::new()
@@ -719,7 +766,7 @@ mod tests {
     use super::*;
 
     fn index() -> std::boxed::Box<Index> {
-        std::boxed::Box::new(Index::new())
+        super::boxed()
     }
 
     fn file(n: u64) -> Fields {

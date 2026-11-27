@@ -512,17 +512,42 @@ pub const DATAFS: Record = Record {
     broken_after: Some((6, 2)),
 };
 
+/// The budget of the layer service's loop (`serve`): 50 us of each 10 ms on CPU 0 (0.5 %), at 34
+/// once spent no more than the 32 of `SERVICE_LOW`, above every program of POSIX. A request is a
+/// walk of a path over the index or a batch of a listing, 17,546 ticks at most under `-icount`
+/// (the steps of `cargo xtask layer-steps`, 0.9 B), which is a few microseconds of a CPU of EC2:
+/// the budget takes eight of the longest steps of each period at the service's own level. The
+/// share is the 0.5 % that the table of EC2 left over its 74.5 % on CPU 0 (the data file service 1 %
+/// and the NVMe service 1 % are in it): with the layer service the sum of the table is the 75 %
+/// the budgets may take, and the reserve of 3 % for the process and package services is whole.
+pub const LAYERD_BUDGETS: &[Budget] = &[Budget {
+    name: "serve",
+    cpu: 0,
+    c_ns: 50_000,
+    t_ns: 10 * MS,
+    low: super::ramfs::SERVICE_LOW,
+}];
+
 /// The layer service (services/layerd): the names of the layered root over the live layer on the
-/// data volume, read only in this part. Its loop works at 34, above the clients of POSIX (ceiling
-/// 31) and below the data file service (36) it is a native client of; the RAM file service of the
-/// lower set runs above both. It connects to the RAM file service (the boot profile, for the
-/// lower names) and to the data file service (the label `SERVICE`, for the live layer), and asks
-/// the process service who a client is through the notary session init gives a voucher; its root
-/// goes to that service with Register (the mark `LAYER`). It has no budget in this part and never
-/// restarts (a later part gives it both): the descriptions of directories it gave out end with
-/// the instance, and a program asks for a new session. The start is watched for 30 s: the first
-/// request to the data service waits for the end of its start (a blank volume is formatted
-/// first).
+/// data volume. Its loop works at 34, above the clients of POSIX (ceiling 31) and below the data
+/// file service (36) it is a native client of; the RAM file service of the lower set runs above
+/// both. It connects to the RAM file service (the boot profile, for the lower names) and to the
+/// data file service (the label `SERVICE`, for the live layer), and asks the process service who
+/// a client is through the notary session init gives a voucher; its root goes to that service
+/// with Register (the mark `LAYER`). The loop runs under the budget `LAYERD_BUDGETS` and the
+/// thread that registers the root works at the level `free`, 31.
+///
+/// It restarts. A new instance registers its root again (the process service replaces the old
+/// one), builds the index of the live layer anew and answers STARTING until it is done; the
+/// descriptions of directories the old instance gave out answer STALE (the epoch of the handle),
+/// the sessions died with it (a client asks the process service for the root and takes a new
+/// session), and the files a program holds belong to the RAM and data file services and live on.
+/// The instance ends itself when its session with the data file service answers PEER_CLOSED (exit
+/// code 6), and init starts the next one, which waits for the new instance of that service. No
+/// exit code marks it broken: a start that fails the same way five times in a minute does (the
+/// rule of every record). The start is watched for 30 s: the first request to the data file service
+/// waits for the end of its start (a blank volume is formatted first), and the build of the index
+/// of a layer of 8,192 names runs in steps after READY is not yet said.
 pub const LAYERD: Record = Record {
     name: "layerd",
     program: "layerd",
@@ -532,8 +557,9 @@ pub const LAYERD: Record = Record {
     }),
     priority: 34,
     ceiling: 34,
-    // The stack of the loop is the program's, the index and the pages of the descriptors are
-    // statics that init pays for as segments; the quota is the slots of the sessions the service
+    // The stack of the loop is the program's, the index (16,384 places, the keys of its directories
+    // and the arena: .bss of 1.1 MiB) and the pages of the descriptors are statics that init pays
+    // for as segments; the quota is the slots of the sessions the service
     // gives (192) and its own channels.
     quota: 192 * PAGE,
     // The handles the service holds at most: 192 copies of identity sessions (one for each bound
@@ -542,7 +568,7 @@ pub const LAYERD: Record = Record {
     // the notary, the page of the generations, the console, the timers of the heartbeat and of the
     // registrar): 218, and a limit of 256.
     handle_limit: 256,
-    restart: Restart::Never,
+    restart: Restart::Always,
     console: true,
     log: false,
     trace: false,
@@ -559,8 +585,8 @@ pub const LAYERD: Record = Record {
     shares: Shares::CREATOR,
     cpus: GENERAL_CPUS,
     waits: &[],
-    budgets: &[],
-    free: 0,
+    budgets: LAYERD_BUDGETS,
+    free: super::ramfs::SERVICE_FREE,
     broken_after: None,
 };
 
@@ -1175,8 +1201,8 @@ mod tests {
     }
 
     /// The layer service sits between the clients of POSIX and the data file service, connects to
-    /// the two file services and to nothing else, has no budget and no restart in this part, and
-    /// the table of its probe starts it after the data service it is a client of.
+    /// the two file services and to nothing else, has a budget and restarts, and the table of its
+    /// probe starts it after the data service it is a client of.
     #[test]
     fn the_layer_service_sits_above_the_posix_clients_and_below_the_data_service() {
         use crate::table::ramfs::{LAYER_NAMES_TABLE, POSIX};
@@ -1187,8 +1213,12 @@ mod tests {
             !LAYERD.connects.contains(&"posix"),
             "a POSIX record connects to it"
         );
-        assert!(LAYERD.budgets.is_empty());
-        assert!(matches!(LAYERD.restart, Restart::Never));
+        assert_eq!(LAYERD.budgets, LAYERD_BUDGETS);
+        assert_eq!(LAYERD_BUDGETS[0].share_ppm(), 5_000);
+        assert_eq!(LAYERD_BUDGETS[0].name, "serve");
+        assert_eq!(LAYERD_BUDGETS[0].low, super::super::ramfs::SERVICE_LOW);
+        const { assert!(LAYERD.free < LAYERD.priority) };
+        assert!(matches!(LAYERD.restart, Restart::Always));
         assert_eq!(LAYERD.broken_after, None);
         // 192 identity copies, a pass or a Vouch copy in flight and about 24 of its own.
         const { assert!(LAYERD.handle_limit >= 192 + 1 + 24) };

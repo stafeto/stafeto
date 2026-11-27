@@ -486,14 +486,15 @@ impl Server {
         &mut self,
         fs: &mut Fs<'_, D>,
         caller: &Caller,
+        native: bool,
         from: &[u8],
         to: &[u8],
     ) -> Res<()> {
         if from == b"/" || to == b"/" {
             return Err(p::code(p::INVALID));
         }
-        visible(from)?;
-        visible(to)?;
+        visible(from, native)?;
+        visible(to, native)?;
         let from_found = self.lookup(fs, caller, false, from)?;
         let to_found = self.lookup(fs, caller, false, to)?;
         let (from_parent, _) = split(from);
@@ -739,6 +740,7 @@ impl Server {
         &mut self,
         fs: &mut Fs<'_, D>,
         di: usize,
+        native: bool,
         w: &mut Writer,
     ) -> Res<()> {
         let d = self.descriptions[di];
@@ -764,6 +766,14 @@ impl Server {
                     Ok(found) => match found {
                         None => break,
                         Some((entry, _, _)) if root && entry.name() == &ORPHANS[1..] => continue,
+                        Some((entry, _, _))
+                            if root
+                                && !native
+                                && cfg!(not(feature = "break-datafs-layers-visible"))
+                                && entry.name() == &LAYERS[1..] =>
+                        {
+                            continue;
+                        }
                         Some((entry, record, at)) => {
                             // The number of `.` and `..` is looked up: a failure there moves the
                             // iterator back too.

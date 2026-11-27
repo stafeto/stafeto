@@ -799,13 +799,13 @@ pub struct Scheduler<T> {
     /// `ran` it makes the time outside idle.
     system: u64,
     /// The counter value at which the time that belongs to no stint began:
-    /// the end of a stint, or the entry that woke the CPU; `IDLE` while the
-    /// CPU sleeps, which belongs to nobody.
-    gap: u64,
+    /// the end of a stint, or the entry that woke the CPU; none while the
+    /// CPU sleeps, which belongs to nobody. Held complemented (`!value`), so
+    /// that 0 is the idle mark and a fresh scheduler is all zero bytes: a
+    /// per-CPU static of it stays in `.bss` and out of the flat image. The
+    /// earlier of two values is then the larger complement (`gap_min`).
+    gap_inv: u64,
 }
-
-/// `Scheduler::gap` while the CPU idles.
-const IDLE: u64 = u64::MAX;
 
 // SAFETY: the scheduler holds pointers to threads that the kernel hands
 // it, and moving it moves them along, as moving the threads would.
@@ -821,8 +821,35 @@ impl<T: Schedulable> Scheduler<T> {
             slice_end: 0,
             quantum,
             system: 0,
-            gap: IDLE,
+            gap_inv: 0,
         }
+    }
+
+    /// The gap begins at `now`.
+    fn gap_begins(&mut self, now: u64) {
+        self.gap_inv = !now;
+    }
+
+    /// The CPU sleeps: no gap runs.
+    fn gap_idle(&mut self) {
+        self.gap_inv = 0;
+    }
+
+    /// Whether the CPU sleeps (`gap_idle`).
+    fn is_idle(&self) -> bool {
+        self.gap_inv == 0
+    }
+
+    /// The gap begins at `now` unless it began earlier; an idle CPU's gap
+    /// (0, the least complement) begins at `now`.
+    fn gap_min(&mut self, now: u64) {
+        self.gap_inv = self.gap_inv.max(!now);
+    }
+
+    /// The counter value at which the gap began; `u64::MAX` for an idle CPU,
+    /// so that a difference from it saturates to 0.
+    fn gap_start(&self) -> u64 {
+        !self.gap_inv
     }
 
     /// Ticks of the entries for interrupts, switches and cleanup that no
@@ -849,12 +876,12 @@ impl<T: Schedulable> Scheduler<T> {
             if n.stamp & PENDING == 0 {
                 n.ran = n.ran.saturating_add(now.saturating_sub(n.stamp & !RUNNING));
                 n.set_stamp(RUNNING | PENDING);
-                self.gap = now;
+                self.gap_begins(now);
                 return;
             }
         }
-        if self.gap == IDLE {
-            self.gap = now;
+        if self.is_idle() {
+            self.gap_begins(now);
         }
     }
 
@@ -878,8 +905,10 @@ impl<T: Schedulable> Scheduler<T> {
         let n = unsafe { node(t) };
         if n.stamp & PENDING != 0 {
             n.stamp = now | RUNNING;
-            self.system = self.system.saturating_add(now.saturating_sub(self.gap));
-            self.gap = IDLE;
+            self.system = self
+                .system
+                .saturating_add(now.saturating_sub(self.gap_start()));
+            self.gap_idle();
         }
     }
 
@@ -914,7 +943,7 @@ impl<T: Schedulable> Scheduler<T> {
             // it was chosen; the time since then is the system's.
             if n.stamp & PENDING == 0 {
                 n.ran = n.ran.saturating_add(now.saturating_sub(n.stamp & !RUNNING));
-                self.gap = now;
+                self.gap_begins(now);
             }
             // The stint is over: the word holds no counter value any more.
             n.set_stamp(0);
@@ -1094,8 +1123,10 @@ impl<T: Schedulable> Scheduler<T> {
         let Some(top) = top else {
             // The time up to here is the system's; sleep belongs to nobody,
             // and the entry that wakes the CPU begins the next gap.
-            self.system = self.system.saturating_add(now.saturating_sub(self.gap));
-            self.gap = IDLE;
+            self.system = self
+                .system
+                .saturating_add(now.saturating_sub(self.gap_start()));
+            self.gap_idle();
             return Decision::Idle;
         };
         let next = self.ready.first(top).must("a level with its bit set");
@@ -1110,7 +1141,7 @@ impl<T: Schedulable> Scheduler<T> {
             n.stamp = begins(now);
             Self::with_server(next, Op::Run, now);
         }
-        self.gap = self.gap.min(now);
+        self.gap_min(now);
         self.running = Some(next);
         Decision::Run(next)
     }
@@ -1489,7 +1520,7 @@ impl<T: Schedulable> Scheduler<T> {
             }
             n.state = State::Running;
             n.stamp = begins(now);
-            self.gap = self.gap.min(now);
+            self.gap_min(now);
             self.slice_end = now.saturating_add(self.quantum);
             self.running = Some(t);
             Self::with_server(t, Op::Run, now);
@@ -1811,6 +1842,21 @@ mod tests {
     use crate::sync::Lock;
     use crate::time::Clock;
     use abi::RR_QUANTUM_NS;
+
+    /// A scheduler of quantum 0 is all zero bytes, so the per-CPU static of
+    /// the kernel stays in `.bss` and out of the flat image (#629).
+    #[test]
+    fn a_fresh_scheduler_is_all_zero_bytes() {
+        let s = Scheduler::<Fake>::new(0);
+        // SAFETY: the bytes of `s`, which lives through the view.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&raw const s).cast::<u8>(),
+                core::mem::size_of::<Scheduler<Fake>>(),
+            )
+        };
+        assert!(bytes.iter().all(|&b| b == 0));
+    }
 
     #[test]
     fn parked_priorities_preserve_the_list_and_continue_with_new_quanta() {

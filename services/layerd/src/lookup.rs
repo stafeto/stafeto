@@ -44,6 +44,42 @@ pub const STEP: usize = 16;
 /// `out` and their count; the result is never longer than `path`, so 512 bytes hold every path of
 /// the protocol.
 pub fn normalize(path: &[u8], out: &mut [u8; 512]) -> usize {
+    // A path that is plain already (no empty component, no `.` or `..`) is itself: one pass over
+    // its bytes and a copy, where the general walk over its components costs 35 ticks a byte
+    // under -icount (17,000 for a path of 253 components).
+    if path.len() <= out.len() && is_plain(path) {
+        out[..path.len()].copy_from_slice(path);
+        return path.len();
+    }
+    normalize_slow(path, out)
+}
+
+/// Whether `path` is absolute and has no `//`, no `.` and no `..` component: `normalize` of it is
+/// the path itself (a slash at its end stays).
+fn is_plain(path: &[u8]) -> bool {
+    if path.first() != Some(&b'/') {
+        return false;
+    }
+    let n = path.len();
+    for (i, &b) in path.iter().enumerate() {
+        if b != b'/' {
+            continue;
+        }
+        // The component that follows this slash.
+        match path.get(i + 1) {
+            Some(b'/') => return false,
+            Some(b'.') => match path.get(i + 2) {
+                None | Some(b'/') => return false,
+                Some(b'.') if i + 3 >= n || path[i + 3] == b'/' => return false,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    true
+}
+
+fn normalize_slow(path: &[u8], out: &mut [u8; 512]) -> usize {
     let mut len = 0;
     let mut last: &[u8] = b"";
     for part in path.split(|&b| b == b'/') {
@@ -70,6 +106,14 @@ pub fn normalize(path: &[u8], out: &mut [u8; 512]) -> usize {
         len += 1;
     }
     len
+}
+
+/// The components of a plain path (`normalize`): the names between its slashes.
+pub fn components(plain: &[u8]) -> usize {
+    plain
+        .split(|&b| b == b'/')
+        .filter(|p| !p.is_empty())
+        .count()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +177,23 @@ impl<'p> Walk<'p> {
     /// the path the first name the layer does not hold starts.
     pub fn missed(&self) -> (u32, usize) {
         self.miss
+    }
+
+    /// A walk of `path` that went on to the byte `pos` of it, in the directory `cur`: the state a
+    /// walk of several requests keeps (`pos` and `cur` of an earlier one of the same path).
+    pub fn resume(path: &'p [u8], pos: usize, cur: u32) -> Walk<'p> {
+        Walk {
+            path,
+            pos,
+            cur,
+            follow: true,
+            miss: (0, 0),
+        }
+    }
+
+    /// Where the walk stands: the byte of the path and the directory it has reached.
+    pub fn state(&self) -> (usize, u32) {
+        (self.pos, self.cur)
     }
 
     /// Whether the path ends with a slash: the name must be a directory.
@@ -245,7 +306,7 @@ mod tests {
     /// /etc (0755), /etc/hostname, /etc/.wh. for motd, /priv (0700 root) with /priv/x,
     /// /opaque (opaque) with /opaque/inside, /file.
     fn world() -> Box<Index> {
-        let mut ix = Box::new(Index::new());
+        let mut ix = crate::index::boxed();
         ix.root.mode = 0o755;
         let etc = ix.insert(0, b"etc", fields(Kind::Dir, 0o755, 0)).unwrap();
         ix.insert(etc, b"hostname", fields(Kind::File, 0o644, 0))
@@ -400,9 +461,45 @@ mod tests {
         assert_eq!(walk(&ix, b"/etc/tmp", 0), Outcome::Lower);
     }
 
+    /// The fast path of `normalize` gives what the walk over the components gives, for plain paths
+    /// and for the ones with dots, slashes and a slash at the end.
+    #[test]
+    fn a_plain_path_is_normalized_as_the_general_walk_does() {
+        let paths: [&[u8]; 22] = [
+            b"/",
+            b"/a",
+            b"/a/",
+            b"/a/b/c",
+            b"/a/b/c/",
+            b"//a",
+            b"/a//b",
+            b"/a/./b",
+            b"/a/.",
+            b"/a/..",
+            b"/a/../b",
+            b"/a/b/..",
+            b"/.a/..b/c.",
+            b"/a/.../b",
+            b"/..",
+            b"/../a",
+            b"/a/b/../../..",
+            b"a/b",
+            b"",
+            b"/a/b/./",
+            b"/.hidden",
+            b"/a/..b",
+        ];
+        for path in paths {
+            let (mut fast, mut slow) = ([0u8; 512], [0u8; 512]);
+            let a = normalize(path, &mut fast);
+            let b = normalize_slow(path, &mut slow);
+            assert_eq!(&fast[..a], &slow[..b], "{:?}", std::str::from_utf8(path));
+        }
+    }
+
     #[test]
     fn a_deep_path_takes_a_step_for_every_sixteen_components() {
-        let mut ix = Box::new(Index::new());
+        let mut ix = crate::index::boxed();
         let mut parent = 0;
         let mut path = std::vec::Vec::new();
         for i in 0..40 {
@@ -422,7 +519,7 @@ mod tests {
         assert_eq!(w.advance(&ix, who(0), STEP), Step::More);
         assert!(matches!(w.advance(&ix, who(0), STEP), Step::Done(_)));
         // 253 components of one letter is 16 steps.
-        let mut ix = Box::new(Index::new());
+        let mut ix = crate::index::boxed();
         let mut parent = 0;
         for _ in 0..253 {
             parent = ix

@@ -2735,7 +2735,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         }
         // The lower set of the probe of the names of the layered root: the files the layer of the
         // volume (`data_image::LAYER_VOLUME_ENTRIES`) shadows, deletes or hides.
-        "boot-layer-names.img" => {
+        "boot-layer-names.img" | "boot-layer-steps.img" | "boot-layer-restart.img" => {
             // In the strictly ascending order of the paths.
             let mut files = vec![
                 dir("/bin"),
@@ -4007,6 +4007,8 @@ mod tests {
             "boot-data-posix-atomic.img",
             "boot-data-posix-steps.img",
             "boot-layer-names.img",
+            "boot-layer-steps.img",
+            "boot-layer-restart.img",
             "boot-layer-posix.img",
             "boot-layer-ash.img",
             "boot-posix-window.img",

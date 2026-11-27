@@ -1398,6 +1398,27 @@ static void run_check(const char *name, int (*check)(void)) {
     }
 }
 
+/* The directory `/.layers` of the data volume is the layer service's: the superuser of a program
+ * does not see it through /data either (the data file service answers as if it were not there),
+ * so no layer is written past the index of the layer service. */
+static int layers_directory_is_hidden(void) {
+    struct stat st;
+    LP_CHECK(FAILS(stat("/data/.layers", &st), ENOENT));
+    LP_CHECK(FAILS(stat("/data/.layers/00", &st), ENOENT));
+    LP_CHECK(FAILS(open("/data/.layers/COMPOSITION", O_RDONLY), ENOENT));
+    LP_CHECK(FAILS(mkdir("/data/.layers/x", 0755), ENOENT));
+    LP_CHECK(FAILS(unlink("/data/.layers/COMPOSITION"), ENOENT));
+    LP_CHECK(FAILS(rename("/data/.layers/COMPOSITION", "/data/taken"), ENOENT));
+    DIR *d = opendir("/data");
+    LP_CHECK(d != NULL);
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        LP_CHECK(strcmp(e->d_name, ".layers") != 0);
+    }
+    closedir(d);
+    return 0;
+}
+
 static int first(void) {
     /* The program has no session with the layer service until its first path call. */
     if (lp_session() != 0) {
@@ -1434,6 +1455,7 @@ static int first(void) {
     run_check("a description of the service has no path after exec", no_path_after_exec);
     run_check("a set-ID program is given the service's session", slot_checks);
     run_check("a set-ID program keeps the genuine session and binds it", setid_keeps_the_genuine_session);
+    run_check("the directory of the layers is hidden from programs", layers_directory_is_hidden);
     if (failures != 0) {
         printf("layer-posix: %d checks failed\n", failures);
         return 20;

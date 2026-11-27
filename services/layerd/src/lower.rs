@@ -2,81 +2,52 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The lower set through the RAM file service: the session of the service with the boot profile
-//! (init gives it to the clients of `BOOT_PROFILE_CLIENTS`), spoken through `PosixFs` as the host
-//! key service does. A directory is read with READ_DIR_FD and kept open between the requests of
-//! a listing.
+//! (init gives it to the clients of `BOOT_PROFILE_CLIENTS`), spoken through `rt::fs::Files` as
+//! the host key service does. A directory is opened with one OPEN of its path and read with
+//! READ_DIR_FD, and stays open between the requests of a listing. The calls are single round
+//! trips of the boot profile, so that no step of the loop holds the several phases of an open
+//! of the general file layer (`posix_fs::PosixFs::opendir` is three of them, and its open alone
+//! costs more than the bound of a step).
 
 use layerd::volume::{Lower, LowerStat, R};
-use posix_fs::{Directory, FileKind, FsError, PosixFs};
-use proto_wire::Status;
+use rt::fs::Files;
 
 pub struct Ram {
-    pub files: &'static mut PosixFs,
+    pub files: Files,
 }
 
-fn status(e: FsError) -> Status {
-    Status::Unknown(match e {
-        FsError::NoEntry => proto_fs::NO_ENTRY,
-        FsError::NotDirectory => proto_fs::NOT_DIRECTORY,
-        FsError::PermissionDenied | FsError::OperationNotPermitted => proto_fs::ACCESS_DENIED,
-        FsError::NameTooLong => proto_fs::NAME_TOO_LONG,
-        FsError::Loop => proto_fs::LOOP,
-        FsError::TooManyOpenFiles => proto_fs::TOO_MANY_OPEN_FILES,
-        FsError::TooManyInSystem => proto_fs::TOO_MANY_FILES_IN_SYSTEM,
-        FsError::IsDirectory => proto_fs::IS_DIRECTORY,
-        _ => proto_fs::INVALID_ARGUMENT,
-    })
-}
-
-fn kind(k: FileKind) -> u32 {
-    match k {
-        FileKind::Directory => 1,
-        FileKind::Regular => 2,
-        FileKind::Character => 3,
-        FileKind::Fifo => 4,
-        FileKind::Symlink => 5,
-        FileKind::Socket => 6,
-    }
+/// A directory of the lower set: the descriptor of the RAM file service.
+pub struct Dir {
+    fd: u32,
 }
 
 impl Lower for Ram {
-    type Dir = Directory;
+    type Dir = Dir;
 
-    fn open_dir(&mut self, path: &[u8]) -> R<Directory> {
-        match self.files.opendir(path) {
-            Ok(d) => Ok(d),
-            // The pages of the table of descriptors are all given at the start.
-            Err(FsError::NeedPage(_)) => Err(Status::Unknown(proto_fs::NO_SPACE)),
-            Err(e) => Err(status(e)),
-        }
+    fn open_dir(&mut self, path: &[u8]) -> R<Dir> {
+        let flags = proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY;
+        self.files
+            .open_marked_bytes(path, flags)
+            .map(|(fd, _)| Dir { fd })
     }
 
-    fn next(&mut self, dir: &mut Directory, name: &mut [u8; 256]) -> R<Option<(u64, u32, usize)>> {
-        match self.files.readdir(dir, &mut name[..]) {
-            Ok(Some(e)) => Ok(Some((e.inode, kind(e.kind), e.name_len))),
-            Ok(None) => Ok(None),
-            Err(e) => Err(status(e)),
-        }
+    fn next(&mut self, dir: &mut Dir, name: &mut [u8; 256]) -> R<Option<(u64, u32, usize)>> {
+        Ok(self
+            .files
+            .read_dir_fd(dir.fd, &mut name[..])?
+            .map(|(len, kind, inode)| (inode, kind, len)))
     }
 
-    fn close_dir(&mut self, dir: Directory) {
-        let _ = self.files.closedir(&dir);
+    fn close_dir(&mut self, dir: Dir) {
+        let _ = self.files.close(dir.fd);
     }
 
     fn readlink(&mut self, _path: &[u8], _out: &mut [u8]) -> R<usize> {
-        Err(Status::Unknown(proto_fs::INVALID_ARGUMENT))
+        Err(proto_wire::Status::Unknown(proto_fs::INVALID_ARGUMENT))
     }
 
     fn stat(&mut self, path: &[u8], follow: bool) -> R<LowerStat> {
-        let info = self
-            .files
-            .transport()
-            .files()
-            .node_information_from(None, path, follow)
-            .map_err(|e| match e {
-                Status::Unknown(c) => Status::Unknown(c),
-                other => other,
-            })?;
+        let info = self.files.node_information_from(None, path, follow)?;
         Ok(LowerStat {
             kind: info.kind,
             mode: info.permissions,

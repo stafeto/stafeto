@@ -95,7 +95,7 @@ struct World {
 impl World {
     fn new() -> World {
         World {
-            index: Box::new(Index::new()),
+            index: crate::index::boxed(),
             scan: Box::new(Scan::new()),
         }
     }
@@ -138,6 +138,7 @@ fn open(
         match done {
             Done::Written => None,
             Done::Pass(p) => Some(p),
+            Done::Continue(_) => unreachable!("an open runs its calls to the end"),
         },
     ))
 }
@@ -1007,8 +1008,34 @@ fn a_link_over_a_file_and_a_file_over_a_link_leave_one_name_and_an_empty_target_
 }
 
 #[test]
+fn create_and_unlink_churn_never_fills_the_probes() {
+    let mut ix = crate::index::boxed();
+    let f = crate::index::Fields {
+        kind: Kind::File,
+        layer: 0,
+        number: 0,
+        uid: 0,
+        gid: 0,
+        mode: 0,
+    };
+    // A name is made and removed again and again: its slot is a gone entry the next name takes.
+    let mut live = std::collections::VecDeque::new();
+    for i in 0..20_000u32 {
+        let name = format!("c{i}");
+        let id = ix
+            .insert(0, name.as_bytes(), f)
+            .expect("a place for the name");
+        live.push_back(id);
+        if live.len() > 500 {
+            ix.remove(live.pop_front().unwrap());
+        }
+    }
+    assert_eq!(ix.counts().0, 500);
+}
+
+#[test]
 fn the_index_says_whether_a_name_has_room_before_the_volume_is_touched() {
-    let mut ix = Box::new(Index::new());
+    let mut ix = crate::index::boxed();
     assert!(ix.has_room(0, b"x"));
     assert!(!ix.has_room(99, b"x"));
     let f = crate::index::Fields {
@@ -1524,7 +1551,7 @@ fn chmod_chown_utimens_and_truncate_of_a_file_of_the_layer() {
 
 #[test]
 fn a_removed_name_leaves_the_probes_of_the_others_unbroken_and_is_taken_again() {
-    let mut ix = Box::new(Index::new());
+    let mut ix = crate::index::boxed();
     let f = |n: u64| crate::index::Fields {
         kind: Kind::File,
         layer: 0,

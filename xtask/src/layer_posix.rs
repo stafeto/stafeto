@@ -43,7 +43,7 @@ const DISK_BYTES: u64 = 64 << 20;
 const LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The checks of the probe, in the order it runs them: the line of each is `layer-posix: <check> ok`.
-pub const CHECKS: [&str; 30] = [
+pub const CHECKS: [&str; 31] = [
     "a file of the layer of the user is read",
     "a lower file is read",
     "a name of the layer shadows the lower one",
@@ -74,10 +74,11 @@ pub const CHECKS: [&str; 30] = [
     "a description of the service has no path after exec",
     "a set-ID program is given the service's session",
     "a set-ID program keeps the genuine session and binds it",
+    "the directory of the layers is hidden from programs",
 ];
 
 /// The deliberate breaks, the program each is a feature of and the check each one fails.
-pub const BREAKS: [(&str, &str, &str); 5] = [
+pub const BREAKS: [(&str, &str, &str); 6] = [
     (
         "break-layer-route",
         "layer-posix",
@@ -104,6 +105,12 @@ pub const BREAKS: [(&str, &str, &str); 5] = [
         "break-layer-unverified",
         "loader",
         "a set-ID program is given the service's session",
+    ),
+    // The data file service shows `/.layers` to every session, so a program sees the layers.
+    (
+        "break-datafs-layers-visible",
+        "datafsd",
+        "the directory of the layers is hidden from programs",
     ),
 ];
 
@@ -159,6 +166,7 @@ struct Build {
     ramfs: &'static [&'static str],
     loader: &'static [&'static str],
     layerd: &'static [&'static str],
+    datafs: &'static [&'static str],
 }
 
 /// The image's programs; the probe is built with `probe` features, the RAM file service with
@@ -169,6 +177,7 @@ fn programs(build: Build) -> Vec<ImageProgram> {
         ramfs,
         loader,
         layerd,
+        datafs,
     } = build;
     vec![
         ("init", "init", INIT_STACK_SIZE, &["table-layer-posix"][..]),
@@ -188,8 +197,8 @@ fn programs(build: Build) -> Vec<ImageProgram> {
             crate::blk_probe::BLK_STACK_SIZE,
             &[],
         ),
-        ("datafsd", "datafsd", 32 * 1024, &[]),
-        ("layerd", "layerd", 128 * 1024, layerd),
+        ("datafsd", "datafsd", 32 * 1024, datafs),
+        ("layerd", "layerd", crate::LAYERD_STACK_SIZE, layerd),
         (
             "layer-posix",
             "layer-posix-probe",
@@ -525,6 +534,10 @@ pub fn breaks(machine: &qemu::Machine) -> Result<(), String> {
                 loader: features,
                 ..Build::default()
             },
+            "datafsd" => Build {
+                datafs: features,
+                ..Build::default()
+            },
             _ => Build {
                 probe: features,
                 ..Build::default()
@@ -741,9 +754,9 @@ mod tests {
     fn every_break_names_a_check_of_the_probe() {
         for (feature, program, check) in BREAKS {
             assert!(CHECKS.contains(&check), "{feature}");
-            assert!(feature.starts_with("break-layer"));
+            assert!(feature.starts_with("break-layer") || feature == "break-datafs-layers-visible");
             assert!(
-                ["layer-posix", "ramfs", "loader"].contains(&program),
+                ["layer-posix", "ramfs", "loader", "datafsd"].contains(&program),
                 "{feature}"
             );
         }
