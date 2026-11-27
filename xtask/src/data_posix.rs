@@ -411,10 +411,11 @@ impl Drop for Disk {
 const DISK_BYTES: u64 = 64 << 20;
 /// The throughput mode writes 64 MiB: a disk of 256 MiB has a data partition of 127 MiB.
 const THROUGHPUT_DISK_BYTES: u64 = 256 << 20;
-/// The atomic role rewrites files of megabytes for minutes, and the service gets the blocks the
-/// rewrites free back only in an idle walk (`idle.rs`), which a probe that never rests does not give
-/// it: with 127 MiB the free space fell to 1 MiB before the check of fork and SCM_RIGHTS once the
-/// check of the tail of a lapse had run. 512 MiB leaves a partition of 255 MiB.
+/// The atomic role rewrites files of megabytes for minutes. The room check of a write reads the
+/// allocator's window, which does not see the blocks that rewrites and removals free until a walk
+/// (littlefs itself would rescan at the wrap): with 127 MiB a write of the fork and SCM_RIGHTS check
+/// got NO_SPACE once the check of the tail of a lapse had run. 512 MiB, a partition of 255 MiB, is a
+/// stopgap until issue #627 is fixed; then the role goes back to the throughput disk.
 const ATOMIC_DISK_BYTES: u64 = 512 << 20;
 const ENDS: &str = "init: posix-data ended: ";
 const ENDED: &str = "init: posix-data ended: exit code 0, not restarted";
