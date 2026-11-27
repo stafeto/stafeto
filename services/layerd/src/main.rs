@@ -245,7 +245,11 @@ fn main(_: u64) -> u64 {
     touch_stack();
     touch(INDEX.0.get().cast(), core::mem::size_of::<Index>());
     touch(SCAN.0.get().cast(), core::mem::size_of::<Scan>());
-    index.reseed(rt::time::now() as u32 ^ (rt::time::now() >> 32) as u32 ^ 0x5bd1_e995);
+    index.reseed(
+        (u64::from(rt::time::now() as u32) << 32)
+            ^ rt::time::now().rotate_left(17)
+            ^ 0x5bd1_e995_9e37_79b9,
+    );
     let epoch = epoch_of(rt::time::now());
     let mut core = Core::new(
         index,
@@ -794,6 +798,9 @@ impl Layerd {
                 // An OPEN that creates or writes is a job whatever the path: its walk is in steps and
                 // the change of the volume is the step that finishes it.
                 let creates = flags & proto_fs::CREATE != 0;
+                if self.core.partial && (creates || n::open_writes(flags)) {
+                    return st(proto_fs::READ_ONLY_FILESYSTEM);
+                }
                 let follow = flags & proto_fs::NO_FOLLOW == 0
                     && !(creates && flags & proto_fs::EXCLUSIVE != 0);
                 if (Prewalk::long(path) || creates || n::open_writes(flags))
@@ -920,6 +927,9 @@ impl Layerd {
                     Ok(all) => all,
                     Err(_) => return bad,
                 };
+                if self.core.partial {
+                    return st(proto_fs::READ_ONLY_FILESYSTEM);
+                }
                 if n::Change::read(proto_wire::Reader::new(all)).is_err() {
                     return bad;
                 }
@@ -1125,6 +1135,12 @@ impl Service<0> for Layerd {
                         self.core.build_steps()
                     ),
                     other => rt::println!("layerd: not serving: {other:?}"),
+                }
+                let (names, marks) = self.core.left_out();
+                if names + marks != 0 {
+                    rt::println!(
+                        "layerd: {names} names and {marks} marks left out for the buckets of the index (directories among the names take their subtrees with them): the root is served read-only"
+                    );
                 }
                 if self.core.skipped() != 0 {
                     rt::println!(

@@ -1033,27 +1033,70 @@ fn a_step_of_the_build_makes_a_bounded_number_of_calls_to_the_volume() {
     assert!(steps >= 4000 / 59, "{steps}");
 }
 
+/// The build of a volume to its end: the steps it took.
+fn build_to_the_end(core: &mut Core<'_, FakeVolume, FakeLower>) -> u32 {
+    core.prepare();
+    let mut steps = 0;
+    while !core.build_step() {
+        steps += 1;
+        assert!(steps < 200_000);
+    }
+    steps
+}
+
+fn status_flags(core: &Core<'_, FakeVolume, FakeLower>) -> u32 {
+    let mut w = Writer::new();
+    core.status(&mut w).unwrap();
+    l::Stat::read(w.as_bytes()).unwrap().flags
+}
+
 #[test]
-fn a_full_index_fails_the_start_with_no_space() {
+fn a_build_that_overflows_a_bucket_starts_again_under_another_seed() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    core.index.fail_inserts = 1;
+    build_to_the_end(&mut core);
+    assert_eq!(core.state, State::Ready);
+    assert!(!core.partial);
+    assert_eq!(core.left_out(), (0, 0));
+    assert_eq!(status_flags(&core) & l::STATUS_PARTIAL, 0);
+    assert!(open(&mut core, 0, f::READ_ONLY, "/etc/own.conf").is_ok());
+}
+
+#[test]
+fn a_build_that_always_overflows_leaves_the_names_out_and_serves_the_root_read_only() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    core.index.fail_inserts = u32::MAX;
+    build_to_the_end(&mut core);
+    assert_eq!(core.state, State::Ready);
+    assert!(core.partial);
+    let (names, marks) = core.left_out();
+    assert!(names > 0, "{names} {marks}");
+    assert_ne!(status_flags(&core) & l::STATUS_PARTIAL, 0);
+    // The names the table could not take are the lower set's or absent; the root answers.
+    assert!(open(&mut core, 0, f::READ_ONLY, "/etc").is_ok());
+}
+
+#[test]
+fn a_layer_over_the_places_of_the_table_serves_what_it_holds_read_only() {
     let mut v = volume();
-    // More names than the table takes within the probes: 20,000 files in one directory.
-    for i in 0..20_000 {
+    // More names than the table has places: 17,000 files in one directory.
+    for i in 0..17_000 {
         v.file(&format!("/.layers/00/opq/f{i:05}"), 0o644, 0, b"");
     }
     v.batch = 20;
     let mut world = World::new();
     let mut core = world.core(v);
-    core.prepare();
-    let mut steps = 0;
-    while !core.build_step() {
-        steps += 1;
-        assert!(steps < 100_000);
-    }
-    assert_eq!(core.state, State::Failed(l::NO_SPACE));
-    assert_eq!(
-        open(&mut core, 0, f::READ_ONLY, "/etc").err(),
-        Some(st(l::NO_SPACE))
+    build_to_the_end(&mut core);
+    assert_eq!(core.state, State::Ready);
+    assert!(core.partial);
+    let (names, _) = core.left_out();
+    assert!(
+        names >= 17_000 + 100 - crate::index::SLOTS as u32,
+        "{names}"
     );
+    assert_ne!(status_flags(&core) & l::STATUS_PARTIAL, 0);
 }
 
 #[test]

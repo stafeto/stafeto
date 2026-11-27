@@ -12,7 +12,7 @@
 //! its target), and any other name that begins `.wh..wh.` is reserved and ignored. The attributes of a
 //! directory come from its stat; those of the files the listing does not need.
 
-use crate::index::{Fields, Index, Kind, OPAQUE, SLOTS, UNSCANNED};
+use crate::index::{Error, Fields, Index, Kind, OPAQUE, SLOTS, UNSCANNED};
 use crate::volume::{BATCH_BYTES, Volume, raw_entry};
 use proto_data::{DIRECTORY, KIND_DIRECTORY, READ};
 use proto_wire::Status;
@@ -65,8 +65,10 @@ pub fn special(name: &[u8]) -> Special<'_> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
-    /// The index is full: the layer holds more names than the table.
+    /// The index is full: the arena has no room for the names of the layer.
     NoSpace,
+    /// Both buckets of a name are full: the build starts again under another seed.
+    Reseed,
     /// The volume answered with this status.
     Volume(Status),
 }
@@ -78,7 +80,7 @@ pub enum Progress {
 }
 
 /// The entries of a batch one step takes into the index.
-pub const ENTRIES_PER_STEP: usize = 24;
+pub const ENTRIES_PER_STEP: usize = 16;
 
 pub struct Scan {
     queue: [u32; SLOTS],
@@ -106,6 +108,13 @@ pub struct Scan {
     pub steps: u32,
     /// The directories left unlisted because their path passes the volume's limit.
     pub skipped: u32,
+    /// Whether a name that finds both buckets full ends the build (it starts again under another
+    /// seed); once the seeds are used up the name is left out and the build goes on.
+    pub patient: bool,
+    /// The names (and the directories among them, whose subtrees go with them) and the marks the
+    /// build left out for the buckets.
+    pub skipped_names: u32,
+    pub skipped_marks: u32,
 }
 
 impl Scan {
@@ -126,6 +135,9 @@ impl Scan {
             started: false,
             steps: 0,
             skipped: 0,
+            patient: true,
+            skipped_names: 0,
+            skipped_marks: 0,
         }
     }
 
@@ -141,6 +153,8 @@ impl Scan {
         self.started = false;
         self.steps = 0;
         self.skipped = 0;
+        self.skipped_names = 0;
+        self.skipped_marks = 0;
         self.lifted = 0;
     }
 
@@ -311,6 +325,17 @@ impl Scan {
                     if kind == Kind::Dir {
                         found_queue[found] = child;
                         found += 1;
+                    }
+                }
+                Err(Error::Buckets) if self.patient => {
+                    failure = Some(Failure::Reseed);
+                    break;
+                }
+                Err(Error::Buckets) => {
+                    if kind == Kind::Whiteout {
+                        self.skipped_marks += 1;
+                    } else {
+                        self.skipped_names += 1;
                     }
                 }
                 Err(_) => {

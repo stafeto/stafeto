@@ -533,3 +533,68 @@ impl Lower for FakeLower {
         })
     }
 }
+
+/// The names of the volume of the scale probe (`xtask::data_image::layer_steps_entries`: 8,192
+/// names, the chain of 246 directories, `/long`, `/etc` with 1,024 files, `d00` and on) and, as
+/// that volume has them after the part that adds the marks, `/opq` and `/marks` with `marks` marks.
+/// Each name is inserted in the index in the order the build lists them: the directory, the id, the
+/// name and the id it got.
+pub fn scale_set(
+    ix: &mut crate::index::Index,
+    marks: usize,
+) -> Result<Vec<(u32, Vec<u8>, u32)>, crate::index::Error> {
+    use crate::index::{Fields, Kind};
+    let fields = |kind| Fields {
+        kind,
+        layer: 0,
+        number: 1,
+        uid: 0,
+        gid: 0,
+        mode: 0o755,
+    };
+    let mut out = Vec::new();
+    let mut put = |ix: &mut crate::index::Index,
+                   parent: u32,
+                   name: &str,
+                   kind: Kind|
+     -> Result<u32, crate::index::Error> {
+        let id = ix.insert_shallow(parent, name.as_bytes(), fields(kind))?;
+        out.push((parent, name.as_bytes().to_vec(), id));
+        Ok(id)
+    };
+    let mut names = 0;
+    let mut at = 0;
+    for _ in 0..246 {
+        at = put(ix, at, "a", Kind::Dir)?;
+        names += 1;
+    }
+    put(ix, at, "f", Kind::File)?;
+    names += 1;
+    let long = put(ix, 0, "long", Kind::Dir)?;
+    put(ix, long, &"n".repeat(200), Kind::File)?;
+    names += 2;
+    let etc = put(ix, 0, "etc", Kind::Dir)?;
+    names += 1;
+    for k in 0..1024 {
+        put(ix, etc, &std::format!("x{k:04}"), Kind::File)?;
+        names += 1;
+    }
+    let mut d = 0;
+    while names < 8192 {
+        let dir = put(ix, 0, &std::format!("d{d:02}"), Kind::Dir)?;
+        names += 1;
+        let mut k = 0;
+        while k < 1024 && names < 8192 {
+            put(ix, dir, &std::format!("n{k:04}"), Kind::File)?;
+            names += 1;
+            k += 1;
+        }
+        d += 1;
+    }
+    put(ix, 0, "opq", Kind::Dir)?;
+    let dir = put(ix, 0, "marks", Kind::Dir)?;
+    for k in 0..marks {
+        put(ix, dir, &std::format!("m{k:04}"), Kind::Whiteout)?;
+    }
+    Ok(out)
+}

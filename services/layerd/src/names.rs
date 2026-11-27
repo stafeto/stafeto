@@ -83,6 +83,19 @@ pub enum Done<P> {
     Continue(OpenCont),
 }
 
+/// The times a build starts again under another seed before it leaves names out.
+pub const RESEEDS: u8 = 3;
+
+/// The seed of the next build: a mix of the last one and the number of the attempt.
+fn next_seed(seed: u64, attempt: u64) -> u64 {
+    let mut h = seed ^ attempt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
+}
+
 pub struct Core<'a, V: Volume, L: Lower> {
     pub volume: V,
     pub lower: L,
@@ -90,6 +103,12 @@ pub struct Core<'a, V: Volume, L: Lower> {
     scan: &'a mut Scan,
     pub composition: Composition,
     pub state: State,
+    /// The builds that started again under another seed, and the place of the clearing between
+    /// two of them (`Index::clear_step`).
+    reseeds: u8,
+    clearing: Option<usize>,
+    /// The build left names out for the buckets: the root is served read-only.
+    pub partial: bool,
     /// `/.layers/NN`, the live layer's directory.
     live: [u8; 16],
     live_len: usize,
@@ -256,6 +275,9 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             scan,
             composition: Composition::first(),
             state: State::Starting,
+            reseeds: 0,
+            clearing: None,
+            partial: false,
             live: *b"/.layers/00\0\0\0\0\0",
             live_len: 11,
             table: Table::new(epoch),
@@ -449,6 +471,13 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         if self.state != State::Starting {
             return true;
         }
+        if let Some(from) = self.clearing {
+            self.clearing = self.index.clear_step(from);
+            if self.clearing.is_none() {
+                self.scan.reset();
+            }
+            return false;
+        }
         let mut root = [0u8; 16];
         let len = self.live_len;
         root[..len].copy_from_slice(self.live_path());
@@ -465,8 +494,19 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         match stepped {
             Ok(Progress::More) => false,
             Ok(Progress::Done) => {
+                self.partial = self.scan.skipped_names + self.scan.skipped_marks != 0;
                 self.state = State::Ready;
                 true
+            }
+            Err(Failure::Reseed) => {
+                // Both buckets of a name are full: the build starts again under another seed, a
+                // few times at most.
+                self.reseeds += 1;
+                self.scan.patient = self.reseeds < RESEEDS;
+                self.index
+                    .set_seed(next_seed(self.index.seed(), u64::from(self.reseeds)));
+                self.clearing = Some(0);
+                false
             }
             Err(Failure::NoSpace) => {
                 self.state = State::Failed(l::NO_SPACE);
@@ -480,6 +520,11 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
                 true
             }
         }
+    }
+
+    /// The names and the marks the build left out for the buckets.
+    pub fn left_out(&self) -> (u32, u32) {
+        (self.scan.skipped_names, self.scan.skipped_marks)
     }
 
     /// The directories the build left out for a path past the volume's limit.
@@ -509,6 +554,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         let flags = match self.state {
             State::Starting => l::STATUS_STARTING,
             State::NoStore => l::STATUS_NO_STORE,
+            State::Ready if self.partial => l::STATUS_PARTIAL,
             State::Ready => 0,
             State::Damaged => return Err(st(l::DAMAGED)),
             State::Failed(code) => return Err(st(code)),

@@ -1,14 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The index of the names of the live layer (the layered file system, section 5.1): an open
-//! table of `SLOTS` entries with at most `PROBES` probes for a name, keyed by the pair (the id of
-//! the directory above, the name). The id of an entry is its slot plus one, and the root of the
-//! layer is id 0. The service is the only writer of the names of `/.layers`, so the index is exact
-//! without a journal; nothing is ever removed in this part, which keeps a probe sequence unbroken.
-//! The names live in an arena (`ARENA` bytes, each name once); an insertion that finds no free slot
-//! within the probes, or no room in the arena, is NO_SPACE (ENOSPC for the program that created
-//! the name).
+//! The index of the names of the live layer (the layered file system, section 5.1): a table of
+//! `BUCKETS` buckets of `WAYS` places, keyed by the pair (the key of the directory above, the
+//! name). A name has two buckets, one in each half of the table, chosen by two parts of its
+//! 64-bit hash; an insertion takes the less loaded of the two (a tie goes to the left one) and no
+//! entry ever moves, so the id of an entry is its slot plus one (the slot is bucket times `WAYS`
+//! plus the way) and the root of the layer is id 0. A lookup reads the 16 tags of the two buckets
+//! and compares the entry and the name for each tag that matches. The service is the only writer
+//! of the names of `/.layers`, so the index is exact without a journal.
+//!
+//! Two choices make the table fail only at the edge of its capacity: with random hashes 10,240
+//! entries in the 16,384 places never overflowed a bucket in 2,000,000 builds. The table holds at
+//! most `ENTRIES_MAX` entries (the names and the marks) at run time: a new name over that is
+//! NO_SPACE (ENOSPC for the program that created it), which keeps the next build of the same
+//! names, under the seed of the next start, inside what the buckets take. A build that does
+//! overflow a bucket (`Error::Buckets`) starts again under another seed.
+//!
+//! The names live in an arena (`ARENA` bytes, each name once); an insertion that finds no room
+//! in the arena is NO_SPACE too.
 //!
 //! An entry has the layer it lies in, its kind (a file, a directory, a symbolic link, or the mark of
 //! a deletion: the file `.wh.<name>` of the layer says "the name of the lower set is gone"; a link
@@ -18,11 +28,14 @@
 //! the flags OPAQUE (the directory holds the file `.wh..wh..opq`: the lower set shows through it
 //! no more) and HAS_CHILDREN (a name of the layer lies in it).
 
-/// The table holds 8,192 names of a layer with room to spare: 16,384 places and 32 probes took
-/// more than 9,000 names of a layer in a host test before the first miss (8,192 places and 8 probes
-/// took 2,777: an open table at an eighth of its places is the most a short probe holds).
-pub const SLOTS: usize = 16384;
-pub const PROBES: usize = 32;
+/// The places of the table: `BUCKETS` buckets of `WAYS`.
+pub const BUCKETS: usize = 2048;
+pub const WAYS: usize = 8;
+pub const SLOTS: usize = BUCKETS * WAYS;
+/// The most entries (names and marks) the table takes at run time. A build takes every name the
+/// volume holds (it does not look at the limit), so the names of a layer that was filled to the
+/// limit still build.
+pub const ENTRIES_MAX: usize = 10_240;
 pub const ARENA: usize = 256 * 1024;
 pub const NAME_MAX: usize = 255;
 /// The bytes a link's file name (`.wh..wh.lnk.`) and a mark (`.wh.`) add to a name, and the marker of
@@ -78,8 +91,8 @@ pub struct Entry {
     pub uid: u32,
     pub gid: u32,
     pub mode: u16,
-    /// The top 16 bits of the hash of the key, compared before the name.
-    tag: u16,
+    /// For a directory: how many of its children are names (not marks).
+    pub live_children: u16,
 }
 
 const EMPTY: Entry = Entry {
@@ -95,7 +108,7 @@ const EMPTY: Entry = Entry {
     uid: 0,
     gid: 0,
     mode: 0,
-    tag: 0,
+    live_children: 0,
 };
 
 /// What `next_child` found: an entry (the position after it and its id), the end of the slots
@@ -120,8 +133,11 @@ pub struct Fields {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// No free slot within `PROBES` probes, or no room for the name in the arena.
+    /// No room for the name in the arena, or the table holds `ENTRIES_MAX` entries.
     NoSpace,
+    /// Both buckets of the name are full (the build starts again under another seed; at run time
+    /// the table is at its limit long before, so a program sees NO_SPACE).
+    Buckets,
     /// An empty name, one over `NAME_MAX`, or a parent that is no directory.
     Invalid,
 }
@@ -138,6 +154,11 @@ pub struct Root {
 
 pub struct Index {
     slots: [Entry; SLOTS],
+    /// The tag of each place (the top 16 bits of the hash of its name, 0 mapped to 1): 0 is a free
+    /// place, and a gone entry keeps its tag.
+    tags: [u16; SLOTS],
+    /// The live entries of each bucket.
+    loads: [u8; BUCKETS],
     arena: [u8; ARENA],
     arena_len: usize,
     live: u32,
@@ -150,7 +171,10 @@ pub struct Index {
     free_len: usize,
     /// The seed of the hash, chosen at each start of the service (`reseed`): the names of a layer
     /// cannot be made to collide offline.
-    seed: u32,
+    seed: u64,
+    /// A test hook: this many of the next insertions fail with `Error::Buckets`.
+    #[cfg(test)]
+    pub fail_inserts: u32,
     pub root: Root,
 }
 
@@ -162,26 +186,51 @@ const EMPTY_ROOT: Root = Root {
     flags: 0,
 };
 
-fn hash(seed: u32, parent: u32, name: &[u8]) -> u32 {
-    // FNV-1a over the key and the name, folded into the table.
-    let mut h: u32 = 0x811c_9dc5 ^ seed;
+/// The 64-bit hash of a key: FNV-1a over the key and the name, then the final mix of murmur3, so
+/// that names that differ in one byte spread over the table.
+fn hash(seed: u64, parent: u32, name: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ seed;
     for b in parent.to_le_bytes().iter().chain(name) {
-        h ^= u32::from(*b);
-        h = h.wrapping_mul(0x0100_0193);
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    // The final mix of murmur3, so that names that differ in one byte spread over the table.
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x85eb_ca6b);
-    h ^= h >> 13;
-    h = h.wrapping_mul(0xc2b2_ae35);
-    h ^= h >> 16;
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 33;
     h
+}
+
+/// The two buckets of a hash (one in each half) and its tag.
+fn places(h: u64) -> (usize, usize, u16) {
+    let tag = (h >> 48) as u16;
+    (
+        (h & 1023) as usize,
+        BUCKETS / 2 + ((h >> 10) & 1023) as usize,
+        if tag == 0 { 1 } else { tag },
+    )
+}
+
+/// The places one step of `clear_step` empties.
+pub const CLEAR_SLOTS: usize = 256;
+
+/// What a look at the two buckets of a key found.
+struct Probe {
+    /// The slot of the live entry of the key.
+    live: Option<usize>,
+    /// The slot of a gone entry of the same key (its name is in the arena still).
+    gone: Option<usize>,
+    /// The place a new entry would take: in the less loaded bucket, a free way, else a gone one.
+    place: Option<usize>,
 }
 
 impl Index {
     pub const fn new() -> Index {
         Index {
             slots: [EMPTY; SLOTS],
+            tags: [0; SLOTS],
+            loads: [0; BUCKETS],
             arena: [0; ARENA],
             arena_len: 0,
             live: 0,
@@ -191,6 +240,8 @@ impl Index {
             free_keys: [0; SLOTS],
             free_len: 0,
             seed: 0,
+            #[cfg(test)]
+            fail_inserts: 0,
             // All zeros, so that the static of the program is `.bss`: the build of the index
             // sets the attributes of the root from the volume.
             root: Root {
@@ -205,21 +256,52 @@ impl Index {
 
     /// Chooses the seed of the hash; the index is empty (the start of the service, before the
     /// build).
-    pub fn reseed(&mut self, seed: u32) {
+    pub fn reseed(&mut self, seed: u64) {
         self.clear();
+        self.seed = seed;
+    }
+
+    /// The seed of the hash.
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Takes the seed of the next build; the index is emptied by `clear_step` first.
+    pub fn set_seed(&mut self, seed: u64) {
         self.seed = seed;
     }
 
     /// Empties the index (the build starts again).
     pub fn clear(&mut self) {
-        self.slots.fill(EMPTY);
-        self.dslot.fill(0);
+        let mut from = 0;
+        while let Some(next) = self.clear_step(from) {
+            from = next;
+        }
+    }
+
+    /// One step of emptying the index: `CLEAR_SLOTS` places from `from` (and, at the end, the keys
+    /// and the counters). The place to go on from, or None when the index is empty.
+    pub fn clear_step(&mut self, from: usize) -> Option<usize> {
+        if from < SLOTS {
+            let to = (from + CLEAR_SLOTS).min(SLOTS);
+            // SAFETY: the bytes of `EMPTY` are all zero (the kind `Empty` is 0), and a fill of
+            // zero bytes is a memset, which the loop over the places is not (it stores the fields
+            // one by one, 100 ticks a place under -icount).
+            unsafe {
+                core::ptr::write_bytes(self.slots.as_mut_ptr().add(from), 0, to - from);
+            }
+            self.tags[from..to].fill(0);
+            self.dslot[from..to].fill(0);
+            return Some(to);
+        }
+        self.loads.fill(0);
         self.arena_len = 0;
         self.live = 0;
         self.marks = 0;
         self.keys_issued = 0;
         self.free_len = 0;
         self.root = EMPTY_ROOT;
+        None
     }
 
     /// The names of a layer (files and directories) and the marks of deletion.
@@ -254,20 +336,58 @@ impl Index {
         }
     }
 
-    /// The slot of (`pkey`, `name`) within the probes.
-    fn find(&self, pkey: u32, name: &[u8]) -> Option<usize> {
-        let h = hash(self.seed, pkey, name);
-        let (start, tag) = (h as usize, (h >> 16) as u16);
-        for i in 0..PROBES {
-            let slot = (start + i) & (SLOTS - 1);
-            let e = &self.slots[slot];
-            match e.kind {
-                Kind::Empty => return None,
-                Kind::Gone => {}
-                _ if e.tag == tag && e.pkey == pkey && self.name_of(e) == name => {
-                    return Some(slot);
+    /// What the two buckets of (`pkey`, `name`) hold: the entry (live or gone) of the key, and the
+    /// place a new one takes. Every one of the 16 tags is looked at.
+    fn probe(&self, pkey: u32, name: &[u8]) -> Probe {
+        let (b1, b2, tag) = places(hash(self.seed, pkey, name));
+        let mut found = Probe {
+            live: None,
+            gone: None,
+            place: None,
+        };
+        for b in [b1, b2] {
+            for slot in b * WAYS..(b + 1) * WAYS {
+                if self.tags[slot] == tag {
+                    let e = &self.slots[slot];
+                    if e.pkey == pkey && self.name_of(e) == name {
+                        if e.kind == Kind::Gone {
+                            found.gone = Some(slot);
+                        } else {
+                            found.live = Some(slot);
+                        }
+                    }
                 }
-                _ => {}
+            }
+        }
+        let b = if self.loads[b2] < self.loads[b1] {
+            b2
+        } else {
+            b1
+        };
+        if usize::from(self.loads[b]) < WAYS {
+            let ways = b * WAYS..(b + 1) * WAYS;
+            found.place = ways
+                .clone()
+                .find(|&slot| self.slots[slot].kind == Kind::Empty)
+                .or_else(|| {
+                    ways.into_iter()
+                        .find(|&slot| self.slots[slot].kind == Kind::Gone)
+                });
+        }
+        found
+    }
+
+    /// The slot of the live entry of (`pkey`, `name`).
+    fn find(&self, pkey: u32, name: &[u8]) -> Option<usize> {
+        let (b1, b2, tag) = places(hash(self.seed, pkey, name));
+        for b in [b1, b2] {
+            for slot in b * WAYS..(b + 1) * WAYS {
+                if self.tags[slot] == tag {
+                    let e = &self.slots[slot];
+                    if e.kind != Kind::Gone && e.pkey == pkey && self.name_of(e) == name {
+                        return Some(slot);
+                    }
+                }
             }
         }
         None
@@ -353,7 +473,7 @@ impl Index {
     /// Inserts a name. A mark of deletion over a name of the layer changes nothing, and a name over
     /// a mark replaces it (the layer says the name is there). Returns the id.
     pub fn insert(&mut self, parent: u32, name: &[u8], f: Fields) -> Result<u32, Error> {
-        self.insert_with(parent, name, f, None, false)
+        self.insert_with(parent, name, f, None, false, true)
     }
 
     /// `insert` for the build of the index: only the directory the name lies in learns how far it
@@ -361,7 +481,7 @@ impl Index {
     /// one step); the directories above learn it from `lift`, which the build runs when it has
     /// listed them all.
     pub fn insert_shallow(&mut self, parent: u32, name: &[u8], f: Fields) -> Result<u32, Error> {
-        self.insert_with(parent, name, f, None, true)
+        self.insert_with(parent, name, f, None, true, false)
     }
 
     /// The directory above `id` reaches as far as `id` does and its name: the build calls it for the
@@ -386,8 +506,9 @@ impl Index {
         f: Fields,
         keep: Option<u32>,
         shallow: bool,
+        capped: bool,
     ) -> Result<u32, Error> {
-        let id = self.insert_raw(parent, name, f, keep)?;
+        let id = self.insert_raw(parent, name, f, keep, capped)?;
         let extra = match f.kind {
             Kind::Link => LINK_EXTRA,
             Kind::Whiteout => MARK_EXTRA,
@@ -430,33 +551,21 @@ impl Index {
         }
     }
 
-    /// Whether `insert` of `name` in `parent` would find a place: a free slot within the probes (or the
-    /// name's own) and room in the arena. The service asks before it touches the volume.
+    /// Whether `insert` of `name` in `parent` would find a place: the name's own place (a live
+    /// entry of it, which an insertion replaces), or a free one with the table under `ENTRIES_MAX`
+    /// and room in the arena. The service asks before it touches the volume.
     pub fn has_room(&self, parent: u32, name: &[u8]) -> bool {
         let Some(pkey) = self.dkey_of(parent) else {
             return false;
         };
-        let h = hash(self.seed, pkey, name);
-        let (start, tag) = (h as usize, (h >> 16) as u16);
-        let mut slot_free = false;
-        for i in 0..PROBES {
-            let e = &self.slots[(start + i) & (SLOTS - 1)];
-            match e.kind {
-                Kind::Empty => {
-                    slot_free = true;
-                    break;
-                }
-                Kind::Gone => {
-                    if e.tag == tag && e.pkey == pkey && self.name_of(e) == name {
-                        return true;
-                    }
-                    slot_free = true;
-                }
-                _ if e.tag == tag && e.pkey == pkey && self.name_of(e) == name => return true,
-                _ => {}
-            }
+        let p = self.probe(pkey, name);
+        if p.live.is_some() {
+            return true;
         }
-        slot_free && self.arena_len + name.len() <= ARENA
+        if self.names() as usize >= ENTRIES_MAX {
+            return false;
+        }
+        p.gone.is_some() || (p.place.is_some() && self.arena_len + name.len() <= ARENA)
     }
 
     /// The most bytes a name below the directory `id` adds to its path.
@@ -464,58 +573,58 @@ impl Index {
         self.entry(id).map_or(0, |e| usize::from(e.reach))
     }
 
+    /// `capped` is false for the build and for a move: an entry that is net zero (the name over
+    /// its mark, a moved name) does not count against `ENTRIES_MAX` either way.
     fn insert_raw(
         &mut self,
         parent: u32,
         name: &[u8],
         f: Fields,
         keep: Option<u32>,
+        capped: bool,
     ) -> Result<u32, Error> {
         if name.is_empty() || name.len() > NAME_MAX || f.kind == Kind::Empty {
             return Err(Error::Invalid);
         }
         let pkey = self.dkey_of(parent).ok_or(Error::Invalid)?;
-        let h = hash(self.seed, pkey, name);
-        let (start, tag) = (h as usize, (h >> 16) as u16);
-        let mut free = None;
-        for i in 0..PROBES {
-            let slot = (start + i) & (SLOTS - 1);
-            let e = self.slots[slot];
-            match e.kind {
-                Kind::Empty => {
-                    free.get_or_insert(slot);
-                    break;
-                }
-                Kind::Gone => {
-                    if e.tag == tag && e.pkey == pkey && self.name_of(&e) == name {
-                        // The same name again: the slot and the name in the arena are taken up.
-                        let dkey = self.key_for(f.kind, keep)?;
-                        self.slots[slot] = Entry {
-                            dkey,
-                            reach: 0,
-                            kind: f.kind,
-                            flags: if f.kind == Kind::Dir { UNSCANNED } else { 0 },
-                            layer: f.layer,
-                            number: f.number,
-                            uid: f.uid,
-                            gid: f.gid,
-                            mode: f.mode,
-                            ..e
-                        };
-                        self.place_key(dkey, slot);
-                        self.count_in(f.kind);
-                        self.mark_parent(parent);
-                        return Ok(slot as u32 + 1);
-                    }
-                    free.get_or_insert(slot);
-                }
-                _ if e.tag == tag && e.pkey == pkey && self.name_of(&e) == name => {
-                    return self.replace(slot, f, keep);
-                }
-                _ => {}
-            }
+        let p = self.probe(pkey, name);
+        if let Some(slot) = p.live {
+            return self.replace(slot, f, keep);
         }
-        let slot = free.ok_or(Error::NoSpace)?;
+        #[cfg(test)]
+        if self.fail_inserts > 0 {
+            if self.fail_inserts != u32::MAX {
+                self.fail_inserts -= 1;
+            }
+            return Err(Error::Buckets);
+        }
+        if capped && self.names() as usize >= ENTRIES_MAX {
+            return Err(Error::NoSpace);
+        }
+        if let Some(slot) = p.gone {
+            // The same name again: the slot and the name in the arena are taken up.
+            let dkey = self.key_for(f.kind, keep)?;
+            let e = self.slots[slot];
+            self.slots[slot] = Entry {
+                dkey,
+                reach: 0,
+                live_children: 0,
+                kind: f.kind,
+                flags: if f.kind == Kind::Dir { UNSCANNED } else { 0 },
+                layer: f.layer,
+                number: f.number,
+                uid: f.uid,
+                gid: f.gid,
+                mode: f.mode,
+                ..e
+            };
+            self.loads[slot / WAYS] += 1;
+            self.place_key(dkey, slot);
+            self.count_in(f.kind);
+            self.mark_parent(parent, f.kind);
+            return Ok(slot as u32 + 1);
+        }
+        let slot = p.place.ok_or(Error::Buckets)?;
         if self.arena_len + name.len() > ARENA {
             return Err(Error::NoSpace);
         }
@@ -527,7 +636,7 @@ impl Index {
             pkey,
             dkey,
             reach: 0,
-            tag,
+            live_children: 0,
             name_at: at as u32,
             name_len: name.len() as u8,
             kind: f.kind,
@@ -538,9 +647,11 @@ impl Index {
             gid: f.gid,
             mode: f.mode,
         };
+        self.tags[slot] = places(hash(self.seed, pkey, name)).2;
+        self.loads[slot / WAYS] += 1;
         self.place_key(dkey, slot);
         self.count_in(f.kind);
-        self.mark_parent(parent);
+        self.mark_parent(parent, f.kind);
         Ok(slot as u32 + 1)
     }
 
@@ -596,6 +707,7 @@ impl Index {
         self.slots[slot].kind = Kind::Gone;
         self.slots[slot].flags = 0;
         self.slots[slot].dkey = 0;
+        self.loads[slot / WAYS] -= 1;
         if give_key_back {
             self.give_back(e.dkey);
         }
@@ -636,7 +748,7 @@ impl Index {
         }
         // The new place first, so a refusal leaves the entry where it was.
         let keep = (e.kind == Kind::Dir).then_some(e.dkey);
-        let new = self.insert_with(parent, name, fields, keep, false)?;
+        let new = self.insert_with(parent, name, fields, keep, false, false)?;
         self.take_out(id, false);
         if let Some(slot) = (new as usize).checked_sub(1) {
             self.slots[slot].flags = e.flags & !UNSCANNED;
@@ -686,7 +798,7 @@ impl Index {
         Ok(slot as u32 + 1)
     }
 
-    fn mark_parent(&mut self, parent: u32) {
+    fn mark_parent(&mut self, parent: u32, _kind: Kind) {
         if parent == 0 {
             self.root.flags |= HAS_CHILDREN;
         } else if let Some(p) = (parent as usize)
@@ -919,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn a_name_that_finds_no_free_slot_in_eight_probes_is_no_space() {
+    fn the_table_holds_entries_max_and_the_next_new_name_is_no_space() {
         let mut ix = index();
         let mut inserted = 0u32;
         let mut refused = None;
@@ -933,16 +1045,131 @@ mod tests {
                 }
             }
         }
+        // The cap or a bucket that overflowed first (at run time the cap is far from it).
         let (_, e) = refused.expect("the table fills up");
-        assert_eq!(e, Error::NoSpace);
-        // Open addressing with eight probes fills a good part of the table before the first miss,
-        // and every name inserted is found again.
-        assert!(inserted > SLOTS as u32 / 8, "{inserted}");
+        assert!(matches!(e, Error::NoSpace | Error::Buckets));
+        assert!(inserted as usize >= ENTRIES_MAX, "{inserted}");
         for n in 0..inserted {
             let name = std::format!("n{n}");
             assert!(ix.lookup(0, name.as_bytes()).is_some(), "{name}");
         }
         assert_eq!(ix.counts().0, inserted);
+    }
+
+    /// An index with `ENTRIES_MAX` entries: the names `n0` and on, the last of them a mark.
+    fn full() -> std::boxed::Box<Index> {
+        let mut ix = index();
+        ix.reseed(0x1234_5678_9abc_def0);
+        let w = Fields {
+            kind: Kind::Whiteout,
+            ..file(0)
+        };
+        for n in 0..ENTRIES_MAX - 1 {
+            let name = std::format!("n{n}");
+            ix.insert_shallow(0, name.as_bytes(), file(n as u64))
+                .unwrap();
+        }
+        ix.insert_shallow(0, b"mark", w).unwrap();
+        assert_eq!(ix.names() as usize, ENTRIES_MAX);
+        ix
+    }
+
+    #[test]
+    fn at_entries_max_a_new_name_is_no_space_and_a_net_zero_change_is_not() {
+        let mut ix = full();
+        let w = Fields {
+            kind: Kind::Whiteout,
+            ..file(0)
+        };
+        assert_eq!(ix.insert(0, b"fresh", file(1)), Err(Error::NoSpace));
+        assert!(!ix.has_room(0, b"fresh"));
+        // A name over its own mark: net zero.
+        assert!(ix.has_room(0, b"mark"));
+        let id = ix.insert(0, b"mark", file(2)).unwrap();
+        assert_eq!(ix.entry(id).unwrap().kind, Kind::File);
+        assert_eq!(ix.names() as usize, ENTRIES_MAX);
+        // A mark over a name changes nothing, and a name over a name replaces it.
+        assert!(ix.insert(0, b"n5", w).is_ok());
+        assert!(ix.insert(0, b"n5", file(9)).is_ok());
+        assert_eq!(ix.names() as usize, ENTRIES_MAX);
+        // A move: net zero, so it needs only a free way.
+        let before = ix.lookup(0, b"n7").unwrap().0;
+        let dir = ix.entry(before).map(|e| e.kind);
+        assert_eq!(dir, Some(Kind::File));
+        let to = ix.move_to(before, 0, b"moved");
+        assert!(to.is_ok() || to == Err(Error::Buckets), "{to:?}");
+        assert!(ix.names() as usize <= ENTRIES_MAX);
+        // A removal makes room for a new name again.
+        let gone = ix.lookup(0, b"n8").unwrap().0;
+        ix.remove(gone);
+        assert!(ix.insert(0, b"fresh", file(1)).is_ok());
+    }
+
+    #[test]
+    fn the_entry_is_forty_bytes() {
+        assert_eq!(core::mem::size_of::<Entry>(), 40);
+    }
+
+    #[test]
+    fn a_name_created_and_removed_over_and_over_never_runs_out_of_space() {
+        let mut ix = index();
+        ix.reseed(77);
+        let mut arena = None;
+        for n in 0..100_000u32 {
+            let id = ix.insert(0, b"churn", file(u64::from(n))).unwrap();
+            if arena.is_none() {
+                arena = Some(ix.arena_len);
+            }
+            ix.remove(id);
+            assert_eq!(ix.arena_len, arena.unwrap(), "{n}");
+        }
+        assert_eq!(ix.counts(), (0, 0));
+    }
+
+    /// The most live entries any bucket holds.
+    fn max_load(ix: &Index) -> usize {
+        ix.loads.iter().map(|&l| usize::from(l)).max().unwrap()
+    }
+
+    fn build_the_probe_set(seed: u64, marks: usize, ix: &mut Index) -> usize {
+        ix.reseed(seed);
+        let placed = crate::testkit::scale_set(ix, marks)
+            .unwrap_or_else(|e| panic!("seed {seed:#x}: {e:?}"));
+        let mut ids = std::collections::HashSet::new();
+        for (parent, name, id) in &placed {
+            assert_eq!(ix.lookup(*parent, name).map(|(i, _)| i), Some(*id));
+            assert!(ids.insert(*id));
+        }
+        let (live, marked) = ix.counts();
+        assert_eq!((live + marked) as usize, placed.len());
+        assert_eq!(marked as usize, marks);
+        max_load(ix)
+    }
+
+    #[test]
+    fn the_probe_set_and_2048_marks_build_for_every_seed() {
+        let mut ix = index();
+        for k in 0..SEEDS as u64 {
+            let load =
+                build_the_probe_set(k.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x55, 2048, &mut ix);
+            assert!(load <= WAYS);
+        }
+    }
+
+    /// The seeds the ordinary test runs (the sweep that follows runs 100,000).
+    const SEEDS: usize = 2000;
+
+    #[test]
+    #[ignore = "a sweep of 100,000 seeds"]
+    fn seed_sweep() {
+        let mut ix = index();
+        let mut histogram = [0u32; WAYS + 1];
+        for k in 0..100_000u64 {
+            let load =
+                build_the_probe_set(k.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xa5, 2048, &mut ix);
+            histogram[load] += 1;
+        }
+        std::println!("max load of a bucket over 100,000 builds: {histogram:?}");
     }
 
     #[test]

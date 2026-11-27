@@ -974,7 +974,7 @@ fn status_round_trips_and_refuses_what_makes_no_sense() {
             deferred: 0,
             ..stat
         },
-        Stat { flags: 16, ..stat },
+        Stat { flags: 32, ..stat },
         Stat { job: 8, ..stat },
         Stat {
             queued: JOBS_MAX + 1,
