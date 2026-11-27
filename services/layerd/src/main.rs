@@ -33,6 +33,7 @@ mod notary;
 use abi::Rights;
 use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Release};
+use layerd::changejob::{ChangeJob, ChangeStep};
 use layerd::identity::{Binding, Vouched, vouched_from};
 use layerd::index::Index;
 use layerd::names::{Client, Core, Done, OpenCont, Prewalk, State};
@@ -122,6 +123,9 @@ static INDEX: Cell<Index> = Cell(UnsafeCell::new(Index::new()));
 static SCAN: Cell<Scan> = Cell(UnsafeCell::new(Scan::new()));
 static WORKERS: Cell<layerd::reaper::Workers> =
     Cell(UnsafeCell::new(layerd::reaper::Workers::new()));
+/// The change jobs, one for each place of the table of jobs.
+type Change = ChangeJob<data::Data, lower::Ram>;
+static CHANGES: Cell<[Change; JOBS]> = Cell(UnsafeCell::new([const { Change::new() }; JOBS]));
 
 /// The registrar thread: the root goes to the process service, tried until it is there.
 static PARENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -243,11 +247,12 @@ fn main(_: u64) -> u64 {
         rt::service::table_steps_from(16);
     }
     // SAFETY: the statics are used by this thread alone from here on.
-    let (index, scan, workers) = unsafe {
+    let (index, scan, workers, changes) = unsafe {
         (
             &mut *INDEX.0.get(),
             &mut *SCAN.0.get(),
             &mut *WORKERS.0.get(),
+            &mut *CHANGES.0.get(),
         )
     };
     touch_stack();
@@ -285,6 +290,7 @@ fn main(_: u64) -> u64 {
         walk_step,
         jobs: [const { None }; JOBS],
         next_job: 0,
+        changes,
         reap_turn: false,
         notary: notary::Notary::new(),
         next_label: 1,
@@ -350,15 +356,9 @@ struct Job {
 enum Stage {
     Walking(Prewalk),
     Opening(OpenCont),
-    /// A change of names: the whole operation (its walk of the directory part and its calls to the
-    /// data file service) runs in the one step of the job, never in the step of its request.
-    Changing(ChangeBuf),
-}
-
-/// The body of a CHANGE request, kept by the job that does it.
-struct ChangeBuf {
-    bytes: [u8; abi::MESSAGE_MAX],
-    len: usize,
+    /// A change of names: its state is `Layerd::changes[place]` (a change job runs in steps, one
+    /// call to a service in each, and never in the step of its request).
+    Changing,
 }
 
 enum JobKind {
@@ -382,6 +382,7 @@ struct Layerd {
     walk_step: Handle<Channel>,
     jobs: [Option<Job>; JOBS],
     next_job: usize,
+    changes: &'static mut [Change; JOBS],
     /// The next step of the loop goes to the reaper when it has work (the jobs and the reaper
     /// take turns).
     reap_turn: bool,
@@ -630,6 +631,41 @@ impl Layerd {
     /// jobs has no place for the session (`jobs::place`): a long path is never walked inside the
     /// step of its request. None when the service does not answer yet (the request then gives its
     /// own refusal).
+    /// The place of the table of jobs for a job of the session `label`, or the answer the request
+    /// gets: busy (`STARTING`) when the table is full or the session holds its share.
+    fn place_for(&self, label: u64) -> Result<usize, Answer> {
+        if !self.core.walkable() {
+            return Err(st(l::STARTING));
+        }
+        let held: [Option<u64>; JOBS] =
+            core::array::from_fn(|i| self.jobs[i].as_ref().map(|j| j.label));
+        layerd::jobs::place(&held, label).map_err(|_| st(l::STARTING))
+    }
+
+    /// The request waits as the job in `place`.
+    fn defer_at(
+        &mut self,
+        r: &mut Request<'_>,
+        place: usize,
+        who: Vouched,
+        label: u64,
+        kind: JobKind,
+        stage: Stage,
+    ) -> Answer {
+        let Some(pending) = r.defer() else {
+            return Answer::Status(Status::BadSize);
+        };
+        self.jobs[place] = Some(Job {
+            pending,
+            label,
+            who,
+            kind,
+            stage,
+        });
+        let _ = sys::notify(&self.walk_step, 1);
+        Answer::Deferred
+    }
+
     fn defer_walk(
         &mut self,
         r: &mut Request<'_>,
@@ -678,20 +714,36 @@ impl Layerd {
             return;
         }
         self.reap_turn = true;
+        // A change job that does not hold the lock waits while another one does.
         let Some(place) = (0..JOBS)
             .map(|k| (self.next_job + k) % JOBS)
-            .find(|&i| self.jobs[i].is_some())
+            .find(|&i| self.runnable(i))
         else {
             return;
         };
         self.next_job = (place + 1) % JOBS;
-        if let Some(job) = self.jobs[place].take() {
-            if self.slot_of(job.label).is_none() {
+        let gone = self.jobs[place]
+            .as_ref()
+            .is_some_and(|job| self.slot_of(job.label).is_none());
+        if matches!(
+            self.jobs[place].as_ref().map(|j| &j.stage),
+            Some(Stage::Changing)
+        ) {
+            // A change job whose session went before its first call is dropped; after it the
+            // job runs to its end (its answer goes to nobody) and lets the lock go.
+            if gone && !self.changes[place].committed() {
+                self.core.change_abandon(&mut self.changes[place]);
+                self.jobs[place] = None;
+            } else {
+                self.change_job(place);
+            }
+        } else if let Some(job) = self.jobs[place].take() {
+            if gone {
                 if let Stage::Opening(cont) = job.stage {
                     self.core.open_abandon(cont);
                 }
             } else {
-                self.jobs[place] = self.advance(job);
+                self.jobs[place] = self.advance(place, job);
             }
         }
         if self.jobs.iter().any(Option::is_some) || self.core.reaping() {
@@ -699,8 +751,46 @@ impl Layerd {
         }
     }
 
+    fn runnable(&self, place: usize) -> bool {
+        match self.jobs[place].as_ref().map(|j| &j.stage) {
+            None => false,
+            Some(Stage::Changing) => self.changes[place].holds_lock() || !self.core.change_locked(),
+            Some(_) => true,
+        }
+    }
+
+    /// One step of the change job in `place`; the job is answered when its last call is made.
+    fn change_job(&mut self, place: usize) {
+        let Some(job) = self.jobs[place].as_ref() else {
+            return;
+        };
+        #[cfg(feature = "steps")]
+        rt::service::step_detail(self.changes[place].detail());
+        let c = Client {
+            owner: job.label,
+            who: &job.who,
+        };
+        let mut w = proto_wire::Writer::new();
+        let stepped = self.core.change_step(&c, &mut self.changes[place], &mut w);
+        let none = rt::handle::Outgoing::new;
+        match stepped {
+            ChangeStep::Wait | ChangeStep::More => {}
+            ChangeStep::Done(result) => {
+                let Some(job) = self.jobs[place].take() else {
+                    return;
+                };
+                let _ = match result {
+                    Ok(Done::Written) => job.pending.answer(w.as_bytes(), none()),
+                    Ok(Done::Pass(pass)) => job.pending.answer(w.as_bytes(), [pass]),
+                    Ok(Done::Continue(_)) => unreachable!(),
+                    Err(status) => job.pending.answer(&proto_wire::reply(status), none()),
+                };
+            }
+        }
+    }
+
     /// One step of a job: the job again when it goes on, None when it has been answered.
-    fn advance(&mut self, job: Job) -> Option<Job> {
+    fn advance(&mut self, place: usize, job: Job) -> Option<Job> {
         let Job {
             pending,
             label,
@@ -726,6 +816,30 @@ impl Layerd {
                 };
                 match kind {
                     JobKind::Open { flags } => {
+                        // An OPEN that creates a name the layer does not hold is a change job.
+                        if flags & proto_fs::CREATE != 0 && walked.is_missing() {
+                            return match self.changes[place].start_create(
+                                place as u8,
+                                flags,
+                                walked.path(),
+                                walked.trailing(),
+                            ) {
+                                Ok(()) => Some(Job {
+                                    pending,
+                                    label,
+                                    who,
+                                    kind,
+                                    stage: Stage::Changing,
+                                }),
+                                Err(status) => {
+                                    let _ = pending.answer(
+                                        &proto_wire::reply(status),
+                                        rt::handle::Outgoing::new(),
+                                    );
+                                    None
+                                }
+                            };
+                        }
                         self.core
                             .open_walked(&c, flags, Some(walked), true, b"", &mut w)
                     }
@@ -744,12 +858,7 @@ impl Layerd {
                     JobKind::Change => Err(Status::BadSize),
                 }
             }
-            Stage::Changing(buf) => {
-                match n::Change::read(proto_wire::Reader::new(&buf.bytes[..buf.len])) {
-                    Ok(req) => self.core.change(&c, &req, &mut w).map(|()| Done::Written),
-                    Err(status) => Err(status),
-                }
-            }
+            Stage::Changing => Err(Status::BadSize),
             Stage::Opening(cont) => self.core.open_continue(&c, cont, &mut w),
         };
         let none = rt::handle::Outgoing::new;
@@ -957,16 +1066,17 @@ impl Layerd {
                 if n::Change::read(proto_wire::Reader::new(all)).is_err() {
                     return bad;
                 }
-                let mut buf = ChangeBuf {
-                    bytes: [0; abi::MESSAGE_MAX],
-                    len: all.len(),
-                };
-                buf.bytes[..all.len()].copy_from_slice(all);
                 // A change is a job: the table of jobs answers busy (STARTING) when it is full or
                 // the session holds its share, and the walk and the calls are not in the step of
                 // the request.
-                self.defer_walk(r, who, label, JobKind::Change, Stage::Changing(buf))
-                    .unwrap_or_else(|| st(l::STARTING))
+                let place = match self.place_for(label) {
+                    Ok(place) => place,
+                    Err(answer) => return answer,
+                };
+                if let Err(status) = self.changes[place].start_request(place as u8, all) {
+                    return Answer::Status(status);
+                }
+                self.defer_at(r, place, who, label, JobKind::Change, Stage::Changing)
             }
             NameMethod::Fstat => {
                 let Ok(handle) = n::read_handle(body) else {

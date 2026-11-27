@@ -14,6 +14,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod change;
+pub mod changejob;
 pub mod composition;
 pub mod descriptions;
 pub mod identity;

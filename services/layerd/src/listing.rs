@@ -68,6 +68,7 @@ fn numbers(index: &Index, id: u32) -> (u64, u64) {
 }
 
 /// Serves one READ_DIR: entries are pushed to `reply`, `position` and `lower` are advanced.
+#[allow(clippy::too_many_arguments)]
 pub fn read_dir<L: Lower>(
     index: &Index,
     lower: &mut L,

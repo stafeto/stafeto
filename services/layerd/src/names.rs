@@ -207,8 +207,19 @@ enum OpenPhase {
 }
 
 impl Walked {
-    pub(crate) fn path(&self) -> &[u8] {
+    pub fn path(&self) -> &[u8] {
         &self.path[..self.len]
+    }
+
+    /// The walk ended at a name the layer does not hold (the lower set's or none): an OPEN that
+    /// creates makes it.
+    pub fn is_missing(&self) -> bool {
+        matches!(self.outcome, Outcome::Lower | Outcome::Absent)
+    }
+
+    /// The path ended with a slash.
+    pub fn trailing(&self) -> bool {
+        self.trailing
     }
 }
 

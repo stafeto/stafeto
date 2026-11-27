@@ -1133,10 +1133,10 @@ mod tests {
             }
             match op {
                 0 => {
-                    if let Ok(id) = ix.insert(parent, name.as_bytes(), dir(1)) {
-                        if !dirs.contains(&id) {
-                            dirs.push(id);
-                        }
+                    if let Ok(id) = ix.insert(parent, name.as_bytes(), dir(1))
+                        && !dirs.contains(&id)
+                    {
+                        dirs.push(id);
                     }
                 }
                 1 | 2 => {
@@ -1160,10 +1160,10 @@ mod tests {
                     // Move a name that is no directory.
                     let to = dirs[next(dirs.len())];
                     let new = std::format!("m{}", next(12));
-                    if let Some((id, e)) = ix.lookup(parent, name.as_bytes()) {
-                        if e.kind != Kind::Dir {
-                            let _ = ix.move_to(id, to, new.as_bytes());
-                        }
+                    if let Some((id, e)) = ix.lookup(parent, name.as_bytes())
+                        && e.kind != Kind::Dir
+                    {
+                        let _ = ix.move_to(id, to, new.as_bytes());
                     }
                 }
                 _ => {

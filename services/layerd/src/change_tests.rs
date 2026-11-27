@@ -1203,7 +1203,7 @@ fn a_change_that_would_retire_a_directory_with_the_reaper_full_is_busy() {
     ready(&mut core);
     let v = who(0);
     let c = Client { owner: 40, who: &v };
-    let mut rmdir_of = |core: &mut C<'_>, path: &str| {
+    let rmdir_of = |core: &mut C<'_>, path: &str| {
         let req = n::Change {
             op: ChangeOp::Rmdir,
             a: 0,
@@ -1224,6 +1224,351 @@ fn a_change_that_would_retire_a_directory_with_the_reaper_full_is_busy() {
     assert!(node(&core, &format!("/.layers/00/d{}", crate::reaper::REAPS)).is_some());
     while core.reap_step() {}
     rmdir_of(&mut core, &format!("/d{}", crate::reaper::REAPS)).unwrap();
+}
+
+// ---------------------------------------------------------------------- the steps of a change
+
+type J = crate::changejob::ChangeJob<FakeVolume, FakeLower>;
+
+fn lower_calls(core: &C<'_>) -> usize {
+    core.lower.stats + core.lower.opened + core.lower.closed + core.lower.nexts
+}
+
+/// A change run step by step: its result, and the calls each step made (to the volume, to the
+/// lower set).
+fn by_steps(
+    core: &mut C<'_>,
+    uid: u32,
+    op: ChangeOp,
+    a: u64,
+    first: &str,
+    second: &str,
+) -> (Result<(), Status>, Vec<(usize, usize)>) {
+    let v = who(uid);
+    let c = Client {
+        owner: 40 + u64::from(uid),
+        who: &v,
+    };
+    let mut job = J::new();
+    job.start(0, op, a, 0, first.as_bytes(), second.as_bytes())
+        .unwrap();
+    let mut counts = Vec::new();
+    loop {
+        let before = (core.volume.calls.len(), lower_calls(core));
+        let mut w = Writer::new();
+        let step = core.change_step(&c, &mut job, &mut w);
+        counts.push((
+            core.volume.calls.len() - before.0,
+            lower_calls(core) - before.1,
+        ));
+        match step {
+            crate::changejob::ChangeStep::More => {}
+            crate::changejob::ChangeStep::Wait => panic!("the lock is free"),
+            crate::changejob::ChangeStep::Done(r) => {
+                while core.reap_step() {}
+                return (r.map(|_| ()), counts);
+            }
+        }
+        assert!(counts.len() < 5000);
+    }
+}
+
+/// A step makes at most one call to the data file service or to the lower set, a batch of
+/// `LOWER_PER_STEP` calls to the lower set for the listing of an emptiness check, and in the one
+/// step of a rename over a directory two renames.
+fn assert_one_call_a_step(what: &str, counts: &[(usize, usize)], over_directory: bool) {
+    for (k, &(volume, lower)) in counts.iter().enumerate() {
+        let ok = volume + lower <= 1
+            || (volume == 0 && lower <= crate::listing::LOWER_PER_STEP)
+            || (over_directory && volume == 2 && lower == 0);
+        assert!(ok, "{what}: step {k} made {volume} and {lower} calls");
+    }
+}
+
+fn mk_volume() -> FakeVolume {
+    let mut v = volume();
+    v.dir("/.layers/00/mk", 0o755, 0);
+    for k in 0..10 {
+        v.file(&format!("/.layers/00/mk/.wh.m{k}"), 0o644, 0, b"");
+    }
+    v.dir("/.layers/00/empty2", 0o755, 0)
+        .dir("/.layers/00/empty3", 0o755, 0)
+        .file("/.layers/00/etc/other", 0o644, 0, b"o");
+    v
+}
+
+#[test]
+fn every_change_makes_one_call_in_a_step() {
+    let mut world = World::new();
+    let mut core = world.core(mk_volume());
+    ready(&mut core);
+    let runs: &[(&str, ChangeOp, u64, &str, &str, bool)] = &[
+        (
+            "mkdir below a lower directory",
+            ChangeOp::Mkdir,
+            0o755,
+            "/lowdir/sub",
+            "",
+            false,
+        ),
+        (
+            "mkdir three lower directories deep",
+            ChangeOp::Mkdir,
+            0o755,
+            "/deep/a/b/new",
+            "",
+            false,
+        ),
+        (
+            "mkdir over a removed lower one",
+            ChangeOp::Mkdir,
+            0o755,
+            "/gone2",
+            "",
+            false,
+        ),
+        (
+            "symlink",
+            ChangeOp::Symlink,
+            0,
+            "/etc/ln",
+            "own.conf",
+            false,
+        ),
+        (
+            "unlink of a lower name",
+            ChangeOp::Unlink,
+            0,
+            "/bin/ls",
+            "",
+            false,
+        ),
+        (
+            "unlink of a name of the layer",
+            ChangeOp::Unlink,
+            0,
+            "/etc/other",
+            "",
+            false,
+        ),
+        (
+            "rmdir of a lower directory",
+            ChangeOp::Rmdir,
+            0,
+            "/empty",
+            "",
+            false,
+        ),
+        (
+            "rmdir of a directory of marks",
+            ChangeOp::Rmdir,
+            0,
+            "/mk",
+            "",
+            false,
+        ),
+        (
+            "rename of a file",
+            ChangeOp::Rename,
+            0,
+            "/etc/own.conf",
+            "/etc/own2",
+            false,
+        ),
+        (
+            "rename of a file over a file",
+            ChangeOp::Rename,
+            0,
+            "/etc/own2",
+            "/etc/passwd",
+            false,
+        ),
+        (
+            "rename of a directory",
+            ChangeOp::Rename,
+            0,
+            "/empty2",
+            "/shared/moved",
+            false,
+        ),
+        (
+            "rename of a directory over a directory",
+            ChangeOp::Rename,
+            0,
+            "/shared/moved",
+            "/empty3",
+            true,
+        ),
+        (
+            "rename a link over a file",
+            ChangeOp::Rename,
+            0,
+            "/etc/ln",
+            "/etc/passwd",
+            false,
+        ),
+        ("chmod", ChangeOp::Chmod, 0o600, "/etc/passwd", "", false),
+        ("chown", ChangeOp::Chown, 5, "/etc/passwd", "", false),
+        ("utimens", ChangeOp::Utimens, 5, "/etc/passwd", "", false),
+        ("truncate", ChangeOp::Truncate, 2, "/etc/passwd", "", false),
+    ];
+    for &(what, op, a, first, second, over) in runs {
+        let (result, counts) = by_steps(&mut core, 0, op, a, first, second);
+        assert!(
+            result.is_ok() || what.contains("rename a link"),
+            "{what}: {result:?} {counts:?} {:?}",
+            &core.volume.calls[core.volume.calls.len().saturating_sub(14)..]
+        );
+        assert_one_call_a_step(what, &counts, over);
+    }
+}
+
+#[test]
+fn a_deep_copy_up_goes_on_in_many_steps_each_with_one_call() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let (result, counts) = by_steps(&mut core, 0, ChangeOp::Mkdir, 0o755, "/deep/a/b/new", "");
+    assert_eq!(result, Ok(()));
+    // Three lower directories copied up (a stat and five calls each) and the directory itself.
+    assert!(counts.len() >= 3 * 6 + 5, "{}", counts.len());
+    assert_one_call_a_step("copy up", &counts, false);
+    assert!(node(&core, "/.layers/00/deep/a/b/new").is_some());
+}
+
+fn creating_job(core: &C<'_>, id: u8, path: &str) -> J {
+    let _ = core;
+    let mut job = J::new();
+    job.start_create(id, creating(f::READ_WRITE, 0o644), path.as_bytes(), false)
+        .unwrap();
+    job
+}
+
+fn step_job(core: &mut C<'_>, uid: u32, job: &mut J) -> crate::changejob::ChangeStep<Vec<u8>> {
+    let v = who(uid);
+    let c = Client {
+        owner: 40 + u64::from(uid),
+        who: &v,
+    };
+    core.change_step(&c, job, &mut Writer::new())
+}
+
+#[test]
+fn two_creates_of_one_name_take_turns_and_the_second_finds_it_there() {
+    use crate::changejob::ChangeStep;
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let mut first = creating_job(&core, 0, "/etc/new");
+    let mut second = creating_job(&core, 1, "/etc/new");
+    assert!(matches!(
+        step_job(&mut core, 0, &mut first),
+        ChangeStep::More
+    ));
+    assert!(core.change_locked() && first.holds_lock());
+    // The second waits: no step, no call.
+    let calls = core.volume.calls.len();
+    assert!(matches!(
+        step_job(&mut core, 0, &mut second),
+        ChangeStep::Wait
+    ));
+    assert_eq!(core.volume.calls.len(), calls);
+    let done = loop {
+        match step_job(&mut core, 0, &mut first) {
+            ChangeStep::More => {}
+            ChangeStep::Done(r) => break r,
+            ChangeStep::Wait => panic!(),
+        }
+    };
+    assert!(matches!(done, Ok(Done::Pass(_))), "the first made the file");
+    assert!(!core.change_locked());
+    // The second takes its turn and finds the name there.
+    let answer = loop {
+        match step_job(&mut core, 0, &mut second) {
+            ChangeStep::More => {}
+            ChangeStep::Done(r) => break r,
+            ChangeStep::Wait => panic!(),
+        }
+    };
+    assert_eq!(answer.err(), Some(st(f::ALREADY_EXISTS)));
+    assert!(!core.change_locked());
+}
+
+#[test]
+fn a_reader_between_the_steps_of_a_rename_over_a_file_sees_the_old_target_or_the_new() {
+    use crate::changejob::ChangeStep;
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let etc = core.index.lookup(0, b"etc").unwrap().0;
+    let old = core.index.lookup(etc, b"passwd").unwrap().1.number;
+    let new = core.index.lookup(etc, b"own.conf").unwrap().1.number;
+    let mut job = J::new();
+    job.start(0, ChangeOp::Rename, 0, 0, b"/etc/own.conf", b"/etc/passwd")
+        .unwrap();
+    let mut seen = Vec::new();
+    loop {
+        match step_job(&mut core, 0, &mut job) {
+            ChangeStep::More => {}
+            ChangeStep::Done(r) => {
+                r.unwrap();
+                break;
+            }
+            ChangeStep::Wait => panic!(),
+        }
+        // The name of the target is never missing from the index.
+        let number = core.index.lookup(etc, b"passwd").map(|(_, e)| e.number);
+        assert!(number == Some(old) || number == Some(new), "{number:?}");
+        seen.push(number.unwrap());
+    }
+    assert_eq!(seen.first(), Some(&old));
+    assert_eq!(
+        core.index.lookup(etc, b"passwd").map(|(_, e)| e.number),
+        Some(new)
+    );
+    assert!(core.index.lookup(etc, b"own.conf").is_none());
+}
+
+#[test]
+fn a_job_that_made_its_first_call_runs_to_its_end_and_one_that_did_not_lets_the_lock_go() {
+    use crate::changejob::ChangeStep;
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    // Dropped before its first call: the lock goes with it.
+    let mut early = J::new();
+    early
+        .start(0, ChangeOp::Rename, 0, 0, b"/etc/own.conf", b"/etc/own2")
+        .unwrap();
+    assert!(matches!(
+        step_job(&mut core, 0, &mut early),
+        ChangeStep::More
+    ));
+    assert!(core.change_locked() && !early.committed());
+    core.change_abandon(&mut early);
+    assert!(!core.change_locked());
+    assert!(node(&core, "/.layers/00/etc/own.conf").is_some());
+    // Past the plan the job is committed: it goes on to its end whoever asks for the answer, and
+    // the lock is released with the last call.
+    let mut job = J::new();
+    job.start(0, ChangeOp::Mkdir, 0o755, 0, b"/lowdir/sub", b"")
+        .unwrap();
+    while !job.committed() {
+        assert!(matches!(step_job(&mut core, 0, &mut job), ChangeStep::More));
+    }
+    assert!(core.change_locked());
+    loop {
+        match step_job(&mut core, 0, &mut job) {
+            ChangeStep::More => {}
+            ChangeStep::Done(r) => {
+                r.unwrap();
+                break;
+            }
+            ChangeStep::Wait => panic!(),
+        }
+    }
+    assert!(!core.change_locked());
+    assert!(node(&core, "/.layers/00/lowdir/sub").is_some());
 }
 
 // ---------------------------------------------------------------------- rename

@@ -168,6 +168,15 @@ pub struct Hidden {
 }
 
 impl Hidden {
+    pub const fn new() -> Hidden {
+        Hidden {
+            bits: [0; HIDDEN_DEPTH / 64],
+            depth: 0,
+            now: false,
+            started: false,
+        }
+    }
+
     fn push(&mut self) {
         let at = usize::from(self.depth);
         if at < HIDDEN_DEPTH {
