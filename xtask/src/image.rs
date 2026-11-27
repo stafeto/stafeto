@@ -157,7 +157,8 @@ pub fn check_data(size: u64, nm: &str) -> Result<(), String> {
 }
 
 /// Compares the kernel image of `stem`, `len` bytes, built from `elf`, with
-/// the record of `kernel/size.txt` and checks the `.data` of the ELF file.
+/// the record of `kernel/size.txt` and checks the `.data` of the ELF file;
+/// a kernel the record does not name (a test kernel) is not checked.
 /// Fails when the image is more than `SIZE_MARGIN` away from the record or
 /// `.data` is over `DATA_LIMIT`; with `enforce` false (a build with a trace
 /// feature, whose size the record does not describe) it prints the same
@@ -168,10 +169,13 @@ pub fn report(stem: &str, len: u64, elf: &Path, enforce: bool) -> Result<(), Str
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let record = parse_record(&text)?;
     let mut verdicts = Vec::new();
-    if let Some((line, verdict)) = compare(&record, stem, len) {
-        println!("{line}");
-        verdicts.push(verdict);
-    }
+    // Only a kernel the record names is held: the test kernels carry fixtures
+    // in .data on purpose and have no size to keep.
+    let Some((line, verdict)) = compare(&record, stem, len) else {
+        return Ok(());
+    };
+    println!("{line}");
+    verdicts.push(verdict);
     let bytes = std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?;
     let data =
         data_size(&bytes).ok_or_else(|| format!("{}: not a 64-bit ELF file", elf.display()))?;
