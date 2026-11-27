@@ -827,10 +827,7 @@ mod tests {
         assert_eq!(Header::read(&mut r), Ok(NameMethod::Open.header()));
         assert_eq!(read_open(r), Ok((flags, &b"/etc/new"[..])));
         // The mode bits without CREATE, and bit 28 with it, are refused.
-        for bad in [
-            with_permissions(crate::READ_WRITE, 0o640),
-            flags | 1 << 28,
-        ] {
+        for bad in [with_permissions(crate::READ_WRITE, 0o640), flags | 1 << 28] {
             let mut w = Writer::new();
             w.u32(bad).unwrap();
             w.bytes(b"/x").unwrap();
@@ -841,7 +838,10 @@ mod tests {
             );
         }
         assert_eq!(permissions_of(crate::READ_WRITE | crate::CREATE), 0);
-        assert!(!open_writes(with_permissions(crate::READ_ONLY | crate::CREATE, 0o644)));
+        assert!(!open_writes(with_permissions(
+            crate::READ_ONLY | crate::CREATE,
+            0o644
+        )));
         assert!(open_writes(flags));
     }
 

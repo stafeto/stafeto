@@ -202,24 +202,6 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         }
     }
 
-    /// Whether the lower set shows through the directory `id` of the layer: no directory of it,
-    /// and none above, is opaque.
-    fn lower_visible(&self, id: u32) -> bool {
-        let mut at = id;
-        loop {
-            if self.index.flags(at) & OPAQUE != 0 {
-                return false;
-            }
-            if at == 0 {
-                return true;
-            }
-            if self.index.entry(at).is_none() {
-                return false;
-            }
-            at = self.index.parent_of(at);
-        }
-    }
-
     /// The path of the name `name` in the directory `parent` of the layer on the volume; a link
     /// is the file that holds it. NAME_TOO_LONG past the volume's limit.
     fn child_path(&self, parent: u32, name: &[u8], link: bool) -> R<([u8; 512], usize)> {
@@ -397,14 +379,14 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 Ok(Parent {
                     up: Some(id),
                     attr,
-                    visible: self.lower_visible(id),
+                    visible: self.index.lower_visible(id),
                     deepest: id,
                     miss: 0,
                 })
             }
             Outcome::Lower => {
                 let (cur, start) = walk.missed();
-                if !self.lower_visible(cur) {
+                if !self.index.lower_visible(cur) {
                     return fail(proto_fs::NO_ENTRY);
                 }
                 let mut pos = start;
@@ -490,7 +472,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         Ok(match (hidden, seen) {
             (true, s) => Leaf::Missing {
                 hidden: true,
-                lower_dir: s.is_some_and(|s| s.kind == 1),
+                lower_dir: s.is_some_and(|s| s.kind == 1 || s.kind == 5),
             },
             (false, Some(s)) => Leaf::Lower(s),
             (false, None) => Leaf::Missing {

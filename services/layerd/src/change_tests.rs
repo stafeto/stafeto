@@ -77,6 +77,8 @@ fn lower() -> FakeLower {
         .dir("/shared", 60)
         .dir("/opq", 70)
         .file("/opq/l1", 71)
+        .dir("/opq/sub", 72)
+        .file("/opq/sub/lx", 73)
         .link("/lowlink", 80)
         .file("/rootonly", 81)
         .attr("/rootonly", 0o600, 0, 0);
@@ -849,6 +851,30 @@ fn a_directory_over_a_removed_lower_one_is_opaque() {
     unlink(&mut core, 0, "/etc/hostname").unwrap();
     mkdir(&mut core, 0, "/etc/hostname", 0o755).unwrap();
     assert!(node(&core, "/.layers/00/etc/hostname/.wh..wh..opq").is_none());
+}
+
+#[test]
+fn a_directory_made_below_an_opaque_one_has_none_of_the_lower_names() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    // /opq is opaque and the lower set has /opq/sub with a name in it: the new directory is a new
+    // one, whatever the lower set has under the same path.
+    mkdir(&mut core, 0, "/opq/sub", 0o755).unwrap();
+    assert!(node(&core, "/.layers/00/opq/sub/.wh..wh..opq").is_none());
+    assert!(listing(&mut core, "/opq/sub").is_empty());
+    assert_eq!(
+        open(&mut core, 0, f::READ_ONLY, "/opq/sub/lx").err(),
+        Some(st(f::NO_ENTRY))
+    );
+    open(&mut core, 0, creating(f::WRITE_ONLY, 0o600), "/opq/sub/new").unwrap();
+    assert_eq!(listing(&mut core, "/opq/sub"), ["new"]);
+    // A lower link to a directory that the layer deleted and a directory made over it: opaque, so
+    // the directory the link names does not show through.
+    unlink(&mut core, 0, "/lowlink").unwrap();
+    assert!(node(&core, "/.layers/00/.wh.lowlink").is_some());
+    mkdir(&mut core, 0, "/lowlink", 0o755).unwrap();
+    assert!(node(&core, "/.layers/00/lowlink/.wh..wh..opq").is_some());
 }
 
 // ---------------------------------------------------------------------- rename

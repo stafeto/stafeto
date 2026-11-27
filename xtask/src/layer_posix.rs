@@ -750,7 +750,11 @@ mod tests {
         );
         // The breaks of the write probe name a check of its phase.
         for (feature, reread, check) in WRITE_BREAKS {
-            let checks: &[&str] = if reread { &REREAD_CHECKS } else { &WRITE_CHECKS };
+            let checks: &[&str] = if reread {
+                &REREAD_CHECKS
+            } else {
+                &WRITE_CHECKS
+            };
             assert!(checks.contains(&check), "{feature}");
             assert!(feature.starts_with("break-layerd-"));
         }

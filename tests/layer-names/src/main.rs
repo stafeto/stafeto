@@ -456,7 +456,9 @@ extern "C" fn main(
         "a stat of a lower name is a redirect",
         if stat_redirect_is(&names, "/lower/keep", "/lower/keep")
             && stat_redirect_is(&names, "/bin", "/bin")
-            && stat_redirect_is(&names, "/bin/../lower/keep", "/lower/keep")
+            // A `..` after the first lower name is the RAM file service's to answer: the path
+            // goes whole.
+            && stat_redirect_is(&names, "/bin/../lower/keep", "/bin/../lower/keep")
         {
             Ok(())
         } else {
@@ -514,18 +516,19 @@ extern "C" fn main(
             Err(format_args!("a deleted name opens or stats"))
         }
     });
-    // `..` is resolved before the walk: a path through a lower name meets the marks and the
-    // shadows of the layer all the same, and a redirect carries the path plain.
-    t.check("a dot dot is resolved before the walk", {
-        let hidden = open(&names, proto_fs::READ_ONLY, "/bin/../etc/layer-hidden");
-        let below = open(&names, proto_fs::READ_ONLY, "/tmp/../lowdir/l1");
+    // A `..` through a directory of the layer is exact in the index, so the marks and the shadows
+    // of the layer are met; after the first lower name the path goes whole to the RAM file service,
+    // which answers a `..` with a redirect that routes by the path.
+    t.check("a dot dot in the index and after a lower name", {
+        let hidden = open(&names, proto_fs::READ_ONLY, "/etc/../etc/layer-hidden");
+        let below = open(&names, proto_fs::READ_ONLY, "/lowdir/../lowdir/l1");
         let kept = open(&names, proto_fs::READ_ONLY, "/bin/../lower/./keep");
         if !status_is(&hidden, proto_fs::NO_ENTRY) || !status_is(&below, proto_fs::NO_ENTRY) {
             Err(format_args!("a deleted name opens through a dot dot"))
-        } else if !redirect_is(&kept, "/lower/keep") {
-            Err(format_args!("the redirect does not carry the plain path"))
+        } else if !redirect_is(&kept, "/bin/../lower/keep") {
+            Err(format_args!("the redirect does not carry the path whole"))
         } else {
-            expect_bytes(&data, &names, "/bin/../lower/shadowed", b"upper shadow\n")
+            expect_bytes(&data, &names, "/lower/../lower/shadowed", b"upper shadow\n")
         }
     });
     t.check(
@@ -592,33 +595,45 @@ extern "C" fn main(
             _ => Err(format_args!("no description")),
         },
     );
-    // Nothing is written: a write open, a create and CHANGE are a read-only file system, WAIT is no
-    // method of this part.
-    t.check("read only", {
-        let w1 = open(&names, proto_fs::WRITE_ONLY, "/etc/layer-note");
-        let w2 = open(&names, proto_fs::READ_ONLY | proto_fs::CREATE, "/newfile");
-        let mut w = Writer::new();
-        let change = n::Change {
-            op: n::ChangeOp::Mkdir,
-            a: 0o755,
-            b: 0,
-            first: b"/newdir",
-            second: b"",
+    // The lower set is not written: a write open, a create over a lower name and the changes of a
+    // lower name are a read-only file system (or the lower name does not move), the volume has no
+    // hard links, and WAIT is no method of this part.
+    t.check("the lower set is not written", {
+        let w1 = open(&names, proto_fs::WRITE_ONLY, "/lower/keep");
+        let w2 = open(
+            &names,
+            proto_fs::WRITE_ONLY | proto_fs::CREATE,
+            "/lower/keep",
+        );
+        let change = |op: n::ChangeOp, first: &[u8], second: &[u8]| {
+            let mut w = Writer::new();
+            let request = n::Change {
+                op,
+                a: 0o755,
+                b: 0,
+                first,
+                second,
+            };
+            let _ = request.write(&mut w);
+            call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status())
         };
-        let _ = change.write(&mut w);
-        let c = call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status());
+        let chmod = change(n::ChangeOp::Chmod, b"/lower/keep", b"");
+        let rename = change(n::ChangeOp::Rename, b"/lower/keep", b"/lower/moved");
+        let link = change(n::ChangeOp::Link, b"/lower/keep", b"/lower/hard");
         let mut w = Writer::new();
         let _ = n::write_wait(1, &mut w);
         let wait = call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status());
         if status_is(&w1, proto_fs::READ_ONLY_FILESYSTEM)
             && status_is(&w2, proto_fs::READ_ONLY_FILESYSTEM)
-            && c == Some(proto_fs::READ_ONLY_FILESYSTEM)
+            && chmod == Some(proto_fs::READ_ONLY_FILESYSTEM)
+            && rename == Some(proto_fs::CROSS_DEVICE)
+            && link == Some(proto_fs::TOO_MANY_LINKS)
             && wait == Some(proto_wire::UNKNOWN_METHOD)
         {
             Ok(())
         } else {
             Err(format_args!(
-                "a change was not refused with EROFS, or WAIT is served"
+                "a lower name was written, or moved, or WAIT is served"
             ))
         }
     });
@@ -664,7 +679,7 @@ extern "C" fn main(
         t.check(shown, {
             let a = open(s, proto_fs::READ_ONLY, "/private/f");
             let b = open(s, proto_fs::READ_ONLY, "/private/lower");
-            let dots = open(s, proto_fs::READ_ONLY, "/bin/../private/lower");
+            let dots = open(s, proto_fs::READ_ONLY, "/etc/../private/lower");
             let c = open(
                 s,
                 proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY,

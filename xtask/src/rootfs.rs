@@ -2225,7 +2225,12 @@ fn layer_posix_lower(programs: bool) -> Vec<RootFile> {
         // meets through the merged view (the RAM file service of a layered image answers the
         // expansion of a link with a redirect that routes by the path).
         let link = |path: &'static str, target: &'static str| {
-            of(path, bootimg::rootfs::SYMLINK_MODE, ROOT, Source::Link(target))
+            of(
+                path,
+                bootimg::rootfs::SYMLINK_MODE,
+                ROOT,
+                Source::Link(target),
+            )
         };
         let at = files
             .iter()

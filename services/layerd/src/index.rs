@@ -543,6 +543,26 @@ impl Index {
         }
     }
 
+    /// Whether the lower set shows through the directory `id` (0 is the root): no directory from it
+    /// up to the root is opaque. A directory made below an opaque one has none of the lower names
+    /// either.
+    pub fn lower_visible(&self, id: u32) -> bool {
+        let mut at = id;
+        for _ in 0..=SLOTS {
+            if self.flags(at) & OPAQUE != 0 {
+                return false;
+            }
+            if at == 0 {
+                return true;
+            }
+            if self.entry(at).is_none() {
+                return false;
+            }
+            at = self.parent_of(at);
+        }
+        false
+    }
+
     /// The owner, group and mode of a directory of the layer, the root included.
     pub fn attr(&self, id: u32) -> Option<posix_perm::Attr> {
         let (uid, gid, mode) = if id == 0 {

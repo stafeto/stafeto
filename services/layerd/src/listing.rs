@@ -18,7 +18,7 @@
 //! that asks again reaches the end.
 
 use crate::descriptions::Position;
-use crate::index::{Index, Kind, NextChild, OPAQUE};
+use crate::index::{Index, Kind, NextChild};
 use crate::volume::{Lower, R};
 use proto_fs::names::{DirEntry, DirReply, ENTRY_HEAD, LOWER_PER_READDIR, NAME_MAX, cursor};
 use proto_wire::Status;
@@ -123,7 +123,7 @@ pub fn read_dir<L: Lower>(
         }
     }
     // Stage 1: the lower set, unless the directory is opaque.
-    if index.flags(dir) & OPAQUE != 0 {
+    if !index.lower_visible(dir) {
         return Ok(listed(position, false));
     }
     if open.is_none() {

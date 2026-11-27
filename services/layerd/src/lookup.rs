@@ -33,7 +33,7 @@
 //! after the redirect, and a path is open when both pass (a directory the layer of the user opened
 //! with `chmod` wider than its lower one stays closed, section 4 of the decision).
 
-use crate::index::{Index, Kind, OPAQUE};
+use crate::index::{Index, Kind};
 use posix_perm::{EXEC, Identity, permits};
 
 /// The components one step of the walk takes: a measure of its work.
@@ -199,7 +199,7 @@ impl<'p> Walk<'p> {
                 }
                 Some((id, e)) if e.kind == Kind::Dir => self.cur = id,
                 Some(_) => return Step::Done(Outcome::NotDir),
-                None if index.flags(self.cur) & OPAQUE != 0 => return Step::Done(Outcome::Absent),
+                None if !index.lower_visible(self.cur) => return Step::Done(Outcome::Absent),
                 None => {
                     self.miss = (self.cur, start);
                     return Step::Done(Outcome::Lower);
@@ -224,7 +224,7 @@ impl<'p> Walk<'p> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::Fields;
+    use crate::index::{Fields, OPAQUE};
     use std::boxed::Box;
 
     fn who(uid: u32) -> Identity<'static> {

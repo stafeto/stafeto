@@ -58,6 +58,10 @@
 //! * Waits. The retries sleep with a timed wait (`threads::sleep::pause`); the session is taken
 //!   under a lock held for one round trip at a time, never across a sleep.
 
+// The loop of a path (`run`) carries the next path in its error: a path is 512 bytes on the stack
+// of the one call, and the layer has no heap to box it in.
+#![allow(clippy::result_large_err)]
+
 use crate::constants::*;
 use core::cell::UnsafeCell;
 use core::ffi::c_int;
@@ -523,7 +527,9 @@ enum Answered {
     Redirect { target: u32, path: Abs },
 }
 
-/// Why an attempt on a path did not end the call.
+/// Why an attempt on a path did not end the call. The layer has no heap to box the path in, and the
+/// value lives for one step of a loop.
+#[allow(clippy::large_enum_variant)]
 enum Next {
     /// The errno of the failure.
     Errno(i32),
@@ -848,7 +854,8 @@ pub fn check_exec(abs: &Abs) -> Result<Abs, i32> {
 
 // ---------------------------------------------------------------- changes
 
-/// What a change of a path of the root came to.
+/// What a change of a path of the root came to. The path lives on the stack of the one call.
+#[allow(clippy::large_enum_variant)]
 pub enum Changed {
     Done,
     /// A link led the path out of the layered root: the call goes on at the service that owns
@@ -1027,10 +1034,8 @@ pub fn attributes(
     // The last name is looked through when the call follows links: the path of its target.
     let target = if follow {
         let mut resolved = [0u8; WIDE];
-        match realpath(abs, &mut resolved) {
-            Ok(len) => Abs::from(&resolved[..len], false).ok_or(ENAMETOOLONG)?,
-            Err(error) => return Err(error),
-        }
+        let len = realpath(abs, &mut resolved)?;
+        Abs::from(&resolved[..len], false).ok_or(ENAMETOOLONG)?
     } else {
         abs.clone()
     };
@@ -1041,6 +1046,7 @@ pub fn attributes(
 
 /// What an attempt to open a path came to: a descriptor of another service (the RAM file service,
 /// the data file service), or the reply of the layer service and the path it was given.
+#[allow(clippy::large_enum_variant)]
 enum Opened {
     Fd(c_int),
     Reply(Got, Abs),
