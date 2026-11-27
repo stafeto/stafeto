@@ -44,6 +44,8 @@ mod tests_perm;
 #[cfg(test)]
 mod tests_scale;
 #[cfg(test)]
+mod tests_tail;
+#[cfg(test)]
 mod tests_window;
 pub mod volume;
 pub mod vouching;

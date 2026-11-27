@@ -1,5 +1,5 @@
 diff --git a/third-party/littlefs/lfs.c b/third-party/littlefs/lfs.c
-index c83c7e0..dd5a849 100644
+index c83c7e0..5e802e3 100644
 --- a/third-party/littlefs/lfs.c
 +++ b/third-party/littlefs/lfs.c
 @@ -186,7 +186,16 @@ static int lfs_bd_flush(lfs_t *lfs,
@@ -20,7 +20,17 @@ index c83c7e0..dd5a849 100644
              // check data on disk
              lfs_cache_drop(lfs, rcache);
              int res = lfs_bd_cmp(lfs,
-@@ -1481,8 +1490,78 @@ static int lfs_dir_find_match(void *data,
+@@ -568,6 +577,9 @@ static lfs_ssize_t lfs_file_write_(lfs_t *lfs, lfs_file_t *file,
+ static int lfs_file_sync_(lfs_t *lfs, lfs_file_t *file);
+ static int lfs_file_outline(lfs_t *lfs, lfs_file_t *file);
+ static int lfs_file_flush(lfs_t *lfs, lfs_file_t *file);
++static int lfs_file_flush_blocks(lfs_t *lfs, lfs_file_t *file,
++        lfs_size_t blocks);
++static int lfs_file_finish_flush(lfs_t *lfs, lfs_file_t *file);
+ 
+ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss);
+ static int lfs_fs_preporphans(lfs_t *lfs, int8_t orphans);
+@@ -1481,8 +1493,78 @@ static int lfs_dir_find_match(void *data,
  // - 0                  if file is found
  // - LFS_ERR_NOENT      if file or parent is not found
  // - LFS_ERR_NOTDIR     if parent is not a dir
@@ -101,7 +111,7 @@ index c83c7e0..dd5a849 100644
      // we reduce path to a single name if we can find it
      const char *name = *path;
  
-@@ -1496,6 +1575,13 @@ static lfs_stag_t lfs_dir_find(lfs_t *lfs, lfs_mdir_t *dir,
+@@ -1496,6 +1578,13 @@ static lfs_stag_t lfs_dir_find(lfs_t *lfs, lfs_mdir_t *dir,
          return LFS_ERR_INVAL;
      }
  
@@ -115,7 +125,7 @@ index c83c7e0..dd5a849 100644
      while (true) {
  nextname:
          // skip slashes if we're a directory
-@@ -1585,11 +1671,24 @@ nextname:
+@@ -1585,11 +1674,24 @@ nextname:
              }
          }
  
@@ -140,7 +150,7 @@ index c83c7e0..dd5a849 100644
  // commit logic
  struct lfs_commit {
      lfs_block_t block;
-@@ -2815,6 +2914,33 @@ static int lfs_dir_read_(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
+@@ -2815,6 +2917,33 @@ static int lfs_dir_read_(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
      return true;
  }
  
@@ -174,7 +184,7 @@ index c83c7e0..dd5a849 100644
  static int lfs_dir_seek_(lfs_t *lfs, lfs_dir_t *dir, lfs_off_t off) {
      // simply walk from head dir
      int err = lfs_dir_rewind_(lfs, dir);
-@@ -2918,6 +3044,104 @@ static int lfs_ctz_find(lfs_t *lfs,
+@@ -2918,6 +3047,104 @@ static int lfs_ctz_find(lfs_t *lfs,
      return 0;
  }
  
@@ -279,7 +289,7 @@ index c83c7e0..dd5a849 100644
  #ifndef LFS_READONLY
  static int lfs_ctz_extend(lfs_t *lfs,
          lfs_cache_t *pcache, lfs_cache_t *rcache,
-@@ -3085,6 +3309,9 @@ static int lfs_file_opencfg_(lfs_t *lfs, lfs_file_t *file,
+@@ -3085,6 +3312,9 @@ static int lfs_file_opencfg_(lfs_t *lfs, lfs_file_t *file,
      file->pos = 0;
      file->off = 0;
      file->cache.buffer = NULL;
@@ -289,15 +299,113 @@ index c83c7e0..dd5a849 100644
  
      // allocate entry for file if it doesn't exist
      lfs_stag_t tag = lfs_dir_find(lfs, &file->m, &path, &file->id);
-@@ -3418,6 +3645,7 @@ relocate:
+@@ -3350,7 +3580,21 @@ static int lfs_file_outline(lfs_t *lfs, lfs_file_t *file) {
+ }
+ #endif
+ 
++// stafeto: the flush copies the tail of a rewritten file, which is as long as
++// the file past the last byte written. With blocks > 0 it copies that many
++// blocks and returns 1 when more is left, with the file in LFS_F_FLUSHING:
++// pos is the part copied, flush_pos the position of the file. Everything the
++// copy needs is in the file (the old list is file->ctz, its read position is
++// file->pos, the read cache is dropped between calls), so the next call goes
++// on from there. The blocks of the part copied are those of the file's own
++// walk of the allocator (LFS_F_WRITING), and those of the old list are
++// protected as they were before (the entry of the directory, or LFS_F_DIRTY).
+ static int lfs_file_flush(lfs_t *lfs, lfs_file_t *file) {
++    return lfs_file_flush_blocks(lfs, file, 0);
++}
++
++static int lfs_file_flush_blocks(lfs_t *lfs, lfs_file_t *file,
++        lfs_size_t blocks) {
+     if (file->flags & LFS_F_READING) {
+         if (!(file->flags & LFS_F_INLINE)) {
+             lfs_cache_drop(lfs, &file->cache);
+@@ -3360,7 +3604,8 @@ static int lfs_file_flush(lfs_t *lfs, lfs_file_t *file) {
+ 
+ #ifndef LFS_READONLY
+     if (file->flags & LFS_F_WRITING) {
+-        lfs_off_t pos = file->pos;
++        lfs_off_t pos = (file->flags & LFS_F_FLUSHING)
++                ? file->flush_pos : file->pos;
+ 
+         if (!(file->flags & LFS_F_INLINE)) {
+             // copy over anything after current branch
+@@ -3372,8 +3617,25 @@ static int lfs_file_flush(lfs_t *lfs, lfs_file_t *file) {
+                 .cache = lfs->rcache,
+             };
+             lfs_cache_drop(lfs, &lfs->rcache);
++            lfs_size_t copied = 0;
++            lfs_size_t limit = 0;
++            if (blocks > 0) {
++                // the position of the file is kept from here on, so that an
++                // error inside the step leaves the file as a step that ended
++                file->flush_pos = pos;
++                file->flags |= LFS_F_FLUSHING;
++                limit = (blocks > lfs->file_max / lfs->cfg->block_size)
++                        ? lfs->file_max : blocks * lfs->cfg->block_size;
++            }
+ 
+             while (file->pos < file->ctz.size) {
++                if (blocks > 0 && copied >= limit) {
++                    // this step is over: leave the file where it is
++                    lfs_cache_drop(lfs, &lfs->rcache);
++                    return 1;
++                }
++                copied += 1;
++
+                 // copy over a byte at a time, leave it up to caching
+                 // to make this efficient
+                 uint8_t data;
+@@ -3418,9 +3680,10 @@ relocate:
          }
  
          // actual file updates
 +        lfs_ctz_hints_drop(file);
          file->ctz.head = file->block;
          file->ctz.size = file->pos;
-         file->flags &= ~LFS_F_WRITING;
-@@ -3515,8 +3743,7 @@ static lfs_ssize_t lfs_file_flushedread(lfs_t *lfs, lfs_file_t *file,
+-        file->flags &= ~LFS_F_WRITING;
++        file->flags &= ~LFS_F_WRITING & ~LFS_F_FLUSHING;
+         file->flags |= LFS_F_DIRTY;
+ 
+         file->pos = pos;
+@@ -3430,6 +3693,35 @@ relocate:
+     return 0;
+ }
+ 
++// stafeto: finishes a flush that a step left half done, for the calls that
++// read or move the position of the file
++static int lfs_file_finish_flush(lfs_t *lfs, lfs_file_t *file) {
++#ifndef LFS_READONLY
++    if (file->flags & LFS_F_FLUSHING) {
++        return lfs_file_flush(lfs, file);
++    }
++#endif
++    (void)lfs;
++    (void)file;
++    return 0;
++}
++
++#ifndef LFS_READONLY
++static lfs_ssize_t lfs_file_tail_(lfs_t *lfs, lfs_file_t *file) {
++    (void)lfs;
++    if ((file->flags & LFS_F_WRITING) && !(file->flags & LFS_F_INLINE)
++            && file->pos < file->ctz.size) {
++        return file->ctz.size - file->pos;
++    }
++    return 0;
++}
++
++static int lfs_file_flush_step_(lfs_t *lfs, lfs_file_t *file,
++        lfs_size_t blocks) {
++    return lfs_file_flush_blocks(lfs, file, blocks > 0 ? blocks : 1);
++}
++#endif
++
+ #ifndef LFS_READONLY
+ static int lfs_file_sync_(lfs_t *lfs, lfs_file_t *file) {
+     int err = lfs_file_flush(lfs, file);
+@@ -3515,8 +3807,7 @@ static lfs_ssize_t lfs_file_flushedread(lfs_t *lfs, lfs_file_t *file,
          if (!(file->flags & LFS_F_READING) ||
                  file->off == lfs->cfg->block_size) {
              if (!(file->flags & LFS_F_INLINE)) {
@@ -307,17 +415,46 @@ index c83c7e0..dd5a849 100644
                          file->pos, &file->block, &file->off);
                  if (err) {
                      return err;
-@@ -3665,6 +3892,9 @@ static lfs_ssize_t lfs_file_write_(lfs_t *lfs, lfs_file_t *file,
+@@ -3665,6 +3956,15 @@ static lfs_ssize_t lfs_file_write_(lfs_t *lfs, lfs_file_t *file,
          const void *buffer, lfs_size_t size) {
      LFS_ASSERT((file->flags & LFS_O_WRONLY) == LFS_O_WRONLY);
  
++    // a flush that is half done ends first: pos is not the file's yet
++    int ferr = lfs_file_finish_flush(lfs, file);
++    if (ferr) {
++        return ferr;
++    }
++
 +    // the list the wayposts name is about to change
 +    lfs_ctz_hints_drop(file);
 +
      if (file->flags & LFS_F_READING) {
          // drop any reads
          int err = lfs_file_flush(lfs, file);
-@@ -3765,6 +3995,9 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
+@@ -3707,6 +4007,12 @@ static lfs_ssize_t lfs_file_write_(lfs_t *lfs, lfs_file_t *file,
+ 
+ static lfs_soff_t lfs_file_seek_(lfs_t *lfs, lfs_file_t *file,
+         lfs_soff_t off, int whence) {
++    // a flush that is half done ends first: pos is not the file's yet
++    int ferr = lfs_file_finish_flush(lfs, file);
++    if (ferr) {
++        return ferr;
++    }
++
+     // find new pos
+     //
+     // fortunately for us, littlefs is limited to 31-bit file sizes, so we
+@@ -3761,10 +4067,19 @@ static lfs_soff_t lfs_file_seek_(lfs_t *lfs, lfs_file_t *file,
+ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
+     LFS_ASSERT((file->flags & LFS_O_WRONLY) == LFS_O_WRONLY);
+ 
++    // a flush that is half done ends first: pos is not the file's yet
++    int ferr = lfs_file_finish_flush(lfs, file);
++    if (ferr) {
++        return ferr;
++    }
++
+     if (size > LFS_FILE_MAX) {
          return LFS_ERR_INVAL;
      }
  
@@ -327,7 +464,7 @@ index c83c7e0..dd5a849 100644
      lfs_off_t pos = file->pos;
      lfs_off_t oldsize = lfs_file_size_(lfs, file);
      if (size < oldsize) {
-@@ -3784,6 +4017,7 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
+@@ -3784,6 +4099,7 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
                  return (int)res;
              }
  
@@ -335,7 +472,7 @@ index c83c7e0..dd5a849 100644
              file->ctz.head = LFS_BLOCK_INLINE;
              file->ctz.size = size;
              file->flags |= LFS_F_DIRTY | LFS_F_READING | LFS_F_INLINE;
-@@ -3810,6 +4044,7 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
+@@ -3810,6 +4126,7 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
              // need to set pos/block/off consistently so seeking back to
              // the old position does not get confused
              file->pos = size;
@@ -343,7 +480,19 @@ index c83c7e0..dd5a849 100644
              file->ctz.head = file->block;
              file->ctz.size = size;
              file->flags |= LFS_F_DIRTY | LFS_F_READING;
-@@ -3884,6 +4119,73 @@ static int lfs_stat_(lfs_t *lfs, const char *path, struct lfs_info *info) {
+@@ -3842,6 +4159,11 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
+ 
+ static lfs_soff_t lfs_file_tell_(lfs_t *lfs, lfs_file_t *file) {
+     (void)lfs;
++#ifndef LFS_READONLY
++    if (file->flags & LFS_F_FLUSHING) {
++        return file->flush_pos;
++    }
++#endif
+     return file->pos;
+ }
+ 
+@@ -3884,6 +4206,73 @@ static int lfs_stat_(lfs_t *lfs, const char *path, struct lfs_info *info) {
      return lfs_dir_getinfo(lfs, &cwd, lfs_tag_id(tag), info);
  }
  
@@ -417,7 +566,7 @@ index c83c7e0..dd5a849 100644
  #ifndef LFS_READONLY
  static int lfs_remove_(lfs_t *lfs, const char *path) {
      // deorphan if we haven't yet, needed at most once after poweron
-@@ -4894,6 +5196,200 @@ static lfs_stag_t lfs_fs_parent(lfs_t *lfs, const lfs_block_t pair[2],
+@@ -4894,6 +5283,200 @@ static lfs_stag_t lfs_fs_parent(lfs_t *lfs, const lfs_block_t pair[2],
  }
  #endif
  
@@ -618,7 +767,7 @@ index c83c7e0..dd5a849 100644
  static void lfs_fs_prepsuperblock(lfs_t *lfs, bool needssuperblock) {
      lfs->gstate.tag = (lfs->gstate.tag & ~LFS_MKTAG(0, 0, 0x200))
              | (uint32_t)needssuperblock << 9;
-@@ -5010,6 +5506,13 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
+@@ -5010,6 +5593,13 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
      // references to full-orphans, effectively hiding them from the deorphan
      // search.
      //
@@ -632,7 +781,7 @@ index c83c7e0..dd5a849 100644
      int pass = 0;
      while (pass < 2) {
          // Fix any orphans
-@@ -5028,7 +5531,8 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
+@@ -5028,7 +5618,8 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
              if (!pdir.split) {
                  // check if we have a parent
                  lfs_mdir_t parent;
@@ -642,7 +791,7 @@ index c83c7e0..dd5a849 100644
                  if (tag < 0 && tag != LFS_ERR_NOENT) {
                      return tag;
                  }
-@@ -5071,6 +5575,7 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
+@@ -5071,6 +5662,7 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
                          if (state < 0) {
                              return state;
                          }
@@ -650,7 +799,7 @@ index c83c7e0..dd5a849 100644
  
                          // did our commit create more orphans?
                          if (state == LFS_OK_ORPHANED) {
-@@ -5105,6 +5610,7 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
+@@ -5105,6 +5697,7 @@ static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss) {
                      if (state < 0) {
                          return state;
                      }
@@ -658,7 +807,7 @@ index c83c7e0..dd5a849 100644
  
                      // did our commit create more orphans?
                      if (state == LFS_OK_ORPHANED) {
-@@ -5195,6 +5701,48 @@ static lfs_ssize_t lfs_fs_size_(lfs_t *lfs) {
+@@ -5195,6 +5788,48 @@ static lfs_ssize_t lfs_fs_size_(lfs_t *lfs) {
      return size;
  }
  
@@ -707,7 +856,7 @@ index c83c7e0..dd5a849 100644
  // explicit garbage collection
  #ifndef LFS_READONLY
  static int lfs_fs_gc_(lfs_t *lfs) {
-@@ -6096,6 +6644,42 @@ int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info) {
+@@ -6096,6 +6731,42 @@ int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info) {
      return err;
  }
  
@@ -750,7 +899,50 @@ index c83c7e0..dd5a849 100644
  lfs_ssize_t lfs_getattr(lfs_t *lfs, const char *path,
          uint8_t type, void *buffer, lfs_size_t size) {
      int err = LFS_LOCK(lfs->cfg);
-@@ -6391,6 +6975,23 @@ int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
+@@ -6216,6 +6887,42 @@ int lfs_file_sync(lfs_t *lfs, lfs_file_t *file) {
+ }
+ #endif
+ 
++#ifndef LFS_READONLY
++lfs_ssize_t lfs_file_tail(lfs_t *lfs, lfs_file_t *file) {
++    int err = LFS_LOCK(lfs->cfg);
++    if (err) {
++        return err;
++    }
++    LFS_TRACE("lfs_file_tail(%p, %p)", (void*)lfs, (void*)file);
++    LFS_ASSERT(lfs_mlist_isopen(lfs->mlist, (struct lfs_mlist*)file));
++
++    lfs_ssize_t res = lfs_file_tail_(lfs, file);
++
++    LFS_TRACE("lfs_file_tail -> %"PRId32, res);
++    LFS_UNLOCK(lfs->cfg);
++    return res;
++}
++
++int lfs_file_flush_step(lfs_t *lfs, lfs_file_t *file, lfs_size_t blocks) {
++    int err = LFS_LOCK(lfs->cfg);
++    if (err) {
++        return err;
++    }
++    LFS_TRACE("lfs_file_flush_step(%p, %p, %"PRIu32")",
++            (void*)lfs, (void*)file, blocks);
++    LFS_ASSERT(lfs_mlist_isopen(lfs->mlist, (struct lfs_mlist*)file));
++
++    err = lfs_file_flush_step_(lfs, file, blocks);
++    if (err < 0) {
++        file->flags |= LFS_F_ERRED;
++    }
++
++    LFS_TRACE("lfs_file_flush_step -> %d", err);
++    LFS_UNLOCK(lfs->cfg);
++    return err;
++}
++#endif
++
+ lfs_ssize_t lfs_file_read(lfs_t *lfs, lfs_file_t *file,
+         void *buffer, lfs_size_t size) {
+     int err = LFS_LOCK(lfs->cfg);
+@@ -6391,6 +7098,23 @@ int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info) {
      return err;
  }
  
@@ -774,7 +966,7 @@ index c83c7e0..dd5a849 100644
  int lfs_dir_seek(lfs_t *lfs, lfs_dir_t *dir, lfs_off_t off) {
      int err = LFS_LOCK(lfs->cfg);
      if (err) {
-@@ -6462,6 +7063,20 @@ lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
+@@ -6462,6 +7186,20 @@ lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
      return res;
  }
  
@@ -796,10 +988,19 @@ index c83c7e0..dd5a849 100644
      int err = LFS_LOCK(lfs->cfg);
      if (err) {
 diff --git a/third-party/littlefs/lfs.h b/third-party/littlefs/lfs.h
-index 8fbd5b4..79fcf12 100644
+index 8fbd5b4..49da402 100644
 --- a/third-party/littlefs/lfs.h
 +++ b/third-party/littlefs/lfs.h
-@@ -291,6 +291,35 @@ struct lfs_config {
+@@ -142,6 +142,8 @@ enum lfs_open_flags {
+     LFS_F_READING = 0x00080000, // File has been read since last flush
+ #ifndef LFS_READONLY
+     LFS_F_ERRED   = 0x00100000, // An error occurred during write
++    // stafeto: the copy of the tail of a rewrite has begun and is not done
++    LFS_F_FLUSHING = 0x00200000,
+ #endif
+     LFS_F_INLINE  = 0x01000000, // Currently inlined in directory entry
+ };
+@@ -291,6 +293,35 @@ struct lfs_config {
      // to the most recent minor version when zero.
      uint32_t disk_version;
  #endif
@@ -835,7 +1036,7 @@ index 8fbd5b4..79fcf12 100644
  };
  
  // File info structure
-@@ -397,6 +426,14 @@ typedef struct lfs_dir {
+@@ -397,6 +428,14 @@ typedef struct lfs_dir {
      lfs_block_t head[2];
  } lfs_dir_t;
  
@@ -850,10 +1051,14 @@ index 8fbd5b4..79fcf12 100644
  // littlefs file type
  typedef struct lfs_file {
      struct lfs_file *next;
-@@ -416,6 +453,19 @@ typedef struct lfs_file {
+@@ -416,6 +455,23 @@ typedef struct lfs_file {
      lfs_cache_t cache;
  
      const struct lfs_file_config *cfg;
++
++    // stafeto: the position of the file while LFS_F_FLUSHING is set (pos is
++    // then the length of the part copied so far), see lfs_file_flush_step
++    lfs_off_t flush_pos;
 +
 +    // stafeto: blocks of the skip list of the file (the pair ctz) that the last
 +    // reads passed, each with its index in the list. They are valid while the
@@ -870,7 +1075,7 @@ index 8fbd5b4..79fcf12 100644
  } lfs_file_t;
  
  typedef struct lfs_superblock {
-@@ -526,6 +576,45 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
+@@ -526,6 +582,45 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath);
  // Returns a negative error code on failure.
  int lfs_stat(lfs_t *lfs, const char *path, struct lfs_info *info);
  
@@ -916,7 +1121,25 @@ index 8fbd5b4..79fcf12 100644
  // Get a custom attribute
  //
  // Custom attributes are uniquely identified by an 8-bit type and limited
-@@ -686,6 +775,21 @@ int lfs_dir_close(lfs_t *lfs, lfs_dir_t *dir);
+@@ -607,6 +702,17 @@ int lfs_file_close(lfs_t *lfs, lfs_file_t *file);
+ // Returns a negative error code on failure.
+ int lfs_file_sync(lfs_t *lfs, lfs_file_t *file);
+ 
++// stafeto: the bytes that a flush of the file would copy now (what lies past
++// the last byte written, when the file is rewritten from the middle), 0 when
++// there is nothing to copy
++lfs_ssize_t lfs_file_tail(lfs_t *lfs, lfs_file_t *file);
++
++// stafeto: the flush of lfs_file_sync in steps. Copies at most `blocks` blocks
++// (at least 1) of the tail and returns 1 when more is left, 0 when the flush
++// is done (the file then waits for lfs_file_sync to commit it), or a negative
++// error. Any other call on the file finishes a flush that is half done.
++int lfs_file_flush_step(lfs_t *lfs, lfs_file_t *file, lfs_size_t blocks);
++
+ // Read data from file
+ //
+ // Takes a buffer and size indicating where to store the read data.
+@@ -686,6 +792,21 @@ int lfs_dir_close(lfs_t *lfs, lfs_dir_t *dir);
  // or a negative error code on failure.
  int lfs_dir_read(lfs_t *lfs, lfs_dir_t *dir, struct lfs_info *info);
  
@@ -938,7 +1161,7 @@ index 8fbd5b4..79fcf12 100644
  // Change the position of the directory
  //
  // The new off must be a value previous returned from tell and specifies
-@@ -724,6 +828,15 @@ int lfs_fs_stat(lfs_t *lfs, struct lfs_fsinfo *fsinfo);
+@@ -724,6 +845,15 @@ int lfs_fs_stat(lfs_t *lfs, struct lfs_fsinfo *fsinfo);
  // Returns the number of allocated blocks, or a negative error code on failure.
  lfs_ssize_t lfs_fs_size(lfs_t *lfs);
  
