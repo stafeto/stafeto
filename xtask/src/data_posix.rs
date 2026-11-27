@@ -67,7 +67,7 @@ pub const PROGRAMS: [ImageProgram; 11] = programs(&[]);
 /// The service that counts the reads of the disk (`data-fast`).
 const PROGRAMS_FAST: [ImageProgram; 11] = programs(&["count"]);
 /// The service that ends on a request, for the restart of `data-atomic`.
-const PROGRAMS_ATOMIC: [ImageProgram; 11] = programs(&["probe-restart"]);
+const PROGRAMS_ATOMIC: [ImageProgram; 11] = programs(&["probe-restart", "probe-lapse"]);
 /// The service with the steps and the counts (`data-steps`).
 const PROGRAMS_STEPS: [ImageProgram; 11] = programs(&["steps"]);
 const PROGRAMS_CRASH: [ImageProgram; 11] = programs(&["crash"]);
@@ -191,7 +191,7 @@ impl Mode {
 }
 
 /// The checks of the atomic role, in the order the probe runs them.
-pub const ATOMIC_CHECKS: [&str; 17] = [
+pub const ATOMIC_CHECKS: [&str; 18] = [
     "1 MiB writes and reads never mix",
     "the service keeps no cell mapped",
     "O_APPEND 200 KiB records whole",
@@ -202,6 +202,7 @@ pub const ATOMIC_CHECKS: [&str; 17] = [
     "readv of 2 x 64 KiB never mixes",
     "writev lease lapses after 1 s",
     "readv lease lapses after 1 s",
+    "lease lapse waits for its tail",
     "siglongjmp out of a handler returns the cell",
     "thread exit mid-call returns the cell",
     "handler write during a long write",
@@ -410,6 +411,12 @@ impl Drop for Disk {
 const DISK_BYTES: u64 = 64 << 20;
 /// The throughput mode writes 64 MiB: a disk of 256 MiB has a data partition of 127 MiB.
 const THROUGHPUT_DISK_BYTES: u64 = 256 << 20;
+/// The atomic role rewrites files of megabytes for minutes. The room check of a write reads the
+/// allocator's window, which does not see the blocks that rewrites and removals free until a walk
+/// (littlefs itself would rescan at the wrap): with 127 MiB a write of the fork and SCM_RIGHTS check
+/// got NO_SPACE once the check of the tail of a lapse had run. 512 MiB, a partition of 255 MiB, is a
+/// stopgap until issue #627 is fixed; then the role goes back to the throughput disk.
+const ATOMIC_DISK_BYTES: u64 = 512 << 20;
 const ENDS: &str = "init: posix-data ended: ";
 const ENDED: &str = "init: posix-data ended: exit code 0, not restarted";
 
@@ -501,7 +508,9 @@ fn boot_with(
     );
     crate::data_image::make_posix_volume(
         &disk.0,
-        if big {
+        if mode == Mode::Atomic {
+            ATOMIC_DISK_BYTES
+        } else if big {
             THROUGHPUT_DISK_BYTES
         } else {
             DISK_BYTES
@@ -538,6 +547,9 @@ fn run(mode: Mode, machine: &qemu::Machine, how: Boot) -> Result<(), String> {
     read_lines(&output.lines, mode)?;
     if matches!(mode, Mode::Restart | Mode::Atomic) {
         restarted(&output.lines)?;
+    }
+    if mode == Mode::Atomic {
+        lapse_verdict(&output.lines)?;
     }
     let report = match mode {
         Mode::Fast => Some(fast_verdict(&output.lines)?),
@@ -784,6 +796,78 @@ fn median(mut values: Vec<f64>) -> f64 {
     } else {
         (values[n / 2 - 1] + values[n / 2]) / 2.0
     }
+}
+
+/// How late the sweep may end a lease after the instant the worker's timer was set for, and how
+/// long after the lapse the job that waited for it may be chosen, in microseconds. A fixed margin
+/// over the lateness of the timer wake measured on a Mac under QEMU: the lapse 0.5 to 10 ms after the
+/// expiry and the waiter chosen 14 to 420 us after the lapse in eleven lapses; a slow runner or a
+/// job of another file in flight at the expiry stays well inside 250 ms.
+const LAPSE_LATE_US: i64 = 250_000;
+
+/// One lapse the service said (`datafs: lease lapse N: last answer A us after the waiter was queued,
+/// lapse B us after the expiry, waiter chosen C us after the lapse, waiter job D us, R disk reads, W
+/// disk writes`, under the feature `probe-lapse`).
+#[derive(Debug, PartialEq, Eq)]
+struct Lapse {
+    answered: i64,
+    late: i64,
+    chosen: i64,
+    job: i64,
+    reads: i64,
+    writes: i64,
+}
+
+fn lapse_facts(line: &str) -> Option<Lapse> {
+    let rest = &line[line.find("datafs: lease lapse ")?..];
+    let value = |key: &str, end: &str| -> Option<i64> {
+        let from = rest.find(key)? + key.len();
+        let len = rest[from..].find(end)?;
+        rest[from..from + len].trim().parse().ok()
+    };
+    Some(Lapse {
+        answered: value("last answer ", " us after")?,
+        late: value(", lapse ", " us after the expiry")?,
+        chosen: value("waiter chosen ", " us after")?,
+        job: value("waiter job ", " us")?,
+        reads: value("us, ", " disk reads")?,
+        writes: value("disk reads, ", " disk writes")?,
+    })
+}
+
+/// The leases that lapsed with a job waiting for them: each lapse is seen within `LAPSE_LATE_US` of
+/// the instant the timer was set for, and the waiter is chosen within `LAPSE_LATE_US` of the lapse.
+/// The job of the waiter itself is not judged here: it pays the tail of a rewrite (`lease.rs`), and
+/// the check `lease lapse waits for its tail` bounds the wait it causes.
+fn lapse_verdict(lines: &[String]) -> Result<(), String> {
+    let facts: Vec<_> = lines.iter().filter_map(|l| lapse_facts(l)).collect();
+    if facts.len() < 4 {
+        return Err(format!(
+            "the service said {} lapses with a waiter, at least four expected (the pwrite, the writev, the readv and the tail)",
+            facts.len()
+        ));
+    }
+    for (n, f) in facts.iter().enumerate() {
+        println!(
+            "data-posix: lapse {}: the last answer {} us after the waiter was queued, the lapse {} us after the expiry, the waiter chosen {} us after it, its job {} us with {} disk reads and {} disk writes",
+            n + 1,
+            f.answered,
+            f.late,
+            f.chosen,
+            f.job,
+            f.reads,
+            f.writes
+        );
+        if f.late > LAPSE_LATE_US || !(0..=LAPSE_LATE_US).contains(&f.chosen) {
+            return Err(format!(
+                "lapse {}: {} us after the expiry and the waiter chosen {} us after it, each over {LAPSE_LATE_US} us",
+                n + 1,
+                f.late,
+                f.chosen
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The counters of the disk the service said (`datafs: disk reads R writes W`): the last pair said
@@ -1434,6 +1518,41 @@ mod tests {
         let mut late = good();
         late[1] = "datafs: root registered after 3 failed attempts".to_owned();
         assert_eq!(read_lines(&late, Mode::Read), Ok(()));
+    }
+
+    #[test]
+    fn the_lapse_lines_are_read_and_judged() {
+        let say = |a: i64, b: i64, c: i64| {
+            format!(
+                "datafs: lease lapse 2: last answer {a} us after the waiter was queued, lapse {b} us after the expiry, waiter chosen {c} us after the lapse, waiter job 1500 us, 732 disk reads, 209 disk writes"
+            )
+        };
+        assert_eq!(
+            lapse_facts(&say(-358, 9794, 21)),
+            Some(Lapse {
+                answered: -358,
+                late: 9794,
+                chosen: 21,
+                job: 1500,
+                reads: 732,
+                writes: 209
+            })
+        );
+        assert_eq!(lapse_facts("datafs: pairs 1 of 2"), None);
+        let ok: Vec<String> = vec![
+            say(7, 3000, 50),
+            say(-5, 10_000, 20),
+            say(600, 2000, 30),
+            say(1, 0, 9),
+        ];
+        assert_eq!(lapse_verdict(&ok), Ok(()));
+        assert!(lapse_verdict(&ok[..3]).is_err());
+        let mut late = ok.clone();
+        late[1] = say(0, 540_000, 20);
+        assert!(lapse_verdict(&late).unwrap_err().contains("540000"));
+        let mut slow = ok;
+        slow[2] = say(0, 100, 300_000);
+        assert!(lapse_verdict(&slow).is_err());
     }
 
     #[test]

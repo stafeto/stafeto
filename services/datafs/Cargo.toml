@@ -28,6 +28,9 @@ crash = []
 # exit code 1 (init starts it again), so that a program can see the descriptors of the old instance
 # answer EIO and the new instance take new opens.
 probe-restart = []
+# The service tells the facts of each lapse of a lease that a job waited for (`lease lapse N: ...`),
+# for `cargo xtask data-posix atomic`.
+probe-lapse = []
 # The stop handler exits at once (the probe of the stop handlers must catch it).
 break-datafs-stop = []
 # The deliberate breaks of the probes of the service (`STAFETO_DATA_POSIX_BREAK`, `cargo xtask
