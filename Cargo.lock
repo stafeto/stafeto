@@ -602,6 +602,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "layer-names"
+version = "0.1.0"
+dependencies = [
+ "libc-ffi",
+ "posix-abi",
+ "posix-crt",
+ "proto-data",
+ "proto-fs",
+ "proto-layer",
+ "proto-process",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "layer-probe"
 version = "0.1.0"
 dependencies = [

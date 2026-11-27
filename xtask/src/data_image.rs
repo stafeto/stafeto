@@ -229,6 +229,163 @@ pub fn make_posix_volume(path: &Path, size: u64) -> Result<(), String> {
         .map_err(|_| format!("{}: flush failed", path.display()))
 }
 
+/// The bit of the number of a file the layer service creates (`proto_fs::names::UPPER_INO_TAG`).
+const UPPER_INO_TAG: u64 = 1 << 62;
+
+/// What the volume of `cargo xtask layer-names-probe` holds: the layer directory with the composition
+/// and the live layer 00 of the probe (the lower set is the boot image of the probe: its files
+/// `/lower/*`, `/lowdir/*` and `/etc/layer-*` are in `rootfs.rs`).
+///
+/// Under `/.layers/00`: `etc/.wh.layer-hidden` (a mark of deletion of a lower file), `etc/layer-note`
+/// (a name the lower set does not have), `etc/layer-own` (0640, owner 1000:1000, the number
+/// `UPPER_INO_TAG | 5`), `lower/shadowed` (shadows the lower file of the same name) with
+/// `lower/.wh.hidden`, `lowdir` (the marker `.wh..wh..opq` over a lower directory, and its own
+/// `u1`) and `private` (0700, owner 0, with `f`).
+pub const LAYER_VOLUME_ENTRIES: &[LayerEntry] = &[
+    LayerEntry::dir("/.layers", 0o700, 0, 0),
+    LayerEntry::dir("/.layers/00", 0o755, 0, 0),
+    LayerEntry::dir("/.layers/work", 0o700, 0, 0),
+    LayerEntry::file(
+        "/.layers/COMPOSITION",
+        0o600,
+        0,
+        0,
+        b"STAFLAYR 1\nnext 01\nino 8\nlower -\nlayer 00 live unsealed - -\n",
+    ),
+    LayerEntry::dir("/.layers/00/etc", 0o755, 0, 0),
+    LayerEntry::file("/.layers/00/etc/.wh.layer-hidden", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/etc/layer-note", 0o644, 0, 0, b"layer note\n"),
+    LayerEntry::file("/.layers/00/etc/layer-own", 0o640, 1000, 1000, LAYER_OWN_BYTES)
+        .numbered(UPPER_INO_TAG | 5),
+    LayerEntry::dir("/.layers/00/lower", 0o755, 0, 0),
+    LayerEntry::file("/.layers/00/lower/.wh.hidden", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/lower/shadowed", 0o644, 0, 0, LAYER_SHADOW_BYTES),
+    LayerEntry::dir("/.layers/00/lowdir", 0o755, 0, 0),
+    LayerEntry::file("/.layers/00/lowdir/.wh..wh..opq", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/lowdir/u1", 0o644, 0, 0, b"u1\n"),
+    LayerEntry::dir("/.layers/00/private", 0o700, 0, 0),
+    LayerEntry::file("/.layers/00/private/f", 0o644, 0, 0, b"private\n"),
+];
+
+/// The bytes of `/etc/layer-own` of the layer and of `/lower/shadowed`, which the probe reads.
+pub const LAYER_OWN_BYTES: &[u8] = b"owned bytes of the layer\n";
+pub const LAYER_SHADOW_BYTES: &[u8] = b"upper shadow\n";
+
+/// One entry of the volume of the layer probe.
+#[derive(Clone, Copy, Debug)]
+pub struct LayerEntry {
+    pub path: &'static str,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// None for a directory.
+    pub bytes: Option<&'static [u8]>,
+    /// The number of the entry, or 0 for the next one of the order of the list.
+    pub ino: u64,
+}
+
+impl LayerEntry {
+    pub const fn dir(path: &'static str, mode: u32, uid: u32, gid: u32) -> LayerEntry {
+        LayerEntry {
+            path,
+            mode,
+            uid,
+            gid,
+            bytes: None,
+            ino: 0,
+        }
+    }
+
+    pub const fn file(
+        path: &'static str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        bytes: &'static [u8],
+    ) -> LayerEntry {
+        LayerEntry {
+            path,
+            mode,
+            uid,
+            gid,
+            bytes: Some(bytes),
+            ino: 0,
+        }
+    }
+
+    pub const fn numbered(mut self, ino: u64) -> LayerEntry {
+        self.ino = ino;
+        self
+    }
+}
+
+/// The volume of the layer probe (`LAYER_VOLUME_ENTRIES`), with the format mark 4 so that the data
+/// service converts nothing. The numbers of the entries are their places in the list plus 2, but the
+/// ones the list names, and the counter starts above all of them.
+pub fn make_layer_volume(path: &Path, size: u64) -> Result<(), String> {
+    use datafs::attr::{ATTR_COUNTER_TYPE, ATTR_FORMAT_TYPE, ATTR_TYPE, Attr, VOLUME_FORMAT};
+    make(path, size)?;
+    let mut state = Box::new(Storage::new());
+    let (mut fs, _, _) = volume::open(FileDevice::open(path)?, &mut state, SEED)
+        .map_err(|r| format!("{}: datafs refused the file: {}", path.display(), r.text()))?;
+    let record = |mode: u32, uid: u32, gid: u32, ino: u64| {
+        Attr {
+            uid,
+            gid,
+            mode,
+            ino,
+            atime: POSIX_VOLUME_TIME_NS,
+            mtime: POSIX_VOLUME_TIME_NS,
+            ctime: POSIX_VOLUME_TIME_NS,
+        }
+        .to_bytes()
+    };
+    for (i, entry) in LAYER_VOLUME_ENTRIES.iter().enumerate() {
+        let ino = if entry.ino != 0 {
+            entry.ino
+        } else {
+            i as u64 + 2
+        };
+        let name = entry.path.as_bytes();
+        match entry.bytes {
+            None => fs
+                .mkdir(name)
+                .map_err(|e| format!("{}: mkdir {e:?}", entry.path))?,
+            Some(bytes) => {
+                let flags = datafs::Open::WRITE.with(datafs::Open::CREATE);
+                let file = fs
+                    .open(name, flags)
+                    .map_err(|e| format!("{}: open {e:?}", entry.path))?;
+                if !bytes.is_empty() {
+                    fs.write(file, bytes)
+                        .map_err(|e| format!("{}: write {e:?}", entry.path))?;
+                }
+                fs.close(file)
+                    .map_err(|e| format!("{}: close {e:?}", entry.path))?;
+            }
+        }
+        fs.setattr(
+            name,
+            ATTR_TYPE,
+            &record(entry.mode, entry.uid, entry.gid, ino),
+        )
+        .map_err(|e| format!("{}: setattr {e:?}", entry.path))?;
+    }
+    fs.setattr(b"/", ATTR_TYPE, &record(0o755, 0, 0, 1))
+        .map_err(|e| format!("/: setattr {e:?}"))?;
+    fs.setattr(b"/", ATTR_FORMAT_TYPE, &VOLUME_FORMAT.to_le_bytes())
+        .map_err(|e| format!("/: format mark {e:?}"))?;
+    let counter = LAYER_VOLUME_ENTRIES.len() as u64 + 100;
+    fs.setattr(b"/", ATTR_COUNTER_TYPE, &counter.to_le_bytes())
+        .map_err(|e| format!("/: counter {e:?}"))?;
+    fs.unmount()
+        .map_err(|e| format!("{}: unmount: {e:?}", path.display()))?;
+    fs.into_device()
+        .device
+        .flush()
+        .map_err(|_| format!("{}: flush failed", path.display()))
+}
+
 /// A file as a disk whose flush does nothing: the fill writes hundreds of MiB and syncs the file once
 /// at the end, since a crash of the host during the fill leaves a file that is made again.
 struct Quick(FileDevice);
