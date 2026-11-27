@@ -108,6 +108,12 @@ const B: Rect = Rect {
     w: 240,
     h: 180,
 };
+/// The windows of the scenes of sixteen windows (`Probe::many`): the service's
+/// most, the windows of a context, and the fifteen of the run under -icount,
+/// which lie over the first client's.
+const WINDOWS: usize = 16;
+const PER_CONTEXT: usize = 4;
+const MANY: usize = WINDOWS - 1;
 /// Where the injected pointer clicks (in A alone), and where the tablet does
 /// (in A, with B gone).
 const CLICK: (i32, i32) = (60, 60);
@@ -177,6 +183,12 @@ enum Fail {
 
 /// The objects of a window's buffers and where they are mapped.
 type Buffers = ([Option<Handle<Memory>>; 3], [usize; 3]);
+
+/// The windows of `Probe::spawn` and the objects of their buffers.
+type Made = (
+    [Option<Handle<Channel>>; WINDOWS],
+    [Option<[Option<Handle<Memory>>; 3]>; WINDOWS],
+);
 
 struct Probe<'a> {
     process: &'a Handle<rt::handle::Process>,
@@ -485,6 +497,57 @@ fn expected_crc(order: [bool; 2], only_a: bool) -> u32 {
                 } else if !is_a && inside(B, x, y) {
                     point = over(point, b_point(x - B.x, y - B.y));
                 }
+            }
+            crc.point(point);
+        }
+    }
+    !crc.0
+}
+
+/// Window `k` of the scene of sixteen windows (`Probe::many` with the monitor):
+/// staggered so that each overlaps the others, every third XRGB8888 (the value
+/// is the colour) and the others ARGB8888 (the value is premultiplied, an alpha
+/// of 0x60 to 0xD8 and each channel under it).
+fn sixteen_of(k: usize) -> (Rect, u32, u32) {
+    let n = k as u32;
+    let rect = Rect {
+        x: 20 + 27 * n,
+        y: 10 + 16 * n + 13 * (n % 3),
+        w: 200,
+        h: 110,
+    };
+    let channel = |step: u32| (n * step + 40) & 0xFF;
+    if k.is_multiple_of(3) {
+        let colour = channel(53) << 16 | channel(97) << 8 | channel(29);
+        return (rect, FORMAT_XRGB8888, colour);
+    }
+    let alpha = 0x60 + 8 * n;
+    let under = |step: u32| channel(step) * alpha / 255;
+    (
+        rect,
+        FORMAT_ARGB8888,
+        alpha << 24 | under(61) << 16 | under(83) << 8 | under(37),
+    )
+}
+
+/// What the screen shows with the sixteen windows of `sixteen_of`, in order,
+/// over the black.
+fn sixteen_crc() -> u32 {
+    let inside = |r: Rect, x: u32, y: u32| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+    let windows: [(Rect, u32, u32); WINDOWS] = core::array::from_fn(sixteen_of);
+    let mut crc = Crc(0xFFFF_FFFF);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let mut point = 0;
+            for &(rect, format, value) in &windows {
+                if !inside(rect, x, y) {
+                    continue;
+                }
+                point = if format == FORMAT_ARGB8888 {
+                    over(point, value)
+                } else {
+                    value
+                };
             }
             crc.point(point);
         }
@@ -818,7 +881,7 @@ impl Probe<'_> {
         if cfg!(feature = "quick") {
             // The manager runs while the many windows are made (the run under
             // -icount): they take no focus from it.
-            self.wait_open(&display, 8)?;
+            self.wait_open(&display, 1 + MANY as u32)?;
             self.wait_open(&display, 1)?;
         }
         Ok(())
@@ -850,7 +913,7 @@ impl Probe<'_> {
         proto_comp::write_manage(manage::LIST, 0, 0, 0, &mut w).map_err(say("MANAGE's bytes"))?;
         let reply = sys::send(display, w.as_bytes()).map_err(say("LIST"))?;
         let mut buffer = [0; MESSAGE_MAX];
-        let mut windows = [WindowRecord::default(); 8];
+        let mut windows = [WindowRecord::default(); 16];
         let mut n = 0;
         proto_comp::read_list(reply.bytes(&mut buffer), |r| {
             if n < windows.len() {
@@ -910,60 +973,147 @@ impl Probe<'_> {
         }
     }
 
-    /// The many windows: seven windows more over the screen's lower right,
-    /// four of this context and three of a clone's (a context has four), all of
-    /// ARGB8888 and all on one place over the first client's window (ARGB8888 in
-    /// the run under -icount), which with it make the eight the service has: a
-    /// band over that place lays eight translucent layers (the model of a band
-    /// charges each layer after the first). None has the focus while the manager runs, and the bands of
-    /// the frames they make stay under the bound (xtask reads the steps of the
-    /// run under -icount, which is the one that has them: the other has the
-    /// screenshots, and these windows are not in them).
+    /// The many windows, in two forms by the run.
+    ///
+    /// Under -icount: fifteen windows more over the first client's place, four
+    /// of this context and four of each of three clones' (a context has four;
+    /// the last has three), all of ARGB8888 and all on one place over the first
+    /// client's window (ARGB8888 in that run), which with it make the sixteen the
+    /// service has: a band over that place lays sixteen translucent layers,
+    /// which the service draws in groups (the model of a band charges each layer
+    /// after the first). None has the focus while the manager runs, and the bands
+    /// of the frames they make stay under the bound (xtask reads the steps of
+    /// that run).
+    ///
+    /// With the monitor: when both clients are gone, sixteen windows over one
+    /// another (`sixteen_of`, some ARGB8888 and some XRGB8888, each of a colour of
+    /// its own, in four contexts of four), the CRC of the screen they make,
+    /// which xtask compares with QEMU's screenshot, and then the windows go. The
+    /// service draws that frame in groups of layers.
     fn many(self) -> Result<(), &'static str> {
-        if !cfg!(feature = "quick") {
-            return Ok(());
-        }
+        let quick = cfg!(feature = "quick");
         let display = self.display()?;
         self.describe_when_ready(&display)?;
-        // The first client alone is on the screen.
-        self.until(&display, "the first client never stood alone", |d| {
-            d.open == 1 && d.created >= 2
-        })?;
-        let (status, mut reply) =
-            call(&display, &proto_gpu::Method::Clone.header().bytes()).map_err(say("CLONE"))?;
-        if status != Status::Ok {
-            return Err("CLONE was refused");
+        if quick {
+            // The first client alone is on the screen.
+            self.until(&display, "the first client never stood alone", |d| {
+                d.open == 1 && d.created >= 2
+            })?;
+        } else {
+            // Both clients are gone.
+            self.until(&display, "the clients never went", |d| {
+                d.open == 0 && d.created >= 2
+            })?;
         }
-        let clone = reply
-            .handles
-            .take::<Channel>(0)
-            .map_err(|_| "CLONE's handle")?;
-        let mut windows = [const { None }; 7];
-        let mut keep = [const { None }; 7];
-        for k in 0..7usize {
-            let rect = Rect {
-                x: A.x + 10,
-                y: A.y + 10,
-                w: 200,
-                h: 150,
-            };
-            let format = FORMAT_ARGB8888;
-            let session = if k < 4 { &display } else { &clone };
+        let clones = self.clones::<3>(&display)?;
+        let sessions = [&display, &clones[0], &clones[1], &clones[2]];
+        let count = if quick { MANY } else { WINDOWS };
+        let made = if quick {
+            self.spawn(&sessions, count, |_| {
+                (
+                    Rect {
+                        x: A.x + 10,
+                        y: A.y + 10,
+                        w: 200,
+                        h: 150,
+                    },
+                    FORMAT_ARGB8888,
+                    0x8040_4040,
+                )
+            })?
+        } else {
+            self.spawn(&sessions, count, sixteen_of)?
+        };
+        if quick {
+            self.until(&display, "the many windows never settled", |d| {
+                d.open == 1 + MANY as u32
+            })?;
+            self.none_has_the_focus(&made.0)?;
+            rt::println!(
+                "focus-probe: sixteen windows are shown and none of the fifteen took the focus"
+            );
+            // Held until the first client has seen them all.
+            self.sleep(500_000_000);
+            return Ok(());
+        }
+        // The screen has settled: all the windows are open, no frame is being
+        // made and the count of frames stood still over a pause.
+        let mut frames = None;
+        loop {
+            let d = self.until(&display, "the sixteen windows never settled", |d| {
+                d.open == WINDOWS as u32
+            })?;
+            if frames == Some(d.frames) {
+                break;
+            }
+            frames = Some(d.frames);
+            self.sleep(200_000_000);
+        }
+        rt::println!("focus-probe: sixteen crc {:08x}", sixteen_crc());
+        self.sleep(SNAPSHOT_NS);
+        Ok(())
+    }
+
+    /// `N` clones of the display session: contexts of their own.
+    fn clones<const N: usize>(
+        &self,
+        display: &Handle<Channel>,
+    ) -> Result<[Handle<Channel>; N], &'static str> {
+        let mut out = [const { None }; N];
+        for slot in &mut out {
+            let (status, mut reply) =
+                call(display, &proto_gpu::Method::Clone.header().bytes()).map_err(say("CLONE"))?;
+            if status != Status::Ok {
+                return Err("CLONE was refused");
+            }
+            *slot = Some(
+                reply
+                    .handles
+                    .take::<Channel>(0)
+                    .map_err(|_| "CLONE's handle")?,
+            );
+        }
+        Ok(out.map(|c| c.expect("every clone was made")))
+    }
+
+    /// `count` windows of `many`: window `k` is made in session
+    /// `sessions[k / PER_CONTEXT]` with the rectangle, the format and the value
+    /// of every point `of(k)` gives (premultiplied for ARGB8888), has one buffer
+    /// and posts it. The windows and the objects of their buffers are returned.
+    fn spawn(
+        &self,
+        sessions: &[&Handle<Channel>],
+        count: usize,
+        of: impl Fn(usize) -> (Rect, u32, u32),
+    ) -> Result<Made, &'static str> {
+        let mut windows = [const { None }; WINDOWS];
+        let mut keep = [const { None }; WINDOWS];
+        for k in 0..count {
+            let (rect, format, value) = of(k);
             let (window, _) = self
-                .create_as(session, rect, format)
+                .create_as(sessions[k / PER_CONTEXT], rect, format)
                 .map_err(say("WINDOW_CREATE of many"))?;
-            let (objects, at) = self.buffers(1, 200 * 150 * 4)?;
-            self.attach_as(&window, 800, &objects[..1], format)
+            let (objects, at) = self.buffers(1, u64::from(rect.w) * u64::from(rect.h) * 4)?;
+            self.attach_as(&window, rect.w * 4, &objects[..1], format)
                 .map_err(say("ATTACH of many"))?;
             // SAFETY: `buffers` mapped this object for writing at this
-            // address, 200 by 150 points; one thread.
-            let points = unsafe { core::slice::from_raw_parts_mut(at[0] as *mut u32, 200 * 150) };
-            points.fill(0x8040_4040);
+            // address, `w` by `h` points; one thread.
+            let points = unsafe {
+                core::slice::from_raw_parts_mut(at[0] as *mut u32, (rect.w * rect.h) as usize)
+            };
+            points.fill(value);
             self.post(&window, 0, &[]).map_err(say("POST of many"))?;
             windows[k] = Some(window);
             keep[k] = Some(objects);
         }
-        self.until(&display, "the many windows never settled", |d| d.open == 8)?;
+        Ok((windows, keep))
+    }
+
+    /// No window of `windows` has an event (none was given the focus).
+    fn none_has_the_focus(
+        &self,
+        windows: &[Option<Handle<Channel>>; WINDOWS],
+    ) -> Result<(), &'static str> {
         for window in windows.iter().flatten() {
             let mut out = [Event::default(); MAX_EVENTS];
             let (n, _) = self
@@ -977,9 +1127,6 @@ impl Probe<'_> {
                 return Err("a window made while a manager runs took the focus");
             }
         }
-        rt::println!("focus-probe: eight windows are shown and none of the seven took the focus");
-        // Held until the first client has seen them all.
-        self.sleep(500_000_000);
         Ok(())
     }
 
@@ -1053,7 +1200,7 @@ impl Probe<'_> {
         if cfg!(feature = "quick") {
             // The many windows come and go first (the run under -icount).
             let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
-            while self.describe(&display).map_err(say("DESCRIBE"))?.created < 9 {
+            while self.describe(&display).map_err(say("DESCRIBE"))?.created < 2 + MANY as u32 {
                 if time::ticks_to_ns(time::now()) > end {
                     return Err("the many windows never came");
                 }

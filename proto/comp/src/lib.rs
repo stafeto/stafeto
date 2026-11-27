@@ -1814,7 +1814,7 @@ mod tests {
         // The longest reply is 720 bytes: 16 records of 32 bytes after 208.
         assert_eq!(STATS_MAX, 720);
         // A message is at most 1 024 bytes.
-        assert!(STATS_MAX <= 1_024);
+        const { assert!(STATS_MAX <= 1_024) };
         let full = StatsReply::new(sample_stats(), &(1..=16).map(window).collect::<Vec<_>>());
         assert_eq!(reply_bytes(&full.unwrap()).len(), 720);
     }

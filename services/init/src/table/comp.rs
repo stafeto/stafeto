@@ -18,8 +18,9 @@
 //! mapped for reading and writing, whose handle goes to that program): the
 //! pool is the driver's object and its pages are the driver's, so the quota
 //! holds the service's program (about 57 pages with pixman, which the windows
-//! are put together by), the arena of pixman's allocations (8 pages), the
-//! rings of events (3 pages), the tables of its mappings and its 64 KiB stack.
+//! are put together by), the arena of pixman's allocations (16 pages), the
+//! rings of events (3 pages for eight windows, 6 for sixteen), the tables of
+//! its mappings and its 64 KiB stack.
 //! The 250 pages of a buffer of its own that the quota held until the direct
 //! frame are gone. The base image keeps `INIT_RESERVE_PAGES` free after its
 //! services started (`cargo xtask pkg-identity`) and init gives the pool of
@@ -58,6 +59,10 @@ pub const COMPOSITOR: Record = Record {
     ceiling: 32,
     // The compositor's 150 pages and the pool of the prepared images of
     // its elements (2 MiB, `compositor::prep::POOL_BYTES`: 512 pages).
+    // Measured under -icount with sixteen windows of three buffers each (the
+    // arena of pixman is 64 KiB for them): 47 pages used of the 150 and 80
+    // handles live of the 128 (a window holds its session, its notice and
+    // its buffers), so the figures stand.
     quota: 662 * PAGE,
     handle_limit: 128,
     restart: Restart::Always,

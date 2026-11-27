@@ -5719,7 +5719,7 @@ mod tests {
         }
         assert_eq!(layers, 16);
         // Without groups the calls of 16 layers alone pass the band.
-        assert!(16 * (OVER.call + LAYER) > BAND_TICKS);
+        const { assert!(16 * (OVER.call + LAYER) > BAND_TICKS) };
         let (worst, bands) = worst_step(&s, d, &src);
         assert!(
             worst <= BAND_TICKS,

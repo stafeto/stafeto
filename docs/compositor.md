@@ -117,7 +117,7 @@ the top place itself, so the manager does nothing for a click and nothing is
 done twice. Super is the modifier because Doom binds Alt, Ctrl and Shift, and
 the shell reads the console's keys and never this keyboard's. Tab alone and Q
 alone are the windows'. The manager's calls are the compositor's ordinary steps: LIST
-has at most MAX_WINDOWS records, no loop is added to a step. When the manager
+has at most MAX_WINDOWS (16) records, no loop is added to a step. When the manager
 ends, the compositor goes on by its own rule: the window that has the focus
 keeps it, the first window shown takes it when no manager has subscribed, a click
 moves it, and a window that goes passes it to the one on top.
@@ -194,7 +194,7 @@ source by `tools/build-pixman.py` (`packages/pixman.toml`: version, URL and
 SHA-256 of the archive) as a static library that `lib/pixman` links into the
 compositor: its AArch64 NEON paths (`pixman-arm-neon.c` and the two assembly
 files of meson's `a64-neon`) over its portable C paths, with no threads and no
-timers, over the headers and the shim of `ports/pixman` (an arena of 32 KiB that pixman
+timers, over the headers and the shim of `ports/pixman` (an arena of 64 KiB that pixman
 allocates from, and the few functions of a C library it calls). Two files of
 pixman are left out and replaced by one function each in the shim: the
 combiners of the wide formats and the accessors of images, which windows of 8
@@ -293,7 +293,12 @@ fork, a signal and close are checked by the program.
 
 ## Limits accepted in stage G1
 
-One process can take all 8 window places through clones of its session. A
+The service holds 16 windows (`MAX_WINDOWS`), 4 for one context (`PER_CONTEXT`), so
+one process can take all 16 window places through three clones of its session. STATS
+tells up to 16 records of windows (720 bytes) and LIST up to 16 (456 bytes). The buffers of
+16 windows, three each, are 48 MiB at the service's addresses, below its pool, and the
+images pixman keeps (`pixman::KEPT`) are 64, with 64 hints (`HINTS`), for the 48 buffers, the
+screen, the pointer's picture and the pool. A
 client at level 1 that posts without pause drives composition at level 32
 with no budget. On the frame clock the cap bounds the work of a period (the cap
 below), so the service leaves the rest of the period to the levels below it, and one
@@ -366,6 +371,22 @@ soon as the commands are in the device's queue, and the driver says
 `FRAME_SHOWN` (or `FRAME_FAILED`) on that channel when the device is done.
 FLUSH of the first revision still waits inside the driver, for the programs
 that speak to the driver directly (the image of `gpu-probe`).
+
+With no scene, more than 8 shown windows over a damage (`WINDOW_GROUPS_ABOVE`) are drawn
+in groups of layers, a step a group, by the rule of the groups of a scene
+(`Scene::window_passes`): the topmost opaque window that covers the damage whole is the base
+and the windows under it are not drawn, the black is group 0 when no opaque window covers
+the damage, each window that touches the damage is a layer (a copy of an XRGB8888 window,
+a laying over of an ARGB8888 one, each with the term of a layer) that joins the open group
+while the group's calls stay within `GROUP_CALLS`, and the pointer's picture, when the frame
+draws it, is the last group. A group draws only the windows of that group, in the order of
+depth, over the place of the frame, bottom up, so the picture is the one of a single step;
+the groups name the windows by place. A step pays `ELEMENT_TERM` for every shown window it
+walks, the term the probe measured for the elements of a scene. With 8 windows or fewer the
+band is one band's layers as before (the same tile, the same prices). Sixteen translucent
+windows over one place make a black group and four groups of at most five layers (a layer
+laid over others is 903 ticks of call and 288 of the term of a layer, with the margin), where the calls of
+sixteen layers in one band (19 056 ticks) pass the 14 000 a band has.
 
 Under a scene each element is charged by its class (`elements::classes`; the rows of
 `compositor::PRICES` after the black, the copy and the laying over): a stretch, turn or
@@ -681,7 +702,13 @@ coordinates. The pointer is on the cursor pipeline, so no CRC has its picture
 (`virtio_gpu_update_cursor`) must show the cursor's update from resource 3 at
 the place of the injected move, then a move with resource 3 to the tablet's
 place, and none with resource 0. QEMU's tablet then moves and presses through
-the monitor, and the surviving window must see the click. The same command then runs the image of the
+the monitor, and the surviving window must see the click. When both clients are gone, a
+program of its own (role `n`) makes 16 windows over one another in four contexts, some ARGB8888
+and some XRGB8888, each of a colour of its own, and the screen they make (drawn in groups of
+layers) is compared with the guest's CRC-32 like the others. Under `-icount` the same role
+makes 15 windows over the first client's, all ARGB8888 (16 translucent layers over one place,
+none with the focus while the manager runs), and the longest band step of that frame is
+printed (the gate of a band is 16 328 ticks). The same command then runs the image of the
 window manager (`table::focus::WM_TABLE`: the program `wm`, a keyboard's
 driver, a native client and a client of the first revision): the manager gives
 each new window the focus, Super and Tab switch the windows twice, and the keys
@@ -708,9 +735,9 @@ with the window it shows, the rectangle of the window it takes the points from
 (16.16 points), the rectangle of the screen it puts them in, the turn and
 reflection, the filter, the kind of transparency, a global alpha and a mask
 (`proto_comp::Element`, 56 bytes; up to 16 of them in a message of 916 bytes).
-The window is the `id` WINDOW_CREATE answers: its place in the table (3 bits)
-and the count of windows made at that place (`proto_comp::window_id`), so the id
-of a window that went is no window's again. LIST, the events CREATE and CLOSE
+The window is the `id` WINDOW_CREATE answers: its place in the table (4 bits)
+and the count of windows made at that place (23 bits, `proto_comp::window_id`),
+so the id of a window that went is no window's again; an id stays below 2^27. LIST, the events CREATE and CLOSE
 (the id is their `value`; `code` is the place) and MANAGE carry the same id. An
 element whose id names no live window shows nothing and holds no buffer, also
 when the holder commits with the id of a window that went before it read the
@@ -911,8 +938,8 @@ scene.
 A window's resize, a frame clock that follows the display's own vertical blank
 (the period is the service's, and the free run is the only way without it), the
 sharing of the cap between clients, a call of pixman for the parts of windows that
-do not overlap (eight translucent windows on one place cost eight calls a band, and
-the worst scene, eight of them over the whole screen, is 15 bands a line and 6 000 bands
+do not overlap (eight translucent windows on one place cost eight calls a band; sixteen cost four groups of
+five layers at most, a group a step, and the worst scene, eight of them over the whole screen, is 15 bands a line and 6 000 bands
 a frame: 128 periods at the cap of 47, 2.1 s at 60 Hz under -icount; eight of 320 by
 200 points are 1 600 bands and 35 periods; a copy of the whole screen that no window
 covers is 50 bands and 2 periods), the window manager

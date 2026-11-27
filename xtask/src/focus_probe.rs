@@ -12,8 +12,11 @@
 //! guest computed for the screen it should show: the overlap with its
 //! transparency, a click that gives a window the focus and the top place,
 //! the manager's switch on Super and Tab, and the screen after the second
-//! client ended. The guest checks that each client saw the focus and the keys
-//! of its time and no others, and that the manager heard the Super keys alone.
+//! client ended. When both clients are gone, sixteen windows over one another
+//! (some ARGB8888, some XRGB8888) make a screen that the service draws in groups
+//! of layers; it is compared in the same way. The guest checks that each client
+//! saw the focus and the keys of its time and no others, and that the manager
+//! heard the Super keys alone.
 //! Then xtask moves QEMU's tablet and presses its button through QMP
 //! (`input-send-event`: the monitor's `mouse_move` is relative, and a tablet
 //! has no relative axes): the surviving window must see the click, in its own
@@ -147,6 +150,9 @@ const OVERLAP: &str = "focus-probe: overlap crc ";
 const CLICK: &str = "focus-probe: click crc ";
 const SWITCH: &str = "focus-probe: switch crc ";
 const SURVIVOR: &str = "focus-probe: survivor crc ";
+/// The screen of sixteen windows over one another, made when the clients have
+/// gone, which the service draws in groups of layers.
+const SIXTEEN: &str = "focus-probe: sixteen crc ";
 const INJECTED: &str = "focus-probe: the keys are injected";
 /// The line of the keyboard's driver about its device, as far as the status.
 const KEYBOARD_LINE: &str = "virtio-input: virtio-mmio at 0xa001e00, line 63, status 0x0";
@@ -161,7 +167,7 @@ const ENDED: [&str; 5] = [
 ];
 /// The line the run under -icount has of the many windows, and the bound on
 /// their bands is the compositor's steps.
-const MANY: &str = "focus-probe: eight windows are shown and none of the seven took the focus";
+const MANY: &str = "focus-probe: sixteen windows are shown and none of the fifteen took the focus";
 
 /// The programs of the window manager's image end in this order of their
 /// names; the native client is the last, and the run stops on it.
@@ -384,6 +390,29 @@ pub(crate) fn rows_of(
     Ok(rows)
 }
 
+/// The longest band step of the compositor from the survivor's frame on, which
+/// holds the sixteen layers of the many windows: the steps whose lines the
+/// service printed after the survivor's line are those that passed the longest
+/// before, so a step the many windows made longer than all the earlier ones
+/// is among them. None when no band passed the earlier greatest there.
+fn many_band(lines: &[String]) -> Option<u64> {
+    let from = lines.iter().position(|l| l.contains(SURVIVOR))?;
+    longest_steps(&lines[from..], comp_probe::COMP_TAG)
+        .into_iter()
+        .find(|r| r.0 == 65)
+        .map(|r| r.1)
+}
+
+/// The sentence of `many_band` for the run's report.
+fn many_band_text(lines: &[String]) -> String {
+    match many_band(lines) {
+        Some(ticks) => format!(
+            "the longest band step with the many windows (sixteen layers in groups), ticks: {ticks} (portions {PORTION_MAX})"
+        ),
+        None => "no band step of the many windows passed the earlier greatest".to_owned(),
+    }
+}
+
 /// The steps of the compositor in the window manager's run.
 pub fn wm_steps_verdict(lines: &[String]) -> Result<comp_probe::Rows, String> {
     rows_of(lines, comp_probe::COMP_TAG, "compositor", &WM_COMP_KINDS)
@@ -569,7 +598,11 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
     qmp.left_button(true)?;
     std::thread::sleep(Duration::from_millis(300));
     qmp.left_button(false)?;
-    // The four end in the order the scene takes, which the lines of one
+    // The clients are gone: sixteen windows over one another, drawn in groups
+    // of layers, are the screen the guest's CRC says.
+    let line = run.expect_line(SIXTEEN, |l| l.contains(SIXTEEN), WITHIN)?;
+    gpu_probe::compare(&mut monitor, &scratch.picture(), &line, SIXTEEN)?;
+    // The five end in the order the scene takes, which the lines of one
     // run already passed: each is looked for anywhere in the output.
     for ended in ENDED {
         run.expect_seen(ended, WITHIN)?;
@@ -614,7 +647,7 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     )
     .map_err(|e| format!("focus-probe on {}: {e}", machine.name))?;
     println!(
-        "focus-probe on {}: the screen matched the guest's frames (no pointer in them: it is on the cursor pipeline) for two windows with an alpha, a click that raised one, the manager's switch and the screen after the second client ended; the keys went to the window with the focus only; the tablet's click reached the window under it; QEMU's trace shows the cursor's update from resource 3 and its moves to the tablet's place",
+        "focus-probe on {}: the screen matched the guest's frames (no pointer in them: it is on the cursor pipeline) for two windows with an alpha, a click that raised one, the manager's switch, the screen after the second client ended and, when the clients had gone, sixteen windows over one another (ARGB8888 and XRGB8888, drawn in groups of layers); the keys went to the window with the focus only; the tablet's click reached the window under it; QEMU's trace shows the cursor's update from resource 3 and its moves to the tablet's place",
         machine.name
     );
     wm_probe(machine, false)?;
@@ -724,6 +757,11 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    println!(
+        "focus-probe on {}: {}",
+        machine.name,
+        many_band_text(&output.lines)
+    );
     println!(
         "focus-probe on {}: the longest steps under -icount, ticks (0.9 of term B {}, portions {PORTION_MAX}): compositor {}; tablet's driver {}; display driver {}",
         machine.name,
@@ -947,6 +985,23 @@ mod tests {
         assert!(steps_verdict(&run(11)).unwrap_err().contains("Layers"));
         assert!(steps_verdict(&run(9)).unwrap_err().contains("Pipelines"));
         assert!(steps_verdict(&run(10)).unwrap_err().contains("Source"));
+    }
+
+    #[test]
+    fn the_band_of_the_many_windows_is_the_longest_after_the_survivor() {
+        let row =
+            |ticks: u64| format!("service step: 17 kind 65 {ticks} ticks preempts 0 wall {ticks}");
+        let lines = vec![
+            row(9_000),
+            format!("{SURVIVOR}0123abcd"),
+            row(14_348),
+            row(15_000),
+        ];
+        assert_eq!(many_band(&lines), Some(15_000));
+        assert!(many_band_text(&lines).contains("15000"));
+        let before = vec![row(9_000), format!("{SURVIVOR}0123abcd")];
+        assert_eq!(many_band(&before), None);
+        assert!(many_band_text(&before).contains("no band step"));
     }
 
     #[test]
