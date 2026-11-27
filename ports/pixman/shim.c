@@ -4,7 +4,7 @@
 // What pixman asks of a C library, for the composition service (a program
 // with no C library). The allocator is a first-fit arena over a static
 // buffer: the service allocates a few hundred bytes per image and per
-// implementation table, once, and the service is one thread. The functions
+// implementation table, once, and each of its two threads has an arena of its own. The functions
 // of <math.h> that the gradients and the filters use are the CPU's square
 // root, absolute value and rounding; the ones the service never reaches
 // (the conical gradient, the Gaussian filter) end the program.
@@ -15,7 +15,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "pxs.h"
+
 #define ARENA_BYTES (32 * 1024)
+// The worker draws one source and one target at a time through its own
+// table of images, so its arena is half of the service's.
+#define WORKER_ARENA_BYTES (16 * 1024)
 #define ALIGN 16
 
 struct block {
@@ -23,24 +28,7 @@ struct block {
     size_t free; // 1 when the block is free
 };
 
-static unsigned char arena[ARENA_BYTES] __attribute__((aligned(ALIGN)));
-static int started;
-
 #define HEADER ((sizeof(struct block) + ALIGN - 1) & ~(size_t)(ALIGN - 1))
-
-static struct block *next(struct block *b)
-{
-    unsigned char *p = (unsigned char *)b + HEADER + b->size;
-    return p >= arena + ARENA_BYTES ? 0 : (struct block *)p;
-}
-
-static void start(void)
-{
-    struct block *b = (struct block *)arena;
-    b->size = ARENA_BYTES - HEADER;
-    b->free = 1;
-    started = 1;
-}
 
 // The small blocks (up to SMALL_MAX bytes) a free gives back are kept for the
 // next allocation of their size, one list for each multiple of ALIGN: a block of
@@ -50,22 +38,82 @@ static void start(void)
 // free blocks after it cost thousands of ticks for each. A kept block is marked 2
 // and is not joined or split; the arena's walk passes it.
 #define SMALL_MAX 512
-static struct block *kept[SMALL_MAX / ALIGN + 1];
+
+// The state of pixman that a call changes, one record for each thread that
+// calls it: the arena the allocator serves from, its lists of small blocks, and
+// the cache of the paths found (pixman-implementation.c, through pxs_cache). The
+// main thread uses `main_state`. The worker's thread points TPIDR_EL0 at
+// `worker_state` (pxs_worker_enter) and uses that: the two threads share no
+// state that a call writes, so the one of the lower level may be preempted
+// anywhere in a call. The tables of the implementations are made by the main
+// thread before the worker starts and are read alone after that.
+struct pxs_state {
+    unsigned char *arena;
+    size_t size;
+    int started;
+    struct block *kept[SMALL_MAX / ALIGN + 1];
+    unsigned char cache[PXS_CACHE_BYTES] __attribute__((aligned(ALIGN)));
+};
+
+static unsigned char main_arena[ARENA_BYTES] __attribute__((aligned(ALIGN)));
+static unsigned char worker_arena[WORKER_ARENA_BYTES] __attribute__((aligned(ALIGN)));
+static struct pxs_state main_state = {main_arena, ARENA_BYTES};
+static struct pxs_state worker_state = {worker_arena, WORKER_ARENA_BYTES};
+
+static struct pxs_state *state(void)
+{
+#ifdef PXS_HOST_STATE
+    return pxs_host_state == (void *)&worker_state ? &worker_state : &main_state;
+#else
+    uintptr_t t;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(t));
+    return t == (uintptr_t)&worker_state ? &worker_state : &main_state;
+#endif
+}
+
+void pxs_worker_enter(void)
+{
+#ifdef PXS_HOST_STATE
+    pxs_host_state = (void *)&worker_state;
+#else
+    __asm__ volatile("msr tpidr_el0, %0" : : "r"((uintptr_t)&worker_state));
+#endif
+}
+
+void *pxs_cache(void)
+{
+    return state()->cache;
+}
+
+static struct block *next(struct pxs_state *s, struct block *b)
+{
+    unsigned char *p = (unsigned char *)b + HEADER + b->size;
+    return p >= s->arena + s->size ? 0 : (struct block *)p;
+}
+
+static void start(struct pxs_state *s)
+{
+    struct block *b = (struct block *)s->arena;
+    b->size = s->size - HEADER;
+    b->free = 1;
+    s->started = 1;
+}
 
 void *pxs_malloc(size_t n)
 {
-    if (!started)
-        start();
+    struct pxs_state *s = state();
+    if (!s->started)
+        start(s);
     n = (n + ALIGN - 1) & ~(size_t)(ALIGN - 1);
     if (n == 0)
         n = ALIGN;
-    if (n <= SMALL_MAX && kept[n / ALIGN]) {
-        struct block *b = kept[n / ALIGN];
-        kept[n / ALIGN] = *(struct block **)((unsigned char *)b + HEADER);
+    if (n <= SMALL_MAX && s->kept[n / ALIGN]) {
+        struct block *b = s->kept[n / ALIGN];
+        s->kept[n / ALIGN] = *(struct block **)((unsigned char *)b + HEADER);
         b->free = 0;
         return (unsigned char *)b + HEADER;
     }
-    for (struct block *b = (struct block *)arena; b; b = next(b)) {
+    for (struct block *b = (struct block *)s->arena; b; b = next(s, b)) {
         if (b->free != 1 || b->size < n)
             continue;
         if (b->size >= n + HEADER + ALIGN) {
@@ -80,14 +128,20 @@ void *pxs_malloc(size_t n)
     return 0;
 }
 
+// A block goes back to the arena it was made in: a thread frees what it made
+// (the images of a thread's own table), and a pointer of the other arena is
+// ignored, so a mistake of a caller leaks a block and never corrupts a list.
 void pxs_free(void *p)
 {
+    struct pxs_state *s = state();
     if (!p)
+        return;
+    if ((unsigned char *)p < s->arena || (unsigned char *)p >= s->arena + s->size)
         return;
     struct block *b = (struct block *)((unsigned char *)p - HEADER);
     if (b->size <= SMALL_MAX) {
-        *(struct block **)p = kept[b->size / ALIGN];
-        kept[b->size / ALIGN] = b;
+        *(struct block **)p = s->kept[b->size / ALIGN];
+        s->kept[b->size / ALIGN] = b;
         b->free = 2;
         return;
     }
@@ -96,9 +150,9 @@ void pxs_free(void *p)
     // not join it backwards (the blocks have no link to the one before), so
     // joining only the blocks that follow the one freed leaves free blocks side by
     // side for good, and the walk of `pxs_malloc` grows with them.
-    for (struct block *c = (struct block *)arena; c; c = next(c))
+    for (struct block *c = (struct block *)s->arena; c; c = next(s, c))
         while (c->free == 1) {
-            struct block *n = next(c);
+            struct block *n = next(s, c);
             if (!n || n->free != 1)
                 break;
             c->size += HEADER + n->size;
