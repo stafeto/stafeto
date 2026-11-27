@@ -7,9 +7,7 @@
 //! working: a description of the old instance answers STALE or its session is dead, a file the data
 //! file service holds is read on, and a new session of the new instance lists and reads as before.
 
-use super::{
-    Checks, Opened, call, list_of, open, read_pass, say, session, stat, status_is, take_root,
-};
+use super::{Checks, Opened, call, list_of, open, say, stat, status_is, take_root};
 use proto_fs::names::{self as n, NameMethod};
 use proto_wire::Writer;
 use rt::handle::{Channel, Handle};
@@ -255,7 +253,6 @@ pub fn run() -> i32 {
             _ => Err(format_args!("the listing")),
         },
     );
-    let _ = (read_pass, session);
     if t.failed == 0 {
         say(format_args!("restart checks passed"));
         0

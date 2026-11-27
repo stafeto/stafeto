@@ -35,7 +35,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Release};
 use layerd::identity::{Binding, Vouched, vouched_from};
 use layerd::index::Index;
-use layerd::names::{Client, Core, Done, OpenCont, Prewalk, State, Walked};
+use layerd::names::{Client, Core, Done, OpenCont, Prewalk, State};
 use layerd::scan::Scan;
 use proto_fs::names::{self as n, NameMethod};
 use proto_init::ServiceArgs;
@@ -161,6 +161,16 @@ const fn epoch_of(ticks: u64) -> u16 {
     if epoch == 0 { 1 } else { epoch }
 }
 
+/// Maps the stack pages below the frame of `main`: the first touch of a page of the stack is a fault
+/// the kernel serves, and a request that went deeper into the stack than any before it (a long path,
+/// the open of a file) paid for it in its step. The array is the frame of this call alone.
+#[inline(never)]
+fn touch_stack() {
+    let mut pad = [0u8; 64 * 1024];
+    touch(pad.as_mut_ptr(), pad.len());
+    core::hint::black_box(&mut pad);
+}
+
 fn main(_: u64) -> u64 {
     let Ok(mut s) = rt::startup() else {
         return NO_START_DATA;
@@ -230,6 +240,7 @@ fn main(_: u64) -> u64 {
     }
     // SAFETY: the statics are used by this thread alone from here on.
     let (index, scan) = unsafe { (&mut *INDEX.0.get(), &mut *SCAN.0.get()) };
+    touch_stack();
     touch(INDEX.0.get().cast(), core::mem::size_of::<Index>());
     touch(SCAN.0.get().cast(), core::mem::size_of::<Scan>());
     let epoch = epoch_of(rt::time::now());
@@ -661,7 +672,8 @@ impl Layerd {
                 };
                 match kind {
                     JobKind::Open { flags } => {
-                        self.core.open_walked(&c, flags, Some(walked), b"", &mut w)
+                        self.core
+                            .open_walked(&c, flags, Some(walked), true, b"", &mut w)
                     }
                     JobKind::Stat { flags } => self
                         .core
@@ -761,7 +773,16 @@ impl Layerd {
                     owner: label,
                     who: &who,
                 };
-                match self.core.open(&c, flags, path, r.reply()) {
+                let opened = self.core.open(&c, flags, path, r.reply());
+                // What the longest OPEN was: 7300 a redirect or a description, 7301 a pass, 7302 a
+                // refusal (the detail of the line of the steps).
+                #[cfg(feature = "steps")]
+                rt::service::step_detail(match &opened {
+                    Ok(Done::Pass(_)) => 7301,
+                    Err(_) => 7302,
+                    _ => 7300,
+                });
+                match opened {
                     Ok(Done::Written) => Answer::Reply(rt::handle::Outgoing::new()),
                     Ok(Done::Pass(pass)) => Answer::Reply([pass].into()),
                     // `Core::open` runs the calls to their end.

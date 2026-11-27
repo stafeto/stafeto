@@ -938,7 +938,7 @@ fn a_long_path_walked_in_steps_comes_to_the_answer_of_the_walk_in_one_piece() {
             let mut once = Writer::new();
             let mut stepped = Writer::new();
             let a = core.open(&c, f::READ_ONLY, path.as_bytes(), &mut once);
-            let mut b = core.open_walked(&c, f::READ_ONLY, Some(walked), b"", &mut stepped);
+            let mut b = core.open_walked(&c, f::READ_ONLY, Some(walked), true, b"", &mut stepped);
             // The calls to the volume go on one at a time: three of them for a file.
             let mut calls = 0;
             while let Ok(Done::Continue(cont)) = b {

@@ -669,21 +669,20 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         path: &[u8],
         w: &mut Writer,
     ) -> R<Done<V::Pass>> {
-        let mut done = self.open_walked(c, flags, None, path, w)?;
-        while let Done::Continue(cont) = done {
-            done = self.open_continue(c, cont, w)?;
-        }
-        Ok(done)
+        self.open_walked(c, flags, None, false, path, w)
     }
 
     /// OPEN of a path the walk of which was made in steps (`prewalk_step`), or of `path` when None.
-    /// The open of a file of the layer ends in `Done::Continue`: its calls to the data file service
-    /// go on with `open_continue`.
+    /// With `stepwise` the open of a file of the layer ends in `Done::Continue`: its calls to the
+    /// data file service go on with `open_continue`, one in each step (a copy of the state is a
+    /// copy of 530 bytes, 1,600 ticks under -icount, so the request that does all the calls in
+    /// its own step does not make it).
     pub fn open_walked(
         &mut self,
         c: &Client<'_>,
         flags: u32,
         walked: Option<Walked>,
+        stepwise: bool,
         path: &[u8],
         w: &mut Writer,
     ) -> R<Done<V::Pass>> {
@@ -735,12 +734,37 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         }
         let mut vp = [0u8; 512];
         let len = self.vpath_of(&walked, id, &mut vp)?;
-        Ok(Done::Continue(OpenCont {
-            vp,
-            len,
-            phase: OpenPhase::Stat,
-            handle: 0,
-        }))
+        if stepwise {
+            return Ok(Done::Continue(OpenCont {
+                vp,
+                len,
+                phase: OpenPhase::Stat,
+                handle: 0,
+            }));
+        }
+        let path = &vp[..len];
+        self.open_rights(c, path)?;
+        let handle = self.volume.open(path, d::READ, 0).map_err(from_volume)?;
+        self.open_pass(handle, w)
+    }
+
+    /// The right to read the file at `path` on the volume.
+    fn open_rights(&mut self, c: &Client<'_>, path: &[u8]) -> R<()> {
+        let stat = self.volume.stat(path).map_err(from_volume)?;
+        if permits(c.who.identity(false), &attr_of(&stat), READ) {
+            Ok(())
+        } else {
+            Err(st(proto_fs::ACCESS_DENIED))
+        }
+    }
+
+    /// The pass of the description `handle`, which closes whatever the pass came to.
+    fn open_pass(&mut self, handle: u32, w: &mut Writer) -> R<Done<V::Pass>> {
+        let pass = self.volume.export(handle);
+        let _ = self.volume.close(handle);
+        let pass = pass.map_err(from_volume)?;
+        OpenAnswer::Pass.write(w)?;
+        Ok(Done::Pass(pass))
     }
 
     /// The next call of the OPEN of a file of the layer: the rights, then the description, then
@@ -754,10 +778,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         let path = &cont.vp[..cont.len];
         match cont.phase {
             OpenPhase::Stat => {
-                let stat = self.volume.stat(path).map_err(from_volume)?;
-                if !permits(c.who.identity(false), &attr_of(&stat), READ) {
-                    return Err(st(proto_fs::ACCESS_DENIED));
-                }
+                self.open_rights(c, path)?;
                 cont.phase = OpenPhase::Open;
                 Ok(Done::Continue(cont))
             }
@@ -766,13 +787,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
                 cont.phase = OpenPhase::Export;
                 Ok(Done::Continue(cont))
             }
-            OpenPhase::Export => {
-                let pass = self.volume.export(cont.handle);
-                let _ = self.volume.close(cont.handle);
-                let pass = pass.map_err(from_volume)?;
-                OpenAnswer::Pass.write(w)?;
-                Ok(Done::Pass(pass))
-            }
+            OpenPhase::Export => self.open_pass(cont.handle, w),
         }
     }
 

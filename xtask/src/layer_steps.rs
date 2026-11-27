@@ -163,10 +163,21 @@ pub fn breaks(machine: &qemu::Machine) -> Result<(), String> {
         let features: &'static [&'static str] =
             Box::leak(vec!["steps", feature].into_boxed_slice());
         let (output, seconds) = boot(machine, features)?;
+        // A step the watch of init finds too long kills the service (`went silent`): caught too.
+        let silent = output
+            .lines
+            .iter()
+            .find(|l| l.contains("layerd went silent"));
         match gate(&output.lines) {
             Err(why) if why.contains("kind 64") || why.contains("over 0.9 B") => {
                 println!(
                     "layer-steps breaks: {feature} is caught by the gate ({why}) in {seconds} s"
+                );
+            }
+            _ if silent.is_some() => {
+                println!(
+                    "layer-steps breaks: {feature} is caught by the watch of init ({}) in {seconds} s",
+                    silent.map_or("", String::as_str)
                 );
             }
             Err(why) => {
