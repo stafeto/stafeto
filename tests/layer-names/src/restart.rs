@@ -7,7 +7,7 @@
 //! working: a description of the old instance answers STALE or its session is dead, a file the data
 //! file service holds is read on, and a new session of the new instance lists and reads as before.
 
-use super::{Checks, Opened, call, list_of, open, say, stat, status_is, take_root};
+use super::{Checks, Opened, call, list_of, open, say, stat, status_is};
 use proto_fs::names::{self as n, NameMethod};
 use proto_wire::Writer;
 use rt::handle::{Channel, Handle};
@@ -199,7 +199,7 @@ pub fn run() -> i32 {
     t.check(
         "a stat on the new session",
         match stat(&names2, "/etc/layer-own") {
-            Ok(info) if u64::from(info.size) == OWN.len() as u64 && info.kind == 2 => Ok(()),
+            Ok(info) if info.size == OWN.len() as u64 && info.kind == 2 => Ok(()),
             _ => Err(format_args!("the stat failed")),
         },
     );
