@@ -22,6 +22,9 @@ uart-input = []
 procfs = ["posix-abi/procfs", "posix-platform/procfs"]
 # The data file service at /data in the layer (libc.so has it).
 data = ["posix-abi/data", "posix-platform/data"]
+# The layer service at the root in the layer (the layered root of an image whose init table has
+# layerd). It brings the data file service with it, whose passes and redirects it uses.
+layer = ["data", "posix-abi/layer", "posix-platform/layer"]
 # Part of libc.so, the C library that dynamically linked programs share:
 # `stafeto_start(area, main)` replaces the program's `main` symbol and
 # `__ehdr_start`; the loader writes the auxiliary vector (spec 2, 3.12.3).

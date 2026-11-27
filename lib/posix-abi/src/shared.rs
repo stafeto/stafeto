@@ -307,9 +307,20 @@ pub(crate) fn descriptor_information(
     if let Target::Data(data) = target {
         return crate::data::fstat(data.handle);
     }
-    transport
+    if let Target::Layer(layer) = target {
+        return crate::layer::fstat(layer.handle);
+    }
+    let info = transport
         .descriptor_information(target)
-        .map_err(crate::error)
+        .map_err(crate::error)?;
+    // A description the layered root opened (a lower file) is of the root's one device, as its
+    // path is.
+    Ok(match target {
+        Target::Ram(ram) if posix_fs::layer::is_marked_ram(ram.fd()) => {
+            posix_fs::layer::stamp(info)
+        }
+        _ => info,
+    })
 }
 
 /// Runs `run` with the transports and `path` resolved against the
@@ -518,6 +529,8 @@ fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
         Target::Tty(number) => terminal_reply(transport, number, count, &mut *out),
         Target::Net(net) => net_reply(net.description, count, &mut *out),
         Target::Data(data) => data_reply(data, count, &mut *out),
+        // A directory of the layer service has no bytes to read.
+        Target::Layer(_) => Err(EISDIR),
         Target::Random(_) => random_reply(count, &mut *out),
         // An epoll descriptor has nothing to read.
         Target::Epoll(_) => Err(EINVAL),
@@ -745,6 +758,15 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
                     _ => return Err(EINVAL),
                 };
                 return crate::data::seek(data, offset, whence);
+            }
+            if let Target::Layer(layer) = target {
+                let whence = match origin {
+                    posix_fs::SeekFrom::Start => 0,
+                    posix_fs::SeekFrom::Current => 1,
+                    posix_fs::SeekFrom::End => 2,
+                    _ => return Err(EINVAL),
+                };
+                return crate::layer::seek(layer, offset, whence);
             }
             transport
                 .lseek(target, offset, origin)

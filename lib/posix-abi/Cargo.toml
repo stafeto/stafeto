@@ -18,6 +18,11 @@ procfs = []
 # The data file service at /data (data.rs, proto_data): the paths under /data, the descriptions of the
 # service and the session with it. libc.so has it; the other images do not carry the code.
 data = ["dep:proto-data"]
+# The layer service at the root (layer.rs, proto_fs::names): the paths of the layered root, the
+# descriptions of the service and the session with it. It needs the data file service for the
+# passes and the redirects to `/data`. libc.so does not have it until the shell image takes it; a
+# static program has it when it asks.
+layer = ["data"]
 # Read-only resident named-open witness, absent from shipped builds.
 fifo-probe = []
 # threads::set_level, the levels of rtbench 2's threads (tests/rtbench-posix).

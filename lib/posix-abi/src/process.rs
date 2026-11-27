@@ -1146,7 +1146,9 @@ impl Shadow {
                     posix_fs::Target::Input => Names::Input,
                     posix_fs::Target::Output => Names::Output,
                     posix_fs::Target::Error => Names::Error,
-                    posix_fs::Target::Ram(n) => Names::File(n.fd()),
+                    // The mark of a description of the layered root rides in the word, so that
+                    // the new image reports the same `st_dev`.
+                    posix_fs::Target::Ram(n) => Names::File(posix_fs::layer::mark_word(n.fd())),
                     posix_fs::Target::Pipe(n) => Names::Pipe(n),
                     posix_fs::Target::Net(n) => Names::Net {
                         description: n.description,
@@ -1162,6 +1164,10 @@ impl Shadow {
                     posix_fs::Target::Data(n) => Names::Data {
                         handle: n.handle,
                         directory: n.directory,
+                    },
+                    posix_fs::Target::Layer(n) => Names::Layer {
+                        handle: n.handle,
+                        directory: true,
                     },
                     // An epoll descriptor never reaches the new image: its set
                     // goes with ABANDON, and its number is free there.
@@ -1275,6 +1281,20 @@ impl Shadow {
             }),
             false,
         )
+    }
+
+    /// A clone of the session with the layer service that shares the descriptions the child's
+    /// descriptors name, none when it has none (the child takes a session at its first use of
+    /// the layered root).
+    fn clone_layer(&self) -> Result<Option<Handle<Channel>>, i32> {
+        let (list, count) = self.descriptors()?;
+        crate::layer::clone_for_child(list[..count].iter().filter_map(|d| match d.names {
+            proto_loader::Names::Layer { handle, .. } => Some(posix_fs::data::Held {
+                handle,
+                clofork: false,
+            }),
+            _ => None,
+        }))
     }
 
     /// The descriptions of sockets the child's session shares, each once.
@@ -1560,6 +1580,13 @@ pub fn spawn_search<'s, 'a>(
     if search.is_none() && crate::data::route(crate::names::AT_FDCWD, file)?.is_some() {
         return Err(crate::constants::EACCES);
     }
+    // A path of the layered root goes through the layer service first: the layers that delete the
+    // name make it ENOENT, and a name of a layer of the user is never run.
+    if search.is_none()
+        && let Some(abs) = crate::layer::route(crate::names::AT_FDCWD, file)?
+    {
+        crate::layer::check_exec(&abs)?;
+    }
     let pgroup = attributes.pgroup;
     if pgroup > i32::MAX as u32 || attributes.flags & !proto_process::SPAWN_FLAGS != 0 {
         return Err(EINVAL);
@@ -1802,6 +1829,11 @@ fn exec_selected<'s>(
         && crate::data::route(crate::names::AT_FDCWD, path)?.is_some()
     {
         return Err(crate::constants::EACCES);
+    }
+    if let ExecSource::Path(path) = source
+        && let Some(abs) = crate::layer::route(crate::names::AT_FDCWD, path)?
+    {
+        crate::layer::check_exec(&abs)?;
     }
     // The claimed network device stays with this image (spec 6, 3.9).
     if crate::fast::claimed() {
@@ -2198,6 +2230,8 @@ fn move_files(c: &Handle<Channel>) -> bool {
             // The session with the data file service goes on with the descriptions of the
             // descriptors that stay: its binding lapses, and the new image binds it again.
             (Slot::Data, moved(crate::data::session_for_exec())),
+            // The same for the session with the layer service.
+            (Slot::Layer, moved(crate::layer::session_for_exec())),
         ],
     ) == 0
 }
@@ -2308,6 +2342,7 @@ fn commit(
     let display = crate::display::clone_session();
     let packages = crate::packages::clone_session();
     let data = shadow.clone_data()?;
+    let layer = shadow.clone_layer()?;
     let (nets, count) = shadow.shared_nets()?;
     // The child carries 64 descriptors at most: one portion.
     let net = crate::net::clone_kept(|out| {
@@ -2325,6 +2360,7 @@ fn commit(
         (Slot::Net, net),
         (Slot::Packages, packages),
         (Slot::Data, data),
+        (Slot::Layer, layer),
     ];
     if give_sessions(c, sessions) != 0 {
         return Err(EIO);

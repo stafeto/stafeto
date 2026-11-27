@@ -238,6 +238,10 @@ pub unsafe extern "C" fn stafeto_getdents(
             if let Target::Data(data) = target {
                 return data_entries(data, out, Some(position));
             }
+            // So does a directory of the layer service (a merged directory of the layered root).
+            if let Target::Layer(layer) = target {
+                return posix_abi::layer::entries(layer.handle, out, Some(position));
+            }
             entries(transport, target, out, position)
         })
     });
@@ -1389,6 +1393,9 @@ pub unsafe extern "C" fn stafeto_posix_getdents(fd: c_int, buf: *mut u8, len: us
             }
             if let Target::Data(data) = target {
                 return data_entries(data, out, None);
+            }
+            if let Target::Layer(layer) = target {
+                return posix_abi::layer::entries(layer.handle, out, None);
             }
             let position = transport
                 .lseek(target, 0, SeekFrom::Current)

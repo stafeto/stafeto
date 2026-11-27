@@ -54,6 +54,11 @@ pub mod fast_events;
 pub mod fast_tickets;
 pub mod fastnet;
 pub mod ipc;
+#[cfg(feature = "layer")]
+pub mod layer;
+#[cfg(not(feature = "layer"))]
+#[path = "layer_off.rs"]
+pub mod layer;
 pub mod lock_fields;
 pub mod long;
 pub mod metadata;
@@ -313,6 +318,10 @@ fn open_policy_once(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result<
     if let Some(vol) = data::route(names::AT_FDCWD, name)? {
         return data::open(&vol, flags, mode, umask);
     }
+    // The other paths are the layered root's, where the image has the layer service (layer).
+    if let Some(abs) = layer::route(names::AT_FDCWD, name)? {
+        return layer::open(&abs, flags, mode, umask);
+    }
     // The RAM file service takes every write as done at its return: the bit is the volume's.
     open_image(name, flags & !(O_SYNC | O_SEARCH), mode, umask)
 }
@@ -370,6 +379,10 @@ pub fn openat_policy(
     // A name against a directory of /data (data).
     if let Some(vol) = data::route(dirfd, name)? {
         return data::open(&vol, flags, mode, umask);
+    }
+    // A name against a directory of the layered root (layer).
+    if let Some(abs) = layer::route(dirfd, name)? {
+        return layer::open(&abs, flags, mode, umask);
     }
     let given = flags;
     let flags = flags & !(O_SYNC | O_SEARCH);

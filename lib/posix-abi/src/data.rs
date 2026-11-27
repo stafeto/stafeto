@@ -201,7 +201,7 @@ fn take_root() -> Result<Handle<Channel>, Attempt> {
 }
 
 /// A copy of the identity session for a request of the service to carry (it moves with the call).
-fn identity_copy() -> Result<rt::handle::Handle<rt::handle::Any>, i32> {
+pub(crate) fn identity_copy() -> Result<rt::handle::Handle<rt::handle::Any>, i32> {
     let Some(identity) = crate::process::identity() else {
         why!("no identity session in the start data of this process");
         return Err(EIO);
@@ -310,7 +310,7 @@ fn forget(raw: rt::abi::Handle) {
 // ---------------------------------------------------------------- the calls
 
 /// The status of a reply for a request the service has no job for (WouldBlock).
-fn busy_code() -> u32 {
+pub(crate) fn busy_code() -> u32 {
     Status::Kernel(Error::WouldBlock).code()
 }
 

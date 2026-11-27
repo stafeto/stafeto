@@ -430,9 +430,13 @@ fn classify(target: Target) -> Result<Kind, i32> {
         // The console is the terminal's descriptors of the process.
         Target::Input | Target::Output | Target::Error => Kind::Other,
         Target::Epoll(_) => return Err(EINVAL),
-        // Files of the file service, of `/proc`, of `/data` and the random devices have
-        // no waiting.
-        Target::Ram(_) | Target::Random(_) | Target::Proc(_) | Target::Data(_) => {
+        // Files of the file service, of `/proc`, of `/data`, the directories of the layer service
+        // and the random devices have no waiting.
+        Target::Ram(_)
+        | Target::Random(_)
+        | Target::Proc(_)
+        | Target::Data(_)
+        | Target::Layer(_) => {
             return Err(EPERM);
         }
     })

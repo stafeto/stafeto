@@ -343,10 +343,17 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
             Names::Input => InheritedTarget::Ready(Target::Input),
             Names::Output => InheritedTarget::Ready(Target::Output),
             Names::Error => InheritedTarget::Ready(Target::Error),
-            Names::File(n) => InheritedTarget::RawRam {
-                fd: n,
-                random_hint: false,
-            },
+            Names::File(n) => {
+                // A description the layered root opened carries its mark in the word.
+                let (fd, layered) = posix_fs::layer::unmark_word(n);
+                if layered {
+                    posix_fs::layer::mark_ram(fd);
+                }
+                InheritedTarget::RawRam {
+                    fd,
+                    random_hint: false,
+                }
+            }
             Names::Pipe(n) => InheritedTarget::Ready(Target::Pipe(n)),
             Names::Net {
                 description,
@@ -381,8 +388,13 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
             Names::Data { handle, directory } => {
                 InheritedTarget::Ready(Target::Data(posix_fs::DataTarget { handle, directory }))
             }
-            // A description of the layer service: its client in the layer of POSIX comes with the
-            // part that routes the paths of the root to it, and no loader gives one before.
+            // A directory description of the layer service, held by the session in the slot Layer.
+            // A build without the layer client has no such session: the number is not inherited.
+            #[cfg(feature = "layer")]
+            Names::Layer { handle, .. } => {
+                InheritedTarget::Ready(Target::Layer(posix_fs::LayerTarget { handle }))
+            }
+            #[cfg(not(feature = "layer"))]
             Names::Layer { .. } => continue,
             Names::PendingTerminal(_) => continue,
         };
@@ -556,6 +568,10 @@ fn loaded_main() -> u64 {
     // service's root (the genuine one passes with its descriptions, a forged one leaves the slot
     // empty); the service checks the identity only through the process service. SAFETY: as above.
     unsafe { posix_abi::data::init(one(Slot::Data).map(Handle::from_raw)) };
+    // The layer session of a set-ID program is the service's, as the loader verified it with the
+    // service's root (the genuine one passes with its descriptions, a forged one leaves the slot
+    // empty); the service checks the identity only through the process service. SAFETY: as above.
+    unsafe { posix_abi::layer::init(one(Slot::Layer).map(Handle::from_raw)) };
     posix_abi::fork::at_child(forked);
     // SAFETY: the platform's umask takes any mask.
     unsafe { stafeto_umask(area.umask) };
