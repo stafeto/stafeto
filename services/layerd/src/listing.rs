@@ -46,11 +46,22 @@ pub const SLOTS_PER_READDIR: usize = if cfg!(feature = "break-layerd-slots") {
 pub const LOWER_PER_STEP: usize = 4;
 const _: () = assert!(LOWER_PER_STEP <= LOWER_PER_READDIR);
 
-/// The descriptions whose lower directory is being opened at once. Each holds a preparation of the
-/// session of the service with the RAM file service (96 of them), and a change job holds one more
-/// while it resolves a lower path, so the listings leave the rest to the jobs.
-pub const LISTINGS_RESOLVING: u32 = 32;
-const _: () = assert!(LISTINGS_RESOLVING as usize + crate::jobs::JOBS < 96);
+/// The descriptions whose lower directory is being opened at once. Each holds a path job of the
+/// session of the service with the RAM file service, which has `proto_fs::SESSION_PREPARATIONS`
+/// (16) of them for everything the session holds: a change job holds one while it resolves a
+/// lower path, `JOBS` of them at most, and `MARGIN` stay free for the others the session may hold
+/// (a binding, a refresh). The listings get the rest.
+pub const LISTINGS_RESOLVING: u32 =
+    (proto_fs::SESSION_PREPARATIONS - crate::jobs::JOBS - MARGIN) as u32;
+/// The preparations of the session that neither jobs nor listings take.
+pub const MARGIN: usize = 4;
+/// The descriptions one session has being opened at once: a client that opens many directories
+/// cannot take the places of the others, whose opens only advance when they ask.
+pub const LISTINGS_PER_SESSION: usize = 1;
+const _: () = assert!(LISTINGS_RESOLVING >= 1);
+const _: () = assert!(
+    LISTINGS_RESOLVING as usize + crate::jobs::JOBS + MARGIN <= proto_fs::SESSION_PREPARATIONS
+);
 
 const DIRECTORY: u32 = 1;
 const REGULAR: u32 = 2;
@@ -84,6 +95,7 @@ pub fn read_dir<L: Lower>(
     open: &mut Option<L::Dir>,
     opening: &mut bool,
     resolving: &mut u32,
+    mine: usize,
     replayed: &mut u32,
     reply: &mut DirReply,
 ) -> R<Listed> {
@@ -163,8 +175,11 @@ pub fn read_dir<L: Lower>(
     // these has `more` and no entry; the position does not move, the state of the description
     // does.
     if open.is_none() {
-        if *resolving >= LISTINGS_RESOLVING {
-            return Ok(listed(position, true));
+        // No place: busy, which the client answers by waiting a little and asking again (the
+        // library of the C programs does so for STARTING); a reply with `more` and no entry is
+        // for the steps that make progress.
+        if *resolving >= LISTINGS_RESOLVING || mine >= LISTINGS_PER_SESSION {
+            return Err(Status::Unknown(proto_layer::STARTING));
         }
         let mut path = [0u8; 512];
         let n = index.path_of(dir, &mut path).ok_or(Status::BadSize)?;
@@ -179,6 +194,10 @@ pub fn read_dir<L: Lower>(
             // The directory is only in the layer of the user: nothing below it.
             Err(Status::Unknown(proto_fs::NO_ENTRY | proto_fs::NOT_DIRECTORY)) => {
                 Ok(listed(position, false))
+            }
+            // The session has no path job free: busy.
+            Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES)) => {
+                Err(Status::Unknown(proto_layer::STARTING))
             }
             Err(e) => Err(e),
         };

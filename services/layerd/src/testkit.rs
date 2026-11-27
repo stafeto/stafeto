@@ -436,6 +436,14 @@ pub struct FakeLower {
     pub live: usize,
     pub most: usize,
     pub cancelled: usize,
+    /// The answers that come back as stale after the delay (the tree changed under the resolve):
+    /// the poll says None again, and the delay runs once more.
+    pub stale: u32,
+    /// The preparations the session holds at most (0 for no limit): a start past it is refused
+    /// with TOO_MANY_OPEN_FILES.
+    pub limit: usize,
+    /// The poll after which a resolve fails with INVALID_ARGUMENT, counted over all of them.
+    pub fail_at: Option<usize>,
 }
 
 pub struct LowerDir {
@@ -482,9 +490,18 @@ impl FakeLower {
 }
 
 impl FakeLower {
-    fn begin(&mut self) {
+    fn begin(&mut self) -> R<()> {
+        if self.limit != 0 && self.live >= self.limit {
+            return Err(st(proto_fs::TOO_MANY_OPEN_FILES));
+        }
         self.live += 1;
         self.most = self.most.max(self.live);
+        Ok(())
+    }
+
+    /// Whether this poll is the one that fails.
+    fn failing(&self) -> bool {
+        self.fail_at == Some(self.polls)
     }
 
     fn open_now(&mut self, path: &[u8]) -> R<Vec<(u64, u32, Vec<u8>)>> {
@@ -542,7 +559,7 @@ impl Lower for FakeLower {
     type Probe = FakeProbe;
 
     fn open_dir_start(&mut self, path: &[u8]) -> R<LowerDir> {
-        self.begin();
+        self.begin()?;
         Ok(LowerDir {
             entries: Vec::new(),
             pos: 0,
@@ -555,8 +572,18 @@ impl Lower for FakeLower {
             return Ok(true);
         };
         self.polls += 1;
+        if self.fail_at == Some(self.polls) {
+            dir.opening = None;
+            self.live -= 1;
+            return Err(st(proto_fs::INVALID_ARGUMENT));
+        }
         if *left > 0 {
             *left -= 1;
+            return Ok(false);
+        }
+        if self.stale > 0 {
+            self.stale -= 1;
+            *left = self.delay;
             return Ok(false);
         }
         let path = std::mem::take(path);
@@ -591,7 +618,7 @@ impl Lower for FakeLower {
     }
 
     fn stat_start(&mut self, path: &[u8], _follow: bool) -> R<FakeProbe> {
-        self.begin();
+        self.begin()?;
         Ok(FakeProbe {
             path: path.to_vec(),
             left: self.delay,
@@ -602,8 +629,18 @@ impl Lower for FakeLower {
     fn stat_poll(&mut self, probe: &mut FakeProbe) -> R<Option<LowerStat>> {
         assert!(!probe.spent, "poll of a spent stat");
         self.polls += 1;
+        if self.failing() {
+            probe.spent = true;
+            self.live -= 1;
+            return Err(st(proto_fs::INVALID_ARGUMENT));
+        }
         if probe.left > 0 {
             probe.left -= 1;
+            return Ok(None);
+        }
+        if self.stale > 0 {
+            self.stale -= 1;
+            probe.left = self.delay;
             return Ok(None);
         }
         probe.spent = true;

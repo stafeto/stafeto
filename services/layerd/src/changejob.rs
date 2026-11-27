@@ -994,6 +994,16 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     }
 
     /// One lower component of the directory part: its stat.
+    ///
+    /// The bound of the lock. Each component is a stat of its whole path from the root, so a lower
+    /// chain of k components costs the RAM file service about k*(k+1)/2 resolve steps (about
+    /// 1,400 ticks each) for the walk, and as many again for the directories a copy up makes
+    /// (`stage_ensure`), all of them with the job holding the lock of the changes. Each is a step
+    /// of the loop of its own, so no step is longer, but a change below a deep chain holds the
+    /// lock for many of them, and the other changes wait their turns (round robin over the
+    /// places, about `JOBS - 1` times the longest change). A resolve of each prefix against the
+    /// descriptor of its parent (`Files::path_start` takes a base) would make the cost linear; it
+    /// needs a descriptor of the RAM file service for each level, and is left for a later change.
     fn step_lower(
         &mut self,
         c: &Client<'_>,
@@ -1131,6 +1141,8 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                         job.empty.empty = true;
                         Ok(true)
                     }
+                    // The session has no path job free: the start is made again in the next step.
+                    Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES)) => Ok(false),
                     Err(e) => Err(Stop::Status(e)),
                 }
             }

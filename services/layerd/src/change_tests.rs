@@ -1469,6 +1469,68 @@ fn a_lower_path_resolved_over_steps_gives_the_answer_of_one_that_is_not() {
 }
 
 #[test]
+fn a_stale_resolve_polls_again_and_an_error_or_a_refusal_leaves_nothing_in_flight() {
+    // The tree changed under the resolve twice: the polls start over and the answer is the same.
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    core.lower.delay = 1;
+    core.lower.stale = 2;
+    let (result, _) = by_steps(&mut core, 0, ChangeOp::Mkdir, 0o755, "/deep/a/b/new", "");
+    assert_eq!(result, Ok(()));
+    assert_eq!((core.lower.live, core.lower.stale), (0, 0));
+    // An error after some polls ends the change with it, and nothing is in flight or locked.
+    for (op, path) in [
+        (ChangeOp::Mkdir, "/deep/a/b/new2"),
+        (ChangeOp::Rmdir, "/empty"),
+    ] {
+        let mut world = World::new();
+        let mut core = world.core(volume());
+        ready(&mut core);
+        core.lower.delay = 2;
+        core.lower.fail_at = Some(core.lower.polls + 5);
+        let (result, _) = by_steps(&mut core, 0, op, 0o755, path, "");
+        assert_eq!(result, Err(st(proto_fs::INVALID_ARGUMENT)), "{path}");
+        assert_eq!(core.lower.live, 0, "{path}");
+        assert!(!core.change_locked());
+    }
+    // The session has no path job free: the job waits in its steps and goes on when one frees.
+    for (op, path) in [
+        (ChangeOp::Mkdir, "/deep/a/b/new3"),
+        (ChangeOp::Rmdir, "/empty"),
+    ] {
+        use crate::changejob::ChangeStep;
+        let mut world = World::new();
+        let mut core = world.core(volume());
+        ready(&mut core);
+        core.lower.limit = 1;
+        core.lower.live = 1;
+        let v = who(0);
+        let c = Client { owner: 40, who: &v };
+        let mut job = J::new();
+        job.start(0, op, 0o755, 0, path.as_bytes(), b"").unwrap();
+        for _ in 0..30 {
+            assert!(matches!(
+                core.change_step(&c, &mut job, &mut Writer::new()),
+                ChangeStep::More
+            ));
+        }
+        assert_eq!(core.lower.live, 1, "{path}: nothing was started");
+        core.lower.live = 0;
+        let mut done = false;
+        for _ in 0..500 {
+            if let ChangeStep::Done(r) = core.change_step(&c, &mut job, &mut Writer::new()) {
+                assert!(r.is_ok(), "{path}");
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "{path}");
+        assert_eq!(core.lower.live, 0);
+    }
+}
+
+#[test]
 fn an_open_of_the_lower_directory_for_the_emptiness_check_goes_on_over_steps() {
     for delay in [0, 3] {
         let mut world = World::new();
