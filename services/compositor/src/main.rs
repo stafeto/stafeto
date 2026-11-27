@@ -358,7 +358,13 @@ struct Axes {
 
 /// The frame being made: the rectangle and the next line.
 struct Job {
+    /// The bounds of the frame's damage: what the driver is told to show.
     damage: Rect,
+    /// The rectangles the bands walk, one after the other (`Scene::frame_damage`),
+    /// and the one the bands are in now.
+    rects: [Rect; compositor::damage::MAX_DAMAGE],
+    count: usize,
+    index: usize,
     at: Band,
     /// The groups of the layers of the place, made once when it began.
     passes: Option<compositor::Passes>,
@@ -1531,13 +1537,21 @@ impl Compositor {
         } else {
             damage.y
         };
+        let mut rects = [damage; compositor::damage::MAX_DAMAGE];
+        let list = self.scene.frame_damage();
+        let count = list.len().clamp(1, rects.len());
+        rects[..count].copy_from_slice(&list[..count]);
+        let row = if count == 1 { row } else { rects[0].y };
         let passes = if self.scene.frame_kind() == FrameKind::Bypass {
             None
         } else {
-            compositor::plan(&self.scene, damage)
+            compositor::plan(&self.scene, rects[0])
         };
         self.job = Some(Job {
             damage,
+            rects,
+            count,
+            index: 0,
             passes,
             at: Band {
                 row,
@@ -1567,7 +1581,7 @@ impl Compositor {
         let Some(job) = self.job.as_mut() else {
             return;
         };
-        if job.at.row >= job.damage.y + job.damage.h {
+        if job.at.row >= job.rects[job.index].y + job.rects[job.index].h {
             let damage = job.damage;
             self.job = None;
             #[cfg(feature = "steps")]
@@ -1590,7 +1604,7 @@ impl Compositor {
         let compose_began = rt::time::now();
         job.at = compose_planned(
             &self.scene,
-            job.damage,
+            job.rects[job.index],
             job.at,
             job.passes.as_ref(),
             fb,
@@ -1618,7 +1632,22 @@ impl Compositor {
         // band of images made.
         rt::service::step_detail(STEP_BAND + u64::from(self.raster.made().wrapping_sub(made)));
         self.scene.band_done();
-        let more = job.at.row < job.damage.y + job.damage.h;
+        // The last band of a rectangle goes on to the next one at once, in the
+        // same step: the groups of its layers are made for it, and its first band
+        // is the next step.
+        if job.at.row >= job.rects[job.index].y + job.rects[job.index].h
+            && job.index + 1 < job.count
+        {
+            job.index += 1;
+            let next = job.rects[job.index];
+            job.passes = compositor::plan(&self.scene, next);
+            job.at = Band {
+                row: next.y,
+                col: 0,
+                pass: 0,
+            };
+        }
+        let more = job.at.row < job.rects[job.index].y + job.rects[job.index].h;
         let now = now_ns();
         match self.pacer.band_done(now, now.saturating_sub(began), more) {
             frame::Band::Go => {
