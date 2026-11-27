@@ -489,6 +489,11 @@ impl Files {
         }
     }
 
+    /// A cancel that a signal keeps taking back is given up after `CANCEL_TRIES` sends, which
+    /// would leave the job in the session of the service (a slot of its sixteen path jobs) until
+    /// the session closes. That is harmless for the layer service: a cancel is interrupted only
+    /// while the thread's entries stay deferred, which the loop of the service does not do, and
+    /// a job that is left frees with the session.
     fn path_cancel_id(&self, id: u64) {
         let request = job_request(Method::ResolveCancel, id);
         for _ in 0..CANCEL_TRIES {

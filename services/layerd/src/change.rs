@@ -204,6 +204,8 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 Err(Status::Unknown(proto_fs::NO_ENTRY | proto_fs::NOT_DIRECTORY)) => {
                     Ok(Some(None))
                 }
+                // The session has no path job free: the job asks again in its next step.
+                Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES)) => Ok(None),
                 Err(e) => Err(e.into()),
             };
         };

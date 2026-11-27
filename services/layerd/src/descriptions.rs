@@ -166,6 +166,15 @@ impl<D> Table<D> {
         Ok(handle(place as u8, self.generations[place], self.epoch))
     }
 
+    /// The descriptions `owner` holds whose lower directory is being opened.
+    pub fn opening_held(&self, owner: u64) -> usize {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|d| d.opening && d.holds(owner))
+            .count()
+    }
+
     pub fn get(&mut self, owner: u64, h: u32) -> Result<&mut Description<D>, Lost> {
         let (place, generation, epoch) = split_handle(h);
         if epoch != self.epoch {

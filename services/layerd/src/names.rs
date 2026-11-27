@@ -1126,6 +1126,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             resolving,
             ..
         } = self;
+        let mine = table.opening_held(owner);
         let desc = table.get(owner, handle).map_err(Self::lost)?;
         let mut reply = DirReply::new()?;
         if desc.dir == crate::descriptions::GONE {
@@ -1142,6 +1143,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             &mut desc.lower,
             &mut desc.opening,
             resolving,
+            mine,
             &mut desc.replayed,
             &mut reply,
         )?;

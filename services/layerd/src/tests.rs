@@ -741,9 +741,7 @@ fn listings_resolving_at_once_are_capped_and_the_rest_ask_again() {
     }
     assert_eq!(stage, 1);
     for _ in 0..3 {
-        let (bytes, len) = core.read_dir(40, h).unwrap();
-        let (more, _, mut entries) = n::read_dir_reply(&bytes[..len]).unwrap();
-        assert!(more && entries.next().is_none());
+        assert_eq!(core.read_dir(40, h).err(), Some(st(proto_layer::STARTING)));
     }
     assert_eq!(core.lower.live, 0);
     core.resolving = 0;
@@ -779,6 +777,83 @@ fn listings_resolving_at_once_are_capped_and_the_rest_ask_again() {
         (core.lower.live, core.lower.cancelled, core.resolving),
         (0, 3, 0)
     );
+}
+
+fn to_lower_stage(core: &mut Core<'_, FakeVolume, FakeLower>, owner: u64, h: u32) {
+    for _ in 0..500 {
+        let (bytes, len) = core.read_dir(owner, h).unwrap();
+        let (_, cursor, _) = n::read_dir_reply(&bytes[..len]).unwrap();
+        if n::split_cursor(cursor).0 == 1 {
+            return;
+        }
+    }
+    panic!("the lower stage is not reached");
+}
+
+#[test]
+fn one_session_has_one_listing_opening_at_a_time_and_a_refused_start_is_busy() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    core.lower.delay = 50;
+    let (reply, _) = open(&mut core, 0, f::READ_ONLY, "/etc").unwrap();
+    let first = handle_of(&reply);
+    let (reply, _) = open(&mut core, 0, f::READ_ONLY, "/").unwrap();
+    let second = handle_of(&reply);
+    to_lower_stage(&mut core, 40, first);
+    core.read_dir(40, first).unwrap();
+    assert_eq!(core.resolving, 1);
+    // The second description of the session waits for its share, however often it asks, and
+    // the first goes on.
+    for _ in 0..5 {
+        loop {
+            if let Err(e) = core.read_dir(40, second) {
+                assert_eq!(e, st(proto_layer::STARTING));
+                break;
+            }
+            // The layer's own names of the second come first.
+            assert!(core.resolving <= 1);
+        }
+        core.read_dir(40, first).unwrap();
+    }
+    assert_eq!(core.lower.most, 1);
+    // A refusal of the RAM file service at the start is busy too, and starts nothing.
+    core.gone(40);
+    core.lower.limit = 1;
+    core.lower.live = 1;
+    let (reply, _) = open(&mut core, 1, f::READ_ONLY, "/etc").unwrap();
+    let h = handle_of(&reply);
+    let mut busy = false;
+    for _ in 0..500 {
+        if let Err(e) = core.read_dir(41, h) {
+            assert_eq!(e, st(proto_layer::STARTING));
+            busy = true;
+            break;
+        }
+    }
+    assert!(busy);
+    assert_eq!(core.resolving, 0);
+}
+
+#[test]
+fn an_error_of_a_poll_of_a_listing_gives_the_place_back() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    core.lower.delay = 3;
+    let (reply, _) = open(&mut core, 0, f::READ_ONLY, "/etc").unwrap();
+    let h = handle_of(&reply);
+    to_lower_stage(&mut core, 40, h);
+    core.lower.fail_at = Some(core.lower.polls + 2);
+    let mut failed = None;
+    for _ in 0..20 {
+        if let Err(e) = core.read_dir(40, h) {
+            failed = Some(e);
+            break;
+        }
+    }
+    assert_eq!(failed, Some(st(proto_fs::INVALID_ARGUMENT)));
+    assert_eq!((core.lower.live, core.resolving), (0, 0));
 }
 
 #[test]
