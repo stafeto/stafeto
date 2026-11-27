@@ -411,6 +411,17 @@ impl Drop for Disk {
 const DISK_BYTES: u64 = 64 << 20;
 /// The throughput mode writes 64 MiB: a disk of 256 MiB has a data partition of 127 MiB.
 const THROUGHPUT_DISK_BYTES: u64 = 256 << 20;
+/// The size of the disk file of a mode.
+fn disk_bytes(mode: Mode) -> u64 {
+    if matches!(
+        mode,
+        Mode::Throughput | Mode::Fast | Mode::Atomic | Mode::Steps
+    ) {
+        THROUGHPUT_DISK_BYTES
+    } else {
+        DISK_BYTES
+    }
+}
 const ENDS: &str = "init: posix-data ended: ";
 const ENDED: &str = "init: posix-data ended: exit code 0, not restarted";
 
@@ -496,18 +507,7 @@ fn boot_with(
         std::process::id(),
         mode.role()
     )));
-    let big = matches!(
-        mode,
-        Mode::Throughput | Mode::Fast | Mode::Atomic | Mode::Steps
-    );
-    crate::data_image::make_posix_volume(
-        &disk.0,
-        if big {
-            THROUGHPUT_DISK_BYTES
-        } else {
-            DISK_BYTES
-        },
-    )?;
+    crate::data_image::make_posix_volume(&disk.0, disk_bytes(mode))?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::store(&disk.0, None));
     if how.cpus > 0 {
@@ -553,9 +553,10 @@ fn run(mode: Mode, machine: &qemu::Machine, how: Boot) -> Result<(), String> {
         println!("{report}");
     }
     println!(
-        "data-posix {:?} on {}: {} checks of /data in the POSIX layer over the data file service in {} s: ok",
+        "data-posix {:?} on {} (disk {} MiB): {} checks of /data in the POSIX layer over the data file service in {} s: ok",
         mode,
         machine.name,
+        disk_bytes(mode) >> 20,
         mode.checks().len(),
         seconds
     );

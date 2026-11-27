@@ -27,7 +27,7 @@ use crate::attr::{
     RESERVE_BLOCKS, Standing, VOLUME_FORMAT, default_attr, read_entry,
 };
 use crate::binding::{self, Binding, Caller, Root, Vouched};
-use crate::fs::{Dir, Error, File, Fs, Kind, Open, PathEntry, Whence};
+use crate::fs::{Dir, Error, File, Fs, Kind, Open, PathEntry, Whence, blocks_of};
 use crate::{BLOCK, DIRS, Device, FILES};
 use posix_perm::{self as perm, Denial, TimesRequest};
 use proto_data as p;
@@ -340,6 +340,14 @@ pub struct Server {
     /// The leases on files (`lease.rs`) and the monotonic clock of the worker, in nanoseconds.
     leases: [lease::Lease; p::LEASES],
     mono: u64,
+    /// The walks a request makes (`walk_for`) take at most a fifth of the worker's time: after a
+    /// walk the next one waits four times as long as the job that made it lasted. `walk_began` is
+    /// the clock at the start of the job that walked, until the next job sets the clock.
+    walk_after: u64,
+    walk_began: Option<u64>,
+    /// The walks of requests since the start, for the tests.
+    #[cfg(test)]
+    pub(crate) walks: u32,
     /// The instant the request thread queued the job that runs, and the parts that answered
     /// `UNLEASED` so far.
     job_queued: u64,
@@ -566,6 +574,10 @@ impl Server {
             orphan_seq: 0,
             leases: [lease::Lease::EMPTY; p::LEASES],
             mono: 0,
+            walk_after: 0,
+            walk_began: None,
+            #[cfg(test)]
+            walks: 0,
             job_queued: 0,
             unleased: 0,
             lapse: lease::Lapse::EMPTY,
@@ -1193,9 +1205,10 @@ impl Server {
                 if size > current {
                     // Growing is blocks: the reserve and the room apply as to a write.
                     let mut room = self.room_bytes(fs, &caller)?;
-                    if size - current > room && fs.window_stale() {
-                        // As in a write: walk once before answering NO_SPACE.
-                        volume(fs.walk())?;
+                    if size - current > room
+                        && self.walk_for(fs, blocks_of(size - current - room))?
+                    {
+                        // As in a write: walk before answering NO_SPACE.
                         room = self.room_bytes(fs, &caller)?;
                     }
                     if size - current > room {
@@ -1828,6 +1841,23 @@ impl Server {
         Ok(usable * BLOCK as u64)
     }
 
+    /// Walks the tree to fill the allocator's window again when a request is `shortfall` blocks
+    /// short of room, and the walk could find that many (`Fs::walk_gain`) and the last walk of a
+    /// request is far enough behind (the duty cycle of `walk_after`). Whether it walked. A walk that
+    /// the stop notice ended is an IO status.
+    fn walk_for<D: Device>(&mut self, fs: &mut Fs<'_, D>, shortfall: u64) -> Res<bool> {
+        if fs.walk_gain() < shortfall || self.mono < self.walk_after {
+            return Ok(false);
+        }
+        self.walk_began = Some(self.mono);
+        #[cfg(test)]
+        {
+            self.walks += 1;
+        }
+        volume(fs.walk())?;
+        Ok(true)
+    }
+
     /// The bytes a write that starts at `start` of a file of `size` bytes may take: the part over
     /// the file's own bytes, and the room for the rest (the gap past the end is zeros that take
     /// blocks too).
@@ -1887,11 +1917,10 @@ impl Server {
         }
         // The blocks the write adds: the part past the end of the file, up to the room.
         let mut fits = self.write_fits(fs, caller, start, size)?;
-        if (allowed as u64) > fits && fs.window_stale() {
+        if (allowed as u64) > fits && self.walk_for(fs, blocks_of(allowed as u64 - fits))? {
             // The room comes from the bits of the allocator's window, which do not see the blocks
-            // that rewrites and removals gave back since the last walk. Walk once before answering
-            // NO_SPACE, as littlefs does at the wrap of its allocator, and count again.
-            volume(fs.walk())?;
+            // that rewrites and removals gave back since the last walk. The walk is what littlefs
+            // does at the wrap of its allocator; count again after it.
             fits = self.write_fits(fs, caller, start, size)?;
         }
         if (allowed as u64) > fits {
@@ -1904,10 +1933,6 @@ impl Server {
         self.nodes[ni].at = None;
         let n = volume(fs.write(file, &data[..allowed]))?;
         self.nodes[ni].at = Some(pos + n as u32);
-        if start < size {
-            // The blocks of the part rewritten in place are given back when the file is synced.
-            fs.note_freed_blocks((n as u64).min(size - start) / BLOCK as u64);
-        }
         if n > 0 {
             self.nodes[ni].wrote = true;
             self.nodes[ni].wrote_at = self.now;

@@ -3074,10 +3074,12 @@ fn the_work_before_ready_does_not_traverse_the_files_of_a_volume_full_of_them() 
     assert!(fs.stat(server::ORPHANS).is_ok());
 }
 
-/// A file of an eighth of the volume is replaced again and again, by a rewrite of the whole
-/// file and by a remove and a new file. Each round allocates new blocks and gives the old ones back,
-/// which the window's bits do not see until a walk. The writes must not get NO_SPACE while most of
-/// the volume is free: the request walks before it answers NO_SPACE.
+/// A file of an eighth of the volume is made again and again: the even rounds truncate it and write
+/// it anew, the odd rounds remove it and create a new file. Each round allocates new blocks and gives
+/// the old ones back, which the window's bits do not see until a walk. The writes must not get
+/// NO_SPACE while most of the volume is free: the request walks before it answers NO_SPACE. A
+/// rewrite in place never needed the walk: the part over the file's own bytes always fits
+/// (`fits = (size - start) + room`).
 #[test]
 fn rewrites_never_meet_no_space_on_a_mostly_free_volume() {
     let mut rig = Rig::new();
@@ -3106,4 +3108,162 @@ fn rewrites_never_meet_no_space_on_a_mostly_free_volume() {
             "most of the volume is free"
         );
     }
+}
+
+/// Files of 14,400 bytes (4 blocks each) written as the superuser until a write is short, so that
+/// the window has no free block. The number of files.
+fn fill_full(rig: &mut Rig) -> usize {
+    rig.mkdir(ROOT, b"/d", 0o777).unwrap();
+    let chunk = [9u8; 900];
+    let mut n = 0;
+    loop {
+        let path = std::format!("/d/fill{n}");
+        let h = rig
+            .open(ROOT, path.as_bytes(), p::WRITE | p::CREATE, 0o644)
+            .unwrap();
+        for _ in 0..16 {
+            match rig.write(ROOT, h, &chunk) {
+                Ok(900) => {}
+                _ => {
+                    rig.close(ROOT, h);
+                    return n;
+                }
+            }
+        }
+        rig.close(ROOT, h);
+        n += 1;
+    }
+}
+
+fn append(rig: &mut Rig, who: u64, h: u32, bytes: usize) -> Result<u32, Status> {
+    rig.write(who, h, &std::vec![3u8; bytes])
+}
+
+#[test]
+fn a_write_far_in_a_file_on_a_mostly_free_volume_makes_no_walk() {
+    let mut rig = Rig::new();
+    let h = rig.open(ROOT, b"/f", p::WRITE | p::CREATE, 0o666).unwrap();
+    rig.write(ROOT, h, b"x").unwrap();
+    let reads = rig.fs.device().reads;
+    // The gap of zeros up to the offset takes blocks, but the room holds them.
+    rig.call(ROOT, |w| p::pwrite(h, 300 << 10, b"y", w))
+        .unwrap();
+    assert_eq!(rig.server.walks, 0);
+    assert!(rig.fs.device().reads > reads);
+}
+
+#[test]
+fn a_second_no_space_on_a_full_volume_reads_nothing_and_a_short_count_leads_to_one_walk() {
+    let mut rig = Rig::new();
+    fill_full(&mut rig);
+    let h = rig
+        .open(ROOT, b"/last", p::WRITE | p::CREATE, 0o644)
+        .unwrap();
+    // The last short write took the blocks that were left; this one has none to take: the window
+    // holds blocks handed out since the walk, so it walks once to see what there is.
+    let before = rig.server.walks;
+    assert_eq!(append(&mut rig, ROOT, h, 900), Err(p::code(p::NO_SPACE)));
+    assert!(rig.server.walks <= before + 1);
+    // The walk found nothing: the window is fresh, and the next answers read no block.
+    let settled = rig.server.walks;
+    let reads = rig.fs.device().reads;
+    assert_eq!(append(&mut rig, ROOT, h, 900), Err(p::code(p::NO_SPACE)));
+    assert_eq!(append(&mut rig, ROOT, h, 900), Err(p::code(p::NO_SPACE)));
+    assert_eq!(rig.fs.device().reads, reads, "no read, no walk");
+    assert_eq!(rig.server.walks, settled);
+}
+
+#[test]
+fn an_unlink_after_the_volume_is_full_is_seen_by_the_next_write() {
+    let mut rig = Rig::new();
+    fill_full(&mut rig);
+    let h = rig
+        .open(ROOT, b"/last", p::WRITE | p::CREATE, 0o644)
+        .unwrap();
+    let _ = append(&mut rig, ROOT, h, 900);
+    assert_eq!(append(&mut rig, ROOT, h, 900), Err(p::code(p::NO_SPACE)));
+    let walks = rig.server.walks;
+    rig.ok(ROOT, |w| p::path_call(p::Method::Unlink, b"/d/fill0", w));
+    assert_eq!(append(&mut rig, ROOT, h, 900), Ok(900));
+    assert_eq!(rig.server.walks, walks + 1);
+    // The walk saw all the blocks of the file: more than one write fits.
+    assert_eq!(append(&mut rig, ROOT, h, 900), Ok(900));
+    assert_eq!(rig.server.walks, walks + 1);
+}
+
+#[test]
+fn a_growing_truncate_walks_for_the_blocks_an_unlink_gave_back() {
+    let mut rig = Rig::new();
+    fill_full(&mut rig);
+    let h = rig
+        .open(ROOT, b"/last", p::WRITE | p::CREATE, 0o644)
+        .unwrap();
+    let grow = |rig: &mut Rig, size: u64| rig.call(ROOT, |w| p::truncate(h, size, w));
+    assert_eq!(grow(&mut rig, 100 << 10), Err(p::code(p::NO_SPACE)));
+    let walks = rig.server.walks;
+    let reads = rig.fs.device().reads;
+    assert_eq!(grow(&mut rig, 100 << 10), Err(p::code(p::NO_SPACE)));
+    assert_eq!(rig.fs.device().reads, reads);
+    assert_eq!(rig.server.walks, walks);
+    for n in 0..8 {
+        let path = std::format!("/d/fill{n}");
+        rig.ok(ROOT, |w| {
+            p::path_call(p::Method::Unlink, path.as_bytes(), w)
+        });
+    }
+    assert!(grow(&mut rig, 20 << 10).is_ok());
+    assert_eq!(rig.server.walks, walks + 1);
+}
+
+#[test]
+fn a_user_at_the_reserve_gets_no_space_without_a_walk_each_time() {
+    let mut rig = Rig::new();
+    rig.put(ROOT, b"/keep", 0o666, b"abc");
+    fill_to_the_reserve(&mut rig);
+    let h = rig.open(OWNER, b"/keep", p::WRITE, 0).unwrap();
+    let far = |rig: &mut Rig| rig.call(OWNER, |w| p::pwrite(h, 100_000, b"x", w));
+    assert_eq!(far(&mut rig), Err(p::code(p::NO_SPACE)));
+    let walks = rig.server.walks;
+    let reads = rig.fs.device().reads;
+    assert_eq!(far(&mut rig), Err(p::code(p::NO_SPACE)));
+    assert_eq!(rig.fs.device().reads, reads);
+    assert_eq!(rig.server.walks, walks);
+    // The superuser still writes into the reserve.
+    let more = rig
+        .open(ROOT, b"/d/more", p::WRITE | p::CREATE, 0o666)
+        .unwrap();
+    assert_eq!(rig.write(ROOT, more, &[2u8; 900]).unwrap(), 900);
+}
+
+#[test]
+fn request_walks_cool_down_by_four_times_the_job_that_walked() {
+    const T: u64 = 1_000_000;
+    let mut rig = Rig::new();
+    rig.server.set_mono(T);
+    fill_full(&mut rig);
+    let h = rig
+        .open(ROOT, b"/last", p::WRITE | p::CREATE, 0o644)
+        .unwrap();
+    let _ = append(&mut rig, ROOT, h, 900);
+    let _ = append(&mut rig, ROOT, h, 900);
+    // The jobs above walked at T and ended 1,000 ns later: the next walk waits until T + 5,000.
+    rig.server.set_mono(T + 1_000);
+    rig.server.set_mono(T + 5_000);
+    rig.ok(ROOT, |w| p::path_call(p::Method::Unlink, b"/d/fill0", w));
+    let walks = rig.server.walks;
+    assert_eq!(append(&mut rig, ROOT, h, 900), Ok(900));
+    assert_eq!(rig.server.walks, walks + 1);
+    // That job lasted 10 ns: the next walk waits until T + 5,010 + 40.
+    rig.server.set_mono(T + 5_010);
+    rig.ok(ROOT, |w| p::path_call(p::Method::Unlink, b"/d/fill1", w));
+    // The blocks of the first file are used up, and those of the second are not seen yet.
+    while append(&mut rig, ROOT, h, 900).is_ok() {}
+    assert_eq!(
+        rig.server.walks,
+        walks + 1,
+        "the cool-down holds the walk back"
+    );
+    rig.server.set_mono(T + 5_050);
+    assert!(append(&mut rig, ROOT, h, 900).is_ok());
+    assert_eq!(rig.server.walks, walks + 2);
 }

@@ -415,6 +415,11 @@ impl Device for Disk {
         self.sectors
     }
 
+    fn walk_marks(&mut self, on: bool) {
+        // A walk of a request ends at the stop notice; `YIELD_OK` stays as the idle walk set it.
+        WALKING.store(on, Release);
+    }
+
     fn read(&mut self, sector: u64, out: &mut [u8]) -> Result<(), DeviceError> {
         // A stop notice ends a walk at its next read, and so does a queued job when the walk may
         // give way to one: the walk only reads, nothing is lost, and the glue leaves the caches of

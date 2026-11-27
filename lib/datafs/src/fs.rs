@@ -525,8 +525,11 @@ impl<'a, D: Device> Fs<'a, D> {
     /// refers to is marked, the others are free. The walk only reads. The estimate of freed blocks
     /// starts again from 0. Make it where no operation is half done (between jobs).
     pub fn walk(&mut self) -> Res<()> {
+        self.device.walk_marks(true);
         // SAFETY: as above.
-        check(self.call(|d, ctx| unsafe { datafs_walk(d, ctx) }))?;
+        let done = check(self.call(|d, ctx| unsafe { datafs_walk(d, ctx) }));
+        self.device.walk_marks(false);
+        done?;
         self.freed = 0;
         Ok(())
     }
@@ -568,12 +571,19 @@ impl<'a, D: Device> Fs<'a, D> {
         Ok(self.window_free())
     }
 
-    /// A walk could show more free blocks than the window's bits do: the allocator has handed out
-    /// blocks since the last walk (its next block is not 0), or removals and truncations gave
-    /// blocks back (`freed_estimate`). Right after a walk with nothing allocated since, a second
-    /// walk finds the same count.
-    pub fn window_stale(&self) -> bool {
-        self.window_state().1 != 0 || self.freed != 0
+    /// The most blocks a walk could add to the free count: twice the blocks the allocator has
+    /// handed out since the last walk (each may have replaced a block of a copy-on-write rewrite),
+    /// the blocks that removals and truncations gave back (`freed_estimate`) and the blocks the
+    /// window does not hold. 0 for a volume larger than the window, where `free_blocks` walks the
+    /// tree itself and is exact.
+    pub fn walk_gain(&self) -> u64 {
+        // SAFETY: reads a field of the state.
+        let capacity = u64::from(unsafe { datafs_window_blocks(self.state.0.as_ptr().cast()) });
+        if capacity < self.blocks() {
+            return 0;
+        }
+        let (_, next, size) = self.window_state();
+        2 * u64::from(next) + self.freed + self.blocks().saturating_sub(u64::from(size))
     }
 
     /// The window is filled and holds less than the volume: the allocator walked in the middle of a
@@ -594,7 +604,9 @@ impl<'a, D: Device> Fs<'a, D> {
     /// A file of `bytes` left the tree: its blocks come back at the next walk. A file small enough to
     /// live inside its directory's metadata (`INLINE_MAX` bytes or fewer) owns no block.
     pub fn note_freed_file(&mut self, bytes: u64) {
-        self.freed += file_blocks(bytes);
+        // Each block of a file holds 8 bytes less than a block (the skip list).
+        let blocks = file_blocks(bytes);
+        self.freed += file_blocks(bytes + 8 * blocks).max(blocks);
     }
 
     /// `blocks` blocks came back (a directory's pair, for one).
