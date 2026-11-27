@@ -2087,6 +2087,142 @@ fn pkg_files(address: &str, roots: &[u8]) -> Vec<RootFile> {
     ]
 }
 
+/// The lower set of the probes of the POSIX layer on the layered root (the image `boot-layer-posix.img`
+/// and the image of its shell `boot-layer-ash.img`): the files the layer of the volume
+/// (`data_image::LAYER_POSIX_VOLUME_ENTRIES`) shadows, deletes or hides, the programs the C probe
+/// starts when `programs` (one a set-ID program of another owner, one the layer deletes), a
+/// directory the layer does not touch and one whose lower entries the layer hides in a row.
+fn layer_posix_lower(programs: bool) -> Vec<RootFile> {
+    // In the strictly ascending order of the paths.
+    let mut files = vec![dir("/bin")];
+    if programs {
+        files.extend([
+            file("/bin/layer-posix", 0o755, ROOT, "layer-posix"),
+            of(
+                "/bin/layer-posix-gone",
+                0o755,
+                ROOT,
+                Source::Bytes("layer-posix-gone", b"the layer deletes this program\n"),
+            ),
+            // Owned by another user, set-ID: a spawn of it runs with a real ID that differs
+            // from the effective one, and the loader verifies its layer session with the
+            // root of the service.
+            of(
+                "/bin/layer-posix-suid",
+                0o4755,
+                (1000, 100),
+                Source::Variant {
+                    program: "layer-posix",
+                    tag: "setid",
+                    extra: 4096,
+                },
+            ),
+        ]);
+    }
+    files.push(dir("/dev"));
+    files.extend(devices());
+    files.extend([
+        of(
+            "/etc/layer-hidden",
+            0o644,
+            ROOT,
+            Source::Bytes("layerp-etc-hidden", b"hidden by the layer\n"),
+        ),
+        of(
+            "/etc/layer-lower",
+            0o644,
+            ROOT,
+            Source::Bytes("layerp-etc-lower", b"lower of etc\n"),
+        ),
+        dir("/lowdir"),
+        of(
+            "/lowdir/l1",
+            0o644,
+            ROOT,
+            Source::Bytes("layerp-lowdir-l1", b"l1\n"),
+        ),
+        of(
+            "/lowdir/l2",
+            0o644,
+            ROOT,
+            Source::Bytes("layerp-lowdir-l2", b"l2\n"),
+        ),
+        dir("/lower"),
+        of(
+            "/lower/hidden",
+            0o644,
+            ROOT,
+            Source::Bytes("layerp-lower-hidden", b"lower hidden\n"),
+        ),
+        of(
+            "/lower/keep",
+            0o644,
+            ROOT,
+            Source::Bytes("layerp-lower-keep", b"lower keep\n"),
+        ),
+        of(
+            "/lower/shadowed",
+            0o644,
+            ROOT,
+            Source::Bytes("layerp-lower-shadowed", b"lower shadowed\n"),
+        ),
+        // A lower directory closed to other users (0700).
+        RootFile {
+            path: "/lowpriv",
+            mode: 0o700,
+            uid: 0,
+            gid: 0,
+            source: None,
+        },
+        of(
+            "/lowpriv/f",
+            0o644,
+            ROOT,
+            Source::Bytes("layerp-lowpriv-f", b"lower closed\n"),
+        ),
+        // Twenty lower files, of which the layer hides the first sixteen: the first
+        // listings of the merged directory have no entry and say there is more.
+        dir("/many"),
+    ]);
+    for i in 0..20 {
+        let path: &'static str = Box::leak(format!("/many/f{i:02}").into_boxed_str());
+        let name: &'static str = Box::leak(format!("layerp-many-{i:02}").into_boxed_str());
+        let bytes: &'static [u8] =
+            Box::leak(format!("many {i:02}\n").into_bytes().into_boxed_slice());
+        files.push(of(path, 0o644, ROOT, Source::Bytes(name, bytes)));
+    }
+    files.extend([
+        // A lower directory no layer touches: the file service lists it.
+        dir("/plain"),
+        of(
+            "/plain/a",
+            0o644,
+            ROOT,
+            Source::Bytes("layerp-plain-a", b"a\n"),
+        ),
+        of(
+            "/plain/b",
+            0o644,
+            ROOT,
+            Source::Bytes("layerp-plain-b", b"b\n"),
+        ),
+        of(
+            "/plain/c",
+            0o644,
+            ROOT,
+            Source::Bytes("layerp-plain-c", b"c\n"),
+        ),
+        dir("/private"),
+        of(
+            "/private/lower",
+            0o644,
+            ROOT,
+            Source::Bytes("layerp-private-lower", b"lower private\n"),
+        ),
+    ]);
+    files
+}
+
 /// The list of the image `name`: none for an image with no table.
 pub fn files_of(name: &str) -> Vec<RootFile> {
     let mut files = match name {
@@ -2654,139 +2790,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             ]);
             files
         }
-        // The lower set of the probe of the POSIX layer on the layered root (tests/layer-posix): the
-        // files the layer of the volume (`data_image::LAYER_POSIX_VOLUME_ENTRIES`) shadows, deletes
-        // or hides, the programs the probe starts (one a set-ID program of another owner, one the
-        // layer deletes), a directory the layer does not touch and one whose lower entries the
-        // layer hides in a row.
-        "boot-layer-posix.img" => {
-            // In the strictly ascending order of the paths.
-            let mut files = vec![
-                dir("/bin"),
-                file("/bin/layer-posix", 0o755, ROOT, "layer-posix"),
-                of(
-                    "/bin/layer-posix-gone",
-                    0o755,
-                    ROOT,
-                    Source::Bytes("layer-posix-gone", b"the layer deletes this program\n"),
-                ),
-                // Owned by another user, set-ID: a spawn of it runs with a real ID that differs from
-                // the effective one, and the loader verifies its layer session with the root of the
-                // service.
-                of(
-                    "/bin/layer-posix-suid",
-                    0o4755,
-                    (1000, 100),
-                    Source::Variant {
-                        program: "layer-posix",
-                        tag: "setid",
-                        extra: 4096,
-                    },
-                ),
-                dir("/dev"),
-            ];
-            files.extend(devices());
-            files.extend([
-                of(
-                    "/etc/layer-hidden",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layerp-etc-hidden", b"hidden by the layer\n"),
-                ),
-                of(
-                    "/etc/layer-lower",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layerp-etc-lower", b"lower of etc\n"),
-                ),
-                dir("/lowdir"),
-                of(
-                    "/lowdir/l1",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layerp-lowdir-l1", b"l1\n"),
-                ),
-                of(
-                    "/lowdir/l2",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layerp-lowdir-l2", b"l2\n"),
-                ),
-                dir("/lower"),
-                of(
-                    "/lower/hidden",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layerp-lower-hidden", b"lower hidden\n"),
-                ),
-                of(
-                    "/lower/keep",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layerp-lower-keep", b"lower keep\n"),
-                ),
-                of(
-                    "/lower/shadowed",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layerp-lower-shadowed", b"lower shadowed\n"),
-                ),
-                // A lower directory closed to other users (0700).
-                RootFile {
-                    path: "/lowpriv",
-                    mode: 0o700,
-                    uid: 0,
-                    gid: 0,
-                    source: None,
-                },
-                of(
-                    "/lowpriv/f",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layerp-lowpriv-f", b"lower closed\n"),
-                ),
-                // Twenty lower files, of which the layer hides the first sixteen: the first
-                // listings of the merged directory have no entry and say there is more.
-                dir("/many"),
-            ]);
-            for i in 0..20 {
-                let path: &'static str = Box::leak(format!("/many/f{i:02}").into_boxed_str());
-                let name: &'static str = Box::leak(format!("layerp-many-{i:02}").into_boxed_str());
-                let bytes: &'static [u8] =
-                    Box::leak(format!("many {i:02}\n").into_bytes().into_boxed_slice());
-                files.push(of(path, 0o644, ROOT, Source::Bytes(name, bytes)));
-            }
-            files.extend([
-                // A lower directory no layer touches: the file service lists it.
-                dir("/plain"),
-                of(
-                    "/plain/a",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layerp-plain-a", b"a\n"),
-                ),
-                of(
-                    "/plain/b",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layerp-plain-b", b"b\n"),
-                ),
-                of(
-                    "/plain/c",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layerp-plain-c", b"c\n"),
-                ),
-                dir("/private"),
-                of(
-                    "/private/lower",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layerp-private-lower", b"lower private\n"),
-                ),
-            ]);
-            files
-        }
+        // The lower sets of the probes of the POSIX layer on the layered root (tests/layer-posix and
+        // the shell of tests/busybox).
+        "boot-layer-posix.img" => layer_posix_lower(true),
+        "boot-layer-ash.img" => layer_posix_lower(false),
         "boot-cxx-probe.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -3978,6 +3985,7 @@ mod tests {
             "boot-data-posix-steps.img",
             "boot-layer-names.img",
             "boot-layer-posix.img",
+            "boot-layer-ash.img",
             "boot-posix-window.img",
             "boot-cxx-probe.img",
             "boot-gles-pbuffer.img",

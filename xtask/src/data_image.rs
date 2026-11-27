@@ -711,6 +711,40 @@ mod tests {
         std::env::temp_dir().join(format!("stafeto-data-image-{}-{name}", std::process::id()))
     }
 
+    /// The volumes of the probes of the layered root list each directory before what lies in it, no
+    /// path twice, and a number of a file once.
+    #[test]
+    fn the_layer_volumes_are_lists_of_directories_before_their_entries() {
+        for entries in [LAYER_VOLUME_ENTRIES, LAYER_POSIX_VOLUME_ENTRIES] {
+            let mut seen: Vec<&str> = Vec::new();
+            let mut numbers = Vec::new();
+            for entry in entries {
+                assert!(!seen.contains(&entry.path), "{} twice", entry.path);
+                let parent = entry.path.rsplit_once('/').map_or("", |(p, _)| p);
+                assert!(
+                    parent.is_empty() || seen.contains(&parent),
+                    "{}",
+                    entry.path
+                );
+                seen.push(entry.path);
+                if entry.ino != 0 {
+                    assert!(!numbers.contains(&entry.ino), "{}", entry.path);
+                    numbers.push(entry.ino);
+                }
+            }
+        }
+        // The probe of the POSIX layer has the layer's marks of the lower names it lists.
+        for name in ["f00", "f07", "f15"] {
+            let path = format!("/.layers/00/many/.wh.{name}");
+            assert!(LAYER_POSIX_VOLUME_ENTRIES.iter().any(|e| e.path == path));
+        }
+        assert!(
+            !LAYER_POSIX_VOLUME_ENTRIES
+                .iter()
+                .any(|e| e.path.ends_with(".wh.f16"))
+        );
+    }
+
     #[test]
     fn sizes_are_parsed() {
         assert_eq!(parse_size("2G"), Ok(2 << 30));

@@ -9,7 +9,10 @@
 #[cfg(any(
     all(feature = "ash-probe", feature = "ash-interactive"),
     all(feature = "ash-probe", feature = "ls-probe"),
-    all(feature = "ash-interactive", feature = "ls-probe")
+    all(feature = "ash-interactive", feature = "ls-probe"),
+    all(feature = "ash-layer", feature = "ash-probe"),
+    all(feature = "ash-layer", feature = "ash-interactive"),
+    all(feature = "ash-layer", feature = "ls-probe")
 ))]
 compile_error!("choose one BusyBox probe");
 
@@ -206,12 +209,33 @@ read mode rest < /tmp/o
 echo mode $mode
 exit 0";
 
+/// The script of the shell of the layered root (xtask layer-posix ash): a long listing of a directory
+/// the layer of the user and the lower set share, reads of a name of each and of a shadowed one, a
+/// name the layer deletes, a listing in which the layer hides lower names, and a write below `/tmp`.
+/// The long listing reads `/etc/passwd` for the owners' names through the layer service as well.
+#[cfg(feature = "ash-layer")]
+const ASH_LAYER_SCRIPT: &core::ffi::CStr = c"echo layer-shell-ready
+ls -la /etc
+cat /etc/layer-lower
+cat /etc/layer-own
+cat /lower/shadowed
+test -e /etc/layer-hidden || echo hidden-gone
+ls -1 /many
+cd /plain
+ls -1
+cat a
+cd /
+echo tmp-bytes > /tmp/f
+cat /tmp/f
+echo write > /etc/layer-lower || echo write-refused
+exit 0";
+
 /// The probe's C main: the applet and its arguments of the build's
 /// feature, then BusyBox's dispatcher.
 #[cfg(not(feature = "applets"))]
 #[unsafe(no_mangle)]
 extern "C" fn main(_: isize, _: *mut *mut c_char, _: *mut *mut c_char) -> c_int {
-    #[cfg(not(any(feature = "ash-probe", feature = "ls-probe")))]
+    #[cfg(not(any(feature = "ash-probe", feature = "ls-probe", feature = "ash-layer")))]
     let argv = [
         c"busybox".as_ptr(),
         c"cat".as_ptr(),
@@ -224,6 +248,14 @@ extern "C" fn main(_: isize, _: *mut *mut c_char, _: *mut *mut c_char) -> c_int 
         c"ash".as_ptr(),
         c"-c".as_ptr(),
         ASH_SCRIPT.as_ptr(),
+        core::ptr::null(),
+    ];
+    #[cfg(feature = "ash-layer")]
+    let argv = [
+        c"busybox".as_ptr(),
+        c"ash".as_ptr(),
+        c"-c".as_ptr(),
+        ASH_LAYER_SCRIPT.as_ptr(),
         core::ptr::null(),
     ];
     #[cfg(feature = "ls-probe")]

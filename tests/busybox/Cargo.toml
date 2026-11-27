@@ -18,6 +18,9 @@ ash-interactive = ["applets", "posix-crt/uart-input"]
 # the shell image of the utilities only.
 utilities = ["posix-crt/procfs"]
 ls-probe = []
+# The shell of the layered root (xtask layer-posix ash): ash runs a script of `ls -la /etc` and
+# the reads of names of the layers through the layer service (the feature `layer` of the layer).
+ash-layer = ["posix-crt/layer"]
 # BusyBox as the program of a file (posix_spawn, 5c): the applet and its
 # arguments are the program's own argv.
 applets = []

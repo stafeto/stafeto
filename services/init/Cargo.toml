@@ -280,6 +280,8 @@ table-data-posix = []
 table-layer-names = []
 # The C probe of the POSIX layer on the layered root (xtask layer-posix).
 table-layer-posix = []
+# The shell of the layered root (xtask layer-posix ash).
+table-layer-ash = []
 # The C probe of the window library (xtask posix-window).
 table-posix-window = []
 # The scene demo on OpenWF Composition over the compositor (xtask wfc-probe).

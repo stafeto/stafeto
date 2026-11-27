@@ -324,6 +324,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("layer-names-probe breaks", 20),
     ("layer-posix", 15),
     ("layer-posix breaks", 25),
+    ("layer-posix ash", 12),
     ("vi-dialog", 30),
     ("posix-window", 25),
     ("wfd-probe", 40),

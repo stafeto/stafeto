@@ -12,6 +12,11 @@
 //! pass-through names to the layer service (the feature `layer`). The probe prints a line for each
 //! check (`layer-posix: <check> ok`) and ends with `layer-posix: checks passed`.
 //!
+//! `ash` runs the shell of the layered root (`boot-layer-ash.img`, the same volume and lower set
+//! without the programs of the C probe): BusyBox's `ash` with a script of `ls -la /etc`, reads of
+//! names of the layers, a listing in which the layer hides lower names, a directory of the lower set
+//! alone, a write below `/tmp` and a write the root refuses (tests/busybox, feature `ash-layer`).
+//!
 //! `breaks` builds the probe's layer with each deliberate break (no path routed to the layer
 //! service, no session for a child) and runs the probe against it: the probe must fail, and the
 //! check each break is meant for must be one of the failures.
@@ -26,6 +31,9 @@ const PREFIX: &str = "layer-posix: ";
 const ENDS: &str = "init: layer-posix ended: ";
 const PASSED: &str = "layer-posix: checks passed";
 const IMAGE: &str = "boot-layer-posix.img";
+
+const ASH_IMAGE: &str = "boot-layer-ash.img";
+const ASH_ENDS: &str = "init: busybox-probe ended: ";
 
 /// The size of the disk file: the layout takes 1 MiB for the table, `store` half of the rest, and the
 /// data partition of 31 MiB holds the volume of the probe.
@@ -140,8 +148,148 @@ pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
     match args.first().map(String::as_str) {
         None => probe(machine),
         Some("breaks") if args.len() == 1 => breaks(machine),
-        Some(other) => Err(format!("layer-posix [breaks]: unknown argument {other}")),
+        Some("ash") if args.len() == 1 => ash(machine),
+        Some(other) => Err(format!(
+            "layer-posix [breaks | ash]: unknown argument {other}"
+        )),
     }
+}
+
+/// The image of the shell: the C probe's services with BusyBox's probe in its place.
+fn ash_programs() -> Vec<ImageProgram> {
+    let mut list = programs(&[], &[]);
+    list[0].3 = &["table-layer-ash"];
+    let at = list
+        .iter()
+        .position(|p| p.0 == "layer-posix")
+        .expect("the probe is in the image");
+    list[at] = (
+        "busybox-probe",
+        "busybox-probe",
+        crate::POSIX_STACK_SIZE,
+        &["ash-layer"],
+    );
+    list
+}
+
+/// The programs of the image of the shell, for the check of the stacks.
+#[cfg(test)]
+pub fn plain_ash_programs() -> Vec<ImageProgram> {
+    ash_programs()
+}
+
+/// The shell on the layered root: its output is the script's, in order.
+pub fn ash(machine: &qemu::Machine) -> Result<(), String> {
+    crate::relibc()?;
+    crate::busybox_build()?;
+    let kernel = build(Variant::Normal)?;
+    let image = write_boot_image_files(ASH_IMAGE, &ash_programs(), BOOT_PROFILE, &[], Vec::new())?;
+    let disk =
+        Disk(std::env::temp_dir().join(format!("stafeto-layer-ash-{}.img", std::process::id())));
+    crate::data_image::make_layer_posix_volume(&disk.0, DISK_BYTES)?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS).args(qemu::store(&disk.0, None));
+    let started = std::time::Instant::now();
+    let output = run_until(cmd, LIMIT, Some(ASH_ENDS), &kernel.elf)?;
+    registered(&output.lines)?;
+    qemu::expect_stopped_on(
+        &output,
+        "init: busybox-probe ended: exit code 0, not restarted",
+    )?;
+    read_ash(&output.lines)?;
+    println!(
+        "layer-posix ash on {}: the shell on the layered root in {} s: ok",
+        machine.name,
+        started.elapsed().as_secs()
+    );
+    Ok(())
+}
+
+/// The last word of a line of a long listing.
+fn last_word(line: &str) -> &str {
+    line.split_whitespace().last().unwrap_or("")
+}
+
+/// The output of the script of the shell (tests/busybox, `ASH_LAYER_SCRIPT`) after
+/// `layer-shell-ready`: the long listing of `/etc` (BusyBox's `ls` of this build prints the mode,
+/// the links, the size and the name, in the reverse of the order the directory gives them) with the
+/// names of the layer of the user and of the lower set and the sizes of the layer's files, then the
+/// lines of the rest of the script, in order (`ls -1` of `/many` is in the same reverse order).
+pub fn read_ash(lines: &[String]) -> Result<(), String> {
+    let at = lines
+        .iter()
+        .position(|l| l == "layer-shell-ready")
+        .ok_or_else(|| {
+            format!(
+                "no layer-shell-ready; last lines: {:?}",
+                &lines[lines.len().saturating_sub(8)..]
+            )
+        })?;
+    let rest = &lines[at + 1..];
+    let end = rest
+        .iter()
+        .position(|l| l == "lower of etc")
+        .ok_or("no line of the file layer-lower after the listing")?;
+    let listing = &rest[..end];
+    let find = |name: &str| listing.iter().find(|l| last_word(l) == name);
+    let wanted = [
+        ("layer-own", "-rw-r-----", "25"),
+        ("layer-note", "-rw-r--r--", "11"),
+        ("layer-world", "-rw-r--r--", "13"),
+        ("layer-secret", "-rw-------", "7"),
+        ("layer-lower", "-rw-r--r--", "13"),
+        (".", "drwxr-xr-x", "0"),
+        ("..", "drwxr-xr-x", "0"),
+    ];
+    for (name, mode, size) in wanted {
+        match find(name) {
+            Some(line)
+                if line.starts_with(mode) && line.split_whitespace().nth(2) == Some(size) => {}
+            other => {
+                return Err(format!(
+                    "the long listing has no {name:?} of mode {mode} and size {size}: {other:?}"
+                ));
+            }
+        }
+    }
+    // Each name once: the layer of the user and the lower set do not list one twice.
+    for (name, _, _) in wanted {
+        if listing.iter().filter(|l| last_word(l) == name).count() != 1 {
+            return Err(format!("the listing has {name:?} not once: {listing:?}"));
+        }
+    }
+    if find("layer-hidden").is_some() {
+        return Err("the listing shows layer-hidden, which the layer deletes".to_owned());
+    }
+    let after = [
+        "lower of etc",
+        "owned bytes of the layer",
+        "upper shadow",
+        "hidden-gone",
+        "f19",
+        "f18",
+        "f17",
+        "f16",
+        "own",
+        "c",
+        "b",
+        "a",
+        "a",
+        "tmp-bytes",
+    ];
+    let got = &rest[end..];
+    if got.len() < after.len() || !got.iter().zip(after).all(|(line, want)| line == want) {
+        return Err(format!(
+            "the lines after the listing are not {after:?}: {got:?}"
+        ));
+    }
+    if !got[after.len()..].iter().any(|l| l == "write-refused") {
+        return Err(format!(
+            "the shell wrote below the layers: {:?}",
+            &got[after.len()..]
+        ));
+    }
+    Ok(())
 }
 
 /// One boot with the probe built with `probe` features and the RAM file service with `ramfs`
@@ -325,6 +473,65 @@ mod tests {
         let mut v = all_ok();
         v.remove(0);
         assert!(read_lines(&v).is_err(), "no root registered");
+    }
+
+    #[test]
+    fn the_output_of_the_shell_is_read_line_by_line() {
+        let long = |mode: &str, size: &str, name: &str| format!("{mode}    1 {size:>9} {name}");
+        let mut lines: Vec<String> = vec![
+            "layer-shell-ready".into(),
+            "datafs: first walk made by a request, 32 blocks used".into(),
+        ];
+        lines.push(long("-rw-------", "80", "shadow"));
+        lines.push(long("-rw-r-----", "25", "layer-own"));
+        lines.push(long("-rw-r--r--", "11", "layer-note"));
+        lines.push(long("-rw-r--r--", "13", "layer-world"));
+        lines.push(long("-rw-------", "7", "layer-secret"));
+        lines.push(long("-rw-r--r--", "13", "layer-lower"));
+        lines.push(long("drwxr-xr-x", "0", ".."));
+        lines.push(long("drwxr-xr-x", "0", "."));
+        for l in [
+            "lower of etc",
+            "owned bytes of the layer",
+            "upper shadow",
+            "hidden-gone",
+            "f19",
+            "f18",
+            "f17",
+            "f16",
+            "own",
+            "c",
+            "b",
+            "a",
+            "a",
+            "tmp-bytes",
+            "ash: can't create /etc/layer-lower: Read-only file system",
+            "write-refused",
+        ] {
+            lines.push(l.to_owned());
+        }
+        assert_eq!(read_ash(&lines), Ok(()));
+        // The deleted name in the listing, a name twice, a missing name, a size that is not the
+        // layer's, a lower name that stayed hidden, and a write that went through each fail it.
+        let mut bad = lines.clone();
+        bad.insert(3, long("-rw-r--r--", "20", "layer-hidden"));
+        assert!(read_ash(&bad).is_err());
+        let mut bad = lines.clone();
+        bad.insert(3, long("-rw-r--r--", "13", "layer-lower"));
+        assert!(read_ash(&bad).is_err());
+        let mut bad = lines.clone();
+        bad.remove(4);
+        assert!(read_ash(&bad).is_err());
+        let mut bad = lines.clone();
+        bad[3] = long("-rw-r-----", "99", "layer-own");
+        assert!(read_ash(&bad).is_err());
+        let mut bad = lines.clone();
+        bad.retain(|l| l != "f17");
+        assert!(read_ash(&bad).is_err());
+        let mut bad = lines.clone();
+        bad.retain(|l| l != "write-refused");
+        assert!(read_ash(&bad).is_err());
+        assert!(read_ash(&lines[1..]).is_err());
     }
 
     #[test]

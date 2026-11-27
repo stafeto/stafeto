@@ -1695,6 +1695,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-data-posix") as usize
     + cfg!(feature = "table-layer-names") as usize
     + cfg!(feature = "table-layer-posix") as usize
+    + cfg!(feature = "table-layer-ash") as usize
     + cfg!(feature = "table-posix-window") as usize
     + cfg!(feature = "table-wfc") as usize
     + cfg!(feature = "table-wfc-steps") as usize
@@ -1814,6 +1815,7 @@ const _: () = assert!(
     feature = "table-data-posix",
     feature = "table-layer-names",
     feature = "table-layer-posix",
+    feature = "table-layer-ash",
     feature = "table-posix-window",
     feature = "table-wfc",
     feature = "table-wfc-steps",
@@ -2041,6 +2043,8 @@ pub const TABLE: &[Record] = ramfs::DATA_POSIX_TABLE;
 pub const TABLE: &[Record] = ramfs::LAYER_NAMES_TABLE;
 #[cfg(feature = "table-layer-posix")]
 pub const TABLE: &[Record] = ramfs::LAYER_POSIX_TABLE;
+#[cfg(feature = "table-layer-ash")]
+pub const TABLE: &[Record] = ramfs::LAYER_ASH_TABLE;
 #[cfg(feature = "table-posix-window")]
 pub const TABLE: &[Record] = window::TABLE;
 #[cfg(feature = "table-wfc")]
@@ -2152,6 +2156,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     ramfs::DATA_POSIX_TABLE,
     ramfs::LAYER_NAMES_TABLE,
     ramfs::LAYER_POSIX_TABLE,
+    ramfs::LAYER_ASH_TABLE,
     ramfs::DISPLAY_TABLE,
     ramfs::LOADER_CHANNELS_TABLE,
     ramfs::POSIX_POLL_TABLE,

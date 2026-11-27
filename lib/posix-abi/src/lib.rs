@@ -108,8 +108,12 @@ pub unsafe fn file_lock(fd: c_int, command: c_int, pointer: *mut u8) -> Result<c
     let result = (|| {
         let fd = u32::try_from(fd).map_err(|_| constants::EBADF)?;
         let target = shared::with_fd(fd, |files| files.target(fd).map_err(error))?;
-        // The data volume keeps no record locks: ENOLCK (XSH fcntl()).
-        if matches!(target, posix_fs::Target::Data(_)) {
+        // The data volume and a directory of the layer service keep no record locks: ENOLCK (XSH
+        // fcntl()).
+        if matches!(
+            target,
+            posix_fs::Target::Data(_) | posix_fs::Target::Layer(_)
+        ) {
             return Err(constants::ENOLCK);
         }
         // SAFETY: the calling platform supplies flock fields for this invocation.
@@ -793,8 +797,8 @@ pub fn pipe_status_flags(number: c_int, set: Option<c_int>) -> Result<Option<c_i
             Ok(Some((flags & 3) as c_int | append))
         }
         posix_fs::Target::Net(net) => net::status_flags(net.description, set).map(Some),
-        // A file or directory of /proc is read only.
-        posix_fs::Target::Proc(_) => Ok(Some(0)),
+        // A file or directory of /proc, and a directory of the layer service, is read only.
+        posix_fs::Target::Proc(_) | posix_fs::Target::Layer(_) => Ok(Some(0)),
         _ => Ok(None),
     })
 }

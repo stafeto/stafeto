@@ -1443,6 +1443,32 @@ pub const LAYER_POSIX_TABLE: &[Record] = &[
     super::entropy::ENTROPY,
 ];
 
+/// The shell of the layered root (`xtask layer-posix ash`): the tables of the probe of the POSIX
+/// layer with BusyBox's `ash` in the place of the C probe. It runs a script of the applets inside
+/// the shell, `ls -la /etc` first, on paths of the layers.
+pub const LAYER_ASH_TABLE: &[Record] = &[
+    RAM_FIFO_CLOCKED,
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 2 * PROCS_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    super::pkg::BLK_DATADISK,
+    super::pkg::DATAFS_CLOCKED,
+    super::pkg::LAYERD,
+    Record {
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
+        waits: &[super::Wait {
+            service: "layerd",
+            deadline_ms: 30_000,
+        }],
+        ..BUSYBOX_TABLE[3]
+    },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
+];
+
 /// The probe of the screen and the keys on libc.so (tests/display-run and
 /// tests/posix-so/dyn/display-probe.c, sub-project 3 part 3b): the RAM
 /// files, the process and clock services, the pipe service, the input

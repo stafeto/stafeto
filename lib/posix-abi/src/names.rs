@@ -1010,6 +1010,18 @@ fn statvfs_once(path: &[u8]) -> Result<Statvfs, c_int> {
         crate::data::stat(&vol)?;
         return crate::data::statvfs();
     }
+    // A path of the layered root exists when the layer service says so; the file system is the
+    // file service's own (the lower set is its, and the layer of the user has no block counts of
+    // its own to give a program that asks `df`).
+    if let Some(abs) = crate::layer::route(AT_FDCWD, path)? {
+        crate::layer::stat(&abs, true)?;
+        return statvfs_ram(b"/");
+    }
+    statvfs_ram(path)
+}
+
+/// The file system of a path of the file service.
+fn statvfs_ram(path: &[u8]) -> Result<Statvfs, c_int> {
     let placed = place(AT_FDCWD, path)?;
     let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
     if virtual_leaf(transport, &placed, true)?.is_some() {
