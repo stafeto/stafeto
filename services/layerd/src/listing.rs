@@ -46,6 +46,12 @@ pub const SLOTS_PER_READDIR: usize = if cfg!(feature = "break-layerd-slots") {
 pub const LOWER_PER_STEP: usize = 4;
 const _: () = assert!(LOWER_PER_STEP <= LOWER_PER_READDIR);
 
+/// The descriptions whose lower directory is being opened at once. Each holds a preparation of the
+/// session of the service with the RAM file service (96 of them), and a change job holds one more
+/// while it resolves a lower path, so the listings leave the rest to the jobs.
+pub const LISTINGS_RESOLVING: u32 = 32;
+const _: () = assert!(LISTINGS_RESOLVING as usize + crate::jobs::JOBS < 96);
+
 const DIRECTORY: u32 = 1;
 const REGULAR: u32 = 2;
 const SYMLINK: u32 = 5;
@@ -76,6 +82,8 @@ pub fn read_dir<L: Lower>(
     hidden: bool,
     position: &mut Position,
     open: &mut Option<L::Dir>,
+    opening: &mut bool,
+    resolving: &mut u32,
     replayed: &mut u32,
     reply: &mut DirReply,
 ) -> R<Listed> {
@@ -148,14 +156,23 @@ pub fn read_dir<L: Lower>(
     }
     // The open of the lower directory, the replay to the position a seek or an earlier request
     // left, and the entries themselves are steps of their own: each costs round trips to the RAM
-    // file service, and a request does one of them. A reply of the first two has `more` and no
-    // entry; the position does not move, the state of the description does.
+    // file service, and a request does one of them. The open is made in as many requests as the
+    // RAM file service has steps for the path (`Lower::open_dir_poll`), and no more than
+    // `LISTINGS_RESOLVING` descriptions are in it at once, so that the preparations of the session
+    // of the service (96 in the RAM file service) are never all taken by listings. A reply of
+    // these has `more` and no entry; the position does not move, the state of the description
+    // does.
     if open.is_none() {
+        if *resolving >= LISTINGS_RESOLVING {
+            return Ok(listed(position, true));
+        }
         let mut path = [0u8; 512];
         let n = index.path_of(dir, &mut path).ok_or(Status::BadSize)?;
-        return match lower.open_dir(&path[..n]) {
+        return match lower.open_dir_start(&path[..n]) {
             Ok(d) => {
                 *open = Some(d);
+                *opening = true;
+                *resolving += 1;
                 *replayed = 0;
                 Ok(listed(position, true))
             }
@@ -164,6 +181,33 @@ pub fn read_dir<L: Lower>(
                 Ok(listed(position, false))
             }
             Err(e) => Err(e),
+        };
+    }
+    if *opening {
+        let Some(d) = open.as_mut() else {
+            return Ok(listed(position, false));
+        };
+        return match lower.open_dir_poll(d) {
+            Ok(done) => {
+                if done {
+                    *opening = false;
+                    *resolving -= 1;
+                }
+                Ok(listed(position, true))
+            }
+            Err(e) => {
+                if let Some(d) = open.take() {
+                    lower.close_dir(d);
+                }
+                *opening = false;
+                *resolving -= 1;
+                match e {
+                    Status::Unknown(proto_fs::NO_ENTRY | proto_fs::NOT_DIRECTORY) => {
+                        Ok(listed(position, false))
+                    }
+                    e => Err(e),
+                }
+            }
         };
     }
     let Some(d) = open.as_mut() else {
@@ -219,20 +263,34 @@ pub fn rewind<L: Lower>(
     lower: &mut L,
     position: &mut Position,
     open: &mut Option<L::Dir>,
+    opening: &mut bool,
+    resolving: &mut u32,
     replayed: &mut u32,
 ) -> R<()> {
-    seek(lower, position, Position::default(), open, replayed, 0)
+    seek(
+        lower,
+        position,
+        Position::default(),
+        open,
+        opening,
+        resolving,
+        replayed,
+        0,
+    )
 }
 
 /// Puts a description at a cursor a reply gave. A stage other than 0 and 1 is INVALID_ARGUMENT, and
 /// so is a position past `given`, the furthest the replies of this description have gone: the
 /// cursor of a reply is what the service names, and a number the replies never gave points into
 /// the table or the lower directory at a place nobody asked to see.
+#[allow(clippy::too_many_arguments)]
 pub fn seek<L: Lower>(
     lower: &mut L,
     position: &mut Position,
     given: Position,
     open: &mut Option<L::Dir>,
+    opening: &mut bool,
+    resolving: &mut u32,
     replayed: &mut u32,
     cursor: u64,
 ) -> R<()> {
@@ -244,7 +302,11 @@ pub fn seek<L: Lower>(
     // The lower directory is read again from its start up to `at`, when the next request asks.
     if let Some(d) = open.take() {
         lower.close_dir(d);
+        if *opening {
+            *resolving -= 1;
+        }
     }
+    *opening = false;
     *replayed = 0;
     *position = wanted;
     Ok(())

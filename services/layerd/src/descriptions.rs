@@ -53,6 +53,9 @@ pub struct Description<D> {
     pub given: Position,
     /// The directory of the lower set, open from the first request of the second stage.
     pub lower: Option<D>,
+    /// The lower directory is still being opened (a preparation of the RAM file service that the
+    /// requests of the listing poll).
+    pub opening: bool,
     /// The entries of the open lower directory read so far (a request after a seek replays them
     /// up to the position, a few at a time).
     pub replayed: u32,
@@ -157,6 +160,7 @@ impl<D> Table<D> {
             position: Position::default(),
             given: Position::default(),
             lower: None,
+            opening: false,
             replayed: 0,
         });
         Ok(handle(place as u8, self.generations[place], self.epoch))

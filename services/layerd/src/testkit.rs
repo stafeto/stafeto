@@ -427,11 +427,29 @@ pub struct FakeLower {
     pub closed: usize,
     /// The entries `next` gave (and the ones it found at the end), for the cost of a request.
     pub nexts: usize,
+    /// The polls an open or a stat answers None to before its answer, as the steps of the RAM
+    /// file service do.
+    pub delay: u32,
+    /// The polls made, the preparations in flight and the most that were, and the ones given back
+    /// before their answer.
+    pub polls: usize,
+    pub live: usize,
+    pub most: usize,
+    pub cancelled: usize,
 }
 
 pub struct LowerDir {
     entries: Vec<(u64, u32, Vec<u8>)>,
     pos: usize,
+    /// The polls left before the open is done; None once it is.
+    opening: Option<(Vec<u8>, u32)>,
+}
+
+/// A stat in flight.
+pub struct FakeProbe {
+    path: Vec<u8>,
+    left: u32,
+    spent: bool,
 }
 
 impl FakeLower {
@@ -463,10 +481,13 @@ impl FakeLower {
     }
 }
 
-impl Lower for FakeLower {
-    type Dir = LowerDir;
+impl FakeLower {
+    fn begin(&mut self) {
+        self.live += 1;
+        self.most = self.most.max(self.live);
+    }
 
-    fn open_dir(&mut self, path: &[u8]) -> R<LowerDir> {
+    fn open_now(&mut self, path: &[u8]) -> R<Vec<(u64, u32, Vec<u8>)>> {
         match self.nodes.get(path) {
             None => return Err(st(proto_fs::NO_ENTRY)),
             Some((2, _)) => return Err(st(proto_fs::NOT_DIRECTORY)),
@@ -487,28 +508,10 @@ impl Lower for FakeLower {
                 entries.push((*ino, *kind, p[prefix.len()..].to_vec()));
             }
         }
-        Ok(LowerDir { entries, pos: 0 })
+        Ok(entries)
     }
 
-    fn next(&mut self, dir: &mut LowerDir, name: &mut [u8; 256]) -> R<Option<(u64, u32, usize)>> {
-        self.nexts += 1;
-        let Some((ino, kind, n)) = dir.entries.get(dir.pos) else {
-            return Ok(None);
-        };
-        dir.pos += 1;
-        name[..n.len()].copy_from_slice(n);
-        Ok(Some((*ino, *kind, n.len())))
-    }
-
-    fn close_dir(&mut self, _: LowerDir) {
-        self.closed += 1;
-    }
-
-    fn readlink(&mut self, _: &[u8], _: &mut [u8]) -> R<usize> {
-        Err(st(proto_fs::INVALID_ARGUMENT))
-    }
-
-    fn stat(&mut self, path: &[u8], _follow: bool) -> R<LowerStat> {
+    fn stat_now(&mut self, path: &[u8]) -> R<LowerStat> {
         self.stats += 1;
         // A name below a file or a link is no name.
         let mut at = 0;
@@ -531,6 +534,88 @@ impl Lower for FakeLower {
             gid,
             ino,
         })
+    }
+}
+
+impl Lower for FakeLower {
+    type Dir = LowerDir;
+    type Probe = FakeProbe;
+
+    fn open_dir_start(&mut self, path: &[u8]) -> R<LowerDir> {
+        self.begin();
+        Ok(LowerDir {
+            entries: Vec::new(),
+            pos: 0,
+            opening: Some((path.to_vec(), self.delay)),
+        })
+    }
+
+    fn open_dir_poll(&mut self, dir: &mut LowerDir) -> R<bool> {
+        let Some((path, left)) = dir.opening.as_mut() else {
+            return Ok(true);
+        };
+        self.polls += 1;
+        if *left > 0 {
+            *left -= 1;
+            return Ok(false);
+        }
+        let path = std::mem::take(path);
+        dir.opening = None;
+        self.live -= 1;
+        dir.entries = self.open_now(&path)?;
+        Ok(true)
+    }
+
+    fn next(&mut self, dir: &mut LowerDir, name: &mut [u8; 256]) -> R<Option<(u64, u32, usize)>> {
+        assert!(dir.opening.is_none(), "next on a directory being opened");
+        self.nexts += 1;
+        let Some((ino, kind, n)) = dir.entries.get(dir.pos) else {
+            return Ok(None);
+        };
+        dir.pos += 1;
+        name[..n.len()].copy_from_slice(n);
+        Ok(Some((*ino, *kind, n.len())))
+    }
+
+    fn close_dir(&mut self, dir: LowerDir) {
+        if dir.opening.is_some() {
+            self.live -= 1;
+            self.cancelled += 1;
+        } else {
+            self.closed += 1;
+        }
+    }
+
+    fn readlink(&mut self, _: &[u8], _: &mut [u8]) -> R<usize> {
+        Err(st(proto_fs::INVALID_ARGUMENT))
+    }
+
+    fn stat_start(&mut self, path: &[u8], _follow: bool) -> R<FakeProbe> {
+        self.begin();
+        Ok(FakeProbe {
+            path: path.to_vec(),
+            left: self.delay,
+            spent: false,
+        })
+    }
+
+    fn stat_poll(&mut self, probe: &mut FakeProbe) -> R<Option<LowerStat>> {
+        assert!(!probe.spent, "poll of a spent stat");
+        self.polls += 1;
+        if probe.left > 0 {
+            probe.left -= 1;
+            return Ok(None);
+        }
+        probe.spent = true;
+        self.live -= 1;
+        self.stat_now(&probe.path.clone()).map(Some)
+    }
+
+    fn stat_cancel(&mut self, probe: FakeProbe) {
+        if !probe.spent {
+            self.live -= 1;
+            self.cancelled += 1;
+        }
     }
 }
 

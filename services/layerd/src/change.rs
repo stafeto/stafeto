@@ -186,11 +186,42 @@ pub(crate) enum Leaf {
 impl<V: Volume, L: Lower> Core<'_, V, L> {
     // ------------------------------------------------------------------ small things
 
-    pub(crate) fn lower_stat(&mut self, path: &[u8]) -> F<Option<LowerStat>> {
-        match self.lower.stat(path, false) {
-            Ok(s) => Ok(Some(s)),
-            Err(Status::Unknown(proto_fs::NO_ENTRY | proto_fs::NOT_DIRECTORY)) => Ok(None),
-            Err(e) => Err(e.into()),
+    /// One round trip of the stat of `path` in the lower set (`Lower::stat_start`, then a poll
+    /// of each call). None while the RAM file service resolves the path: the caller leaves its
+    /// state as it is and asks again in its next step, with the same `probe` and `path`. Some
+    /// is the answer, None inside it for a name that does not exist.
+    pub(crate) fn lower_stat(
+        &mut self,
+        probe: &mut Option<L::Probe>,
+        path: &[u8],
+    ) -> F<Option<Option<LowerStat>>> {
+        let Some(p) = probe.as_mut() else {
+            return match self.lower.stat_start(path, false) {
+                Ok(p) => {
+                    *probe = Some(p);
+                    Ok(None)
+                }
+                Err(Status::Unknown(proto_fs::NO_ENTRY | proto_fs::NOT_DIRECTORY)) => {
+                    Ok(Some(None))
+                }
+                Err(e) => Err(e.into()),
+            };
+        };
+        match self.lower.stat_poll(p) {
+            Ok(None) => Ok(None),
+            Ok(Some(s)) => {
+                *probe = None;
+                Ok(Some(Some(s)))
+            }
+            Err(e) => {
+                if let Some(p) = probe.take() {
+                    self.lower.stat_cancel(p);
+                }
+                match e {
+                    Status::Unknown(proto_fs::NO_ENTRY | proto_fs::NOT_DIRECTORY) => Ok(Some(None)),
+                    e => Err(e.into()),
+                }
+            }
         }
     }
 

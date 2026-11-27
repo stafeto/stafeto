@@ -1436,6 +1436,84 @@ fn a_deep_copy_up_goes_on_in_many_steps_each_with_one_call() {
     assert!(node(&core, "/.layers/00/deep/a/b/new").is_some());
 }
 
+#[test]
+fn a_lower_path_resolved_over_steps_gives_the_answer_of_one_that_is_not() {
+    for delay in [0, 1, 5] {
+        let mut world = World::new();
+        let mut core = world.core(volume());
+        ready(&mut core);
+        core.lower.delay = delay;
+        let (result, counts) = by_steps(&mut core, 0, ChangeOp::Mkdir, 0o755, "/deep/a/b/new", "");
+        assert_eq!(result, Ok(()), "delay {delay}");
+        assert!(node(&core, "/.layers/00/deep/a/b/new").is_some());
+        assert!(node(&core, "/.layers/00/deep/a/b").is_some());
+        // One stat or open in flight at a time, none left, and each poll was a step of its own.
+        assert_eq!((core.lower.live, core.lower.most), (0, 1), "delay {delay}");
+        assert_eq!(core.lower.cancelled, 0);
+        assert!(
+            core.lower.polls >= core.lower.stats * (delay as usize + 1),
+            "delay {delay}: {} polls for {} stats",
+            core.lower.polls,
+            core.lower.stats
+        );
+        assert_one_call_a_step("copy up over polls", &counts, false);
+    }
+    // A name that is not there is the answer of the last poll.
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    core.lower.delay = 4;
+    let (result, _) = by_steps(&mut core, 0, ChangeOp::Mkdir, 0o755, "/nothere/x/y", "");
+    assert_eq!(result, Err(st(proto_fs::NO_ENTRY)));
+    assert_eq!(core.lower.live, 0);
+}
+
+#[test]
+fn an_open_of_the_lower_directory_for_the_emptiness_check_goes_on_over_steps() {
+    for delay in [0, 3] {
+        let mut world = World::new();
+        let mut core = world.core(volume());
+        ready(&mut core);
+        core.lower.delay = delay;
+        // A lower directory with a name in it is not empty, and an empty one goes.
+        let (full, _) = by_steps(&mut core, 0, ChangeOp::Rmdir, 0, "/lowdir", "");
+        assert_eq!(full, Err(st(proto_fs::NOT_EMPTY)), "delay {delay}");
+        let (empty, _) = by_steps(&mut core, 0, ChangeOp::Rmdir, 0, "/empty", "");
+        assert_eq!(empty, Ok(()), "delay {delay}");
+        assert_eq!((core.lower.live, core.lower.most), (0, 1));
+        assert_eq!(core.lower.opened, core.lower.closed);
+    }
+}
+
+#[test]
+fn a_job_dropped_in_the_middle_of_a_resolve_gives_the_preparation_back() {
+    use crate::changejob::ChangeStep;
+    let v = who(0);
+    let c = Client { owner: 40, who: &v };
+    for (op, path) in [
+        (ChangeOp::Mkdir, "/deep/a/b/new"),
+        (ChangeOp::Rmdir, "/empty"),
+    ] {
+        let mut world = World::new();
+        let mut core = world.core(volume());
+        ready(&mut core);
+        core.lower.delay = 1000;
+        let mut job = J::new();
+        job.start(0, op, 0o755, 0, path.as_bytes(), b"").unwrap();
+        for _ in 0..20 {
+            assert!(matches!(
+                core.change_step(&c, &mut job, &mut Writer::new()),
+                ChangeStep::More
+            ));
+        }
+        assert_eq!(core.lower.live, 1, "{path}: a preparation is in flight");
+        core.change_abandon(&mut job);
+        assert_eq!(core.lower.live, 0, "{path}");
+        assert_eq!(core.lower.cancelled, 1, "{path}");
+        assert!(!core.change_locked());
+    }
+}
+
 fn creating_job(core: &C<'_>, id: u8, path: &str) -> J {
     let _ = core;
     let mut job = J::new();

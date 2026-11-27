@@ -115,6 +115,8 @@ pub struct Core<'a, V: Volume, L: Lower> {
     live: [u8; 16],
     live_len: usize,
     pub(crate) table: Table<L::Dir>,
+    /// The descriptions whose lower directory is being opened (`listing::LISTINGS_RESOLVING`).
+    pub(crate) resolving: u32,
     /// What the changes keep between requests (`change`).
     pub(crate) writes: crate::change::Writes,
 }
@@ -300,6 +302,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             live: *b"/.layers/00\0\0\0\0\0",
             live_len: 11,
             table: Table::new(epoch),
+            resolving: 0,
             writes: crate::change::Writes::default(),
         }
     }
@@ -1120,6 +1123,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             table,
             index,
             lower,
+            resolving,
             ..
         } = self;
         let desc = table.get(owner, handle).map_err(Self::lost)?;
@@ -1136,6 +1140,8 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             desc.hidden,
             &mut desc.position,
             &mut desc.lower,
+            &mut desc.opening,
+            resolving,
             &mut desc.replayed,
             &mut reply,
         )?;
@@ -1158,25 +1164,39 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
 
     pub fn rewind(&mut self, owner: u64, handle: u32) -> R<()> {
         self.gate()?;
-        let Core { table, lower, .. } = self;
+        let Core {
+            table,
+            lower,
+            resolving,
+            ..
+        } = self;
         let desc = table.get(owner, handle).map_err(Self::lost)?;
         listing::rewind(
             lower,
             &mut desc.position,
             &mut desc.lower,
+            &mut desc.opening,
+            resolving,
             &mut desc.replayed,
         )
     }
 
     pub fn seek_dir(&mut self, owner: u64, handle: u32, cursor: u64) -> R<()> {
         self.gate()?;
-        let Core { table, lower, .. } = self;
+        let Core {
+            table,
+            lower,
+            resolving,
+            ..
+        } = self;
         let desc = table.get(owner, handle).map_err(Self::lost)?;
         listing::seek(
             lower,
             &mut desc.position,
             desc.given,
             &mut desc.lower,
+            &mut desc.opening,
+            resolving,
             &mut desc.replayed,
             cursor,
         )
@@ -1185,8 +1205,8 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     /// `owner` lets go of a description; the lower directory it kept closes with the last holder.
     pub fn close(&mut self, owner: u64, handle: u32) -> R<()> {
         let freed = self.table.close(owner, handle).map_err(Self::lost)?;
-        if let Some(dir) = freed.and_then(|d| d.lower) {
-            self.lower.close_dir(dir);
+        if let Some(d) = freed {
+            self.give_back(d.lower, d.opening);
         }
         Ok(())
     }
@@ -1204,8 +1224,17 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     /// The session `owner` went: what it held closes.
     pub fn gone(&mut self, owner: u64) {
         while let Some(d) = self.table.take_owned(owner) {
-            if let Some(dir) = d.lower {
-                self.lower.close_dir(dir);
+            self.give_back(d.lower, d.opening);
+        }
+    }
+
+    /// The lower directory of a description that went closes; one that was being opened frees its
+    /// place among the listings that resolve.
+    fn give_back(&mut self, dir: Option<L::Dir>, opening: bool) {
+        if let Some(dir) = dir {
+            self.lower.close_dir(dir);
+            if opening {
+                self.resolving -= 1;
             }
         }
     }
