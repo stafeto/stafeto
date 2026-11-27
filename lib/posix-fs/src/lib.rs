@@ -76,6 +76,10 @@ pub enum FsError {
     CrossDevice,
     /// An operation the object does not support (EOPNOTSUPP).
     NotSupported,
+    /// The RAM file service ended the walk at a name another service owns (`proto_fs::REDIRECT`).
+    /// Inside the layer only: the call that asked takes the redirect (`names::follow_path`), and
+    /// the layer answers EXDEV where a call does not follow it.
+    Redirect,
     Io,
 }
 
@@ -128,6 +132,7 @@ impl From<Status> for FsError {
             Status::Unknown(proto_fs::NOT_EMPTY) => Self::NotEmpty,
             Status::Unknown(proto_fs::BUSY) => Self::Busy,
             Status::Unknown(proto_fs::CROSS_DEVICE) => Self::CrossDevice,
+            Status::Unknown(proto_fs::REDIRECT) => Self::Redirect,
             Status::Unknown(proto_fs::NOT_SUPPORTED) => Self::NotSupported,
             _ => Self::Io,
         }

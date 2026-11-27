@@ -3589,3 +3589,22 @@ fn a_change_step_at_the_backlog_threshold_frees_inode_work_and_leaves_the_parked
     assert_eq!(env.ram.storage.parked_backlog(), 64);
     env.release(&mut fds, OWNER, start.key).unwrap();
 }
+
+#[test]
+fn a_walk_through_a_link_onto_the_mount_point_finishes_with_the_result_redirect() {
+    let mut env = Env::new();
+    let mut fds = session();
+    assert!(env.ram.storage.state.set_mount(proto_fs::DATA_MOUNT));
+    env.node(ROOT, b"d", DIR, 0o755);
+    let symlink = |path| op(ChangeOp::Symlink, path);
+    assert_eq!(env.go_result(&mut fds, symlink(b"/d/l"), Some(b"/data")), 0);
+    let access = |path| with_args(ChangeOp::Access, path, 0, [0, 0, 0, 0]);
+    let done = env.go(&mut fds, access(b"/d/l/x/y"), None);
+    assert_eq!((done.result, done.bytes.len()), (proto_fs::REDIRECT, 0));
+    // The second path of a rename that reaches it is a rename across two file systems.
+    env.node(ROOT, b"f", REG, 0o644);
+    let rename = op(ChangeOp::Rename, b"/f");
+    let done = env.go(&mut fds, rename, Some(b"/d/l/g"));
+    assert_eq!((done.result, done.bytes.len()), (proto_fs::CROSS_DEVICE, 0));
+    env.assert_quiet();
+}

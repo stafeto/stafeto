@@ -14,6 +14,12 @@ use proto_wire::{Reader, Status, Writer};
 
 mod change_release_reply;
 
+/// The status of a reply whose first word says REDIRECT: the walk reached the name another service
+/// owns. The status alone says it, whatever the length of the reply (`proto_fs::Redirect`).
+fn is_redirect(reply: &crate::sys::Reply) -> bool {
+    reply.len >= 4 && reply.words[0] as u32 == proto_fs::REDIRECT && reply.handles.is_empty()
+}
+
 /// A console transport snapshot, without a borrow of the file owner.
 /// It carries no application buffer or file-state pointer. The owning Files
 /// must remain alive while this snapshot is used; it does not retain a UART
@@ -273,6 +279,16 @@ fn resolve_start_job(len: usize, words: &[u64; 8], handles: usize) -> Result<u64
     Ok(job)
 }
 
+/// A redirect `Files::redirect_of` found: the fields of `proto_fs::Redirect`, and how many bytes
+/// of the caller's buffer hold its path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Redirected {
+    pub target: u32,
+    pub index: u32,
+    pub links: u32,
+    pub length: usize,
+}
+
 /// A retained service preparation; cancellation also releases the captured base.
 struct Proof<'a> {
     files: &'a Files,
@@ -286,6 +302,9 @@ impl Proof<'_> {
         let request = job_request(Method::ResolveStep, self.id);
         loop {
             let reply = self.send(&request)?;
+            if is_redirect(&reply) {
+                return Err(Status::Unknown(proto_fs::REDIRECT));
+            }
             match proof_ready_status(reply.len, reply.words[0], reply.handles.len())? {
                 Status::Ok => return Ok(()),
                 Status::Unknown(proto_fs::RESOLVING) => {}
@@ -294,10 +313,34 @@ impl Proof<'_> {
         }
     }
 }
+/// The sends of a cancel that a signal took back, and the cancels given up after `CANCEL_TRIES`
+/// of them (`proof_cancel_counts`): the probes read both.
+static CANCEL_RETRIES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static CANCEL_GIVEN_UP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// How often a cancel is sent again after an interruption. A thread whose entries stay deferred is
+/// interrupted by every send until they reopen, so the loop is bounded: the job that is left is
+/// released with the session (the service frees every job of a session that closes).
+const CANCEL_TRIES: u32 = 16;
+
+/// The retries of the cancels of the jobs of paths since the start of the process, and how many
+/// of them ended with the job left to the session.
+pub fn proof_cancel_counts() -> (u32, u32) {
+    (
+        CANCEL_RETRIES.load(core::sync::atomic::Ordering::Relaxed),
+        CANCEL_GIVEN_UP.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 impl Drop for Proof<'_> {
     fn drop(&mut self) {
         let request = job_request(Method::ResolveCancel, self.id);
-        while let Err(Status::Kernel(Error::Interrupted)) = self.send(&request) {}
+        for _ in 0..CANCEL_TRIES {
+            if !matches!(self.send(&request), Err(Status::Kernel(Error::Interrupted))) {
+                return;
+            }
+            CANCEL_RETRIES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        CANCEL_GIVEN_UP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -647,6 +690,9 @@ impl Files {
         .write(&mut w)?;
         w.u64(id)?;
         let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        if !prepare && is_redirect(&reply) {
+            return Err(Status::Unknown(proto_fs::REDIRECT));
+        }
         if Self::reply_code(&reply)? == proto_fs::RESOLVING {
             if reply.len != 8 || reply.words[0] >> 32 != 0 || !reply.handles.is_empty() {
                 return Err(Status::BadSize);
@@ -1807,6 +1853,49 @@ impl Files {
         proto_fs::write_key_body(&mut request, key)?;
         let reply = sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)?;
         change_release_reply::read(&reply.words, reply.len, reply.handles.len())
+    }
+
+    /// Asks where a walk of `path` against `base` goes on, when it ends in a redirect: the redirect
+    /// (its path copied to `out`, its length in the answer), or None for a walk that ends in a node,
+    /// in a missing name or in any other refusal. The walk is the one that the failed call made
+    /// (`follow` as that call had it), asked again as a lookup that changes nothing.
+    pub fn redirect_of(
+        &self,
+        base: Option<(u32, u64)>,
+        path: &[u8],
+        follow: bool,
+        out: &mut [u8; proto_fs::MAX_PATH],
+    ) -> Result<Option<Redirected>, Status> {
+        let mut request = [0; 28 + proto_fs::MAX_PATH];
+        let len = resolve_start_request(&mut request, path, base, follow)?;
+        let reply = Self::send_on(&self.channel, &request[..len])?;
+        let proof = Proof {
+            files: self,
+            id: resolve_start_job(reply.len, &reply.words, reply.handles.len())?,
+        };
+        let step = job_request(Method::ResolveStep, proof.id);
+        loop {
+            let reply = proof.send(&step)?;
+            if is_redirect(&reply) {
+                let mut buffer = [0; MESSAGE_MAX];
+                let bytes = reply.bytes(&mut buffer);
+                let Some(found) = proto_fs::Redirect::read_reply(bytes) else {
+                    return Err(Status::BadSize);
+                };
+                let found = found?;
+                out[..found.path.len()].copy_from_slice(found.path);
+                return Ok(Some(Redirected {
+                    target: found.target,
+                    index: found.index,
+                    links: found.links,
+                    length: found.path.len(),
+                }));
+            }
+            match proof_ready_status(reply.len, reply.words[0], reply.handles.len())? {
+                Status::Unknown(proto_fs::RESOLVING) => {}
+                _ => return Ok(None),
+            }
+        }
     }
 
     /// A path against a base, for the requests that read: the node information
