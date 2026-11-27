@@ -3360,7 +3360,7 @@ const NVME_BREAKS: [&str; 10] = [
 /// The deliberate breaks of the data volume (`cargo xtask datafs-breaks`): each is a feature of
 /// `lib/datafs` that does one wrong thing, and its host tests (a cut of the power at every sector of a
 /// workload, the table of a new volume, the protocol) pass without it and fail with it.
-const DATAFS_BREAKS: [&str; 14] = [
+const DATAFS_BREAKS: [&str; 15] = [
     "break-datafs-sync",
     "break-datafs-consistent",
     "break-datafs-busy",
@@ -3375,6 +3375,7 @@ const DATAFS_BREAKS: [&str; 14] = [
     "break-datafs-lease-deref",
     "break-datafs-append-end",
     "break-datafs-layers-visible",
+    "break-datafs-tail-whole",
 ];
 
 /// The breaks to run: every one of `DATAFS_BREAKS`, or only the ones `named` (each must be one of

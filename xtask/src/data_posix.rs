@@ -798,6 +798,12 @@ fn median(mut values: Vec<f64>) -> f64 {
 /// job of another file in flight at the expiry stays well inside 250 ms.
 const LAPSE_LATE_US: i64 = 250_000;
 
+/// What the choice of the waiter may add for each step of the copy of a tail that ran between the
+/// lapse and the choice (`lib/datafs/src/server/tail.rs`): the waiter of a file with a tail waits for the
+/// whole copy, in steps of 64 KiB with jobs of other files between them. The runs measured 44 to 60 ms
+/// a step on the Mac under QEMU; `TAIL_STEP_MS` of `tests/posix-data/data.c` is the same bound.
+const LAPSE_STEP_US: i64 = 100_000;
+
 /// One lapse the service said (`datafs: lease lapse N: last answer A us after the waiter was queued,
 /// lapse B us after the expiry, waiter chosen C us after the lapse, waiter job D us, R disk reads, W
 /// disk writes`, under the feature `probe-lapse`).
@@ -809,6 +815,8 @@ struct Lapse {
     job: i64,
     reads: i64,
     writes: i64,
+    /// The steps of the copy of a tail that ran between the lapse and the choice of the waiter.
+    steps: i64,
 }
 
 fn lapse_facts(line: &str) -> Option<Lapse> {
@@ -825,6 +833,7 @@ fn lapse_facts(line: &str) -> Option<Lapse> {
         job: value("waiter job ", " us")?,
         reads: value("us, ", " disk reads")?,
         writes: value("disk reads, ", " disk writes")?,
+        steps: value("disk writes, ", " tail steps")?,
     })
 }
 
@@ -842,21 +851,24 @@ fn lapse_verdict(lines: &[String]) -> Result<(), String> {
     }
     for (n, f) in facts.iter().enumerate() {
         println!(
-            "data-posix: lapse {}: the last answer {} us after the waiter was queued, the lapse {} us after the expiry, the waiter chosen {} us after it, its job {} us with {} disk reads and {} disk writes",
+            "data-posix: lapse {}: the last answer {} us after the waiter was queued, the lapse {} us after the expiry, the waiter chosen {} us after it, its job {} us with {} disk reads and {} disk writes, {} steps of a copy between",
             n + 1,
             f.answered,
             f.late,
             f.chosen,
             f.job,
             f.reads,
-            f.writes
+            f.writes,
+            f.steps
         );
-        if f.late > LAPSE_LATE_US || !(0..=LAPSE_LATE_US).contains(&f.chosen) {
+        let chosen_by = LAPSE_LATE_US + f.steps * LAPSE_STEP_US;
+        if f.late > LAPSE_LATE_US || !(0..=chosen_by).contains(&f.chosen) {
             return Err(format!(
-                "lapse {}: {} us after the expiry and the waiter chosen {} us after it, each over {LAPSE_LATE_US} us",
+                "lapse {}: {} us after the expiry (over {LAPSE_LATE_US} us) or the waiter chosen {} us after it (over {chosen_by} us, with {} steps of a copy)",
                 n + 1,
                 f.late,
-                f.chosen
+                f.chosen,
+                f.steps
             ));
         }
     }
@@ -1517,7 +1529,7 @@ mod tests {
     fn the_lapse_lines_are_read_and_judged() {
         let say = |a: i64, b: i64, c: i64| {
             format!(
-                "datafs: lease lapse 2: last answer {a} us after the waiter was queued, lapse {b} us after the expiry, waiter chosen {c} us after the lapse, waiter job 1500 us, 732 disk reads, 209 disk writes"
+                "datafs: lease lapse 2: last answer {a} us after the waiter was queued, lapse {b} us after the expiry, waiter chosen {c} us after the lapse, waiter job 1500 us, 732 disk reads, 209 disk writes, 0 tail steps"
             )
         };
         assert_eq!(
@@ -1528,7 +1540,8 @@ mod tests {
                 chosen: 21,
                 job: 1500,
                 reads: 732,
-                writes: 209
+                writes: 209,
+                steps: 0
             })
         );
         assert_eq!(lapse_facts("datafs: pairs 1 of 2"), None);
@@ -1543,9 +1556,15 @@ mod tests {
         let mut late = ok.clone();
         late[1] = say(0, 540_000, 20);
         assert!(lapse_verdict(&late).unwrap_err().contains("540000"));
-        let mut slow = ok;
+        let mut slow = ok.clone();
         slow[2] = say(0, 100, 300_000);
         assert!(lapse_verdict(&slow).is_err());
+        // A waiter that waited for the steps of a copy of a tail is chosen later by the steps it waited for.
+        let mut copy = ok;
+        copy[3] = "datafs: lease lapse 4: last answer 1 us after the waiter was queued, lapse 500 us after the expiry, waiter chosen 961082 us after the lapse, waiter job 769 us, 2 disk reads, 0 disk writes, 16 tail steps".to_owned();
+        assert_eq!(lapse_verdict(&copy), Ok(()));
+        copy[3] = copy[3].replace("16 tail steps", "0 tail steps");
+        assert!(lapse_verdict(&copy).is_err());
     }
 
     #[test]

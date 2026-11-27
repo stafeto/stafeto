@@ -49,6 +49,8 @@ unsafe extern "C" {
         offset: i32,
         whence: c_int,
     ) -> i64;
+    fn datafs_tail(d: *mut c_void, ctx: *mut c_void, slot: c_int) -> i64;
+    fn datafs_flush_step(d: *mut c_void, ctx: *mut c_void, slot: c_int, blocks: u32) -> c_int;
     fn datafs_truncate(d: *mut c_void, ctx: *mut c_void, slot: c_int, size: u32) -> c_int;
     fn datafs_size(d: *mut c_void, ctx: *mut c_void, slot: c_int) -> i64;
     fn datafs_mkdir(d: *mut c_void, ctx: *mut c_void, path: *const c_char) -> c_int;
@@ -648,6 +650,23 @@ impl<'a, D: Device> Fs<'a, D> {
     pub fn sync(&mut self, file: File) -> Res<()> {
         // SAFETY: as above.
         check(self.call(|d, ctx| unsafe { datafs_sync(d, ctx, c_int::from(file.0)) })).map(drop)
+    }
+
+    /// The bytes the next flush of the file copies: what lies past the last byte written when the
+    /// file was rewritten from the middle, 0 when there is nothing to copy. The flush runs in the
+    /// first seek, read, sync or close of the file, in one call (`flush_step` makes it in parts).
+    pub fn tail(&mut self, file: File) -> Res<u64> {
+        // SAFETY: as above.
+        check64(self.call(|d, ctx| unsafe { datafs_tail(d, ctx, c_int::from(file.0)) }))
+    }
+
+    /// One step of the flush: copies at most `blocks` blocks (at least 1) of the tail. True when
+    /// more is left, false when the copy is done (the next sync commits it). Any other call on the
+    /// file finishes a copy that is half done, in one call.
+    pub fn flush_step(&mut self, file: File, blocks: u32) -> Res<bool> {
+        // SAFETY: as above.
+        check(self.call(|d, ctx| unsafe { datafs_flush_step(d, ctx, c_int::from(file.0), blocks) }))
+            .map(|more| more != 0)
     }
 
     /// Moves the offset of the file; the new offset from the start.

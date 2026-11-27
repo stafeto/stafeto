@@ -577,6 +577,9 @@ static lfs_ssize_t lfs_file_write_(lfs_t *lfs, lfs_file_t *file,
 static int lfs_file_sync_(lfs_t *lfs, lfs_file_t *file);
 static int lfs_file_outline(lfs_t *lfs, lfs_file_t *file);
 static int lfs_file_flush(lfs_t *lfs, lfs_file_t *file);
+static int lfs_file_flush_blocks(lfs_t *lfs, lfs_file_t *file,
+        lfs_size_t blocks);
+static int lfs_file_finish_flush(lfs_t *lfs, lfs_file_t *file);
 
 static int lfs_fs_deorphan(lfs_t *lfs, bool powerloss);
 static int lfs_fs_preporphans(lfs_t *lfs, int8_t orphans);
@@ -3577,7 +3580,21 @@ static int lfs_file_outline(lfs_t *lfs, lfs_file_t *file) {
 }
 #endif
 
+// stafeto: the flush copies the tail of a rewritten file, which is as long as
+// the file past the last byte written. With blocks > 0 it copies that many
+// blocks and returns 1 when more is left, with the file in LFS_F_FLUSHING:
+// pos is the part copied, flush_pos the position of the file. Everything the
+// copy needs is in the file (the old list is file->ctz, its read position is
+// file->pos, the read cache is dropped between calls), so the next call goes
+// on from there. The blocks of the part copied are those of the file's own
+// walk of the allocator (LFS_F_WRITING), and those of the old list are
+// protected as they were before (the entry of the directory, or LFS_F_DIRTY).
 static int lfs_file_flush(lfs_t *lfs, lfs_file_t *file) {
+    return lfs_file_flush_blocks(lfs, file, 0);
+}
+
+static int lfs_file_flush_blocks(lfs_t *lfs, lfs_file_t *file,
+        lfs_size_t blocks) {
     if (file->flags & LFS_F_READING) {
         if (!(file->flags & LFS_F_INLINE)) {
             lfs_cache_drop(lfs, &file->cache);
@@ -3587,7 +3604,8 @@ static int lfs_file_flush(lfs_t *lfs, lfs_file_t *file) {
 
 #ifndef LFS_READONLY
     if (file->flags & LFS_F_WRITING) {
-        lfs_off_t pos = file->pos;
+        lfs_off_t pos = (file->flags & LFS_F_FLUSHING)
+                ? file->flush_pos : file->pos;
 
         if (!(file->flags & LFS_F_INLINE)) {
             // copy over anything after current branch
@@ -3599,8 +3617,25 @@ static int lfs_file_flush(lfs_t *lfs, lfs_file_t *file) {
                 .cache = lfs->rcache,
             };
             lfs_cache_drop(lfs, &lfs->rcache);
+            lfs_size_t copied = 0;
+            lfs_size_t limit = 0;
+            if (blocks > 0) {
+                // the position of the file is kept from here on, so that an
+                // error inside the step leaves the file as a step that ended
+                file->flush_pos = pos;
+                file->flags |= LFS_F_FLUSHING;
+                limit = (blocks > lfs->file_max / lfs->cfg->block_size)
+                        ? lfs->file_max : blocks * lfs->cfg->block_size;
+            }
 
             while (file->pos < file->ctz.size) {
+                if (blocks > 0 && copied >= limit) {
+                    // this step is over: leave the file where it is
+                    lfs_cache_drop(lfs, &lfs->rcache);
+                    return 1;
+                }
+                copied += 1;
+
                 // copy over a byte at a time, leave it up to caching
                 // to make this efficient
                 uint8_t data;
@@ -3648,7 +3683,7 @@ relocate:
         lfs_ctz_hints_drop(file);
         file->ctz.head = file->block;
         file->ctz.size = file->pos;
-        file->flags &= ~LFS_F_WRITING;
+        file->flags &= ~LFS_F_WRITING & ~LFS_F_FLUSHING;
         file->flags |= LFS_F_DIRTY;
 
         file->pos = pos;
@@ -3657,6 +3692,35 @@ relocate:
 
     return 0;
 }
+
+// stafeto: finishes a flush that a step left half done, for the calls that
+// read or move the position of the file
+static int lfs_file_finish_flush(lfs_t *lfs, lfs_file_t *file) {
+#ifndef LFS_READONLY
+    if (file->flags & LFS_F_FLUSHING) {
+        return lfs_file_flush(lfs, file);
+    }
+#endif
+    (void)lfs;
+    (void)file;
+    return 0;
+}
+
+#ifndef LFS_READONLY
+static lfs_ssize_t lfs_file_tail_(lfs_t *lfs, lfs_file_t *file) {
+    (void)lfs;
+    if ((file->flags & LFS_F_WRITING) && !(file->flags & LFS_F_INLINE)
+            && file->pos < file->ctz.size) {
+        return file->ctz.size - file->pos;
+    }
+    return 0;
+}
+
+static int lfs_file_flush_step_(lfs_t *lfs, lfs_file_t *file,
+        lfs_size_t blocks) {
+    return lfs_file_flush_blocks(lfs, file, blocks > 0 ? blocks : 1);
+}
+#endif
 
 #ifndef LFS_READONLY
 static int lfs_file_sync_(lfs_t *lfs, lfs_file_t *file) {
@@ -3892,6 +3956,12 @@ static lfs_ssize_t lfs_file_write_(lfs_t *lfs, lfs_file_t *file,
         const void *buffer, lfs_size_t size) {
     LFS_ASSERT((file->flags & LFS_O_WRONLY) == LFS_O_WRONLY);
 
+    // a flush that is half done ends first: pos is not the file's yet
+    int ferr = lfs_file_finish_flush(lfs, file);
+    if (ferr) {
+        return ferr;
+    }
+
     // the list the wayposts name is about to change
     lfs_ctz_hints_drop(file);
 
@@ -3937,6 +4007,12 @@ static lfs_ssize_t lfs_file_write_(lfs_t *lfs, lfs_file_t *file,
 
 static lfs_soff_t lfs_file_seek_(lfs_t *lfs, lfs_file_t *file,
         lfs_soff_t off, int whence) {
+    // a flush that is half done ends first: pos is not the file's yet
+    int ferr = lfs_file_finish_flush(lfs, file);
+    if (ferr) {
+        return ferr;
+    }
+
     // find new pos
     //
     // fortunately for us, littlefs is limited to 31-bit file sizes, so we
@@ -3990,6 +4066,12 @@ static lfs_soff_t lfs_file_seek_(lfs_t *lfs, lfs_file_t *file,
 #ifndef LFS_READONLY
 static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
     LFS_ASSERT((file->flags & LFS_O_WRONLY) == LFS_O_WRONLY);
+
+    // a flush that is half done ends first: pos is not the file's yet
+    int ferr = lfs_file_finish_flush(lfs, file);
+    if (ferr) {
+        return ferr;
+    }
 
     if (size > LFS_FILE_MAX) {
         return LFS_ERR_INVAL;
@@ -4077,6 +4159,11 @@ static int lfs_file_truncate_(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
 
 static lfs_soff_t lfs_file_tell_(lfs_t *lfs, lfs_file_t *file) {
     (void)lfs;
+#ifndef LFS_READONLY
+    if (file->flags & LFS_F_FLUSHING) {
+        return file->flush_pos;
+    }
+#endif
     return file->pos;
 }
 
@@ -6795,6 +6882,42 @@ int lfs_file_sync(lfs_t *lfs, lfs_file_t *file) {
     err = lfs_file_sync_(lfs, file);
 
     LFS_TRACE("lfs_file_sync -> %d", err);
+    LFS_UNLOCK(lfs->cfg);
+    return err;
+}
+#endif
+
+#ifndef LFS_READONLY
+lfs_ssize_t lfs_file_tail(lfs_t *lfs, lfs_file_t *file) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_file_tail(%p, %p)", (void*)lfs, (void*)file);
+    LFS_ASSERT(lfs_mlist_isopen(lfs->mlist, (struct lfs_mlist*)file));
+
+    lfs_ssize_t res = lfs_file_tail_(lfs, file);
+
+    LFS_TRACE("lfs_file_tail -> %"PRId32, res);
+    LFS_UNLOCK(lfs->cfg);
+    return res;
+}
+
+int lfs_file_flush_step(lfs_t *lfs, lfs_file_t *file, lfs_size_t blocks) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_file_flush_step(%p, %p, %"PRIu32")",
+            (void*)lfs, (void*)file, blocks);
+    LFS_ASSERT(lfs_mlist_isopen(lfs->mlist, (struct lfs_mlist*)file));
+
+    err = lfs_file_flush_step_(lfs, file, blocks);
+    if (err < 0) {
+        file->flags |= LFS_F_ERRED;
+    }
+
+    LFS_TRACE("lfs_file_flush_step -> %d", err);
     LFS_UNLOCK(lfs->cfg);
     return err;
 }

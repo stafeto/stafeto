@@ -142,6 +142,8 @@ enum lfs_open_flags {
     LFS_F_READING = 0x00080000, // File has been read since last flush
 #ifndef LFS_READONLY
     LFS_F_ERRED   = 0x00100000, // An error occurred during write
+    // stafeto: the copy of the tail of a rewrite has begun and is not done
+    LFS_F_FLUSHING = 0x00200000,
 #endif
     LFS_F_INLINE  = 0x01000000, // Currently inlined in directory entry
 };
@@ -454,6 +456,10 @@ typedef struct lfs_file {
 
     const struct lfs_file_config *cfg;
 
+    // stafeto: the position of the file while LFS_F_FLUSHING is set (pos is
+    // then the length of the part copied so far), see lfs_file_flush_step
+    lfs_off_t flush_pos;
+
     // stafeto: blocks of the skip list of the file (the pair ctz) that the last
     // reads passed, each with its index in the list. They are valid while the
     // file is the same pair (head, size), and are dropped by every write and
@@ -695,6 +701,17 @@ int lfs_file_close(lfs_t *lfs, lfs_file_t *file);
 // Any pending writes are written out to storage.
 // Returns a negative error code on failure.
 int lfs_file_sync(lfs_t *lfs, lfs_file_t *file);
+
+// stafeto: the bytes that a flush of the file would copy now (what lies past
+// the last byte written, when the file is rewritten from the middle), 0 when
+// there is nothing to copy
+lfs_ssize_t lfs_file_tail(lfs_t *lfs, lfs_file_t *file);
+
+// stafeto: the flush of lfs_file_sync in steps. Copies at most `blocks` blocks
+// (at least 1) of the tail and returns 1 when more is left, 0 when the flush
+// is done (the file then waits for lfs_file_sync to commit it), or a negative
+// error. Any other call on the file finishes a flush that is half done.
+int lfs_file_flush_step(lfs_t *lfs, lfs_file_t *file, lfs_size_t blocks);
 
 // Read data from file
 //

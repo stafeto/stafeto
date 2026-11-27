@@ -37,10 +37,12 @@ use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 mod lease;
 mod mount;
 mod names;
+mod tail;
 
 pub use lease::{CANDIDATES_MAX, Candidate, LEASE_CLIENT_MAX_NS, LEASE_GAP_NS, Lapse, Pick};
 pub use mount::{Mounted, Recovered, StartWork, Step, bump_epoch, ensure_orphans, recover_orphans};
 use names::{denied, entry_of, split, stat_record};
+pub use tail::TAIL_SLICE_BLOCKS;
 
 /// The memory of one cell of a window for the job of one part (`Server::handle_with`): the worker
 /// maps the cell for the job, read only for a part that writes the file and read-write for a part
@@ -184,6 +186,12 @@ struct Node {
     /// `ctime`) and the clearing of the set-ID bits wait for the sync or the last close.
     wrote: bool,
     wrote_at: i64,
+    /// What the handle is known to hold past the last byte written (`tail.rs`).
+    tail: tail::Tail,
+    /// The error of a step of the copy that failed, for the next job that flushes the node: the
+    /// close of the last description gives it too, though littlefs closes a file that failed with
+    /// no sync.
+    tail_err: Option<Error>,
     path: PathBuf,
 }
 
@@ -197,6 +205,8 @@ impl Node {
         at: None,
         wrote: false,
         wrote_at: 0,
+        tail: tail::Tail::None,
+        tail_err: None,
         path: PathBuf::EMPTY,
     };
 }
@@ -354,6 +364,10 @@ pub struct Server {
     unleased: u64,
     /// The last lapse that jobs of the file waited for (`lease::Lapse`), for the probes.
     lapse: lease::Lapse,
+    /// The node whose copy of a tail ran a step last (`tail.rs`), and, in the tests, the steps run.
+    tail_after: usize,
+    #[cfg(test)]
+    pub(crate) tail_steps: u32,
     #[cfg(test)]
     pub(crate) fail_reopen: bool,
     #[cfg(test)]
@@ -590,6 +604,9 @@ impl Server {
             job_queued: 0,
             unleased: 0,
             lapse: lease::Lapse::EMPTY,
+            tail_after: 0,
+            #[cfg(test)]
+            tail_steps: 0,
             #[cfg(test)]
             fail_reopen: false,
             #[cfg(test)]
@@ -836,6 +853,11 @@ impl Server {
         } else {
             fs.close(File(n.slot))
         };
+        // A step of the copy of the tail failed and the rewrite is lost: the close says so.
+        let closed = match n.tail_err {
+            Some(e) => Err(e),
+            None => closed,
+        };
         if n.orphan && fs.remove(n.path.get()).is_ok() {
             fs.note_freed_file(size);
         }
@@ -881,6 +903,7 @@ impl Server {
         }
         // littlefs drops a file at close even when the sync inside it fails, so sync first.
         volume(fs.sync(File(node.slot)))?;
+        self.tail_done(ni);
         // The attribute follows the name: the time of the writes goes in before the move.
         let _ = self.write_times(fs, ni);
         self.nodes[ni].broken = true;
@@ -966,6 +989,10 @@ impl Server {
         let n = &mut self.nodes[ni];
         if n.broken {
             return Err(p::code(p::IO));
+        }
+        if let Some(e) = n.tail_err.take() {
+            n.at = None;
+            return Err(status_of(e));
         }
         let file = File(n.slot);
         if n.at != Some(pos) {
@@ -1228,9 +1255,14 @@ impl Server {
                 if self.nodes[ni].broken {
                     return Err(p::code(p::IO));
                 }
+                if let Some(e) = self.nodes[ni].tail_err.take() {
+                    self.nodes[ni].at = None;
+                    return Err(status_of(e));
+                }
                 let file = File(self.nodes[ni].slot);
                 self.nodes[ni].at = None;
                 volume(fs.truncate(file, size as u32))?;
+                self.tail_done(ni);
                 self.nodes[ni].wrote = true;
                 self.nodes[ni].wrote_at = self.now;
                 Ok(())
@@ -1946,6 +1978,7 @@ impl Server {
         if n > 0 {
             self.nodes[ni].wrote = true;
             self.nodes[ni].wrote_at = self.now;
+            self.tail_maybe(ni);
             // A description with `SYNC` makes the write durable before the reply; the parts of one
             // call (`last` false) leave it to the part that ends the call.
             if sync {
@@ -1958,11 +1991,15 @@ impl Server {
     /// The file is synced and its attribute written (the time of the writes, the set-ID bits
     /// cleared): what FSYNC and a description with SYNC make durable.
     fn sync_node<D: Device>(&mut self, fs: &mut Fs<'_, D>, ni: usize) -> Res<()> {
-        let n = &self.nodes[ni];
+        let n = &mut self.nodes[ni];
         if n.broken {
             return Err(p::code(p::IO));
         }
+        if let Some(e) = n.tail_err.take() {
+            return Err(status_of(e));
+        }
         volume(fs.sync(File(n.slot)))?;
+        self.tail_done(ni);
         self.write_times(fs, ni)
     }
 
@@ -2200,6 +2237,7 @@ impl Server {
                         }
                         return Err(status_of(e));
                     }
+                    self.tail_done(ni);
                     self.nodes[ni].wrote = true;
                     self.nodes[ni].wrote_at = self.now;
                 }

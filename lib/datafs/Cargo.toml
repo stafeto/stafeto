@@ -30,6 +30,9 @@ break-datafs-gpt-order = []
 break-datafs-relocate-order = []
 break-datafs-ctz-hints = []
 break-datafs-trust-prog = []
+# `break-datafs-tail-whole`: the copy of the tail of a rewrite never begins in steps, so the job that flushes the
+# node copies it whole (as before issue #626).
+break-datafs-tail-whole = []
 # `break-datafs-layers-visible`: the directory `/.layers` of the layered root is visible to every session.
 break-datafs-layers-visible = []
 # The deliberate breaks of the leases (tests_lease.rs): `break-datafs-lease-hold` no lease holds a
