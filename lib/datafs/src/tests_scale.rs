@@ -578,7 +578,7 @@ fn free_blocks_from_the_window_agree_with_the_walk_and_read_nothing() {
     assert!(seen < truth, "the freed blocks wait for the next walk");
     // The estimate of what was freed is the callers' (the server knows the size it removes).
     fs.note_freed_file(1 << 20);
-    assert_eq!(fs.freed_estimate(), 256);
+    assert_eq!(fs.freed_estimate(), 257);
     // A walk sees them and starts the estimate again.
     fs.walk().unwrap();
     assert_eq!(fs.freed_estimate(), 0);
@@ -714,35 +714,35 @@ fn freed_blocks_are_counted_by_what_the_server_knows() {
     made(&mut server, &mut fs, b"/over", 20 << 10, false);
     made(&mut server, &mut fs, b"/with", 1000, false);
     assert_eq!(fs.freed_estimate(), 0);
-    // A file of 40 KiB is 10 blocks; an inline file owns none.
+    // A file of 40 KiB is 11 blocks (each block holds 8 bytes less for the skip list); an inline file owns none.
     served(&mut server, &mut fs, &|w| {
         p::path_call(p::Method::Unlink, b"/big", w).unwrap()
     })
     .unwrap();
-    assert_eq!(fs.freed_estimate(), 10);
+    assert_eq!(fs.freed_estimate(), 11);
     served(&mut server, &mut fs, &|w| {
         p::path_call(p::Method::Unlink, b"/tiny", w).unwrap()
     })
     .unwrap();
-    assert_eq!(fs.freed_estimate(), 10, "an inline file owns no block");
-    // A rename over a file gives the replaced file's blocks back (20 KiB: 5 blocks).
+    assert_eq!(fs.freed_estimate(), 11, "an inline file owns no block");
+    // A rename over a file gives the replaced file's blocks back (20 KiB: 6 blocks).
     served(&mut server, &mut fs, &|w| {
         p::rename(b"/with", b"/over", w).unwrap()
     })
     .unwrap();
-    assert_eq!(fs.freed_estimate(), 15);
+    assert_eq!(fs.freed_estimate(), 17);
     // An open file that is unlinked gives its blocks back at the last close.
     let h = made(&mut server, &mut fs, b"/open", 8192, true);
     served(&mut server, &mut fs, &|w| {
         p::path_call(p::Method::Unlink, b"/open", w).unwrap()
     })
     .unwrap();
-    assert_eq!(fs.freed_estimate(), 15);
+    assert_eq!(fs.freed_estimate(), 17);
     served(&mut server, &mut fs, &|w| {
         p::handle_call(p::Method::Close, h, w).unwrap()
     })
     .unwrap();
-    assert_eq!(fs.freed_estimate(), 17);
+    assert_eq!(fs.freed_estimate(), 20);
     // A directory's pair, and a failed remove counts nothing.
     served(&mut server, &mut fs, &|w| {
         p::mkdir(b"/d", 0o755, w).unwrap()
@@ -752,7 +752,7 @@ fn freed_blocks_are_counted_by_what_the_server_knows() {
         p::path_call(p::Method::Rmdir, b"/d", w).unwrap()
     })
     .unwrap();
-    assert_eq!(fs.freed_estimate(), 19);
+    assert_eq!(fs.freed_estimate(), 22);
     assert!(
         served(&mut server, &mut fs, &|w| p::path_call(
             p::Method::Unlink,
@@ -762,12 +762,12 @@ fn freed_blocks_are_counted_by_what_the_server_knows() {
         .unwrap())
         .is_err()
     );
-    assert_eq!(fs.freed_estimate(), 19);
+    assert_eq!(fs.freed_estimate(), 22);
     // A truncation counts the blocks it cuts; a walk starts the estimate again.
     made(&mut server, &mut fs, b"/t", 20 << 10, false);
     let f = fs.open(b"/t", Open::READ_WRITE).unwrap();
     fs.truncate(f, 4096).unwrap();
-    assert_eq!(fs.freed_estimate(), 19 + 4);
+    assert_eq!(fs.freed_estimate(), 22 + 4);
     fs.close(f).unwrap();
     fs.walk().unwrap();
     assert_eq!(fs.freed_estimate(), 0);
@@ -2060,6 +2060,64 @@ impl Device for Yielding {
     fn flush(&mut self) -> Result<(), crate::DeviceError> {
         self.inner.flush()
     }
+}
+
+/// A device that tells the walks around it and fails every read during a walk once `stop` is set:
+/// the worker's disk at the stop notice.
+struct Marked {
+    inner: MemDevice,
+    on: bool,
+    stop: bool,
+    marks: Vec<bool>,
+}
+
+impl Device for Marked {
+    fn sectors(&self) -> u64 {
+        self.inner.sectors()
+    }
+
+    fn read(&mut self, sector: u64, out: &mut [u8]) -> Result<(), crate::DeviceError> {
+        if self.on && self.stop {
+            return Err(crate::DeviceError);
+        }
+        self.inner.read(sector, out)
+    }
+
+    fn write(&mut self, sector: u64, data: &[u8]) -> Result<(), crate::DeviceError> {
+        self.inner.write(sector, data)
+    }
+
+    fn flush(&mut self) -> Result<(), crate::DeviceError> {
+        self.inner.flush()
+    }
+
+    fn walk_marks(&mut self, on: bool) {
+        self.on = on;
+        self.marks.push(on);
+    }
+}
+
+#[test]
+fn a_walk_is_marked_to_the_device_and_a_stop_ends_it_with_io_whichever_way_it_was_asked_for() {
+    let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+    let device = Marked {
+        inner: kept_device(),
+        on: false,
+        stop: false,
+        marks: Vec::new(),
+    };
+    let mut fs = Fs::new(device, state).unwrap();
+    fs.mount().unwrap();
+    fs.walk().unwrap();
+    assert_eq!(fs.device().marks, [true, false]);
+    // The stop notice ends the walk at its next read; the mark goes off on the failure too.
+    fs.device().stop = true;
+    assert_eq!(fs.walk(), Err(Error::Io));
+    assert_eq!(fs.device().marks, [true, false, true, false]);
+    assert!(!fs.device().on);
+    // The walk inside `free_blocks` of an empty window is the same walk.
+    assert_eq!(fs.free_blocks(), Err(Error::Io));
+    assert_eq!(fs.device().marks.len(), 6);
 }
 
 #[test]

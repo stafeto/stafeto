@@ -191,6 +191,9 @@ impl Server {
     /// Sets the clock of the leases, in nanoseconds (monotonic), before a job.
     pub fn set_mono(&mut self, ns: u64) {
         self.mono = ns;
+        if let Some(began) = self.walk_began.take() {
+            self.walk_after = ns.saturating_add(4 * ns.saturating_sub(began));
+        }
     }
 
     pub(super) fn lease_number(&self, slot: usize) -> u32 {

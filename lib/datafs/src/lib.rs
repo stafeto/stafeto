@@ -87,6 +87,10 @@ pub trait Device {
     fn write(&mut self, sector: u64, data: &[u8]) -> Result<(), DeviceError>;
     /// Makes the writes that returned durable.
     fn flush(&mut self) -> Result<(), DeviceError>;
+    /// Told around a walk of the whole tree (`Fs::walk`): `true` before it, `false` after it, whether
+    /// it ended well or not. A device that serves a worker may end the reads of a walk at a stop
+    /// notice; the default does nothing.
+    fn walk_marks(&mut self, _on: bool) {}
 }
 
 impl<D: Device + ?Sized> Device for &mut D {
@@ -104,6 +108,10 @@ impl<D: Device + ?Sized> Device for &mut D {
 
     fn flush(&mut self) -> Result<(), DeviceError> {
         (**self).flush()
+    }
+
+    fn walk_marks(&mut self, on: bool) {
+        (**self).walk_marks(on)
     }
 }
 
@@ -143,5 +151,9 @@ impl<D: Device> Device for Window<D> {
 
     fn flush(&mut self) -> Result<(), DeviceError> {
         self.device.flush()
+    }
+
+    fn walk_marks(&mut self, on: bool) {
+        self.device.walk_marks(on)
     }
 }
