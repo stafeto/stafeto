@@ -9,7 +9,8 @@
 //! - `Table` (the loop): the places of the copies with their tickets (the place and the
 //!   generation), the queue of the files that wait for one of the `ACTIVE` copies in work, and the
 //!   outcome of a copy that is done until its place is taken again. A second request for a file
-//!   whose copy is in the table gets the same ticket. `Waiters` holds the replies WAIT defers.
+//!   whose copy is in the table gets the same ticket. `Waiters` holds the notifications of the
+//!   programs that wait (WAIT with a handle).
 //! - `Copier` (the worker): the copies in work, each of its turns one unit of one copy in turn.
 //!   The unit that moves bytes is one cell of `CELL` bytes: up to six reads of the lower file into
 //!   the cell (`proto_fs::READ_PORTION` each, the step of the RAM file service) and one write of
@@ -369,7 +370,8 @@ impl Table {
     }
 }
 
-/// The requests WAIT defers: `N` places for a ticket and what the reply needs.
+/// The waiters of a ticket: `N` places for what the service gives each when its copy ends (the
+/// notification a program's WAIT brought).
 pub struct Waiters<P, const N: usize> {
     held: [Option<(u64, P)>; N],
 }

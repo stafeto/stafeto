@@ -7602,9 +7602,9 @@ const VOUCH_TICKS_MAX: u64 = 8_000;
 const TERM_B: u64 = 20_410;
 
 /// The stack of the main thread of the layer service: the table of its sessions (192 records with
-/// their identities), the table of its descriptions and of its jobs live in the frame of `main`,
-/// which 128 KiB no longer holds.
-pub(crate) const LAYERD_STACK_SIZE: u32 = 192 * 1024;
+/// their identities), the table of its descriptions, of its jobs and of its copies live in the
+/// frame of `main`, which 192 KiB no longer holds.
+pub(crate) const LAYERD_STACK_SIZE: u32 = 256 * 1024;
 
 /// The bound on the kernel itself: the longest row of the `B on` line of
 /// `kernel_tests` (icount build) may not pass it. The longest paths at

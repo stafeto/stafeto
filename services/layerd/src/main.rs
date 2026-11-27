@@ -25,10 +25,11 @@
 //! The copy up (step C4 part A). A request that writes a file of the lower set is a change job that
 //! makes the directories of the path in the layer, takes a place in the table of copies
 //! (`layerd::copy`) and answers COPYING with the ticket; the bytes are copied by the worker thread
-//! (`worker`) with sessions of its own, so the loop never waits for a disk. WAIT is a deferred reply
-//! that the commit job answers: when the worker has ended a copy the loop walks the name again under
-//! the lock and either makes the copy visible (the rename into the layer and the index entry in one
-//! step) or hands it to the reaper, and answers the waiters with 0 or the failure.
+//! (`worker`) with sessions of its own, so the loop never waits for a disk. WAIT is answered at once
+//! (COPYING while the copy goes on) and keeps the notification the request brings; when the worker
+//! has ended a copy the loop walks the name again under the lock and either makes the copy visible
+//! (the rename into the layer and the index entry in one step) or hands it to the reaper, and
+//! notifies the waiters, who ask WAIT again for the outcome (0 or the failure).
 
 #![no_std]
 #![no_main]
@@ -316,6 +317,14 @@ fn main(_: u64) -> u64 {
         epoch,
     );
     core.prepare();
+    if core.cleared != 0 {
+        rt::println!(
+            "layerd: work/ held {} names an earlier instance left, removed",
+            core.cleared
+        );
+    } else {
+        rt::println!("layerd: work/ is empty at the start");
+    }
     match core.state {
         State::Starting => rt::println!(
             "layerd: live layer {:02}, building the index",
@@ -336,6 +345,7 @@ fn main(_: u64) -> u64 {
         changes,
         commit: false,
         kick,
+        copy_seen: (0, 0, 0, 0),
         waiters: Waiters::new(),
         reap_turn: false,
         notary: notary::Notary::new(),
@@ -433,8 +443,10 @@ struct Layerd {
     commit: bool,
     /// The kick of the worker thread.
     kick: Handle<Channel>,
-    /// The WAIT requests that wait for a copy.
-    waiters: Waiters<rt::service::Pending, { copy::WAITERS }>,
+    /// The counters of the copies at the last line the service printed.
+    copy_seen: (u32, u32, u32, u32),
+    /// The notifications of the programs that wait for a copy (WAIT with a handle).
+    waiters: Waiters<Handle<Channel>, { copy::WAITERS }>,
     /// The next step of the loop goes to the reaper when it has work (the jobs and the reaper
     /// take turns).
     reap_turn: bool,
@@ -848,14 +860,15 @@ impl Layerd {
                 let Some(job) = self.jobs[place].take() else {
                     return;
                 };
+                // A change that reserved a copy has a copy for the worker, and the line that says so
+                // goes before the answer, so a program that has the answer has the line too.
+                self.pump();
                 let _ = match result {
                     Ok(Done::Written) => job.pending.answer(w.as_bytes(), none()),
                     Ok(Done::Pass(pass)) => job.pending.answer(w.as_bytes(), [pass]),
                     Ok(Done::Continue(_)) => unreachable!(),
                     Err(status) => job.pending.answer(&proto_wire::reply(status), none()),
                 };
-                // A change that reserved a copy has a copy for the worker.
-                self.pump();
             }
         }
     }
@@ -867,23 +880,29 @@ impl Layerd {
             worker::publish(&order);
             sent = true;
         }
+        self.note_copies("queued");
         if sent {
-            self.copy_line("queued");
             let _ = sys::notify(&self.kick, 1);
             #[cfg(feature = "break-layerd-copy-in-loop")]
             worker::inline();
         }
     }
 
-    /// The counters of the copies, a line when something happened: the probes read it.
-    fn copy_line(&self, what: &str) {
+    /// The counters of the copies, a line when one of them moved: the probes read it (a read open
+    /// makes no copy, two writers of one file make one).
+    fn note_copies(&mut self, what: &str) {
         let t = &self.core.copies;
+        let seen = (t.reserved, t.committed, t.dropped, t.failed);
+        if seen == self.copy_seen {
+            return;
+        }
+        self.copy_seen = seen;
         rt::println!(
             "layerd: copies {what}: {} reserved, {} made visible, {} dropped, {} failed",
-            t.reserved,
-            t.committed,
-            t.dropped,
-            t.failed
+            seen.0,
+            seen.1,
+            seen.2,
+            seen.3
         );
     }
 
@@ -924,23 +943,16 @@ impl Layerd {
                 let of = self.changes[JOBS].commit_of();
                 self.core.commit_done(&mut self.changes[JOBS]);
                 self.commit = false;
+                // The line goes before the answers, so a program that has its answer has it too.
+                self.note_copies("over");
                 if let Some((place, generation)) = of {
+                    // The programs that wait for the copy are told, and ask WAIT once more for how
+                    // it ended.
                     let ticket = copy::ticket_of(place, generation);
-                    let code = match self.core.copy_wait(ticket) {
-                        copy::Wait::Over(code) => code,
-                        copy::Wait::Pending => 0,
-                    };
-                    while let Some(pending) = self.waiters.take(ticket) {
-                        let status = if code == 0 {
-                            Status::Ok
-                        } else {
-                            Status::Unknown(code)
-                        };
-                        let _ =
-                            pending.answer(&proto_wire::reply(status), rt::handle::Outgoing::new());
+                    while let Some(notify) = self.waiters.take(ticket) {
+                        let _ = sys::notify(&notify, 1);
                     }
                 }
-                self.copy_line("over");
                 self.next_commit();
                 self.pump();
             }
@@ -1246,27 +1258,32 @@ impl Layerd {
                 let Ok(ticket) = n::read_wait(body) else {
                     return bad;
                 };
+                if r.handles.len() > 1 {
+                    return bad;
+                }
+                // WAIT is answered at once: 0 or the failure when the copy is over, COPYING while it
+                // goes on. The kernel gives no end to the wait of a thread for the reply of a request
+                // that a service has taken, so a wait that a signal may end is the program's `receive`
+                // on its own channel: the copy of that channel the request brings (NOTIFY, labelled
+                // with the ticket) is kept here and notified when the copy ends.
                 match self.core.copy_wait(ticket) {
                     copy::Wait::Over(0) => Answer::Status(Status::Ok),
                     copy::Wait::Over(code) => st(code),
                     copy::Wait::Pending => {
-                        // The reply waits for the end of the copy; no place for it is a request to
-                        // ask again.
-                        if self.waiters.len() >= copy::WAITERS {
-                            return st(l::STARTING);
-                        }
-                        let Some(pending) = r.defer() else {
-                            return bad;
-                        };
-                        match self.waiters.add(ticket, pending) {
-                            Ok(()) => Answer::Deferred,
-                            Err(pending) => {
-                                let _ = pending.answer(
-                                    &proto_wire::reply(Status::Unknown(l::STARTING)),
-                                    rt::handle::Outgoing::new(),
-                                );
-                                Answer::Deferred
+                        if r.handles.len() == 1 {
+                            if self.waiters.len() >= copy::WAITERS {
+                                return st(l::STARTING);
                             }
+                            let Ok(handle) = r.handles.take::<Channel>(0) else {
+                                return Answer::Status(Status::Kernel(abi::Error::WrongType));
+                            };
+                            if self.waiters.add(ticket, handle).is_err() {
+                                return st(l::STARTING);
+                            }
+                        }
+                        match n::write_copying(ticket, r.reply()) {
+                            Ok(()) => Answer::Reply(rt::handle::Outgoing::new()),
+                            Err(status) => Answer::Status(status),
                         }
                     }
                 }

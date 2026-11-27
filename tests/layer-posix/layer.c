@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -43,6 +44,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -431,11 +433,13 @@ static int dotdot_out_of_tmp(void) {
 
 /* A link below a pass-through name that leads into the root, met by a path against a descriptor of
  * the directory (the file service walks it from the descriptor): the walk is routed through the
- * layer service, so a read sees the merged view and a write to a lower file is refused. */
+ * layer service, so a read sees the merged view and a write to a lower program is refused (a program
+ * is never copied up, so the refusal is the layer service's: a plain file would be copied). */
 static int link_below_a_pass_through_directory(void) {
     struct stat st;
     LP_CHECK(mkdir("/tmp/ld", 0755) == 0);
     LP_CHECK(symlink("/etc", "/tmp/ld/l") == 0);
+    LP_CHECK(symlink("/bin", "/tmp/ld/b") == 0);
     int d = open("/tmp/ld", O_RDONLY | O_DIRECTORY);
     LP_CHECK(d >= 0);
     LP_CHECK(FAILS(openat(d, "l/layer-hidden", O_RDONLY), ENOENT));
@@ -443,10 +447,10 @@ static int link_below_a_pass_through_directory(void) {
     LP_CHECK(fd >= 0 && fd_has_bytes(fd, OWN_BYTES));
     close(fd);
     LP_CHECK(fstatat(d, "l/layer-own", &st, 0) == 0 && st.st_dev == LAYERED_DEVICE);
-    LP_CHECK(FAILS(openat(d, "l/layer-lower", O_WRONLY), EROFS));
+    LP_CHECK(FAILS(openat(d, "b/layer-posix", O_WRONLY), EROFS));
     LP_CHECK(has_bytes("/etc/layer-lower", "lower of etc\n"));
     close(d);
-    LP_CHECK(unlink("/tmp/ld/l") == 0 && rmdir("/tmp/ld") == 0);
+    LP_CHECK(unlink("/tmp/ld/l") == 0 && unlink("/tmp/ld/b") == 0 && rmdir("/tmp/ld") == 0);
     return 0;
 }
 
@@ -644,28 +648,32 @@ static int rights_of_another_user(void) {
 static int writes_to_the_lower_set_are_refused(void) {
     struct stat st;
     struct timespec times[2] = {{1, 0}, {1, 0}};
-    LP_CHECK(FAILS(open("/etc/layer-lower", O_WRONLY), EROFS));
-    LP_CHECK(FAILS(open("/etc/layer-lower", O_RDWR), EROFS));
-    LP_CHECK(FAILS(open("/etc/layer-lower", O_RDONLY | O_TRUNC), EROFS));
-    LP_CHECK(FAILS(open("/lowpriv/f", O_WRONLY | O_CREAT, 0644), EROFS));
-    LP_CHECK(FAILS(chmod("/etc/layer-lower", 0600), EROFS));
-    LP_CHECK(FAILS(chown("/etc/layer-lower", 1, 1), EROFS));
-    LP_CHECK(FAILS(utimensat(AT_FDCWD, "/etc/layer-lower", times, 0), EROFS));
-    LP_CHECK(FAILS(truncate("/etc/layer-lower", 0), EROFS));
+    /* A program of the lower set is never copied up: every write to it is refused. A file that is no
+     * program is copied up when it is written (the copy phase, `layer-posix copy`). */
+    LP_CHECK(FAILS(open("/bin/layer-posix", O_WRONLY), EROFS));
+    LP_CHECK(FAILS(open("/bin/layer-posix", O_RDWR), EROFS));
+    LP_CHECK(FAILS(open("/bin/layer-posix", O_RDONLY | O_TRUNC), EROFS));
     LP_CHECK(FAILS(chmod("/bin/layer-posix", 0600), EROFS));
-    /* A lower name does not move until it is copied up, and the volume has no hard links. */
+    LP_CHECK(FAILS(chown("/bin/layer-posix", 1, 1), EROFS));
+    LP_CHECK(FAILS(utimensat(AT_FDCWD, "/bin/layer-posix", times, 0), EROFS));
+    LP_CHECK(FAILS(truncate("/bin/layer-posix", 0), EROFS));
+    /* A directory is not opened for writing. */
+    LP_CHECK(FAILS(open("/plain", O_WRONLY), EISDIR));
+    /* A lower name is not renamed (EXDEV), and the volume has no hard links. */
     LP_CHECK(FAILS(rename("/etc/layer-lower", "/etc/renamed"), EXDEV));
     LP_CHECK(FAILS(rename("/etc/layer-lower", "/tmp/renamed"), EXDEV));
+    LP_CHECK(FAILS(rename("/bin/layer-posix", "/bin/renamed"), EXDEV));
     LP_CHECK(FAILS(link("/etc/layer-lower", "/etc/hard"), EMLINK));
     /* A path against a description of a lower directory is refused as well. */
     int lower = open("/plain", O_RDONLY | O_DIRECTORY);
     LP_CHECK(lower >= 0);
-    LP_CHECK(FAILS(openat(lower, "a", O_WRONLY), EROFS));
+    LP_CHECK(FAILS(openat(lower, "../bin/layer-posix", O_WRONLY), EROFS));
     LP_CHECK(FAILS(renameat(lower, "a", lower, "a2"), EXDEV));
     close(lower);
     /* Nothing was written below the layers. */
     LP_CHECK(has_bytes("/etc/layer-lower", "lower of etc\n") && has_bytes("/plain/a", "a\n"));
     LP_CHECK(stat("/etc/layer-lower", &st) == 0 && (st.st_mode & 07777) == 0644 && st.st_uid == 0);
+    LP_CHECK(stat("/bin/layer-posix", &st) == 0 && (st.st_mode & 07777) == 0755 && st.st_uid == 0);
     LP_CHECK(FAILS(stat("/etc/renamed", &st), ENOENT) && FAILS(stat("/etc/hard", &st), ENOENT));
     return 0;
 }
@@ -1256,10 +1264,13 @@ static int a_sticky_directory_is_kept(void) {
 static int the_lower_set_is_not_written(void) {
     struct stat st;
     struct timespec times[2] = {{1, 0}, {1, 0}};
-    LP_CHECK(FAILS(open("/lowpriv/f", O_WRONLY), EROFS) && FAILS(open("/lowpriv/f", O_RDONLY | O_TRUNC), EROFS));
-    LP_CHECK(FAILS(truncate("/lowpriv/f", 0), EROFS) && FAILS(chmod("/lowpriv/f", 0600), EROFS));
-    LP_CHECK(FAILS(chown("/lowpriv/f", 1, 1), EROFS) && FAILS(utimensat(AT_FDCWD, "/lowpriv/f", times, 0), EROFS));
+    /* A program of the lower set is not copied up, so it is not written; the files are (`copy`). */
+    LP_CHECK(FAILS(open("/bin/layer-posix", O_WRONLY), EROFS) && FAILS(open("/bin/layer-posix", O_RDONLY | O_TRUNC), EROFS));
+    LP_CHECK(FAILS(truncate("/bin/layer-posix", 0), EROFS) && FAILS(chmod("/bin/layer-posix", 0600), EROFS));
+    LP_CHECK(FAILS(chown("/bin/layer-posix", 1, 1), EROFS) && FAILS(utimensat(AT_FDCWD, "/bin/layer-posix", times, 0), EROFS));
     LP_CHECK(FAILS(link("/lowpriv/f", "/lowpriv/h"), EMLINK));
+    /* The attributes of a description of a lower file are not changed through it (the path of the
+     * description is not known to the layer, so no copy is made). */
     int fd = open("/lowpriv/f", O_RDONLY);
     LP_CHECK(fd >= 0 && FAILS(fchmod(fd, 0600), EROFS) && FAILS(fchown(fd, 1, 1), EROFS));
     LP_CHECK(close(fd) == 0);
@@ -1289,7 +1300,7 @@ static int changes_against_descriptions(void) {
     /* Against a directory of the lower set alone. */
     fd = openat(lower, "w-new2", O_CREAT | O_WRONLY, 0644);
     LP_CHECK(fd >= 0 && close(fd) == 0 && listed("/lowpriv", "w-new2", 1));
-    LP_CHECK(FAILS(openat(lower, "f", O_WRONLY), EROFS));
+    LP_CHECK(FAILS(openat(lower, "../bin/layer-posix", O_WRONLY), EROFS));
     LP_CHECK(unlinkat(lower, "w-new2", 0) == 0);
     close(merged);
     close(lower);
@@ -1504,6 +1515,358 @@ static int reread_first(void) {
     return 0;
 }
 
+/* ---- the copy phase: a lower file is copied up when it is written (the roles "copy" and
+ * "copyreread") ----
+ *
+ * The lower set of this image has the directory /copyup (xtask layer_posix::copy_lower_files). The
+ * layer service answers a write of a file of it COPYING, a worker thread copies the file, and the
+ * program's layer waits and asks again: the program sees an open (or a chmod) that takes the time
+ * of the copy and then works. The number and the device of the file stay those of the lower file, and
+ * so do its owner, mode and times. The lines "layer-posix: marker <name>" tell the xtask where a
+ * read open and two writers lie among the lines of the layer service, which counts its copies. */
+
+#define BIG_BYTES (16UL << 20)
+#define TWO_BYTES (3UL << 20)
+#define BIG_BYTE(i) ((unsigned char)(((i) * 7 + ((i) >> 12)) | 1))
+
+/* The numbers the copy phase saw after the copies, which the second boot compares. */
+#define NUMBERED 8
+static const char *numbered_paths[NUMBERED] = {
+    "/copyup/append", "/copyup/attrs",  "/copyup/trunc", "/copyup/chmod",
+    "/copyup/chown",  "/copyup/utime",  "/copyup/dir",   "/copyup/link",
+};
+
+static int same_attributes(const struct stat *a, const struct stat *b) {
+    return a->st_mode == b->st_mode && a->st_uid == b->st_uid && a->st_gid == b->st_gid &&
+           a->st_ino == b->st_ino && a->st_dev == b->st_dev;
+}
+
+static int same_times(const struct stat *a, const struct stat *b) {
+    return a->st_mtim.tv_sec == b->st_mtim.tv_sec && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec;
+}
+
+static int copy_of_a_written_file(void) {
+    struct stat before, after;
+    LP_CHECK(stat("/copyup/append", &before) == 0 && before.st_dev == LAYERED_DEVICE);
+    LP_CHECK(has_bytes("/copyup/append", "lower line\n"));
+    int fd = open("/copyup/append", O_WRONLY | O_APPEND);
+    LP_CHECK(fd >= 0 && write(fd, "added\n", 6) == 6 && close(fd) == 0);
+    LP_CHECK(has_bytes("/copyup/append", "lower line\nadded\n"));
+    LP_CHECK(stat("/copyup/append", &after) == 0 && after.st_size == 17);
+    LP_CHECK(same_attributes(&before, &after));
+    /* The copy is the layer's file now: the next write needs no copy and the number is the same. */
+    fd = open("/copyup/append", O_RDWR);
+    LP_CHECK(fd >= 0 && fstat(fd, &after) == 0 && after.st_ino == before.st_ino && close(fd) == 0);
+    return 0;
+}
+
+static int the_copy_keeps_the_attributes(void) {
+    struct stat before, after;
+    LP_CHECK(stat("/copyup/attrs", &before) == 0);
+    LP_CHECK((before.st_mode & 07777) == 0751 && before.st_uid == 1001 && before.st_gid == 102);
+    /* The change of nothing that has to copy the file all the same. */
+    LP_CHECK(chown("/copyup/attrs", (uid_t)-1, (gid_t)-1) == 0);
+    LP_CHECK(stat("/copyup/attrs", &after) == 0);
+    LP_CHECK(same_attributes(&before, &after) && same_times(&before, &after));
+    LP_CHECK(after.st_size == before.st_size && has_bytes("/copyup/attrs", "attrs bytes\n"));
+    return 0;
+}
+
+static int a_cut_open_makes_an_empty_copy(void) {
+    struct stat before, after;
+    LP_CHECK(stat("/copyup/trunc", &before) == 0 && before.st_size == 10);
+    LP_CHECK((before.st_mode & 07777) == 0600 && before.st_uid == 1000 && before.st_gid == 100);
+    int fd = open("/copyup/trunc", O_WRONLY | O_TRUNC);
+    LP_CHECK(fd >= 0 && close(fd) == 0);
+    LP_CHECK(stat("/copyup/trunc", &after) == 0 && after.st_size == 0);
+    LP_CHECK(same_attributes(&before, &after));
+    LP_CHECK(has_bytes("/copyup/trunc", ""));
+    fd = open("/copyup/trunc", O_WRONLY);
+    LP_CHECK(fd >= 0 && write(fd, "new\n", 4) == 4 && close(fd) == 0);
+    LP_CHECK(has_bytes("/copyup/trunc", "new\n"));
+    return 0;
+}
+
+static int changes_of_a_lower_file(void) {
+    struct stat before, after;
+    struct timespec times[2] = {{5, 0}, {6, 0}};
+    LP_CHECK(stat("/copyup/chmod", &before) == 0);
+    LP_CHECK(chmod("/copyup/chmod", 0600) == 0);
+    LP_CHECK(stat("/copyup/chmod", &after) == 0 && (after.st_mode & 07777) == 0600);
+    LP_CHECK(after.st_ino == before.st_ino && after.st_uid == before.st_uid);
+    LP_CHECK(has_bytes("/copyup/chmod", "chmod me\n"));
+    LP_CHECK(stat("/copyup/chown", &before) == 0 && chown("/copyup/chown", 1002, 103) == 0);
+    LP_CHECK(stat("/copyup/chown", &after) == 0 && after.st_uid == 1002 && after.st_gid == 103);
+    LP_CHECK(after.st_ino == before.st_ino && (after.st_mode & 07777) == (before.st_mode & 07777));
+    LP_CHECK(has_bytes("/copyup/chown", "chown me\n"));
+    LP_CHECK(stat("/copyup/utime", &before) == 0 && utimensat(AT_FDCWD, "/copyup/utime", times, 0) == 0);
+    LP_CHECK(stat("/copyup/utime", &after) == 0 && after.st_atim.tv_sec == 5 && after.st_mtim.tv_sec == 6);
+    LP_CHECK(after.st_ino == before.st_ino && has_bytes("/copyup/utime", "utime\n"));
+    LP_CHECK(stat("/copyup/trunc2", &before) == 0 && truncate("/copyup/trunc2", 4) == 0);
+    LP_CHECK(stat("/copyup/trunc2", &after) == 0 && after.st_size == 4 && after.st_ino == before.st_ino);
+    LP_CHECK(has_bytes("/copyup/trunc2", "trun"));
+    return 0;
+}
+
+static int changes_of_a_lower_directory(void) {
+    struct stat before, after;
+    struct timespec times[2] = {{7, 0}, {8, 0}};
+    LP_CHECK(stat("/copyup/dir", &before) == 0 && S_ISDIR(before.st_mode));
+    LP_CHECK((before.st_mode & 07777) == 0750 && before.st_uid == 1000 && before.st_gid == 100);
+    LP_CHECK(chmod("/copyup/dir", 0700) == 0);
+    LP_CHECK(stat("/copyup/dir", &after) == 0 && (after.st_mode & 07777) == 0700);
+    LP_CHECK(after.st_ino == before.st_ino && after.st_dev == before.st_dev);
+    LP_CHECK(chown("/copyup/dir", 1003, 104) == 0 && utimensat(AT_FDCWD, "/copyup/dir", times, 0) == 0);
+    LP_CHECK(stat("/copyup/dir", &after) == 0 && after.st_uid == 1003 && after.st_gid == 104);
+    LP_CHECK(after.st_ino == before.st_ino && after.st_mtim.tv_sec == 8);
+    /* No content moved: the lower names still show through the directory of the layer. */
+    DIR *d = opendir("/copyup/dir");
+    LP_CHECK(d != NULL);
+    struct names n;
+    LP_CHECK(collect(d, &n) == 0);
+    closedir(d);
+    int seen = 0;
+    for (int i = 0; i < n.count; i++) {
+        if (strcmp(n.name[i], "in") == 0) seen++;
+    }
+    LP_CHECK(seen == 1 && has_bytes("/copyup/dir/in", "inside\n"));
+    return 0;
+}
+
+static int lchown_of_a_lower_link(void) {
+    struct stat before, after;
+    char text[16];
+    LP_CHECK(lstat("/copyup/link", &before) == 0 && S_ISLNK(before.st_mode));
+    LP_CHECK(lchown("/copyup/link", 1005, 106) == 0);
+    LP_CHECK(lstat("/copyup/link", &after) == 0 && S_ISLNK(after.st_mode));
+    LP_CHECK(after.st_uid == 1005 && after.st_gid == 106 && after.st_ino == before.st_ino);
+    LP_CHECK(readlink("/copyup/link", text, sizeof text) == 6 && memcmp(text, "append", 6) == 0);
+    return 0;
+}
+
+static int a_lower_program_is_never_copied_and_still_runs(void) {
+    struct stat st;
+    LP_CHECK(FAILS(open("/bin/layer-posix", O_WRONLY | O_APPEND), EROFS));
+    LP_CHECK(FAILS(open("/bin/layer-posix", O_WRONLY | O_TRUNC), EROFS));
+    LP_CHECK(FAILS(chmod("/bin/layer-posix", 0644), EROFS));
+    LP_CHECK(FAILS(chown("/bin/layer-posix", 1, 1), EROFS));
+    LP_CHECK(FAILS(truncate("/bin/layer-posix", 0), EROFS));
+    LP_CHECK(stat("/bin/layer-posix", &st) == 0 && st.st_dev == LAYERED_DEVICE && st.st_size > 4096);
+    LP_CHECK((st.st_mode & 07777) == 0755);
+    pid_t pid = 0;
+    char *argv[] = {"layer-posix", "exit0", NULL};
+    LP_CHECK(posix_spawn(&pid, "/bin/layer-posix", NULL, NULL, argv, environ) == 0);
+    LP_CHECK(wait_ok(pid) == 0);
+    return 0;
+}
+
+static int a_read_open_copies_nothing(void) {
+    struct stat st;
+    char buf[32];
+    printf("layer-posix: marker read-begin\n");
+    int fd = open("/copyup/read", O_RDONLY);
+    LP_CHECK(fd >= 0 && read(fd, buf, sizeof buf) == 10 && memcmp(buf, "read only\n", 10) == 0);
+    LP_CHECK(close(fd) == 0);
+    LP_CHECK(stat("/copyup/read", &st) == 0 && access("/copyup/read", R_OK) == 0);
+    LP_CHECK(has_bytes("/copyup/read", "read only\n") && lstat("/copyup/link", &st) == 0);
+    DIR *d = opendir("/copyup");
+    LP_CHECK(d != NULL);
+    struct names n;
+    LP_CHECK(collect(d, &n) == 0 && n.count >= 10);
+    closedir(d);
+    printf("layer-posix: marker read-end\n");
+    return 0;
+}
+
+static int two_writers_of_one_file_make_one_copy(void) {
+    int gate[2];
+    LP_CHECK(pipe(gate) == 0);
+    printf("layer-posix: marker two-begin\n");
+    pid_t pid = fork();
+    LP_CHECK(pid >= 0);
+    if (pid == 0) {
+        char go;
+        if (read(gate[0], &go, 1) != 1) _exit(1);
+        int fd = open("/copyup/two", O_WRONLY | O_APPEND);
+        if (fd < 0 || write(fd, "child\n", 6) != 6 || close(fd) != 0) _exit(2);
+        _exit(0);
+    }
+    LP_CHECK(write(gate[1], "g", 1) == 1);
+    int fd = open("/copyup/two", O_WRONLY | O_APPEND);
+    LP_CHECK(fd >= 0 && write(fd, "parent\n", 7) == 7 && close(fd) == 0);
+    LP_CHECK(wait_ok(pid) == 0);
+    printf("layer-posix: marker two-end\n");
+    close(gate[0]);
+    close(gate[1]);
+    /* Both lines are there, whole, after the 3 MiB of the lower file. */
+    struct stat st;
+    LP_CHECK(stat("/copyup/two", &st) == 0 && st.st_size == (off_t)(TWO_BYTES + 13));
+    char tail[16];
+    fd = open("/copyup/two", O_RDONLY);
+    LP_CHECK(fd >= 0 && pread(fd, tail, 13, (off_t)TWO_BYTES) == 13 && close(fd) == 0);
+    tail[13] = 0;
+    LP_CHECK(strcmp(tail, "child\nparent\n") == 0 || strcmp(tail, "parent\nchild\n") == 0);
+    return 0;
+}
+
+static volatile sig_atomic_t alarmed;
+static void on_alarm(int sig) {
+    (void)sig;
+    alarmed++;
+}
+
+/* The first byte of the file and a byte after its middle are the lower file's. */
+static int is_the_big_file(const char *path) {
+    unsigned char b[2];
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size != (off_t)BIG_BYTES) return 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    int ok = pread(fd, b, 1, 0) == 1 && b[0] == BIG_BYTE(0) &&
+             pread(fd, b + 1, 1, (off_t)(BIG_BYTES / 2 + 5)) == 1 && b[1] == BIG_BYTE(BIG_BYTES / 2 + 5);
+    close(fd);
+    return ok;
+}
+
+/* A signal during the wait for the copy of 16 MiB (the copy takes the time of the disk, the timer
+ * fires at 200 ms): without SA_RESTART the open ends with EINTR and the copy goes on in the layer
+ * service (the open asked again takes the copy that is there); with SA_RESTART the open goes on and
+ * returns the descriptor. */
+static int a_signal_during_the_wait(const char *path, int restart) {
+    struct sigaction sa;
+    struct sigevent ev;
+    struct itimerspec timer = {{0, 0}, {0, 200000000}};
+    struct itimerspec off = {{0, 0}, {0, 0}};
+    timer_t clock_timer;
+    memset(&sa, 0, sizeof sa);
+    memset(&ev, 0, sizeof ev);
+    ev.sigev_notify = SIGEV_SIGNAL;
+    ev.sigev_signo = SIGALRM;
+    sa.sa_handler = on_alarm;
+    sa.sa_flags = restart ? SA_RESTART : 0;
+    sigemptyset(&sa.sa_mask);
+    LP_CHECK(sigaction(SIGALRM, &sa, NULL) == 0);
+    alarmed = 0;
+    LP_CHECK(timer_create(CLOCK_MONOTONIC, &ev, &clock_timer) == 0);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    LP_CHECK(timer_settime(clock_timer, 0, &timer, NULL) == 0);
+    int fd = open(path, O_WRONLY | O_APPEND);
+    int err = errno;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    printf("layer-posix: the open of the file of 16 MiB took %ld ms\n", (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
+    timer_settime(clock_timer, 0, &off, NULL);
+    timer_delete(clock_timer);
+    if (restart) {
+        if (fd < 0) printf("layer-posix: the open ended with errno %d\n", err);
+        LP_CHECK(fd >= 0 && alarmed >= 1);
+    } else {
+        if (fd >= 0 || err != EINTR) printf("layer-posix: the open gave %d, errno %d\n", fd, err);
+        LP_CHECK(fd == -1 && err == EINTR && alarmed == 1);
+        fd = open(path, O_WRONLY | O_APPEND);
+        LP_CHECK(fd >= 0);
+    }
+    /* The file is not written: its size is past the limit of a program's writes (SIGXFSZ). */
+    LP_CHECK(close(fd) == 0);
+    LP_CHECK(is_the_big_file(path));
+    return 0;
+}
+
+static int signal_without_restart(void) {
+    return a_signal_during_the_wait("/copyup/big1", 0);
+}
+
+static int signal_with_restart(void) {
+    return a_signal_during_the_wait("/copyup/big2", 1);
+}
+
+/* The numbers of the copies go to a file of the layer for the second boot. */
+static int the_numbers_are_kept(void) {
+    char text[NUMBERED * 48];
+    size_t at = 0;
+    for (int i = 0; i < NUMBERED; i++) {
+        struct stat st;
+        LP_CHECK(lstat(numbered_paths[i], &st) == 0 && st.st_dev == LAYERED_DEVICE);
+        at += (size_t)snprintf(text + at, sizeof text - at, "%s %llx\n", numbered_paths[i], (unsigned long long)st.st_ino);
+    }
+    int fd = open("/etc/copy-numbers", O_CREAT | O_WRONLY | O_EXCL, 0644);
+    LP_CHECK(fd >= 0 && write(fd, text, at) == (ssize_t)at && close(fd) == 0);
+    return 0;
+}
+
+static int copy_first(void) {
+    if (lp_session() != 0) {
+        printf("layer-posix: the program started with a session\n");
+        failures++;
+    }
+    run_check("a lower file that is written is copied up", copy_of_a_written_file);
+    run_check("the copy keeps the owner, the mode, the times and the number", the_copy_keeps_the_attributes);
+    run_check("a cut open makes an empty copy with the lower attributes", a_cut_open_makes_an_empty_copy);
+    run_check("chmod, chown, utimensat and truncate of a lower file copy it up", changes_of_a_lower_file);
+    run_check("chmod, chown and utimensat of a lower directory keep its number", changes_of_a_lower_directory);
+    run_check("lchown of a lower link copies the link", lchown_of_a_lower_link);
+    run_check("a lower program is never copied up and still runs", a_lower_program_is_never_copied_and_still_runs);
+    run_check("a read open copies nothing", a_read_open_copies_nothing);
+    run_check("two writers of one file make one copy", two_writers_of_one_file_make_one_copy);
+    run_check("a signal during the wait of a copy is EINTR without SA_RESTART", signal_without_restart);
+    run_check("a signal during the wait of a copy goes on with SA_RESTART", signal_with_restart);
+    run_check("the numbers of the copies are kept", the_numbers_are_kept);
+    if (failures != 0) {
+        printf("layer-posix: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("layer-posix: copy checks passed\n");
+    return 0;
+}
+
+/* The second boot: the copies are the layer's, with the numbers they had, and what they hold. */
+static int the_copies_are_kept(void) {
+    char text[NUMBERED * 48 + 1];
+    long n = read_file("/etc/copy-numbers", text, sizeof text);
+    LP_CHECK(n > 0);
+    char *line = text;
+    for (int i = 0; i < NUMBERED; i++) {
+        char *end = strchr(line, '\n');
+        LP_CHECK(end != NULL);
+        *end = 0;
+        char *space = strrchr(line, ' ');
+        LP_CHECK(space != NULL);
+        *space = 0;
+        LP_CHECK(strcmp(line, numbered_paths[i]) == 0);
+        unsigned long long ino = strtoull(space + 1, NULL, 16);
+        struct stat st;
+        LP_CHECK(lstat(line, &st) == 0 && st.st_dev == LAYERED_DEVICE);
+        if ((unsigned long long)st.st_ino != ino) printf("layer-posix: %s has number %llx, was %llx\n", line, (unsigned long long)st.st_ino, ino);
+        LP_CHECK((unsigned long long)st.st_ino == ino);
+        line = end + 1;
+    }
+    struct stat st;
+    LP_CHECK(has_bytes("/copyup/append", "lower line\nadded\n") && has_bytes("/copyup/trunc", "new\n"));
+    LP_CHECK(has_bytes("/copyup/chmod", "chmod me\n") && has_bytes("/copyup/trunc2", "trun"));
+    LP_CHECK(stat("/copyup/attrs", &st) == 0 && (st.st_mode & 07777) == 0751 && st.st_uid == 1001);
+    LP_CHECK(stat("/copyup/chmod", &st) == 0 && (st.st_mode & 07777) == 0600);
+    LP_CHECK(stat("/copyup/dir", &st) == 0 && (st.st_mode & 07777) == 0700 && st.st_uid == 1003);
+    LP_CHECK(lstat("/copyup/link", &st) == 0 && st.st_uid == 1005 && S_ISLNK(st.st_mode));
+    LP_CHECK(is_the_big_file("/copyup/big1") && is_the_big_file("/copyup/big2"));
+    /* The directory of the layer shows its lower name still. */
+    LP_CHECK(has_bytes("/copyup/dir/in", "inside\n"));
+    /* A file that is already the layer's is written without a copy. */
+    int fd = open("/copyup/append", O_WRONLY | O_APPEND);
+    LP_CHECK(fd >= 0 && write(fd, "again\n", 6) == 6 && close(fd) == 0);
+    LP_CHECK(has_bytes("/copyup/append", "lower line\nadded\nagain\n"));
+    return 0;
+}
+
+static int copyreread_first(void) {
+    run_check("the copies are the layer's with the numbers they had", the_copies_are_kept);
+    if (failures != 0) {
+        printf("layer-posix: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("layer-posix: copy reread checks passed\n");
+    return 0;
+}
+
 /* The program init starts has no code in its map to copy, so it cannot fork (the layer answers
  * ENOSYS); a program the loader starts can. The first role is therefore a launcher: it starts the
  * program from /bin with posix_spawn and passes on how it ended. */
@@ -1531,5 +1894,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "run") == 0) return first();
     if (argc > 1 && strcmp(argv[1], "write") == 0) return write_first();
     if (argc > 1 && strcmp(argv[1], "reread") == 0) return reread_first();
+    if (argc > 1 && strcmp(argv[1], "copy") == 0) return copy_first();
+    if (argc > 1 && strcmp(argv[1], "copyreread") == 0) return copyreread_first();
     return launcher();
 }

@@ -40,6 +40,13 @@ fn main() {
     if env::var_os("CARGO_FEATURE_PHASE_REREAD").is_some() {
         mode = "reread".to_owned();
     }
+    // The copy probe has two boots on one disk as well (`cargo xtask layer-posix copy`).
+    if env::var_os("CARGO_FEATURE_PHASE_COPY").is_some() {
+        mode = "copy".to_owned();
+    }
+    if env::var_os("CARGO_FEATURE_PHASE_COPYREREAD").is_some() {
+        mode = "copyreread".to_owned();
+    }
     assert!(
         mode.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
         "STAFETO_LAYER_POSIX_MODE {mode:?} is a role name"

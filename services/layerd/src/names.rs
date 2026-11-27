@@ -121,6 +121,8 @@ pub struct Core<'a, V: Volume, L: Lower> {
     pub(crate) writes: crate::change::Writes,
     /// The copies up (`copy`).
     pub copies: crate::copy::Table,
+    /// The names `work/` held when the service started: what an earlier instance left.
+    pub cleared: u32,
 }
 
 /// The result of a walk and the plain path it walked, which a redirect carries.
@@ -312,6 +314,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             resolving: 0,
             writes: crate::change::Writes::default(),
             copies: crate::copy::Table::new(),
+            cleared: 0,
         }
     }
 
@@ -473,6 +476,9 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
                     return Ok(());
                 }
                 self.volume.rmdir(&path[..len])?;
+                if root == WORK_DIR {
+                    self.cleared += 1;
+                }
                 while path[len - 1] != b'/' {
                     len -= 1;
                 }
@@ -491,6 +497,9 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
                     break;
                 }
                 self.volume.unlink(&path[..at])?;
+                if root == WORK_DIR {
+                    self.cleared += 1;
+                }
             }
         }
     }

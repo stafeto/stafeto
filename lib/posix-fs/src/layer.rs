@@ -130,6 +130,55 @@ pub fn errno_of(code: u32) -> i32 {
     }
 }
 
+/// The ticket of a reply whose status is COPYING (the layer service copies a file of the lower set
+/// up before it writes it): the program sends WAIT with it and then sends its request again. None
+/// for a reply of another status; an error for a COPYING reply with no ticket.
+pub fn copying_ticket(reply: &[u8]) -> Option<Result<u64, i32>> {
+    n::read_copying(reply).map(|ticket| ticket.map_err(|_| errno::EIO))
+}
+
+/// The errno of a copy that failed, which the answer to WAIT carries as a status of the layer
+/// service: a full volume is ENOSPC and a volume that cannot be written (or a program, which is
+/// never copied up) is EROFS; any other failure is EIO.
+pub fn copy_errno(code: u32) -> i32 {
+    match code {
+        proto_fs::NO_SPACE => errno::ENOSPC,
+        proto_fs::READ_ONLY_FILESYSTEM => errno::EROFS,
+        _ => errno::EIO,
+    }
+}
+
+/// What the answer to WAIT asks of the program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Waited {
+    /// The copy is over: the request that said COPYING is sent again, and sees the present state
+    /// (the copy, or the name as it became).
+    Over,
+    /// The copy goes on: the service holds the notification the WAIT brought and gives it when the
+    /// copy ends. The program waits for it in `receive` on its own channel, where a signal ends the
+    /// wait, and asks WAIT again after it.
+    Going,
+    /// The service has no place for the waiter, or builds its index: WAIT is sent again after a
+    /// pause.
+    Pause,
+    /// The session is not bound: BIND, then WAIT again.
+    Bind,
+    /// The copy failed, or the request is refused: this errno.
+    Failed(i32),
+}
+
+/// The plan for the status of the answer to WAIT. `busy` is the status of a service that has no job
+/// for the request. WAIT is answered at once: 0 when the copy is over, COPYING while it goes on.
+pub fn waited(status: u32, busy: u32) -> Waited {
+    match status {
+        0 => Waited::Over,
+        proto_fs::COPYING => Waited::Going,
+        proto_fs::AUTHENTICATING => Waited::Bind,
+        s if s == STARTING || s == busy => Waited::Pause,
+        s => Waited::Failed(copy_errno(s)),
+    }
+}
+
 /// The node information the layered root reports: the device is the root's.
 pub fn stamp(mut info: NodeInfo) -> NodeInfo {
     info.device = DEVICE;
@@ -655,6 +704,62 @@ mod tests {
         // The handle 0 is a handle like another.
         assert!(mark_data(0) && is_marked_data(0));
         unmark_data(0);
+    }
+
+    #[test]
+    fn a_copying_reply_has_its_ticket_and_no_other_reply_has_one() {
+        let mut w = proto_wire::Writer::new();
+        n::write_copying(0x0102_0304_0506, &mut w).unwrap();
+        assert_eq!(copying_ticket(w.as_bytes()), Some(Ok(0x0102_0304_0506)));
+        // A reply that is not COPYING (the plain status 0, a redirect, a refusal) has none.
+        assert_eq!(copying_ticket(&[0, 0, 0, 0]), None);
+        assert_eq!(copying_ticket(&proto_fs::REDIRECT.to_le_bytes()), None);
+        assert_eq!(
+            copying_ticket(&proto_fs::READ_ONLY_FILESYSTEM.to_le_bytes()),
+            None
+        );
+        // COPYING with no ticket, or with bytes after it, is broken.
+        assert_eq!(
+            copying_ticket(&proto_fs::COPYING.to_le_bytes()),
+            Some(Err(errno::EIO))
+        );
+        let mut long = w.as_bytes().to_vec();
+        long.push(0);
+        assert_eq!(copying_ticket(&long), Some(Err(errno::EIO)));
+        // The request a client sends for the wait round-trips with the same ticket.
+        let mut w = proto_wire::Writer::new();
+        n::write_wait(77, &mut w).unwrap();
+        let mut r = proto_wire::Reader::new(w.as_bytes());
+        assert_eq!(
+            proto_wire::Header::read(&mut r),
+            Ok(n::NameMethod::Wait.header())
+        );
+        assert_eq!(n::read_wait(r), Ok(77));
+    }
+
+    #[test]
+    fn the_answer_to_wait_is_a_resend_a_pause_a_bind_or_an_errno() {
+        let busy = 0x8000_0007;
+        assert_eq!(waited(0, busy), Waited::Over);
+        assert_eq!(waited(proto_fs::COPYING, busy), Waited::Going);
+        assert_eq!(waited(STARTING, busy), Waited::Pause);
+        assert_eq!(waited(busy, busy), Waited::Pause);
+        assert_eq!(waited(proto_fs::AUTHENTICATING, busy), Waited::Bind);
+        assert_eq!(
+            waited(proto_fs::NO_SPACE, busy),
+            Waited::Failed(errno::ENOSPC)
+        );
+        assert_eq!(
+            waited(proto_fs::READ_ONLY_FILESYSTEM, busy),
+            Waited::Failed(errno::EROFS)
+        );
+        // The code of an I/O error of the layer service, and any other one, is EIO.
+        for code in [1313, proto_fs::NO_ENTRY, proto_fs::STALE, 9999] {
+            assert_eq!(waited(code, busy), Waited::Failed(errno::EIO), "{code}");
+        }
+        assert_eq!(copy_errno(proto_fs::NO_SPACE), errno::ENOSPC);
+        assert_eq!(copy_errno(proto_fs::READ_ONLY_FILESYSTEM), errno::EROFS);
+        assert_eq!(copy_errno(0), errno::EIO);
     }
 
     #[test]
