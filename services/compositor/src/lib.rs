@@ -38,6 +38,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod damage;
 #[cfg(test)]
 mod element_tests;
 pub mod elements;
@@ -51,6 +52,7 @@ pub const STACK_BYTES: usize = 128 * 1024;
 #[cfg(test)]
 mod measures;
 
+use damage::DamageList;
 use elements::{Def, Fault, Shape};
 use proto_comp::{
     BUFFERS, BUTTON, CLOSE, CREATE, Element, Event, FOCUS_IN, FOCUS_OUT, KEY, MAX_ELEMENTS,
@@ -855,7 +857,10 @@ pub struct Scene {
     /// Who got the press of each key below KEYS_TRACKED: its release goes
     /// to the same (OWNER_NONE: no press seen).
     owner: [u8; KEYS_TRACKED],
-    damage: Option<Rect>,
+    damage: DamageList,
+    /// The damage of the frame in progress, as `begin_at` took it: the rectangles
+    /// its bands cover (`frame_damage`).
+    frame_damage: DamageList,
     /// The earliest start a window left by the last taking is due at (the
     /// caller says `hold` with it to the pacer).
     held_until: Option<u64>,
@@ -1033,7 +1038,8 @@ impl Scene {
             bands: 0,
             modifier: 0,
             owner: [OWNER_NONE; KEYS_TRACKED],
-            damage: None,
+            damage: DamageList::new(),
+            frame_damage: DamageList::new(),
             held_until: None,
             frame: false,
             seq: 0,
@@ -1169,7 +1175,7 @@ impl Scene {
     /// scene, or a buffer a window holds for the start of its interval.
     pub fn busy(&self) -> bool {
         self.frame
-            || self.damage.is_some()
+            || !self.damage.is_empty()
             || self.windows.iter().flatten().any(|w| w.held.is_some())
     }
 
@@ -1394,7 +1400,7 @@ impl Scene {
     }
 
     fn add_damage(&mut self, r: Rect) {
-        self.damage = Some(union(self.damage, r));
+        self.damage.add(r);
     }
 
     /// Whether a scene session holds a scene (committed, or taken).
@@ -1721,6 +1727,7 @@ impl Scene {
         if w.bufs[buffer as usize] != Buf::Free {
             return Err(Refusal::Busy);
         }
+        let wrect = w.rect;
         let mut damage = Scene::changed(w.rect, rects)?;
         let mut seen = true;
         if let Some(carried) = in_scene {
@@ -1753,13 +1760,24 @@ impl Scene {
             }
             None => w.pace.count_post(replaced.is_some()),
         }
-        if let Some(h) = w.held.take() {
+        let held = w.held.take();
+        if let Some(h) = held {
             damage = union(Some(damage), h);
         }
         if in_scene.is_some() {
             self.route_damage(damage, seen);
-        } else {
+        } else if held.is_some() || rects.is_empty() {
             self.add_damage(damage);
+        } else {
+            // The areas of the change stay apart in the frame's damage.
+            for r in rects {
+                self.add_damage(Rect {
+                    x: wrect.x + r.x,
+                    y: wrect.y + r.y,
+                    w: r.w,
+                    h: r.h,
+                });
+            }
         }
         Ok((replaced, due))
     }
@@ -1768,7 +1786,10 @@ impl Scene {
     /// something of the scene a taking is for (a buffer to give back, a
     /// SCENE_COMPOSE, the end of the scene).
     pub fn damaged(&self) -> bool {
-        self.damage.is_some() || self.stage.give_back || self.stage.compose_due || self.stage.ending
+        !self.damage.is_empty()
+            || self.stage.give_back
+            || self.stage.compose_due
+            || self.stage.ending
     }
 
     /// The start the windows a taking left are due at, the earliest.
@@ -2050,11 +2071,10 @@ impl Scene {
         // On the device's cursor pipeline the move is the device's: the
         // frame holds no picture, so nothing is damaged.
         if self.cursor.is_none() {
-            let mut damage = Scene::cursor_rect(at);
+            self.add_damage(Scene::cursor_rect(at));
             if let Some(old) = before {
-                damage = union(Some(damage), Scene::cursor_rect(old));
+                self.add_damage(Scene::cursor_rect(old));
             }
-            self.add_damage(damage);
         }
         // Under a scene the place of a window on the screen is the element's,
         // with its scale and turn: the pointer is the scene's, in the screen's
@@ -2170,7 +2190,8 @@ impl Scene {
             w.rect = to;
         }
         if shown {
-            self.add_damage(union(Some(was), to));
+            self.add_damage(was);
+            self.add_damage(to);
         }
         Ok(())
     }
@@ -2225,8 +2246,15 @@ impl Scene {
 
     // ------------------------------------------------------------ the frame
 
+    /// The rectangles the bands of the frame in progress cover, which do not
+    /// overlap: at most `damage::MAX_DAMAGE`, all inside the rectangle `begin`
+    /// returned (their bounds are it for a frame that composes only the damage).
+    pub fn frame_damage(&self) -> &[Rect] {
+        self.frame_damage.rects()
+    }
+
     /// Starts a frame when none is in progress and damage waits: the
-    /// damage, clipped to the screen. Each window's posted buffer is taken,
+    /// bounds of its damage, clipped to the screen. Each window's posted buffer is taken,
     /// and, when no manager has subscribed, a window that has its first
     /// buffer taken gets the focus and the top place.
     pub fn begin(&mut self) -> Option<Rect> {
@@ -2261,7 +2289,7 @@ impl Scene {
             if w.pace.due(k)
                 && let Some(h) = w.held.take()
             {
-                self.damage = Some(union(self.damage, h));
+                self.damage.add(h);
             }
         }
         // A pending scene is taken when its images are made, at the latest when the
@@ -2273,19 +2301,25 @@ impl Scene {
             return None;
         }
         let compose_now = core::mem::take(&mut self.stage.compose_due);
-        let d = self.damage.take();
-        let frozen = self.take_scene(compose_now, d.is_some(), hold);
+        let mut list = self.damage.take();
+        let frozen = self.take_scene(compose_now, !list.is_empty(), hold);
         // The damage the commit kept aside came with the taking.
-        let d = match (d, self.damage.take()) {
-            (Some(a), Some(b)) => Some(union(Some(a), b)),
-            (a, b) => a.or(b),
-        };
-        let d = d?;
-        let x1 = (d.x + d.w).min(WIDTH);
-        let y1 = (d.y + d.h).min(HEIGHT);
-        if d.x >= x1 || d.y >= y1 {
-            return None;
+        list.add_all(&self.damage.take());
+        // The rectangles cut to the screen; what lies outside it is nothing.
+        let mut clipped = DamageList::new();
+        for r in list.rects() {
+            let x1 = (r.x + r.w).min(WIDTH);
+            let y1 = (r.y + r.h).min(HEIGHT);
+            if r.x < x1 && r.y < y1 {
+                clipped.add(Rect {
+                    x: r.x,
+                    y: r.y,
+                    w: x1 - r.x,
+                    h: y1 - r.y,
+                });
+            }
         }
+        let d = clipped.bounds()?;
         let mut first = 0u8;
         for (i, w) in self.windows.iter_mut().enumerate() {
             let Some(w) = w else {
@@ -2337,12 +2371,7 @@ impl Scene {
                 }
             }
         }
-        let mut area = Rect {
-            x: d.x,
-            y: d.y,
-            w: x1 - d.x,
-            h: y1 - d.y,
-        };
+        let mut area = d;
         self.kind = match self.plan() {
             Plan::Bypass(_) => {
                 // The target is not kept while the pool is shown.
@@ -2361,6 +2390,14 @@ impl Scene {
             }
         };
         self.whole = area == SCREEN;
+        // Only a frame that composes the damage walks its rectangles; the others
+        // have the one the frame is over.
+        self.frame_damage = DamageList::new();
+        if self.kind == FrameKind::Compose && area == d {
+            self.frame_damage.add_all(&clipped);
+        } else {
+            self.frame_damage.add(area);
+        }
         self.frame = true;
         // The images the frame reads are taken now and held to its end.
         if let (Some(t), Some(w)) = (self.prep, self.slot_working) {
@@ -4132,6 +4169,37 @@ mod tests {
             .unwrap();
         s.post(i, 1, &[rect(50, 0, 1, 1)]).unwrap();
         assert_eq!(s.begin(), Some(rect(10, 20, 100, 50)));
+    }
+
+    #[test]
+    fn two_far_areas_are_two_rectangles_and_make_fewer_bands_than_their_union() {
+        let mut s = Scene::new();
+        let i = make(&mut s, 1, 1, SCREEN, 2);
+        let bytes = (STRIDE * HEIGHT) as usize;
+        let src = flat(&[(i, 0, 1, bytes), (i, 1, 2, bytes)]);
+        let mut fb = screen();
+        s.post(i, 0, &[]).unwrap();
+        frame(&mut s, &mut fb, &src);
+        // Two small areas at the opposite corners.
+        let (a, b) = (rect(0, 0, 16, 16), rect(600, 380, 16, 16));
+        s.post(i, 1, &[a, b]).unwrap();
+        let bounds = s.begin().expect("a frame");
+        assert_eq!(bounds, rect(0, 0, 616, 396));
+        assert_eq!(s.frame_damage(), &[a, b]);
+        let list = s.frame_damage().to_vec();
+        let mut walked = 0;
+        for r in &list {
+            walked += draw(&s, *r, &mut fb, &src);
+        }
+        // The bands of the union of the two, for the same scene.
+        let union_bands = draw(&s, bounds, &mut screen(), &src);
+        s.end(true);
+        assert!(walked >= 2);
+        assert!(walked < union_bands, "{walked} bands against {union_bands}");
+        // The areas show the new buffer, and what lies between them is as it was.
+        assert_eq!(at(&fb, 0, 0), 2);
+        assert_eq!(at(&fb, 610, 390), 2);
+        assert_eq!(at(&fb, 300, 200), 1);
     }
 
     #[test]
