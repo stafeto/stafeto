@@ -43,7 +43,7 @@ const DISK_BYTES: u64 = 64 << 20;
 const LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The checks of the probe, in the order it runs them: the line of each is `layer-posix: <check> ok`.
-pub const CHECKS: [&str; 24] = [
+pub const CHECKS: [&str; 29] = [
     "a file of the layer of the user is read",
     "a lower file is read",
     "a name of the layer shadows the lower one",
@@ -57,6 +57,7 @@ pub const CHECKS: [&str; 24] = [
     "paths against a merged directory",
     "paths against a lower directory",
     "the pass-through names are the services' own",
+    "a path out of a pass-through directory is the root's",
     "chdir and fchdir",
     "realpath",
     "a forked child shares the directory description",
@@ -66,12 +67,16 @@ pub const CHECKS: [&str; 24] = [
     "a forked child binds its own identity",
     "rights of another user",
     "writes are refused",
+    "the attributes of descriptions are kept",
+    "the names of the layers are kept",
+    "descriptions keep the device across fork and exec",
+    "a description of the service has no path after exec",
     "a set-ID program is given the service's session",
     "a set-ID program keeps the genuine session and binds it",
 ];
 
 /// The deliberate breaks, the program each is a feature of and the check each one fails.
-pub const BREAKS: [(&str, &str, &str); 3] = [
+pub const BREAKS: [(&str, &str, &str); 6] = [
     (
         "break-layer-route",
         "layer-posix",
@@ -82,12 +87,33 @@ pub const BREAKS: [(&str, &str, &str); 3] = [
         "layer-posix",
         "a forked child shares the directory description",
     ),
+    (
+        "break-layer-refuse",
+        "layer-posix",
+        "the names of the layers are kept",
+    ),
+    // The probe's layer refuses nothing here (`break-layer-refuse`), so the guard of the RAM file
+    // service is what stands between the calls and the lower set.
     ("break-layered-guard", "ramfs", "writes are refused"),
+    (
+        "break-layer-fd-guard",
+        "layer-posix",
+        "the attributes of descriptions are kept",
+    ),
+    (
+        "break-layer-unverified",
+        "loader",
+        "a set-ID program is given the service's session",
+    ),
 ];
 
 /// The image's programs; the probe is built with `probe` features and the RAM file service with
 /// `ramfs` features.
-fn programs(probe: &'static [&'static str], ramfs: &'static [&'static str]) -> Vec<ImageProgram> {
+fn programs(
+    probe: &'static [&'static str],
+    ramfs: &'static [&'static str],
+    loader: &'static [&'static str],
+) -> Vec<ImageProgram> {
     vec![
         ("init", "init", INIT_STACK_SIZE, &["table-layer-posix"][..]),
         ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, ramfs),
@@ -99,7 +125,7 @@ fn programs(probe: &'static [&'static str], ramfs: &'static [&'static str]) -> V
         ),
         ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
         ("pipe", "pipe", crate::PIPE_STACK_SIZE, &[]),
-        ("loader", "loader", 0, &[]),
+        ("loader", "loader", 0, loader),
         (
             "virtio-blk",
             "virtio-blk",
@@ -132,7 +158,7 @@ fn programs(probe: &'static [&'static str], ramfs: &'static [&'static str]) -> V
 /// The programs of the plain image, for the check of the stacks of every list of programs.
 #[cfg(test)]
 pub fn plain_programs() -> Vec<ImageProgram> {
-    programs(&[], &[])
+    programs(&[], &[], &[])
 }
 
 /// The disk of the run: a file of the process's name, removed at the end.
@@ -157,7 +183,7 @@ pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
 
 /// The image of the shell: the C probe's services with BusyBox's probe in its place.
 fn ash_programs() -> Vec<ImageProgram> {
-    let mut list = programs(&[], &[]);
+    let mut list = programs(&[], &[], &[]);
     list[0].3 = &["table-layer-ash"];
     let at = list
         .iter()
@@ -261,28 +287,42 @@ pub fn read_ash(lines: &[String]) -> Result<(), String> {
     if find("layer-hidden").is_some() {
         return Err("the listing shows layer-hidden, which the layer deletes".to_owned());
     }
-    let after = [
+    // The listings of `ls -1` come in the order the build's `ls` makes of them, so each is a set.
+    let got = &rest[end..];
+    let fixed = [
         "lower of etc",
         "owned bytes of the layer",
         "upper shadow",
         "hidden-gone",
-        "f19",
-        "f18",
-        "f17",
-        "f16",
-        "own",
-        "c",
-        "b",
-        "a",
-        "a",
-        "tmp-bytes",
     ];
-    let got = &rest[end..];
-    if got.len() < after.len() || !got.iter().zip(after).all(|(line, want)| line == want) {
+    let sets: [&[&str]; 2] = [&["f16", "f17", "f18", "f19", "own"], &["a", "b", "c"]];
+    let tail = ["a", "tmp-bytes"];
+    let want = fixed.len() + sets[0].len() + sets[1].len() + tail.len();
+    let mut at = 0;
+    let mut ok = got.len() >= want && got[..fixed.len()].iter().zip(fixed).all(|(l, w)| l == w);
+    at += fixed.len();
+    for set in sets {
+        if !ok {
+            break;
+        }
+        let mut have: Vec<&str> = got[at..at + set.len()].iter().map(String::as_str).collect();
+        have.sort_unstable();
+        let mut wanted = set.to_vec();
+        wanted.sort_unstable();
+        ok = have == wanted;
+        at += set.len();
+    }
+    ok = ok
+        && got[at..at + tail.len()]
+            .iter()
+            .zip(tail)
+            .all(|(l, w)| l == w);
+    if !ok {
         return Err(format!(
-            "the lines after the listing are not {after:?}: {got:?}"
+            "the lines after the listing are not the script's ({fixed:?}, {sets:?}, {tail:?}): {got:?}"
         ));
     }
+    let after = &got[..want];
     if !got[after.len()..].iter().any(|l| l == "write-refused") {
         return Err(format!(
             "the shell wrote below the layers: {:?}",
@@ -292,18 +332,19 @@ pub fn read_ash(lines: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// One boot with the probe built with `probe` features and the RAM file service with `ramfs`
-/// features; the lines of the console.
+/// One boot with the probe built with `probe` features, the RAM file service with `ramfs` features
+/// and the loader with `loader` features; the lines of the console.
 fn boot(
     machine: &qemu::Machine,
     probe: &'static [&'static str],
     ramfs: &'static [&'static str],
+    loader: &'static [&'static str],
 ) -> Result<(qemu::Outcome, u64), String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
     let image = write_boot_image_files(
         IMAGE,
-        &programs(probe, ramfs),
+        &programs(probe, ramfs, loader),
         BOOT_PROFILE,
         &[],
         Vec::new(),
@@ -390,7 +431,7 @@ pub fn read_lines(lines: &[String]) -> Result<(), String> {
 }
 
 pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
-    let (output, seconds) = boot(machine, &[], &[])?;
+    let (output, seconds) = boot(machine, &[], &[], &[])?;
     read_lines(&output.lines)?;
     qemu::expect_stopped_on(
         &output,
@@ -410,8 +451,9 @@ pub fn breaks(machine: &qemu::Machine) -> Result<(), String> {
     for (feature, program, check) in BREAKS {
         let features: &'static [&'static str] = Box::leak(vec![feature].into_boxed_slice());
         let (output, seconds) = match program {
-            "ramfs" => boot(machine, &[], features)?,
-            _ => boot(machine, features, &[])?,
+            "ramfs" => boot(machine, &["break-layer-refuse"], features, &[])?,
+            "loader" => boot(machine, &[], &[], features)?,
+            _ => boot(machine, features, &[], &[])?,
         };
         let mine = mine(&output.lines);
         if mine.iter().any(|l| *l == &PASSED[PREFIX.len()..]) {
@@ -539,7 +581,10 @@ mod tests {
         for (feature, program, check) in BREAKS {
             assert!(CHECKS.contains(&check), "{feature}");
             assert!(feature.starts_with("break-layer"));
-            assert!(["layer-posix", "ramfs"].contains(&program), "{feature}");
+            assert!(
+                ["layer-posix", "ramfs", "loader"].contains(&program),
+                "{feature}"
+            );
         }
         // The checks of the file are the checks of the C program, each once.
         let source = include_str!("../../tests/layer-posix/layer.c");

@@ -1584,11 +1584,12 @@ pub fn spawn_search<'s, 'a>(
     }
     // A path of the layered root goes through the layer service first: the layers that delete the
     // name make it ENOENT, and a name of a layer of the user is never run.
-    if search.is_none()
-        && let Some(abs) = crate::layer::route(crate::names::AT_FDCWD, file)?
-    {
-        crate::layer::check_exec(&abs)?;
-    }
+    // The loader gets the path the service approved.
+    let checked = match crate::layer::route(crate::names::AT_FDCWD, file)? {
+        Some(abs) if search.is_none() => Some(crate::layer::check_exec(&abs)?),
+        _ => None,
+    };
+    let file = checked.as_ref().map_or(file, |abs| abs.bytes());
     let pgroup = attributes.pgroup;
     if pgroup > i32::MAX as u32 || attributes.flags & !proto_process::SPAWN_FLAGS != 0 {
         return Err(EINVAL);
@@ -1832,11 +1833,18 @@ fn exec_selected<'s>(
     {
         return Err(crate::constants::EACCES);
     }
-    if let ExecSource::Path(path) = source
-        && let Some(abs) = crate::layer::route(crate::names::AT_FDCWD, path)?
-    {
-        crate::layer::check_exec(&abs)?;
-    }
+    // The loader gets the path the service approved.
+    let checked = match source {
+        ExecSource::Path(path) => match crate::layer::route(crate::names::AT_FDCWD, path)? {
+            Some(abs) => Some(crate::layer::check_exec(&abs)?),
+            None => None,
+        },
+        ExecSource::Descriptor(_) => None,
+    };
+    let source = match &checked {
+        Some(abs) => ExecSource::Path(abs.bytes()),
+        None => source,
+    };
     // The claimed network device stays with this image (spec 6, 3.9).
     if crate::fast::claimed() {
         return Err(crate::constants::EPERM);

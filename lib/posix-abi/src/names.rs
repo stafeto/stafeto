@@ -393,6 +393,7 @@ fn unlinkat_once(dirfd: c_int, path: &[u8], flags: c_int) -> Result<(), c_int> {
     if let Some(vol) = crate::data::route(dirfd, path)? {
         return crate::data::unlink(&vol, flags & AT_REMOVEDIR != 0);
     }
+    crate::layer::refuse_write(dirfd, path)?;
     let placed = place(dirfd, path)?;
     let remove_directory = flags & AT_REMOVEDIR != 0;
     check_virtual(
@@ -419,6 +420,7 @@ fn mkdirat_once(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), 
     if let Some(vol) = crate::data::route(dirfd, path)? {
         return crate::data::mkdir(&vol, mode, umask);
     }
+    crate::layer::refuse_write(dirfd, path)?;
     let placed = place(dirfd, path)?;
     // A name of the terminal exists even with a slash after it.
     check_virtual(Named::Mkdir, &placed, None, false)?;
@@ -433,6 +435,7 @@ fn mkfifoat_once(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(),
     if crate::data::route(dirfd, path)?.is_some() {
         return Err(EPERM);
     }
+    crate::layer::refuse_write(dirfd, path)?;
     let placed = place(dirfd, path)?;
     check_virtual(Named::Mkdir, &placed, None, false)?;
     let mut create = request(ChangeOp::Mkfifo, &placed);
@@ -446,6 +449,7 @@ fn mksockat_once(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(),
     if crate::data::route(dirfd, path)?.is_some() {
         return Err(EPERM);
     }
+    crate::layer::refuse_write(dirfd, path)?;
     let placed = place(dirfd, path)?;
     check_virtual(Named::Mkdir, &placed, None, false)?;
     let mut create = request(ChangeOp::Mksock, &placed);
@@ -516,6 +520,8 @@ pub(crate) fn faccessat_ram(
 /// rename: `renameat2` without flags.
 pub fn renameat(old_dirfd: c_int, old: &[u8], new_dirfd: c_int, new: &[u8]) -> Result<(), c_int> {
     // Both names on the volume, or neither (EXDEV across the mount).
+    crate::layer::refuse_write(old_dirfd, old)?;
+    crate::layer::refuse_write(new_dirfd, new)?;
     if let Some((from, to)) = crate::data::pair(old_dirfd, old, new_dirfd, new)? {
         return crate::data::rename(&from, &to);
     }
@@ -539,6 +545,8 @@ pub fn linkat(
     if flags & !AT_SYMLINK_FOLLOW != 0 {
         return Err(EINVAL);
     }
+    crate::layer::refuse_write(old_dirfd, old)?;
+    crate::layer::refuse_write(new_dirfd, new)?;
     if let Some((from, _)) = crate::data::pair(old_dirfd, old, new_dirfd, new)? {
         return crate::data::link(&from);
     }
@@ -564,6 +572,7 @@ fn symlinkat_once(target: &[u8], new_dirfd: c_int, linkpath: &[u8]) -> Result<()
     if crate::data::route(new_dirfd, linkpath)?.is_some() {
         return Err(EPERM);
     }
+    crate::layer::refuse_write(new_dirfd, linkpath)?;
     let placed = place(new_dirfd, linkpath)?;
     check_virtual(Named::Symlink, &placed, None, false)?;
     let mut symlink = request(ChangeOp::Symlink, &placed);
@@ -635,6 +644,14 @@ fn metadata_target(dirfd: c_int, path: &[u8], at_flags: c_int) -> Result<(Placed
     match target {
         target if target.ram_target().is_some() => {
             let target = target.ram_target().ok_or(ENOTDIR)?;
+            // A description the layered root opened is of a lower name: its attributes are not
+            // the program's to change (EROFS). The RAM file service guards the paths; a
+            // description has no path there, so the layer refuses it here.
+            if !cfg!(feature = "break-layer-fd-guard")
+                && posix_fs::layer::is_marked_ram(target.fd(), target.generation())
+            {
+                return Err(EROFS);
+            }
             placed.base = Base::Fd {
                 fd: target.fd(),
                 generation: target.generation(),
@@ -658,10 +675,21 @@ fn metadata_once(
     if at_flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(EINVAL);
     }
+    // A file of a layer of the user that the root passed is read only here like a lower one.
+    if path.is_empty()
+        && !cfg!(feature = "break-layer-fd-guard")
+        && crate::data::data_target(dirfd)
+            .is_some_and(|d| posix_fs::layer::is_marked_data(d.handle))
+    {
+        return Err(EROFS);
+    }
     if (!path.is_empty() || at_flags & AT_EMPTY_PATH != 0)
         && crate::data::change(op, dirfd, path, args)?
     {
         return Ok(());
+    }
+    if !path.is_empty() {
+        crate::layer::refuse_write(dirfd, path)?;
     }
     let (placed, itself) = metadata_target(dirfd, path, at_flags)?;
     if !itself {

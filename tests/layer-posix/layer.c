@@ -289,6 +289,8 @@ static int merged_listing(void) {
     LP_CHECK(fd >= 0);
     struct stat st;
     LP_CHECK(fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) && st.st_dev == LAYERED_DEVICE);
+    /* A directory has nothing to make durable, as one of the file service. */
+    LP_CHECK(fsync(fd) == 0);
     d = fdopendir(fd);
     LP_CHECK(d != NULL && collect(d, &l) == 0 && etc_list_is_right(&l) && l.count == total);
     LP_CHECK(closedir(d) == 0);
@@ -410,6 +412,20 @@ static int pass_through_names(void) {
     /* /run is made by the probe, as an image with no such directory has it made. */
     LP_CHECK(mkdir("/run", 0755) == 0 || errno == EEXIST);
     LP_CHECK(mkdir("/run/lp", 0755) == 0 && rmdir("/run/lp") == 0);
+    return 0;
+}
+
+/* A path against a directory below a pass-through name that leaves it by `..` is the root's. */
+static int dotdot_out_of_tmp(void) {
+    LP_CHECK(mkdir("/tmp/lq", 0755) == 0);
+    int d = open("/tmp/lq", O_RDONLY | O_DIRECTORY);
+    LP_CHECK(d >= 0);
+    LP_CHECK(FAILS(openat(d, "../../etc/layer-hidden", O_RDONLY), ENOENT));
+    int fd = openat(d, "../../etc/layer-own", O_RDONLY);
+    LP_CHECK(fd >= 0 && fd_has_bytes(fd, OWN_BYTES));
+    close(fd);
+    close(d);
+    LP_CHECK(rmdir("/tmp/lq") == 0);
     return 0;
 }
 
@@ -639,6 +655,125 @@ static int writes_are_refused(void) {
     return 0;
 }
 
+/* The attributes of a lower or layer file are not changed through a description either. */
+static int attributes_of_descriptions(void) {
+    struct stat st;
+    struct timespec times[2] = {{1, 0}, {1, 0}};
+    const char *paths[] = {"/etc/layer-lower", "/plain", "/etc/layer-own", "/etc"};
+    for (int i = 0; i < 4; i++) {
+        int fd = open(paths[i], O_RDONLY);
+        LP_CHECK(fd >= 0);
+        LP_CHECK(FAILS(fchmod(fd, 0777), EROFS));
+        LP_CHECK(FAILS(fchown(fd, 1, 1), EROFS));
+        LP_CHECK(FAILS(futimens(fd, times), EROFS));
+        close(fd);
+    }
+    LP_CHECK(stat("/etc/layer-lower", &st) == 0 && (st.st_mode & 07777) == 0644 && st.st_uid == 0);
+    LP_CHECK(stat("/etc/layer-own", &st) == 0 && (st.st_mode & 07777) == 0640 && st.st_uid == 1000);
+    return 0;
+}
+
+/* The changes of names and attributes at a path of the root are the service's EROFS, also for a
+ * name only the layer of the user has (the file service has none of that name). */
+static int names_of_the_layers_are_kept(void) {
+    struct timespec times[2] = {{1, 0}, {1, 0}};
+    LP_CHECK(FAILS(unlink("/etc/layer-own"), EROFS));
+    LP_CHECK(FAILS(chmod("/etc/layer-own", 0600), EROFS));
+    LP_CHECK(FAILS(chown("/etc/layer-own", 0, 0), EROFS));
+    LP_CHECK(FAILS(utimensat(AT_FDCWD, "/etc/layer-own", times, 0), EROFS));
+    LP_CHECK(FAILS(rename("/etc/layer-own", "/etc/moved"), EROFS));
+    LP_CHECK(FAILS(rename("/etc/layer-lower", "/tmp/moved"), EROFS));
+    LP_CHECK(FAILS(link("/etc/layer-own", "/tmp/hard"), EROFS));
+    LP_CHECK(FAILS(symlink("x", "/etc/layer-own"), EROFS));
+    LP_CHECK(FAILS(mkfifo("/etc/fifo", 0644), EROFS));
+    LP_CHECK(FAILS(rmdir("/private"), EROFS));
+    int merged = open("/etc", O_RDONLY | O_DIRECTORY);
+    LP_CHECK(merged >= 0);
+    LP_CHECK(FAILS(unlinkat(merged, "layer-own", 0), EROFS));
+    LP_CHECK(FAILS(mkdirat(merged, "newdir", 0755), EROFS));
+    LP_CHECK(FAILS(fchmodat(merged, "layer-own", 0600, 0), EROFS));
+    LP_CHECK(FAILS(renameat(merged, "layer-own", merged, "moved"), EROFS));
+    close(merged);
+    struct stat st;
+    LP_CHECK(stat("/etc/layer-own", &st) == 0 && (st.st_mode & 07777) == 0640);
+    LP_CHECK(has_bytes("/etc/layer-own", OWN_BYTES));
+    return 0;
+}
+
+/* A child that inherited the descriptions of a lower and a layer file: the role `dev-child` after an
+ * exec (the mark of the lower one crosses it, the layer one's does not: the departure). */
+static int dev_child(char **argv) {
+    struct stat low, up;
+    if (fstat(atoi(argv[2]), &low) != 0 || fstat(atoi(argv[3]), &up) != 0) return 2;
+    if (low.st_dev != LAYERED_DEVICE) return 3;
+    if (up.st_dev != DATA_DEVICE) return 4;
+    return 0;
+}
+
+static int device_across_fork_and_exec(void) {
+    struct stat st;
+    int low = open("/etc/layer-lower", O_RDONLY);
+    int up = open("/etc/layer-own", O_RDONLY);
+    int fork_only = open("/etc/layer-note", O_RDONLY | O_CLOFORK);
+    LP_CHECK(low >= 0 && up >= 0 && fork_only >= 0);
+    pid_t pid = fork();
+    LP_CHECK(pid >= 0);
+    if (pid == 0) {
+        if (fstat(low, &st) != 0 || st.st_dev != LAYERED_DEVICE) _exit(1);
+        if (fstat(up, &st) != 0 || st.st_dev != LAYERED_DEVICE) _exit(2);
+        /* O_CLOFORK of the pass is kept: the description is not in the child. */
+        if (!FAILS(fstat(fork_only, &st), EBADF)) _exit(3);
+        _exit(0);
+    }
+    LP_CHECK(wait_ok(pid) == 0);
+    LP_CHECK(fstat(fork_only, &st) == 0);
+    pid = fork();
+    LP_CHECK(pid >= 0);
+    if (pid == 0) {
+        char a[16], b[16];
+        snprintf(a, sizeof a, "%d", low);
+        snprintf(b, sizeof b, "%d", up);
+        char *argv[] = {"layer-posix", "dev-child", a, b, NULL};
+        execv("/bin/layer-posix", argv);
+        _exit(99);
+    }
+    LP_CHECK(wait_ok(pid) == 0);
+    close(low);
+    close(up);
+    close(fork_only);
+    return 0;
+}
+
+/* The role `nopath-child`: a description of the service that crossed an exec has no path. */
+static int nopath_child(char **argv) {
+    int fd = atoi(argv[2]);
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode)) return 2;
+    if (!FAILS(openat(fd, "layer-own", O_RDONLY), EOPNOTSUPP)) return 3;
+    if (!FAILS(fchdir(fd), EOPNOTSUPP)) return 4;
+    DIR *d = fdopendir(fd);
+    struct names l;
+    if (d == NULL || collect(d, &l) != 0 || !etc_list_is_right(&l)) return 5;
+    return 0;
+}
+
+static int no_path_after_exec(void) {
+    int fd = open("/etc", O_RDONLY | O_DIRECTORY);
+    LP_CHECK(fd >= 0);
+    pid_t pid = fork();
+    LP_CHECK(pid >= 0);
+    if (pid == 0) {
+        char a[16];
+        snprintf(a, sizeof a, "%d", fd);
+        char *argv[] = {"layer-posix", "nopath-child", a, NULL};
+        execv("/bin/layer-posix", argv);
+        _exit(99);
+    }
+    LP_CHECK(wait_ok(pid) == 0);
+    close(fd);
+    return 0;
+}
+
 /* ---- the session in the slot ---- */
 
 /* The listener of a forged layer service: the count of the requests it got. */
@@ -767,6 +902,7 @@ static int first(void) {
     run_check("paths against a merged directory", paths_against_a_merged_directory);
     run_check("paths against a lower directory", paths_against_a_lower_directory);
     run_check("the pass-through names are the services' own", pass_through_names);
+    run_check("a path out of a pass-through directory is the root's", dotdot_out_of_tmp);
     run_check("chdir and fchdir", current_directory);
     run_check("realpath", real_paths);
     run_check("a forked child shares the directory description", fork_shares_the_description);
@@ -776,6 +912,10 @@ static int first(void) {
     run_check("a forked child binds its own identity", fork_binds_its_own_identity);
     run_check("rights of another user", rights_of_another_user);
     run_check("writes are refused", writes_are_refused);
+    run_check("the attributes of descriptions are kept", attributes_of_descriptions);
+    run_check("the names of the layers are kept", names_of_the_layers_are_kept);
+    run_check("descriptions keep the device across fork and exec", device_across_fork_and_exec);
+    run_check("a description of the service has no path after exec", no_path_after_exec);
     run_check("a set-ID program is given the service's session", slot_checks);
     run_check("a set-ID program keeps the genuine session and binds it", setid_keeps_the_genuine_session);
     if (failures != 0) {
@@ -805,6 +945,8 @@ static int launcher(void) {
 int main(int argc, char **argv) {
     if (argc > 2 && strcmp(argv[1], "child-list") == 0) return child_list(argv);
     if (argc > 1 && strcmp(argv[1], "exit0") == 0) return 0;
+    if (argc > 3 && strcmp(argv[1], "dev-child") == 0) return dev_child(argv);
+    if (argc > 2 && strcmp(argv[1], "nopath-child") == 0) return nopath_child(argv);
     if (argc > 1 && strcmp(argv[1], "forged") == 0) return forged_role();
     if (argc > 1 && strcmp(argv[1], "setid") == 0) return setid_role();
     if (argc > 2 && strcmp(argv[1], "genuine") == 0) return genuine_role(argv);

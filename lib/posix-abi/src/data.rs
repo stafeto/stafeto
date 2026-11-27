@@ -1686,7 +1686,7 @@ pub fn export(handle: u32) -> Result<Handle<Channel>, i32> {
 /// ADOPT of a pass of the data file service received in an SCM_RIGHTS message: the description
 /// becomes a descriptor of this process (the lowest free one), with its rights as they were. The
 /// pass is spent, or closes with the error.
-pub fn adopt(pass: Handle<Channel>, cloexec: bool) -> Result<c_int, i32> {
+pub fn adopt(pass: Handle<Channel>, cloexec: bool, clofork: bool) -> Result<c_int, i32> {
     let mut w = Writer::new();
     p::adopt(&mut w).map_err(|_| EIO)?;
     let session = ensure()?;
@@ -1732,7 +1732,9 @@ pub fn adopt(pass: Handle<Channel>, cloexec: bool) -> Result<c_int, i32> {
         handle: answer.0,
         directory: answer.1 == p::KIND_DIRECTORY,
     };
-    let flags = crate::descriptor_flags(if cloexec { O_CLOEXEC } else { 0 });
+    let flags = crate::descriptor_flags(
+        if cloexec { O_CLOEXEC } else { 0 } | if clofork { O_CLOFORK } else { 0 },
+    );
     let inserted = crate::shared::growing(|files| {
         files
             .insert(Target::Data(target), flags)

@@ -15,8 +15,18 @@ const WIDE: usize = crate::names::MAX_PATH + 1;
 /// A path of the layered root: there is none.
 pub struct Abs;
 
+impl Abs {
+    pub fn bytes(&self) -> &[u8] {
+        &[]
+    }
+}
+
 pub fn route(_dirfd: c_int, _path: &[u8]) -> Result<Option<Abs>, i32> {
     Ok(None)
+}
+
+pub fn refuse_write(_dirfd: c_int, _path: &[u8]) -> Result<(), i32> {
+    Ok(())
 }
 
 pub fn open(_abs: &Abs, _flags: c_int, _mode: u32, _umask: u32) -> Result<c_int, i32> {
@@ -43,8 +53,8 @@ pub fn realpath(_abs: &Abs, _out: &mut [u8; WIDE]) -> Result<usize, i32> {
     Err(EIO)
 }
 
-pub fn check_exec(_abs: &Abs) -> Result<(), i32> {
-    Ok(())
+pub fn check_exec(_abs: &Abs) -> Result<Abs, i32> {
+    Err(EIO)
 }
 
 pub fn descriptor_path(_target: LayerTarget, _out: &mut [u8; WIDE]) -> Result<usize, i32> {

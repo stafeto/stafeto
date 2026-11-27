@@ -13,6 +13,9 @@ build = "build.rs"
 break-layer-route = ["posix-crt/break-layer-route"]
 # Deliberate breakage: a fork or a spawn gives the child no session with the layer service.
 break-layer-clone = ["posix-crt/break-layer-clone"]
+# Deliberate breakage: a change of attributes through a description is not refused.
+break-layer-fd-guard = ["posix-crt/break-layer-fd-guard"]
+break-layer-refuse = ["posix-crt/break-layer-refuse"]
 
 [[bin]]
 name = "layer-posix-probe"

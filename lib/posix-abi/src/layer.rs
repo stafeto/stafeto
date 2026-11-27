@@ -166,9 +166,16 @@ pub fn session() -> Option<rt::abi::Handle> {
     }
 }
 
+/// The process service had no root of the layer service for the whole wait: the image has none, and
+/// no path of this process goes to the service again (a program built with the layer in an image
+/// without `layerd` waits once).
+static NEVER: AtomicBool = AtomicBool::new(false);
+
 /// Why a try to take the session did not end it.
 enum Attempt {
-    /// Not yet: the process service has no root (UNREGISTERED) or the service is busy or starting.
+    /// The process service has no root (UNREGISTERED) yet.
+    NoRoot,
+    /// Not yet: the service is busy or starting.
     Retry,
     /// The errno of the failure.
     Failed(i32),
@@ -191,7 +198,7 @@ fn take_root() -> Result<Handle<Channel>, Attempt> {
         }),
         Ok(proto_process::UNREGISTERED) => {
             why!("TakeRoot: UNREGISTERED, no root yet");
-            Err(Attempt::Retry)
+            Err(Attempt::NoRoot)
         }
         other => {
             why!("TakeRoot refused: {other:?}");
@@ -269,9 +276,14 @@ fn ensure() -> Result<rt::abi::Handle, i32> {
             }
         };
         match attempt {
-            Attempt::Retry if tries < BUSY_TRIES => {
+            Attempt::Retry | Attempt::NoRoot if tries < BUSY_TRIES => {
                 tries += 1;
                 pause()?;
+            }
+            Attempt::NoRoot => {
+                why!("no root of the layer service after the tries: none in this image");
+                NEVER.store(true, Ordering::Release);
+                return Err(EIO);
             }
             Attempt::Retry => {
                 why!("no session after the tries");
@@ -438,8 +450,9 @@ fn base_path(dirfd: c_int) -> Result<Option<pure::DirPath>, i32> {
         Target::Ram(ram) if ram.kind() == Ok(posix_fs::FileKind::Directory) => {
             let mut out = [0u8; WIDE];
             let len = crate::names::descriptor_path(target, &mut out)?;
-            // A directory below a pass-through name is the file service's own.
-            Ok(pure::DirPath::new(&out[..len]).filter(|path| pure::belongs(path.bytes())))
+            // The path is joined first and then tested (`route`): a `..` out of a directory below a
+            // pass-through name reaches the layered root.
+            Ok(pure::DirPath::new(&out[..len]))
         }
         _ => Ok(None),
     }
@@ -452,7 +465,7 @@ fn base_path(dirfd: c_int) -> Result<Option<pure::DirPath>, i32> {
 pub fn route(dirfd: c_int, path: &[u8]) -> Result<Option<Abs>, i32> {
     // The break: no path goes to the layer service, and the file service answers them all as it
     // would in an image with no layers (`cargo xtask layer-posix breaks`).
-    if cfg!(feature = "break-layer-route") {
+    if cfg!(feature = "break-layer-route") || NEVER.load(Ordering::Acquire) {
         return Ok(None);
     }
     if path.is_empty() || path.len() > crate::names::MAX_PATH {
@@ -477,6 +490,20 @@ pub fn route(dirfd: c_int, path: &[u8]) -> Result<Option<Abs>, i32> {
     }
     let abs = Abs::from(absolute, path.last() == Some(&b'/')).ok_or(ENAMETOOLONG)?;
     Ok(Some(abs))
+}
+
+/// A change of names or attributes at `path` is refused when the path belongs to the layered root
+/// (EROFS, as the service answers a write it decides): the RAM file service never sees a name only a
+/// layer of the user has, and a description of the service has no place there. The guard of the
+/// RAM file service stays under this for any call that gets past it.
+pub fn refuse_write(dirfd: c_int, path: &[u8]) -> Result<(), i32> {
+    if cfg!(feature = "break-layer-refuse") {
+        return Ok(());
+    }
+    match route(dirfd, path)? {
+        Some(_) => Err(EROFS),
+        None => Ok(()),
+    }
 }
 
 /// The canonical path of the description `target` (a path kept at its open).
@@ -672,13 +699,13 @@ fn plain(abs: &Abs, out: &mut [u8; WIDE]) -> Result<usize, i32> {
 /// Whether the program at `abs` may be run: a name of the lower set is the loader's to open; a
 /// name of a layer of the user is never run (EACCES, as for `/data`); a name the layers delete or
 /// never had is ENOENT, and a directory of the path that is closed is EACCES.
-pub fn check_exec(abs: &Abs) -> Result<(), i32> {
+pub fn check_exec(abs: &Abs) -> Result<Abs, i32> {
     let mut w = Writer::new();
     n::write_stat(0, abs.bytes(), &mut w).map_err(write_failed)?;
     match ask_path(w.as_bytes(), abs.trailing_slash)? {
         Answered::Done(_) => Err(EACCES),
-        Answered::Redirect { target, .. } => match target {
-            proto_fs::REDIRECT_RAM => Ok(()),
+        Answered::Redirect { target, path } => match target {
+            proto_fs::REDIRECT_RAM => Ok(path),
             _ => Err(EACCES),
         },
     }
@@ -732,7 +759,7 @@ pub fn open(abs: &Abs, flags: c_int, mode: u32, umask: u32) -> Result<c_int, i32
     match n::OpenAnswer::read(got.raw.bytes()).map_err(|_| EIO)? {
         n::OpenAnswer::Pass => {
             let pass = got.handle.ok_or(EIO)?;
-            let fd = crate::data::adopt(pass, flags & O_CLOEXEC != 0)?;
+            let fd = crate::data::adopt(pass, flags & O_CLOEXEC != 0, flags & O_CLOFORK != 0)?;
             // The file is of the root's device (`fstat` of it says so, as `stat` of its path).
             if let Some(data) = crate::data::data_target(fd) {
                 pure::mark_data(data.handle);
@@ -994,7 +1021,7 @@ fn next_entry(handle: u32) -> Result<Option<pure::Entry>, i32> {
     loop {
         let (entry, needs) = DIRS
             .listing(handle, |l| (l.take(), l.needs_batch()))
-            .ok_or(EMFILE)?;
+            .ok_or(ENFILE)?;
         if entry.is_some() {
             return Ok(entry);
         }
@@ -1005,7 +1032,7 @@ fn next_entry(handle: u32) -> Result<Option<pure::Entry>, i32> {
         n::write_handle(NameMethod::ReadDir, handle, &mut w).map_err(write_failed)?;
         let got = call(w.as_bytes())?;
         DIRS.listing(handle, |l| l.load(got.raw.bytes()))
-            .ok_or(EMFILE)??;
+            .ok_or(ENFILE)??;
     }
 }
 

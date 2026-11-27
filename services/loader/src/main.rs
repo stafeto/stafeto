@@ -2417,6 +2417,9 @@ fn finish(
     // verify is refused. Any other program keeps what its parent gave.
     if secure {
         for (root, &(slot, _)) in roots.iter().zip(&VERIFIED) {
+            if slot == Slot::Layer && cfg!(feature = "break-layer-unverified") {
+                continue;
+            }
             if let Some(offered) = given[slot as usize].take() {
                 // The package session is optional (posix-crt takes none): with no root (the
                 // service is not up yet, or its registration failed) and for any error of the

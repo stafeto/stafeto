@@ -318,6 +318,9 @@ pub unsafe extern "C" fn stafeto_start_handles(out: *mut u64) {
     }
 }
 
+// The mark of the layered root in the word of `Names::File` is the loader protocol's.
+const _: () = assert!(posix_fs::layer::MARK_WORD == proto_loader::FILE_LAYERED);
+
 /// The numbers of the descriptors the start area names whose descriptions the layered root opened
 /// (the mark in the word of `Names::File`), and how many.
 fn layered_marks(area: &proto_loader::Start) -> ([u32; proto_loader::DESCRIPTORS], usize) {
