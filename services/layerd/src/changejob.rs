@@ -329,6 +329,8 @@ pub struct ChangeJob<V: Volume, L: Lower> {
     victim: Victim,
     rn: Rn,
     empty: Empty<L::Dir>,
+    /// The stat of the lower set in flight (`Core::lower_stat`): one at a time.
+    probe: Option<L::Probe>,
     stages: [Stage; STAGES],
     nstages: usize,
     pc: usize,
@@ -395,6 +397,7 @@ impl<V: Volume, L: Lower> ChangeJob<V, L> {
                 empty: true,
                 err: None,
             },
+            probe: None,
             stages: [NO_STAGE; STAGES],
             nstages: 0,
             pc: 0,
@@ -696,6 +699,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         if let Some(dir) = job.empty.dir.take() {
             self.lower.close_dir(dir);
         }
+        if let Some(probe) = job.probe.take() {
+            self.lower.stat_cancel(probe);
+        }
         if job.locked {
             self.work.unlock(job.id);
             job.locked = false;
@@ -769,11 +775,15 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             Phase::LowerA => self.step_lower(c, job, false),
             Phase::LowerB => self.step_lower(c, job, true),
             Phase::LeafA => {
-                self.step_leaf(job, false)?;
+                if !self.step_leaf(job, false)? {
+                    return Ok(None);
+                }
                 self.decide(c, job, Phase::LeafA)
             }
             Phase::LeafB => {
-                self.step_leaf(job, true)?;
+                if !self.step_leaf(job, true)? {
+                    return Ok(None);
+                }
                 self.decide(c, job, Phase::LeafB)
             }
             Phase::StatA => {
@@ -785,10 +795,13 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 self.decide(c, job, Phase::StatB)
             }
             Phase::WalkFull => self.step_walk_full(c, job),
-            Phase::LowerTarget => match self.lower_stat(&job.a.plain[..job.a.len])? {
-                Some(_) => fail(proto_fs::READ_ONLY_FILESYSTEM),
-                None => fail(proto_fs::NO_ENTRY),
-            },
+            Phase::LowerTarget => {
+                match self.lower_stat(&mut job.probe, &job.a.plain[..job.a.len])? {
+                    None => Ok(None),
+                    Some(Some(_)) => fail(proto_fs::READ_ONLY_FILESYSTEM),
+                    Some(None) => fail(proto_fs::NO_ENTRY),
+                }
+            }
             Phase::Empty => {
                 if self.step_empty(job)? {
                     self.decide(c, job, Phase::Empty)
@@ -981,6 +994,16 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     }
 
     /// One lower component of the directory part: its stat.
+    ///
+    /// The bound of the lock. Each component is a stat of its whole path from the root, so a lower
+    /// chain of k components costs the RAM file service about k*(k+1)/2 resolve steps (about
+    /// 1,400 ticks each) for the walk, and as many again for the directories a copy up makes
+    /// (`stage_ensure`), all of them with the job holding the lock of the changes. Each is a step
+    /// of the loop of its own, so no step is longer, but a change below a deep chain holds the
+    /// lock for many of them, and the other changes wait their turns (round robin over the
+    /// places, about `JOBS - 1` times the longest change). A resolve of each prefix against the
+    /// descriptor of its parent (`Files::path_start` takes a base) would make the cost linear; it
+    /// needs a descriptor of the RAM file service for each level, and is left for a later change.
     fn step_lower(
         &mut self,
         c: &Client<'_>,
@@ -996,8 +1019,10 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             .iter()
             .position(|&x| x == b'/')
             .map_or(parent_len, |i| pos + i);
-        let Some(ls) = self.lower_stat(&leg.plain[..end])? else {
-            return fail(proto_fs::NO_ENTRY);
+        let ls = match self.lower_stat(&mut job.probe, &leg.plain[..end])? {
+            None => return Ok(None),
+            Some(None) => return fail(proto_fs::NO_ENTRY),
+            Some(Some(ls)) => ls,
         };
         match ls.kind {
             1 => {}
@@ -1027,8 +1052,8 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     }
 
     /// What the merged view has at the leaf of a leg: a lookup in the index and at most one stat
-    /// of the lower set.
-    fn step_leaf(&mut self, job: &mut ChangeJob<V, L>, b: bool) -> F<()> {
+    /// of the lower set, which goes on over steps; false while it does.
+    fn step_leaf(&mut self, job: &mut ChangeJob<V, L>, b: bool) -> F<bool> {
         let leg = if b { &mut job.b } else { &mut job.a };
         let Some(p) = leg.parent.as_ref() else {
             return fail(proto_fs::NO_ENTRY);
@@ -1047,7 +1072,10 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             }
         }
         let seen = if p.visible {
-            self.lower_stat(full)?
+            match self.lower_stat(&mut job.probe, full)? {
+                None => return Ok(false),
+                Some(seen) => seen,
+            }
         } else {
             None
         };
@@ -1063,7 +1091,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 lower_dir: false,
             },
         });
-        Ok(())
+        Ok(true)
     }
 
     /// The stat of the file at the leaf of a leg (a file a rule reads the attributes of).
@@ -1103,7 +1131,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         match job.empty.sub {
             0 => {
                 let path = &path_leg.plain[..path_leg.parts.len];
-                match self.lower.open_dir(path) {
+                match self.lower.open_dir_start(path) {
                     Ok(dir) => {
                         job.empty.dir = Some(dir);
                         job.empty.sub = 1;
@@ -1113,10 +1141,35 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                         job.empty.empty = true;
                         Ok(true)
                     }
+                    // The session has no path job free: the start is made again in the next step.
+                    Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES)) => Ok(false),
                     Err(e) => Err(Stop::Status(e)),
                 }
             }
+            // The open goes on over steps, one round trip each.
             1 => {
+                let Some(dir) = job.empty.dir.as_mut() else {
+                    return Ok(true);
+                };
+                match self.lower.open_dir_poll(dir) {
+                    Ok(true) => job.empty.sub = 2,
+                    Ok(false) => {}
+                    Err(e) => {
+                        if let Some(dir) = job.empty.dir.take() {
+                            self.lower.close_dir(dir);
+                        }
+                        return match e {
+                            Status::Unknown(proto_fs::NO_ENTRY | proto_fs::NOT_DIRECTORY) => {
+                                job.empty.empty = true;
+                                Ok(true)
+                            }
+                            e => Err(Stop::Status(e)),
+                        };
+                    }
+                }
+                Ok(false)
+            }
+            2 => {
                 let mut name = [0u8; 256];
                 let up = job.empty.up;
                 let Some(dir) = job.empty.dir.as_mut() else {
@@ -1136,17 +1189,17 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                             });
                             if !hidden {
                                 job.empty.empty = false;
-                                job.empty.sub = 2;
+                                job.empty.sub = 3;
                                 break;
                             }
                         }
                         Ok(None) => {
-                            job.empty.sub = 2;
+                            job.empty.sub = 3;
                             break;
                         }
                         Err(e) => {
                             job.empty.err = Some(e);
-                            job.empty.sub = 2;
+                            job.empty.sub = 3;
                             break;
                         }
                     }
@@ -2201,10 +2254,16 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             .position(|&x| x == b'/')
             .map_or(parent_len, |i| pos + i);
         if job.sub == 1 {
-            let ls = match self.lower.stat(&job.leg(b).plain[..end], false) {
-                Ok(s) if s.kind == 1 => s,
-                Ok(_) => return fail(proto_fs::NOT_DIRECTORY),
-                Err(e) => return Err(Stop::Status(e)),
+            // The stat goes on over steps: the stage stays at this sub until it is answered.
+            let ls = {
+                let plain = &(if b { &job.b } else { &job.a }).plain[..end];
+                match self.lower_stat(&mut job.probe, plain)? {
+                    None => return Ok(Flow::Call),
+                    Some(Some(s)) if s.kind == 1 => s,
+                    Some(Some(_)) => return fail(proto_fs::NOT_DIRECTORY),
+                    // The directory of the walk is gone from the lower set.
+                    Some(None) => return fail(proto_fs::NO_ENTRY),
+                }
             };
             job.ens_created = Created {
                 uid: ls.uid,

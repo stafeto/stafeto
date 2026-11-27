@@ -53,6 +53,9 @@ pub struct Description<D> {
     pub given: Position,
     /// The directory of the lower set, open from the first request of the second stage.
     pub lower: Option<D>,
+    /// The lower directory is still being opened (a preparation of the RAM file service that the
+    /// requests of the listing poll).
+    pub opening: bool,
     /// The entries of the open lower directory read so far (a request after a seek replays them
     /// up to the position, a few at a time).
     pub replayed: u32,
@@ -157,9 +160,19 @@ impl<D> Table<D> {
             position: Position::default(),
             given: Position::default(),
             lower: None,
+            opening: false,
             replayed: 0,
         });
         Ok(handle(place as u8, self.generations[place], self.epoch))
+    }
+
+    /// The descriptions `owner` holds whose lower directory is being opened.
+    pub fn opening_held(&self, owner: u64) -> usize {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|d| d.opening && d.holds(owner))
+            .count()
     }
 
     pub fn get(&mut self, owner: u64, h: u32) -> Result<&mut Description<D>, Lost> {

@@ -299,18 +299,8 @@ impl Proof<'_> {
         Files::send_on(&self.files.channel, request)
     }
     fn ready(&self) -> Result<(), Status> {
-        let request = job_request(Method::ResolveStep, self.id);
-        loop {
-            let reply = self.send(&request)?;
-            if is_redirect(&reply) {
-                return Err(Status::Unknown(proto_fs::REDIRECT));
-            }
-            match proof_ready_status(reply.len, reply.words[0], reply.handles.len())? {
-                Status::Ok => return Ok(()),
-                Status::Unknown(proto_fs::RESOLVING) => {}
-                status => return Err(status),
-            }
-        }
+        while !self.files.path_step(self.id)? {}
+        Ok(())
     }
 }
 /// The sends of a cancel that a signal took back, and the cancels given up after `CANCEL_TRIES`
@@ -333,9 +323,184 @@ pub fn proof_cancel_counts() -> (u32, u32) {
 
 impl Drop for Proof<'_> {
     fn drop(&mut self) {
-        let request = job_request(Method::ResolveCancel, self.id);
+        self.files.path_cancel_id(self.id);
+    }
+}
+
+/// A preparation of a path that the caller polls itself: the number the RAM file service gave it
+/// and no borrow, so that a service keeps it in a job beside the file owner. Nothing cancels it
+/// on drop: `Files::path_cancel` does. A poll that answers or fails spends it (the service
+/// releases the job with the answer, and a failed poll cancels it), after which `path_cancel` is
+/// a no-op.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PathJob {
+    id: u64,
+    /// The steps of the resolve are done and the finishing call is next.
+    ready: bool,
+    spent: bool,
+}
+
+impl PathJob {
+    /// One round trip: a step of the resolve while it goes on, then the finishing call. The
+    /// answer is None while there is none; a finishing call that finds the tree changed since
+    /// the last step (None, STALE_PROOF on the wire) sends the job back to its steps.
+    fn advance<T>(
+        &mut self,
+        step: impl FnOnce(u64) -> Result<bool, Status>,
+        finish: impl FnOnce(u64) -> Result<Option<T>, Status>,
+    ) -> Result<Option<T>, Status> {
+        if self.spent {
+            return Err(Status::Unknown(proto_fs::STALE_PROOF));
+        }
+        if !self.ready {
+            self.ready = step(self.id)?;
+            return Ok(None);
+        }
+        let answer = finish(self.id)?;
+        match answer {
+            Some(_) => self.spent = true,
+            None => self.ready = false,
+        }
+        Ok(answer)
+    }
+}
+
+impl Files {
+    /// The start of a stepped resolve of `path` against `base` (the root for None), without the
+    /// steps: one round trip.
+    pub fn path_start(
+        &self,
+        base: Option<(u32, u64)>,
+        path: &[u8],
+        follow: bool,
+    ) -> Result<PathJob, Status> {
+        let mut request = [0; 28 + proto_fs::MAX_PATH];
+        let len = resolve_start_request(&mut request, path, base, follow)?;
+        let reply = Self::send_on(&self.channel, &request[..len])?;
+        Ok(PathJob {
+            id: resolve_start_job(reply.len, &reply.words, reply.handles.len())?,
+            ready: false,
+            spent: false,
+        })
+    }
+
+    /// One round trip of a stat of the path of `job`: a step of the resolve (a redirect is the
+    /// status REDIRECT) or, when the steps are done, the node information. None while there is
+    /// no answer. An error cancels the job.
+    pub fn path_stat_poll(&self, job: &mut PathJob) -> Result<Option<proto_fs::NodeInfo>, Status> {
+        let answer = job.advance(
+            |id| self.path_step(id),
+            |id| {
+                let mut w = Writer::new();
+                Method::InfoPath.header().write(&mut w)?;
+                w.u64(id)?;
+                let mut buffer = [0; MESSAGE_MAX];
+                let reply = Self::send_on(&self.channel, w.as_bytes())?;
+                let bytes = reply.bytes(&mut buffer);
+                let status = Status::from_code(Reader::new(bytes).u32()?);
+                if status == Status::Unknown(proto_fs::STALE_PROOF) {
+                    return Ok(None);
+                }
+                if status != Status::Ok {
+                    return Err(status);
+                }
+                let mut r = Reader::new(bytes);
+                if r.u32()? != 0 {
+                    return Err(Status::BadSize);
+                }
+                let info = proto_fs::NodeInfo::read(&mut r)?;
+                r.finish()?;
+                Ok(Some(info))
+            },
+        );
+        self.path_settle(job, answer)
+    }
+
+    /// One round trip of an open of the path of `job` (the same as `path_stat_poll`): the
+    /// descriptor and the random-device mark when the open is done.
+    pub fn path_open_poll(
+        &self,
+        job: &mut PathJob,
+        flags: u32,
+    ) -> Result<Option<(u32, bool)>, Status> {
+        let answer = job.advance(
+            |id| self.path_step(id),
+            |id| {
+                let mut w = Writer::new();
+                Method::Open.header().write(&mut w)?;
+                w.u32(flags)?;
+                w.u64(id)?;
+                let mut buffer = [0; MESSAGE_MAX];
+                let reply = Self::send_on(&self.channel, w.as_bytes())?;
+                let bytes = reply.bytes(&mut buffer);
+                let status = Status::from_code(Reader::new(bytes).u32()?);
+                if status == Status::Unknown(proto_fs::STALE_PROOF) {
+                    return Ok(None);
+                }
+                if status != Status::Ok {
+                    return Err(status);
+                }
+                let mut r = Reader::new(bytes);
+                if r.u32()? != 0 {
+                    return Err(Status::BadSize);
+                }
+                let fd = r.u32()?;
+                let random = match r.u32() {
+                    Ok(proto_fs::RANDOM_DEVICE) => true,
+                    Ok(_) => return Err(Status::BadSize),
+                    Err(_) => false,
+                };
+                r.finish()?;
+                Ok(Some((fd, random)))
+            },
+        );
+        self.path_settle(job, answer)
+    }
+
+    fn path_settle<T>(
+        &self,
+        job: &mut PathJob,
+        answer: Result<Option<T>, Status>,
+    ) -> Result<Option<T>, Status> {
+        if answer.is_err() && !job.spent {
+            job.spent = true;
+            self.path_cancel_id(job.id);
+        }
+        answer
+    }
+
+    /// Gives the job back to the service, unless an answer or an error spent it.
+    pub fn path_cancel(&self, mut job: PathJob) {
+        if !job.spent {
+            job.spent = true;
+            self.path_cancel_id(job.id);
+        }
+    }
+
+    fn path_step(&self, id: u64) -> Result<bool, Status> {
+        let reply = Self::send_on(&self.channel, &job_request(Method::ResolveStep, id))?;
+        if is_redirect(&reply) {
+            return Err(Status::Unknown(proto_fs::REDIRECT));
+        }
+        match proof_ready_status(reply.len, reply.words[0], reply.handles.len())? {
+            Status::Ok => Ok(true),
+            Status::Unknown(proto_fs::RESOLVING) => Ok(false),
+            status => Err(status),
+        }
+    }
+
+    /// A cancel that a signal keeps taking back is given up after `CANCEL_TRIES` sends, which
+    /// would leave the job in the session of the service (a slot of its sixteen path jobs) until
+    /// the session closes. That is harmless for the layer service: a cancel is interrupted only
+    /// while the thread's entries stay deferred, which the loop of the service does not do, and
+    /// a job that is left frees with the session.
+    fn path_cancel_id(&self, id: u64) {
+        let request = job_request(Method::ResolveCancel, id);
         for _ in 0..CANCEL_TRIES {
-            if !matches!(self.send(&request), Err(Status::Kernel(Error::Interrupted))) {
+            if !matches!(
+                Self::send_on(&self.channel, &request),
+                Err(Status::Kernel(Error::Interrupted))
+            ) {
                 return;
             }
             CANCEL_RETRIES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2252,5 +2417,62 @@ mod open_preparation_recovery_tests {
             Err(Status::Unknown(proto_fs::NO_ENTRY))
         );
         assert!(script.next().is_none());
+    }
+}
+
+#[cfg(test)]
+mod path_job_tests {
+    use super::*;
+
+    fn job() -> PathJob {
+        PathJob {
+            id: 7,
+            ready: false,
+            spent: false,
+        }
+    }
+
+    #[test]
+    fn a_job_steps_until_ready_then_finishes_in_one_more_round_trip() {
+        let mut j = job();
+        let mut steps = 0;
+        for left in [true, true, false] {
+            let r: Result<Option<u32>, Status> = j.advance(
+                |_| {
+                    steps += 1;
+                    Ok(!left)
+                },
+                |_| panic!("finishing before the steps are done"),
+            );
+            assert_eq!(r, Ok(None));
+        }
+        assert_eq!(steps, 3);
+        assert!(j.ready);
+        let r = j.advance(|_| panic!("step after ready"), |id| Ok(Some(id as u32)));
+        assert_eq!(r, Ok(Some(7)));
+        assert!(j.spent);
+    }
+
+    #[test]
+    fn a_stale_proof_goes_back_to_the_steps() {
+        let mut j = job();
+        j.ready = true;
+        let r: Result<Option<u32>, Status> = j.advance(|_| panic!(), |_| Ok(None));
+        assert_eq!(r, Ok(None));
+        assert!(!j.ready && !j.spent);
+        let r: Result<Option<u32>, Status> = j.advance(|_| Ok(true), |_| panic!());
+        assert_eq!(r, Ok(None));
+        assert!(j.ready);
+    }
+
+    #[test]
+    fn a_refusal_comes_through_and_a_spent_job_answers_nothing_more() {
+        let mut j = job();
+        let r: Result<Option<u32>, Status> =
+            j.advance(|_| Err(Status::Unknown(proto_fs::NO_ENTRY)), |_| panic!());
+        assert_eq!(r, Err(Status::Unknown(proto_fs::NO_ENTRY)));
+        j.spent = true;
+        let r: Result<Option<u32>, Status> = j.advance(|_| panic!(), |_| panic!());
+        assert_eq!(r, Err(Status::Unknown(proto_fs::STALE_PROOF)));
     }
 }
