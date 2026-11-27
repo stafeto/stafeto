@@ -91,17 +91,22 @@ pub const BOOT_PROFILE_CLIENTS: &[&str] = &[
     "layer-probe",
     "datakey",
     "datakey-probe",
+    LAYER_SERVICE,
 ];
 
 /// The data file service's name (services/datafs).
 pub const DATA_SERVICE: &str = "datafs";
+/// The layer service's name (services/layerd): the names of the layered root over the live layer on
+/// the data volume. It is a native client of the data file service and of the RAM file service (the
+/// boot profile), asks the process service who a client is, and registers its root with it.
+pub const LAYER_SERVICE: &str = "layerd";
 /// The native clients of the data file service: init gives their sessions with it the label
 /// `proto_data::SERVICE`, which the service reads as the identity of user 0, group 0 with no
 /// supplementary groups and no file size limit. Every record of any table that connects to
 /// `datafs` and is not a POSIX process is here (a test walks the tables); a POSIX process gets
 /// its session with the service from the process service and binds it with a copy of its identity
 /// session, and never gets the label.
-pub const DATA_SERVICE_CLIENTS: &[&str] = &["datakey", "data-probe", "stop-writer"];
+pub const DATA_SERVICE_CLIENTS: &[&str] = &["datakey", "data-probe", "stop-writer", LAYER_SERVICE];
 
 /// The label mark of the session that `client` gets by asking for `service`: the data file
 /// service's `SERVICE` for a native client of `DATA_SERVICE_CLIENTS`, none for any other client
@@ -210,6 +215,7 @@ pub const VOUCHERS: &[&str] = &[
     ENTROPY_SERVICE,
     PACKAGE_SERVICE,
     DATA_SERVICE,
+    LAYER_SERVICE,
 ];
 /// The vouchers whose notary session may tell the process service that a
 /// file is set-ID (proto_process SetId, spec 2, 3.2): the file services.
@@ -232,6 +238,7 @@ pub const ROOT_SERVICES: &[(&str, u64)] = &[
     (ENTROPY_SERVICE, proto_process::ENTROPY),
     (DATA_SERVICE, proto_process::DATAFS),
     (PACKAGE_SERVICE, proto_process::PKG),
+    (LAYER_SERVICE, proto_process::LAYER),
 ];
 
 /// The label mark of the notary session of the voucher `name`: NOTARY, with
@@ -1677,6 +1684,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-random-net2") as usize
     + cfg!(feature = "table-posix-display") as usize
     + cfg!(feature = "table-data-posix") as usize
+    + cfg!(feature = "table-layer-names") as usize
     + cfg!(feature = "table-posix-window") as usize
     + cfg!(feature = "table-wfc") as usize
     + cfg!(feature = "table-wfc-steps") as usize
@@ -1794,6 +1802,7 @@ const _: () = assert!(
     feature = "table-posix-random-net2",
     feature = "table-posix-display",
     feature = "table-data-posix",
+    feature = "table-layer-names",
     feature = "table-posix-window",
     feature = "table-wfc",
     feature = "table-wfc-steps",
@@ -2017,6 +2026,8 @@ pub const TABLE: &[Record] = net::POSIX_RANDOM_NET2_TABLE;
 pub const TABLE: &[Record] = ramfs::POSIX_DISPLAY_TABLE;
 #[cfg(feature = "table-data-posix")]
 pub const TABLE: &[Record] = ramfs::DATA_POSIX_TABLE;
+#[cfg(feature = "table-layer-names")]
+pub const TABLE: &[Record] = ramfs::LAYER_NAMES_TABLE;
 #[cfg(feature = "table-posix-window")]
 pub const TABLE: &[Record] = window::TABLE;
 #[cfg(feature = "table-wfc")]
@@ -2126,6 +2137,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     net::POSIX_RANDOM_NET2_TABLE,
     ramfs::POSIX_DISPLAY_TABLE,
     ramfs::DATA_POSIX_TABLE,
+    ramfs::LAYER_NAMES_TABLE,
     ramfs::DISPLAY_TABLE,
     ramfs::LOADER_CHANNELS_TABLE,
     ramfs::POSIX_POLL_TABLE,
@@ -4666,6 +4678,46 @@ mod tests {
                 assert_ne!(a, b);
             }
         }
+    }
+
+    /// The layer service is a voucher whose notary session carries the mark of its root, a native
+    /// client of the data file service and a client of the RAM file service's boot profile, and
+    /// no other service gets the mark of its root.
+    #[test]
+    fn the_layer_service_is_a_voucher_with_its_own_root_and_a_native_client() {
+        use proto_process::{LAYER, NOTARY, ROOT_LAYER, root_of};
+        assert!(VOUCHERS.contains(&LAYER_SERVICE));
+        assert!(!SET_ID_VOUCHERS.contains(&LAYER_SERVICE));
+        assert_eq!(notary_mark(LAYER_SERVICE), NOTARY | LAYER);
+        assert_eq!(root_of(notary_mark(LAYER_SERVICE)), Some(ROOT_LAYER));
+        assert!(DATA_SERVICE_CLIENTS.contains(&LAYER_SERVICE));
+        assert!(BOOT_PROFILE_CLIENTS.contains(&LAYER_SERVICE));
+        assert_eq!(
+            ROOT_SERVICES
+                .iter()
+                .filter(|(_, mark)| *mark == LAYER)
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            [LAYER_SERVICE]
+        );
+        for name in [
+            "clock",
+            RAM_SERVICE,
+            DATA_SERVICE,
+            PACKAGE_SERVICE,
+            PIPE_SERVICE,
+        ] {
+            assert_eq!(notary_mark(name) & LAYER, 0, "{name}");
+        }
+        // Its session with the data service has the label of a native client, and a POSIX record of
+        // the same name never gets it.
+        let native = client(LAYER_SERVICE, 34, 34, &[DATA_SERVICE, RAM_SERVICE]);
+        assert_eq!(
+            data_mark(&native, DATA_SERVICE.as_bytes()),
+            Some(proto_data::SERVICE)
+        );
+        let posix = client(LAYER_SERVICE, 30, 30, &[DATA_SERVICE, PROCESS_SERVICE]);
+        assert_eq!(data_mark(&posix, DATA_SERVICE.as_bytes()), None);
     }
 
     /// Every table that has the data file service (the tables of the images are `all_tables`, the

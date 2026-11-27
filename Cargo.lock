@@ -602,6 +602,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "layer-names"
+version = "0.1.0"
+dependencies = [
+ "libc-ffi",
+ "posix-abi",
+ "posix-crt",
+ "proto-data",
+ "proto-fs",
+ "proto-layer",
+ "proto-process",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "layer-probe"
 version = "0.1.0"
 dependencies = [
@@ -616,6 +631,22 @@ name = "layer-user"
 version = "0.1.0"
 dependencies = [
  "posix-crt",
+]
+
+[[package]]
+name = "layerd"
+version = "0.7.0-pre.0"
+dependencies = [
+ "abi",
+ "posix-fs",
+ "posix-perm",
+ "proto-data",
+ "proto-fs",
+ "proto-init",
+ "proto-layer",
+ "proto-process",
+ "proto-wire",
+ "rt",
 ]
 
 [[package]]

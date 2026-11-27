@@ -4517,7 +4517,7 @@ impl Processes {
     }
 
     /// TakeRoot, through the session of any record: a copy of the root of the data file service
-    /// with `roots::TAKEN_RIGHTS` (`roots::Roots::taken`): the process sends the root SESSION and
+    /// or of the layer service with `roots::TAKEN_RIGHTS` (`roots::Roots::taken`): the process sends the root SESSION and
     /// VERIFY_SESSION and cannot copy it (TRANSFER is the right every handle of a reply needs). One
     /// duplicate of a handle the service holds, so no call to the data service and no wait.
     fn take_root(&self, r: &mut Request<'_>) -> Answer {

@@ -2574,6 +2574,86 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        // The lower set of the probe of the names of the layered root: the files the layer of the
+        // volume (`data_image::LAYER_VOLUME_ENTRIES`) shadows, deletes or hides.
+        "boot-layer-names.img" => {
+            // In the strictly ascending order of the paths.
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/layer-names", 0o755, ROOT, "layer-names"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            // `/etc` and the account files come from `accounts`.
+            files.extend([
+                of(
+                    "/etc/layer-hidden",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("layer-etc-hidden", b"hidden by the layer\n"),
+                ),
+                of(
+                    "/etc/layer-lower",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("layer-etc-lower", b"lower of etc\n"),
+                ),
+                dir("/lowdir"),
+                of(
+                    "/lowdir/l1",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("layer-lowdir-l1", b"l1\n"),
+                ),
+                of(
+                    "/lowdir/l2",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("layer-lowdir-l2", b"l2\n"),
+                ),
+                dir("/lower"),
+                of(
+                    "/lower/hidden",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("layer-lower-hidden", b"lower hidden\n"),
+                ),
+                of(
+                    "/lower/keep",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("layer-lower-keep", b"lower keep\n"),
+                ),
+                of(
+                    "/lower/shadowed",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("layer-lower-shadowed", b"lower shadowed\n"),
+                ),
+                // A lower directory closed to other users (0700).
+                RootFile {
+                    path: "/lowpriv",
+                    mode: 0o700,
+                    uid: 0,
+                    gid: 0,
+                    source: None,
+                },
+                of(
+                    "/lowpriv/f",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("layer-lowpriv-f", b"lower closed\n"),
+                ),
+                dir("/private"),
+                of(
+                    "/private/lower",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("layer-private-lower", b"lower private\n"),
+                ),
+            ]);
+            files
+        }
         "boot-cxx-probe.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -3763,6 +3843,7 @@ mod tests {
             "boot-data-posix-fast.img",
             "boot-data-posix-atomic.img",
             "boot-data-posix-steps.img",
+            "boot-layer-names.img",
             "boot-posix-window.img",
             "boot-cxx-probe.img",
             "boot-gles-pbuffer.img",
