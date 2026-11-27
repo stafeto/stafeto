@@ -22,10 +22,15 @@ bench = false
 # a layer of the user deleted shows again (`cargo xtask layer-names breaks`).
 # `break-layerd-search`: the walk of a path does not check the right to search the directories of
 # the layer of the user.
+# `break-layerd-no-mark`: a name of the lower set that goes is not marked on the volume (the index
+# hides it until the service starts again: `cargo xtask layer-posix write breaks`).
+# `break-layerd-sticky`: the sticky bit of a directory is not looked at by a removal or a rename.
 [features]
 steps = ["rt/step-stats"]
 break-layerd-whiteout = []
 break-layerd-search = []
+break-layerd-no-mark = []
+break-layerd-sticky = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

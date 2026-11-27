@@ -96,6 +96,23 @@ fn denial(denied: Denial) -> Status {
     })
 }
 
+/// Whether the caller may remove `victim` from `parent`: write and search on the directory and the
+/// sticky rule (the break leaves the sticky rule out).
+fn removal_allowed(
+    who: posix_perm::Identity<'_>,
+    parent: &posix_perm::Attr,
+    victim: &posix_perm::Attr,
+) -> Result<(), Status> {
+    if cfg!(feature = "break-layerd-sticky") {
+        return if permits(who, parent, WRITE | EXEC) {
+            Ok(())
+        } else {
+            Err(denial(Denial::Access))
+        };
+    }
+    posix_perm::remove_allowed(who, parent, victim).map_err(denial)
+}
+
 fn fail<T>(code: u32) -> F<T> {
     Err(Stop::Status(st(code)))
 }
@@ -640,6 +657,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
 
     /// The file `.wh.<name>` in `parent` (the volume only: the caller changes the index).
     fn put_mark(&mut self, parent: u32, name: &[u8]) -> R<()> {
+        if cfg!(feature = "break-layerd-no-mark") {
+            return Ok(());
+        }
         if name.len() + WHITEOUT_PREFIX.len() > NAME_MAX {
             return Err(st(proto_fs::NAME_TOO_LONG));
         }
@@ -1024,7 +1044,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                     uid: ls.uid,
                     gid: ls.gid,
                 };
-                posix_perm::remove_allowed(who, &p.attr, &victim).map_err(denial)?;
+                removal_allowed(who, &p.attr, &victim)?;
                 if is_dir && !self.merged_empty(None, full, true)? {
                     return fail(proto_fs::NOT_EMPTY);
                 }
@@ -1049,7 +1069,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                     let n = self.vpath(id, &mut vp)?;
                     attr_of(&self.volume.stat(&vp[..n]).map_err(from_volume)?)
                 };
-                posix_perm::remove_allowed(who, &p.attr, &victim).map_err(denial)?;
+                removal_allowed(who, &p.attr, &victim)?;
                 let up = p.up.ok_or_else(|| Stop::Status(st(proto_fs::NO_ENTRY)))?;
                 if is_dir
                     && !self.merged_empty(Some(id), full, lower.is_some_and(|s| s.kind == 1))?
@@ -1191,15 +1211,20 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             }
         }
         let same_parent = pb.up.is_some() && pb.up == pa.up;
-        posix_perm::rename_allowed(
-            who,
-            &pa.attr,
-            &src_attr,
-            &pb.attr,
-            dst_attr.as_ref(),
-            same_parent,
-        )
-        .map_err(denial)?;
+        if cfg!(feature = "break-layerd-sticky") {
+            removal_allowed(who, &pa.attr, &src_attr)?;
+            posix_perm::place_allowed(who, &pb.attr, None).map_err(denial)?;
+        } else {
+            posix_perm::rename_allowed(
+                who,
+                &pa.attr,
+                &src_attr,
+                &pb.attr,
+                dst_attr.as_ref(),
+                same_parent,
+            )
+            .map_err(denial)?;
+        }
         // The checks are done: make what the new name needs.
         let to = self.ensure_parent(&pb, b_parent)?;
         let mut old_dst = None;

@@ -75,6 +75,10 @@ pub struct Resolve {
     /// Whether an `Intent::Metadata` walk is for a change of the attributes (chmod, chown, times)
     /// and not for a check of access.
     guard_metadata: bool,
+    /// The walk belongs to a POSIX session of an image whose root is layered: the expansion of a
+    /// link and a `..` end it with a redirect that routes by the path (`bounce_layered`), so the
+    /// merged view decides what they lead to.
+    bounce: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intent {
@@ -191,6 +195,7 @@ impl Resolve {
             redirected: false,
             guard: false,
             guard_metadata: false,
+            bounce: false,
         })
     }
     /// A resolver that only carries bytes of 0 to 511: the contents of a new
@@ -243,6 +248,7 @@ impl Resolve {
             redirected: false,
             guard: false,
             guard_metadata: false,
+            bounce: false,
         })
     }
     /// Whether the walk is in the chain of a name.
@@ -381,6 +387,9 @@ impl Resolve {
             }
             let mut replacement = [0; MAX_PATH];
             storage.read(link, 0, &mut replacement[..len])?;
+            if self.bounces(storage) {
+                return self.bounce_link(&replacement[..len]);
+            }
             replacement[len..len + rest].copy_from_slice(&self.path[self.end..self.length]);
             if replacement[0] == b'/' {
                 self.current = ROOT;
@@ -430,6 +439,9 @@ impl Resolve {
             }
             if name == b"." || name == b".." {
                 let parent_component = name == b"..";
+                if parent_component && self.bounces(storage) {
+                    return self.bounce_parent();
+                }
                 if self.final_component() {
                     self.capture_edge(storage, false)?;
                 }
@@ -530,10 +542,125 @@ impl Resolve {
     /// Makes this walk refuse a result that writes outside the pass-through names of the layered
     /// root (READ_ONLY_FILESYSTEM): the service sets it for the sessions of POSIX processes in an
     /// image whose root the layer service decides. `metadata_writes` says an `Intent::Metadata`
-    /// walk changes attributes.
+    /// walk changes attributes. The walk bounces too (`bounce_layered`).
     pub fn guard_layered(&mut self, metadata_writes: bool) {
         self.guard = true;
         self.guard_metadata = metadata_writes;
+        self.bounce = true;
+    }
+
+    /// Makes this walk of a POSIX session of a layered image end with a redirect that routes by
+    /// the path where it would expand a link or go to the parent: the layer service owns the names
+    /// of the root, so what a link or a `..` leads to is its merged view's to say. Only a walk
+    /// that starts at the root bounces (the paths of the layered root are absolute); the
+    /// path the redirect carries is the root's own and has the dots of a link's text applied to
+    /// the directory the link lies in.
+    pub fn bounce_layered(&mut self) {
+        self.bounce = true;
+    }
+
+    fn bounces(&self, storage: &Storage<'_>) -> bool {
+        self.bounce && self.base == ROOT && !self.inert && storage.state.layered()
+    }
+
+    /// The names the walk has entered, as a path: every one is a plain name of the original path
+    /// (a link or a `..` ends the walk before it is taken), so the directory the walk stands in is
+    /// that path. The bytes and their count; the root is empty.
+    fn entered(&self) -> ([u8; MAX_PATH], usize) {
+        let mut out = [0; MAX_PATH];
+        let mut len = 0;
+        for part in self.path[..self.at.min(self.length)].split(|&b| b == b'/') {
+            if part.is_empty() || part == b"." {
+                continue;
+            }
+            if len + 1 + part.len() > MAX_PATH {
+                break;
+            }
+            out[len] = b'/';
+            out[len + 1..len + 1 + part.len()].copy_from_slice(part);
+            len += 1 + part.len();
+        }
+        (out, len)
+    }
+
+    /// Ends the walk with the redirect that carries `head` and `tail` as one absolute path (the
+    /// root when both are empty).
+    fn redirect_to(&mut self, head: &[u8], tail: &[u8]) -> Result<Progress, u32> {
+        let total = head.len() + tail.len();
+        if total > MAX_PATH {
+            return Err(NAME_TOO_LONG);
+        }
+        let mut path = [0; MAX_PATH];
+        path[..head.len()].copy_from_slice(head);
+        path[head.len()..total].copy_from_slice(tail);
+        let mut length = total;
+        if length == 0 {
+            path[0] = b'/';
+            length = 1;
+        }
+        self.path = path;
+        self.length = length;
+        self.redirected = true;
+        Err(REDIRECT)
+    }
+
+    /// The link the walk stands at, with the text `text`: the path of the redirect is the text
+    /// (an absolute one stands alone, a relative one follows the directory the link lies in, and
+    /// the `..` it begins with take that directory's last names) and what is left of the path.
+    fn bounce_link(&mut self, text: &[u8]) -> Result<Progress, u32> {
+        let rest_at = self.end.min(self.length);
+        let mut rest = [0; MAX_PATH];
+        let rest_len = self.length - rest_at;
+        rest[..rest_len].copy_from_slice(&self.path[rest_at..self.length]);
+        if text[0] == b'/' {
+            let mut head = [0; MAX_PATH];
+            head[..text.len()].copy_from_slice(text);
+            return self.redirect_to(&head[..text.len()], &rest[..rest_len]);
+        }
+        let (dir, mut dir_len) = self.entered();
+        let mut text = text;
+        // Leading `..` of the text go up the directory the link is in.
+        loop {
+            let (first, tail) = match text.iter().position(|&b| b == b'/') {
+                Some(i) => (&text[..i], Some(&text[i + 1..])),
+                None => (text, None),
+            };
+            if first != b".." {
+                break;
+            }
+            dir_len = dir[..dir_len].iter().rposition(|&b| b == b'/').unwrap_or(0);
+            match tail {
+                Some(t) => text = t,
+                None => {
+                    text = b"";
+                    break;
+                }
+            }
+        }
+        let mut joined = [0; MAX_PATH];
+        let mut len = dir_len;
+        joined[..len].copy_from_slice(&dir[..dir_len]);
+        if !text.is_empty() {
+            if len + 1 + text.len() > MAX_PATH {
+                return Err(NAME_TOO_LONG);
+            }
+            joined[len] = b'/';
+            joined[len + 1..len + 1 + text.len()].copy_from_slice(text);
+            len += 1 + text.len();
+        }
+        self.redirect_to(&joined[..len], &rest[..rest_len])
+    }
+
+    /// The walk stands at a `..`: the redirect is the directory above the one the walk stands in
+    /// and what is left of the path after the `..`.
+    fn bounce_parent(&mut self) -> Result<Progress, u32> {
+        let rest_at = self.end.min(self.length);
+        let mut rest = [0; MAX_PATH];
+        let rest_len = self.length - rest_at;
+        rest[..rest_len].copy_from_slice(&self.path[rest_at..self.length]);
+        let (dir, dir_len) = self.entered();
+        let up = dir[..dir_len].iter().rposition(|&b| b == b'/').unwrap_or(0);
+        self.redirect_to(&dir[..up], &rest[..rest_len])
     }
 
     /// The refusal of a result that writes below the layered root: the directory the name lies in

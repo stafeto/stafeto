@@ -6257,7 +6257,11 @@ impl Fs {
                 };
             let identity = fds.binding.identity(false).expect("authenticated");
             match Resolve::new(&mut self.ram.storage, path, base, identity, follow != 0) {
-                Ok(second) => {
+                Ok(mut second) => {
+                    // The second path of a POSIX session in a layered image bounces as the first.
+                    if self.ram.storage.state.layered() && !matches!(fds.binding, Binding::Boot) {
+                        second.bounce_layered();
+                    }
                     j.path_mut().second = Some(second);
                     return Answer::Status(Status::Ok);
                 }
