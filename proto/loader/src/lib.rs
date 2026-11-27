@@ -242,12 +242,12 @@ impl Descriptor {
         let fd = word(0);
         let ram_generation = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
         let pipe_generation = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
-        if matches!(word(1), 10 | 11 | 12) && ram_generation > 1 {
+        if matches!(word(1), 10..=12) && ram_generation > 1 {
             return None;
         }
         if word(1) != 8
             && word(1) != 9
-            && !(matches!(word(1), 10 | 11 | 12) && ram_generation <= 1)
+            && !(matches!(word(1), 10..=12) && ram_generation <= 1)
             && (ram_generation != 0 || pipe_generation != 0)
         {
             return None;
@@ -1956,7 +1956,13 @@ mod tests {
         .unwrap();
         let read = Block::read(&out[..len]).unwrap();
         assert!(read.needs(Slot::Layer));
-        for other in [Slot::Files, Slot::Data, Slot::Pipes, Slot::Terminal, Slot::Net] {
+        for other in [
+            Slot::Files,
+            Slot::Data,
+            Slot::Pipes,
+            Slot::Terminal,
+            Slot::Net,
+        ] {
             assert!(!read.needs(other), "{other:?}");
         }
     }

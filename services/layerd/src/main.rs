@@ -591,8 +591,7 @@ impl Service<0> for Layerd {
     fn request(&mut self, _: &mut Session<(), 0>, r: &mut Request<'_>) -> Answer {
         let method = r.method();
         if r.label() == l::ROOT {
-            return if method == l::Method::Session as u16 || method == NameMethod::Session as u16
-            {
+            return if method == l::Method::Session as u16 || method == NameMethod::Session as u16 {
                 self.session(r)
             } else if method == NameMethod::VerifySession as u16 {
                 self.verify_session(r)
@@ -608,9 +607,7 @@ impl Service<0> for Layerd {
             };
         }
         match NameMethod::from_number(method) {
-            Some(NameMethod::Session | NameMethod::VerifySession) => {
-                st(proto_fs::INVALID_ARGUMENT)
-            }
+            Some(NameMethod::Session | NameMethod::VerifySession) => st(proto_fs::INVALID_ARGUMENT),
             Some(m) => self.names(m, r.label(), r),
             None => Answer::Status(Status::UnknownMethod),
         }

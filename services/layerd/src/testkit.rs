@@ -81,7 +81,14 @@ impl FakeVolume {
         self.file_numbered(path, mode, uid, ino, data)
     }
 
-    pub fn file_numbered(&mut self, path: &str, mode: u32, uid: u32, ino: u64, data: &[u8]) -> &mut Self {
+    pub fn file_numbered(
+        &mut self,
+        path: &str,
+        mode: u32,
+        uid: u32,
+        ino: u64,
+        data: &[u8],
+    ) -> &mut Self {
         self.nodes.insert(
             path.as_bytes().to_vec(),
             Node {
@@ -134,7 +141,11 @@ impl FakeVolume {
 
 fn stat_of(n: &Node) -> d::Stat {
     d::Stat {
-        kind: if n.dir { d::KIND_DIRECTORY } else { d::KIND_FILE },
+        kind: if n.dir {
+            d::KIND_DIRECTORY
+        } else {
+            d::KIND_FILE
+        },
         mode: n.mode,
         uid: n.uid,
         gid: n.gid,
@@ -211,7 +222,11 @@ impl Volume for FakeVolume {
     fn write(&mut self, handle: u32, bytes: &[u8]) -> R<usize> {
         self.check("write")?;
         let (path, _) = self.handles.get(&handle).ok_or(st(d::BAD_HANDLE))?;
-        self.nodes.get_mut(path.as_slice()).unwrap().data.extend_from_slice(bytes);
+        self.nodes
+            .get_mut(path.as_slice())
+            .unwrap()
+            .data
+            .extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -267,13 +282,25 @@ impl Volume for FakeVolume {
     fn read_dir(&mut self, handle: u32, visit: Visit<'_>) -> R<bool> {
         self.check("read_dir")?;
         let batch = self.batch;
-        let (path, pos) = self.handles.get(&handle).cloned().ok_or(st(d::BAD_HANDLE))?;
+        let (path, pos) = self
+            .handles
+            .get(&handle)
+            .cloned()
+            .ok_or(st(d::BAD_HANDLE))?;
         let mut all: Vec<(Vec<u8>, u64, u32)> = vec![
             (b".".to_vec(), 0, d::KIND_DIRECTORY),
             (b"..".to_vec(), 0, d::KIND_DIRECTORY),
         ];
         for (name, n) in self.children(&path) {
-            all.push((name, n.ino, if n.dir { d::KIND_DIRECTORY } else { d::KIND_FILE }));
+            all.push((
+                name,
+                n.ino,
+                if n.dir {
+                    d::KIND_DIRECTORY
+                } else {
+                    d::KIND_FILE
+                },
+            ));
         }
         let end = (pos + batch).min(all.len());
         for (name, ino, kind) in &all[pos..end] {
@@ -325,7 +352,11 @@ impl Lower for FakeLower {
     type Dir = LowerDir;
 
     fn stat(&mut self, path: &[u8], _no_follow: bool) -> R<NodeInfo> {
-        let path = if path.len() > 1 { path.strip_suffix(b"/").unwrap_or(path) } else { path };
+        let path = if path.len() > 1 {
+            path.strip_suffix(b"/").unwrap_or(path)
+        } else {
+            path
+        };
         let (kind, ino) = *self.nodes.get(path).ok_or(st(proto_fs::NO_ENTRY))?;
         Ok(NodeInfo {
             kind,
@@ -359,7 +390,10 @@ impl Lower for FakeLower {
         };
         let mut entries = vec![(1, 1, b".".to_vec()), (1, 1, b"..".to_vec())];
         for (p, (kind, ino)) in &self.nodes {
-            if p.len() > prefix.len() && p.starts_with(&prefix) && !p[prefix.len()..].contains(&b'/') {
+            if p.len() > prefix.len()
+                && p.starts_with(&prefix)
+                && !p[prefix.len()..].contains(&b'/')
+            {
                 entries.push((*ino, *kind, p[prefix.len()..].to_vec()));
             }
         }

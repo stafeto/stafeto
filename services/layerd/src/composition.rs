@@ -122,7 +122,10 @@ impl Composition {
     }
 
     pub fn parse(text: &[u8]) -> Result<Composition, Error> {
-        if text.is_empty() || text.last() != Some(&b'\n') || text.contains(&0) || text.contains(&b'\r')
+        if text.is_empty()
+            || text.last() != Some(&b'\n')
+            || text.contains(&0)
+            || text.contains(&b'\r')
         {
             return Err(Error::Text);
         }
@@ -157,8 +160,7 @@ impl Composition {
         let mut layers = [NONE; MAX_LAYERS];
         let mut count = 0;
         let mut live = 0;
-        loop {
-            let Some(l) = lines.next() else { break };
+        for l in lines {
             n += 1;
             let rest = l.strip_prefix(b"layer ").ok_or(Error::Line(n))?;
             if count == MAX_LAYERS {
@@ -375,7 +377,10 @@ mod tests {
             ("STAFLAYR 1\nnext 1\n", Error::Number(2)),
             ("STAFLAYR 1\nnext 100\n", Error::Number(2)),
             ("STAFLAYR 1\nnext 01\nino 01\n", Error::Field(3)),
-            ("STAFLAYR 1\nnext 01\nino 4611686018427387904\n", Error::Field(3)),
+            (
+                "STAFLAYR 1\nnext 01\nino 4611686018427387904\n",
+                Error::Field(3),
+            ),
             ("STAFLAYR 1\nnext 01\nino 1\nlower ABC\n", Error::Field(4)),
             ("STAFLAYR 1\nnext 01\nino 1\nlower -\n", Error::Live),
             (

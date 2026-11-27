@@ -92,7 +92,9 @@ struct Answer {
 
 impl Answer {
     fn status(&self) -> u32 {
-        Reader::new(&self.bytes[..self.len]).u32().unwrap_or(u32::MAX)
+        Reader::new(&self.bytes[..self.len])
+            .u32()
+            .unwrap_or(u32::MAX)
     }
 
     fn all(&self) -> &[u8] {
@@ -100,13 +102,12 @@ impl Answer {
     }
 }
 
-fn call(to: &Handle<Channel>, request: &[u8], handles: impl Into<rt::handle::Outgoing>) -> Option<Answer> {
-    let reply = loop {
-        match rt::sys::send_handles(to, request, handles_once(&mut Some(handles.into()))) {
-            Ok(r) => break r,
-            Err(_) => return None,
-        }
-    };
+fn call(
+    to: &Handle<Channel>,
+    request: &[u8],
+    handles: impl Into<rt::handle::Outgoing>,
+) -> Option<Answer> {
+    let reply = rt::sys::send_handles(to, request, handles).ok()?;
     let mut answer = Answer {
         bytes: [0; MESSAGE_MAX],
         len: 0,
@@ -116,17 +117,17 @@ fn call(to: &Handle<Channel>, request: &[u8], handles: impl Into<rt::handle::Out
     Some(answer)
 }
 
-fn handles_once(h: &mut Option<rt::handle::Outgoing>) -> rt::handle::Outgoing {
-    h.take().unwrap_or_default()
-}
-
 /// The root of a service from the process service (TakeRoot), asked again while it is not
 /// registered yet.
 fn take_root(which: u32) -> Option<Handle<Channel>> {
     let mut w = Writer::new();
     proto_process::take_root(which, &mut w).ok()?;
     for _ in 0..500 {
-        let mut a = call(posix_abi::process::client().session(), w.as_bytes(), rt::handle::Outgoing::new())?;
+        let mut a = call(
+            posix_abi::process::client().session(),
+            w.as_bytes(),
+            rt::handle::Outgoing::new(),
+        )?;
         match a.status() {
             0 => return a.reply.handles.take::<Channel>(0).ok(),
             proto_process::UNREGISTERED => {
@@ -161,8 +162,13 @@ fn session(root: &Handle<Channel>, header: proto_wire::Header) -> Option<Handle<
 }
 
 /// What OPEN gave.
+#[allow(clippy::large_enum_variant)]
 enum Opened {
-    Redirect { target: u32, path: [u8; 512], len: usize },
+    Redirect {
+        target: u32,
+        path: [u8; 512],
+        len: usize,
+    },
     Pass(Handle<Any>),
     Directory(u32),
     Status(u32),
@@ -307,10 +313,16 @@ fn redirect_is(opened: &Opened, path: &str) -> bool {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn main(_argc: isize, _argv: *mut *mut core::ffi::c_char, _envp: *mut *mut core::ffi::c_char) -> c_int {
+extern "C" fn main(
+    _argc: isize,
+    _argv: *mut *mut core::ffi::c_char,
+    _envp: *mut *mut core::ffi::c_char,
+) -> c_int {
     let mut t = Checks { failed: 0 };
-    let (Some(root), Some(data_root)) = (take_root(proto_process::ROOT_LAYER), take_root(proto_process::ROOT_DATA))
-    else {
+    let (Some(root), Some(data_root)) = (
+        take_root(proto_process::ROOT_LAYER),
+        take_root(proto_process::ROOT_DATA),
+    ) else {
         say(format_args!("session FAILED: no root"));
         return 1;
     };
@@ -325,13 +337,26 @@ extern "C" fn main(_argc: isize, _argv: *mut *mut core::ffi::c_char, _envp: *mut
     t.ok("sessions");
     // The layer's own protocol through the second session.
     let status = {
-        let a = call(&control, &l::Method::Status.header().bytes(), rt::handle::Outgoing::new());
+        let a = call(
+            &control,
+            &l::Method::Status.header().bytes(),
+            rt::handle::Outgoing::new(),
+        );
         a.map(|a| l::Stat::read(a.all()))
     };
     t.check(
         "status",
         match status {
-            Some(Ok(s)) if s.flags == 0 && s.live == 0 && s.frozen == 0 && s.added == 9 && s.deleted == 2 && s.names == 11 => Ok(()),
+            Some(Ok(s))
+                if s.flags == 0
+                    && s.live == 0
+                    && s.frozen == 0
+                    && s.added == 9
+                    && s.deleted == 2
+                    && s.names == 11 =>
+            {
+                Ok(())
+            }
             Some(Ok(_)) => Err(format_args!("the counts of the index differ")),
             _ => Err(format_args!("no status")),
         },
@@ -339,20 +364,36 @@ extern "C" fn main(_argc: isize, _argv: *mut *mut core::ffi::c_char, _envp: *mut
     // A lower file and a lower directory go to the RAM file service with the whole path.
     t.check(
         "a lower file is a redirect",
-        if redirect_is(&open(&names, proto_fs::READ_ONLY, "/lower/keep"), "/lower/keep")
-            && redirect_is(&open(&names, proto_fs::READ_ONLY, "/etc/layer-lower"), "/etc/layer-lower")
-            && redirect_is(&open(&names, proto_fs::READ_ONLY, "/bin/layer-names"), "/bin/layer-names")
-        {
+        if redirect_is(
+            &open(&names, proto_fs::READ_ONLY, "/lower/keep"),
+            "/lower/keep",
+        ) && redirect_is(
+            &open(&names, proto_fs::READ_ONLY, "/etc/layer-lower"),
+            "/etc/layer-lower",
+        ) && redirect_is(
+            &open(&names, proto_fs::READ_ONLY, "/bin/layer-names"),
+            "/bin/layer-names",
+        ) {
             Ok(())
         } else {
-            Err(format_args!("not a redirect to the RAM file service with the path"))
+            Err(format_args!(
+                "not a redirect to the RAM file service with the path"
+            ))
         },
     );
     t.check(
         "a lower directory is a redirect",
-        if redirect_is(&open(&names, proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY, "/bin"), "/bin")
-            && redirect_is(&open(&names, proto_fs::READ_ONLY, "/private/lower"), "/private/lower")
-        {
+        if redirect_is(
+            &open(
+                &names,
+                proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY,
+                "/bin",
+            ),
+            "/bin",
+        ) && redirect_is(
+            &open(&names, proto_fs::READ_ONLY, "/private/lower"),
+            "/private/lower",
+        ) {
             Ok(())
         } else {
             Err(format_args!("not a redirect"))
@@ -361,7 +402,12 @@ extern "C" fn main(_argc: isize, _argv: *mut *mut core::ffi::c_char, _envp: *mut
     // The pass of a file of the layer: its bytes after ADOPT in a session of the data service.
     t.check(
         "the pass of a file of the layer",
-        expect_bytes(&data, &names, "/etc/layer-own", b"owned bytes of the layer\n"),
+        expect_bytes(
+            &data,
+            &names,
+            "/etc/layer-own",
+            b"owned bytes of the layer\n",
+        ),
     );
     t.check(
         "a file of the layer shadows the lower one",
@@ -370,11 +416,27 @@ extern "C" fn main(_argc: isize, _argv: *mut *mut core::ffi::c_char, _envp: *mut
     // Numbers.
     t.check(
         "stat numbers",
-        match (stat(&names, "/etc/layer-own"), stat(&names, "/lower/keep"), stat(&names, "/")) {
+        match (
+            stat(&names, "/etc/layer-own"),
+            stat(&names, "/lower/keep"),
+            stat(&names, "/"),
+        ) {
             (Ok(own), Ok(keep), Ok(root_info)) => {
-                if own.inode != (UPPER_INO_TAG | 5) || own.device != 0 || own.uid != 1000 || own.permissions != 0o640 || own.size != 25 || own.kind != 2 {
-                    Err(format_args!("the file of the layer: number, device, owner, mode or size"))
-                } else if keep.inode == 0 || keep.inode & (UPPER_INO_TAG | 1 << 63) != 0 || keep.device != 0 || keep.kind != 2 {
+                if own.inode != (UPPER_INO_TAG | 5)
+                    || own.device != 0
+                    || own.uid != 1000
+                    || own.permissions != 0o640
+                    || own.size != 25
+                    || own.kind != 2
+                {
+                    Err(format_args!(
+                        "the file of the layer: number, device, owner, mode or size"
+                    ))
+                } else if keep.inode == 0
+                    || keep.inode & (UPPER_INO_TAG | 1 << 63) != 0
+                    || keep.device != 0
+                    || keep.kind != 2
+                {
                     Err(format_args!("the lower file: number or device"))
                 } else if root_info.kind != 1 || root_info.device != 0 {
                     Err(format_args!("the root"))
@@ -390,8 +452,13 @@ extern "C" fn main(_argc: isize, _argv: *mut *mut core::ffi::c_char, _envp: *mut
         "merged listing of a directory",
         match list_of(&names, "/etc") {
             Some(l) => {
-                if l.count_of("layer-note") != 1 || l.count_of("layer-own") != 1 || l.count_of("layer-lower") != 1 {
-                    Err(format_args!("a name of the layer or of the lower set is not there once"))
+                if l.count_of("layer-note") != 1
+                    || l.count_of("layer-own") != 1
+                    || l.count_of("layer-lower") != 1
+                {
+                    Err(format_args!(
+                        "a name of the layer or of the lower set is not there once"
+                    ))
                 } else if l.count_of("layer-hidden") != 0 {
                     Err(format_args!("a deleted name is listed"))
                 } else if l.any_starts(".wh.") {
@@ -408,28 +475,42 @@ extern "C" fn main(_argc: isize, _argv: *mut *mut core::ffi::c_char, _envp: *mut
     t.check(
         "a name of the layer is listed once over the lower one",
         match list_of(&names, "/lower") {
-            Some(l) if l.count_of("shadowed") == 1 && l.count_of("keep") == 1 && l.count_of("hidden") == 0 => Ok(()),
+            Some(l)
+                if l.count_of("shadowed") == 1
+                    && l.count_of("keep") == 1
+                    && l.count_of("hidden") == 0 =>
+            {
+                Ok(())
+            }
             Some(_) => Err(format_args!("shadowed, keep or hidden")),
             None => Err(format_args!("no listing")),
         },
     );
-    t.check(
-        "the names a layer deleted are gone",
+    t.check("the names a layer deleted are gone", {
+        let a = open(&names, proto_fs::READ_ONLY, "/etc/layer-hidden");
+        let b = open(&names, proto_fs::READ_ONLY, "/lower/hidden");
+        if status_is(&a, proto_fs::NO_ENTRY)
+            && status_is(&b, proto_fs::NO_ENTRY)
+            && stat(&names, "/lower/hidden") == Err(proto_fs::NO_ENTRY)
         {
-            let a = open(&names, proto_fs::READ_ONLY, "/etc/layer-hidden");
-            let b = open(&names, proto_fs::READ_ONLY, "/lower/hidden");
-            if status_is(&a, proto_fs::NO_ENTRY) && status_is(&b, proto_fs::NO_ENTRY) && stat(&names, "/lower/hidden") == Err(proto_fs::NO_ENTRY) {
-                Ok(())
-            } else {
-                Err(format_args!("a deleted name opens or stats"))
-            }
-        },
-    );
+            Ok(())
+        } else {
+            Err(format_args!("a deleted name opens or stats"))
+        }
+    });
     t.check(
         "an opaque directory lists only its own names",
         match list_of(&names, "/lowdir") {
-            Some(l) if l.count_of("u1") == 1 && l.count_of("l1") == 0 && l.count_of("l2") == 0 && l.count == 3 => {
-                if status_is(&open(&names, proto_fs::READ_ONLY, "/lowdir/l1"), proto_fs::NO_ENTRY) {
+            Some(l)
+                if l.count_of("u1") == 1
+                    && l.count_of("l1") == 0
+                    && l.count_of("l2") == 0
+                    && l.count == 3 =>
+            {
+                if status_is(
+                    &open(&names, proto_fs::READ_ONLY, "/lowdir/l1"),
+                    proto_fs::NO_ENTRY,
+                ) {
                     Ok(())
                 } else {
                     Err(format_args!("a lower name opens below an opaque directory"))
@@ -442,25 +523,36 @@ extern "C" fn main(_argc: isize, _argv: *mut *mut core::ffi::c_char, _envp: *mut
     // A description: rewind lists the same names, fstat says directory, close frees it.
     t.check(
         "rewind fstat and close",
-        match open(&names, proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY, "/etc") {
+        match open(
+            &names,
+            proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY,
+            "/etc",
+        ) {
             Opened::Directory(h) => {
                 let first = list(&names, h);
                 let mut w = Writer::new();
                 let _ = n::write_handle(NameMethod::Rewind, h, &mut w);
-                let rewound = call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status());
+                let rewound =
+                    call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status());
                 let second = list(&names, h);
                 let mut w = Writer::new();
                 let _ = n::write_handle(NameMethod::Fstat, h, &mut w);
-                let info = call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| n::read_info(a.all()));
+                let info = call(&names, w.as_bytes(), rt::handle::Outgoing::new())
+                    .map(|a| n::read_info(a.all()));
                 let mut w = Writer::new();
                 let _ = n::write_handle(NameMethod::Close, h, &mut w);
-                let closed = call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status());
+                let closed =
+                    call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status());
                 let mut w = Writer::new();
                 let _ = n::write_handle(NameMethod::Close, h, &mut w);
-                let again = call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status());
+                let again =
+                    call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status());
                 match (first, second, rewound, info, closed, again) {
                     (Some(a), Some(b), Some(0), Some(Ok(i)), Some(0), Some(s))
-                        if a.count == b.count && a.count >= 5 && i.kind == 1 && s == proto_fs::BAD_FD =>
+                        if a.count == b.count
+                            && a.count >= 5
+                            && i.kind == 1
+                            && s == proto_fs::BAD_FD =>
                     {
                         Ok(())
                     }
@@ -472,35 +564,34 @@ extern "C" fn main(_argc: isize, _argv: *mut *mut core::ffi::c_char, _envp: *mut
     );
     // Nothing is written: a write open, a create and CHANGE are a read-only file system, WAIT is no
     // method of this part.
-    t.check(
-        "read only",
+    t.check("read only", {
+        let w1 = open(&names, proto_fs::WRITE_ONLY, "/etc/layer-note");
+        let w2 = open(&names, proto_fs::READ_ONLY | proto_fs::CREATE, "/newfile");
+        let mut w = Writer::new();
+        let change = n::Change {
+            op: n::ChangeOp::Mkdir,
+            a: 0o755,
+            b: 0,
+            first: b"/newdir",
+            second: b"",
+        };
+        let _ = change.write(&mut w);
+        let c = call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status());
+        let mut w = Writer::new();
+        let _ = n::write_wait(1, &mut w);
+        let wait = call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status());
+        if status_is(&w1, proto_fs::READ_ONLY_FILESYSTEM)
+            && status_is(&w2, proto_fs::READ_ONLY_FILESYSTEM)
+            && c == Some(proto_fs::READ_ONLY_FILESYSTEM)
+            && wait == Some(proto_wire::UNKNOWN_METHOD)
         {
-            let w1 = open(&names, proto_fs::WRITE_ONLY, "/etc/layer-note");
-            let w2 = open(&names, proto_fs::READ_ONLY | proto_fs::CREATE, "/newfile");
-            let mut w = Writer::new();
-            let change = n::Change {
-                op: n::ChangeOp::Mkdir,
-                a: 0o755,
-                b: 0,
-                first: b"/newdir",
-                second: b"",
-            };
-            let _ = change.write(&mut w);
-            let c = call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status());
-            let mut w = Writer::new();
-            let _ = n::write_wait(1, &mut w);
-            let wait = call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status());
-            if status_is(&w1, proto_fs::READ_ONLY_FILESYSTEM)
-                && status_is(&w2, proto_fs::READ_ONLY_FILESYSTEM)
-                && c == Some(proto_fs::READ_ONLY_FILESYSTEM)
-                && wait == Some(proto_wire::UNKNOWN_METHOD)
-            {
-                Ok(())
-            } else {
-                Err(format_args!("a change was not refused with EROFS, or WAIT is served"))
-            }
-        },
-    );
+            Ok(())
+        } else {
+            Err(format_args!(
+                "a change was not refused with EROFS, or WAIT is served"
+            ))
+        }
+    });
     // The superuser searches /private.
     t.check(
         "the superuser searches a closed directory",
@@ -511,13 +602,17 @@ extern "C" fn main(_argc: isize, _argv: *mut *mut core::ffi::c_char, _envp: *mut
     );
     // User 1000 from here on, on the old session and on a new one.
     // SAFETY: plain calls of relibc.
-    let dropped = unsafe { setgroups(0, core::ptr::null()) == 0 && setgid(1000) == 0 && setuid(1000) == 0 };
+    let dropped =
+        unsafe { setgroups(0, core::ptr::null()) == 0 && setgid(1000) == 0 && setuid(1000) == 0 };
     if !dropped {
         t.fail("drop privileges", format_args!("setuid refused"));
         return 1;
     }
     let fresh = session(&root, NameMethod::Session.header());
-    for (label, s) in [("the session of before", Some(&names)), ("a new session", fresh.as_ref())] {
+    for (label, s) in [
+        ("the session of before", Some(&names)),
+        ("a new session", fresh.as_ref()),
+    ] {
         let Some(s) = s else {
             t.fail(label, format_args!("no session"));
             continue;
@@ -529,31 +624,42 @@ extern "C" fn main(_argc: isize, _argv: *mut *mut core::ffi::c_char, _envp: *mut
             at += part.len();
         }
         let shown = core::str::from_utf8(&name[..at]).unwrap_or("search denied");
-        t.check(
-            shown,
+        t.check(shown, {
+            let a = open(s, proto_fs::READ_ONLY, "/private/f");
+            let b = open(s, proto_fs::READ_ONLY, "/private/lower");
+            let c = open(
+                s,
+                proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY,
+                "/private",
+            );
+            if status_is(&a, proto_fs::ACCESS_DENIED)
+                && status_is(&b, proto_fs::ACCESS_DENIED)
+                && status_is(&c, proto_fs::ACCESS_DENIED)
+                && stat(s, "/private/f") == Err(proto_fs::ACCESS_DENIED)
             {
-                let a = open(s, proto_fs::READ_ONLY, "/private/f");
-                let b = open(s, proto_fs::READ_ONLY, "/private/lower");
-                let c = open(s, proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY, "/private");
-                if status_is(&a, proto_fs::ACCESS_DENIED)
-                    && status_is(&b, proto_fs::ACCESS_DENIED)
-                    && status_is(&c, proto_fs::ACCESS_DENIED)
-                    && stat(s, "/private/f") == Err(proto_fs::ACCESS_DENIED)
-                {
-                    Ok(())
-                } else {
-                    Err(format_args!("a path below a closed directory of the layer opens"))
-                }
-            },
-        );
+                Ok(())
+            } else {
+                Err(format_args!(
+                    "a path below a closed directory of the layer opens"
+                ))
+            }
+        });
     }
     t.check(
         "the owner reads the file of the layer",
-        expect_bytes(&data, &names, "/etc/layer-own", b"owned bytes of the layer\n"),
+        expect_bytes(
+            &data,
+            &names,
+            "/etc/layer-own",
+            b"owned bytes of the layer\n",
+        ),
     );
     t.check(
         "a lower file stays reachable",
-        if redirect_is(&open(&names, proto_fs::READ_ONLY, "/lower/keep"), "/lower/keep") {
+        if redirect_is(
+            &open(&names, proto_fs::READ_ONLY, "/lower/keep"),
+            "/lower/keep",
+        ) {
             Ok(())
         } else {
             Err(format_args!("not a redirect"))

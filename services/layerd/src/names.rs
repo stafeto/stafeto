@@ -569,9 +569,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         self.gate()?;
         let (outcome, trailing) = self.walk(c, path);
         match outcome {
-            Outcome::PassThrough { .. } => {
-                Self::redirect_for(outcome, path, w).unwrap_or(Ok(()))
-            }
+            Outcome::PassThrough { .. } => Self::redirect_for(outcome, path, w).unwrap_or(Ok(())),
             Outcome::Lower => {
                 let mut info = self.lower.stat(path, flags & n::STAT_NO_FOLLOW != 0)?;
                 if trailing && info.kind != 1 {

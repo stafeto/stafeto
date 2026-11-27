@@ -255,11 +255,23 @@ pub const LAYER_VOLUME_ENTRIES: &[LayerEntry] = &[
     LayerEntry::dir("/.layers/00/etc", 0o755, 0, 0),
     LayerEntry::file("/.layers/00/etc/.wh.layer-hidden", 0o644, 0, 0, b""),
     LayerEntry::file("/.layers/00/etc/layer-note", 0o644, 0, 0, b"layer note\n"),
-    LayerEntry::file("/.layers/00/etc/layer-own", 0o640, 1000, 1000, LAYER_OWN_BYTES)
-        .numbered(UPPER_INO_TAG | 5),
+    LayerEntry::file(
+        "/.layers/00/etc/layer-own",
+        0o640,
+        1000,
+        1000,
+        LAYER_OWN_BYTES,
+    )
+    .numbered(UPPER_INO_TAG | 5),
     LayerEntry::dir("/.layers/00/lower", 0o755, 0, 0),
     LayerEntry::file("/.layers/00/lower/.wh.hidden", 0o644, 0, 0, b""),
-    LayerEntry::file("/.layers/00/lower/shadowed", 0o644, 0, 0, LAYER_SHADOW_BYTES),
+    LayerEntry::file(
+        "/.layers/00/lower/shadowed",
+        0o644,
+        0,
+        0,
+        LAYER_SHADOW_BYTES,
+    ),
     LayerEntry::dir("/.layers/00/lowdir", 0o755, 0, 0),
     LayerEntry::file("/.layers/00/lowdir/.wh..wh..opq", 0o644, 0, 0, b""),
     LayerEntry::file("/.layers/00/lowdir/u1", 0o644, 0, 0, b"u1\n"),

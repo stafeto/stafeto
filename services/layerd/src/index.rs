@@ -266,12 +266,14 @@ impl Index {
                 self.live += 1;
                 e.kind = f.kind;
                 e.flags = if f.kind == Kind::Dir { UNSCANNED } else { 0 };
-                (e.layer, e.number, e.uid, e.gid, e.mode) = (f.layer, f.number, f.uid, f.gid, f.mode);
+                (e.layer, e.number, e.uid, e.gid, e.mode) =
+                    (f.layer, f.number, f.uid, f.gid, f.mode);
             }
             (Kind::File | Kind::Dir, Kind::Whiteout) | (Kind::Whiteout, Kind::Whiteout) => {}
             _ => {
                 e.kind = f.kind;
-                (e.layer, e.number, e.uid, e.gid, e.mode) = (f.layer, f.number, f.uid, f.gid, f.mode);
+                (e.layer, e.number, e.uid, e.gid, e.mode) =
+                    (f.layer, f.number, f.uid, f.gid, f.mode);
             }
         }
         slot as u32 + 1
@@ -280,7 +282,10 @@ impl Index {
     fn mark_parent(&mut self, parent: u32) {
         if parent == 0 {
             self.root.flags |= HAS_CHILDREN;
-        } else if let Some(p) = (parent as usize).checked_sub(1).and_then(|s| self.slots.get_mut(s)) {
+        } else if let Some(p) = (parent as usize)
+            .checked_sub(1)
+            .and_then(|s| self.slots.get_mut(s))
+        {
             p.flags |= HAS_CHILDREN;
         }
     }
@@ -289,7 +294,10 @@ impl Index {
     pub fn set_flags(&mut self, id: u32, set: u8, clear: u8) {
         if id == 0 {
             self.root.flags = (self.root.flags | set) & !clear;
-        } else if let Some(e) = (id as usize).checked_sub(1).and_then(|s| self.slots.get_mut(s)) {
+        } else if let Some(e) = (id as usize)
+            .checked_sub(1)
+            .and_then(|s| self.slots.get_mut(s))
+        {
             e.flags = (e.flags | set) & !clear;
         }
     }
@@ -328,7 +336,10 @@ impl Index {
         if id == 0 {
             self.root.number = number;
             (self.root.uid, self.root.gid, self.root.mode) = (uid, gid, mode);
-        } else if let Some(e) = (id as usize).checked_sub(1).and_then(|s| self.slots.get_mut(s)) {
+        } else if let Some(e) = (id as usize)
+            .checked_sub(1)
+            .and_then(|s| self.slots.get_mut(s))
+        {
             (e.number, e.uid, e.gid, e.mode) = (number, uid, gid, mode);
         }
     }
@@ -403,8 +414,14 @@ mod tests {
         let b = ix.insert(a, b"passwd", file(11)).unwrap();
         let c = ix.insert(0, b"passwd", file(12)).unwrap();
         assert_ne!(b, c);
-        assert_eq!(ix.lookup(a, b"passwd").map(|(id, e)| (id, e.number)), Some((b, 11)));
-        assert_eq!(ix.lookup(0, b"passwd").map(|(id, e)| (id, e.number)), Some((c, 12)));
+        assert_eq!(
+            ix.lookup(a, b"passwd").map(|(id, e)| (id, e.number)),
+            Some((b, 11))
+        );
+        assert_eq!(
+            ix.lookup(0, b"passwd").map(|(id, e)| (id, e.number)),
+            Some((c, 12))
+        );
         assert!(ix.lookup(0, b"etc").is_some());
         assert!(ix.lookup(a, b"etc").is_none());
         assert!(ix.lookup(0, b"pass").is_none());
@@ -480,7 +497,10 @@ mod tests {
         );
         let mut ix = index();
         assert_eq!(ix.insert(0, b"", file(1)), Err(Error::Invalid));
-        assert_eq!(ix.insert(0, &[b'x'; NAME_MAX + 1], file(1)), Err(Error::Invalid));
+        assert_eq!(
+            ix.insert(0, &[b'x'; NAME_MAX + 1], file(1)),
+            Err(Error::Invalid)
+        );
         assert_eq!(ix.insert(77, b"x", file(1)), Err(Error::Invalid));
         let f = ix.insert(0, b"f", file(1)).unwrap();
         assert_eq!(ix.insert(f, b"x", file(1)), Err(Error::Invalid));

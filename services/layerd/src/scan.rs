@@ -140,7 +140,13 @@ impl Scan {
             if stat.kind != proto_data::KIND_DIRECTORY {
                 return Err(Failure::Volume(proto_data::code(proto_data::NOT_DIRECTORY)));
             }
-            index.set_attr(id, stat.ino, stat.uid, stat.gid, (stat.mode & 0o7777) as u16);
+            index.set_attr(
+                id,
+                stat.ino,
+                stat.uid,
+                stat.gid,
+                (stat.mode & 0o7777) as u16,
+            );
             let handle = volume
                 .open(&path[..n], READ | DIRECTORY, 0)
                 .map_err(Failure::Volume)?;

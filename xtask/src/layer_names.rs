@@ -61,10 +61,7 @@ fn ok_checks() -> &'static [&'static str] {
 
 /// The deliberate breaks of the layer service and the check each one fails.
 pub const BREAKS: [(&str, &str); 2] = [
-    (
-        "break-layerd-whiteout",
-        "merged listing of a directory",
-    ),
+    ("break-layerd-whiteout", "merged listing of a directory"),
     (
         "break-layerd-search",
         "search denied for user 1000 on a new session",
@@ -74,12 +71,7 @@ pub const BREAKS: [(&str, &str); 2] = [
 /// The image's programs; the layer service is built with `layerd` features.
 fn programs(layerd: &'static [&'static str]) -> Vec<ImageProgram> {
     vec![
-        (
-            "init",
-            "init",
-            INIT_STACK_SIZE,
-            &["table-layer-names"][..],
-        ),
+        ("init", "init", INIT_STACK_SIZE, &["table-layer-names"][..]),
         ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
         (
             "posix-process-service",
@@ -98,12 +90,7 @@ fn programs(layerd: &'static [&'static str]) -> Vec<ImageProgram> {
         ),
         ("datafsd", "datafsd", 32 * 1024, &[]),
         ("layerd", "layerd", 128 * 1024, layerd),
-        (
-            "layer-names",
-            "layer-names",
-            crate::POSIX_STACK_SIZE,
-            &[],
-        ),
+        ("layer-names", "layer-names", crate::POSIX_STACK_SIZE, &[]),
         (
             "virtio-rng",
             "virtio-rng",
@@ -138,19 +125,22 @@ pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
     match args.first().map(String::as_str) {
         None => probe(machine),
         Some("breaks") if args.len() == 1 => breaks(machine),
-        Some(other) => Err(format!("layer-names-probe [breaks]: unknown argument {other}")),
+        Some(other) => Err(format!(
+            "layer-names-probe [breaks]: unknown argument {other}"
+        )),
     }
 }
 
 /// One boot with the layer service built with `features`; the lines of the console.
-fn boot(machine: &qemu::Machine, features: &'static [&'static str]) -> Result<(qemu::Outcome, u64), String> {
+fn boot(
+    machine: &qemu::Machine,
+    features: &'static [&'static str],
+) -> Result<(qemu::Outcome, u64), String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
     let image = write_boot_image_files(IMAGE, &programs(features), BOOT_PROFILE, &[], Vec::new())?;
-    let disk = Disk(std::env::temp_dir().join(format!(
-        "stafeto-layer-names-{}.img",
-        std::process::id()
-    )));
+    let disk =
+        Disk(std::env::temp_dir().join(format!("stafeto-layer-names-{}.img", std::process::id())));
     crate::data_image::make_layer_volume(&disk.0, DISK_BYTES)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::store(&disk.0, None));
@@ -189,7 +179,10 @@ fn registered(lines: &[String]) -> Result<(), String> {
 pub fn read_lines(lines: &[String]) -> Result<(), String> {
     registered(lines)?;
     let mine = mine(lines);
-    if let Some(bad) = mine.iter().find(|l| l.contains("FAILED") || l.contains("checks failed")) {
+    if let Some(bad) = mine
+        .iter()
+        .find(|l| l.contains("FAILED") || l.contains("checks failed"))
+    {
         return Err(format!("layer-names: {bad}"));
     }
     let want = ok_checks();
@@ -212,7 +205,9 @@ pub fn read_lines(lines: &[String]) -> Result<(), String> {
         match want.get(next) {
             Some(expected) if *expected == name => next += 1,
             Some(expected) => {
-                return Err(format!("the check {name:?} came where {expected:?} was due"));
+                return Err(format!(
+                    "the check {name:?} came where {expected:?} was due"
+                ));
             }
             None => return Err(format!("an extra check line {line:?}")),
         }
@@ -249,7 +244,9 @@ pub fn breaks(machine: &qemu::Machine) -> Result<(), String> {
         let (output, seconds) = boot(machine, features)?;
         let mine = mine(&output.lines);
         if mine.iter().any(|l| *l == &PASSED[PREFIX.len()..]) {
-            return Err(format!("layer-names-probe breaks: {feature} did not fail the probe"));
+            return Err(format!(
+                "layer-names-probe breaks: {feature} did not fail the probe"
+            ));
         }
         let failed: Vec<&&str> = mine.iter().filter(|l| l.contains(" FAILED")).collect();
         let wanted = format!("{check} FAILED");

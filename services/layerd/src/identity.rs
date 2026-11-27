@@ -187,10 +187,13 @@ mod tests {
             Looked::Stands
         );
         assert_eq!(asked.get(), 0);
-        let looked = b.look(|_| 10, || {
-            asked.set(asked.get() + 1);
-            Some(who(10, 3, 10, 0))
-        });
+        let looked = b.look(
+            |_| 10,
+            || {
+                asked.set(asked.get() + 1);
+                Some(who(10, 3, 10, 0))
+            },
+        );
         assert_eq!((looked, asked.get()), (Looked::Renewed, 1));
         assert_eq!(b.bound().unwrap().ids.euid, 0);
         assert_eq!(b.look(|_| 10, || None), Looked::Stands);

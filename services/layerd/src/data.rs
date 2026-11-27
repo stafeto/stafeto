@@ -100,7 +100,8 @@ impl Volume for Data {
     }
 
     fn rmdir(&mut self, path: &[u8]) -> R<()> {
-        self.call(|w| p::path_call(Method::Rmdir, path, w)).map(drop)
+        self.call(|w| p::path_call(Method::Rmdir, path, w))
+            .map(drop)
     }
 
     fn read_dir(&mut self, handle: u32, visit: Visit<'_>) -> R<bool> {

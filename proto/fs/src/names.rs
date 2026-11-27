@@ -656,13 +656,16 @@ mod tests {
         assert_eq!(crate::VERSION, 23);
         assert_eq!(UPPER_INO_TAG, 1 << 62);
         assert_eq!(LOWER_PER_READDIR, 8);
-        assert_eq!(DEVICE, u64::from_be_bytes([0, 0, 0, 0, b'l', b'a', b'y', b'r']));
+        assert_eq!(
+            DEVICE,
+            u64::from_be_bytes([0, 0, 0, 0, b'l', b'a', b'y', b'r'])
+        );
         assert!(is_pass_through(b"/data/x"));
         assert!(is_pass_through(b"/tmp"));
         assert!(!is_pass_through(b"/etc/tmp"));
         assert!(!is_pass_through(b"/database"));
         assert_ne!(COPYING, crate::STALE);
-        assert!(COPYING > crate::REDIRECT && crate::STALE > COPYING);
+        const { assert!(COPYING > crate::REDIRECT && crate::STALE > COPYING) };
     }
 
     #[test]
@@ -676,13 +679,15 @@ mod tests {
     #[test]
     fn open_round_trips_and_refuses_what_it_does_not_take() {
         let mut w = Writer::new();
-        write_open(crate::READ_ONLY | crate::DIRECTORY_ONLY, b"/etc/motd", &mut w).unwrap();
+        write_open(
+            crate::READ_ONLY | crate::DIRECTORY_ONLY,
+            b"/etc/motd",
+            &mut w,
+        )
+        .unwrap();
         let mut r = Reader::new(w.as_bytes());
         assert_eq!(Header::read(&mut r), Ok(NameMethod::Open.header()));
-        assert_eq!(
-            read_open(r),
-            Ok((crate::DIRECTORY_ONLY, &b"/etc/motd"[..]))
-        );
+        assert_eq!(read_open(r), Ok((crate::DIRECTORY_ONLY, &b"/etc/motd"[..])));
         for bad in [3u32, 1 << 20, crate::READ_WRITE | 1 << 9] {
             let mut w = Writer::new();
             w.u32(bad).unwrap();
@@ -700,7 +705,9 @@ mod tests {
             assert_eq!(read_open(Reader::new(w.as_bytes())), Err(Status::BadSize));
         }
         assert!(!open_writes(crate::READ_ONLY));
-        assert!(!open_writes(crate::READ_ONLY | crate::DIRECTORY_ONLY | crate::NO_FOLLOW));
+        assert!(!open_writes(
+            crate::READ_ONLY | crate::DIRECTORY_ONLY | crate::NO_FOLLOW
+        ));
         for flags in [
             crate::WRITE_ONLY,
             crate::READ_WRITE,
@@ -724,7 +731,9 @@ mod tests {
         for answer in [
             OpenAnswer::Redirect(redirect),
             OpenAnswer::Pass,
-            OpenAnswer::Directory { handle: 0x0001_0207 },
+            OpenAnswer::Directory {
+                handle: 0x0001_0207,
+            },
         ] {
             let mut w = Writer::new();
             answer.write(&mut w).unwrap();

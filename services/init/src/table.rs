@@ -4700,7 +4700,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             [LAYER_SERVICE]
         );
-        for name in ["clock", RAM_SERVICE, DATA_SERVICE, PACKAGE_SERVICE, PIPE_SERVICE] {
+        for name in [
+            "clock",
+            RAM_SERVICE,
+            DATA_SERVICE,
+            PACKAGE_SERVICE,
+            PIPE_SERVICE,
+        ] {
             assert_eq!(notary_mark(name) & LAYER, 0, "{name}");
         }
         // Its session with the data service has the label of a native client, and a POSIX record of

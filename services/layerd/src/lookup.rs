@@ -163,13 +163,19 @@ mod tests {
         let mut ix = Box::new(Index::new());
         ix.root.mode = 0o755;
         let etc = ix.insert(0, b"etc", fields(Kind::Dir, 0o755, 0)).unwrap();
-        ix.insert(etc, b"hostname", fields(Kind::File, 0o644, 0)).unwrap();
-        ix.insert(etc, b"motd", fields(Kind::Whiteout, 0, 0)).unwrap();
+        ix.insert(etc, b"hostname", fields(Kind::File, 0o644, 0))
+            .unwrap();
+        ix.insert(etc, b"motd", fields(Kind::Whiteout, 0, 0))
+            .unwrap();
         let private = ix.insert(0, b"priv", fields(Kind::Dir, 0o700, 0)).unwrap();
-        ix.insert(private, b"x", fields(Kind::File, 0o600, 0)).unwrap();
-        let opaque = ix.insert(0, b"opaque", fields(Kind::Dir, 0o755, 0)).unwrap();
+        ix.insert(private, b"x", fields(Kind::File, 0o600, 0))
+            .unwrap();
+        let opaque = ix
+            .insert(0, b"opaque", fields(Kind::Dir, 0o755, 0))
+            .unwrap();
         ix.set_flags(opaque, OPAQUE, 0);
-        ix.insert(opaque, b"inside", fields(Kind::File, 0o644, 0)).unwrap();
+        ix.insert(opaque, b"inside", fields(Kind::File, 0o644, 0))
+            .unwrap();
         ix.insert(0, b"file", fields(Kind::File, 0o644, 0)).unwrap();
         ix
     }
@@ -198,7 +204,10 @@ mod tests {
         assert_eq!(walk(&ix, b"/etc/../bin/ls", 1000), Outcome::Lower);
         assert_eq!(walk(&ix, b"/etc/..", 1000), Outcome::Upper(0));
         assert_eq!(walk(&ix, b"/..", 1000), Outcome::Upper(0));
-        assert_eq!(walk(&ix, b"/etc/../etc/hostname", 1000), walk(&ix, b"/etc/hostname", 1000));
+        assert_eq!(
+            walk(&ix, b"/etc/../etc/hostname", 1000),
+            walk(&ix, b"/etc/hostname", 1000)
+        );
     }
 
     #[test]
@@ -234,16 +243,25 @@ mod tests {
         assert_eq!(walk(&ix, b"/file/", 0), Outcome::NotDir);
         assert_eq!(walk(&ix, b"/file/.", 0), Outcome::NotDir);
         assert!(matches!(walk(&ix, b"/file", 0), Outcome::Upper(_)));
-        assert_eq!(walk(&ix, &[b"/".as_slice(), &[b'a'; 256]].concat(), 0), Outcome::NameTooLong);
+        assert_eq!(
+            walk(&ix, &[b"/".as_slice(), &[b'a'; 256]].concat(), 0),
+            Outcome::NameTooLong
+        );
     }
 
     #[test]
     fn the_names_the_root_passes_through_never_reach_the_index() {
         let mut ix = world();
         ix.insert(0, b"tmp", fields(Kind::Dir, 0o755, 0)).unwrap();
-        assert_eq!(walk(&ix, b"/data/x", 0), Outcome::PassThrough { data: true });
+        assert_eq!(
+            walk(&ix, b"/data/x", 0),
+            Outcome::PassThrough { data: true }
+        );
         assert_eq!(walk(&ix, b"/tmp", 0), Outcome::PassThrough { data: false });
-        assert_eq!(walk(&ix, b"/etc/../run/x", 0), Outcome::PassThrough { data: false });
+        assert_eq!(
+            walk(&ix, b"/etc/../run/x", 0),
+            Outcome::PassThrough { data: false }
+        );
         assert_eq!(walk(&ix, b"/etc/tmp", 0), Outcome::Lower);
     }
 
@@ -254,7 +272,9 @@ mod tests {
         let mut path = std::vec::Vec::new();
         for i in 0..40 {
             let name = std::format!("d{i}");
-            parent = ix.insert(parent, name.as_bytes(), fields(Kind::Dir, 0o755, 0)).unwrap();
+            parent = ix
+                .insert(parent, name.as_bytes(), fields(Kind::Dir, 0o755, 0))
+                .unwrap();
             path.extend_from_slice(b"/");
             path.extend_from_slice(name.as_bytes());
         }
@@ -270,10 +290,15 @@ mod tests {
         let mut ix = Box::new(Index::new());
         let mut parent = 0;
         for _ in 0..253 {
-            parent = ix.insert(parent, b"a", fields(Kind::Dir, 0o755, 0)).unwrap();
+            parent = ix
+                .insert(parent, b"a", fields(Kind::Dir, 0o755, 0))
+                .unwrap();
         }
         let long: std::vec::Vec<u8> = (0..253).flat_map(|_| *b"/a").collect();
         assert_eq!(long.len(), 506);
-        assert_eq!(Walk::new(&long).run(&ix, who(0)), (Outcome::Upper(parent), 16));
+        assert_eq!(
+            Walk::new(&long).run(&ix, who(0)),
+            (Outcome::Upper(parent), 16)
+        );
     }
 }

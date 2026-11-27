@@ -59,7 +59,6 @@ mod cxx_probe;
 mod cyrillic;
 mod data_image;
 mod data_posix;
-mod layer_names;
 mod data_probe;
 mod deqp;
 mod disasm;
@@ -92,6 +91,7 @@ mod input_probe;
 mod jobs;
 mod kernel_size;
 mod keys;
+mod layer_names;
 mod layer_probe;
 mod linux_guest;
 mod log_quiet;
@@ -11394,7 +11394,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("data-steps", || data_posix::steps(&qemu::VIRT)),
         // The names of the layered root over the live layer on the volume, read only.
         job("layer-names-probe", || layer_names::probe(&qemu::VIRT)),
-        job("layer-names-probe breaks", || layer_names::breaks(&qemu::VIRT)),
+        job("layer-names-probe breaks", || {
+            layer_names::breaks(&qemu::VIRT)
+        }),
         job("vi-dialog", vi_dialog::vi_dialog),
         // The window library of C programs against QEMU's screenshots.
         job("posix-window", || posix_window::probe(&qemu::VIRT)),
@@ -14883,6 +14885,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "pkgd",
         "--package",
+        "layerd",
+        "--package",
         "netd",
         "--package",
         "neighbour-learn",
@@ -15098,8 +15102,12 @@ fn ci_lints() -> Result<(), String> {
         "pkg",
         "--package",
         "runas",
+        "--package",
+        "layerd",
+        "--package",
+        "layer-names",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/calibrate,compositor/irq-trace,compositor/late-open,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/calibrate,compositor/irq-trace,compositor/late-open,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash,layerd/steps,layerd/break-layerd-whiteout,layerd/break-layerd-search",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -17960,7 +17968,10 @@ mod entropy_in_images_tests {
             ("pkg_slot::PROGRAMS", &crate::pkg_slot::PROGRAMS),
             ("posix_display::PROGRAMS", &crate::posix_display::PROGRAMS),
             ("data_posix::PROGRAMS", &crate::data_posix::PROGRAMS),
-            ("layer_names::programs", &crate::layer_names::plain_programs()),
+            (
+                "layer_names::programs",
+                Box::leak(crate::layer_names::plain_programs().into_boxed_slice()),
+            ),
             ("posix_window::PROGRAMS", &crate::posix_window::PROGRAMS),
             ("cxx_probe::PROGRAMS", &crate::cxx_probe::PROGRAMS),
             ("gles_pbuffer::PROGRAMS", &crate::gles_pbuffer::PROGRAMS),

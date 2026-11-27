@@ -1181,17 +1181,30 @@ mod tests {
     fn the_layer_service_sits_above_the_posix_clients_and_below_the_data_service() {
         use crate::table::ramfs::{LAYER_NAMES_TABLE, POSIX};
         assert_eq!((LAYERD.priority, LAYERD.ceiling), (34, 34));
-        assert!(POSIX.ceiling < LAYERD.priority && LAYERD.priority < DATAFS.priority);
+        const { assert!(POSIX.ceiling < LAYERD.priority && LAYERD.priority < DATAFS.priority) };
         assert_eq!(LAYERD.connects, &["ramfs", "datafs"]);
-        assert!(!LAYERD.connects.contains(&"posix"), "a POSIX record connects to it");
+        assert!(
+            !LAYERD.connects.contains(&"posix"),
+            "a POSIX record connects to it"
+        );
         assert!(LAYERD.budgets.is_empty());
         assert!(matches!(LAYERD.restart, Restart::Never));
         assert_eq!(LAYERD.broken_after, None);
         // 192 identity copies, a pass or a Vouch copy in flight and about 24 of its own.
-        assert!(LAYERD.handle_limit >= 192 + 1 + 24);
-        let at = |name: &str| LAYER_NAMES_TABLE.iter().position(|r| r.name == name).unwrap();
+        const { assert!(LAYERD.handle_limit >= 192 + 1 + 24) };
+        let at = |name: &str| {
+            LAYER_NAMES_TABLE
+                .iter()
+                .position(|r| r.name == name)
+                .unwrap()
+        };
         assert!(at("datafs") < at("layerd") && at("layerd") < at("layer-names"));
-        assert!(LAYER_NAMES_TABLE[at("layer-names")].waits.iter().any(|w| w.service == "layerd"));
+        assert!(
+            LAYER_NAMES_TABLE[at("layer-names")]
+                .waits
+                .iter()
+                .any(|w| w.service == "layerd")
+        );
         assert!(crate::table::check(LAYER_NAMES_TABLE).is_ok());
     }
 

@@ -10,8 +10,8 @@ use crate::names::{Client, Core, Done, State};
 use crate::scan::Scan;
 use crate::testkit::{FakeLower, FakeVolume};
 use proto_data as d;
-use proto_fs::names::{self as n, OpenAnswer, UPPER_INO_TAG};
 use proto_fs as f;
+use proto_fs::names::{self as n, OpenAnswer, UPPER_INO_TAG};
 use proto_layer as l;
 use proto_wire::{Status, Writer};
 use std::boxed::Box;
@@ -203,7 +203,7 @@ fn a_start_empties_the_work_directory() {
     core.prepare();
     assert_eq!(core.state, State::Starting);
     assert!(core.volume.children(b"/.layers/work").is_empty());
-    assert!(core.volume.nodes.contains_key(&b"/.layers/work".to_vec()));
+    assert!(core.volume.nodes.contains_key(b"/.layers/work".as_slice()));
 }
 
 #[test]
@@ -283,9 +283,15 @@ fn the_index_holds_the_layer_with_its_marks_and_its_opaque_directories() {
     ready(&mut core);
     let ix = &core.index;
     let etc = ix.lookup(0, b"etc").unwrap().0;
-    assert_eq!(ix.lookup(etc, b"motd").unwrap().1.kind, crate::index::Kind::Whiteout);
+    assert_eq!(
+        ix.lookup(etc, b"motd").unwrap().1.kind,
+        crate::index::Kind::Whiteout
+    );
     assert!(ix.lookup(etc, b".wh.motd").is_none());
-    assert_eq!(ix.lookup(etc, b"own.conf").unwrap().1.number, UPPER_INO_TAG | 7);
+    assert_eq!(
+        ix.lookup(etc, b"own.conf").unwrap().1.number,
+        UPPER_INO_TAG | 7
+    );
     let opq = ix.lookup(0, b"opq").unwrap().0;
     assert_ne!(ix.flags(opq) & crate::index::OPAQUE, 0);
     assert!(ix.lookup(opq, b".wh..wh..opq").is_none());
@@ -339,14 +345,22 @@ fn a_file_of_the_layer_of_the_user_is_a_pass_after_the_check_of_the_right_to_rea
     let (reply, pass) = open(&mut core, 1000, f::READ_ONLY, "/etc/own.conf").unwrap();
     assert_eq!(OpenAnswer::read(&reply), Ok(OpenAnswer::Pass));
     assert_eq!(pass.as_deref(), Some(&b"/.layers/00/etc/own.conf"[..]));
-    assert!(open(&mut core, 0, f::READ_ONLY, "/etc/own.conf").unwrap().1.is_some());
+    assert!(
+        open(&mut core, 0, f::READ_ONLY, "/etc/own.conf")
+            .unwrap()
+            .1
+            .is_some()
+    );
     assert_eq!(
         open(&mut core, 1001, f::READ_ONLY, "/etc/own.conf").err(),
         Some(st(f::ACCESS_DENIED))
     );
     // The description opened for the pass is closed again: the service holds none.
     assert_eq!(core.volume.calls_of("export"), 2);
-    assert_eq!(core.volume.calls_of("open") - core.volume.calls_of("close"), 0);
+    assert_eq!(
+        core.volume.calls_of("open") - core.volume.calls_of("close"),
+        0
+    );
     // A file that shadows a lower one.
     let (_, pass) = open(&mut core, 1000, f::READ_ONLY, "/etc/passwd").unwrap();
     assert_eq!(pass.as_deref(), Some(&b"/.layers/00/etc/passwd"[..]));
@@ -363,7 +377,12 @@ fn the_names_a_layer_deleted_or_never_had_are_not_there() {
         Some(st(f::NO_ENTRY))
     );
     // The opaque directory shows its own names only.
-    assert!(open(&mut core, 0, f::READ_ONLY, "/opq/u1").unwrap().1.is_some());
+    assert!(
+        open(&mut core, 0, f::READ_ONLY, "/opq/u1")
+            .unwrap()
+            .1
+            .is_some()
+    );
     assert_eq!(
         open(&mut core, 0, f::READ_ONLY, "/opq/l1").err(),
         Some(st(f::NO_ENTRY))
@@ -373,7 +392,13 @@ fn the_names_a_layer_deleted_or_never_had_are_not_there() {
         Some(st(f::NOT_DIRECTORY))
     );
     assert_eq!(
-        open(&mut core, 0, f::READ_ONLY | f::DIRECTORY_ONLY, "/etc/own.conf").err(),
+        open(
+            &mut core,
+            0,
+            f::READ_ONLY | f::DIRECTORY_ONLY,
+            "/etc/own.conf"
+        )
+        .err(),
         Some(st(f::NOT_DIRECTORY))
     );
 }
@@ -392,7 +417,12 @@ fn each_directory_of_the_layer_is_checked_for_the_right_to_search() {
             "{path}"
         );
     }
-    assert!(open(&mut core, 0, f::READ_ONLY, "/home/secret").unwrap().1.is_some());
+    assert!(
+        open(&mut core, 0, f::READ_ONLY, "/home/secret")
+            .unwrap()
+            .1
+            .is_some()
+    );
     // The directory itself cannot be read either.
     assert_eq!(
         open(&mut core, 1000, f::READ_ONLY | f::DIRECTORY_ONLY, "/home").err(),
@@ -437,7 +467,10 @@ fn a_write_or_a_create_is_a_read_only_file_system() {
     }
     // The names the root passes through are the services' own.
     let (reply, _) = open(&mut core, 0, f::WRITE_ONLY | f::CREATE, "/tmp/x").unwrap();
-    assert!(matches!(OpenAnswer::read(&reply), Ok(OpenAnswer::Redirect(_))));
+    assert!(matches!(
+        OpenAnswer::read(&reply),
+        Ok(OpenAnswer::Redirect(_))
+    ));
     assert_eq!(core.change(), st(f::READ_ONLY_FILESYSTEM));
 }
 
@@ -454,8 +487,13 @@ fn a_merged_directory_lists_the_layer_then_the_lower_set_without_what_the_layer_
     assert!(!names.iter().any(|n| n.starts_with(".wh.")));
     assert!(!names.contains(&"motd".into()));
     assert_eq!(names.iter().filter(|n| *n == "passwd").count(), 1);
-    for expected in [".", "..", "own.conf", "passwd", "hostname", "group", "big00", "big19"] {
-        assert!(names.contains(&expected.to_string()), "{expected}: {names:?}");
+    for expected in [
+        ".", "..", "own.conf", "passwd", "hostname", "group", "big00", "big19",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "{expected}: {names:?}"
+        );
     }
     // The lower directory has 4 names and 20 more: at most 8 of them in one reply.
     assert!(requests >= 4, "{requests}");
@@ -512,7 +550,10 @@ fn an_opaque_directory_lists_only_its_own_names_and_a_lower_only_one_is_no_descr
     let (names, _) = list(&mut core, 40, root);
     let names = sorted(names);
     for expected in ["etc", "home", "opq", "bin"] {
-        assert!(names.contains(&expected.to_string()), "{expected}: {names:?}");
+        assert!(
+            names.contains(&expected.to_string()),
+            "{expected}: {names:?}"
+        );
     }
     assert_eq!(names.iter().filter(|n| *n == "etc").count(), 1);
 }
@@ -592,7 +633,10 @@ fn stat_numbers_come_from_the_service_that_holds_the_name() {
     // A file of the layer: the number the data volume keeps, device 0.
     let own = stat(&mut core, "/etc/own.conf").unwrap();
     assert_eq!(own.inode, UPPER_INO_TAG | 7);
-    assert_eq!((own.device, own.uid, own.permissions, own.size), (0, 1000, 0o640, 9));
+    assert_eq!(
+        (own.device, own.uid, own.permissions, own.size),
+        (0, 1000, 0o640, 9)
+    );
     assert_eq!(own.kind, 2);
     // A lower name: the number the RAM service gives, and none of the top bits.
     let ls = stat(&mut core, "/bin/ls").unwrap();
@@ -604,10 +648,19 @@ fn stat_numbers_come_from_the_service_that_holds_the_name() {
     assert_eq!(stat(&mut core, "/").unwrap().inode, root);
     assert_eq!(stat(&mut core, "/bin").unwrap().inode, 20);
     assert_eq!(stat(&mut core, "/etc/motd").err(), Some(st(f::NO_ENTRY)));
-    assert_eq!(stat(&mut core, "/home/secret").err(), Some(st(f::ACCESS_DENIED)));
+    assert_eq!(
+        stat(&mut core, "/home/secret").err(),
+        Some(st(f::ACCESS_DENIED))
+    );
     assert_eq!(stat(&mut core, "/nothing").err(), Some(st(f::NO_ENTRY)));
-    assert_eq!(stat(&mut core, "/etc/own.conf/").err(), Some(st(f::NOT_DIRECTORY)));
-    assert_eq!(stat(&mut core, "/bin/ls/").err(), Some(st(f::NOT_DIRECTORY)));
+    assert_eq!(
+        stat(&mut core, "/etc/own.conf/").err(),
+        Some(st(f::NOT_DIRECTORY))
+    );
+    assert_eq!(
+        stat(&mut core, "/bin/ls/").err(),
+        Some(st(f::NOT_DIRECTORY))
+    );
     // The times are the data service's, in seconds and nanoseconds.
     assert_eq!(own.modify_time.seconds, 2);
     // A pass-through name is a redirect.
@@ -695,7 +748,9 @@ fn the_volume_statuses_become_the_statuses_of_the_names() {
     v.file("/.layers/00/etc/own.conf", 0o640, 1000, b"x");
     let mut core = world.core(v);
     ready(&mut core);
-    core.volume.nodes.remove(&b"/.layers/00/etc/own.conf".to_vec());
+    core.volume
+        .nodes
+        .remove(b"/.layers/00/etc/own.conf".as_slice());
     assert_eq!(
         open(&mut core, 0, f::READ_ONLY, "/etc/own.conf").err(),
         Some(st(f::NO_ENTRY))

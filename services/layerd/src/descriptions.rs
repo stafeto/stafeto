@@ -84,7 +84,11 @@ impl<D> Table<D> {
         if self.held_by(owner) >= PER_SESSION {
             return Err(Refused::PerSession);
         }
-        let place = self.slots.iter().position(Option::is_none).ok_or(Refused::Full)?;
+        let place = self
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .ok_or(Refused::Full)?;
         // Generation 0 is skipped, so a handle with generation 0 and place 0 is never given.
         self.generations[place] = self.generations[place].wrapping_add(1).max(1);
         self.slots[place] = Some(Description {
