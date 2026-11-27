@@ -280,7 +280,13 @@ impl Pacer {
             return Wake::None;
         }
         let at = self.clock.start(p.max(from));
-        if self.armed == Some(at) {
+        // An armed timer is never moved later: a second change read after
+        // the pending start (a kick that follows a post) would otherwise
+        // re-arm for the next start, drop the expiry of the owed one as
+        // early, and count a skipped period with no late frame. `pending`
+        // only decreases, and every path that needs a fresh arming clears
+        // `armed` first, so an earlier expiry still takes the owed start.
+        if self.armed.is_some_and(|a| a <= at) {
             return Wake::None;
         }
         self.armed = Some(at);
@@ -1351,6 +1357,26 @@ mod tests {
         assert!(p.armed());
         assert_eq!(p.fire(c.start(3)), Fire::Continue);
         assert_eq!(p.counters.wakeups, 2);
+    }
+
+    #[test]
+    fn a_later_change_does_not_move_an_armed_start() {
+        let mut p = pacer();
+        let c = *p.clock();
+        assert_eq!(p.change(c.start(2) - 1, Some(2)), Wake::At(c.start(2)));
+        // A kick read just after the start: the timer stays at the owed start.
+        assert_eq!(p.change(c.start(2) + 5, None), Wake::None);
+        assert_eq!(p.fire(c.start(2) + 50), Fire::Take(2));
+        assert_eq!(p.counters.skipped, 0);
+        assert_eq!(p.counters.wakeups, 1);
+    }
+
+    #[test]
+    fn an_earlier_change_still_arms_earlier() {
+        let mut p = pacer();
+        let c = *p.clock();
+        assert_eq!(p.change(c.start(1) + 1, Some(3)), Wake::At(c.start(3)));
+        assert_eq!(p.change(c.start(1) + 2, Some(2)), Wake::At(c.start(2)));
     }
 
     /// A window of interval 2 waits for its start e while another window's
