@@ -15,6 +15,7 @@ pub mod control;
 pub mod data;
 pub mod drain;
 pub mod fifo;
+pub mod layer;
 pub mod open;
 mod target;
 pub use target::{FifoTarget, RamTarget};
@@ -309,6 +310,17 @@ pub enum Target {
     /// A file or a directory of the data file service by its description (`proto_data`), held in
     /// the process's session with that service; read only until the writing paths exist.
     Data(DataTarget),
+    /// A directory of the layer service by its description (`proto_fs::names`), held in the
+    /// process's session with it: a directory that has a name in a layer of the user, whose
+    /// listing the service merges. The files of the layered root are the other services'.
+    Layer(LayerTarget),
+}
+
+/// An open description of the layer service: its handle in the process's session. Every one is a
+/// directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LayerTarget {
+    pub handle: u32,
 }
 
 /// An open description of the data file service: its handle in the process's session and whether
@@ -412,6 +424,25 @@ static DATA_RELEASE: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomi
 /// the service lives in the ABI layer (`posix_abi::data`); the transport holds no handle of it.
 pub fn set_data_release(release: fn(u32)) {
     DATA_RELEASE.store(release as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// The function that closes a `Target::Layer` description in the layer service when its last
+/// descriptor closes (0 until `set_layer_release`).
+static LAYER_RELEASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Names the function that closes the description `handle` of a `Target::Layer`: the session with
+/// the service lives in the ABI layer (`posix_abi::layer`); the transport holds no handle of it.
+pub fn set_layer_release(release: fn(u32)) {
+    LAYER_RELEASE.store(release as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn release_layer(handle: u32) {
+    let hook = LAYER_RELEASE.load(core::sync::atomic::Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `set_layer_release` stores a value, a `fn(u32)`.
+        let hook: fn(u32) = unsafe { core::mem::transmute::<usize, fn(u32)>(hook) };
+        hook(handle);
+    }
 }
 
 fn release_data(handle: u32) {
@@ -660,6 +691,7 @@ impl Transport {
     pub fn release(&self, target: Option<Target>) -> Result<(), FsError> {
         match target {
             Some(Target::Ram(fd) | Target::Random(fd)) => {
+                layer::unmark_ram(fd.fd());
                 ram_closed(fd);
                 self.close_file(fd)
             }
@@ -686,6 +718,10 @@ impl Transport {
             }
             Some(Target::Data(data)) => {
                 release_data(data.handle);
+                Ok(())
+            }
+            Some(Target::Layer(layer)) => {
+                release_layer(layer.handle);
                 Ok(())
             }
             _ => Ok(()),

@@ -393,6 +393,7 @@ fn unlinkat_once(dirfd: c_int, path: &[u8], flags: c_int) -> Result<(), c_int> {
     if let Some(vol) = crate::data::route(dirfd, path)? {
         return crate::data::unlink(&vol, flags & AT_REMOVEDIR != 0);
     }
+    crate::layer::refuse_write(dirfd, path)?;
     let placed = place(dirfd, path)?;
     let remove_directory = flags & AT_REMOVEDIR != 0;
     check_virtual(
@@ -419,6 +420,7 @@ fn mkdirat_once(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), 
     if let Some(vol) = crate::data::route(dirfd, path)? {
         return crate::data::mkdir(&vol, mode, umask);
     }
+    crate::layer::refuse_write(dirfd, path)?;
     let placed = place(dirfd, path)?;
     // A name of the terminal exists even with a slash after it.
     check_virtual(Named::Mkdir, &placed, None, false)?;
@@ -433,6 +435,7 @@ fn mkfifoat_once(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(),
     if crate::data::route(dirfd, path)?.is_some() {
         return Err(EPERM);
     }
+    crate::layer::refuse_write(dirfd, path)?;
     let placed = place(dirfd, path)?;
     check_virtual(Named::Mkdir, &placed, None, false)?;
     let mut create = request(ChangeOp::Mkfifo, &placed);
@@ -446,6 +449,7 @@ fn mksockat_once(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(),
     if crate::data::route(dirfd, path)?.is_some() {
         return Err(EPERM);
     }
+    crate::layer::refuse_write(dirfd, path)?;
     let placed = place(dirfd, path)?;
     check_virtual(Named::Mkdir, &placed, None, false)?;
     let mut create = request(ChangeOp::Mksock, &placed);
@@ -462,6 +466,21 @@ fn faccessat_once(dirfd: c_int, path: &[u8], mode: c_int, flags: c_int) -> Resul
     if let Some(vol) = crate::data::route(dirfd, path)? {
         return crate::data::access(&vol, mode, effective);
     }
+    if let Some(abs) = crate::layer::route(dirfd, path)? {
+        return crate::layer::access(&abs, mode, effective);
+    }
+    faccessat_ram(dirfd, path, mode, flags)
+}
+
+/// access of a path of the file service: the part of `faccessat_once` after the routes of the
+/// other services (the layer service sends the paths of its lower set here).
+pub(crate) fn faccessat_ram(
+    dirfd: c_int,
+    path: &[u8],
+    mode: c_int,
+    flags: c_int,
+) -> Result<(), c_int> {
+    let effective = flags & AT_EACCESS != 0;
     let placed = place(dirfd, path)?;
     let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
     if let Some((kind, number)) = virtual_leaf(transport, &placed, true)? {
@@ -501,6 +520,8 @@ fn faccessat_once(dirfd: c_int, path: &[u8], mode: c_int, flags: c_int) -> Resul
 /// rename: `renameat2` without flags.
 pub fn renameat(old_dirfd: c_int, old: &[u8], new_dirfd: c_int, new: &[u8]) -> Result<(), c_int> {
     // Both names on the volume, or neither (EXDEV across the mount).
+    crate::layer::refuse_write(old_dirfd, old)?;
+    crate::layer::refuse_write(new_dirfd, new)?;
     if let Some((from, to)) = crate::data::pair(old_dirfd, old, new_dirfd, new)? {
         return crate::data::rename(&from, &to);
     }
@@ -524,6 +545,8 @@ pub fn linkat(
     if flags & !AT_SYMLINK_FOLLOW != 0 {
         return Err(EINVAL);
     }
+    crate::layer::refuse_write(old_dirfd, old)?;
+    crate::layer::refuse_write(new_dirfd, new)?;
     if let Some((from, _)) = crate::data::pair(old_dirfd, old, new_dirfd, new)? {
         return crate::data::link(&from);
     }
@@ -549,6 +572,7 @@ fn symlinkat_once(target: &[u8], new_dirfd: c_int, linkpath: &[u8]) -> Result<()
     if crate::data::route(new_dirfd, linkpath)?.is_some() {
         return Err(EPERM);
     }
+    crate::layer::refuse_write(new_dirfd, linkpath)?;
     let placed = place(new_dirfd, linkpath)?;
     check_virtual(Named::Symlink, &placed, None, false)?;
     let mut symlink = request(ChangeOp::Symlink, &placed);
@@ -566,6 +590,15 @@ fn readlinkat_once(dirfd: c_int, path: &[u8], out: &mut [u8]) -> Result<usize, c
     if let Some(vol) = crate::data::route(dirfd, path)? {
         return crate::data::stat(&vol).and(Err(EINVAL));
     }
+    if let Some(abs) = crate::layer::route(dirfd, path)? {
+        return crate::layer::readlink(&abs, out);
+    }
+    readlinkat_ram(dirfd, path, out)
+}
+
+/// readlink of a path of the file service (the part of `readlinkat_once` after the routes of the
+/// other services).
+pub(crate) fn readlinkat_ram(dirfd: c_int, path: &[u8], out: &mut [u8]) -> Result<usize, c_int> {
     let placed = place(dirfd, path)?;
     // A name of the terminal exists and is no link.
     check_virtual(Named::ReadLink, &placed, None, false)?;
@@ -611,6 +644,14 @@ fn metadata_target(dirfd: c_int, path: &[u8], at_flags: c_int) -> Result<(Placed
     match target {
         target if target.ram_target().is_some() => {
             let target = target.ram_target().ok_or(ENOTDIR)?;
+            // A description the layered root opened is of a lower name: its attributes are not
+            // the program's to change (EROFS). The RAM file service guards the paths; a
+            // description has no path there, so the layer refuses it here.
+            if !cfg!(feature = "break-layer-fd-guard")
+                && posix_fs::layer::is_marked_ram(target.fd(), target.generation())
+            {
+                return Err(EROFS);
+            }
             placed.base = Base::Fd {
                 fd: target.fd(),
                 generation: target.generation(),
@@ -634,10 +675,21 @@ fn metadata_once(
     if at_flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(EINVAL);
     }
+    // A file of a layer of the user that the root passed is read only here like a lower one.
+    if path.is_empty()
+        && !cfg!(feature = "break-layer-fd-guard")
+        && crate::data::data_target(dirfd)
+            .is_some_and(|d| posix_fs::layer::is_marked_data(d.handle))
+    {
+        return Err(EROFS);
+    }
     if (!path.is_empty() || at_flags & AT_EMPTY_PATH != 0)
         && crate::data::change(op, dirfd, path, args)?
     {
         return Ok(());
+    }
+    if !path.is_empty() {
+        crate::layer::refuse_write(dirfd, path)?;
     }
     let (placed, itself) = metadata_target(dirfd, path, at_flags)?;
     if !itself {
@@ -748,25 +800,10 @@ fn fstatat_once(
         if let Some(vol) = crate::data::route(dirfd, path)? {
             return crate::data::stat(&vol);
         }
-        let placed = place(dirfd, path)?;
-        let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
-        if let Some((kind, number)) = transport
-            .terminal_leaf(placed.start_fd(), placed.path(), placed.trailing_slash)
-            .map_err(error)?
-        {
-            return transport
-                .terminal_leaf_information(kind, number)
-                .map_err(error);
+        if let Some(abs) = crate::layer::route(dirfd, path)? {
+            return crate::layer::stat(&abs, flags & AT_SYMLINK_NOFOLLOW == 0);
         }
-        let follow = flags & AT_SYMLINK_NOFOLLOW == 0 || placed.trailing_slash;
-        let info = transport
-            .files()
-            .node_information_from(placed.start_fd(), placed.path(), follow)
-            .map_err(|status| error(FsError::from(status)))?;
-        if placed.trailing_slash && info.kind != 1 {
-            return Err(ENOTDIR);
-        }
-        return Ok(info);
+        return fstatat_ram(dirfd, path, flags);
     }
     if path.is_some() && flags & AT_EMPTY_PATH == 0 {
         return Err(ENOENT);
@@ -784,6 +821,34 @@ fn fstatat_once(
     })
 }
 
+/// The node information of a path of the file service: the part of `fstatat_once` after the routes
+/// of the other services (the layer service sends the paths of its lower set here).
+pub(crate) fn fstatat_ram(
+    dirfd: c_int,
+    path: &[u8],
+    flags: c_int,
+) -> Result<proto_fs::NodeInfo, c_int> {
+    let placed = place(dirfd, path)?;
+    let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
+    if let Some((kind, number)) = transport
+        .terminal_leaf(placed.start_fd(), placed.path(), placed.trailing_slash)
+        .map_err(error)?
+    {
+        return transport
+            .terminal_leaf_information(kind, number)
+            .map_err(error);
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0 || placed.trailing_slash;
+    let info = transport
+        .files()
+        .node_information_from(placed.start_fd(), placed.path(), follow)
+        .map_err(|status| error(FsError::from(status)))?;
+    if placed.trailing_slash && info.kind != 1 {
+        return Err(ENOTDIR);
+    }
+    Ok(info)
+}
+
 /// The canonical path of the directory `path` names, against the current
 /// directory: the service resolves the links, `.` and `..`, and checks that
 /// the caller may search it. The path of a name of the terminal is ENOTDIR.
@@ -791,6 +856,18 @@ fn directory_path_once(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usiz
     if let Some(vol) = crate::data::route(AT_FDCWD, path)? {
         return crate::data::directory(&vol, out);
     }
+    if let Some(abs) = crate::layer::route(AT_FDCWD, path)? {
+        return crate::layer::directory(&abs, out);
+    }
+    directory_path_ram(path, out)
+}
+
+/// The canonical path of a directory of the file service (the part of `directory_path_once` after
+/// the routes of the other services).
+pub(crate) fn directory_path_ram(
+    path: &[u8],
+    out: &mut [u8; MAX_PATH + 1],
+) -> Result<usize, c_int> {
     let placed = place(AT_FDCWD, path)?;
     let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
     if virtual_leaf(transport, &placed, false)?.is_some() {
@@ -810,6 +887,9 @@ fn directory_path_once(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usiz
 pub fn descriptor_path(target: Target, out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
     if let Target::Data(data) = target {
         return crate::data::descriptor_path(data, out);
+    }
+    if let Target::Layer(layer) = target {
+        return crate::layer::descriptor_path(layer, out);
     }
     let base = match target {
         target if target.ram_target().is_some() => {
@@ -866,6 +946,15 @@ fn realpath_once(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_i
     if let Some(vol) = crate::data::route(AT_FDCWD, path)? {
         return crate::data::realpath(&vol, out);
     }
+    if let Some(abs) = crate::layer::route(AT_FDCWD, path)? {
+        return crate::layer::realpath(&abs, out);
+    }
+    realpath_ram(path, out)
+}
+
+/// The canonical path of a path of the file service (the part of `realpath_once` after the routes
+/// of the other services).
+pub(crate) fn realpath_ram(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
     let placed = place(AT_FDCWD, path)?;
     let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
     // A slash after a name of the terminal makes ENOTDIR.
@@ -949,6 +1038,18 @@ fn statvfs_once(path: &[u8]) -> Result<Statvfs, c_int> {
         crate::data::stat(&vol)?;
         return crate::data::statvfs();
     }
+    // A path of the layered root exists when the layer service says so; the file system is the
+    // file service's own (the lower set is its, and the layer of the user has no block counts of
+    // its own to give a program that asks `df`).
+    if let Some(abs) = crate::layer::route(AT_FDCWD, path)? {
+        crate::layer::stat(&abs, true)?;
+        return statvfs_ram(b"/");
+    }
+    statvfs_ram(path)
+}
+
+/// The file system of a path of the file service.
+fn statvfs_ram(path: &[u8]) -> Result<Statvfs, c_int> {
     let placed = place(AT_FDCWD, path)?;
     let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
     if virtual_leaf(transport, &placed, true)?.is_some() {
@@ -970,6 +1071,7 @@ pub fn fstatvfs(fd: c_int) -> Result<Statvfs, c_int> {
             }
         }
         Target::Data(_) => return crate::data::statvfs(),
+        Target::Layer(_) => return Ok(NO_FILESYSTEM),
         _ => return Ok(NO_FILESYSTEM),
     };
     let placed = Placed {

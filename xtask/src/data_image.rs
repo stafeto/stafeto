@@ -280,6 +280,84 @@ pub const LAYER_VOLUME_ENTRIES: &[LayerEntry] = &[
     LayerEntry::file("/.layers/00/private/f", 0o644, 0, 0, b"private\n"),
 ];
 
+/// The volume of the probe of the POSIX layer on the layered root: the entries of the names probe,
+/// and, under `/.layers/00`, `bin/.wh.layer-posix-gone` (a mark of deletion of a lower program) with
+/// `bin/layer-upper-prog` (a program of the layer, which no one runs), `many` (the marks of
+/// deletion of `f00` to `f15` of twenty lower files, and a file of its own), and `etc/layer-world`
+/// (0644 for everyone, to read as another user).
+pub const LAYER_POSIX_VOLUME_ENTRIES: &[LayerEntry] = &[
+    LayerEntry::dir("/.layers", 0o700, 0, 0),
+    LayerEntry::dir("/.layers/00", 0o755, 0, 0),
+    LayerEntry::dir("/.layers/work", 0o700, 0, 0),
+    LayerEntry::file(
+        "/.layers/COMPOSITION",
+        0o600,
+        0,
+        0,
+        b"STAFLAYR 1\nnext 01\nino 8\nlower -\nlayer 00 live unsealed - -\n",
+    ),
+    LayerEntry::dir("/.layers/00/bin", 0o755, 0, 0),
+    LayerEntry::file("/.layers/00/bin/.wh.layer-posix-gone", 0o644, 0, 0, b""),
+    LayerEntry::file(
+        "/.layers/00/bin/layer-upper-prog",
+        0o755,
+        0,
+        0,
+        b"a program of the layer\n",
+    ),
+    LayerEntry::dir("/.layers/00/etc", 0o755, 0, 0),
+    LayerEntry::file("/.layers/00/etc/.wh.layer-hidden", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/etc/layer-note", 0o644, 0, 0, b"layer note\n"),
+    LayerEntry::file(
+        "/.layers/00/etc/layer-own",
+        0o640,
+        1000,
+        1000,
+        LAYER_OWN_BYTES,
+    )
+    .numbered(UPPER_INO_TAG | 5),
+    LayerEntry::file("/.layers/00/etc/layer-secret", 0o600, 0, 0, b"secret\n"),
+    LayerEntry::file(
+        "/.layers/00/etc/layer-world",
+        0o644,
+        0,
+        0,
+        b"for everyone\n",
+    ),
+    LayerEntry::dir("/.layers/00/lower", 0o755, 0, 0),
+    LayerEntry::file("/.layers/00/lower/.wh.hidden", 0o644, 0, 0, b""),
+    LayerEntry::file(
+        "/.layers/00/lower/shadowed",
+        0o644,
+        0,
+        0,
+        LAYER_SHADOW_BYTES,
+    ),
+    LayerEntry::dir("/.layers/00/lowdir", 0o755, 0, 0),
+    LayerEntry::file("/.layers/00/lowdir/.wh..wh..opq", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/lowdir/u1", 0o644, 0, 0, b"u1\n"),
+    LayerEntry::dir("/.layers/00/many", 0o755, 0, 0),
+    LayerEntry::file("/.layers/00/many/.wh.f00", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f01", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f02", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f03", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f04", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f05", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f06", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f07", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f08", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f09", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f10", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f11", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f12", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f13", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f14", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/.wh.f15", 0o644, 0, 0, b""),
+    LayerEntry::file("/.layers/00/many/own", 0o644, 0, 0, b"own of many\n"),
+    LayerEntry::dir("/.layers/00/private", 0o700, 0, 0),
+    LayerEntry::file("/.layers/00/private/f", 0o644, 0, 0, b"private\n"),
+];
+
 /// The bytes of `/etc/layer-own` of the layer and of `/lower/shadowed`, which the probe reads.
 pub const LAYER_OWN_BYTES: &[u8] = b"owned bytes of the layer\n";
 pub const LAYER_SHADOW_BYTES: &[u8] = b"upper shadow\n";
@@ -336,6 +414,15 @@ impl LayerEntry {
 /// service converts nothing. The numbers of the entries are their places in the list plus 2, but the
 /// ones the list names, and the counter starts above all of them.
 pub fn make_layer_volume(path: &Path, size: u64) -> Result<(), String> {
+    make_layer_volume_of(path, size, LAYER_VOLUME_ENTRIES)
+}
+
+/// The volume of the probe of the POSIX layer (`LAYER_POSIX_VOLUME_ENTRIES`).
+pub fn make_layer_posix_volume(path: &Path, size: u64) -> Result<(), String> {
+    make_layer_volume_of(path, size, LAYER_POSIX_VOLUME_ENTRIES)
+}
+
+fn make_layer_volume_of(path: &Path, size: u64, entries: &[LayerEntry]) -> Result<(), String> {
     use datafs::attr::{ATTR_COUNTER_TYPE, ATTR_FORMAT_TYPE, ATTR_TYPE, Attr, VOLUME_FORMAT};
     make(path, size)?;
     let mut state = Box::new(Storage::new());
@@ -353,7 +440,7 @@ pub fn make_layer_volume(path: &Path, size: u64) -> Result<(), String> {
         }
         .to_bytes()
     };
-    for (i, entry) in LAYER_VOLUME_ENTRIES.iter().enumerate() {
+    for (i, entry) in entries.iter().enumerate() {
         let ino = if entry.ino != 0 {
             entry.ino
         } else {
@@ -388,7 +475,7 @@ pub fn make_layer_volume(path: &Path, size: u64) -> Result<(), String> {
         .map_err(|e| format!("/: setattr {e:?}"))?;
     fs.setattr(b"/", ATTR_FORMAT_TYPE, &VOLUME_FORMAT.to_le_bytes())
         .map_err(|e| format!("/: format mark {e:?}"))?;
-    let counter = LAYER_VOLUME_ENTRIES.len() as u64 + 100;
+    let counter = entries.len() as u64 + 100;
     fs.setattr(b"/", ATTR_COUNTER_TYPE, &counter.to_le_bytes())
         .map_err(|e| format!("/: counter {e:?}"))?;
     fs.unmount()
@@ -622,6 +709,40 @@ mod tests {
 
     fn temp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("stafeto-data-image-{}-{name}", std::process::id()))
+    }
+
+    /// The volumes of the probes of the layered root list each directory before what lies in it, no
+    /// path twice, and a number of a file once.
+    #[test]
+    fn the_layer_volumes_are_lists_of_directories_before_their_entries() {
+        for entries in [LAYER_VOLUME_ENTRIES, LAYER_POSIX_VOLUME_ENTRIES] {
+            let mut seen: Vec<&str> = Vec::new();
+            let mut numbers = Vec::new();
+            for entry in entries {
+                assert!(!seen.contains(&entry.path), "{} twice", entry.path);
+                let parent = entry.path.rsplit_once('/').map_or("", |(p, _)| p);
+                assert!(
+                    parent.is_empty() || seen.contains(&parent),
+                    "{}",
+                    entry.path
+                );
+                seen.push(entry.path);
+                if entry.ino != 0 {
+                    assert!(!numbers.contains(&entry.ino), "{}", entry.path);
+                    numbers.push(entry.ino);
+                }
+            }
+        }
+        // The probe of the POSIX layer has the layer's marks of the lower names it lists.
+        for name in ["f00", "f07", "f15"] {
+            let path = format!("/.layers/00/many/.wh.{name}");
+            assert!(LAYER_POSIX_VOLUME_ENTRIES.iter().any(|e| e.path == path));
+        }
+        assert!(
+            !LAYER_POSIX_VOLUME_ENTRIES
+                .iter()
+                .any(|e| e.path.ends_with(".wh.f16"))
+        );
     }
 
     #[test]

@@ -66,12 +66,21 @@ pub const RAM_SERVICE: &str = "ramfs";
 /// service: the name below the root that the volume owns (`proto_fs::RAM_MOUNT_ARG` and a space).
 /// With no data service the service redirects nothing.
 const RAM_MOUNT_FIRST: &[u8] = b"mount=data ";
+/// The same for a table that has the layer service too: the root is layered, and the RAM file
+/// service refuses the writes of a POSIX session outside the pass-through names
+/// (`proto_fs::RAM_LAYERED_ARG`).
+const RAM_LAYERED_FIRST: &[u8] = b"mount=data layered ";
 
 /// The arguments that go before those of the record `name` of `table`: the mount of the data
-/// volume for the RAM file service of a table that has the data service, nothing for any other.
+/// volume for the RAM file service of a table that has the data service (and the word `layered`
+/// when it has the layer service), nothing for any other.
 pub fn first_args(table: &[Record], name: &str) -> &'static [u8] {
     if name == RAM_SERVICE && table.iter().any(|record| record.name == DATA_SERVICE) {
-        RAM_MOUNT_FIRST
+        if table.iter().any(|record| record.name == LAYER_SERVICE) {
+            RAM_LAYERED_FIRST
+        } else {
+            RAM_MOUNT_FIRST
+        }
     } else {
         &[]
     }
@@ -1685,6 +1694,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-display") as usize
     + cfg!(feature = "table-data-posix") as usize
     + cfg!(feature = "table-layer-names") as usize
+    + cfg!(feature = "table-layer-posix") as usize
+    + cfg!(feature = "table-layer-ash") as usize
     + cfg!(feature = "table-posix-window") as usize
     + cfg!(feature = "table-wfc") as usize
     + cfg!(feature = "table-wfc-steps") as usize
@@ -1803,6 +1814,8 @@ const _: () = assert!(
     feature = "table-posix-display",
     feature = "table-data-posix",
     feature = "table-layer-names",
+    feature = "table-layer-posix",
+    feature = "table-layer-ash",
     feature = "table-posix-window",
     feature = "table-wfc",
     feature = "table-wfc-steps",
@@ -2028,6 +2041,10 @@ pub const TABLE: &[Record] = ramfs::POSIX_DISPLAY_TABLE;
 pub const TABLE: &[Record] = ramfs::DATA_POSIX_TABLE;
 #[cfg(feature = "table-layer-names")]
 pub const TABLE: &[Record] = ramfs::LAYER_NAMES_TABLE;
+#[cfg(feature = "table-layer-posix")]
+pub const TABLE: &[Record] = ramfs::LAYER_POSIX_TABLE;
+#[cfg(feature = "table-layer-ash")]
+pub const TABLE: &[Record] = ramfs::LAYER_ASH_TABLE;
 #[cfg(feature = "table-posix-window")]
 pub const TABLE: &[Record] = window::TABLE;
 #[cfg(feature = "table-wfc")]
@@ -2138,6 +2155,8 @@ pub const ALL_TABLES: &[&[Record]] = &[
     ramfs::POSIX_DISPLAY_TABLE,
     ramfs::DATA_POSIX_TABLE,
     ramfs::LAYER_NAMES_TABLE,
+    ramfs::LAYER_POSIX_TABLE,
+    ramfs::LAYER_ASH_TABLE,
     ramfs::DISPLAY_TABLE,
     ramfs::LOADER_CHANNELS_TABLE,
     ramfs::POSIX_POLL_TABLE,
@@ -2181,6 +2200,27 @@ mod tests {
             }
         }
         assert!(with > 0);
+    }
+
+    /// The word `layered` goes with the mount in a table that has the layer service, and only there.
+    #[test]
+    fn the_layered_argument_goes_with_the_layer_service() {
+        assert_eq!(
+            RAM_LAYERED_FIRST,
+            [RAM_MOUNT_FIRST, proto_fs::RAM_LAYERED_ARG, b" "]
+                .concat()
+                .as_slice()
+        );
+        let mut layered = 0;
+        for table in all_tables() {
+            let has_layer = table.iter().any(|record| record.name == LAYER_SERVICE);
+            let first = first_args(table, RAM_SERVICE);
+            assert_eq!(first == RAM_LAYERED_FIRST, has_layer, "{first:?}");
+            // The layer service needs the data service: a layered root has the mount.
+            assert!(!has_layer || first.starts_with(RAM_MOUNT_FIRST.trim_ascii_end()));
+            layered += usize::from(has_layer);
+        }
+        assert!(layered > 0);
     }
 
     /// The CPU a thread is left on when the loader is asked nothing for it, and the CPU asked for the

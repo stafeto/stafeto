@@ -2594,3 +2594,229 @@ fn the_mount_name_is_one_component() {
     assert!(r.storage.state.set_mount(b"vol"));
     assert_eq!(r.storage.state.mount(), Some(&b"vol"[..]));
 }
+
+/// The walk of `path` with `intent` as a session of a POSIX process makes it in a layered image
+/// (`guarded`) or as the boot profile does: the progress, or the code that refused it.
+fn guarded_walk(
+    r: &mut Ram<'_>,
+    path: &[u8],
+    intent: crate::resolve::Intent,
+    guarded: bool,
+    metadata_writes: bool,
+) -> Result<Progress, u32> {
+    let mut resolver = Resolve::with_intent(&mut r.storage, path, ROOT, ADMIN, intent)?;
+    if guarded {
+        resolver.guard_layered(metadata_writes);
+    }
+    let result = intent_ready(r, &mut resolver, ADMIN).map(|(progress, _)| progress);
+    resolver.release(&mut r.storage);
+    result
+}
+
+/// A layered root: a walk of a POSIX session that would write a name outside the pass-through
+/// names is refused with READ_ONLY_FILESYSTEM when it ends; reads, the writes below `/tmp`, `/run`,
+/// `/data`, `/dev` and `/proc`, and every walk of the boot profile are as they were.
+#[test]
+fn a_layered_root_refuses_the_writes_outside_the_pass_through_names() {
+    use crate::resolve::Intent;
+    use proto_fs::{CHANGES, CREATE, READ_ONLY, READ_WRITE, TRUNCATE, WRITE_ONLY};
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    // The directories /etc and /tmp are the first names of the file service in a test.
+    let etc = r.storage.lookup(ROOT, b"etc").unwrap();
+    create(&mut r, etc, b"passwd", REG, 0o644);
+    let tmp = r.storage.lookup(ROOT, b"tmp").unwrap();
+    let tmp_a = create(&mut r, tmp, b"a", DIR, 0o777);
+    create(&mut r, tmp_a, b"f", REG, 0o644);
+    let tmp_link = create(&mut r, tmp, b"link", SYMLINK, 0o777);
+    r.storage
+        .write(tmp_link, ROOT_ACCOUNT, 0, b"/etc/passwd")
+        .unwrap();
+    r.storage.state.set_layered(true);
+    let refused = Err(proto_fs::READ_ONLY_FILESYSTEM);
+    let open = |flags| Intent::Open { flags };
+    let found = |p: Result<Progress, u32>| matches!(p, Ok(Progress::Found(_)));
+    let missing = |p: Result<Progress, u32>| matches!(p, Ok(Progress::Missing(_)));
+    // Reads are never refused.
+    for path in [&b"/etc/passwd"[..], b"/etc", b"/", b"/tmp/a/f"] {
+        assert!(
+            found(guarded_walk(&mut r, path, open(READ_ONLY), true, false)),
+            "{path:?}"
+        );
+    }
+    assert!(found(guarded_walk(
+        &mut r,
+        b"/etc/passwd",
+        Intent::Lookup { follow: true },
+        true,
+        false
+    )));
+    // A write open of a file outside the names: refused, whatever way it writes.
+    for flags in [
+        WRITE_ONLY,
+        READ_WRITE,
+        READ_ONLY | TRUNCATE,
+        READ_ONLY | CHANGES,
+    ] {
+        assert_eq!(
+            guarded_walk(&mut r, b"/etc/passwd", open(flags), true, false),
+            refused,
+            "{flags}"
+        );
+    }
+    // A create outside the names is refused, one below /tmp is not.
+    assert_eq!(
+        guarded_walk(&mut r, b"/etc/new", open(CREATE | WRITE_ONLY), true, false),
+        refused
+    );
+    assert!(missing(guarded_walk(
+        &mut r,
+        b"/tmp/new",
+        open(CREATE | WRITE_ONLY),
+        true,
+        false
+    )));
+    assert!(missing(guarded_walk(
+        &mut r,
+        b"/tmp/a/new",
+        open(CREATE | WRITE_ONLY),
+        true,
+        false
+    )));
+    assert!(found(guarded_walk(
+        &mut r,
+        b"/tmp/a/f",
+        open(READ_WRITE | TRUNCATE),
+        true,
+        false
+    )));
+    // A create of a name that exists, with a read only access, writes nothing.
+    assert!(found(guarded_walk(
+        &mut r,
+        b"/etc/passwd",
+        open(CREATE | READ_ONLY),
+        true,
+        false
+    )));
+    // A link below /tmp that leads out is no way to write: the file it names is refused.
+    assert_eq!(
+        guarded_walk(&mut r, b"/tmp/link", open(WRITE_ONLY), true, false),
+        refused
+    );
+    // The creation of names, the removal and the rename, the links.
+    assert_eq!(
+        guarded_walk(&mut r, b"/etc/sub", Intent::DirectoryCreate, true, false),
+        refused
+    );
+    assert!(missing(guarded_walk(
+        &mut r,
+        b"/tmp/sub",
+        Intent::DirectoryCreate,
+        true,
+        false
+    )));
+    for intent in [Intent::FifoCreate, Intent::SymbolicLinkCreate] {
+        assert_eq!(
+            guarded_walk(&mut r, b"/etc/x", intent, true, false),
+            refused
+        );
+        assert!(missing(guarded_walk(
+            &mut r, b"/tmp/x", intent, true, false
+        )));
+    }
+    let victim = Intent::Namespace {
+        path: crate::namespace::NamespacePath::Victim,
+    };
+    assert_eq!(
+        guarded_walk(&mut r, b"/etc/passwd", victim, true, false),
+        refused
+    );
+    assert!(found(guarded_walk(
+        &mut r,
+        b"/tmp/a/f",
+        victim,
+        true,
+        false
+    )));
+    let destination = Intent::Namespace {
+        path: crate::namespace::NamespacePath::Destination,
+    };
+    assert_eq!(
+        guarded_walk(&mut r, b"/etc/moved", destination, true, false),
+        refused
+    );
+    assert!(missing(guarded_walk(
+        &mut r,
+        b"/tmp/moved",
+        destination,
+        true,
+        false
+    )));
+    // A change of attributes is refused, a check of access (the same intent) is not.
+    let metadata = Intent::Metadata {
+        path: crate::metadata::MetadataPath {
+            follow: true,
+            real: false,
+        },
+    };
+    assert_eq!(
+        guarded_walk(&mut r, b"/etc/passwd", metadata, true, true),
+        refused
+    );
+    assert!(found(guarded_walk(
+        &mut r,
+        b"/etc/passwd",
+        metadata,
+        true,
+        false
+    )));
+    assert!(found(guarded_walk(
+        &mut r,
+        b"/tmp/a/f",
+        metadata,
+        true,
+        true
+    )));
+    // The root takes the creation of a pass-through directory and no other change.
+    assert!(missing(guarded_walk(
+        &mut r,
+        b"/run",
+        Intent::DirectoryCreate,
+        true,
+        false
+    )));
+    assert_eq!(
+        guarded_walk(&mut r, b"/other", Intent::DirectoryCreate, true, false),
+        refused
+    );
+    assert_eq!(guarded_walk(&mut r, b"/", metadata, true, true), refused);
+    // The boot profile writes as it did, and an image whose root is not layered has no guard.
+    assert!(found(guarded_walk(
+        &mut r,
+        b"/etc/passwd",
+        open(WRITE_ONLY),
+        false,
+        false
+    )));
+    assert!(missing(guarded_walk(
+        &mut r,
+        b"/etc/new",
+        open(CREATE | WRITE_ONLY),
+        false,
+        false
+    )));
+    r.storage.state.set_layered(false);
+    assert!(found(guarded_walk(
+        &mut r,
+        b"/etc/passwd",
+        open(WRITE_ONLY),
+        true,
+        false
+    )));
+    assert!(missing(guarded_walk(
+        &mut r,
+        b"/etc/new",
+        Intent::DirectoryCreate,
+        true,
+        false
+    )));
+}

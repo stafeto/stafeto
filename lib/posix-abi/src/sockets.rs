@@ -1174,7 +1174,7 @@ fn install(
                 .map_err(|_| EIO);
             let adopted = match (pass, kind) {
                 (Ok(pass), KIND_NET) => crate::net::adopt(pass, kept),
-                (Ok(pass), KIND_DATA) => crate::data::adopt(pass, cloexec),
+                (Ok(pass), KIND_DATA) => crate::data::adopt(pass, cloexec, false),
                 (Ok(pass), _) => {
                     drop(pass);
                     return Err(EBADF);

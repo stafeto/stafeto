@@ -169,8 +169,8 @@ struct Work {
 }
 
 /// The values of the sessions a fork gives the child's loader (Handles),
-/// by proto_loader::Slot: Files, Clock, Driver, Pipes, Terminal, Entropy, Display, Net, Packages
-/// and Data; 0 for none.
+/// by proto_loader::Slot: Files, Clock, Driver, Pipes, Terminal, Entropy, Display, Net, Packages,
+/// Data and Layer; 0 for none.
 #[derive(Clone, Copy, Default)]
 pub struct Sessions {
     pub files: u64,
@@ -183,6 +183,7 @@ pub struct Sessions {
     pub net: u64,
     pub packages: u64,
     pub data: u64,
+    pub layer: u64,
 }
 
 impl Sessions {
@@ -202,6 +203,7 @@ impl Sessions {
             (Slot::Net, self.net),
             (Slot::Packages, self.packages),
             (Slot::Data, self.data),
+            (Slot::Layer, self.layer),
         ] {
             if raw != 0 {
                 mask |= slot.bit();
@@ -227,6 +229,7 @@ impl Sessions {
             self.net,
             self.packages,
             self.data,
+            self.layer,
         ] {
             if raw != 0 {
                 drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
@@ -295,6 +298,7 @@ fn give(c: &Handle<Channel>, sessions: Sessions) -> Result<(), i32> {
         (Slot::Net, session(sessions.net)),
         (Slot::Packages, session(sessions.packages)),
         (Slot::Data, session(sessions.data)),
+        (Slot::Layer, session(sessions.layer)),
     ];
     match crate::process::give_sessions(c, given) {
         0 => Ok(()),
@@ -847,6 +851,10 @@ fn sessions() -> Result<Sessions, i32> {
         if let Some(clone) = crate::data::clone_for_fork()? {
             out.data = clone.into_raw().0;
         }
+        // The same for the directories of the layer service, whose descriptions the child shares.
+        if let Some(clone) = crate::layer::clone_for_fork()? {
+            out.layer = clone.into_raw().0;
+        }
         Ok(())
     })();
     match made {
@@ -1020,6 +1028,9 @@ fn child() -> Result<(), &'static str> {
         // The child's session with the data file service is the clone the parent made when it
         // held descriptions of `/data`; none otherwise.
         crate::data::after_fork(handle(raw(Slot::Data)));
+        // The child's session with the layer service is the clone the parent made when it held
+        // directory descriptions of the layered root; none otherwise.
+        crate::layer::after_fork(handle(raw(Slot::Layer)));
         // The instances of epoll are the parent's, whose set the parent's
         // session holds: the child's calls on them are EBADF.
         crate::epoll::after_fork();

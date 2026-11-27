@@ -18,6 +18,11 @@ pub fn synchronize(number: i32) -> Result<(), i32> {
             if let Target::Data(data) = target {
                 return crate::data::fsync(data);
             }
+            // A directory of the layer service, like a directory of the file service, has nothing
+            // to make durable.
+            if let Target::Layer(_) = target {
+                return Ok(());
+            }
             let Target::Ram(exact) = target else {
                 return Err(EINVAL);
             };

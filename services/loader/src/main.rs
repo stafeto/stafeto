@@ -1093,12 +1093,15 @@ fn loader_root(session: &Handle<Channel>, root: u32) -> Result<Option<Handle<Cha
 
 /// The slots whose sessions a set-ID program takes only from their service,
 /// each with the root the process service keeps for it.
-const VERIFIED: [(Slot, u32); 5] = [
+const VERIFIED: [(Slot, u32); 6] = [
     (Slot::Pipes, proto_process::ROOT_PIPES),
     (Slot::Net, proto_process::ROOT_NET),
     (Slot::Entropy, proto_process::ROOT_ENTROPY),
     (Slot::Data, proto_process::ROOT_DATA),
     (Slot::Packages, proto_process::ROOT_PKG),
+    // The layer session is verified before any program reads the slot, so that a parent cannot
+    // hand a set-ID child a channel of its own as the names of the root.
+    (Slot::Layer, proto_process::ROOT_LAYER),
 ];
 
 /// The roots of `VERIFIED`, in its order.
@@ -1135,13 +1138,17 @@ fn roots_before_ready(
 /// are dead targets in its layer). Nothing cures it: a session the loader made would carry no
 /// identity of the child's own, and the child's layer asks the root of the service for one that
 /// does.
+///
+/// The same holds for a session of the layer service: its descriptions are dead targets in the
+/// child's layer, and the child takes a session of its own at its first path of the root.
 fn forget_dead_data(given: &mut [Option<Handle<Channel>>; SLOTS]) {
-    let slot = Slot::Data as usize;
-    if given[slot]
-        .as_ref()
-        .is_some_and(|session| !is_open(session))
-    {
-        given[slot] = None;
+    for slot in [Slot::Data as usize, Slot::Layer as usize] {
+        if given[slot]
+            .as_ref()
+            .is_some_and(|session| !is_open(session))
+        {
+            given[slot] = None;
+        }
     }
 }
 
@@ -1226,6 +1233,7 @@ fn verify_header(slot: Slot) -> [u8; 8] {
         Slot::Entropy => proto_entropy::Method::VerifySession.header().bytes(),
         Slot::Data => proto_data::Method::VerifySession.header().bytes(),
         Slot::Packages => proto_pkg::Method::VerifySession.header().bytes(),
+        Slot::Layer => proto_fs::names::NameMethod::VerifySession.header().bytes(),
         _ => proto_pipe::Method::VerifySession.header().bytes(),
     }
 }
@@ -1269,6 +1277,27 @@ fn verify_data(
         .map_err(|refused| code(refused.error))?;
     let mut buffer = [0; MESSAGE_MAX];
     match data_slot::verdict(Reader::new(reply.bytes(&mut buffer)).u32().ok()) {
+        data_slot::Verdict::Keep => reply.handles.take::<Channel>(0).map(Some).map_err(code),
+        data_slot::Verdict::Empty => Ok(None),
+        data_slot::Verdict::Refuse => Err(pl::IO),
+    }
+}
+
+/// A set-ID program's session in the slot Layer: as `verify_data`, with BAD_FD for the channel that
+/// is none of the service's sessions. The root unbinds the session it returns, and the program
+/// binds it again with its own identity (BIND) before the first request that needs one.
+fn verify_layer(
+    root: Option<&Handle<Channel>>,
+    offered: Handle<Channel>,
+) -> Result<Option<Handle<Channel>>, u32> {
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let request = verify_header(Slot::Layer);
+    let mut reply = sys::send_handles(root, &request, [offered.erase()])
+        .map_err(|refused| code(refused.error))?;
+    let mut buffer = [0; MESSAGE_MAX];
+    match data_slot::verdict_layer(Reader::new(reply.bytes(&mut buffer)).u32().ok()) {
         data_slot::Verdict::Keep => reply.handles.take::<Channel>(0).map(Some).map_err(code),
         data_slot::Verdict::Empty => Ok(None),
         data_slot::Verdict::Refuse => Err(pl::IO),
@@ -2388,6 +2417,9 @@ fn finish(
     // verify is refused. Any other program keeps what its parent gave.
     if secure {
         for (root, &(slot, _)) in roots.iter().zip(&VERIFIED) {
+            if slot == Slot::Layer && cfg!(feature = "break-layer-unverified") {
+                continue;
+            }
             if let Some(offered) = given[slot as usize].take() {
                 // The package session is optional (posix-crt takes none): with no root (the
                 // service is not up yet, or its registration failed) and for any error of the
@@ -2402,6 +2434,13 @@ fn finish(
                 }
                 if slot == Slot::Data {
                     match verify_data(root.as_ref(), offered) {
+                        Ok(session) => given[slot as usize] = session,
+                        Err(_) => return GAVE_UP,
+                    }
+                    continue;
+                }
+                if slot == Slot::Layer {
+                    match verify_layer(root.as_ref(), offered) {
                         Ok(session) => given[slot as usize] = session,
                         Err(_) => return GAVE_UP,
                     }

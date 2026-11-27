@@ -617,6 +617,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "layer-posix-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "posix-crt",
+]
+
+[[package]]
 name = "layer-probe"
 version = "0.1.0"
 dependencies = [
@@ -1053,6 +1061,7 @@ dependencies = [
  "posix-path",
  "proto-data",
  "proto-fs",
+ "proto-layer",
  "proto-net",
  "proto-pipe",
  "proto-tty",

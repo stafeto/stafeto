@@ -110,6 +110,9 @@ pub const fn stack_size(asked: u64) -> u64 {
 }
 /// The start area (`Start`), which the loader makes and fills.
 pub const START_AREA: u64 = 0xF000_0000;
+/// The bit of the word of `Names::File` that marks a description the layered root opened
+/// (`posix_fs::layer::MARK_WORD`, which `posix-crt` holds equal to this).
+pub const FILE_LAYERED: u32 = 1 << 30;
 /// The most bytes of the start area: the area itself and the copy of the
 /// block the loader made it from.
 pub const AREA_MAX: u64 = 0x4_0000;
@@ -137,7 +140,11 @@ pub enum Names {
     Output,
     Error,
     /// The open description of this number in the session of the RAM file
-    /// service the child gets (Clone shares it).
+    /// service the child gets (Clone shares it). The numbers have eleven bits;
+    /// bit 30 (`FILE_LAYERED`) is the POSIX layer's own mark: the description
+    /// was opened through the layer service (a lower file of the layered root),
+    /// and the new image reports the root's `st_dev` for it. The loader passes
+    /// the word as it is and the process and file services never see it.
     File(u32),
     /// The end of a pipe of this number in the session of the pipe
     /// service the child gets, which holds it (5e). The loader takes the

@@ -69,6 +69,12 @@ pub struct Resolve {
     retired: bool,
     /// The walk ended in a redirect: `path` holds the absolute path to continue with.
     redirected: bool,
+    /// The walk belongs to a POSIX session of an image whose root is layered: a result that writes
+    /// outside the pass-through names is refused (`guard_layered`).
+    guard: bool,
+    /// Whether an `Intent::Metadata` walk is for a change of the attributes (chmod, chown, times)
+    /// and not for a check of access.
+    guard_metadata: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intent {
@@ -183,6 +189,8 @@ impl Resolve {
             inert: false,
             retired: false,
             redirected: false,
+            guard: false,
+            guard_metadata: false,
         })
     }
     /// A resolver that only carries bytes of 0 to 511: the contents of a new
@@ -233,6 +241,8 @@ impl Resolve {
             inert: true,
             retired: false,
             redirected: false,
+            guard: false,
+            guard_metadata: false,
         })
     }
     /// Whether the walk is in the chain of a name.
@@ -397,6 +407,7 @@ impl Resolve {
                 {
                     return Err(NOT_DIRECTORY);
                 }
+                self.layered_refusal(storage, false)?;
                 storage.pin(self.current, Pin::Pending)?;
                 self.result = Some(self.current);
                 return Ok(Progress::Found(self.current));
@@ -456,6 +467,7 @@ impl Resolve {
                         return Err(NO_ENTRY);
                     }
                     self.capture_edge(storage, true)?;
+                    self.layered_refusal(storage, true)?;
                     self.missing = true;
                     return Ok(Progress::Missing(self.current));
                 }
@@ -515,6 +527,60 @@ impl Resolve {
         self.redirected = true;
         Err(REDIRECT)
     }
+    /// Makes this walk refuse a result that writes outside the pass-through names of the layered
+    /// root (READ_ONLY_FILESYSTEM): the service sets it for the sessions of POSIX processes in an
+    /// image whose root the layer service decides. `metadata_writes` says an `Intent::Metadata`
+    /// walk changes attributes.
+    pub fn guard_layered(&mut self, metadata_writes: bool) {
+        self.guard = true;
+        self.guard_metadata = metadata_writes;
+    }
+
+    /// The refusal of a result that writes below the layered root: the directory the name lies in
+    /// (or the root, for a name of the root itself) must be one of the pass-through names or lie
+    /// below one; the root takes the creation of a pass-through directory alone.
+    fn layered_refusal(&self, storage: &Storage<'_>, missing: bool) -> Result<(), u32> {
+        if !self.guard || !storage.state.layered() || cfg!(feature = "break-layered-guard") {
+            return Ok(());
+        }
+        let writes = match self.intent {
+            Intent::Lookup { .. } => false,
+            Intent::Open { flags } => {
+                flags & 3 != proto_fs::READ_ONLY
+                    || flags & (proto_fs::CHANGES | proto_fs::TRUNCATE) != 0
+                    || (missing && flags & proto_fs::CREATE != 0)
+            }
+            Intent::Metadata { .. } => self.guard_metadata,
+            Intent::DirectoryCreate
+            | Intent::FifoCreate
+            | Intent::SymbolicLinkCreate
+            | Intent::Namespace { .. } => true,
+        };
+        if !writes {
+            return Ok(());
+        }
+        let dir = if missing {
+            self.current
+        } else {
+            self.edge_parent.unwrap_or(self.current)
+        };
+        if dir == ROOT {
+            let leaf = &self.path[self.edge_start..self.edge_end];
+            return if missing
+                && matches!(self.intent, Intent::DirectoryCreate)
+                && proto_fs::names::PASS_THROUGH.contains(&leaf)
+            {
+                Ok(())
+            } else {
+                Err(proto_fs::READ_ONLY_FILESYSTEM)
+            };
+        }
+        match storage.below_root(dir) {
+            Some(top) if storage.is_pass_through(top) => Ok(()),
+            _ => Err(proto_fs::READ_ONLY_FILESYSTEM),
+        }
+    }
+
     fn final_component(&self) -> bool {
         self.path[self.end..self.length]
             .iter()

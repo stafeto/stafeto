@@ -26,3 +26,5 @@ proto-tty = { path = "../../proto/tty" }
 
 [dev-dependencies]
 rt = { path = "../rt", features = ["host-tests"] }
+# The code of STARTING that `layer.rs` keeps is the service's.
+proto-layer = { path = "../../proto/layer" }

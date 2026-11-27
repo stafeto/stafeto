@@ -968,3 +968,61 @@ fn a_file_whose_own_mode_denies_the_read_is_denied_in_an_open_directory() {
             .is_some()
     );
 }
+
+/// CLONE and CLONE_MORE share the description of a merged directory with the child's session (the
+/// choice of the split's part B: POSIX shares the open file description across a fork, so the
+/// position is one). What the parent read, the child does not read again, and the lower directory
+/// closes with the last holder.
+#[test]
+fn a_clone_shares_the_directory_position_with_the_parent() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let parent = 40;
+    let child = 9_000;
+    let (reply, _) = open(&mut core, 0, 0, "/etc").unwrap();
+    let h = handle_of(&reply);
+    // The parent reads the first reply (the names of the layer and the first lower entries).
+    let (bytes, len) = core.read_dir(parent, h).unwrap();
+    let (more, _, entries) = n::read_dir_reply(&bytes[..len]).unwrap();
+    assert!(more);
+    let first: Vec<Vec<u8>> = entries.map(|e| e.unwrap().name.to_vec()).collect();
+    assert!(first.contains(&b".".to_vec()));
+    // The child's session holds it after CLONE: the same handle, the position where the parent left it.
+    core.share(parent, &[h], child).unwrap();
+    let (rest, _) = list(&mut core, child, h);
+    let mut all = first.clone();
+    all.extend(rest);
+    // Every name once across the two reads, nothing twice.
+    let mut once = sorted(all.clone());
+    once.dedup();
+    assert_eq!(once.len(), all.len());
+    assert!(once.contains(&"hostname".to_owned()) && once.contains(&"own.conf".to_owned()));
+    // The parent finds the end: the child consumed the rest of the one position.
+    let (names, _) = list(&mut core, parent, h);
+    assert!(names.is_empty());
+    // A clone of a handle the session does not hold is BAD_FD, and none of the others is given.
+    assert_eq!(
+        core.share(parent, &[h, 0x0005_0105], 777).err(),
+        Some(st(f::BAD_FD))
+    );
+    assert_eq!(core.descriptions(), 1);
+    // The parent closes: the child's description lives on; the last holder closes it.
+    core.close(parent, h).unwrap();
+    assert_eq!(core.descriptions(), 1);
+    assert_eq!(
+        core.fstat(parent, h, &mut Writer::new()).err(),
+        Some(st(f::BAD_FD))
+    );
+    core.fstat(child, h, &mut Writer::new()).unwrap();
+    core.close(child, h).unwrap();
+    assert_eq!(core.descriptions(), 0);
+    // A session that goes without a close lets go of its share too.
+    let (reply, _) = open(&mut core, 0, 0, "/etc").unwrap();
+    let h = handle_of(&reply);
+    core.share(parent, &[h], child).unwrap();
+    core.gone(parent);
+    assert_eq!(core.descriptions(), 1);
+    core.gone(child);
+    assert_eq!(core.descriptions(), 0);
+}

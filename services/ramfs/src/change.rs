@@ -13,7 +13,7 @@
 //! effect. A change of the tree between two steps (STALE_PROOF) never
 //! reaches the client: the job starts its paths again and counts a restart.
 
-use crate::authority::{Identity, Stamp};
+use crate::authority::{Binding, Identity, Stamp};
 use crate::cwd::{GetcwdJournal, GetcwdOutcome};
 use crate::job::{JobGenerations, JobOperation, JobTable, ResolveJob, Seconds};
 use crate::metadata::{MetadataIntent, MetadataJournal, MetadataOutcome, TimeSetting};
@@ -191,17 +191,24 @@ impl ChangeJob {
     ) -> Result<Self, u32> {
         let relative = req.path.first() != Some(&b'/');
         let (first, stage, result) = match anchor(ram, fds, req.base, relative) {
-            Ok(token) if !req.path.is_empty() => (
-                Resolve::with_intent(
+            Ok(token) if !req.path.is_empty() => {
+                let mut first = Resolve::with_intent(
                     &mut ram.storage,
                     req.path,
                     token,
                     identity,
                     first_intent(req.op, req.flags),
-                )?,
-                Stage::Resolve,
-                0,
-            ),
+                )?;
+                // A session of a POSIX process cannot change a name of a layered root outside the
+                // pass-through names: the layer service decides them.
+                if ram.storage.state.layered() && !matches!(fds.binding, Binding::Boot) {
+                    first.guard_layered(matches!(
+                        req.op,
+                        ChangeOp::Chmod | ChangeOp::Chown | ChangeOp::Times
+                    ));
+                }
+                (first, Stage::Resolve, 0)
+            }
             Ok(_) => (Resolve::scratch(&mut ram.storage, b"")?, Stage::Resolve, 0),
             Err(code) => {
                 // The bytes stay so that a repeated Start compares equal.
@@ -292,8 +299,9 @@ impl ChangeJob {
             *slot = Some(Resolve::scratch(&mut ram.storage, req.bytes)?);
         } else {
             let relative = req.bytes.first() != Some(&b'/');
+            let guarded = ram.storage.state.layered() && !matches!(fds.binding, Binding::Boot);
             let made = anchor(ram, fds, req.base, relative).and_then(|token| {
-                Resolve::with_intent(
+                let mut second = Resolve::with_intent(
                     &mut ram.storage,
                     req.bytes,
                     token,
@@ -301,7 +309,11 @@ impl ChangeJob {
                     Intent::Namespace {
                         path: NamespacePath::Destination,
                     },
-                )
+                )?;
+                if guarded {
+                    second.guard_layered(true);
+                }
+                Ok(second)
             });
             match made {
                 Ok(second) => *slot = Some(second),

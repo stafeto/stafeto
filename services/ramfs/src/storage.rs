@@ -508,6 +508,9 @@ pub struct State {
     /// and the bytes. A walk that reaches it ends in a redirect. Length 0 is no mount.
     mount_len: u8,
     mount: [u8; MOUNT_MAX],
+    /// The image's root is layered (init's `layered` argument): the writes of a POSIX session
+    /// outside the pass-through names are refused (`Resolve::guard_layered`).
+    layered: bool,
     pending: [Option<Reservation>; PREPARATIONS],
     preparation_used: u16,
     reclaim_queue: [u16; INODES],
@@ -561,6 +564,7 @@ impl State {
             epoch: 1,
             mount_len: 0,
             mount: [0; MOUNT_MAX],
+            layered: false,
             pending: [None; PREPARATIONS],
             preparation_used: 0,
             reclaim_queue: [0; INODES],
@@ -604,6 +608,15 @@ impl State {
         self.mount[..name.len()].copy_from_slice(name);
         self.mount_len = name.len() as u8;
         true
+    }
+
+    /// The root is layered: the layer service decides its names.
+    pub fn set_layered(&mut self, layered: bool) {
+        self.layered = layered;
+    }
+
+    pub fn layered(&self) -> bool {
+        self.layered
     }
 
     /// The name of the mount, when there is one.
@@ -1376,6 +1389,43 @@ impl<'a> Storage<'a> {
         }
         Ok(n)
     }
+    /// The child of the root that `dir` is or lies below, None for the root itself or a chain that
+    /// does not end at it.
+    pub(crate) fn below_root(&self, dir: Token) -> Option<Token> {
+        let mut at = dir;
+        for _ in 0..NODES {
+            if at == ROOT {
+                return None;
+            }
+            let parent = self.node(at).ok()?.parent;
+            if parent == ROOT {
+                return Some(at);
+            }
+            at = parent;
+        }
+        None
+    }
+
+    /// Whether `token` is the child of the root named one of the pass-through names of the layered
+    /// root (`proto_fs::names::PASS_THROUGH`).
+    pub(crate) fn is_pass_through(&self, token: Token) -> bool {
+        for name in proto_fs::names::PASS_THROUGH {
+            let mut at = self.name_head(ROOT, name);
+            while at != NONE {
+                if let Some((found, node)) = self.entry(ROOT, at as usize)
+                    && found == name
+                {
+                    if node == token {
+                        return true;
+                    }
+                    break;
+                }
+                at = self.name_next(at);
+            }
+        }
+        false
+    }
+
     pub fn node_mut(&mut self, token: Token) -> Result<&mut Node, u32> {
         self.node(token)?;
         Ok(&mut self.state.nodes[token.slot as usize])

@@ -1,0 +1,30 @@
+[package]
+name = "layer-posix-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The C probe of the POSIX layer on the layered root: open, read, stat, readdir, chdir, openat, fork, spawn and exec over the layer service"
+build = "build.rs"
+
+[features]
+# Deliberate breakage (cargo xtask layer-posix breaks): no path is routed to the layer service.
+break-layer-route = ["posix-crt/break-layer-route"]
+# Deliberate breakage: a fork or a spawn gives the child no session with the layer service.
+break-layer-clone = ["posix-crt/break-layer-clone"]
+# Deliberate breakage: a change of attributes through a description is not refused.
+break-layer-fd-guard = ["posix-crt/break-layer-fd-guard"]
+break-layer-refuse = ["posix-crt/break-layer-refuse"]
+
+[[bin]]
+name = "layer-posix-probe"
+test = false
+bench = false
+
+[dependencies]
+# The layer with the layer service at the root and the data file service behind it (the features
+# `layer`, `data` and `trace`: a static program has them when it asks; `trace` makes the layer print
+# the step and the status behind each EIO).
+posix-crt = { path = "../../lib/posix-crt", features = ["layer", "trace"] }
+posix-abi = { path = "../../lib/posix-abi", features = ["layer"] }

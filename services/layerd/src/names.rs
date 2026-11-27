@@ -21,7 +21,7 @@
 //!   list of the program.
 
 use crate::composition::{Composition, MAX_TEXT, State as LayerState};
-use crate::descriptions::{Lost, Refused, Table};
+use crate::descriptions::{Lost, Refused, ShareError, Table};
 use crate::identity::Vouched;
 use crate::index::{Index, Kind};
 use crate::listing;
@@ -734,12 +734,23 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         )
     }
 
+    /// `owner` lets go of a description; the lower directory it kept closes with the last holder.
     pub fn close(&mut self, owner: u64, handle: u32) -> R<()> {
-        let d = self.table.close(owner, handle).map_err(Self::lost)?;
-        if let Some(dir) = d.lower {
+        let freed = self.table.close(owner, handle).map_err(Self::lost)?;
+        if let Some(dir) = freed.and_then(|d| d.lower) {
             self.lower.close_dir(dir);
         }
         Ok(())
+    }
+
+    /// CLONE and CLONE_MORE: the session `to` holds a share of each description of `handles` that
+    /// the session `from` holds. A description is one for the holders, its position shared, as
+    /// POSIX shares an open file description across a fork. All or none.
+    pub fn share(&mut self, from: u64, handles: &[u32], to: u64) -> R<()> {
+        self.table.share(from, handles, to).map_err(|e| match e {
+            ShareError::Lost(lost) => Self::lost(lost),
+            ShareError::Full => st(proto_fs::TOO_MANY_FILES_IN_SYSTEM),
+        })
     }
 
     /// The session `owner` went: what it held closes.

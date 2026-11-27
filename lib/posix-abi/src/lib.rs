@@ -54,6 +54,11 @@ pub mod fast_events;
 pub mod fast_tickets;
 pub mod fastnet;
 pub mod ipc;
+#[cfg(feature = "layer")]
+pub mod layer;
+#[cfg(not(feature = "layer"))]
+#[path = "layer_off.rs"]
+pub mod layer;
 pub mod lock_fields;
 pub mod long;
 pub mod metadata;
@@ -103,8 +108,12 @@ pub unsafe fn file_lock(fd: c_int, command: c_int, pointer: *mut u8) -> Result<c
     let result = (|| {
         let fd = u32::try_from(fd).map_err(|_| constants::EBADF)?;
         let target = shared::with_fd(fd, |files| files.target(fd).map_err(error))?;
-        // The data volume keeps no record locks: ENOLCK (XSH fcntl()).
-        if matches!(target, posix_fs::Target::Data(_)) {
+        // The data volume and a directory of the layer service keep no record locks: ENOLCK (XSH
+        // fcntl()).
+        if matches!(
+            target,
+            posix_fs::Target::Data(_) | posix_fs::Target::Layer(_)
+        ) {
             return Err(constants::ENOLCK);
         }
         // SAFETY: the calling platform supplies flock fields for this invocation.
@@ -313,6 +322,10 @@ fn open_policy_once(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result<
     if let Some(vol) = data::route(names::AT_FDCWD, name)? {
         return data::open(&vol, flags, mode, umask);
     }
+    // The other paths are the layered root's, where the image has the layer service (layer).
+    if let Some(abs) = layer::route(names::AT_FDCWD, name)? {
+        return layer::open(&abs, flags, mode, umask);
+    }
     // The RAM file service takes every write as done at its return: the bit is the volume's.
     open_image(name, flags & !(O_SYNC | O_SEARCH), mode, umask)
 }
@@ -370,6 +383,10 @@ pub fn openat_policy(
     // A name against a directory of /data (data).
     if let Some(vol) = data::route(dirfd, name)? {
         return data::open(&vol, flags, mode, umask);
+    }
+    // A name against a directory of the layered root (layer).
+    if let Some(abs) = layer::route(dirfd, name)? {
+        return layer::open(&abs, flags, mode, umask);
     }
     let given = flags;
     let flags = flags & !(O_SYNC | O_SEARCH);
@@ -780,8 +797,8 @@ pub fn pipe_status_flags(number: c_int, set: Option<c_int>) -> Result<Option<c_i
             Ok(Some((flags & 3) as c_int | append))
         }
         posix_fs::Target::Net(net) => net::status_flags(net.description, set).map(Some),
-        // A file or directory of /proc is read only.
-        posix_fs::Target::Proc(_) => Ok(Some(0)),
+        // A file or directory of /proc, and a directory of the layer service, is read only.
+        posix_fs::Target::Proc(_) | posix_fs::Target::Layer(_) => Ok(Some(0)),
         _ => Ok(None),
     })
 }

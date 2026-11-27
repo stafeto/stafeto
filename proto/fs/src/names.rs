@@ -540,6 +540,76 @@ pub const fn split_cursor(cursor: u64) -> (u32, u32) {
     ((cursor >> 32) as u32, cursor as u32)
 }
 
+/// The descriptions CLONE and CLONE_MORE carry at most: a session holds `PER_SESSION` (16) of the
+/// service, so a clone needs no more.
+pub const CLONE_MAX: usize = 16;
+
+/// The request CLONE after its header: the handles the new session holds, shared with the caller.
+pub fn write_clone(handles: &[u32], w: &mut Writer) -> Result<(), Status> {
+    if handles.len() > CLONE_MAX {
+        return Err(Status::BadSize);
+    }
+    NameMethod::Clone.header().write(w)?;
+    w.u32(handles.len() as u32)?;
+    handles.iter().try_for_each(|&h| w.u32(h))
+}
+
+/// The request CLONE_MORE after its header: more handles for the session CLONE made (`birth`).
+pub fn write_clone_more(birth: u32, handles: &[u32], w: &mut Writer) -> Result<(), Status> {
+    if handles.len() > CLONE_MAX {
+        return Err(Status::BadSize);
+    }
+    NameMethod::CloneMore.header().write(w)?;
+    w.u32(birth)?;
+    w.u32(handles.len() as u32)?;
+    handles.iter().try_for_each(|&h| w.u32(h))
+}
+
+fn read_handles(mut body: Reader<'_>, out: &mut [u32; CLONE_MAX]) -> Result<usize, Status> {
+    let count = body.u32()? as usize;
+    if count > CLONE_MAX {
+        return Err(Status::from_code(crate::INVALID_ARGUMENT));
+    }
+    for slot in out.iter_mut().take(count) {
+        *slot = body.u32()?;
+    }
+    body.finish()?;
+    Ok(count)
+}
+
+/// The handles of a CLONE: how many of `out` are set.
+pub fn read_clone(body: Reader<'_>, out: &mut [u32; CLONE_MAX]) -> Result<usize, Status> {
+    read_handles(body, out)
+}
+
+/// The birth number and the handles of a CLONE_MORE: how many of `out` are set.
+pub fn read_clone_more(
+    mut body: Reader<'_>,
+    out: &mut [u32; CLONE_MAX],
+) -> Result<(u32, usize), Status> {
+    let birth = body.u32()?;
+    Ok((birth, read_handles(body, out)?))
+}
+
+/// The reply of CLONE after its status: the birth number (the new session is the handle of the
+/// reply).
+pub fn write_clone_reply(birth: u32, w: &mut Writer) -> Result<(), Status> {
+    w.u32(0)?;
+    w.u32(birth)
+}
+
+/// The birth number of a whole reply of CLONE.
+pub fn read_clone_reply(bytes: &[u8]) -> Result<u32, Status> {
+    let mut r = Reader::new(bytes);
+    match Status::from_code(r.u32()?) {
+        Status::Ok => {}
+        status => return Err(status),
+    }
+    let birth = r.u32()?;
+    r.finish()?;
+    Ok(birth)
+}
+
 /// The operations of CHANGE and the meaning of `a` and `b` for each. The first path is the name
 /// the operation acts on, the second one the target of a RENAME or a LINK or the text of a SYMLINK
 /// (empty for the other operations).
@@ -912,6 +982,43 @@ mod tests {
         let mut r = Reader::new(w.as_bytes());
         Header::read(&mut r).unwrap();
         assert_eq!(read_readlink(r), Ok(&b"/l"[..]));
+    }
+
+    #[test]
+    fn clone_and_clone_more_round_trip() {
+        let mut w = Writer::new();
+        write_clone(&[3, 5, 0x0102_0304], &mut w).unwrap();
+        let mut r = Reader::new(w.as_bytes());
+        let h = Header::read(&mut r).unwrap();
+        assert_eq!(h.method, NameMethod::Clone.number());
+        let mut out = [0; CLONE_MAX];
+        assert_eq!(read_clone(r, &mut out), Ok(3));
+        assert_eq!(&out[..3], &[3, 5, 0x0102_0304]);
+        let mut w = Writer::new();
+        write_clone_more(9, &[7], &mut w).unwrap();
+        let mut r = Reader::new(w.as_bytes());
+        Header::read(&mut r).unwrap();
+        assert_eq!(read_clone_more(r, &mut out), Ok((9, 1)));
+        assert_eq!(out[0], 7);
+        // Too many handles are refused on both sides.
+        assert!(write_clone(&[0; CLONE_MAX + 1], &mut Writer::new()).is_err());
+        let mut w = Writer::new();
+        w.u32(CLONE_MAX as u32 + 1).unwrap();
+        assert!(read_clone(Reader::new(w.as_bytes()), &mut out).is_err());
+        // A count that the body does not hold, and bytes left over.
+        let mut w = Writer::new();
+        w.u32(2).unwrap();
+        w.u32(1).unwrap();
+        assert!(read_clone(Reader::new(w.as_bytes()), &mut out).is_err());
+        let mut w = Writer::new();
+        w.u32(1).unwrap();
+        w.u32(1).unwrap();
+        w.u32(2).unwrap();
+        assert!(read_clone(Reader::new(w.as_bytes()), &mut out).is_err());
+        let mut w = Writer::new();
+        write_clone_reply(12, &mut w).unwrap();
+        assert_eq!(read_clone_reply(w.as_bytes()), Ok(12));
+        assert!(read_clone_reply(&[1, 1, 0, 0]).is_err());
     }
 
     #[test]

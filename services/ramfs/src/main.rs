@@ -296,7 +296,7 @@ fn main(_: u64) -> u64 {
         return 7;
     };
     let period_ns = args.period_ns;
-    let Ok((mode, mount)) = ramfs::time_source::parse_args(args.own) else {
+    let Ok((mode, mount, layered)) = ramfs::time_source::parse_args(args.own) else {
         return 7;
     };
     // The name is copied: the arguments stay borrowed from the start data.
@@ -340,6 +340,7 @@ fn main(_: u64) -> u64 {
     if mount_len != 0 && !state.set_mount(&mount_name[..mount_len]) {
         return 7;
     }
+    state.set_layered(layered);
     // SAFETY: initialization writes directly into exclusive aligned permanent storage.
     let locks = unsafe {
         let pointer = (*LOCKS.0.get()).as_mut_ptr();
@@ -6182,7 +6183,7 @@ impl Fs {
                         return status(code);
                     }
                 };
-            let resolver =
+            let mut resolver =
                 match Resolve::with_intent(&mut self.ram.storage, path, base, identity, intent) {
                     Ok(r) => r,
                     Err(code) => {
@@ -6190,6 +6191,11 @@ impl Fs {
                         return status(code);
                     }
                 };
+            // The open of a POSIX session for writing, or for a creation, of a name outside the
+            // pass-through names of a layered root is refused (READ_ONLY_FILESYSTEM).
+            if self.ram.storage.state.layered() && !matches!(fds.binding, Binding::Boot) {
+                resolver.guard_layered(false);
+            }
             let id = next << 8 | i as u64;
             self.job_generations[i] = next;
             self.jobs[i] = Some(ResolveJob {

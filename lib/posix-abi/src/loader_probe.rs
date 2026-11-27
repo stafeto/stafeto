@@ -16,7 +16,8 @@ static MODE: AtomicU32 = AtomicU32::new(0);
 /// Modes 1 and 2 replace Files and Clock with a receiving channel;
 /// modes 3 and 4 use a closed endpoint for Files and Clock respectively;
 /// mode 5 puts a receiving channel in the Entropy place, a forged service,
-/// mode 6 puts one in the Pipes place, mode 7 in the Net place and mode 8 in the Packages place.
+/// mode 6 puts one in the Pipes place, mode 7 in the Net place, mode 8 in the Packages place and
+/// mode 9 in the Layer place.
 pub fn start(mode: u32) -> i32 {
     let result = (|| {
         let root = sys::channel_create(1)?;
@@ -60,6 +61,7 @@ pub(crate) fn replace(slot: Slot, offered: Handle<Channel>) -> Result<Handle<Cha
             | (6, Slot::Pipes)
             | (7, Slot::Net)
             | (8, Slot::Packages)
+            | (9, Slot::Layer)
     );
     if !selected {
         return Ok(offered);

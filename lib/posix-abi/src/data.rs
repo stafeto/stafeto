@@ -201,7 +201,7 @@ fn take_root() -> Result<Handle<Channel>, Attempt> {
 }
 
 /// A copy of the identity session for a request of the service to carry (it moves with the call).
-fn identity_copy() -> Result<rt::handle::Handle<rt::handle::Any>, i32> {
+pub(crate) fn identity_copy() -> Result<rt::handle::Handle<rt::handle::Any>, i32> {
     let Some(identity) = crate::process::identity() else {
         why!("no identity session in the start data of this process");
         return Err(EIO);
@@ -310,7 +310,7 @@ fn forget(raw: rt::abi::Handle) {
 // ---------------------------------------------------------------- the calls
 
 /// The status of a reply for a request the service has no job for (WouldBlock).
-fn busy_code() -> u32 {
+pub(crate) fn busy_code() -> u32 {
     Status::Kernel(Error::WouldBlock).code()
 }
 
@@ -852,6 +852,7 @@ fn insert_description(target: DataTarget, flags: c_int) -> Result<c_int, i32> {
 /// a service that went has closed what the session held.
 pub fn close_description(handle: u32) {
     LISTINGS.forget(handle);
+    posix_fs::layer::unmark_data(handle);
     // A process with no session (the old one died with its instance) holds nothing the service
     // knows: the close succeeds with no call, and no session is taken for it.
     let mut w = Writer::new();
@@ -1685,7 +1686,7 @@ pub fn export(handle: u32) -> Result<Handle<Channel>, i32> {
 /// ADOPT of a pass of the data file service received in an SCM_RIGHTS message: the description
 /// becomes a descriptor of this process (the lowest free one), with its rights as they were. The
 /// pass is spent, or closes with the error.
-pub fn adopt(pass: Handle<Channel>, cloexec: bool) -> Result<c_int, i32> {
+pub fn adopt(pass: Handle<Channel>, cloexec: bool, clofork: bool) -> Result<c_int, i32> {
     let mut w = Writer::new();
     p::adopt(&mut w).map_err(|_| EIO)?;
     let session = ensure()?;
@@ -1731,7 +1732,9 @@ pub fn adopt(pass: Handle<Channel>, cloexec: bool) -> Result<c_int, i32> {
         handle: answer.0,
         directory: answer.1 == p::KIND_DIRECTORY,
     };
-    let flags = crate::descriptor_flags(if cloexec { O_CLOEXEC } else { 0 });
+    let flags = crate::descriptor_flags(
+        if cloexec { O_CLOEXEC } else { 0 } | if clofork { O_CLOFORK } else { 0 },
+    );
     let inserted = crate::shared::growing(|files| {
         files
             .insert(Target::Data(target), flags)
