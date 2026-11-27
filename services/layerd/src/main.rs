@@ -327,7 +327,9 @@ struct Job {
 }
 
 /// Where a job stands: its path is being walked, or the calls to the data file service that open
-/// the file it found are going on, one in each step.
+/// the file it found are going on, one in each step. The jobs live in a fixed table of the
+/// service with no heap, so the variants are kept inline at the size of the larger one.
+#[allow(clippy::large_enum_variant)]
 enum Stage {
     Walking(Prewalk),
     Opening(OpenCont),
