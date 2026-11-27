@@ -2362,6 +2362,8 @@ static int lapse_writer(void) {
 }
 
 static int check_lapse(void) {
+    /* A file a failed run left behind would fake a second failure (EEXIST). */
+    unlink("/data/lapse");
     int fd = open("/data/lapse", O_RDWR | O_CREAT | O_EXCL, 0644);
     DATA_CHECK(fd >= 0);
     pid_t pid = fork();
@@ -2404,6 +2406,10 @@ static int lapse_vector_child(int reading) {
     }
     unsigned long long lapsed0 = dcounts().lapsed;
     for (int i = 0; i < 6000; i++) {
+        /* A writer makes the file again each time: the job that goes first after the lapse then
+         * has no tail of the old file to write out (littlefs writes it when the file is read), and
+         * its wait is the gap plus one job. */
+        if (!reading && ftruncate(fd, 0) != 0) return 6;
         if (lseek(fd, 0, SEEK_SET) != 0) return 5;
         ssize_t r = reading ? readv(fd, v, 16) : writev(fd, v, 16);
         unsigned long long lapsed = dcounts().lapsed - lapsed0;
@@ -2422,6 +2428,7 @@ static int lapse_vector_child(int reading) {
 /* The same stop as `check_lapse`: another caller of the file waits for the lease of the stopped
  * child about a second, and the child's call returns the bytes it moved. */
 static int lapse_vector(int reading) {
+    unlink("/data/lapse");
     int fd = open("/data/lapse", O_RDWR | O_CREAT | O_EXCL, 0644);
     DATA_CHECK(fd >= 0);
     fill_salt(big_buf, MIB, 42);

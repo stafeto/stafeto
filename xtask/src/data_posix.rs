@@ -538,6 +538,9 @@ fn run(mode: Mode, machine: &qemu::Machine, how: Boot) -> Result<(), String> {
     if matches!(mode, Mode::Restart | Mode::Atomic) {
         restarted(&output.lines)?;
     }
+    if mode == Mode::Atomic {
+        lapse_verdict(&output.lines)?;
+    }
     let report = match mode {
         Mode::Fast => Some(fast_verdict(&output.lines)?),
         Mode::Steps => Some(steps_verdict(&output.lines, how.cpus)?),
@@ -745,6 +748,53 @@ fn phase(lines: &[String], tag: &str, what: &str) -> Result<Phase, String> {
         })
     };
     read().ok_or_else(|| format!("data-fast: the line is not read: {line:?}"))
+}
+
+/// How long past its gap a lease may lapse, and how long after the lapse the job that waited for it
+/// may be chosen, in microseconds: one job and the wake of the timer, with room for a slow host.
+const LAPSE_JOB_US: i64 = 250_000;
+
+/// The lapses the service said (`datafs: lease lapse N: last answer A us after the waiter was
+/// queued, lapse B us past the gap, waiter chosen C us after the lapse`): A, B and C in
+/// microseconds, A and B signed.
+fn lapse_facts(line: &str) -> Option<(i64, i64, i64)> {
+    let rest = &line[line.find("datafs: lease lapse ")?..];
+    let value = |key: &str, end: &str| -> Option<i64> {
+        let from = rest.find(key)? + key.len();
+        let len = rest[from..].find(end)?;
+        rest[from..from + len].trim().parse().ok()
+    };
+    Some((
+        value("last answer ", " us after")?,
+        value(", lapse ", " us past")?,
+        value("waiter chosen ", " us after")?,
+    ))
+}
+
+/// The leases that lapsed with a job waiting for them: each lapse comes within one job of the gap
+/// after the last answer, and the waiter is chosen within one job of the lapse. (The wait of the
+/// waiter's own call, which the C program prints, adds the work of that call.)
+fn lapse_verdict(lines: &[String]) -> Result<(), String> {
+    let facts: Vec<_> = lines.iter().filter_map(|l| lapse_facts(l)).collect();
+    if facts.len() < 3 {
+        return Err(format!(
+            "the service said {} lapses with a waiter, at least three expected (the pwrite, the writev and the readv)",
+            facts.len()
+        ));
+    }
+    for (n, &(answered, past, chosen)) in facts.iter().enumerate() {
+        println!(
+            "data-posix: lapse {}: the last answer {answered} us after the waiter was queued, the lapse {past} us past the gap, the waiter chosen {chosen} us after it",
+            n + 1
+        );
+        if past > LAPSE_JOB_US || !(0..=LAPSE_JOB_US).contains(&chosen) {
+            return Err(format!(
+                "lapse {}: {past} us past the gap and the waiter chosen {chosen} us after it, each over {LAPSE_JOB_US} us (one job)",
+                n + 1
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The counters of the disk the service said (`datafs: disk reads R writes W`): the last pair said
@@ -1375,6 +1425,26 @@ mod tests {
         let mut late = good();
         late[1] = "datafs: root registered after 3 failed attempts".to_owned();
         assert_eq!(read_lines(&late, Mode::Read), Ok(()));
+    }
+
+    #[test]
+    fn the_lapse_lines_are_read_and_judged() {
+        let say = |a: i64, b: i64, c: i64| {
+            format!(
+                "datafs: lease lapse 2: last answer {a} us after the waiter was queued, lapse {b} us past the gap, waiter chosen {c} us after the lapse"
+            )
+        };
+        assert_eq!(lapse_facts(&say(-358, 9794, 21)), Some((-358, 9794, 21)));
+        assert_eq!(lapse_facts("datafs: pairs 1 of 2"), None);
+        let ok: Vec<String> = vec![say(7, 3000, 50), say(-5, 10_000, 20), say(600, 2000, 30)];
+        assert_eq!(lapse_verdict(&ok), Ok(()));
+        assert!(lapse_verdict(&ok[..2]).is_err());
+        let mut late = ok.clone();
+        late[1] = say(0, 540_000, 20);
+        assert!(lapse_verdict(&late).unwrap_err().contains("540000"));
+        let mut slow = ok;
+        slow[2] = say(0, 100, 300_000);
+        assert!(lapse_verdict(&slow).is_err());
     }
 
     #[test]

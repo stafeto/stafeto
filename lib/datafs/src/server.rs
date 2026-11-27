@@ -38,7 +38,7 @@ mod lease;
 mod mount;
 mod names;
 
-pub use lease::{CANDIDATES_MAX, Candidate, LEASE_CLIENT_MAX_NS, LEASE_GAP_NS, Pick};
+pub use lease::{CANDIDATES_MAX, Candidate, LEASE_CLIENT_MAX_NS, LEASE_GAP_NS, Lapse, Pick};
 pub use mount::{Mounted, Recovered, StartWork, Step, bump_epoch, ensure_orphans, recover_orphans};
 use names::{denied, entry_of, split, stat_record};
 
@@ -344,6 +344,8 @@ pub struct Server {
     /// `UNLEASED` so far.
     job_queued: u64,
     unleased: u64,
+    /// The last lapse that jobs of the file waited for (`lease::Lapse`), for the probes.
+    lapse: lease::Lapse,
     #[cfg(test)]
     pub(crate) fail_reopen: bool,
     #[cfg(test)]
@@ -566,6 +568,7 @@ impl Server {
             mono: 0,
             job_queued: 0,
             unleased: 0,
+            lapse: lease::Lapse::NONE,
             #[cfg(test)]
             fail_reopen: false,
             #[cfg(test)]

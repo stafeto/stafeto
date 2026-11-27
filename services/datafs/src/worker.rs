@@ -1376,6 +1376,23 @@ fn next_job(server: &mut Server, volume: &mut Option<Volume>) -> Option<usize> {
             at.store(wanted, Release);
         }
     }
+    // The facts of a lapse that jobs waited for, said when the waiter is chosen: the probe of the
+    // lease (`xtask data-posix atomic`) judges them.
+    if let Some(i) = choice.run {
+        // SAFETY: the job is QUEUED: the main thread does not touch it until it is DONE.
+        let queued = unsafe { (*job(i)).queued_at.load(Acquire) };
+        if server.lapse_waiter_ran(queued, now_ns()) {
+            let l = server.lapse();
+            let us = |ns: i128| ns / 1_000;
+            rt::println!(
+                "datafs: lease lapse {}: last answer {} us after the waiter was queued, lapse {} us past the gap, waiter chosen {} us after the lapse",
+                l.count,
+                us(i128::from(l.answered) - i128::from(l.queued)),
+                us(i128::from(l.at) - i128::from(l.answered + datafs::server::LEASE_GAP_NS)),
+                us(i128::from(l.ran - l.at))
+            );
+        }
+    }
     choice.run
 }
 
