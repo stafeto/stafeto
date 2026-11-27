@@ -3073,3 +3073,37 @@ fn the_work_before_ready_does_not_traverse_the_files_of_a_volume_full_of_them() 
     server::ensure_orphans(&mut fs).unwrap();
     assert!(fs.stat(server::ORPHANS).is_ok());
 }
+
+/// A file of an eighth of the volume is replaced again and again, by a write in place of the whole
+/// file and by a remove and a new file. Each round allocates new blocks and gives the old ones back,
+/// which the window's bits do not see until a walk. The writes must not get NO_SPACE while most of
+/// the volume is free: the request walks before it answers NO_SPACE.
+#[test]
+fn rewrites_never_meet_no_space_on_a_mostly_free_volume() {
+    let mut rig = Rig::new();
+    let bytes = (SECTORS / 8 / 8 * 4096) as usize;
+    let chunk = [5u8; 900];
+    // Several times the bytes of the volume go through the allocator.
+    let rounds = 6 * (SECTORS / 8 * 4096) as usize / bytes;
+    for round in 0..rounds {
+        let h = if round % 2 == 0 {
+            rig.open(ROOT, b"/f", p::WRITE | p::CREATE | p::TRUNCATE, 0o666)
+        } else {
+            let _ = rig.call(ROOT, |w| p::path_call(p::Method::Unlink, b"/f", w));
+            rig.open(ROOT, b"/f", p::WRITE | p::CREATE, 0o666)
+        }
+        .unwrap();
+        for at in (0..bytes).step_by(chunk.len()) {
+            let n = (bytes - at).min(chunk.len());
+            let got = rig
+                .call(ROOT, |w| p::pwrite(h, at as u64, &chunk[..n], w))
+                .unwrap_or_else(|e| panic!("round {round} at {at}: {e:?}"));
+            assert_eq!(u32::from_le_bytes(got[..4].try_into().unwrap()) as usize, n);
+        }
+        rig.close(ROOT, h);
+        assert!(
+            rig.fs.used_blocks().unwrap() < SECTORS / 8 / 2,
+            "most of the volume is free"
+        );
+    }
+}

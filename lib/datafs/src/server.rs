@@ -1192,7 +1192,12 @@ impl Server {
                 }
                 if size > current {
                     // Growing is blocks: the reserve and the room apply as to a write.
-                    let room = self.room_bytes(fs, &caller)?;
+                    let mut room = self.room_bytes(fs, &caller)?;
+                    if size - current > room && fs.window_stale() {
+                        // As in a write: walk once before answering NO_SPACE.
+                        volume(fs.walk())?;
+                        room = self.room_bytes(fs, &caller)?;
+                    }
                     if size - current > room {
                         return Err(p::code(p::NO_SPACE));
                     }
@@ -1823,6 +1828,24 @@ impl Server {
         Ok(usable * BLOCK as u64)
     }
 
+    /// The bytes a write that starts at `start` of a file of `size` bytes may take: the part over
+    /// the file's own bytes, and the room for the rest (the gap past the end is zeros that take
+    /// blocks too).
+    fn write_fits<D: Device>(
+        &mut self,
+        fs: &mut Fs<'_, D>,
+        caller: &Caller,
+        start: u64,
+        size: u64,
+    ) -> Res<u64> {
+        let room = self.room_bytes(fs, caller)?;
+        Ok(if start < size {
+            (size - start).saturating_add(room)
+        } else {
+            room.saturating_sub(start - size)
+        })
+    }
+
     /// WRITE and PWRITE (rule 13): `data` at `pos`, or at the end of the file when `append`, the
     /// end taken now. The write stops short at the file size limit of the caller (and `FILE_MAX`) or
     /// at the last free block the caller may use, and answers the count; a status comes only when no
@@ -1863,13 +1886,14 @@ impl Server {
             }));
         }
         // The blocks the write adds: the part past the end of the file, up to the room.
-        let room = self.room_bytes(fs, caller)?;
-        // Over the end of the file the gap between the end and `pos` is zeros that take blocks too.
-        let fits = if start < size {
-            (size - start).saturating_add(room)
-        } else {
-            room.saturating_sub(start - size)
-        };
+        let mut fits = self.write_fits(fs, caller, start, size)?;
+        if (allowed as u64) > fits && fs.window_stale() {
+            // The room comes from the bits of the allocator's window, which do not see the blocks
+            // that rewrites and removals gave back since the last walk. Walk once before answering
+            // NO_SPACE, as littlefs does at the wrap of its allocator, and count again.
+            volume(fs.walk())?;
+            fits = self.write_fits(fs, caller, start, size)?;
+        }
         if (allowed as u64) > fits {
             allowed = fits as usize;
             if allowed == 0 && !data.is_empty() {
@@ -1880,6 +1904,10 @@ impl Server {
         self.nodes[ni].at = None;
         let n = volume(fs.write(file, &data[..allowed]))?;
         self.nodes[ni].at = Some(pos + n as u32);
+        if start < size {
+            // The blocks of the part rewritten in place are given back when the file is synced.
+            fs.note_freed_blocks((n as u64).min(size - start) / BLOCK as u64);
+        }
         if n > 0 {
             self.nodes[ni].wrote = true;
             self.nodes[ni].wrote_at = self.now;

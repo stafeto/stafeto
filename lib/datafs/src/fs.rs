@@ -568,6 +568,14 @@ impl<'a, D: Device> Fs<'a, D> {
         Ok(self.window_free())
     }
 
+    /// A walk could show more free blocks than the window's bits do: the allocator has handed out
+    /// blocks since the last walk (its next block is not 0), or removals and truncations gave
+    /// blocks back (`freed_estimate`). Right after a walk with nothing allocated since, a second
+    /// walk finds the same count.
+    pub fn window_stale(&self) -> bool {
+        self.window_state().1 != 0 || self.freed != 0
+    }
+
     /// The window is filled and holds less than the volume: the allocator walked in the middle of a
     /// request and the checkpoint cut the window short. The free count from the bits is low until
     /// a walk fills it whole.
