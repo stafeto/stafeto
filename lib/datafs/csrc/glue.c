@@ -488,6 +488,26 @@ int datafs_sync(struct datafs *d, void *ctx, int slot)
     return lfs_file_sync(&d->lfs, &d->file[slot]);
 }
 
+// The bytes a flush of the file would copy now (0: none), and one step of that copy of at most
+// `blocks` blocks: 1 when more is left, 0 when done (see lfs_file_flush_step).
+int64_t datafs_tail(struct datafs *d, void *ctx, int slot)
+{
+    d->ctx = ctx;
+    if (!file_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    return lfs_file_tail(&d->lfs, &d->file[slot]);
+}
+
+int datafs_flush_step(struct datafs *d, void *ctx, int slot, uint32_t blocks)
+{
+    d->ctx = ctx;
+    if (!file_ok(d, slot)) {
+        return LFS_ERR_BADF;
+    }
+    return lfs_file_flush_step(&d->lfs, &d->file[slot], blocks);
+}
+
 int64_t datafs_seek(struct datafs *d, void *ctx, int slot, int32_t offset, int whence)
 {
     d->ctx = ctx;
