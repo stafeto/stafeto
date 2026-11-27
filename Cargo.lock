@@ -1410,6 +1410,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-layer"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-data",
+ "proto-fs",
+ "proto-pkg",
+ "proto-wire",
+]
+
+[[package]]
 name = "proto-loader"
 version = "0.1.0"
 dependencies = [
