@@ -3074,7 +3074,7 @@ fn the_work_before_ready_does_not_traverse_the_files_of_a_volume_full_of_them() 
     assert!(fs.stat(server::ORPHANS).is_ok());
 }
 
-/// A file of an eighth of the volume is replaced again and again, by a write in place of the whole
+/// A file of an eighth of the volume is replaced again and again, by a rewrite of the whole
 /// file and by a remove and a new file. Each round allocates new blocks and gives the old ones back,
 /// which the window's bits do not see until a walk. The writes must not get NO_SPACE while most of
 /// the volume is free: the request walks before it answers NO_SPACE.
