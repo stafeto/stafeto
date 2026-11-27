@@ -10,6 +10,7 @@ use crate::listing;
 use crate::names::{Client, Core, Done, State};
 use crate::scan::Scan;
 use crate::testkit::{FakeLower, FakeVolume};
+use crate::volume::R;
 use proto_data as d;
 use proto_fs as f;
 use proto_fs::names::{self as n, OpenAnswer, UPPER_INO_TAG};
@@ -83,7 +84,7 @@ struct World {
 impl World {
     fn new() -> World {
         World {
-            index: Box::new(Index::new()),
+            index: crate::index::boxed(),
             scan: Box::new(Scan::new()),
         }
     }
@@ -126,6 +127,7 @@ fn open(
         match done {
             Done::Written => None,
             Done::Pass(p) => Some(p),
+            Done::Continue(_) => unreachable!("an open runs its calls to the end"),
         },
     ))
 }
@@ -878,14 +880,140 @@ fn list_gives_the_lower_set_and_the_live_layer() {
     assert_eq!(l::read_list(w.as_bytes(), &mut out).unwrap().0, 0);
 }
 
+/// A step of the build of the index takes at most a stat and an open, or one batch of a listing,
+/// whatever the layer holds (`break-layerd-one-step` walks it whole in one step).
+/// A long path walked in steps of `lookup::STEP` components comes to the same answer as the walk in
+/// one piece, for OPEN, STAT, ACCESS and READLINK, whatever the outcome.
+#[test]
+fn a_long_path_walked_in_steps_comes_to_the_answer_of_the_walk_in_one_piece() {
+    let mut v = volume();
+    let mut dir = String::from("/.layers/00");
+    let mut plain = String::new();
+    for _ in 0..40 {
+        dir.push_str("/a");
+        plain.push_str("/a");
+        v.dir(&dir, 0o755, 0);
+    }
+    v.file(&format!("{dir}/f"), 0o644, 0, b"deep");
+    v.dir(&format!("{dir}/closed"), 0o700, 0);
+    v.file(&format!("{dir}/closed/g"), 0o644, 0, b"g");
+    let mut world = World::new();
+    let mut core = world.core(v);
+    ready(&mut core);
+    let paths = [
+        format!("{plain}/f"),
+        format!("{plain}/missing"),
+        format!("{plain}/f/x"),
+        format!("{plain}/closed/g"),
+        format!("{plain}/../a/f"),
+        "/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/b"
+            .to_owned(),
+        format!("{plain}/"),
+    ];
+    for uid in [0, 1000] {
+        let who = who(uid);
+        let c = Client {
+            owner: 40 + u64::from(uid),
+            who: &who,
+        };
+        for path in &paths {
+            let mut pw = crate::names::Prewalk::new(path.as_bytes(), false);
+            let mut steps = 0;
+            let walked = loop {
+                steps += 1;
+                assert!(steps < 100);
+                if let Some(done) = core.prewalk_step(&who, &mut pw) {
+                    break done;
+                }
+            };
+            // The first step makes the path plain, then 16 components a step.
+            let comps = path
+                .split('/')
+                .filter(|p| !p.is_empty() && *p != "..")
+                .count();
+            assert!(
+                steps > comps / 16 && steps <= comps / 16 + 3,
+                "{path}: {steps} steps"
+            );
+            let mut once = Writer::new();
+            let mut stepped = Writer::new();
+            let a = core.open(&c, f::READ_ONLY, path.as_bytes(), &mut once);
+            let mut b = core.open_walked(&c, f::READ_ONLY, Some(walked), b"", &mut stepped);
+            // The calls to the volume go on one at a time: three of them for a file.
+            let mut calls = 0;
+            while let Ok(Done::Continue(cont)) = b {
+                calls += 1;
+                b = core.open_continue(&c, cont, &mut stepped);
+            }
+            assert!(calls == 0 || calls == 3, "{path}: {calls} calls");
+            assert_eq!(a.as_ref().err(), b.as_ref().err(), "{path} as {uid}");
+            // (The handle of a description of a directory is the next place, so it differs.)
+            if !path.ends_with('/') {
+                assert_eq!(once.as_bytes(), stepped.as_bytes(), "{path} as {uid}");
+            }
+            // The pass of the file (the fake volume's is its path on the volume) is the same.
+            let pass = |r: &R<Done<Vec<u8>>>| match r {
+                Ok(Done::Pass(p)) => Some(p.clone()),
+                _ => None,
+            };
+            assert_eq!(pass(&a), pass(&b), "{path} as {uid}");
+            let mut once = Writer::new();
+            let mut stepped = Writer::new();
+            let mut pw = crate::names::Prewalk::new(path.as_bytes(), false);
+            let walked = loop {
+                if let Some(done) = core.prewalk_step(&who, &mut pw) {
+                    break done;
+                }
+            };
+            let a = core.stat(&c, 0, path.as_bytes(), &mut once);
+            let b = core.stat_walked(&c, 0, Some(walked), b"", &mut stepped);
+            assert_eq!(a, b, "{path} as {uid}");
+            assert_eq!(once.as_bytes(), stepped.as_bytes());
+        }
+    }
+    // A path of a few components is no long one.
+    assert!(!crate::names::Prewalk::long(b"/etc/passwd"));
+    assert!(crate::names::Prewalk::long(b"/a/b/c/d"));
+}
+
+#[test]
+fn a_step_of_the_build_makes_a_bounded_number_of_calls_to_the_volume() {
+    let mut v = volume();
+    for d in 0..4 {
+        v.dir(&format!("/.layers/00/many{d}"), 0o755, 0);
+        for i in 0..1000 {
+            v.file(&format!("/.layers/00/many{d}/f{i:04}"), 0o644, 0, b"");
+        }
+    }
+    v.batch = 20;
+    let mut world = World::new();
+    let mut core = world.core(v);
+    core.prepare();
+    let mut steps = 0;
+    loop {
+        let before = core.volume.calls.len();
+        let done = core.build_step();
+        let calls = core.volume.calls.len() - before;
+        assert!(calls <= 3, "a step made {calls} calls to the volume");
+        steps += 1;
+        assert!(steps < 100_000);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(core.state, State::Ready);
+    // 4,000 names in batches of 59 and the directories: many steps, none of them long.
+    assert!(steps >= 4000 / 59, "{steps}");
+}
+
 #[test]
 fn a_full_index_fails_the_start_with_no_space() {
     let mut v = volume();
-    // More names than the table takes within eight probes: 20,000 files in one directory.
+    // More names than the table takes within the probes: 20,000 files in one directory.
     for i in 0..20_000 {
         v.file(&format!("/.layers/00/opq/f{i:05}"), 0o644, 0, b"");
     }
-    v.batch = 59;
+    v.batch = 20;
     let mut world = World::new();
     let mut core = world.core(v);
     core.prepare();
@@ -926,7 +1054,7 @@ fn a_request_looks_at_a_bounded_number_of_slots_of_the_index() {
     for i in 0..1_500 {
         v.file(&format!("/.layers/00/filler/f{i:04}"), 0o644, 0, b"");
     }
-    v.batch = 59;
+    v.batch = 20;
     let mut world = World::new();
     let mut core = world.core(v);
     ready(&mut core);
@@ -940,7 +1068,8 @@ fn a_request_looks_at_a_bounded_number_of_slots_of_the_index() {
             "{expected}: {names:?}"
         );
     }
-    // The first stage looks at 512 slots in a request: the whole table takes at least 16 requests,
+    // The first stage looks at `SLOTS_PER_READDIR` slots in a request: the whole table takes at least
+    // `SLOTS` over that many requests,
     // and a request that finds nothing says `more` with no entry.
     assert!(
         requests >= crate::index::SLOTS / crate::listing::SLOTS_PER_READDIR,

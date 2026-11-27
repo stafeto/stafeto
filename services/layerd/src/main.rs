@@ -35,7 +35,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Release};
 use layerd::identity::{Binding, Vouched, vouched_from};
 use layerd::index::Index;
-use layerd::names::{Client, Core, Done, State};
+use layerd::names::{Client, Core, Done, OpenCont, Prewalk, State, Walked};
 use layerd::scan::Scan;
 use proto_fs::names::{self as n, NameMethod};
 use proto_init::ServiceArgs;
@@ -69,12 +69,19 @@ const SESSIONS_PER_PROCESS: usize = 16;
 
 /// The label of the notification the service sends itself for the next step of the build.
 const LABEL_STEP: u64 = 0x6c61_7967_0001;
+/// The label of the notification for the next step of a long walk (`Job`).
+const LABEL_WALK: u64 = 0x6c61_7967_0002;
+/// The requests whose walk goes on in steps at once. A request that finds the table full is walked
+/// in its own step, whatever the length of its path.
+const JOBS: usize = 8;
 /// Bit 63 marks the labels the service gives itself: a count of sessions that is never used twice.
 const OWN: u64 = 1 << 63;
 
-/// The handle of the loop's own budget, kept for the steps build.
+/// The handle of the loop's own budget, kept for the steps build, and the time (ns) the loop began.
 #[cfg(feature = "steps")]
 static SERVE_BUDGET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "steps")]
+static SERVE_START: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Under the feature `steps`, a line when the CPU the loop's budget has charged has grown by 1 ms
 /// since the last line: `layerd: serve ran <us> us in <ms> ms since the start`. The share the loop
@@ -83,7 +90,6 @@ static SERVE_BUDGET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 fn serve_line() {
     use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static LAST: AtomicU64 = AtomicU64::new(0);
-    static START: AtomicU64 = AtomicU64::new(0);
     let raw = SERVE_BUDGET.load(Acquire);
     if raw == 0 {
         return;
@@ -93,7 +99,6 @@ fn serve_line() {
         return;
     };
     let now = rt::time::ticks_to_ns(rt::time::now());
-    let _ = START.compare_exchange(0, now, Relaxed, Relaxed);
     let ran = rt::time::ticks_to_ns(info.ran);
     if ran < LAST.load(Relaxed) + 1_000_000 {
         return;
@@ -102,7 +107,7 @@ fn serve_line() {
     rt::println!(
         "layerd: serve ran {} us in {} ms since the start, {} overruns",
         ran / 1000,
-        (now - START.load(Relaxed)) / 1_000_000,
+        now.saturating_sub(SERVE_START.load(Relaxed)) / 1_000_000,
         info.overruns
     );
 }
@@ -148,7 +153,11 @@ fn touch(base: *mut u8, len: usize) {
 /// of 2^36 ticks apart (about 18 minutes) to within 17 ms, and then its place and generation must
 /// match too (`proto_fs::names::handle`).
 const fn epoch_of(ticks: u64) -> u16 {
-    let epoch = (ticks >> 20) as u16;
+    let epoch = if cfg!(feature = "break-layerd-epoch") {
+        1
+    } else {
+        (ticks >> 20) as u16
+    };
     if epoch == 0 { 1 } else { epoch }
 }
 
@@ -180,6 +189,14 @@ fn main(_: u64) -> u64 {
         &channel,
         Rights::NOTIFY | Rights::TRANSFER,
         LABEL_STEP,
+        level,
+    ) else {
+        return NOT_REGISTERED;
+    };
+    let Ok(walk_step) = sys::handle_label(
+        &channel,
+        Rights::NOTIFY | Rights::TRANSFER,
+        LABEL_WALK,
         level,
     ) else {
         return NOT_REGISTERED;
@@ -238,6 +255,9 @@ fn main(_: u64) -> u64 {
         channel: Handle::borrowed(channel.raw()),
         level,
         step,
+        walk_step,
+        jobs: [const { None }; JOBS],
+        next_job: 0,
         notary: notary::Notary::new(),
         next_label: 1,
         next_birth: 1,
@@ -251,6 +271,7 @@ fn main(_: u64) -> u64 {
         #[cfg(feature = "steps")]
         Ok(Some(kept)) => {
             SERVE_BUDGET.store(kept.raw().0, Release);
+            SERVE_START.store(rt::time::ticks_to_ns(rt::time::now()), Release);
             core::mem::forget(kept);
         }
         Ok(_) => {}
@@ -285,6 +306,29 @@ struct Record {
     identity: Option<Handle<Channel>>,
 }
 
+/// What a request that waits for its walk is: the reply it owes, who asked, and what it asked for.
+struct Job {
+    pending: rt::service::Pending,
+    label: u64,
+    who: Vouched,
+    kind: JobKind,
+    stage: Stage,
+}
+
+/// Where a job stands: its path is being walked, or the calls to the data file service that open
+/// the file it found are going on, one in each step.
+enum Stage {
+    Walking(Prewalk),
+    Opening(OpenCont),
+}
+
+enum JobKind {
+    Open { flags: u32 },
+    Stat { flags: u32 },
+    Access { bits: u32, flags: u32 },
+    Readlink,
+}
+
 struct Layerd {
     core: Core<'static, data::Data, lower::Ram>,
     parent: core::mem::ManuallyDrop<Handle<Channel>>,
@@ -294,6 +338,10 @@ struct Layerd {
     level: u8,
     /// A notification of the service to itself: the next step of the build.
     step: Handle<Channel>,
+    /// A notification of the service to itself: the next step of a long walk.
+    walk_step: Handle<Channel>,
+    jobs: [Option<Job>; JOBS],
+    next_job: usize,
     notary: notary::Notary,
     next_label: u64,
     next_birth: u32,
@@ -533,6 +581,122 @@ impl Layerd {
         status_of(self.core.share(parent, &handles[..count], to))
     }
 
+    /// The request waits for its walk: a long path is walked `lookup::STEP` components in each step
+    /// of the loop, and the step that finishes the walk finishes the request (`walk_job`). None
+    /// when the path is short, the service does not answer yet, or the table of jobs is full: the
+    /// request then goes on in this step.
+    fn defer_walk(
+        &mut self,
+        r: &mut Request<'_>,
+        who: Vouched,
+        label: u64,
+        kind: JobKind,
+        walk: Prewalk,
+    ) -> Option<Answer> {
+        if !self.core.walkable() {
+            return None;
+        }
+        let place = self.jobs.iter().position(Option::is_none)?;
+        let pending = r.defer()?;
+        self.jobs[place] = Some(Job {
+            pending,
+            label,
+            who,
+            kind,
+            stage: Stage::Walking(walk),
+        });
+        let _ = sys::notify(&self.walk_step, 1);
+        Some(Answer::Deferred)
+    }
+
+    /// One step of one job, the jobs in turn: the walk of its path, a part of it, or a call of
+    /// the open of its file; a job that is done is answered. A job of a session that went is
+    /// dropped (its reply goes to nobody, the description it holds closes).
+    fn walk_job(&mut self) {
+        let Some(place) = (0..JOBS)
+            .map(|k| (self.next_job + k) % JOBS)
+            .find(|&i| self.jobs[i].is_some())
+        else {
+            return;
+        };
+        self.next_job = (place + 1) % JOBS;
+        if let Some(job) = self.jobs[place].take() {
+            if self.slot_of(job.label).is_none() {
+                if let Stage::Opening(cont) = job.stage {
+                    self.core.open_abandon(cont);
+                }
+            } else {
+                self.jobs[place] = self.advance(job);
+            }
+        }
+        if self.jobs.iter().any(Option::is_some) {
+            let _ = sys::notify(&self.walk_step, 1);
+        }
+    }
+
+    /// One step of a job: the job again when it goes on, None when it has been answered.
+    fn advance(&mut self, job: Job) -> Option<Job> {
+        let Job {
+            pending,
+            label,
+            who,
+            kind,
+            stage,
+        } = job;
+        let c = Client {
+            owner: label,
+            who: &who,
+        };
+        let mut w = proto_wire::Writer::new();
+        let done = match stage {
+            Stage::Walking(mut walk) => {
+                let Some(walked) = self.core.prewalk_step(&who, &mut walk) else {
+                    return Some(Job {
+                        pending,
+                        label,
+                        who,
+                        kind,
+                        stage: Stage::Walking(walk),
+                    });
+                };
+                match kind {
+                    JobKind::Open { flags } => {
+                        self.core.open_walked(&c, flags, Some(walked), b"", &mut w)
+                    }
+                    JobKind::Stat { flags } => self
+                        .core
+                        .stat_walked(&c, flags, Some(walked), b"", &mut w)
+                        .map(|()| Done::Written),
+                    JobKind::Access { bits, flags } => self
+                        .core
+                        .access_walked(&c, (bits, flags), Some(walked), b"", &mut w)
+                        .map(|()| Done::Written),
+                    JobKind::Readlink => self
+                        .core
+                        .readlink_walked(&c, Some(walked), b"", &mut w)
+                        .map(|()| Done::Written),
+                }
+            }
+            Stage::Opening(cont) => self.core.open_continue(&c, cont, &mut w),
+        };
+        let none = rt::handle::Outgoing::new;
+        let _ = match done {
+            Ok(Done::Continue(cont)) => {
+                return Some(Job {
+                    pending,
+                    label,
+                    who,
+                    kind,
+                    stage: Stage::Opening(cont),
+                });
+            }
+            Ok(Done::Written) => pending.answer(w.as_bytes(), none()),
+            Ok(Done::Pass(pass)) => pending.answer(w.as_bytes(), [pass]),
+            Err(status) => pending.answer(&proto_wire::reply(status), none()),
+        };
+        None
+    }
+
     /// The look at the binding of a session before a request: the generation of the process's
     /// record again, and Vouch with the stored copy when it moved.
     fn look(&mut self, place: usize) {
@@ -577,6 +741,22 @@ impl Layerd {
                 let Ok((flags, path)) = n::read_open(body) else {
                     return bad;
                 };
+                #[cfg(feature = "probe-restart")]
+                if path.ends_with(b"/.die") {
+                    rt::println!("layerd: probe-restart: the service ends with the exit code 1");
+                    sys::process_exit(1);
+                }
+                if Prewalk::long(path)
+                    && let Some(deferred) = self.defer_walk(
+                        r,
+                        who,
+                        label,
+                        JobKind::Open { flags },
+                        Prewalk::new(path, false),
+                    )
+                {
+                    return deferred;
+                }
                 let c = Client {
                     owner: label,
                     who: &who,
@@ -584,6 +764,11 @@ impl Layerd {
                 match self.core.open(&c, flags, path, r.reply()) {
                     Ok(Done::Written) => Answer::Reply(rt::handle::Outgoing::new()),
                     Ok(Done::Pass(pass)) => Answer::Reply([pass].into()),
+                    // `Core::open` runs the calls to their end.
+                    Ok(Done::Continue(cont)) => {
+                        self.core.open_abandon(cont);
+                        Answer::Status(Status::BadSize)
+                    }
                     Err(status) => Answer::Status(status),
                 }
             }
@@ -595,6 +780,17 @@ impl Layerd {
                 let Ok((flags, path)) = n::read_stat(body) else {
                     return bad;
                 };
+                if Prewalk::long(path)
+                    && let Some(deferred) = self.defer_walk(
+                        r,
+                        who,
+                        label,
+                        JobKind::Stat { flags },
+                        Prewalk::new(path, false),
+                    )
+                {
+                    return deferred;
+                }
                 let c = Client {
                     owner: label,
                     who: &who,
@@ -609,6 +805,17 @@ impl Layerd {
                 let Ok((bits, flags, path)) = n::read_access(body) else {
                     return bad;
                 };
+                if Prewalk::long(path)
+                    && let Some(deferred) = self.defer_walk(
+                        r,
+                        who,
+                        label,
+                        JobKind::Access { bits, flags },
+                        Prewalk::new(path, flags & proto_data::ACCESS_REAL != 0),
+                    )
+                {
+                    return deferred;
+                }
                 let c = Client {
                     owner: label,
                     who: &who,
@@ -623,6 +830,12 @@ impl Layerd {
                 let Ok(path) = n::read_readlink(body) else {
                     return bad;
                 };
+                if Prewalk::long(path)
+                    && let Some(deferred) =
+                        self.defer_walk(r, who, label, JobKind::Readlink, Prewalk::new(path, false))
+                {
+                    return deferred;
+                }
                 let c = Client {
                     owner: label,
                     who: &who,
@@ -769,6 +982,9 @@ impl Service<0> for Layerd {
 
     fn request(&mut self, _: &mut Session<(), 0>, r: &mut Request<'_>) -> Answer {
         let method = r.method();
+        // The method is the detail of the longest step of its kind (the line of the steps).
+        #[cfg(feature = "steps")]
+        rt::service::step_detail(u64::from(method));
         if r.label() == l::ROOT {
             return if method == l::Method::Session as u16 || method == NameMethod::Session as u16 {
                 self.session(r)
@@ -804,6 +1020,14 @@ impl Service<0> for Layerd {
     }
 
     fn notification(&mut self, notice: Notice) {
+        if notice.label == LABEL_WALK {
+            #[cfg(feature = "steps")]
+            rt::service::step_detail(1000);
+            self.walk_job();
+            return;
+        }
+        #[cfg(feature = "steps")]
+        rt::service::step_detail(2000);
         if notice.label != LABEL_STEP {
             return;
         }

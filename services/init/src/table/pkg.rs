@@ -1216,7 +1216,7 @@ mod tests {
         assert_eq!(LAYERD_BUDGETS[0].share_ppm(), 5_000);
         assert_eq!(LAYERD_BUDGETS[0].name, "serve");
         assert_eq!(LAYERD_BUDGETS[0].low, super::super::ramfs::SERVICE_LOW);
-        assert!(LAYERD.free < LAYERD.priority);
+        const { assert!(LAYERD.free < LAYERD.priority) };
         assert!(matches!(LAYERD.restart, Restart::Always));
         assert_eq!(LAYERD.broken_after, None);
         // 192 identity copies, a pass or a Vouch copy in flight and about 24 of its own.

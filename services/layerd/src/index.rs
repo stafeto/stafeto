@@ -17,8 +17,11 @@
 //! the flags OPAQUE (the directory holds the file `.wh..wh..opq`: the lower set shows through it
 //! no more) and HAS_CHILDREN (a name of the layer lies in it).
 
-pub const SLOTS: usize = 8192;
-pub const PROBES: usize = 8;
+/// The table holds 8,192 names of a layer with room to spare: 16,384 places and 32 probes took
+/// more than 9,000 names of a layer in a host test before the first miss (8,192 places and 8 probes
+/// took 2,777: an open table at an eighth of its places is the most a short probe holds).
+pub const SLOTS: usize = 16384;
+pub const PROBES: usize = 32;
 pub const ARENA: usize = 256 * 1024;
 pub const NAME_MAX: usize = 255;
 
@@ -109,6 +112,14 @@ pub struct Root {
     pub flags: u8,
 }
 
+const EMPTY_ROOT: Root = Root {
+    number: 0,
+    uid: 0,
+    gid: 0,
+    mode: 0,
+    flags: 0,
+};
+
 pub struct Index {
     slots: [Entry; SLOTS],
     arena: [u8; ARENA],
@@ -160,7 +171,7 @@ impl Index {
         self.arena_len = 0;
         self.live = 0;
         self.marks = 0;
-        self.root = Index::new().root;
+        self.root = EMPTY_ROOT;
     }
 
     /// The names of a layer (files and directories) and the marks of deletion.
@@ -372,7 +383,8 @@ impl Index {
             *out.first_mut()? = b'/';
             return Some(1);
         }
-        // Walk up, writing the names from the end of `out`.
+        // Walk up, writing the names from the end of `out`. A name is a few bytes: a loop is
+        // cheaper than a call to `memcpy` for each of the 250 levels of the deepest path.
         let mut end = out.len();
         let mut at = id;
         let mut depth = 0;
@@ -380,8 +392,15 @@ impl Index {
             let e = self.entry(at)?;
             let name = self.name_of(e);
             let start = end.checked_sub(name.len() + 1)?;
-            out[start] = b'/';
-            out[start + 1..end].copy_from_slice(name);
+            let dest = out.get_mut(start..end)?;
+            dest[0] = b'/';
+            if name.len() <= 8 {
+                for (to, from) in dest[1..].iter_mut().zip(name) {
+                    *to = *from;
+                }
+            } else {
+                dest[1..].copy_from_slice(name);
+            }
             end = start;
             at = e.parent;
             depth += 1;
@@ -395,6 +414,15 @@ impl Index {
     }
 }
 
+/// An index on the heap, made without a copy on the stack (the table is 700 KiB, more than the
+/// stack of a test thread holds): every field of an empty index is zero.
+#[cfg(test)]
+pub fn boxed() -> std::boxed::Box<Index> {
+    // SAFETY: all-zero bytes are an empty index: `EMPTY` has kind 0 (`Kind::Empty`) and zeros, the
+    // counters and the root are zeros.
+    unsafe { std::boxed::Box::<Index>::new_zeroed().assume_init() }
+}
+
 impl Default for Index {
     fn default() -> Self {
         Index::new()
@@ -406,7 +434,7 @@ mod tests {
     use super::*;
 
     fn index() -> std::boxed::Box<Index> {
-        std::boxed::Box::new(Index::new())
+        super::boxed()
     }
 
     fn file(n: u64) -> Fields {
@@ -487,7 +515,7 @@ mod tests {
         }
         let (_, e) = refused.expect("the table fills up");
         assert_eq!(e, Error::NoSpace);
-        // Open addressing with eight probes fills a good part of the table before the first miss,
+        // Open addressing with `PROBES` probes fills a good part of the table before the first miss,
         // and every name inserted is found again.
         assert!(inserted > SLOTS as u32 / 8, "{inserted}");
         for n in 0..inserted {

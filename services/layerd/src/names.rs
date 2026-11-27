@@ -73,10 +73,15 @@ pub struct Client<'a> {
     pub who: &'a Vouched,
 }
 
-/// What a handler has done with the reply: written it, or written it and has a pass to send.
+/// What a handler has done with the reply: written it, or written it and has a pass to send. The
+/// step that goes on (`Continue`) is the rare one and the one a job keeps, so its size is no cost.
+#[allow(clippy::large_enum_variant)]
 pub enum Done<P> {
     Written,
     Pass(P),
+    /// The OPEN of a file of the layer goes on with its next call to the data file service
+    /// (`Core::open_continue`); `Core::open` never returns it.
+    Continue(OpenCont),
 }
 
 pub struct Core<'a, V: Volume, L: Lower> {
@@ -93,11 +98,74 @@ pub struct Core<'a, V: Volume, L: Lower> {
 }
 
 /// The result of a walk and the plain path it walked, which a redirect carries.
-struct Walked {
+pub struct Walked {
     outcome: Outcome,
     trailing: bool,
     path: [u8; 512],
     len: usize,
+}
+
+/// The paths of more components than this are walked in steps of their own (`Prewalk`): a step
+/// that walks a path and then asks the data file service (the pass of a file, 16,500 ticks under
+/// -icount) has room for about four more components of the 0.9 B of a step, 420 ticks each.
+pub const SYNC_COMPONENTS: usize = 3;
+
+/// A walk of a long path in progress: the path as it came, then the plain path (`normalize`, which
+/// takes a step of its own) and where the walk stands. A request whose path has more than
+/// `SYNC_COMPONENTS` components is made plain and walked `lookup::STEP` components a step, and the
+/// step that finishes the request starts from the walk's result (`Core::open_walked` and its like),
+/// so that no step holds the walk of a long path and the calls to the volume together.
+pub struct Prewalk {
+    raw: [u8; 512],
+    raw_len: usize,
+    planned: bool,
+    path: [u8; 512],
+    len: usize,
+    pos: usize,
+    cur: u32,
+    real: bool,
+}
+
+impl Prewalk {
+    /// Whether `path` is long enough to be walked in steps: more slashes than a short path holds
+    /// (a count of bytes, a step of the request that costs a fraction of making the path plain).
+    pub fn long(path: &[u8]) -> bool {
+        path.iter().filter(|&&b| b == b'/').count() > SYNC_COMPONENTS
+    }
+
+    /// The walk of `path` with the real identifiers when `real`.
+    pub fn new(path: &[u8], real: bool) -> Prewalk {
+        let mut raw = [0u8; 512];
+        let raw_len = path.len().min(raw.len());
+        raw[..raw_len].copy_from_slice(&path[..raw_len]);
+        Prewalk {
+            raw,
+            raw_len,
+            planned: false,
+            path: [0; 512],
+            len: 0,
+            pos: 0,
+            cur: 0,
+            real,
+        }
+    }
+}
+
+/// What is left of an OPEN of a file of the layer once its name is walked: the three calls to the
+/// data file service (the rights of the file, its description, the pass and the close), one in each
+/// request of a job. A request that is not deferred runs them one after the other in its own step.
+pub struct OpenCont {
+    vp: [u8; 512],
+    len: usize,
+    phase: OpenPhase,
+    handle: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenPhase {
+    Stat,
+    Open,
+    Export,
 }
 
 impl Walked {
@@ -371,10 +439,16 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         let len = self.live_len;
         root[..len].copy_from_slice(self.live_path());
         let layer = self.composition.live().number;
-        match self
+        let mut stepped = self
             .scan
-            .step(self.index, &mut self.volume, &root[..len], layer)
-        {
+            .step(self.index, &mut self.volume, &root[..len], layer);
+        // The deliberate break: the whole layer in one step.
+        while cfg!(feature = "break-layerd-one-step") && stepped == Ok(Progress::More) {
+            stepped = self
+                .scan
+                .step(self.index, &mut self.volume, &root[..len], layer);
+        }
+        match stepped {
             Ok(Progress::More) => false,
             Ok(Progress::Done) => {
                 self.state = State::Ready;
@@ -490,6 +564,54 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             .ok_or_else(|| st(proto_fs::NAME_TOO_LONG))
     }
 
+    /// The volume path of the entry `id` a walk reached: the live layer's path and the plain path
+    /// of the walk, which names the chain of the entry exactly (each component was matched by its
+    /// name), where the way up the index costs 70 ticks for each level, 17,000 for the deepest
+    /// path.
+    fn vpath_of(&self, walked: &Walked, id: u32, out: &mut [u8; 512]) -> R<usize> {
+        let live = self.live_path();
+        let plain = walked.path();
+        let plain = match plain.strip_suffix(b"/") {
+            Some(rest) if !rest.is_empty() => rest,
+            _ => plain,
+        };
+        let end = live.len() + plain.len();
+        if id == 0 || plain.first() != Some(&b'/') || end > out.len() {
+            return self.vpath(id, out);
+        }
+        out[..live.len()].copy_from_slice(live);
+        out[live.len()..end].copy_from_slice(plain);
+        Ok(end)
+    }
+
+    /// Whether a request can be walked in steps: the service answers (not STARTING or damaged).
+    pub fn walkable(&self) -> bool {
+        self.state == State::Ready
+    }
+
+    /// One step of a long walk: `lookup::STEP` components of `pw`; the result when the walk is done.
+    pub fn prewalk_step(&self, who: &Vouched, pw: &mut Prewalk) -> Option<Walked> {
+        // The first step makes the path plain (about 13,000 ticks for a path of 253 components).
+        if !pw.planned {
+            pw.len = normalize(&pw.raw[..pw.raw_len], &mut pw.path);
+            pw.planned = true;
+            return None;
+        }
+        let mut walk = Walk::resume(&pw.path[..pw.len], pw.pos, pw.cur);
+        let step = walk.advance(self.index, who.identity(pw.real), crate::lookup::STEP);
+        (pw.pos, pw.cur) = walk.state();
+        let trailing = walk.trailing_slash();
+        match step {
+            crate::lookup::Step::More => None,
+            crate::lookup::Step::Done(outcome) => Some(Walked {
+                outcome,
+                trailing,
+                path: pw.path,
+                len: pw.len,
+            }),
+        }
+    }
+
     /// The walk of `path` after it is made plain (`lookup::normalize`), with the real identifiers
     /// when `real` (ACCESS with `ACCESS_REAL`) and the effective ones otherwise.
     fn walk(&self, c: &Client<'_>, path: &[u8], real: bool) -> Walked {
@@ -547,8 +669,26 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         path: &[u8],
         w: &mut Writer,
     ) -> R<Done<V::Pass>> {
+        let mut done = self.open_walked(c, flags, None, path, w)?;
+        while let Done::Continue(cont) = done {
+            done = self.open_continue(c, cont, w)?;
+        }
+        Ok(done)
+    }
+
+    /// OPEN of a path the walk of which was made in steps (`prewalk_step`), or of `path` when None.
+    /// The open of a file of the layer ends in `Done::Continue`: its calls to the data file service
+    /// go on with `open_continue`.
+    pub fn open_walked(
+        &mut self,
+        c: &Client<'_>,
+        flags: u32,
+        walked: Option<Walked>,
+        path: &[u8],
+        w: &mut Writer,
+    ) -> R<Done<V::Pass>> {
         self.gate()?;
-        let walked = self.walk(c, path, false);
+        let walked = walked.unwrap_or_else(|| self.walk(c, path, false));
         let (outcome, trailing) = (walked.outcome, walked.trailing);
         // The names the root passes through are the services' own, writes included. A name of
         // the lower set is read only in this part: the RAM file service would write it below the
@@ -594,28 +734,73 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             return Err(st(proto_fs::NOT_DIRECTORY));
         }
         let mut vp = [0u8; 512];
-        let len = self.vpath(id, &mut vp)?;
-        let stat = self.volume.stat(&vp[..len]).map_err(from_volume)?;
-        if !permits(c.who.identity(false), &attr_of(&stat), READ) {
-            return Err(st(proto_fs::ACCESS_DENIED));
+        let len = self.vpath_of(&walked, id, &mut vp)?;
+        Ok(Done::Continue(OpenCont {
+            vp,
+            len,
+            phase: OpenPhase::Stat,
+            handle: 0,
+        }))
+    }
+
+    /// The next call of the OPEN of a file of the layer: the rights, then the description, then
+    /// the pass (and the close of the description, whatever the pass came to).
+    pub fn open_continue(
+        &mut self,
+        c: &Client<'_>,
+        mut cont: OpenCont,
+        w: &mut Writer,
+    ) -> R<Done<V::Pass>> {
+        let path = &cont.vp[..cont.len];
+        match cont.phase {
+            OpenPhase::Stat => {
+                let stat = self.volume.stat(path).map_err(from_volume)?;
+                if !permits(c.who.identity(false), &attr_of(&stat), READ) {
+                    return Err(st(proto_fs::ACCESS_DENIED));
+                }
+                cont.phase = OpenPhase::Open;
+                Ok(Done::Continue(cont))
+            }
+            OpenPhase::Open => {
+                cont.handle = self.volume.open(path, d::READ, 0).map_err(from_volume)?;
+                cont.phase = OpenPhase::Export;
+                Ok(Done::Continue(cont))
+            }
+            OpenPhase::Export => {
+                let pass = self.volume.export(cont.handle);
+                let _ = self.volume.close(cont.handle);
+                let pass = pass.map_err(from_volume)?;
+                OpenAnswer::Pass.write(w)?;
+                Ok(Done::Pass(pass))
+            }
         }
-        let handle = self
-            .volume
-            .open(&vp[..len], d::READ, 0)
-            .map_err(from_volume)?;
-        let pass = self.volume.export(handle);
-        let _ = self.volume.close(handle);
-        let pass = pass.map_err(from_volume)?;
-        OpenAnswer::Pass.write(w)?;
-        Ok(Done::Pass(pass))
+    }
+
+    /// An OPEN given up between its calls (its client went): the description it holds closes.
+    pub fn open_abandon(&mut self, cont: OpenCont) {
+        if cont.phase == OpenPhase::Export {
+            let _ = self.volume.close(cont.handle);
+        }
     }
 
     /// STAT: the node information of a name of the layer. A name of the lower set, and the names
     /// the root passes through, are a redirect: the RAM file service answers with the rights of the
     /// caller's own session and follows the links as the flags say.
-    pub fn stat(&mut self, c: &Client<'_>, _flags: u32, path: &[u8], w: &mut Writer) -> R<()> {
+    pub fn stat(&mut self, c: &Client<'_>, flags: u32, path: &[u8], w: &mut Writer) -> R<()> {
+        self.stat_walked(c, flags, None, path, w)
+    }
+
+    /// STAT of a path the walk of which was made in steps, or of `path` when None.
+    pub fn stat_walked(
+        &mut self,
+        c: &Client<'_>,
+        _flags: u32,
+        walked: Option<Walked>,
+        path: &[u8],
+        w: &mut Writer,
+    ) -> R<()> {
         self.gate()?;
-        let walked = self.walk(c, path, false);
+        let walked = walked.unwrap_or_else(|| self.walk(c, path, false));
         if let Some(done) = Self::redirect_for(walked.outcome, walked.path(), w) {
             return done;
         }
@@ -623,7 +808,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             return Err(Self::refusal(walked.outcome));
         };
         let mut vp = [0u8; 512];
-        let len = self.vpath(id, &mut vp)?;
+        let len = self.vpath_of(&walked, id, &mut vp)?;
         let stat = self.volume.stat(&vp[..len]).map_err(from_volume)?;
         if walked.trailing && stat.kind != d::KIND_DIRECTORY {
             return Err(st(proto_fs::NOT_DIRECTORY));
@@ -640,9 +825,22 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         path: &[u8],
         w: &mut Writer,
     ) -> R<()> {
+        self.access_walked(c, (bits, flags), None, path, w)
+    }
+
+    /// ACCESS of a path the walk of which was made in steps (with the identifiers the bits are
+    /// checked with), or of `path` when None.
+    pub fn access_walked(
+        &mut self,
+        c: &Client<'_>,
+        (bits, flags): (u32, u32),
+        walked: Option<Walked>,
+        path: &[u8],
+        w: &mut Writer,
+    ) -> R<()> {
         self.gate()?;
         // The path is walked with the identifiers the bits are checked with.
-        let walked = self.walk(c, path, flags & d::ACCESS_REAL != 0);
+        let walked = walked.unwrap_or_else(|| self.walk(c, path, flags & d::ACCESS_REAL != 0));
         if let Some(done) = Self::redirect_for(walked.outcome, walked.path(), w) {
             return done;
         }
@@ -653,7 +851,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             return Err(st(proto_fs::READ_ONLY_FILESYSTEM));
         }
         let mut vp = [0u8; 512];
-        let len = self.vpath(id, &mut vp)?;
+        let len = self.vpath_of(&walked, id, &mut vp)?;
         let stat = self.volume.stat(&vp[..len]).map_err(from_volume)?;
         posix_perm::access(
             c.who.ids,
@@ -668,8 +866,19 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
 
     /// READLINK: the layer of the user holds no link in this part, so a name of it is no link.
     pub fn readlink(&mut self, c: &Client<'_>, path: &[u8], w: &mut Writer) -> R<()> {
+        self.readlink_walked(c, None, path, w)
+    }
+
+    /// READLINK of a path the walk of which was made in steps, or of `path` when None.
+    pub fn readlink_walked(
+        &mut self,
+        c: &Client<'_>,
+        walked: Option<Walked>,
+        path: &[u8],
+        w: &mut Writer,
+    ) -> R<()> {
         self.gate()?;
-        let walked = self.walk(c, path, false);
+        let walked = walked.unwrap_or_else(|| self.walk(c, path, false));
         if let Some(done) = Self::redirect_for(walked.outcome, walked.path(), w) {
             return done;
         }
