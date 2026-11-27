@@ -30,6 +30,9 @@ use rt::handle::{Any, Channel, Handle};
 use libc_ffi as _;
 use posix_abi as _;
 
+mod restart;
+mod scale;
+
 #[used]
 static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 
@@ -331,6 +334,11 @@ extern "C" fn main(
     _argv: *mut *mut core::ffi::c_char,
     _envp: *mut *mut core::ffi::c_char,
 ) -> c_int {
+    match option_env!("STAFETO_LAYER_NAMES_MODE") {
+        Some("scale") => return scale::run(),
+        Some("restart") => return restart::run(),
+        _ => {}
+    }
     let mut t = Checks { failed: 0 };
     let (Some(root), Some(data_root)) = (
         take_root(proto_process::ROOT_LAYER),

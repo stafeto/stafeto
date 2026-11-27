@@ -86,6 +86,11 @@ def leaked_names(defined) -> list:
 LAYER_FEATURES = ",".join(
     f for f in (ROOT / "tools" / "layer-features.txt").read_text().strip().split(",")
     if f != "trace" or TRACE)
+# `STAFETO_LAYERED_ROOT=1` builds the library for the shell image with the layer service (init's
+# feature `layered-root`): paths of the root go to the layer service. Off until step C4 of the layered
+# file system; the fingerprint of `cargo xtask abi` counts the features of the file above only.
+if os.environ.get("STAFETO_LAYERED_ROOT") == "1":
+    LAYER_FEATURES += ",layer"
 LAYER_RUSTFLAGS = ("-C relocation-model=pic -C target-feature=+fix-cortex-a53-835769"
                    " -C llvm-args=--enable-machine-outliner=never")
 

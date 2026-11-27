@@ -322,6 +322,10 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("data-steps", 45),
     ("layer-names-probe", 12),
     ("layer-names-probe breaks", 20),
+    ("layer-steps", 25),
+    ("layer-steps breaks", 25),
+    ("layer-restart", 20),
+    ("layer-restart breaks", 15),
     ("layer-posix", 15),
     ("layer-posix breaks", 25),
     ("layer-posix ash", 12),
@@ -569,6 +573,18 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         &[],
         super::init_reserve::check,
     ));
+    // The tables of the shell with the layer service (the feature `layered-root`, off until C4) hold
+    // the checks of the tables as the ones without it do.
+    steps.push(step("host", "init tests with layered-root", &[], || {
+        super::run_cmd(super::cargo().args([
+            "test",
+            "--package",
+            "init",
+            "--lib",
+            "--features",
+            "layered-root",
+        ]))
+    }));
     steps.push(step("host", "counter read sites", &[], || {
         super::disasm::check_counter_read_sites(&super::root())
     }));
