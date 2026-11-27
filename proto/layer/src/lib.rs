@@ -42,8 +42,13 @@
 //! "UID 0" is the superuser, whom the service knows by the identity session that follows the body
 //! (Vouch, as for `pkgd`); NOT_ALLOWED for any other, and for a request without the session. A
 //! client gets its session through the root channel: `layer` asks `init` for it (TakeRoot with
-//! the mark `ROOT_LAYER`, which the process service gains with the service itself), and the other
-//! methods go through that session. The root of a composition (the handle COMPOSE gives) is a
+//! the mark `ROOT_LAYER`, which the process service has since `proto_process` 19), and the other
+//! methods go through that session. The root channel takes the SESSION of this protocol (18) and
+//! the SESSION and VERIFY_SESSION of the names of `proto_fs` 23 (70 and 71): the numbers never
+//! meet, and a request carries the version of its own protocol in its header (this crate's 1 below
+//! the number 64, `proto_fs`'s from 70). A session made through either serves both: the methods
+//! LIST and STATUS here, the names of `proto_fs::names` (OPEN, STAT, READ_DIR and the rest) for the
+//! POSIX layer. The root of a composition (the handle COMPOSE gives) is a
 //! second root channel of the service that speaks `proto_fs` and takes SESSION and VERIFY_SESSION
 //! alone; its sessions see the composition's tree. The last copy of that handle gone discards the
 //! live layer of the composition, or keeps it as a deferred layer when the request had
@@ -110,8 +115,9 @@ pub const JOBS_MAX: u32 = 8;
 pub const BLOCK: u64 = 512;
 
 /// The label of the service's root channel, which it registers with the process service (the
-/// mark `ROOT_LAYER`, which lands with the service) and which takes SESSION alone. Bit 63 marks
-/// the labels the service gives itself, and bit 60 lies above any session of its own.
+/// mark `ROOT_LAYER`, which the process service has since `proto_process` 19) and which takes the
+/// two SESSIONs and VERIFY_SESSION of the names. Bit 63 marks the labels the service gives itself,
+/// and bit 60 lies above any session of its own.
 pub const ROOT: u64 = 1 << 63 | 1 << 60;
 
 /// The kinds of a LIST entry.

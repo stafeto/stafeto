@@ -1,0 +1,42 @@
+[package]
+name = "layerd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The layer service of stafeto: the names of the layered root over the live layer on the data volume"
+
+# What the service decides, apart from the calls: tested on the host.
+[lib]
+bench = false
+
+[[bin]]
+name = "layerd"
+test = false
+bench = false
+
+# `steps`: each new longest step of the loop goes to the console (rt's feature step-stats), for
+# the measurement under -icount.
+# `break-layerd-whiteout`: the listing of the lower entries does not look at the index, so a name
+# a layer of the user deleted shows again (`cargo xtask layer-names breaks`).
+# `break-layerd-search`: the walk of a path does not check the right to search the directories of
+# the layer of the user.
+[features]
+steps = ["rt/step-stats"]
+break-layerd-whiteout = []
+break-layerd-search = []
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+posix-perm = { path = "../../lib/posix-perm" }
+proto-data = { path = "../../proto/data" }
+proto-fs = { path = "../../proto/fs" }
+proto-layer = { path = "../../proto/layer" }
+proto-process = { path = "../../proto/process" }
+proto-wire = { path = "../../proto/wire" }
+
+[target.'cfg(target_os = "none")'.dependencies]
+posix-fs = { path = "../../lib/posix-fs" }
+proto-init = { path = "../../proto/init" }
+rt = { path = "../../lib/rt" }

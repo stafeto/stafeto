@@ -167,7 +167,7 @@
 //! image and the ticket of its place (`LoaderOf`) only while it loads.
 //!
 //! Register of a root, through a notary session whose label has the mark of
-//! a root (TERMINAL with its notice, PIPE, NET, ENTROPY, DATAFS or PKG; init gives each
+//! a root (TERMINAL with its notice, PIPE, NET, ENTROPY, DATAFS, PKG or LAYER; init gives each
 //! to the one entry of its table that is that service): one handle, a
 //! channel of the service with SEND and DUPLICATE (TERMINAL: the notice and
 //! that channel). The service keeps it, a later Register of the same mark
@@ -176,7 +176,7 @@
 //! the root VerifySession. PERMISSION for a session with no such mark.
 //!
 //! TakeRoot (number 44), through the session of any record: body `LoaderRoot` (the root asked
-//! for, here `ROOT_DATA` alone), no handles. The reply is the status and a copy of the registered
+//! for, here `ROOT_DATA` and `ROOT_LAYER`), no handles. The reply is the status and a copy of the registered
 //! root of the data file service with SEND and TRANSFER (the kernel refuses a reply that carries a
 //! handle without TRANSFER; there is no DUPLICATE), so that the process can send the root its two
 //! requests (SESSION and VERIFY_SESSION) and cannot copy it. The root hands out only sessions whose
@@ -227,6 +227,8 @@ pub mod lifetimes;
 pub mod retry;
 pub mod sporadic;
 
+/// Version 19: the mark LAYER joins the marks of the services that send a root with Register, and
+/// TakeRoot gives the root `ROOT_LAYER` of the layer service as it gives `ROOT_DATA`; `ROOTS` is 7.
 /// Version 17: the mark PKG joins the marks of the services that send a root with Register, with
 /// the root `ROOT_PKG` for the slot Packages of the loader; TakeRoot refuses it.
 /// Version 18: bit 62 of the scheduling word of SpawnStart (`START_LOWERED`): the spawn asked
@@ -240,7 +242,7 @@ pub mod sporadic;
 /// had) names the slot whose root it asks for in a body, and the notary marks
 /// PIPE, NET and ENTROPY join TERMINAL as the marks of a service that sends
 /// its root with Register.
-pub const VERSION: u16 = 18;
+pub const VERSION: u16 = 19;
 
 /// The bytes of the name a record keeps for `ps` (the last component of
 /// the path of its program, cut to fit, with a terminating zero).
@@ -839,6 +841,9 @@ pub const DATAFS: u64 = 1 << 56;
 /// The mark of the notary session of the package service: bit 55, with NOTARY, which init gives
 /// only to the entry of its table that is that service.
 pub const PKG: u64 = 1 << 55;
+/// The mark of the notary session of the layer service: bit 54, with NOTARY, which init gives only
+/// to the entry of its table that is that service.
+pub const LAYER: u64 = 1 << 54;
 
 /// The roots the process service keeps for the loaders, by the slot they
 /// are the root of: a loader asks for one with LoaderRoot and sends it
@@ -849,10 +854,11 @@ pub const ROOT_NET: u32 = 2;
 pub const ROOT_ENTROPY: u32 = 3;
 pub const ROOT_DATA: u32 = 4;
 pub const ROOT_PKG: u32 = 5;
-pub const ROOTS: usize = 6;
+pub const ROOT_LAYER: u32 = 6;
+pub const ROOTS: usize = 7;
 
 /// The marks of the roots, in the order of the roots.
-pub const ROOT_MARKS: [u64; ROOTS] = [TERMINAL, PIPE, NET, ENTROPY, DATAFS, PKG];
+pub const ROOT_MARKS: [u64; ROOTS] = [TERMINAL, PIPE, NET, ENTROPY, DATAFS, PKG, LAYER];
 
 /// The root a notary label may register: the one whose mark it has, and
 /// none for a label with no mark or with two (init gives one at most).
@@ -874,7 +880,7 @@ pub const fn root_of(label: u64) -> Option<u32> {
     found
 }
 
-/// The request of TakeRoot for `root` (`ROOT_DATA` alone is given): the header of method 44 and
+/// The request of TakeRoot for `root` (`ROOT_DATA` and `ROOT_LAYER` are given): the header of method 44 and
 /// the body of LoaderRoot. The layer builds it with this, and the service's handler reads it with
 /// `LoaderRoot::read` after the header.
 pub fn take_root(root: u32, w: &mut Writer) -> Result<(), Status> {
@@ -2125,7 +2131,7 @@ mod tests {
         assert!(METHODS.iter().all(|&m| m < 64));
         // The request is a header and no body.
         let header = Method::EntropyRejoin.header();
-        assert_eq!(header.version, 18);
+        assert_eq!(header.version, 19);
         assert_eq!(header.bytes().len(), 8);
         assert_eq!(Header::read(&mut Reader::new(&header.bytes())), Ok(header));
     }
@@ -2389,7 +2395,11 @@ mod tests {
     /// of the gap at 44, below the step log, in the list of the methods.
     #[test]
     fn the_data_service_has_its_root_and_take_root_its_number() {
-        assert_eq!((ROOT_DATA, ROOT_PKG, ROOTS), (4, 5, 6));
+        assert_eq!((ROOT_DATA, ROOT_PKG, ROOT_LAYER, ROOTS), (4, 5, 6, 7));
+        assert_eq!(LAYER, 1 << 54);
+        assert_eq!(ROOT_MARKS[ROOT_LAYER as usize], LAYER);
+        assert_eq!(root_of(NOTARY | LAYER | 3), Some(ROOT_LAYER));
+        assert_eq!(root_of(NOTARY | LAYER | PKG), None);
         assert_eq!(DATAFS, 1 << 56);
         assert_eq!(PKG, 1 << 55);
         assert_eq!(ROOT_MARKS[ROOT_PKG as usize], PKG);
@@ -2401,7 +2411,7 @@ mod tests {
         assert_eq!(Method::TakeRoot as u16, 44);
         assert!(METHODS.contains(&44));
         assert!(METHODS.iter().all(|&m| m < 64));
-        assert_eq!(VERSION, 18);
+        assert_eq!(VERSION, 19);
         let mut w = Writer::new();
         LoaderRoot { root: ROOT_DATA }.write(&mut w).unwrap();
         assert_eq!(
@@ -2471,7 +2481,7 @@ mod tests {
         long.push(0);
         assert_eq!(Held::read(&long), Err(Status::BadSize));
         assert_eq!(Held::Write.word(), HELD_WRITE);
-        assert_eq!(VERSION, 18);
+        assert_eq!(VERSION, 19);
     }
 
     #[test]

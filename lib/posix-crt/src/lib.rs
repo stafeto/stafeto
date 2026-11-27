@@ -381,6 +381,9 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
             Names::Data { handle, directory } => {
                 InheritedTarget::Ready(Target::Data(posix_fs::DataTarget { handle, directory }))
             }
+            // A description of the layer service: its client in the layer of POSIX comes with the
+            // part that routes the paths of the root to it, and no loader gives one before.
+            Names::Layer { .. } => continue,
             Names::PendingTerminal(_) => continue,
         };
         *place = Inherited { fd: d.fd, target };
