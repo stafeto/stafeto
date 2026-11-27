@@ -14,6 +14,54 @@ This page describes the platform of EGL for stafeto, the part of Mesa that
 `ports/mesa/stafeto/platform_stafeto.c` adds. The rest (the configurations
 softpipe offers, the extensions, GLES 2.0, 3.0 and 3.1) is Mesa's own.
 
+## Functions and extensions
+
+The functions are those of Mesa's EGL 1.5 (`<EGL/egl.h>`) over the platform
+below. What a program can use, by group:
+
+- Display: `eglGetDisplay`, `eglGetPlatformDisplay`, `eglInitialize`,
+  `eglTerminate`, `eglQueryString`, `eglGetError`, `eglGetProcAddress`,
+  `eglReleaseThread`.
+- Configurations: `eglGetConfigs`, `eglChooseConfig`, `eglGetConfigAttrib`.
+- Surfaces: `eglCreateWindowSurface`, `eglCreatePlatformWindowSurface`,
+  `eglCreatePbufferSurface`, `eglDestroySurface`, `eglQuerySurface`,
+  `eglSurfaceAttrib`, `eglSwapBuffers`, `eglSwapInterval`.
+  `eglCreatePixmapSurface`, `eglCreatePlatformPixmapSurface` and
+  `eglCopyBuffers` are refused (`EGL_BAD_MATCH`, `EGL_BAD_NATIVE_PIXMAP`:
+  there is no pixmap and no configuration with `EGL_PIXMAP_BIT`).
+- Contexts: `eglBindAPI` and `eglQueryAPI` (only `EGL_OPENGL_ES_API`),
+  `eglCreateContext`, `eglDestroyContext`, `eglMakeCurrent`,
+  `eglGetCurrentContext`, `eglGetCurrentSurface`, `eglGetCurrentDisplay`,
+  `eglQueryContext`, `eglWaitClient`, `eglWaitGL`, `eglWaitNative`.
+- Synchronization and images of EGL 1.5: `eglCreateSync`, `eglDestroySync`,
+  `eglClientWaitSync`, `eglWaitSync`, `eglGetSyncAttrib`, `eglCreateImage`,
+  `eglDestroyImage` (images stay inside one process, see "Not offered").
+
+The extensions the platform sets itself are `EGL_EXT_swap_buffers_with_damage`
+and `EGL_KHR_swap_buffers_with_damage` (`eglSwapBuffersWithDamageEXT` and
+`...KHR`, found with `eglGetProcAddress`). The common code of Mesa's driver for
+the display adds, with no condition, `EGL_KHR_create_context`,
+`EGL_KHR_create_context_no_error`, `EGL_KHR_no_config_context`,
+`EGL_KHR_surfaceless_context`, `EGL_KHR_fence_sync`, `EGL_KHR_wait_sync`,
+`EGL_KHR_reusable_sync`, `EGL_KHR_cl_event2`, `EGL_KHR_image_base`,
+`EGL_KHR_gl_renderbuffer_image`, `EGL_KHR_gl_texture_2D_image`,
+`EGL_KHR_gl_texture_cubemap_image`, `EGL_KHR_context_flush_control`,
+`EGL_EXT_pixel_format_float`, `EGL_EXT_config_select_group`,
+`EGL_EXT_surface_compression`, `EGL_MESA_gl_interop`, `EGL_MESA_query_driver`
+and `EGL_MESA_x11_native_visual_id` (read in `egl_dri2.c`, `dri2_setup_screen`
+of Mesa 26.3.1). With a condition on what the softpipe driver reports:
+`EGL_KHR_gl_colorspace`, `EGL_KHR_gl_texture_3D_image`, `EGL_KHR_partial_update`,
+`EGL_IMG_context_priority`, `EGL_EXT_create_context_robustness` and its
+companion, `EGL_ANDROID_blob_cache`. The guest was not asked which of these the
+driver reports, so treat the second list as unconfirmed; the probes use only
+`EGL_KHR_swap_buffers_with_damage` and `EGL_KHR_surfaceless_context`.
+`EGL_EXT_buffer_age`, `EGL_EXT_image_dma_buf_import`, the Wayland and Android
+extensions of the first two lists are not offered (the platform has no buffer
+age, no dma-buf and no such window system).
+
+OpenGL ES is Mesa's softpipe: ES 2.0, 3.0 and 3.1 (3.2 is not offered by the
+driver). The client libraries the program links are the ones in `libmesa.a`.
+
 ## The platform
 
 `eglGetDisplay(EGL_DEFAULT_DISPLAY)` is the display of the platform of
@@ -192,9 +240,43 @@ a child of `fork`; `EGL_NOT_INITIALIZED` after `eglTerminate`.
 
 Pixmap surfaces, `EGL_OPENGL_API` and `EGL_OPENVG_API`, OpenGL ES 1,
 multisampling, resizing of a window surface, `EGL_STAFETO_*` extensions, EGL
-images as sources of OpenWF Composition, and a number for
+images as sources of OpenWF Composition (with the readiness marks of the service
+and a path that shows a frame with no copy, the next step of the graphics
+track), fences that signal a descriptor (`EGL_ANDROID_native_fence_sync`), and a number for
 `eglGetPlatformDisplay` of the platform of stafeto: until one is registered the
 default display is the way in.
+
+## Departures from the plan
+
+The plan of the step is `plans/2026-11-22-graphics-g8.md` of the design
+repository. What the code does differently:
+
+- The copy into the window buffer keeps the rows top first, with no flip (the
+  plan asked for a flip): the frame of a window-system framebuffer is top-down
+  in Mesa already.
+- A surface compares `getpid()` at every swap and read, where the plan had a
+  handler registered with `pthread_atfork` that marks the surfaces dead.
+- The value of a native window is the window number plus 1 (the plan took the
+  number itself, and the common code of Mesa refuses 0).
+- Pbuffer-only configurations for the other formats of the driver exist (the
+  plan had only the two window formats); they serve the cases of the dEQP
+  sets for 5-6-5, 10-10-10-2 and 16 bits a channel.
+- dEQP gets a stub pixmap factory with a null handle, which lets the tests of
+  the negative API reach `eglCreatePixmapSurface` and `eglCopyBuffers`; the
+  call still refuses.
+- Mesa is built as the Linux platform of its build system (`system = 'linux'`
+  of the cross file) with `__linux__` defined for the programs, because the
+  headers of relibc need it; the macro `__stafeto__` marks the system.
+- Windows of 480 by 480 points need a screen larger than the 640 by 400 of the
+  service: three cases of the dEQP set (`fence_sync`, `preserve_swap`,
+  `swap_buffers_with_damage`) report `NotSupported` and sit in the list of
+  departures (`tests/deqp/departures.txt`, issue #605).
+- No multisampling: the platform offers no configuration with samples, so the
+  ES 3.0 run through `cts_runner`, which asks for it, is not possible; the sets
+  run are `deqp-egl`, `deqp-gles2`, `deqp-gles3` and `deqp-gles31`.
+- No number of a platform is registered for `eglGetPlatformDisplay`, and no
+  `EGL_STAFETO_*` extension exists. Whether to ask Khronos for them is the
+  owner's decision (publication); until then the default display is the way in.
 
 ## Probes
 
@@ -242,6 +324,29 @@ default display is the way in.
   `services/init/src/table/gles.rs` (the demo's record and the process service's
   pool have quotas above 64 MiB for the programs it starts).
 
+## Numbers of a frame
+
+All of them are on the software path, so the time of a frame is the time of
+softpipe on the host's processor and the cost of the emulation.
+
+- The draw of the cube under `-icount` (QEMU, virtual time) takes about 0.65 to
+  0.81 seconds a frame (`gles-cube --stamps` in `cargo xtask gles-probe steps`;
+  36 stamps in three runs of `probe.yml` on 2026-11-26, 654,524 us the least and
+  813,372 us the greatest). The cube is therefore never a
+  client of 60 Hz under `-icount`; the probes judge the other clients beside it
+  (see "The level of a client that draws").
+- Under HVF on an Apple M-series host the same draw takes about 1.7 ms a frame
+  (`cargo xtask gles-probe load --hvf` prints it; it runs on the host and
+  not in ci, so the figure depends on the machine).
+- The copy into the window buffer (the `putImage` of the platform) is 387 us for
+  a whole frame of the cube's window under `-icount` and 87 us for a smaller
+  one, the post is 169 to 251 us (549 us for the first, a whole window), and the
+  wait for a free buffer 14 to 25 us (`STAFETO_EGL_STAMPS`, same runs).
+- `eglSwapInterval(1)` waits for the compositor to take the frame: up to one
+  period of 16.7 ms under `-icount` in the paced phases (the longest wait of
+  those runs, 18,055 us), and the probe requires that no wait ran out (the limit
+  is one second).
+
 ## Clock stamps
 
 With the variable `STAFETO_EGL_STAMPS` set in the environment of a program, each
@@ -269,6 +374,14 @@ reaper thread at that level, never inside a step of the service's loop. `cargo x
 gles-probe load` judges the cube at that level under -icount: no late frame of a paced
 client beside it when none is late alone, none over two periods, a wake-up at most 2000 us
 longer, no wait of the swap interval that ran out and none over two periods.
+
+The rule of the level: a client that draws on the processor runs at 28, with the
+ceiling 29, below the interactive clients at 30 and 31, and the image of the
+process (its code, tens of megabytes with Mesa) is released at that level too.
+The level is the whole separation: a time budget (a sporadic server) cannot be
+given to a POSIX thread yet (`SCHED_SPORADIC` is refused with `EINVAL` or `ENOTSUP`, and budgets
+belong to the services of init's tables), so a client of this kind that runs
+for a long time shares the processor only through its level.
 
 ## Waits and threads
 

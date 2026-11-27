@@ -866,7 +866,8 @@ stays with them.
 - **Limits.** One screen (number 0) and one context, from any device: a second is
   `WFC_ERROR_IN_USE`. No off-screen context (`wfcCreateOffScreenContext` answers
   `WFC_ERROR_UNSUPPORTED`), and `wfcFence` answers `WFC_ERROR_ILLEGAL_ARGUMENT`
-  (there is no EGL). Up to four devices, 16 elements, 8 sources and 8 masks for
+  (an image of EGL is not a buffer of the service, and a signal that does not
+  wait needs readiness marks). Up to four devices, 16 elements, 8 sources and 8 masks for
   each. The device reports the class fully capable, which section 4.1.1 of the
   specification ties to off-screen contexts: a departure.
 - **Threads and signals.** Each device has a lock held for a whole call, a wait
@@ -918,7 +919,13 @@ covers is 50 bands and 2 periods), the window manager
 and the keyboard in the base image (the manager's image is the probe's), the
 pointer in the base image, the layers of the display
 controller, a window of the second revision shown directly (the flag `SCANOUT`
-of WINDOW_CREATE is reserved), and the C functions for windows in `libc.so`
+of WINDOW_CREATE is reserved), readiness marks in the service (the signal that
+a client's drawing is done, which `wfcFence` and the fences of EGL need), a
+graphics buffer that is an object of memory the service can see (EGL images as
+the source of an element, and a frame that reaches the screen with no copy; the
+swap of EGL copies the frame into a window buffer today), a screen larger than
+640 by 400 points (the window cases of the dEQP set that open 480 by 480 points
+wait for it), and the C functions for windows in `libc.so`
 (a change of the ABI series, 0.6; the static library above has them now, and
 `docs/lvgl.md` tells the program that uses them). `docs/openwf.md` is the page
 for the OpenWF interfaces.

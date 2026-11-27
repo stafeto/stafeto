@@ -51,7 +51,7 @@ The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) a
 
 **Later subprojects**
 
-- Graphics and input: virtio-gpu, touch input, a compositor; Doom as the first playable target (under way).
+- Graphics and input: virtio-gpu, touch input, a compositor; Doom as the first playable target (under way). C programs draw with EGL 1.5 and OpenGL ES 2.0, 3.0 and 3.1 on Mesa's softpipe driver into windows of the compositor, and show scenes with OpenWF Composition and Display (`docs/egl.md`, `docs/openwf.md`); the dEQP suite of Khronos runs against it (`docs/deqp.md`).
 - Network: IPv4 is in. BusyBox `wget` fetches over HTTP and over HTTPS with TLS 1.2 only; it checks no certificate, so use it where the content is verified another way (see `docs/posix-coverage.md`, Names and `wget`).
 - Apps: an app sandbox. The package format and signed packages are in.
 
@@ -81,6 +81,7 @@ cargo xtask help         # every command
 | [docs/posix-coverage.md](docs/posix-coverage.md) | POSIX coverage and the conformance work left |
 | [docs/openwf.md](docs/openwf.md) | OpenWF Composition and Display for C programs: what is implemented, how to run the demo, the differences and the real-time properties |
 | [docs/cxx.md](docs/cxx.md) | C++ programs: libc++, libc++abi and libunwind, how to link them, what the probe checks and the limits |
+| [docs/egl.md](docs/egl.md) | EGL and OpenGL ES on Mesa's softpipe driver: the platform for compositor windows, the functions and extensions, the configurations, swaps, threads, the level of a client that draws, the numbers of a frame |
 | [docs/deqp.md](docs/deqp.md) | The dEQP test framework of VK-GL-CTS on stafeto: how it is built, the platform, the runner in batches, the baseline of the same Mesa on Linux, the departures and the deqp-smoke job |
 | [docs/packages.md](docs/packages.md) | how third-party programs are packaged |
 | [docs/release.md](docs/release.md) | versions and how a release is made |

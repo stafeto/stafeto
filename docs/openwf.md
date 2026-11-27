@@ -31,8 +31,9 @@ integer, float and vector attributes, `wfcInsertElement`, `wfcRemoveElement`,
 `wfcGetElementAbove`, `wfcGetElementBelow`, `wfcDestroyElement`) and the
 extension function `wfcNextStreamSTAFETO`. The functions the header declares
 for images (`wfcCreateSourceFromImage`, `wfcCreateMaskFromImage`) are not in
-the library: they need EGL, which stafeto does not have, and a program that
-calls them does not link.
+the library: an EGL image would have to be a buffer of the composition service,
+and the texture of the software driver lives in the memory of its process, so a
+program that calls them does not link (`docs/egl.md`, "Not offered").
 
 The Display functions that exist cover devices, events (`wfdCreateEvent`,
 `wfdDeviceEventAsync`, `wfdDeviceEventWait`, `wfdDeviceEventFilter`), ports
@@ -172,6 +173,22 @@ is a window of the composition service), and commits the scene that turns the cu
 window by 90 degrees and scales it by one half beside the field of cubes.
 `tools/wfc-ref` (`gles_frame`) draws that scene from the two windows' points.
 
+### EGL and the stream of OpenWF Composition
+
+A window surface of EGL is made over a window of the composition service
+(`<stafeto/window.h>`), and a window of the service is the stream of libWFC. So
+a program draws with `eglSwapBuffers` into a window and another program (or the
+same one) calls `wfcCreateSourceFromStream` with the stream of that window and
+shows it as an element; the swap posts a buffer and the service takes the latest
+one into the scene, as it does for any producer. The two APIs meet at the
+window only: libWFC knows nothing of EGL, and an EGL surface over a window that
+a scene shows needs no call of libWFC. The cube's window turned by 90 degrees
+and scaled by one half is this path, in the probe `cargo xtask gles-probe`.
+A client that draws on the processor runs below the interactive clients
+(`docs/egl.md`, "The level of a client that draws"), so a scene that transforms
+its window adds bands to the frames of the service; `docs/compositor.md` states
+the limit.
+
 The demo goes on to check the API on the way: the calls before a device, the
 device and its attributes, a second device, the context and its refusals, the
 streams and sources, the defaults and refusals of an element, the order of the
@@ -184,8 +201,11 @@ Composition:
 - No off-screen context: `wfcCreateOffScreenContext` answers
   `WFC_ERROR_UNSUPPORTED`. The device reports the class fully capable, which
   section 4.1.1 of the specification ties to off-screen rendering: a departure.
-- No images: there is no EGL, so sources and masks come from streams only;
-  `wfcFence` answers `WFC_ERROR_ILLEGAL_ARGUMENT`.
+- No images: EGL exists (Mesa's, `docs/egl.md`) and a window surface of EGL is a
+  stream, but an EGL image is memory of its process that the service cannot see,
+  so sources and masks come from streams only; `wfcFence` answers
+  `WFC_ERROR_ILLEGAL_ARGUMENT` as before, because an asynchronous signal needs
+  readiness marks in the service.
 - One screen (0) and one context; a second is `WFC_ERROR_IN_USE`.
 - Limits: 4 devices, 16 elements, 8 sources, 8 masks. The 17th element is
   `WFC_ERROR_OUT_OF_MEMORY`.
@@ -224,7 +244,7 @@ Display:
   `WFD_ERROR_ILLEGAL_ARGUMENT`.
 - Masks are not supported: `wfdCreateMaskFromStream` answers
   `WFD_ERROR_NOT_SUPPORTED`, `wfdDestroyMask` answers `WFD_ERROR_BAD_HANDLE`.
-  The images need EGL.
+  The images are not offered (see the composition part).
 - `wfdSetPipelineTSColor` with a valid format answers
   `WFD_ERROR_NOT_SUPPORTED`.
 - A pipeline has no flip, mirror or rotation (only 0 is accepted); the filter

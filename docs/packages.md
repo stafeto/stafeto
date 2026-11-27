@@ -136,6 +136,13 @@ them for the licence notes of the image.
   configured them are compared again), the cross file, the patches (and that they apply
   to the cached archive), the static libraries of the build tree, the checks for names
   defined twice, shared with the C library or the C++ runtime, and left undefined.
+- VK-GL-CTS (dEQP, Apache-2.0, tag `opengl-es-cts-3.2.14.1`) has no package record:
+  its programs (`deqp-egl`, `deqp-gles2`, `deqp-gles3`, `deqp-gles31`) go into the test
+  images only and never into a release. `tools/build-deqp.py` builds them against the
+  archives of the packages `mesa` and `libcxx` (`docs/deqp.md`); the licences of the tree
+  and of the sources it fetches are in `tests/deqp/LICENSES.md` and the texts of what is
+  linked in `target/deqp/NOTICES` (`docs/graphics-licenses.md` lists every licence of the graphics stack). The package `libcxx` serves Mesa and dEQP as well as
+  C++ programs, and the record of Mesa names it in `build_depends`.
 - FreeType (`packages/freetype.toml`, FTL, 2.14.3) is an optional package of the
   image kind `games` that installs no file: the package `lvgl` links it and
   names it in `build_depends`, so the notices of `lvgl` carry its licence.
