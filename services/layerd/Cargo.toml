@@ -22,6 +22,9 @@ bench = false
 # a layer of the user deleted shows again (`cargo xtask layer-names breaks`).
 # `break-layerd-search`: the walk of a path does not check the right to search the directories of
 # the layer of the user.
+# `break-layerd-no-mark`: a name of the lower set that goes is not marked on the volume (the index
+# hides it until the service starts again: `cargo xtask layer-posix write breaks`).
+# `break-layerd-sticky`: the sticky bit of a directory is not looked at by a removal or a rename.
 # `probe-restart`: an OPEN of a name that ends in `/.die` ends the service with the exit code 1 (init
 # starts it again), for `cargo xtask layer-restart`.
 # `break-layerd-one-step`: the build of the index walks the whole layer in one step of the loop, so
@@ -36,8 +39,13 @@ break-layerd-one-step = []
 # `break-layerd-slots`: a request of a listing looks at 4,096 slots of the index, so the step is over
 # 0.9 B and the step gate of `cargo xtask layer-steps breaks` alone catches it.
 break-layerd-slots = []
+# `break-layerd-change-one-step`: a change job does all its work in one step of the loop, so the longest
+# step grows with the change and the step gate alone catches it.
+break-layerd-change-one-step = []
 break-layerd-whiteout = []
 break-layerd-search = []
+break-layerd-no-mark = []
+break-layerd-sticky = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

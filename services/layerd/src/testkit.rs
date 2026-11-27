@@ -3,7 +3,7 @@
 
 //! A data volume and a lower set in memory, for the tests of the service.
 
-use crate::volume::{Lower, R, Visit, Volume};
+use crate::volume::{Lower, LowerStat, R, Visit, Volume};
 use proto_data as d;
 use proto_wire::Status;
 use std::collections::BTreeMap;
@@ -22,6 +22,7 @@ pub struct Node {
     pub gid: u32,
     pub ino: u64,
     pub data: Vec<u8>,
+    pub times: (i64, i64),
 }
 
 #[derive(Default)]
@@ -34,6 +35,8 @@ pub struct FakeVolume {
     pub batch: usize,
     /// The calls made, by name.
     pub calls: Vec<String>,
+    /// The paths and flags of the opens.
+    pub opens: Vec<(Vec<u8>, u32)>,
     pub not_ready: bool,
 }
 
@@ -54,6 +57,7 @@ impl FakeVolume {
                 gid: 0,
                 ino: 1,
                 data: Vec::new(),
+                times: (0, 0),
             },
         );
         v
@@ -70,6 +74,7 @@ impl FakeVolume {
                 gid: uid,
                 ino,
                 data: Vec::new(),
+                times: (0, 0),
             },
         );
         self
@@ -97,6 +102,7 @@ impl FakeVolume {
                 gid: uid,
                 ino,
                 data: data.to_vec(),
+                times: (0, 0),
             },
         );
         self
@@ -114,6 +120,49 @@ impl FakeVolume {
         } else {
             Ok(())
         }
+    }
+
+    fn open_at(&mut self, path: &[u8], flags: u32, mode: u32, ino: Option<u64>) -> R<u32> {
+        self.opens.push((path.to_vec(), flags));
+        if !self.nodes.contains_key(path) {
+            if flags & d::CREATE == 0 {
+                return Err(st(d::NO_ENTRY));
+            }
+            let parent = match path.iter().rposition(|&b| b == b'/') {
+                Some(0) => b"/".to_vec(),
+                Some(i) => path[..i].to_vec(),
+                None => return Err(st(d::INVALID)),
+            };
+            if !self.nodes.get(&parent).is_some_and(|n| n.dir) {
+                return Err(st(d::NO_ENTRY));
+            }
+            let ino = ino.unwrap_or_else(|| self.fresh());
+            self.nodes.insert(
+                path.to_vec(),
+                Node {
+                    dir: false,
+                    mode,
+                    uid: 0,
+                    gid: 0,
+                    ino,
+                    data: Vec::new(),
+                    times: (0, 0),
+                },
+            );
+        } else if flags & d::CREATE != 0 && flags & d::EXCLUSIVE != 0 {
+            return Err(st(d::EXISTS));
+        }
+        let node = &self.nodes[path];
+        if flags & d::DIRECTORY != 0 && !node.dir {
+            return Err(st(d::NOT_DIRECTORY));
+        }
+        if flags & d::TRUNCATE != 0 {
+            self.nodes.get_mut(path).unwrap().data.clear();
+        }
+        let h = self.next_handle;
+        self.next_handle += 1;
+        self.handles.insert(h, (path.to_vec(), 0));
+        Ok(h)
     }
 
     pub fn children(&self, dir: &[u8]) -> Vec<(Vec<u8>, Node)> {
@@ -160,44 +209,56 @@ fn stat_of(n: &Node) -> d::Stat {
 impl Volume for FakeVolume {
     type Pass = Vec<u8>;
 
-    fn open(&mut self, path: &[u8], flags: u32, _mode: u32) -> R<u32> {
+    fn open(&mut self, path: &[u8], flags: u32, mode: u32) -> R<u32> {
         self.check("open")?;
-        if !self.nodes.contains_key(path) {
-            if flags & d::CREATE == 0 {
-                return Err(st(d::NO_ENTRY));
-            }
-            let parent = match path.iter().rposition(|&b| b == b'/') {
-                Some(0) => b"/".to_vec(),
-                Some(i) => path[..i].to_vec(),
-                None => return Err(st(d::INVALID)),
-            };
-            if !self.nodes.get(&parent).is_some_and(|n| n.dir) {
-                return Err(st(d::NO_ENTRY));
-            }
-            let ino = self.fresh();
-            self.nodes.insert(
-                path.to_vec(),
-                Node {
-                    dir: false,
-                    mode: 0o600,
-                    uid: 0,
-                    gid: 0,
-                    ino,
-                    data: Vec::new(),
-                },
-            );
+        self.open_at(path, flags, mode, None)
+    }
+
+    fn open_numbered(&mut self, path: &[u8], flags: u32, mode: u32, ino: u64) -> R<u32> {
+        self.check("open_numbered")?;
+        if self.nodes.contains_key(path) {
+            return Err(st(d::EXISTS));
         }
-        let node = &self.nodes[path];
-        if flags & d::DIRECTORY != 0 && !node.dir {
-            return Err(st(d::NOT_DIRECTORY));
+        self.open_at(path, flags, mode, Some(ino))
+    }
+
+    fn truncate(&mut self, handle: u32, size: u64) -> R<()> {
+        self.check("truncate")?;
+        let (path, _) = self.handles.get(&handle).ok_or(st(d::BAD_HANDLE))?;
+        self.nodes
+            .get_mut(path.as_slice())
+            .unwrap()
+            .data
+            .resize(size as usize, 0);
+        Ok(())
+    }
+
+    fn chmod(&mut self, path: &[u8], mode: u32) -> R<()> {
+        self.check("chmod")?;
+        self.nodes.get_mut(path).ok_or(st(d::NO_ENTRY))?.mode = mode;
+        Ok(())
+    }
+
+    fn chown(&mut self, path: &[u8], uid: u32, gid: u32) -> R<()> {
+        self.check("chown")?;
+        let n = self.nodes.get_mut(path).ok_or(st(d::NO_ENTRY))?;
+        if uid != d::UID_KEEP {
+            n.uid = uid;
         }
-        if flags & d::TRUNCATE != 0 {
-            self.nodes.get_mut(path).unwrap().data.clear();
+        if gid != d::UID_KEEP {
+            n.gid = gid;
         }
-        let h = self.next_handle;
-        self.next_handle += 1;
-        self.handles.insert(h, (path.to_vec(), 0));
-        Ok(h)
+        // A change of owner clears the set-ID bits of a file.
+        if !n.dir {
+            n.mode &= !0o6000;
+        }
+        Ok(())
+    }
+
+    fn utimens(&mut self, path: &[u8], atime: i64, mtime: i64) -> R<()> {
+        self.check("utimens")?;
+        self.nodes.get_mut(path).ok_or(st(d::NO_ENTRY))?.times = (atime, mtime);
+        Ok(())
     }
 
     fn close(&mut self, handle: u32) -> R<()> {
@@ -243,6 +304,14 @@ impl Volume for FakeVolume {
         if self.nodes.contains_key(path) {
             return Err(st(d::EXISTS));
         }
+        let parent = match path.iter().rposition(|&b| b == b'/') {
+            Some(0) => b"/".to_vec(),
+            Some(i) => path[..i].to_vec(),
+            None => return Err(st(d::INVALID)),
+        };
+        if !self.nodes.get(&parent).is_some_and(|n| n.dir) {
+            return Err(st(d::NO_ENTRY));
+        }
         let ino = self.fresh();
         self.nodes.insert(
             path.to_vec(),
@@ -253,6 +322,7 @@ impl Volume for FakeVolume {
                 gid: 0,
                 ino,
                 data: Vec::new(),
+                times: (0, 0),
             },
         );
         Ok(())
@@ -260,13 +330,43 @@ impl Volume for FakeVolume {
 
     fn rename(&mut self, from: &[u8], to: &[u8]) -> R<()> {
         self.check("rename")?;
-        let node = self.nodes.remove(from).ok_or(st(d::NO_ENTRY))?;
+        let node = self.nodes.get(from).cloned().ok_or(st(d::NO_ENTRY))?;
+        if let Some(over) = self.nodes.get(to) {
+            if node.dir != over.dir {
+                return Err(st(if over.dir {
+                    d::IS_DIRECTORY
+                } else {
+                    d::NOT_DIRECTORY
+                }));
+            }
+            if over.dir && !self.children(to).is_empty() {
+                return Err(st(d::NOT_EMPTY));
+            }
+        }
+        // A directory takes everything below it along.
+        let prefix = [from, b"/"].concat();
+        let below: Vec<Vec<u8>> = self
+            .nodes
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for old in below {
+            let n = self.nodes.remove(&old).unwrap();
+            let mut new = to.to_vec();
+            new.extend_from_slice(&old[from.len()..]);
+            self.nodes.insert(new, n);
+        }
+        self.nodes.remove(from);
         self.nodes.insert(to.to_vec(), node);
         Ok(())
     }
 
     fn unlink(&mut self, path: &[u8]) -> R<()> {
         self.check("unlink")?;
+        if self.nodes.get(path).is_some_and(|n| n.dir) {
+            return Err(st(d::IS_DIRECTORY));
+        }
         self.nodes.remove(path).map(|_| ()).ok_or(st(d::NO_ENTRY))
     }
 
@@ -320,6 +420,9 @@ impl Volume for FakeVolume {
 #[derive(Default)]
 pub struct FakeLower {
     pub nodes: BTreeMap<Vec<u8>, (u32, u64)>,
+    /// The mode, owner and group of a name; 0755 or 0644 and user 0 where none is set.
+    pub attrs: BTreeMap<Vec<u8>, (u32, u32, u32)>,
+    pub stats: usize,
     pub opened: usize,
     pub closed: usize,
     /// The entries `next` gave (and the ones it found at the end), for the cost of a request.
@@ -345,6 +448,17 @@ impl FakeLower {
 
     pub fn file(&mut self, path: &str, ino: u64) -> &mut Self {
         self.nodes.insert(path.as_bytes().to_vec(), (2, ino));
+        self
+    }
+
+    pub fn link(&mut self, path: &str, ino: u64) -> &mut Self {
+        self.nodes.insert(path.as_bytes().to_vec(), (5, ino));
+        self
+    }
+
+    pub fn attr(&mut self, path: &str, mode: u32, uid: u32, gid: u32) -> &mut Self {
+        self.attrs
+            .insert(path.as_bytes().to_vec(), (mode, uid, gid));
         self
     }
 }
@@ -393,4 +507,94 @@ impl Lower for FakeLower {
     fn readlink(&mut self, _: &[u8], _: &mut [u8]) -> R<usize> {
         Err(st(proto_fs::INVALID_ARGUMENT))
     }
+
+    fn stat(&mut self, path: &[u8], _follow: bool) -> R<LowerStat> {
+        self.stats += 1;
+        // A name below a file or a link is no name.
+        let mut at = 0;
+        while let Some(i) = path[at + 1..].iter().position(|&b| b == b'/') {
+            at += 1 + i;
+            if matches!(self.nodes.get(&path[..at]), Some((k, _)) if *k != 1) {
+                return Err(st(proto_fs::NOT_DIRECTORY));
+            }
+        }
+        let (kind, ino) = *self.nodes.get(path).ok_or(st(proto_fs::NO_ENTRY))?;
+        let (mode, uid, gid) =
+            self.attrs
+                .get(path)
+                .copied()
+                .unwrap_or((if kind == 1 { 0o755 } else { 0o644 }, 0, 0));
+        Ok(LowerStat {
+            kind,
+            mode,
+            uid,
+            gid,
+            ino,
+        })
+    }
+}
+
+/// The names of the volume of the scale probe (`xtask::data_image::layer_steps_entries`: 8,192
+/// names, the chain of 246 directories, `/long`, `/etc` with 1,024 files, `d00` and on) and, as
+/// that volume has them after the part that adds the marks, `/opq` and `/marks` with `marks` marks.
+/// Each name is inserted in the index in the order the build lists them: the directory, the id, the
+/// name and the id it got.
+pub fn scale_set(
+    ix: &mut crate::index::Index,
+    marks: usize,
+) -> Result<Vec<(u32, Vec<u8>, u32)>, crate::index::Error> {
+    use crate::index::{Fields, Kind};
+    let fields = |kind| Fields {
+        kind,
+        layer: 0,
+        number: 1,
+        uid: 0,
+        gid: 0,
+        mode: 0o755,
+    };
+    let mut out = Vec::new();
+    let mut put = |ix: &mut crate::index::Index,
+                   parent: u32,
+                   name: &str,
+                   kind: Kind|
+     -> Result<u32, crate::index::Error> {
+        let id = ix.insert_shallow(parent, name.as_bytes(), fields(kind))?;
+        out.push((parent, name.as_bytes().to_vec(), id));
+        Ok(id)
+    };
+    let mut names = 0;
+    let mut at = 0;
+    for _ in 0..246 {
+        at = put(ix, at, "a", Kind::Dir)?;
+        names += 1;
+    }
+    put(ix, at, "f", Kind::File)?;
+    names += 1;
+    let long = put(ix, 0, "long", Kind::Dir)?;
+    put(ix, long, &"n".repeat(200), Kind::File)?;
+    names += 2;
+    let etc = put(ix, 0, "etc", Kind::Dir)?;
+    names += 1;
+    for k in 0..1024 {
+        put(ix, etc, &std::format!("x{k:04}"), Kind::File)?;
+        names += 1;
+    }
+    let mut d = 0;
+    while names < 8192 {
+        let dir = put(ix, 0, &std::format!("d{d:02}"), Kind::Dir)?;
+        names += 1;
+        let mut k = 0;
+        while k < 1024 && names < 8192 {
+            put(ix, dir, &std::format!("n{k:04}"), Kind::File)?;
+            names += 1;
+            k += 1;
+        }
+        d += 1;
+    }
+    put(ix, 0, "opq", Kind::Dir)?;
+    let dir = put(ix, 0, "marks", Kind::Dir)?;
+    for k in 0..marks {
+        put(ix, dir, &std::format!("m{k:04}"), Kind::Whiteout)?;
+    }
+    Ok(out)
 }

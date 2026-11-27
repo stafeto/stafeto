@@ -25,6 +25,10 @@ pub const PER_PROCESS: usize = 32;
 pub const HOLDERS: usize = 8;
 const _: () = assert!(PLACES <= proto_fs::names::PLACES_MAX);
 
+/// The directory of a description whose directory was removed: it lists nothing and has no
+/// attributes.
+pub const GONE: u32 = u32::MAX;
+
 /// Where a listing stands: the stage and the position in it (`proto_fs::names::cursor`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Position {
@@ -39,6 +43,11 @@ pub struct Description<D> {
     pub pid: u32,
     /// The id of the directory in the index (0 is the root of the layer).
     pub dir: u32,
+    /// The lower set was hidden from the directory when the description was made (it or a
+    /// directory above it is opaque): the listing has no second stage. The bit stays as OPEN
+    /// found it: a rename of the directory into or out of an opaque one does not change a
+    /// description that is open.
+    pub hidden: bool,
     pub position: Position,
     /// The furthest position the replies gave out: SEEK_DIR goes back to one, never past it.
     pub given: Position,
@@ -124,7 +133,7 @@ impl<D> Table<D> {
     }
 
     /// A new description of the directory `dir` for `owner`; its handle.
-    pub fn make(&mut self, owner: u64, pid: u32, dir: u32) -> Result<u32, Refused> {
+    pub fn make(&mut self, owner: u64, pid: u32, dir: u32, hidden: bool) -> Result<u32, Refused> {
         if self.held_by(owner) >= PER_SESSION {
             return Err(Refused::PerSession);
         }
@@ -144,6 +153,7 @@ impl<D> Table<D> {
             holders,
             pid,
             dir,
+            hidden,
             position: Position::default(),
             given: Position::default(),
             lower: None,
@@ -205,6 +215,19 @@ impl<D> Table<D> {
         Ok(())
     }
 
+    /// The directory `old` of the index is now `new` (a rename moved it to a slot of its own):
+    /// the descriptions of it follow.
+    pub fn retarget(&mut self, old: u32, new: u32) {
+        for d in self.slots.iter_mut().flatten().filter(|d| d.dir == old) {
+            d.dir = new;
+        }
+    }
+
+    /// The directory `dir` of the index is gone (removed): its descriptions list nothing.
+    pub fn forget(&mut self, dir: u32) {
+        self.retarget(dir, GONE);
+    }
+
     /// The session `owner` went: the descriptions it was the last holder of, one by one (the
     /// others lose one holder and live on).
     pub fn take_owned(&mut self, owner: u64) -> Option<Description<D>> {
@@ -234,7 +257,7 @@ mod tests {
     #[test]
     fn a_handle_names_its_place_its_generation_and_its_epoch() {
         let mut t = Table::<()>::new(7);
-        let a = t.make(1, 100, 5).unwrap();
+        let a = t.make(1, 100, 5, false).unwrap();
         assert_eq!(t.get(1, a).unwrap().dir, 5);
         // Another session, a closed description and a forged generation are BAD_FD.
         assert_eq!(t.get(2, a).err(), Some(Lost::Bad));
@@ -242,14 +265,14 @@ mod tests {
         assert_eq!(t.get(1, a).err(), Some(Lost::Bad));
         assert_eq!(t.close(1, a).err(), Some(Lost::Bad));
         // The place is taken again with the next generation: the old handle stays dead.
-        let b = t.make(1, 100, 6).unwrap();
+        let b = t.make(1, 100, 6, false).unwrap();
         assert_ne!(a, b);
         assert_eq!(t.get(1, a).err(), Some(Lost::Bad));
         assert_eq!(t.get(1, b).unwrap().dir, 6);
         // A handle of another epoch is STALE, whatever else it says.
         let other = Table::<()>::new(8);
         let mut other = other;
-        let c = other.make(1, 100, 1).unwrap();
+        let c = other.make(1, 100, 1, false).unwrap();
         assert_eq!(t.get(1, c).err(), Some(Lost::Stale));
         assert_eq!(t.get(1, 0).err(), Some(Lost::Stale));
     }
@@ -258,34 +281,34 @@ mod tests {
     fn a_session_holds_sixteen_and_the_table_a_hundred_and_twenty_eight() {
         let mut t = Table::<()>::new(1);
         for _ in 0..PER_SESSION {
-            t.make(1, 100, 0).unwrap();
+            t.make(1, 100, 0, false).unwrap();
         }
-        assert_eq!(t.make(1, 100, 0).err(), Some(Refused::PerSession));
+        assert_eq!(t.make(1, 100, 0, false).err(), Some(Refused::PerSession));
         let mut owner = 2;
         let mut made = PER_SESSION;
         while made < PLACES {
             for _ in 0..PER_SESSION.min(PLACES - made) {
-                t.make(owner, 1000 + owner as u32, 0).unwrap();
+                t.make(owner, 1000 + owner as u32, 0, false).unwrap();
                 made += 1;
             }
             owner += 1;
         }
         assert_eq!(t.count(), PLACES);
-        assert_eq!(t.make(99, 5000, 0).err(), Some(Refused::Full));
+        assert_eq!(t.make(99, 5000, 0, false).err(), Some(Refused::Full));
         let mut freed = 0;
         while t.take_owned(1).is_some() {
             freed += 1;
         }
         assert_eq!(freed, PER_SESSION);
         assert_eq!(t.held_by(1), 0);
-        assert!(t.make(99, 5000, 0).is_ok());
+        assert!(t.make(99, 5000, 0, false).is_ok());
     }
 
     #[test]
     fn a_clone_shares_a_description_and_it_goes_with_its_last_holder() {
         let mut t = Table::<u8>::new(3);
-        let a = t.make(1, 100, 5).unwrap();
-        let b = t.make(1, 100, 6).unwrap();
+        let a = t.make(1, 100, 5, false).unwrap();
+        let b = t.make(1, 100, 6, false).unwrap();
         // The session 2 takes a share of both: one description each, held by two.
         assert_eq!(t.share(1, &[a, b], 2), Ok(()));
         assert_eq!(t.count(), 2);
@@ -311,8 +334,8 @@ mod tests {
     #[test]
     fn a_share_is_all_or_none_and_has_its_limits() {
         let mut t = Table::<u8>::new(3);
-        let a = t.make(1, 100, 5).unwrap();
-        let b = t.make(1, 100, 6).unwrap();
+        let a = t.make(1, 100, 5, false).unwrap();
+        let b = t.make(1, 100, 6, false).unwrap();
         // A handle the session does not hold, and a handle of another epoch.
         assert_eq!(t.share(2, &[a], 3), Err(ShareError::Lost(Lost::Bad)));
         assert_eq!(
@@ -335,9 +358,9 @@ mod tests {
         let mut t = Table::<u8>::new(3);
         let mut handles = [0u32; PER_SESSION];
         for h in handles.iter_mut() {
-            *h = t.make(1, 100, 1).unwrap();
+            *h = t.make(1, 100, 1, false).unwrap();
         }
-        let extra = t.make(5, 200, 1).unwrap();
+        let extra = t.make(5, 200, 1, false).unwrap();
         assert_eq!(t.share(1, &handles, 2), Ok(()));
         assert_eq!(t.share(5, &[extra], 2), Err(ShareError::Full));
     }

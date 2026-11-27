@@ -28,7 +28,6 @@ layer = ["data", "posix-abi/layer", "posix-platform/layer"]
 break-layer-route = ["layer", "posix-abi/break-layer-route"]
 break-layer-clone = ["layer", "posix-abi/break-layer-clone"]
 break-layer-fd-guard = ["layer", "posix-abi/break-layer-fd-guard"]
-break-layer-refuse = ["layer", "posix-abi/break-layer-refuse"]
 # Part of libc.so, the C library that dynamically linked programs share:
 # `stafeto_start(area, main)` replaces the program's `main` symbol and
 # `__ehdr_start`; the loader writes the auxiliary vector (spec 2, 3.12.3).

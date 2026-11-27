@@ -16,7 +16,7 @@
 //! The root channel (label `proto_layer::ROOT`) takes SESSION (18 of proto_layer, 70 of the names)
 //! and VERIFY_SESSION (71). A session is bound at birth to the process the copy of the identity
 //! session names (Vouch), and serves LIST and STATUS of proto_layer and the names OPEN, STAT,
-//! FSTAT, READ_DIR, REWIND, SEEK_DIR, CLOSE, BIND, ACCESS, READLINK and CHANGE (read only). The
+//! FSTAT, READ_DIR, REWIND, SEEK_DIR, CLOSE, BIND, ACCESS, READLINK and CHANGE. The
 //! other methods of proto_layer that carry a selector answer NOT_FOUND. CLONE makes a session for
 //! a child of a fork or a spawn that shares the descriptions it names (one position for the
 //! holders, as POSIX shares an open file description), and CLONE_MORE adds descriptions to it
@@ -33,6 +33,7 @@ mod notary;
 use abi::Rights;
 use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Release};
+use layerd::changejob::{ChangeJob, ChangeStep};
 use layerd::identity::{Binding, Vouched, vouched_from};
 use layerd::index::Index;
 use layerd::names::{Client, Core, Done, OpenCont, Prewalk, State};
@@ -120,6 +121,11 @@ unsafe impl<T> Sync for Cell<T> {}
 
 static INDEX: Cell<Index> = Cell(UnsafeCell::new(Index::new()));
 static SCAN: Cell<Scan> = Cell(UnsafeCell::new(Scan::new()));
+static WORKERS: Cell<layerd::reaper::Workers> =
+    Cell(UnsafeCell::new(layerd::reaper::Workers::new()));
+/// The change jobs, one for each place of the table of jobs.
+type Change = ChangeJob<data::Data, lower::Ram>;
+static CHANGES: Cell<[Change; JOBS]> = Cell(UnsafeCell::new([const { Change::new() }; JOBS]));
 
 /// The registrar thread: the root goes to the process service, tried until it is there.
 static PARENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -241,15 +247,27 @@ fn main(_: u64) -> u64 {
         rt::service::table_steps_from(16);
     }
     // SAFETY: the statics are used by this thread alone from here on.
-    let (index, scan) = unsafe { (&mut *INDEX.0.get(), &mut *SCAN.0.get()) };
+    let (index, scan, workers, changes) = unsafe {
+        (
+            &mut *INDEX.0.get(),
+            &mut *SCAN.0.get(),
+            &mut *WORKERS.0.get(),
+            &mut *CHANGES.0.get(),
+        )
+    };
     touch_stack();
     touch(INDEX.0.get().cast(), core::mem::size_of::<Index>());
     touch(SCAN.0.get().cast(), core::mem::size_of::<Scan>());
-    index.reseed(rt::time::now() as u32 ^ (rt::time::now() >> 32) as u32 ^ 0x5bd1_e995);
+    index.reseed(
+        (u64::from(rt::time::now() as u32) << 32)
+            ^ rt::time::now().rotate_left(17)
+            ^ 0x5bd1_e995_9e37_79b9,
+    );
     let epoch = epoch_of(rt::time::now());
     let mut core = Core::new(
         index,
         scan,
+        workers,
         data::Data { session },
         lower::Ram { files },
         epoch,
@@ -272,6 +290,8 @@ fn main(_: u64) -> u64 {
         walk_step,
         jobs: [const { None }; JOBS],
         next_job: 0,
+        changes,
+        reap_turn: false,
         notary: notary::Notary::new(),
         next_label: 1,
         next_birth: 1,
@@ -336,6 +356,9 @@ struct Job {
 enum Stage {
     Walking(Prewalk),
     Opening(OpenCont),
+    /// A change of names: its state is `Layerd::changes[place]` (a change job runs in steps, one
+    /// call to a service in each, and never in the step of its request).
+    Changing,
 }
 
 enum JobKind {
@@ -343,6 +366,7 @@ enum JobKind {
     Stat { flags: u32 },
     Access { bits: u32, flags: u32 },
     Readlink,
+    Change,
 }
 
 struct Layerd {
@@ -358,6 +382,10 @@ struct Layerd {
     walk_step: Handle<Channel>,
     jobs: [Option<Job>; JOBS],
     next_job: usize,
+    changes: &'static mut [Change; JOBS],
+    /// The next step of the loop goes to the reaper when it has work (the jobs and the reaper
+    /// take turns).
+    reap_turn: bool,
     notary: notary::Notary,
     next_label: u64,
     next_birth: u32,
@@ -597,6 +625,41 @@ impl Layerd {
         status_of(self.core.share(parent, &handles[..count], to))
     }
 
+    /// The place of the table of jobs for a job of the session `label`, or the answer the request
+    /// gets: busy (`STARTING`) when the table is full or the session holds its share.
+    fn place_for(&self, label: u64) -> Result<usize, Answer> {
+        if !self.core.walkable() {
+            return Err(st(l::STARTING));
+        }
+        let held: [Option<u64>; JOBS] =
+            core::array::from_fn(|i| self.jobs[i].as_ref().map(|j| j.label));
+        layerd::jobs::place(&held, label).map_err(|_| st(l::STARTING))
+    }
+
+    /// The request waits as the job in `place`.
+    fn defer_at(
+        &mut self,
+        r: &mut Request<'_>,
+        place: usize,
+        who: Vouched,
+        label: u64,
+        kind: JobKind,
+        stage: Stage,
+    ) -> Answer {
+        let Some(pending) = r.defer() else {
+            return Answer::Status(Status::BadSize);
+        };
+        self.jobs[place] = Some(Job {
+            pending,
+            label,
+            who,
+            kind,
+            stage,
+        });
+        let _ = sys::notify(&self.walk_step, 1);
+        Answer::Deferred
+    }
+
     /// The request waits for its walk: a long path is walked `lookup::STEP` components in each step
     /// of the loop, and the step that finishes the walk finishes the request (`walk_job`). The
     /// answer is `Deferred`, or busy (`STARTING`, which the clients ask again) when the table of
@@ -640,29 +703,94 @@ impl Layerd {
     /// the open of its file; a job that is done is answered. A job of a session that went is
     /// dropped (its reply goes to nobody, the description it holds closes).
     fn walk_job(&mut self) {
+        // The jobs and the reaper take turns: a step is one or the other.
+        if self.core.reaping() && (self.reap_turn || !self.jobs.iter().any(Option::is_some)) {
+            self.reap_turn = false;
+            #[cfg(feature = "steps")]
+            rt::service::step_detail(1300);
+            if self.core.reap_step() || self.jobs.iter().any(Option::is_some) {
+                let _ = sys::notify(&self.walk_step, 1);
+            }
+            return;
+        }
+        self.reap_turn = true;
+        // A change job that does not hold the lock waits while another one does.
         let Some(place) = (0..JOBS)
             .map(|k| (self.next_job + k) % JOBS)
-            .find(|&i| self.jobs[i].is_some())
+            .find(|&i| self.runnable(i))
         else {
             return;
         };
         self.next_job = (place + 1) % JOBS;
-        if let Some(job) = self.jobs[place].take() {
-            if self.slot_of(job.label).is_none() {
+        let gone = self.jobs[place]
+            .as_ref()
+            .is_some_and(|job| self.slot_of(job.label).is_none());
+        if matches!(
+            self.jobs[place].as_ref().map(|j| &j.stage),
+            Some(Stage::Changing)
+        ) {
+            // A change job whose session went before its first call is dropped; after it the
+            // job runs to its end (its answer goes to nobody) and lets the lock go.
+            if gone && !self.changes[place].committed() {
+                self.core.change_abandon(&mut self.changes[place]);
+                self.jobs[place] = None;
+            } else {
+                self.change_job(place);
+            }
+        } else if let Some(job) = self.jobs[place].take() {
+            if gone {
                 if let Stage::Opening(cont) = job.stage {
                     self.core.open_abandon(cont);
                 }
             } else {
-                self.jobs[place] = self.advance(job);
+                self.jobs[place] = self.advance(place, job);
             }
         }
-        if self.jobs.iter().any(Option::is_some) {
+        if self.jobs.iter().any(Option::is_some) || self.core.reaping() {
             let _ = sys::notify(&self.walk_step, 1);
         }
     }
 
+    fn runnable(&self, place: usize) -> bool {
+        match self.jobs[place].as_ref().map(|j| &j.stage) {
+            None => false,
+            Some(Stage::Changing) => self.changes[place].holds_lock() || !self.core.change_locked(),
+            Some(_) => true,
+        }
+    }
+
+    /// One step of the change job in `place`; the job is answered when its last call is made.
+    fn change_job(&mut self, place: usize) {
+        let Some(job) = self.jobs[place].as_ref() else {
+            return;
+        };
+        #[cfg(feature = "steps")]
+        rt::service::step_detail(self.changes[place].detail());
+        let c = Client {
+            owner: job.label,
+            who: &job.who,
+        };
+        let mut w = proto_wire::Writer::new();
+        let stepped = self.core.change_step(&c, &mut self.changes[place], &mut w);
+        let none = rt::handle::Outgoing::new;
+        match stepped {
+            ChangeStep::Wait | ChangeStep::More => {}
+            ChangeStep::Done(result) => {
+                let Some(job) = self.jobs[place].take() else {
+                    return;
+                };
+                let _ = match result {
+                    Ok(Done::Written) => job.pending.answer(w.as_bytes(), none()),
+                    Ok(Done::Pass(pass)) => job.pending.answer(w.as_bytes(), [pass]),
+                    Ok(Done::Continue(_)) => unreachable!(),
+                    Err(status) => job.pending.answer(&proto_wire::reply(status), none()),
+                };
+            }
+        }
+    }
+
     /// One step of a job: the job again when it goes on, None when it has been answered.
-    fn advance(&mut self, job: Job) -> Option<Job> {
+    fn advance(&mut self, place: usize, job: Job) -> Option<Job> {
         let Job {
             pending,
             label,
@@ -688,6 +816,30 @@ impl Layerd {
                 };
                 match kind {
                     JobKind::Open { flags } => {
+                        // An OPEN that creates a name the layer does not hold is a change job.
+                        if flags & proto_fs::CREATE != 0 && walked.is_missing() {
+                            return match self.changes[place].start_create(
+                                place as u8,
+                                flags,
+                                walked.path(),
+                                walked.trailing(),
+                            ) {
+                                Ok(()) => Some(Job {
+                                    pending,
+                                    label,
+                                    who,
+                                    kind,
+                                    stage: Stage::Changing,
+                                }),
+                                Err(status) => {
+                                    let _ = pending.answer(
+                                        &proto_wire::reply(status),
+                                        rt::handle::Outgoing::new(),
+                                    );
+                                    None
+                                }
+                            };
+                        }
                         self.core
                             .open_walked(&c, flags, Some(walked), true, b"", &mut w)
                     }
@@ -703,8 +855,10 @@ impl Layerd {
                         .core
                         .readlink_walked(&c, Some(walked), b"", &mut w)
                         .map(|()| Done::Written),
+                    JobKind::Change => Err(Status::BadSize),
                 }
             }
+            Stage::Changing => Err(Status::BadSize),
             Stage::Opening(cont) => self.core.open_continue(&c, cont, &mut w),
         };
         let none = rt::handle::Outgoing::new;
@@ -774,13 +928,21 @@ impl Layerd {
                     rt::println!("layerd: probe-restart: the service ends with the exit code 1");
                     sys::process_exit(1);
                 }
-                if Prewalk::long(path)
+                // An OPEN that creates or writes is a job whatever the path: its walk is in steps and
+                // the change of the volume is the step that finishes it.
+                let creates = flags & proto_fs::CREATE != 0;
+                if self.core.partial && (creates || n::open_writes(flags)) {
+                    return st(proto_fs::READ_ONLY_FILESYSTEM);
+                }
+                let follow = flags & proto_fs::NO_FOLLOW == 0
+                    && !(creates && flags & proto_fs::EXCLUSIVE != 0);
+                if (Prewalk::long(path) || creates || n::open_writes(flags))
                     && let Some(deferred) = self.defer_walk(
                         r,
                         who,
                         label,
                         JobKind::Open { flags },
-                        Stage::Walking(Prewalk::new(path, false)),
+                        Stage::Walking(Prewalk::new(path, false, follow)),
                     )
                 {
                     return deferred;
@@ -823,7 +985,7 @@ impl Layerd {
                         who,
                         label,
                         JobKind::Stat { flags },
-                        Stage::Walking(Prewalk::new(path, false)),
+                        Stage::Walking(Prewalk::new(path, false, flags & n::STAT_NO_FOLLOW == 0)),
                     )
                 {
                     return deferred;
@@ -848,7 +1010,11 @@ impl Layerd {
                         who,
                         label,
                         JobKind::Access { bits, flags },
-                        Stage::Walking(Prewalk::new(path, flags & proto_data::ACCESS_REAL != 0)),
+                        Stage::Walking(Prewalk::new(
+                            path,
+                            flags & proto_data::ACCESS_REAL != 0,
+                            true,
+                        )),
                     )
                 {
                     return deferred;
@@ -873,7 +1039,7 @@ impl Layerd {
                         who,
                         label,
                         JobKind::Readlink,
-                        Stage::Walking(Prewalk::new(path, false)),
+                        Stage::Walking(Prewalk::new(path, false, false)),
                     )
                 {
                     return deferred;
@@ -885,13 +1051,32 @@ impl Layerd {
                 reply_of(self.core.readlink(&c, path, r.reply()))
             }
             NameMethod::Change => {
-                if who.is_none() {
-                    return Answer::Status(unbound());
+                let who = match needs(&who) {
+                    Ok(w) => w,
+                    Err(a) => return a,
+                };
+                let mut body = body;
+                let all = match body.bytes(body.left()) {
+                    Ok(all) => all,
+                    Err(_) => return bad,
+                };
+                if self.core.partial {
+                    return st(proto_fs::READ_ONLY_FILESYSTEM);
                 }
-                if n::Change::read(body).is_err() {
+                if n::Change::read(proto_wire::Reader::new(all)).is_err() {
                     return bad;
                 }
-                Answer::Status(self.core.change())
+                // A change is a job: the table of jobs answers busy (STARTING) when it is full or
+                // the session holds its share, and the walk and the calls are not in the step of
+                // the request.
+                let place = match self.place_for(label) {
+                    Ok(place) => place,
+                    Err(answer) => return answer,
+                };
+                if let Err(status) = self.changes[place].start_request(place as u8, all) {
+                    return Answer::Status(status);
+                }
+                self.defer_at(r, place, who, label, JobKind::Change, Stage::Changing)
             }
             NameMethod::Fstat => {
                 let Ok(handle) = n::read_handle(body) else {
@@ -903,11 +1088,12 @@ impl Layerd {
                 let Ok(handle) = n::read_handle(body) else {
                     return bad;
                 };
-                match self.core.read_dir(label, handle) {
-                    Ok((bytes, len)) => {
-                        if r.reply().bytes(&bytes[..len]).is_err() {
-                            return bad;
-                        }
+                match self.core.read_dir_into(label, handle, r.reply()) {
+                    Ok(len) => {
+                        #[cfg(feature = "steps")]
+                        rt::service::step_detail(7600 + (len as u64 / 64));
+                        #[cfg(not(feature = "steps"))]
+                        let _ = len;
                         Answer::Reply(rt::handle::Outgoing::new())
                     }
                     Err(status) => Answer::Status(status),
@@ -1083,6 +1269,18 @@ impl Service<0> for Layerd {
                         self.core.build_steps()
                     ),
                     other => rt::println!("layerd: not serving: {other:?}"),
+                }
+                let (names, marks) = self.core.left_out();
+                if names + marks != 0 {
+                    rt::println!(
+                        "layerd: {names} names and {marks} marks left out for the buckets of the index (directories among the names take their subtrees with them): the root is served read-only"
+                    );
+                }
+                if self.core.skipped() != 0 {
+                    rt::println!(
+                        "layerd: {} directories left out: their path passes the volume's limit",
+                        self.core.skipped()
+                    );
                 }
                 if let Err(why) = rt::service::ready(&self.parent) {
                     rt::println!("layerd: READY refused: {why:?}");

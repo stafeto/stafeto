@@ -15,7 +15,10 @@ break-layer-route = ["posix-crt/break-layer-route"]
 break-layer-clone = ["posix-crt/break-layer-clone"]
 # Deliberate breakage: a change of attributes through a description is not refused.
 break-layer-fd-guard = ["posix-crt/break-layer-fd-guard"]
-break-layer-refuse = ["posix-crt/break-layer-refuse"]
+# The phases of the write probe (`cargo xtask layer-posix write`): the changes of names, and the
+# second boot on the same disk that reads what they left.
+phase-write = []
+phase-reread = []
 
 [[bin]]
 name = "layer-posix-probe"

@@ -148,11 +148,13 @@ pub const IMPORT_ROOT: u32 = 2;
 
 /// Flags of STATUS: the index of names is still being built, the volume is not served (no data
 /// disk, or its start failed), a frozen layer waits to be sealed, a start found a layer that does
-/// not match its MANIFEST and raised the composition to the last one that does.
+/// not match its MANIFEST and raised the composition to the last one that does, the build of the
+/// index left names out (`STATUS_PARTIAL`: the root is served read-only).
 pub const STATUS_STARTING: u32 = 1;
 pub const STATUS_NO_STORE: u32 = 2;
 pub const STATUS_UNSEALED: u32 = 4;
 pub const STATUS_DEGRADED: u32 = 8;
+pub const STATUS_PARTIAL: u32 = 16;
 
 /// The jobs STATUS names: none, the copy of a file up into the live layer, the sealing of a
 /// frozen layer, a check, a squash, an export, an import, the deletion of removed layers.
@@ -1246,10 +1248,11 @@ impl Stat {
     }
 
     /// INVALID for a live number over `NUMBER_MAX`, more than `LAYERS_MAX` layers held (the live
-    /// one counts), a flag that is none of the four, an unknown job, more than `JOBS_MAX` waiting,
+    /// one counts), a flag that is none of the five, an unknown job, more than `JOBS_MAX` waiting,
     /// jobs waiting while none runs, or progress with no job or past its end.
     fn check(&self) -> Result<(), Status> {
-        let flags = STATUS_STARTING | STATUS_NO_STORE | STATUS_UNSEALED | STATUS_DEGRADED;
+        let flags =
+            STATUS_STARTING | STATUS_NO_STORE | STATUS_UNSEALED | STATUS_DEGRADED | STATUS_PARTIAL;
         let held = u64::from(self.frozen) + u64::from(self.deferred) + 1;
         let idle = self.job == JOB_NONE;
         if self.live > NUMBER_MAX

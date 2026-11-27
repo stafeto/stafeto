@@ -17,15 +17,14 @@
 //! - STAT is answered by the service for both sets: a name of the layer from the data file
 //!   service's attributes, a lower name from the RAM file service's information, with `device` 0
 //!   (the POSIX layer puts one number in every stat of the layered root).
-//! - CHANGE is READ_ONLY_FILESYSTEM, and the other methods the part does not serve are not in the
-//!   list of the program.
+//! - CHANGE and the creating or writing OPEN are in `change`.
 
 use crate::composition::{Composition, MAX_TEXT, State as LayerState};
 use crate::descriptions::{Lost, Refused, ShareError, Table};
 use crate::identity::Vouched;
 use crate::index::{Index, Kind};
 use crate::listing;
-use crate::lookup::{Outcome, Walk, normalize};
+use crate::lookup::{Hidden, Outcome, Walk, normalize_dots};
 use crate::scan::{Failure, Progress, Scan};
 use crate::volume::{Lower, R, Volume};
 use posix_perm::{EXEC, READ, WRITE, permits};
@@ -35,7 +34,7 @@ use proto_fs::{NodeInfo, Redirect, Timestamp};
 use proto_layer as l;
 use proto_wire::{Status, Writer};
 
-fn st(code: u32) -> Status {
+pub(crate) fn st(code: u32) -> Status {
     Status::Unknown(code)
 }
 
@@ -84,25 +83,52 @@ pub enum Done<P> {
     Continue(OpenCont),
 }
 
+/// The times a build starts again under another seed before it leaves names out.
+pub const RESEEDS: u8 = 3;
+
+/// The seed of the next build: a mix of the last one and the number of the attempt.
+fn next_seed(seed: u64, attempt: u64) -> u64 {
+    let mut h = seed ^ attempt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
+}
+
 pub struct Core<'a, V: Volume, L: Lower> {
     pub volume: V,
     pub lower: L,
     pub index: &'a mut Index,
     scan: &'a mut Scan,
+    /// The reaper and the lock of the changes.
+    pub(crate) work: &'a mut crate::reaper::Workers,
     pub composition: Composition,
     pub state: State,
+    /// The builds that started again under another seed, and the place of the clearing between
+    /// two of them (`Index::clear_step`).
+    reseeds: u8,
+    clearing: Option<usize>,
+    /// The build left names out for the buckets: the root is served read-only.
+    pub partial: bool,
     /// `/.layers/NN`, the live layer's directory.
     live: [u8; 16],
     live_len: usize,
-    table: Table<L::Dir>,
+    pub(crate) table: Table<L::Dir>,
+    /// What the changes keep between requests (`change`).
+    pub(crate) writes: crate::change::Writes,
 }
 
 /// The result of a walk and the plain path it walked, which a redirect carries.
 pub struct Walked {
-    outcome: Outcome,
-    trailing: bool,
+    pub(crate) outcome: Outcome,
+    pub(crate) trailing: bool,
     path: [u8; 512],
     len: usize,
+    /// The plain path holds a `..`.
+    dotted: bool,
+    /// The lower set is hidden from the directory the outcome names (`Walk::hidden`).
+    pub(crate) hidden: bool,
 }
 
 /// The paths of more components than this are walked in steps of their own (`Prewalk`): a step
@@ -126,7 +152,11 @@ pub struct Prewalk {
     len: usize,
     pos: usize,
     cur: u32,
+    hidden: Hidden,
     real: bool,
+    /// A link at the end of the path is followed.
+    follow: bool,
+    dotted: bool,
 }
 
 impl Prewalk {
@@ -137,7 +167,7 @@ impl Prewalk {
     }
 
     /// The walk of `path` with the real identifiers when `real`.
-    pub fn new(path: &[u8], real: bool) -> Prewalk {
+    pub fn new(path: &[u8], real: bool, follow: bool) -> Prewalk {
         let mut raw = [0u8; 512];
         let raw_len = path.len().min(raw.len());
         raw[..raw_len].copy_from_slice(&path[..raw_len]);
@@ -149,7 +179,10 @@ impl Prewalk {
             len: 0,
             pos: 0,
             cur: 0,
+            hidden: Hidden::default(),
             real,
+            follow,
+            dotted: false,
         }
     }
 }
@@ -162,6 +195,8 @@ pub struct OpenCont {
     len: usize,
     phase: OpenPhase,
     handle: u32,
+    /// The flags of the OPEN: the rights asked and the flags of the description.
+    flags: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -172,13 +207,24 @@ enum OpenPhase {
 }
 
 impl Walked {
-    fn path(&self) -> &[u8] {
+    pub fn path(&self) -> &[u8] {
         &self.path[..self.len]
+    }
+
+    /// The walk ended at a name the layer does not hold (the lower set's or none): an OPEN that
+    /// creates makes it.
+    pub fn is_missing(&self) -> bool {
+        matches!(self.outcome, Outcome::Lower | Outcome::Absent)
+    }
+
+    /// The path ended with a slash.
+    pub fn trailing(&self) -> bool {
+        self.trailing
     }
 }
 
 /// The mapping of a status of the volume to the status of the names.
-fn from_volume(status: Status) -> Status {
+pub(crate) fn from_volume(status: Status) -> Status {
     match status {
         Status::Unknown(code) => st(match code {
             d::NO_ENTRY => proto_fs::NO_ENTRY,
@@ -198,7 +244,7 @@ fn from_volume(status: Status) -> Status {
     }
 }
 
-fn node_from(s: &d::Stat) -> R<NodeInfo> {
+pub(crate) fn node_from(s: &d::Stat) -> R<NodeInfo> {
     let time = |ns: i64| Timestamp::from_ns(i128::from(ns));
     Ok(NodeInfo {
         kind: if s.kind == d::KIND_DIRECTORY { 1 } else { 2 },
@@ -218,7 +264,7 @@ fn node_from(s: &d::Stat) -> R<NodeInfo> {
     })
 }
 
-fn attr_of(s: &d::Stat) -> posix_perm::Attr {
+pub(crate) fn attr_of(s: &d::Stat) -> posix_perm::Attr {
     posix_perm::Attr {
         kind: if s.kind == d::KIND_DIRECTORY {
             posix_perm::Kind::Directory
@@ -235,6 +281,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     pub fn new(
         index: &'a mut Index,
         scan: &'a mut Scan,
+        work: &'a mut crate::reaper::Workers,
         volume: V,
         lower: L,
         epoch: u16,
@@ -244,11 +291,16 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             lower,
             index,
             scan,
+            work,
             composition: Composition::first(),
             state: State::Starting,
+            reseeds: 0,
+            clearing: None,
+            partial: false,
             live: *b"/.layers/00\0\0\0\0\0",
             live_len: 11,
             table: Table::new(epoch),
+            writes: crate::change::Writes::default(),
         }
     }
 
@@ -260,7 +312,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         self.table.count()
     }
 
-    fn live_path(&self) -> &[u8] {
+    pub(crate) fn live_path(&self) -> &[u8] {
         &self.live[..self.live_len]
     }
 
@@ -315,7 +367,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         self.clear_work().map_err(failed)
     }
 
-    fn read_file(&mut self, path: &[u8], out: &mut [u8]) -> R<usize> {
+    pub(crate) fn read_file(&mut self, path: &[u8], out: &mut [u8]) -> R<usize> {
         let h = self.volume.open(path, d::READ, 0)?;
         let mut len = 0;
         let result = loop {
@@ -382,7 +434,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     /// being emptied is one buffer, a directory that is found is entered, and an empty one is
     /// removed and left. The depth is the longest path the volume holds (`PATH_MAX`), and a name is
     /// as long as the volume allows.
-    fn remove_inside(&mut self, root: &[u8]) -> R<()> {
+    pub(crate) fn remove_inside(&mut self, root: &[u8]) -> R<()> {
         let mut path = [0u8; PATH_MAX];
         let mut len = root.len();
         path[..len].copy_from_slice(root);
@@ -438,6 +490,13 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         if self.state != State::Starting {
             return true;
         }
+        if let Some(from) = self.clearing {
+            self.clearing = self.index.clear_step(from);
+            if self.clearing.is_none() {
+                self.scan.reset();
+            }
+            return false;
+        }
         let mut root = [0u8; 16];
         let len = self.live_len;
         root[..len].copy_from_slice(self.live_path());
@@ -454,8 +513,19 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         match stepped {
             Ok(Progress::More) => false,
             Ok(Progress::Done) => {
+                self.partial = self.scan.skipped_names + self.scan.skipped_marks != 0;
                 self.state = State::Ready;
                 true
+            }
+            Err(Failure::Reseed) => {
+                // Both buckets of a name are full: the build starts again under another seed, a
+                // few times at most.
+                self.reseeds += 1;
+                self.scan.patient = self.reseeds < RESEEDS;
+                self.index
+                    .set_seed(next_seed(self.index.seed(), u64::from(self.reseeds)));
+                self.clearing = Some(0);
+                false
             }
             Err(Failure::NoSpace) => {
                 self.state = State::Failed(l::NO_SPACE);
@@ -471,6 +541,16 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         }
     }
 
+    /// The names and the marks the build left out for the buckets.
+    pub fn left_out(&self) -> (u32, u32) {
+        (self.scan.skipped_names, self.scan.skipped_marks)
+    }
+
+    /// The directories the build left out for a path past the volume's limit.
+    pub fn skipped(&self) -> u32 {
+        self.scan.skipped
+    }
+
     pub fn build_steps(&self) -> u32 {
         self.scan.steps
     }
@@ -478,7 +558,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     // ------------------------------------------------------------------ proto_layer
 
     /// The code a request of the names answers while the service cannot serve.
-    fn gate(&self) -> Result<(), Status> {
+    pub(crate) fn gate(&self) -> Result<(), Status> {
         match self.state {
             State::Ready => Ok(()),
             State::Starting => Err(st(l::STARTING)),
@@ -493,6 +573,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         let flags = match self.state {
             State::Starting => l::STATUS_STARTING,
             State::NoStore => l::STATUS_NO_STORE,
+            State::Ready if self.partial => l::STATUS_PARTIAL,
             State::Ready => 0,
             State::Damaged => return Err(st(l::DAMAGED)),
             State::Failed(code) => return Err(st(code)),
@@ -562,9 +643,22 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
 
     // ------------------------------------------------------------------ the names
 
-    fn vpath(&self, id: u32, out: &mut [u8; 512]) -> R<usize> {
-        Scan::volume_path(self.index, self.live_path(), id, out)
-            .ok_or_else(|| st(proto_fs::NAME_TOO_LONG))
+    /// The path of the entry `id` on the volume. A symbolic link is the file
+    /// `.wh..wh.lnk.<name>` in the directory of the name.
+    pub(crate) fn vpath(&self, id: u32, out: &mut [u8; 512]) -> R<usize> {
+        let n = Scan::volume_path(self.index, self.live_path(), id, out)
+            .ok_or_else(|| st(proto_fs::NAME_TOO_LONG))?;
+        if self.index.entry(id).is_none_or(|e| e.kind != Kind::Link) {
+            return Ok(n);
+        }
+        let at = out[..n].iter().rposition(|&b| b == b'/').unwrap_or(0) + 1;
+        let prefix = crate::scan::LINK_PREFIX;
+        if n + prefix.len() > out.len() {
+            return Err(st(proto_fs::NAME_TOO_LONG));
+        }
+        out.copy_within(at..n, at + prefix.len());
+        out[at..at + prefix.len()].copy_from_slice(prefix);
+        Ok(n + prefix.len())
     }
 
     /// The volume path of the entry `id` a walk reached: the live layer's path and the plain path
@@ -579,7 +673,10 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             _ => plain,
         };
         let end = live.len() + plain.len();
-        if id == 0 || plain.first() != Some(&b'/') || end > out.len() {
+        // A link's file has another name, and a path with a `..` does not name the chain.
+        let dotted = walked.dotted;
+        let link = self.index.entry(id).is_some_and(|e| e.kind == Kind::Link);
+        if id == 0 || dotted || link || plain.first() != Some(&b'/') || end > out.len() {
             return self.vpath(id, out);
         }
         out[..live.len()].copy_from_slice(live);
@@ -596,13 +693,16 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     pub fn prewalk_step(&self, who: &Vouched, pw: &mut Prewalk) -> Option<Walked> {
         // The first step makes the path plain (about 13,000 ticks for a path of 253 components).
         if !pw.planned {
-            pw.len = normalize(&pw.raw[..pw.raw_len], &mut pw.path);
+            (pw.len, pw.dotted) = normalize_dots(&pw.raw[..pw.raw_len], &mut pw.path);
             pw.planned = true;
             return None;
         }
-        let mut walk = Walk::resume(&pw.path[..pw.len], pw.pos, pw.cur);
+        let mut walk = Walk::resume(&pw.path[..pw.len], pw.pos, pw.cur, pw.hidden);
+        if !pw.follow {
+            walk = walk.no_follow();
+        }
         let step = walk.advance(self.index, who.identity(pw.real), crate::lookup::STEP);
-        (pw.pos, pw.cur) = walk.state();
+        (pw.pos, pw.cur, pw.hidden) = walk.state();
         let trailing = walk.trailing_slash();
         match step {
             crate::lookup::Step::More => None,
@@ -611,28 +711,43 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
                 trailing,
                 path: pw.path,
                 len: pw.len,
+                dotted: pw.dotted,
+                hidden: walk.hidden(),
             }),
         }
     }
 
     /// The walk of `path` after it is made plain (`lookup::normalize`), with the real identifiers
     /// when `real` (ACCESS with `ACCESS_REAL`) and the effective ones otherwise.
-    fn walk(&self, c: &Client<'_>, path: &[u8], real: bool) -> Walked {
+    pub(crate) fn walk(&self, c: &Client<'_>, path: &[u8], real: bool, follow: bool) -> Walked {
         let mut plain = [0u8; 512];
-        let len = normalize(path, &mut plain);
-        let walk = Walk::new(&plain[..len]);
+        let (len, dotted) = normalize_dots(path, &mut plain);
+        let walk = if follow {
+            Walk::new(&plain[..len])
+        } else {
+            Walk::new(&plain[..len]).no_follow()
+        };
         let trailing = walk.trailing_slash();
-        let outcome = walk.run(self.index, c.who.identity(real)).0;
+        let mut walk = walk;
+        let outcome = loop {
+            if let crate::lookup::Step::Done(o) =
+                walk.advance(self.index, c.who.identity(real), crate::lookup::STEP)
+            {
+                break o;
+            }
+        };
         Walked {
             outcome,
             trailing,
             path: plain,
             len,
+            dotted,
+            hidden: walk.hidden(),
         }
     }
 
     /// A failure of a walk, as a status.
-    fn refusal(outcome: Outcome) -> Status {
+    pub(crate) fn refusal(outcome: Outcome) -> Status {
         st(match outcome {
             Outcome::Absent => proto_fs::NO_ENTRY,
             Outcome::NotDir => proto_fs::NOT_DIRECTORY,
@@ -642,7 +757,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         })
     }
 
-    fn redirect(path: &[u8], target: u32, w: &mut Writer) -> R<()> {
+    pub(crate) fn redirect(path: &[u8], target: u32, w: &mut Writer) -> R<()> {
         Redirect {
             target,
             index: 0,
@@ -690,15 +805,28 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         w: &mut Writer,
     ) -> R<Done<V::Pass>> {
         self.gate()?;
-        let walked = walked.unwrap_or_else(|| self.walk(c, path, false));
-        let (outcome, trailing) = (walked.outcome, walked.trailing);
-        // The names the root passes through are the services' own, writes included. A name of
-        // the lower set is read only in this part: the RAM file service would write it below the
-        // layers, so a write or a create is refused here (whether the name exists is the RAM
-        // file service's to say, and a create of a name that may be there is as much a write).
-        let writes = n::open_writes(flags);
         let creates = flags & proto_fs::CREATE != 0;
-        if (writes || creates) && matches!(outcome, Outcome::Lower | Outcome::Absent) {
+        let excl = flags & proto_fs::EXCLUSIVE != 0;
+        // A name that is made (CREATE and EXCLUSIVE) is not followed at its end.
+        let follow = flags & proto_fs::NO_FOLLOW == 0 && !(creates && excl);
+        let walked = walked.unwrap_or_else(|| self.walk(c, path, false, follow));
+        let (outcome, trailing) = (walked.outcome, walked.trailing);
+        if let Outcome::Link { id, start, end } = outcome {
+            return self
+                .link_redirect(&walked, id, start, end, w)
+                .map(|()| Done::Written);
+        }
+        // The names the root passes through are the services' own, writes included. A name that
+        // the layer of the user does not hold is made in the layer when it is not there (in the
+        // lower set too), and a write to a name of the lower set is refused until the copy up.
+        let writes = n::open_writes(flags);
+        if creates
+            && matches!(outcome, Outcome::Lower | Outcome::Absent)
+            && let Some(done) = self.create_and_open(c, flags, &walked, w)?
+        {
+            return Ok(done);
+        }
+        if writes && outcome == Outcome::Lower {
             return Err(st(proto_fs::READ_ONLY_FILESYSTEM));
         }
         if let Some(done) = Self::redirect_for(outcome, walked.path(), w) {
@@ -707,15 +835,19 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         let Outcome::Upper(id) = outcome else {
             return Err(Self::refusal(outcome));
         };
-        if writes {
-            return Err(st(proto_fs::READ_ONLY_FILESYSTEM));
-        }
-        // A create of a name of the layer opens it for reading, and with EXCLUSIVE it is there.
-        if creates && flags & proto_fs::EXCLUSIVE != 0 {
+        // A create of a name of the layer opens it, and with EXCLUSIVE it is there.
+        if creates && excl {
             return Err(st(proto_fs::ALREADY_EXISTS));
         }
-        let is_dir = id == 0 || self.index.entry(id).is_some_and(|e| e.kind == Kind::Dir);
+        let entry_kind = self.index.entry(id).map(|e| e.kind);
+        if entry_kind == Some(Kind::Link) {
+            return Err(st(proto_fs::LOOP));
+        }
+        let is_dir = id == 0 || entry_kind == Some(Kind::Dir);
         if is_dir {
+            if writes {
+                return Err(st(proto_fs::IS_DIRECTORY));
+            }
             let attr = self
                 .index
                 .attr(id)
@@ -727,7 +859,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             // is the service's own table: ENFILE.
             let handle = self
                 .table
-                .make(c.owner, c.who.pid, id)
+                .make(c.owner, c.who.pid, id, walked.hidden)
                 .map_err(|_: Refused| st(proto_fs::TOO_MANY_FILES_IN_SYSTEM))?;
             OpenAnswer::Directory { handle }.write(w)?;
             return Ok(Done::Written);
@@ -743,18 +875,49 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
                 len,
                 phase: OpenPhase::Stat,
                 handle: 0,
+                flags,
             }));
         }
         let path = &vp[..len];
-        self.open_rights(c, path)?;
-        let handle = self.volume.open(path, d::READ, 0).map_err(from_volume)?;
+        self.open_rights(c, path, flags)?;
+        let handle = self
+            .volume
+            .open(path, Self::wire_flags(flags), 0)
+            .map_err(from_volume)?;
         self.open_pass(handle, w)
     }
 
-    /// The right to read the file at `path` on the volume.
-    fn open_rights(&mut self, c: &Client<'_>, path: &[u8]) -> R<()> {
+    /// The flags of the data file service for the flags of an OPEN of a file of the layer: the
+    /// access asked, and for a write the cut and the append.
+    pub(crate) fn wire_flags(flags: u32) -> u32 {
+        let writes = n::open_writes(flags);
+        let mut wire = 0;
+        if flags & 3 != proto_fs::WRITE_ONLY {
+            wire |= d::READ;
+        }
+        if writes {
+            wire |= d::WRITE;
+            if flags & proto_fs::TRUNCATE != 0 {
+                wire |= d::TRUNCATE;
+            }
+            if flags & proto_fs::APPEND != 0 {
+                wire |= d::APPEND;
+            }
+        }
+        wire
+    }
+
+    /// The right to read and to write (as `flags` ask) the file at `path` on the volume.
+    pub(crate) fn open_rights(&mut self, c: &Client<'_>, path: &[u8], flags: u32) -> R<()> {
         let stat = self.volume.stat(path).map_err(from_volume)?;
-        if permits(c.who.identity(false), &attr_of(&stat), READ) {
+        let mut bits = 0;
+        if flags & 3 != proto_fs::WRITE_ONLY {
+            bits |= READ;
+        }
+        if n::open_writes(flags) {
+            bits |= WRITE;
+        }
+        if permits(c.who.identity(false), &attr_of(&stat), bits) {
             Ok(())
         } else {
             Err(st(proto_fs::ACCESS_DENIED))
@@ -762,7 +925,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     }
 
     /// The pass of the description `handle`, which closes whatever the pass came to.
-    fn open_pass(&mut self, handle: u32, w: &mut Writer) -> R<Done<V::Pass>> {
+    pub(crate) fn open_pass(&mut self, handle: u32, w: &mut Writer) -> R<Done<V::Pass>> {
         let pass = self.volume.export(handle);
         let _ = self.volume.close(handle);
         let pass = pass.map_err(from_volume)?;
@@ -781,12 +944,15 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         let path = &cont.vp[..cont.len];
         match cont.phase {
             OpenPhase::Stat => {
-                self.open_rights(c, path)?;
+                self.open_rights(c, path, cont.flags)?;
                 cont.phase = OpenPhase::Open;
                 Ok(Done::Continue(cont))
             }
             OpenPhase::Open => {
-                cont.handle = self.volume.open(path, d::READ, 0).map_err(from_volume)?;
+                cont.handle = self
+                    .volume
+                    .open(path, Self::wire_flags(cont.flags), 0)
+                    .map_err(from_volume)?;
                 cont.phase = OpenPhase::Export;
                 Ok(Done::Continue(cont))
             }
@@ -812,13 +978,17 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     pub fn stat_walked(
         &mut self,
         c: &Client<'_>,
-        _flags: u32,
+        flags: u32,
         walked: Option<Walked>,
         path: &[u8],
         w: &mut Writer,
     ) -> R<()> {
         self.gate()?;
-        let walked = walked.unwrap_or_else(|| self.walk(c, path, false));
+        let walked =
+            walked.unwrap_or_else(|| self.walk(c, path, false, flags & n::STAT_NO_FOLLOW == 0));
+        if let Outcome::Link { id, start, end } = walked.outcome {
+            return self.link_redirect(&walked, id, start, end, w);
+        }
         if let Some(done) = Self::redirect_for(walked.outcome, walked.path(), w) {
             return done;
         }
@@ -828,10 +998,16 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         let mut vp = [0u8; 512];
         let len = self.vpath_of(&walked, id, &mut vp)?;
         let stat = self.volume.stat(&vp[..len]).map_err(from_volume)?;
-        if walked.trailing && stat.kind != d::KIND_DIRECTORY {
+        let is_link = self.index.entry(id).is_some_and(|e| e.kind == Kind::Link);
+        if walked.trailing && (stat.kind != d::KIND_DIRECTORY || is_link) {
             return Err(st(proto_fs::NOT_DIRECTORY));
         }
-        n::write_info(&node_from(&stat)?, w)
+        let mut info = node_from(&stat)?;
+        if is_link {
+            info.kind = 5;
+            info.permissions = 0o777;
+        }
+        n::write_info(&info, w)
     }
 
     /// ACCESS: whether the bits are allowed; a name of the lower set is the RAM file service's.
@@ -858,16 +1034,17 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     ) -> R<()> {
         self.gate()?;
         // The path is walked with the identifiers the bits are checked with.
-        let walked = walked.unwrap_or_else(|| self.walk(c, path, flags & d::ACCESS_REAL != 0));
+        let walked =
+            walked.unwrap_or_else(|| self.walk(c, path, flags & d::ACCESS_REAL != 0, true));
+        if let Outcome::Link { id, start, end } = walked.outcome {
+            return self.link_redirect(&walked, id, start, end, w);
+        }
         if let Some(done) = Self::redirect_for(walked.outcome, walked.path(), w) {
             return done;
         }
         let Outcome::Upper(id) = walked.outcome else {
             return Err(Self::refusal(walked.outcome));
         };
-        if bits & WRITE != 0 {
-            return Err(st(proto_fs::READ_ONLY_FILESYSTEM));
-        }
         let mut vp = [0u8; 512];
         let len = self.vpath_of(&walked, id, &mut vp)?;
         let stat = self.volume.stat(&vp[..len]).map_err(from_volume)?;
@@ -875,14 +1052,15 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             c.who.ids,
             c.who.groups(),
             &attr_of(&stat),
-            bits & (READ | EXEC),
+            bits & (READ | WRITE | EXEC),
             flags & d::ACCESS_REAL != 0,
         )
         .map_err(|_| st(proto_fs::ACCESS_DENIED))?;
         w.u32(0)
     }
 
-    /// READLINK: the layer of the user holds no link in this part, so a name of it is no link.
+    /// READLINK: the text of a link of the layer of the user; a name of the layer that is no link
+    /// is INVALID_ARGUMENT, and a lower name is the RAM file service's.
     pub fn readlink(&mut self, c: &Client<'_>, path: &[u8], w: &mut Writer) -> R<()> {
         self.readlink_walked(c, None, path, w)
     }
@@ -896,21 +1074,22 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         w: &mut Writer,
     ) -> R<()> {
         self.gate()?;
-        let walked = walked.unwrap_or_else(|| self.walk(c, path, false));
+        let walked = walked.unwrap_or_else(|| self.walk(c, path, false, false));
+        if let Outcome::Link { id, start, end } = walked.outcome {
+            return self.link_redirect(&walked, id, start, end, w);
+        }
         if let Some(done) = Self::redirect_for(walked.outcome, walked.path(), w) {
             return done;
         }
         match walked.outcome {
+            Outcome::Upper(id) if self.index.entry(id).is_some_and(|e| e.kind == Kind::Link) => {
+                let mut text = [0u8; 512];
+                let len = self.link_text(id, &mut text)?;
+                w.u32(0)?;
+                w.bytes(&text[..len])
+            }
             Outcome::Upper(_) => Err(st(proto_fs::INVALID_ARGUMENT)),
             other => Err(Self::refusal(other)),
-        }
-    }
-
-    /// CHANGE: the service writes no names in this part.
-    pub fn change(&self) -> Status {
-        match self.gate() {
-            Err(s) => s,
-            Ok(()) => st(proto_fs::READ_ONLY_FILESYSTEM),
         }
     }
 
@@ -924,6 +1103,9 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     pub fn fstat(&mut self, owner: u64, handle: u32, w: &mut Writer) -> R<()> {
         self.gate()?;
         let dir = self.table.get(owner, handle).map_err(Self::lost)?.dir;
+        if dir == crate::descriptions::GONE {
+            return Err(st(proto_fs::NO_ENTRY));
+        }
         let mut vp = [0u8; 512];
         let len = self.vpath(dir, &mut vp)?;
         let stat = self.volume.stat(&vp[..len]).map_err(from_volume)?;
@@ -931,7 +1113,8 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     }
 
     /// READ_DIR: the reply is returned whole, with its length.
-    pub fn read_dir(&mut self, owner: u64, handle: u32) -> R<([u8; abi::MESSAGE_MAX], usize)> {
+    /// READ_DIR: the reply is written to the end of `out`, and its length is the answer.
+    pub fn read_dir_into(&mut self, owner: u64, handle: u32, out: &mut Writer) -> R<usize> {
         self.gate()?;
         let Core {
             table,
@@ -941,10 +1124,16 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         } = self;
         let desc = table.get(owner, handle).map_err(Self::lost)?;
         let mut reply = DirReply::new()?;
+        if desc.dir == crate::descriptions::GONE {
+            let len = reply.len();
+            reply.finish_into(false, 0, out)?;
+            return Ok(len);
+        }
         let listed = listing::read_dir(
             index,
             lower,
             desc.dir,
+            desc.hidden,
             &mut desc.position,
             &mut desc.lower,
             &mut desc.replayed,
@@ -953,7 +1142,18 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         // What the replies have given out, which SEEK_DIR may go back to and not past.
         desc.given = desc.given.max(desc.position);
         let len = reply.len();
-        Ok((reply.finish(listed.more, listed.cursor)?, len))
+        reply.finish_into(listed.more, listed.cursor, out)?;
+        Ok(len)
+    }
+
+    /// `read_dir_into` with the reply as an array (for the tests).
+    #[cfg(test)]
+    pub fn read_dir(&mut self, owner: u64, handle: u32) -> R<([u8; abi::MESSAGE_MAX], usize)> {
+        let mut w = Writer::new();
+        let len = self.read_dir_into(owner, handle, &mut w)?;
+        let mut bytes = [0u8; abi::MESSAGE_MAX];
+        bytes[..len].copy_from_slice(w.as_bytes());
+        Ok((bytes, len))
     }
 
     pub fn rewind(&mut self, owner: u64, handle: u32) -> R<()> {

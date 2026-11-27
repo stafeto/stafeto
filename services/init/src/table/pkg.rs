@@ -557,8 +557,9 @@ pub const LAYERD: Record = Record {
     }),
     priority: 34,
     ceiling: 34,
-    // The stack of the loop is the program's, the index and the pages of the descriptors are
-    // statics that init pays for as segments; the quota is the slots of the sessions the service
+    // The stack of the loop is the program's, the index (16,384 places, the keys of its directories
+    // and the arena: .bss of 1.1 MiB) and the pages of the descriptors are statics that init pays
+    // for as segments; the quota is the slots of the sessions the service
     // gives (192) and its own channels.
     quota: 192 * PAGE,
     // The handles the service holds at most: 192 copies of identity sessions (one for each bound

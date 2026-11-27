@@ -24,13 +24,18 @@ pub mod errno {
     pub const EIO: i32 = 5;
     pub const EBADF: i32 = 9;
     pub const EACCES: i32 = 13;
+    pub const EBUSY: i32 = 16;
+    pub const EXDEV: i32 = 18;
     pub const EEXIST: i32 = 17;
     pub const ENOTDIR: i32 = 20;
     pub const EISDIR: i32 = 21;
     pub const EINVAL: i32 = 22;
     pub const ENFILE: i32 = 23;
     pub const EMFILE: i32 = 24;
+    pub const EFBIG: i32 = 27;
     pub const ENOSPC: i32 = 28;
+    pub const EMLINK: i32 = 31;
+    pub const ENOTEMPTY: i32 = 39;
     pub const EROFS: i32 = 30;
     pub const ENAMETOOLONG: i32 = 36;
     pub const ELOOP: i32 = 40;
@@ -116,6 +121,11 @@ pub fn errno_of(code: u32) -> i32 {
         proto_fs::TOO_MANY_FILES_IN_SYSTEM => errno::ENFILE,
         proto_fs::INVALID_ARGUMENT => errno::EINVAL,
         proto_fs::NOT_SUPPORTED => errno::EOPNOTSUPP,
+        proto_fs::TOO_MANY_LINKS => errno::EMLINK,
+        proto_fs::NOT_EMPTY => errno::ENOTEMPTY,
+        proto_fs::BUSY => errno::EBUSY,
+        proto_fs::CROSS_DEVICE => errno::EXDEV,
+        proto_fs::FILE_TOO_LARGE => errno::EFBIG,
         _ => errno::EIO,
     }
 }
@@ -509,6 +519,11 @@ mod tests {
         assert_eq!(errno_of(proto_fs::NOT_DIRECTORY), errno::ENOTDIR);
         assert_eq!(errno_of(proto_fs::TOO_MANY_FILES_IN_SYSTEM), errno::ENFILE);
         assert_eq!(errno_of(proto_fs::BAD_FD), errno::EBADF);
+        assert_eq!(errno_of(proto_fs::TOO_MANY_LINKS), errno::EMLINK);
+        assert_eq!(errno_of(proto_fs::NOT_EMPTY), errno::ENOTEMPTY);
+        assert_eq!(errno_of(proto_fs::BUSY), errno::EBUSY);
+        assert_eq!(errno_of(proto_fs::CROSS_DEVICE), errno::EXDEV);
+        assert_eq!(errno_of(proto_fs::FILE_TOO_LARGE), errno::EFBIG);
         assert_eq!(errno_of(proto_fs::STALE), errno::EIO);
         assert_eq!(errno_of(STARTING), errno::EIO);
         assert_eq!(errno_of(proto_fs::AUTHENTICATING), errno::EIO);
