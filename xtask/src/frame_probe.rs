@@ -327,6 +327,122 @@ pub fn frame_cap_bands() -> u32 {
     band_cap(DEFAULT_PERIOD_NS, DEFAULT_CAP_PPM)
 }
 
+/// The bound of the latency from a post to its prepared image ready (`compositor::prep`), in
+/// ticks, for a transform of kind `kind` (a row of `compositor::PRICES`) into an image of `w`
+/// by `h` points, made by the worker at `level`. It is a model bound (the response time by the
+/// formula of the frame over the prices of the model), not a measure. The terms:
+///
+/// - the worker's own work: its pieces of `compositor::prep::PIECE_POINTS` points (whole lines),
+///   a call of pixman each at the model's price, with the loss of the cache of paths once;
+/// - `B_worker`, the blocking by a pass of a lower level that is in its piece when the post comes:
+///   the longest piece of the dearest kind (the nearest point or the bilinear mean, copied);
+/// - the passes of the other slots at or above `level` that come first (`others`: kind and size
+///   of each), each its whole work;
+/// - the wake path of the post (the round trip of the request and the longest path of the kernel
+///   that is not preempted) and the step of the service that was running when it came;
+/// - the sources above the worker: the compositor itself, which makes `bands` bands of at most their
+///   gate in every period (the bands of the scene's frame, or at most the cap's `frame_cap_bands`),
+///   and, with `loaded`, the budgets on CPU 0 of the services of the table above `level` with
+///   their signs of life. The worker's own time is outside the budgets of the clients: it runs at
+///   the poster's level on the service's own account, not on the poster's budget.
+///
+/// None when a kind has no price or the shares leave the worker no CPU (the iteration does not
+/// settle).
+pub fn image_latency_bound(
+    level: u8,
+    kind: &str,
+    (w, h): (u32, u32),
+    others: &[(&str, u32, u32)],
+    bands: u64,
+    loaded: bool,
+) -> Option<u64> {
+    use compositor::frame::DEFAULT_PERIOD_NS;
+    use compositor::prep::piece_rows;
+    let work = |kind: &str, w: u32, h: u32| -> Option<u64> {
+        let mut own = u64::from(compositor::kind_miss_ticks(kind)?);
+        let mut y = 0;
+        while y < h {
+            let rows = piece_rows(w).min(h - y);
+            own += compositor::kind_model_ticks(kind, w, rows)?;
+            y += rows;
+        }
+        Some(own)
+    };
+    let mut own = work(kind, w, h)?;
+    for (k, ow, oh) in others {
+        own += work(k, *ow, *oh)?;
+    }
+    let piece = |kind: &str| compositor::kind_model_ticks(kind, w, piece_rows(w)).unwrap_or(0);
+    own += piece("scale-nearest-copy").max(piece("scale-bilinear-copy"));
+    let above = |r: &&init::table::Record| {
+        loaded && matches!(r.kind, Kind::Service(_)) && r.priority > level
+    };
+    let signs: u64 = TABLE
+        .iter()
+        .filter(above)
+        .map(|r| if r.budgets.is_empty() { 8_000 } else { 2_400 })
+        .sum();
+    own += C_IPC + KERNEL + STEP + signs;
+    let period = ticks_of(DEFAULT_PERIOD_NS);
+    let mut sources = vec![Source {
+        budget: bands * BAND,
+        period,
+        step: BAND,
+        wakes: 1,
+    }];
+    sources.extend(
+        TABLE
+            .iter()
+            .filter(above)
+            .filter(|r| r.program != "compositor")
+            .flat_map(|r| r.budgets.iter().map(move |b| (r, b)))
+            .filter(|(_, b)| b.cpu == 0)
+            .map(|(r, b)| Source {
+                budget: ticks_of(b.c_ns),
+                period: ticks_of(b.t_ns),
+                step: if b.low >= level { STEP } else { 0 },
+                wakes: wakes(r, b),
+            }),
+    );
+    bound(own, &sources, EVENTS, LIMIT)
+}
+
+/// The service's own steps that prepared images add to the work of a frame's period, ticks: each
+/// image the worker publishes is one step of the service (PREP: the raster wraps the image and
+/// the screen is damaged), and the end of the frame that frees buffers and lets go of the images
+/// is another (`Scene::end`, counted in the `2 * STEP` of the frame already). The terms of a row
+/// that has `images` published in the period are `own(row) + prep_steps(images)`; the rows P, D
+/// and F, which have none, are as they were.
+pub fn prep_steps(images: u64) -> u64 {
+    images * STEP
+}
+
+/// The model bounds of the prepared images, as the report tells them (a model, not a measure): the
+/// latency from a post to the image of the cube's element ready at level 28, with the bands of the
+/// scene P in each period and no load, with another slot ahead, at the cap of the frame and with
+/// the loads; and the step a published image adds to the work of a period.
+pub fn image_model_report() -> String {
+    let kind = "scale-nearest-copy";
+    let p = p_bands();
+    let cap = u64::from(frame_cap_bands());
+    let ticks = |bound: Option<u64>| bound.map_or("none".to_owned(), |t| t.to_string());
+    format!(
+        "frame-probe: prepared images, model bounds (not measures), ticks of 16 ns: post to image at level 28 (80 by 80, scene P bands {p}): {}, behind another slot {}, at the cap of {cap} bands {}, with the loads {}; a published image adds {} ticks to the work of a period",
+        ticks(image_latency_bound(28, kind, (80, 80), &[], p, false)),
+        ticks(image_latency_bound(
+            28,
+            kind,
+            (80, 80),
+            &[(kind, 80, 80)],
+            p,
+            false
+        )),
+        ticks(image_latency_bound(28, kind, (80, 80), &[], cap, false)),
+        ticks(image_latency_bound(28, kind, (80, 80), &[], p, true)),
+        prep_steps(1),
+    )
+}
+
 /// The rows of the table of bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Row {
@@ -1066,6 +1182,9 @@ pub fn probe(args: &[String]) -> Result<(), String> {
         let steps = steps_verdict(&lines).map_err(|e| format!("frame-probe: {e}"))?;
         println!("frame-probe: the longest steps, ticks: {steps}");
     }
+    if timed {
+        println!("{}", image_model_report());
+    }
     println!(
         "frame-probe on {}: {} phases judged{}",
         crate::qemu::VIRT.name,
@@ -1174,6 +1293,62 @@ mod tests {
         // The driver stays on the bound of the calls.
         let driver = vec!["service wait: 12 kind 6 48001 ticks of 50000".to_owned()];
         assert!(check_waits(&driver, TABLE, "t").is_err());
+    }
+
+    /// The latency from a post to the prepared image of the cube's element (a turn by a quarter
+    /// and a stretch to half, 80 by 80 points, the nearest point) at the level of the holders
+    /// of the probes (28), by the model: with the bands of the scene P (a window of 160 by 100)
+    /// in every period and no load the bound is within a period; with the pass of another slot
+    /// ahead of it it is longer; at the cap of the frame (47 bands a period, which leaves the
+    /// worker a quarter of the CPU) it is not within a period; with the budgets of the services
+    /// above the worker the bound is longer than with none.
+    #[test]
+    fn the_image_of_a_post_is_ready_within_a_period_by_the_bound() {
+        let period = ticks_of(compositor::frame::DEFAULT_PERIOD_NS);
+        let kind = "scale-nearest-copy";
+        let p = p_bands();
+        let idle = image_latency_bound(28, kind, (80, 80), &[], p, false).expect("a bound");
+        assert!(idle < period, "{idle} ticks over {period}");
+        // A bigger target takes longer, and so does a pass of another slot ahead of it.
+        let big = image_latency_bound(28, kind, (160, 160), &[], p, false).expect("a bound");
+        assert!(big > idle);
+        let behind =
+            image_latency_bound(28, kind, (80, 80), &[(kind, 80, 80)], p, false).expect("a bound");
+        assert!(behind > idle);
+        // The budgets of the services above the worker add to the wait; a lower level has
+        // more of them above it.
+        let high = image_latency_bound(28, kind, (80, 80), &[], p, true);
+        let low = image_latency_bound(10, kind, (80, 80), &[], p, true);
+        assert!(high.is_none_or(|h| h >= idle));
+        assert!(low.is_none_or(|l| high.is_none_or(|h| l >= h)));
+        let capped =
+            image_latency_bound(28, kind, (80, 80), &[], u64::from(frame_cap_bands()), false)
+                .expect("a bound");
+        assert!(capped > period, "{capped} ticks at the cap");
+        println!(
+            "image latency bound at 28 (model, ticks of 16 ns, period {period}): scene P {idle}, 160 by 160 {big}, behind another slot {behind}, at the cap {capped}, with the loads {high:?}"
+        );
+    }
+
+    /// The report tells the bounds and none of them is missing.
+    #[test]
+    fn the_report_tells_the_model_bounds_of_the_images() {
+        let line = image_model_report();
+        assert!(
+            line.starts_with("frame-probe: prepared images, model bounds"),
+            "{line}"
+        );
+        assert!(!line.contains("none"), "{line}");
+        assert!(line.contains(&format!("adds {} ticks", prep_steps(1))));
+    }
+
+    /// An image the worker publishes in a period is a step of the service: the frame's own work
+    /// grows by `STEP` for each, and the rows with none are unchanged.
+    #[test]
+    fn a_published_image_adds_a_step_to_the_work_of_the_period() {
+        assert_eq!(prep_steps(0), 0);
+        assert_eq!(prep_steps(3), 3 * STEP);
+        assert_eq!(own(Row::P) + prep_steps(1), own(Row::P) + STEP);
     }
 
     /// The numbers of the analysis for the image of the frame (the heartbeat 46 400).
