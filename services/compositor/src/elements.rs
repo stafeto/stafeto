@@ -449,6 +449,31 @@ fn fractions(e: &Element, u: i64, v: i64) -> ((i64, i64), (i64, i64)) {
 /// the screen. None when `r` meets no point of the source rectangle or the
 /// result is not on the screen.
 pub fn target_of(e: &Element, r: Rect) -> Option<Rect> {
+    let (x0, y0, x1, y1) = target_raw(e, r)?;
+    clip(x0, y0, x1, y1)
+}
+
+/// `target_of` in the points of the target rectangle itself (from its corner,
+/// 0 to its width and height), with no cut to the screen: the part of a prepared image
+/// that a change of `r` makes stale.
+pub fn target_local(e: &Element, r: Rect) -> Option<Rect> {
+    let at = Element { dx: 0, dy: 0, ..*e };
+    let (x0, y0, x1, y1) = target_raw(&at, r)?;
+    let (x0, y0) = (x0.max(0), y0.max(0));
+    let (x1, y1) = (x1.min(i64::from(e.dw)), y1.min(i64::from(e.dh)));
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    Some(Rect {
+        x: x0 as u32,
+        y: y0 as u32,
+        w: (x1 - x0) as u32,
+        h: (y1 - y0) as u32,
+    })
+}
+
+/// The corners of what `target_of` carries (before the cut to the screen).
+fn target_raw(e: &Element, r: Rect) -> Option<(i64, i64, i64, i64)> {
     let (sx, sy) = (i64::from(e.sx), i64::from(e.sy));
     let (sw, sh) = (i64::from(e.sw), i64::from(e.sh));
     let u0 = (i64::from(r.x) << 16).max(sx) - sx;
@@ -473,7 +498,7 @@ pub fn target_of(e: &Element, r: Rect) -> Option<Rect> {
         hi = (hi.0.max(ceil_x), hi.1.max(ceil_y));
     }
     let margin = i64::from(e.filter == BILINEAR);
-    clip(lo.0 - margin, lo.1 - margin, hi.0 + margin, hi.1 + margin)
+    Some((lo.0 - margin, lo.1 - margin, hi.0 + margin, hi.1 + margin))
 }
 
 /// The union of the screen's rectangles the elements of `def` that use window
@@ -481,9 +506,19 @@ pub fn target_of(e: &Element, r: Rect) -> Option<Rect> {
 /// target rectangle, for a mask is all or nothing under an element); None when
 /// no element uses the window, or what they show of it is off the screen.
 pub fn window_damage(def: &Def, id: u32, r: Rect) -> Option<Rect> {
+    window_damage_by(def, id, r, false)
+}
+
+/// `window_damage` for a service that makes the images of the elements that turn
+/// or stretch (`prepared`): the change of such an element shows when its image is
+/// made, so a window's change is damage only of the plain elements and the masks.
+pub fn window_damage_by(def: &Def, id: u32, r: Rect, prepared: bool) -> Option<Rect> {
     let mut sum = None;
     for e in def.elements() {
         let part = if e.source == id {
+            if prepared && !is_plain(e) {
+                continue;
+            }
             target_of(e, r)
         } else if e.transparency & TRANSPARENCY_MASK != 0 && e.mask == id {
             target_bounds(e)

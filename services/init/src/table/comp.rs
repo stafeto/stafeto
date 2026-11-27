@@ -56,7 +56,9 @@ pub const COMPOSITOR: Record = Record {
     }),
     priority: 32,
     ceiling: 32,
-    quota: 150 * PAGE,
+    // The compositor's 150 pages and the pool of the prepared images of
+    // its elements (2 MiB, `compositor::prep::POOL_BYTES`: 512 pages).
+    quota: 662 * PAGE,
     handle_limit: 128,
     restart: Restart::Always,
     console: true,

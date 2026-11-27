@@ -51,12 +51,15 @@
 
 use abi::{Access, Error, MESSAGE_MAX, Rights, Source};
 use compositor::frame::{self, Fire, Pacer, Wake};
+use compositor::prep::{self, Pass, Reads, Table};
 use compositor::{
     Band, Format, FrameKind, MAX_WINDOWS, Refusal, SCREEN, Scene, ScreenAsk, ScreenPhase,
     Source as PixelSource, compose_planned,
 };
+use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::slice;
+use core::sync::atomic::{AtomicU64, Ordering};
 use proto_comp::{
     Attach, BUFFER_MAX, COMMITTED_BIT, COMPOSED_BIT, Create, Description, EVENTS_BIT, Event,
     FOCUSED, INPUT_MARK, MANAGER_MARK, MAX_EVENTS, Method as Comp, Post, RESET, Rect, SCENE_MARK,
@@ -73,7 +76,7 @@ use proto_init::ServiceArgs;
 use proto_input::{ABS_MAX, ABS_X, ABS_Y, EV_ABS, EV_KEY, Method as InputMethod};
 use proto_wire::clones::Clones;
 use proto_wire::{Status, Writer};
-use rt::handle::{Channel, Memory, Outgoing, Process, Timer};
+use rt::handle::{Channel, Memory, Outgoing, Process, Thread, Timer};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
 use rt::wait::Waiter;
 use rt::{Handle, sys};
@@ -149,6 +152,9 @@ const INPUT: u64 = 4;
 /// for: a step of its own, so that the kernel call is not in the step of the
 /// band that reached the cap.
 const ARM: u64 = 8;
+/// The worker has let go of what it held, or drew something: the free of buffers
+/// that waited for it, the unmapping of windows, the images it published.
+const PREP: u64 = 16;
 /// The events one READ of an input service asks for.
 const READ_MAX: u32 = 32;
 /// The codes of a start that failed, and of the driver's end.
@@ -251,13 +257,13 @@ const STEP_SCREEN_CURSOR: u64 = 5004;
 const STEP_SCREEN_POOL: u64 = 5005;
 const STEP_ARM: u64 = 6000;
 
-impl PixelSource for Pixels<'_> {
-    fn pixels(&self, window: usize, buffer: u8) -> &[u8] {
-        let len = self
-            .0
+/// The windows' buffers, as the mappings hold them.
+fn window_bytes(scene: &Scene, window: usize, buffer: u8) -> &[u8] {
+    {
+        let len = scene
             .window(window)
             .map_or(0, |w| w.stride as usize * w.rect.h as usize);
-        let at = if self.0.window(window).is_some_and(|w| w.legacy) {
+        let at = if scene.window(window).is_some_and(|w| w.legacy) {
             POOL_AT
         } else {
             buf_at(window, buffer as usize)
@@ -269,6 +275,44 @@ impl PixelSource for Pixels<'_> {
         // window has gone and a later step unmaps it, never in the middle
         // of a band (one thread).
         unsafe { slice::from_raw_parts(at as *const u8, len) }
+    }
+}
+
+/// The prepared images (`compositor::prep`): the table the service and the worker
+/// share, the pool of their pages, and what the worker thread needs to start.
+static TABLE: Table = Table::new();
+
+/// The pool of the images, `prep::POOL_BYTES` of memory the table reads and the
+/// worker writes.
+#[repr(align(4096))]
+struct ImagePool(UnsafeCell<[u8; prep::POOL_BYTES]>);
+
+// SAFETY: the table decides who touches which image (a frame reads the one it
+// holds, the worker writes the other).
+unsafe impl Sync for ImagePool {}
+
+static IMAGES: ImagePool = ImagePool(UnsafeCell::new([0; prep::POOL_BYTES]));
+static WORKER_STACK: rt::Stack<{ 64 * 1024 }> = rt::Stack::new();
+/// The page after the main thread's message buffer is the worker's.
+const WORKER_BUFFER: usize = rt::abi::INIT_MSGBUF as usize + 4096;
+/// The wait channel the worker receives on, the channel it tells the service's
+/// bit through, as raw handle numbers (the handles live in the service).
+static WORKER_WAIT: AtomicU64 = AtomicU64::new(0);
+static WORKER_TELL: AtomicU64 = AtomicU64::new(0);
+
+impl PixelSource for Pixels<'_> {
+    fn pixels(&self, window: usize, buffer: u8) -> &[u8] {
+        window_bytes(self.0, window, buffer)
+    }
+
+    fn prepared(&self, slot: u8, image: u8) -> (&[u8], u32, (u32, u32), bool) {
+        let g = TABLE.geometry(usize::from(slot));
+        (
+            TABLE.image(usize::from(slot), image),
+            g.stride(),
+            (g.w, g.h),
+            g.key.argb,
+        )
     }
 }
 
@@ -420,6 +464,91 @@ struct Compositor {
     /// of its own; the copy lives as long as the timer.
     timer: Handle<Timer>,
     _timer_view: Handle<Channel>,
+    /// The worker that makes the prepared images (started at the first job): its
+    /// thread, the wait channel it receives on and the copy of it the service
+    /// wakes it through (NOTIFY alone: no request can queue there).
+    worker: Option<Worker>,
+    /// The worker was tried once at the start.
+    worker_tried: bool,
+    /// The level a commit refused with BUSY lent the worker, until the pages it waits
+    /// for are free.
+    busy_boost: u8,
+}
+
+struct Worker {
+    thread: Handle<Thread>,
+    _wait: Handle<Channel>,
+    wake: Handle<Channel>,
+}
+
+/// The worker's view of the windows' buffers.
+struct WorkerReads;
+
+impl Reads for WorkerReads {
+    fn read(&self, place: usize, buffer: u8, len: usize) -> &[u8] {
+        let len = len.min(BUFFER_MAX as usize);
+        // SAFETY: the worker reads a buffer only while it holds the window
+        // (`Table::hold`): the service unmaps a window's pages only after the worker
+        // lets go, and a window's buffers are mapped when its first POST came.
+        unsafe { slice::from_raw_parts(buf_at(place, usize::from(buffer)) as *const u8, len) }
+    }
+}
+
+/// The worker thread: makes the prepared images, the slot of the highest level
+/// first. It waits on a wait channel for the service to say there is work, and tells
+/// the service (PREP) when it let go of something the service put off, moved to
+/// another buffer while the service waited, published an image, or went idle. It
+/// never sets its own level: the service owns it (`Compositor::steer_worker`),
+/// raises it on the request path and lowers it when told the worker is idle.
+///
+/// The loop has one shape: pieces while a slot is next, then let go and wait. Every
+/// pass that returns Idle or Blocked has cleared its slot's bit, and every setter of
+/// a bit outside the worker (a post, a commit, the end of a frame) is followed by a
+/// notice, so a slot that wants the worker is never left waiting and the worker
+/// never has the same slot for ever.
+extern "C" fn worker_main(_: u64) -> ! {
+    let wait = Handle::<Channel>::borrowed(rt::abi::Handle(WORKER_WAIT.load(Ordering::Acquire)));
+    let tell = Handle::<Channel>::borrowed(rt::abi::Handle(WORKER_TELL.load(Ordering::Acquire)));
+    let mut maker = px::Worker::new();
+    let mut job = prep::Job::NONE;
+    // The level the service was told is too high for the work in hand.
+    let mut told_level = 0;
+    loop {
+        while let Some((slot, at)) = TABLE.next(&job) {
+            // A slot of a level below the worker's: the service is told, to lower the
+            // worker, once for a level, so that the pass does not run above its level.
+            let now = TABLE.worker_level();
+            if at < now && told_level != now {
+                told_level = now;
+                let _ = sys::notify(&tell, PREP);
+            } else if at >= now {
+                told_level = 0;
+            }
+            match TABLE.piece(&mut job, slot, &mut maker, &WorkerReads) {
+                Pass::More => {}
+                Pass::Published => {
+                    TABLE.let_go();
+                    let _ = sys::notify(&tell, PREP);
+                }
+                Pass::Idle | Pass::Blocked => {
+                    if TABLE.let_go() {
+                        let _ = sys::notify(&tell, PREP);
+                    }
+                }
+            }
+            // The claim moved to another buffer of a window while the service waited
+            // for the first: its free can go.
+            if TABLE.take_moved() && TABLE.deferred() {
+                let _ = sys::notify(&tell, PREP);
+            }
+        }
+        // Idle: what the service waits for is let go, and a worker above its lowest
+        // level says so, for the service to lower it.
+        if TABLE.let_go() || TABLE.worker_level() > 1 {
+            let _ = sys::notify(&tell, PREP);
+        }
+        let _ = sys::receive(&wait);
+    }
 }
 
 /// The time on the scale of the counter, in nanoseconds.
@@ -491,7 +620,15 @@ fn main(_: u64) -> u64 {
         pacer: Pacer::new(now_ns(), period, cap),
         timer,
         _timer_view: timer_view,
+        worker: None,
+        worker_tried: false,
+        busy_boost: 0,
     };
+    TABLE.set_pool(IMAGES.0.get().cast());
+    service.scene.set_prep(&TABLE);
+    // The worker starts here, before the first request: a thread is made at no
+    // step of the service.
+    service.start_worker();
     // The image of the pointer's picture is made here, before the first band
     // the pointer is in.
     service.raster.prepare(
@@ -1560,6 +1697,9 @@ impl Compositor {
         self.committed = false;
         let direct = self.scene.frame_kind() == FrameKind::Bypass;
         let ended = self.scene.end(shown);
+        if self.scene.take_wake() {
+            self.wake_worker();
+        }
         // The time of the frame is counted at the beginning of the step in
         // which the service learned the device was done; a failed frame asks for
         // the timer again when a change waits.
@@ -1650,7 +1790,12 @@ impl Compositor {
             || self.cleared.is_some()
             || matches!(self.pool, PoolState::Mapping { .. })
             || self.attaching.is_some()
-            || self.extra.iter().any(|e| e.dying)
+            || self.unmappable().is_some()
+    }
+
+    /// A dying window whose pages are to be unmapped: the worker is not reading it.
+    fn unmappable(&self) -> Option<usize> {
+        (0..MAX_WINDOWS).find(|&i| self.extra[i].dying && !self.scene.worker_reads(i))
     }
 
     /// One step of the work: a piece of the legacy buffer cleared, else a
@@ -1681,7 +1826,7 @@ impl Compositor {
             }
         } else if matches!(self.pool, PoolState::Mapping { .. }) {
             self.map_pool_chunk();
-        } else if let Some(i) = self.extra.iter().position(|e| e.dying) {
+        } else if let Some(i) = self.unmappable() {
             self.unmap_chunk(i);
         } else if self.attaching.is_some() {
             self.map_chunk();
@@ -1992,7 +2137,8 @@ impl Compositor {
             height: HEIGHT,
             format: proto_comp::FORMAT_XRGB8888,
             flags: (u32::from(self.scene.has_manager()) * proto_comp::HAS_MANAGER)
-                | (u32::from(self.scene.cursor_plane()) * proto_comp::CURSOR_PLANE),
+                | (u32::from(self.scene.cursor_plane()) * proto_comp::CURSOR_PLANE)
+                | (u32::from(!self.scene.prepared()) * proto_comp::NO_IMAGE_WORKER),
             open: self.scene.open(),
             created: self.scene.created(),
             frames: self.scene.frames(),
@@ -2162,6 +2308,15 @@ impl Compositor {
                         compositor::image_of(i, buffer),
                     );
                 }
+                // The images of the elements that turn or stretch the window are
+                // behind now: the worker makes them at the poster's level, and the
+                // frame shows them when they are ready.
+                if self
+                    .scene
+                    .note_post(i, buffer, rects, r.level().min(prep::LEVEL_MAX))
+                {
+                    self.wake_worker();
+                }
                 // A window with an interval is due at its start, whatever else
                 // is waiting for a frame.
                 if let Some(e) = due {
@@ -2196,6 +2351,150 @@ impl Compositor {
             Answer::Status(Status::Ok)
         } else {
             Answer::Status(proto_comp::code(proto_comp::INVALID))
+        }
+    }
+
+    /// The worker thread, made once when the service starts. False when it cannot be
+    /// made (it is tried once, and the service says so on the console): the images
+    /// are not made then and the elements that need them show nothing.
+    fn start_worker(&mut self) -> bool {
+        if self.worker.is_some() {
+            return true;
+        }
+        if core::mem::replace(&mut self.worker_tried, true) {
+            return false;
+        }
+        if !self.make_worker() {
+            // Without a worker the elements are drawn by the bands, as before.
+            self.scene.clear_prep();
+            return false;
+        }
+        true
+    }
+
+    fn make_worker(&mut self) -> bool {
+        let Ok(wait) = sys::channel_create_wait(1) else {
+            rt::println!("compositor: no channel for the prepared images");
+            return false;
+        };
+        let Ok(wake) = sys::handle_label(&wait, Rights::NOTIFY, 1, 1) else {
+            rt::println!("compositor: no handle for the prepared images");
+            return false;
+        };
+        WORKER_WAIT.store(wait.raw().0, Ordering::Release);
+        WORKER_TELL.store(self.notify.raw().0, Ordering::Release);
+        // SAFETY: WORKER_STACK is the worker's alone, and the page after the main
+        // thread's message buffer is free.
+        let thread = unsafe {
+            sys::thread_create(
+                &self.process,
+                worker_main,
+                WORKER_STACK.top(),
+                0,
+                1,
+                rt::abi::Policy::Fifo,
+                WORKER_BUFFER,
+            )
+        };
+        let Ok(thread) = thread else {
+            rt::println!("compositor: no thread for the prepared images");
+            return false;
+        };
+        if sys::thread_start(&thread).is_err() {
+            rt::println!("compositor: the thread for the prepared images did not start");
+            return false;
+        }
+        self.worker = Some(Worker {
+            thread,
+            _wait: wait,
+            wake,
+        });
+        true
+    }
+
+    /// The worker's level is the service's to set, and the service sets it here only:
+    /// the level of the highest slot that wants the worker or that it holds (the level
+    /// of the client that posted, capped at 31), or `at_least` (a commit the service
+    /// refused with BUSY), or 1 when there is no work. Called on the request path
+    /// when work comes and when the worker says it let go or went idle, so that the
+    /// worker is never lowered under work it has.
+    fn steer_worker(&mut self, at_least: u8) {
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        let level = TABLE
+            .top_level()
+            .unwrap_or(1)
+            .max(at_least)
+            .max(self.busy_boost)
+            .min(prep::LEVEL_MAX);
+        if level != TABLE.worker_level()
+            && sys::thread_set_priority(&worker.thread, level, rt::abi::Policy::Fifo).is_ok()
+        {
+            TABLE.set_worker_level(level);
+        }
+    }
+
+    /// The worker is raised to the level of the work that waits, and told.
+    fn wake_worker(&mut self) {
+        if !self.start_worker() {
+            return;
+        }
+        self.steer_worker(0);
+        if let Some(worker) = &self.worker {
+            let _ = sys::notify(&worker.wake, 1);
+        }
+    }
+
+    /// The worker let go of something or drew an image (PREP): the buffers whose free
+    /// waited for it are free and told to their clients, the pages of the slots it
+    /// held are free, the images it published are known to the raster and the screen
+    /// is damaged where an element shows them, and the windows whose unmapping waited
+    /// go on.
+    fn prep_done(&mut self) {
+        TABLE.undefer();
+        let freed = self.scene.release_owed();
+        for (i, bits) in freed.into_iter().enumerate() {
+            if bits != 0
+                && let Some(notify) = &self.extra[i].notify
+            {
+                let _ = sys::notify(notify, u64::from(bits));
+            }
+        }
+        TABLE.reap();
+        // One image a step: the raster wraps it now, so that no band does, and
+        // the screen is damaged where an element shows it. The rest wait for the
+        // service's own bit.
+        if let Some((slot, local)) = TABLE.take_drawn() {
+            if let Some(image) = TABLE.front_of(slot) {
+                let g = TABLE.geometry(slot);
+                self.raster.prepare(
+                    TABLE.image(slot, image),
+                    g.stride(),
+                    if g.key.argb {
+                        Format::Argb
+                    } else {
+                        Format::Xrgb
+                    },
+                    (g.w, g.h),
+                    usize::MAX,
+                );
+            }
+            self.scene.images_drawn(&[(slot, local)]);
+            // A scene that waited for its images is taken now.
+            self.kick();
+        }
+        if TABLE.drawn_waits() {
+            let _ = sys::notify(&self.notify, PREP);
+        }
+        // The raise for a commit refused with BUSY ends when the pages are free.
+        if TABLE.zombies_left() == 0 {
+            self.busy_boost = 0;
+        }
+        // The worker lets go or goes idle: its level follows the work that is left.
+        self.steer_worker(0);
+        if self.extra.iter().any(|e| e.dying) {
+            let _ = sys::notify(&self.notify, WORK);
         }
     }
 
@@ -2431,13 +2730,29 @@ impl Compositor {
         {
             return Answer::Status(proto_comp::code(proto_comp::BUSY));
         }
-        if let Err(refusal) = self
-            .scene
-            .commit_done(flags & proto_comp::ASK_COMMITTED != 0)
-        {
+        self.scene.set_period(if self.pacer.is_free() {
+            u64::MAX
+        } else {
+            self.pacer.clock().index(now_ns())
+        });
+        if let Err(refusal) = self.scene.commit_done_at(
+            flags & proto_comp::ASK_COMMITTED != 0,
+            r.level().min(prep::LEVEL_MAX),
+        ) {
+            // BUSY: the images fit once the worker lets go of the slots it holds; it
+            // runs at the commit's level until it does.
+            if refusal == Refusal::Busy {
+                // The raise stays until the pages are free (`prep_done`), so that a
+                // lowering for other work does not undo it early.
+                self.busy_boost = self.busy_boost.max(r.level().min(prep::LEVEL_MAX));
+                self.steer_worker(0);
+            }
             return Answer::Status(Compositor::refusal(refusal));
         }
         self.scene_label = r.label();
+        if TABLE.work_waits() {
+            self.wake_worker();
+        }
         self.kick();
         Answer::Status(Status::Ok)
     }
@@ -2633,6 +2948,9 @@ impl Service<1> for Compositor {
         if matches!(n.source, Source::Unlabeled) && n.bits & INPUT != 0 {
             self.read_device(Which::Keys);
             self.read_device(Which::Pointer);
+        }
+        if matches!(n.source, Source::Unlabeled) && n.bits & PREP != 0 {
+            self.prep_done();
         }
         match n.source {
             Source::Session if n.label & !GENERATION == KEYS => self.read_device(Which::Keys),
