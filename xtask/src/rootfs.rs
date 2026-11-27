@@ -2577,40 +2577,26 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         // The lower set of the probe of the names of the layered root: the files the layer of the
         // volume (`data_image::LAYER_VOLUME_ENTRIES`) shadows, deletes or hides.
         "boot-layer-names.img" => {
+            // In the strictly ascending order of the paths.
             let mut files = vec![
                 dir("/bin"),
                 file("/bin/layer-names", 0o755, ROOT, "layer-names"),
-                dir("/etc"),
-                of(
-                    "/etc/layer-lower",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layer-etc-lower", b"lower of etc\n"),
-                ),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            // `/etc` and the account files come from `accounts`.
+            files.extend([
                 of(
                     "/etc/layer-hidden",
                     0o644,
                     ROOT,
                     Source::Bytes("layer-etc-hidden", b"hidden by the layer\n"),
                 ),
-                dir("/lower"),
                 of(
-                    "/lower/keep",
+                    "/etc/layer-lower",
                     0o644,
                     ROOT,
-                    Source::Bytes("layer-lower-keep", b"lower keep\n"),
-                ),
-                of(
-                    "/lower/shadowed",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layer-lower-shadowed", b"lower shadowed\n"),
-                ),
-                of(
-                    "/lower/hidden",
-                    0o644,
-                    ROOT,
-                    Source::Bytes("layer-lower-hidden", b"lower hidden\n"),
+                    Source::Bytes("layer-etc-lower", b"lower of etc\n"),
                 ),
                 dir("/lowdir"),
                 of(
@@ -2625,6 +2611,25 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                     ROOT,
                     Source::Bytes("layer-lowdir-l2", b"l2\n"),
                 ),
+                dir("/lower"),
+                of(
+                    "/lower/hidden",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("layer-lower-hidden", b"lower hidden\n"),
+                ),
+                of(
+                    "/lower/keep",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("layer-lower-keep", b"lower keep\n"),
+                ),
+                of(
+                    "/lower/shadowed",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("layer-lower-shadowed", b"lower shadowed\n"),
+                ),
                 dir("/private"),
                 of(
                     "/private/lower",
@@ -2632,9 +2637,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                     ROOT,
                     Source::Bytes("layer-private-lower", b"lower private\n"),
                 ),
-                dir("/dev"),
-            ];
-            files.extend(devices());
+            ]);
             files
         }
         "boot-cxx-probe.img" => {

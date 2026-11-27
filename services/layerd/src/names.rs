@@ -511,14 +511,20 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     ) -> R<Done<V::Pass>> {
         self.gate()?;
         let (outcome, trailing) = self.walk(c, path);
+        // The names the root passes through are the services' own, writes included. A name of
+        // the lower set is read only in this part: the RAM file service would write it below the
+        // layers, so a write or a create is refused here.
+        let writes = n::open_writes(flags);
+        if outcome == Outcome::Lower && writes {
+            return Err(st(proto_fs::READ_ONLY_FILESYSTEM));
+        }
         if let Some(done) = Self::redirect_for(outcome, path, w) {
-            // A name of the lower set is the RAM file service's, writes included: it answers.
             return done.map(|()| Done::Written);
         }
         let Outcome::Upper(id) = outcome else {
             return Err(Self::refusal(outcome));
         };
-        if n::open_writes(flags) {
+        if writes {
             return Err(st(proto_fs::READ_ONLY_FILESYSTEM));
         }
         let is_dir = id == 0 || self.index.entry(id).is_some_and(|e| e.kind == Kind::Dir);

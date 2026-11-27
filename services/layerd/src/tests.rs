@@ -422,6 +422,22 @@ fn a_write_or_a_create_is_a_read_only_file_system() {
             Some(st(f::READ_ONLY_FILESYSTEM))
         );
     }
+    // A name of the lower set, one that exists and one that does not: the same.
+    for path in ["/bin/ls", "/bin/none", "/usr/new"] {
+        assert_eq!(
+            open(&mut core, 0, f::READ_ONLY | f::CREATE, path).err(),
+            Some(st(f::READ_ONLY_FILESYSTEM)),
+            "{path}"
+        );
+        assert_eq!(
+            open(&mut core, 0, f::WRITE_ONLY, path).err(),
+            Some(st(f::READ_ONLY_FILESYSTEM)),
+            "{path}"
+        );
+    }
+    // The names the root passes through are the services' own.
+    let (reply, _) = open(&mut core, 0, f::WRITE_ONLY | f::CREATE, "/tmp/x").unwrap();
+    assert!(matches!(OpenAnswer::read(&reply), Ok(OpenAnswer::Redirect(_))));
     assert_eq!(core.change(), st(f::READ_ONLY_FILESYSTEM));
 }
 
