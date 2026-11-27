@@ -2697,9 +2697,14 @@ fn a_layered_root_refuses_the_writes_outside_the_pass_through_names() {
         true,
         false
     )));
-    // A link below /tmp that leads out is no way to write: the file it names is refused.
+    // A link below /tmp that leads out is no way to write: the walk ends at the link with a
+    // redirect to the name it leads to (the layer service decides it), and that name is refused.
     assert_eq!(
         guarded_walk(&mut r, b"/tmp/link", open(WRITE_ONLY), true, false),
+        Err(proto_fs::REDIRECT)
+    );
+    assert_eq!(
+        guarded_walk(&mut r, b"/etc/passwd", open(WRITE_ONLY), true, false),
         refused
     );
     // The creation of names, the removal and the rename, the links.
@@ -2819,4 +2824,147 @@ fn a_layered_root_refuses_the_writes_outside_the_pass_through_names() {
         true,
         false
     )));
+}
+
+/// The redirect the walk of `path` ends with as a POSIX session of a layered image (`guarded`):
+/// the path and the links it had expanded; None when it ended otherwise.
+fn bounced(r: &mut Ram<'_>, path: &[u8], guarded: bool) -> Option<(Vec<u8>, u32)> {
+    use crate::resolve::Intent;
+    let mut resolver = Resolve::with_intent(
+        &mut r.storage,
+        path,
+        ROOT,
+        ADMIN,
+        Intent::Lookup { follow: true },
+    )
+    .unwrap();
+    if guarded {
+        resolver.guard_layered(false);
+    }
+    let result = intent_ready(r, &mut resolver, ADMIN);
+    let found = (result == Err(proto_fs::REDIRECT))
+        .then(|| resolver.redirect().map(|(p, links)| (p.to_vec(), links)))
+        .flatten();
+    resolver.release(&mut r.storage);
+    found
+}
+
+/// A layered root: the expansion of a link and a `..` of a walk of a POSIX session end it with a
+/// redirect that routes by the path, so the merged view of the layer service decides what they
+/// lead to; the boot profile and an image that is not layered walk as they did.
+#[test]
+fn a_layered_root_sends_a_link_and_a_parent_back_to_the_merged_view() {
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let etc = r.storage.lookup(ROOT, b"etc").unwrap();
+    create(&mut r, etc, b"passwd", REG, 0o644);
+    let usr = create(&mut r, ROOT, b"usr", DIR, 0o755);
+    let lib = create(&mut r, usr, b"lib", DIR, 0o755);
+    create(&mut r, lib, b"libc", REG, 0o644);
+    let bin = create(&mut r, usr, b"bin", DIR, 0o755);
+    let link = |r: &mut Ram<'_>, parent, name: &[u8], text: &[u8]| {
+        let l = create(r, parent, name, SYMLINK, 0o777);
+        r.storage.write(l, ROOT_ACCOUNT, 0, text).unwrap();
+    };
+    link(&mut r, ROOT, b"lib", b"usr/lib");
+    link(&mut r, ROOT, b"abs", b"/usr/lib");
+    link(&mut r, bin, b"up", b"../lib");
+    link(&mut r, bin, b"up2", b"../../etc/passwd");
+    link(&mut r, bin, b"self", b"..");
+    let tmp = r.storage.lookup(ROOT, b"tmp").unwrap();
+    link(&mut r, tmp, b"near", b"far");
+    link(&mut r, tmp, b"out", b"../etc");
+    r.storage.state.set_layered(true);
+    let to = |path: &[u8]| Some((path.to_vec(), 1));
+    // A link of the root: the text follows the root; an absolute text stands alone; what is left
+    // of the path comes after.
+    assert_eq!(bounced(&mut r, b"/lib/libc", true), to(b"/usr/lib/libc"));
+    assert_eq!(bounced(&mut r, b"/lib", true), to(b"/usr/lib"));
+    assert_eq!(bounced(&mut r, b"/abs/libc", true), to(b"/usr/lib/libc"));
+    // A link in a directory: the text follows the directory, and the `..` it begins with take
+    // the directory's last names.
+    assert_eq!(
+        bounced(&mut r, b"/usr/bin/up/libc", true),
+        to(b"/usr/lib/libc")
+    );
+    assert_eq!(bounced(&mut r, b"/usr/bin/up2", true), to(b"/etc/passwd"));
+    assert_eq!(bounced(&mut r, b"/usr/bin/self/lib", true), to(b"/usr/lib"));
+    // A link below the pass-through names bounces too: the layer service routes the new path (a
+    // path out of them is the root's).
+    assert_eq!(bounced(&mut r, b"/tmp/near", true), to(b"/tmp/far"));
+    assert_eq!(
+        bounced(&mut r, b"/tmp/out/passwd", true),
+        to(b"/etc/passwd")
+    );
+    // A `..` in the path (the POSIX layer takes them out first, but a walk that meets one) goes
+    // to the directory above, with what is left of the path.
+    assert_eq!(
+        bounced(&mut r, b"/usr/bin/../lib/libc", true),
+        Some((b"/usr/lib/libc".to_vec(), 0))
+    );
+    assert_eq!(bounced(&mut r, b"/usr/..", true), Some((b"/".to_vec(), 0)));
+    assert_eq!(
+        bounced(&mut r, b"/tmp/../etc/passwd", true),
+        Some((b"/etc/passwd".to_vec(), 0))
+    );
+    // A path with no link and no `..` is walked as it was, a link that is the end of a walk
+    // that does not follow it is not expanded, the boot profile is not bounced, and an image that
+    // is not layered has no bounce.
+    assert_eq!(bounced(&mut r, b"/usr/lib/libc", true), None);
+    assert_eq!(bounced(&mut r, b"/lib/libc", false), None);
+    r.storage.state.set_layered(false);
+    assert_eq!(bounced(&mut r, b"/lib/libc", true), None);
+}
+
+/// A walk of a POSIX session of a layered image that starts at a directory below the root (a path
+/// against a descriptor) bounces where it reaches the root: by an absolute link, and by a `..` from
+/// a directory just below it; a walk that stays below it is expanded as it was.
+#[test]
+fn a_walk_from_a_descriptor_bounces_where_it_reaches_the_root() {
+    use crate::resolve::Intent;
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let etc = r.storage.lookup(ROOT, b"etc").unwrap();
+    create(&mut r, etc, b"passwd", REG, 0o644);
+    let tmp = r.storage.lookup(ROOT, b"tmp").unwrap();
+    let a = create(&mut r, tmp, b"a", DIR, 0o777);
+    create(&mut r, a, b"f", REG, 0o644);
+    let link = |r: &mut Ram<'_>, parent, name: &[u8], text: &[u8]| {
+        let l = create(r, parent, name, SYMLINK, 0o777);
+        r.storage.write(l, ROOT_ACCOUNT, 0, text).unwrap();
+    };
+    link(&mut r, tmp, b"abs", b"/etc");
+    link(&mut r, tmp, b"near", b"a/f");
+    r.storage.state.set_layered(true);
+    let from = |r: &mut Ram<'_>, path: &[u8], guarded: bool| {
+        let mut resolver = Resolve::with_intent(
+            &mut r.storage,
+            path,
+            tmp,
+            ADMIN,
+            Intent::Lookup { follow: true },
+        )
+        .unwrap();
+        if guarded {
+            resolver.guard_layered(false);
+        }
+        let result = intent_ready(r, &mut resolver, ADMIN);
+        let found = (result == Err(proto_fs::REDIRECT))
+            .then(|| resolver.redirect().map(|(p, links)| (p.to_vec(), links)))
+            .flatten();
+        let ended = result.is_ok();
+        resolver.release(&mut r.storage);
+        (found, ended)
+    };
+    assert_eq!(
+        from(&mut r, b"abs/passwd", true).0,
+        Some((b"/etc/passwd".to_vec(), 1))
+    );
+    assert_eq!(
+        from(&mut r, b"a/../../etc/passwd", true).0,
+        Some((b"/etc/passwd".to_vec(), 0))
+    );
+    assert_eq!(from(&mut r, b"..", true).0, Some((b"/".to_vec(), 0)));
+    // Below the pass-through names the walk goes on by itself, and the boot profile is not bounced.
+    assert!(from(&mut r, b"near", true).1);
+    assert!(from(&mut r, b"a/f", true).1);
+    assert_eq!(from(&mut r, b"abs/passwd", false).0, None);
 }

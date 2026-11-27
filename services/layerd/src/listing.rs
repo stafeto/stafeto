@@ -19,7 +19,7 @@
 //! that asks again reaches the end.
 
 use crate::descriptions::Position;
-use crate::index::{Index, Kind, NextChild, OPAQUE};
+use crate::index::{Index, Kind, NextChild};
 use crate::volume::{Lower, R};
 use proto_fs::names::{DirEntry, DirReply, ENTRY_HEAD, LOWER_PER_READDIR, NAME_MAX, cursor};
 use proto_wire::Status;
@@ -48,6 +48,7 @@ const _: () = assert!(LOWER_PER_STEP <= LOWER_PER_READDIR);
 
 const DIRECTORY: u32 = 1;
 const REGULAR: u32 = 2;
+const SYMLINK: u32 = 5;
 
 fn room(reply: &DirReply) -> bool {
     reply.len() + ENTRY_HEAD + NAME_MAX <= abi::MESSAGE_MAX
@@ -62,15 +63,17 @@ fn numbers(index: &Index, id: u32) -> (u64, u64) {
             index.entry(id).map_or(0, |e| e.number)
         }
     };
-    let parent = index.entry(id).map_or(0, |e| e.parent());
+    let parent = index.parent_of(id);
     (number(id), number(parent))
 }
 
 /// Serves one READ_DIR: entries are pushed to `reply`, `position` and `lower` are advanced.
+#[allow(clippy::too_many_arguments)]
 pub fn read_dir<L: Lower>(
     index: &Index,
     lower: &mut L,
     dir: u32,
+    hidden: bool,
     position: &mut Position,
     open: &mut Option<L::Dir>,
     replayed: &mut u32,
@@ -97,9 +100,14 @@ pub fn read_dir<L: Lower>(
             return Ok(listed(position, true));
         }
         let mut budget = SLOTS_PER_READDIR;
+        let key = index.dir_key(dir);
         while room(reply) {
             let from = (position.at - 2) as usize;
-            match index.next_child(dir, from, &mut budget) {
+            let found = match key {
+                Some(key) => index.next_child_of(key, from, &mut budget),
+                None => NextChild::End,
+            };
+            match found {
                 NextChild::End => {
                     // The names of the layer are done.
                     *position = Position { stage: 1, at: 0 };
@@ -114,9 +122,10 @@ pub fn read_dir<L: Lower>(
                     position.at = next as u32 + 2;
                     let Some(e) = index.entry(id) else { continue };
                     let kind = match e.kind {
-                        Kind::Whiteout | Kind::Empty => continue,
+                        Kind::Whiteout | Kind::Empty | Kind::Gone => continue,
                         Kind::Dir => DIRECTORY,
                         Kind::File => REGULAR,
+                        Kind::Link => SYMLINK,
                     };
                     let name = index.name(id).unwrap_or(&[]);
                     reply
@@ -134,7 +143,7 @@ pub fn read_dir<L: Lower>(
         return Ok(listed(position, true));
     }
     // Stage 1: the lower set, unless the directory is opaque.
-    if index.flags(dir) & OPAQUE != 0 {
+    if hidden {
         return Ok(listed(position, false));
     }
     // The open of the lower directory, the replay to the position a seek or an earlier request
@@ -174,6 +183,7 @@ pub fn read_dir<L: Lower>(
         return Ok(listed(position, true));
     }
     let mut taken = 0;
+    let key = index.dir_key(dir);
     while taken < LOWER_PER_STEP && room(reply) {
         let Some((ino, kind, len)) = lower.next(d, &mut name)? else {
             return Ok(listed(position, false));
@@ -185,7 +195,9 @@ pub fn read_dir<L: Lower>(
         if name == b"." || name == b".." {
             continue;
         }
-        if cfg!(not(feature = "break-layerd-whiteout")) && index.lookup(dir, name).is_some() {
+        if cfg!(not(feature = "break-layerd-whiteout"))
+            && key.is_some_and(|key| index.lookup_in(key, name).is_some())
+        {
             continue;
         }
         reply

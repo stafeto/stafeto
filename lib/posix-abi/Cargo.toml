@@ -28,12 +28,8 @@ break-layer-route = ["layer"]
 # Deliberate breakage (cargo xtask layer-posix breaks): a fork or a spawn gives the child no session
 # with the layer service, so the directory descriptions it inherits answer nothing.
 break-layer-clone = ["layer"]
-# Deliberate breakage: a change of attributes through a description of a lower or layer file is not refused.
+# Deliberate breakage: a change of attributes through a description of a lower file is not refused.
 break-layer-fd-guard = ["layer"]
-# Deliberate breakage: the changes of names at a path of the root are not refused by the layer and go
-# to the file service (alone it must catch the names only a layer of the user has; with the guard of
-# the file service off too, the writes go through).
-break-layer-refuse = ["layer"]
 # Read-only resident named-open witness, absent from shipped builds.
 fifo-probe = []
 # threads::set_level, the levels of rtbench 2's threads (tests/rtbench-posix).

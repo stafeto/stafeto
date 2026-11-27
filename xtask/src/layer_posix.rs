@@ -43,7 +43,7 @@ const DISK_BYTES: u64 = 64 << 20;
 const LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The checks of the probe, in the order it runs them: the line of each is `layer-posix: <check> ok`.
-pub const CHECKS: [&str; 30] = [
+pub const CHECKS: [&str; 31] = [
     "a file of the layer of the user is read",
     "a lower file is read",
     "a name of the layer shadows the lower one",
@@ -58,6 +58,7 @@ pub const CHECKS: [&str; 30] = [
     "paths against a lower directory",
     "the pass-through names are the services' own",
     "a path out of a pass-through directory is the root's",
+    "a link below a pass-through directory is routed through the layer",
     "chdir and fchdir",
     "realpath",
     "a forked child shares the directory description",
@@ -66,9 +67,9 @@ pub const CHECKS: [&str; 30] = [
     "programs of the layers",
     "a forked child binds its own identity",
     "rights of another user",
-    "writes are refused",
+    "writes to the lower set are refused",
     "the attributes of descriptions are kept",
-    "the names of the layers are kept",
+    "a lower link leads through the merged view",
     "descriptions keep the device across fork and exec",
     "a description of the service has no path after exec",
     "a set-ID program is given the service's session",
@@ -77,7 +78,7 @@ pub const CHECKS: [&str; 30] = [
 ];
 
 /// The deliberate breaks, the program each is a feature of and the check each one fails.
-pub const BREAKS: [(&str, &str, &str); 7] = [
+pub const BREAKS: [(&str, &str, &str); 6] = [
     (
         "break-layer-route",
         "layer-posix",
@@ -88,14 +89,13 @@ pub const BREAKS: [(&str, &str, &str); 7] = [
         "layer-posix",
         "a forked child shares the directory description",
     ),
+    // The file service expands a link that reaches the root from a descriptor itself, and its write
+    // guard is off.
     (
-        "break-layer-refuse",
-        "layer-posix",
-        "the names of the layers are kept",
+        "break-layered-guard",
+        "ramfs",
+        "a link below a pass-through directory is routed through the layer",
     ),
-    // The probe's layer refuses nothing here (`break-layer-refuse`), so the guard of the RAM file
-    // service is what stands between the calls and the lower set.
-    ("break-layered-guard", "ramfs", "writes are refused"),
     (
         "break-layer-fd-guard",
         "layer-posix",
@@ -114,14 +114,71 @@ pub const BREAKS: [(&str, &str, &str); 7] = [
     ),
 ];
 
-/// The image's programs; the probe is built with `probe` features and the RAM file service with
-/// `ramfs` features.
-fn programs(
+const PASSED_WRITE: &str = "layer-posix: write checks passed";
+const PASSED_REREAD: &str = "layer-posix: reread checks passed";
+
+/// The checks of the write phase (`cargo xtask layer-posix write`): the changes of names on the
+/// layer, in the order the probe runs them.
+pub const WRITE_CHECKS: [&str; 13] = [
+    "a file is created and written",
+    "a file of the layer is rewritten",
+    "directories are made and removed",
+    "names are deleted from the layer and from the lower set",
+    "directories are removed and made again opaque",
+    "an opaque directory removed or moved stays removed",
+    "names are renamed inside the layer",
+    "symbolic links of the layer",
+    "hard links, reserved names and long paths",
+    "the rights of another user on the layer",
+    "a sticky directory is kept",
+    "the lower set is not written",
+    "changes against descriptions",
+];
+
+/// The checks of the second boot of the write probe, on the disk the first one left.
+pub const REREAD_CHECKS: [&str; 5] = [
+    "the names made are kept",
+    "the names deleted stay deleted",
+    "a directory made over a removed one is opaque",
+    "the links are kept",
+    "the numbers go on and the owners are kept",
+];
+
+/// The breaks of the layer service the write probe must catch: the feature, the phase whose probe
+/// must fail (the second boot reads what the first left) and the check that must be one of the
+/// failures.
+pub const WRITE_BREAKS: [(&str, bool, &str); 2] = [
+    // The sticky bit of a directory is not looked at by a removal or a rename.
+    ("break-layerd-sticky", false, "a sticky directory is kept"),
+    // The mark of the deletion of a lower name is not written to the volume: the index hides the
+    // name until the service starts again.
+    (
+        "break-layerd-no-mark",
+        true,
+        "the names deleted stay deleted",
+    ),
+];
+
+/// The features each program of the image is built with.
+#[derive(Clone, Copy, Default)]
+struct Build {
     probe: &'static [&'static str],
     ramfs: &'static [&'static str],
     loader: &'static [&'static str],
+    layerd: &'static [&'static str],
     datafs: &'static [&'static str],
-) -> Vec<ImageProgram> {
+}
+
+/// The image's programs; the probe is built with `probe` features, the RAM file service with
+/// `ramfs` features, the loader with `loader` features and the layer service with `layerd`.
+fn programs(build: Build) -> Vec<ImageProgram> {
+    let Build {
+        probe,
+        ramfs,
+        loader,
+        layerd,
+        datafs,
+    } = build;
     vec![
         ("init", "init", INIT_STACK_SIZE, &["table-layer-posix"][..]),
         ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, ramfs),
@@ -141,7 +198,7 @@ fn programs(
             &[],
         ),
         ("datafsd", "datafsd", 32 * 1024, datafs),
-        ("layerd", "layerd", crate::LAYERD_STACK_SIZE, &[]),
+        ("layerd", "layerd", crate::LAYERD_STACK_SIZE, layerd),
         (
             "layer-posix",
             "layer-posix-probe",
@@ -166,7 +223,7 @@ fn programs(
 /// The programs of the plain image, for the check of the stacks of every list of programs.
 #[cfg(test)]
 pub fn plain_programs() -> Vec<ImageProgram> {
-    programs(&[], &[], &[], &[])
+    programs(Build::default())
 }
 
 /// The disk of the run: a file of the process's name, removed at the end.
@@ -183,15 +240,17 @@ pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
         None => probe(machine),
         Some("breaks") if args.len() == 1 => breaks(machine),
         Some("ash") if args.len() == 1 => ash(machine),
+        Some("write") if args.len() == 1 => write(machine),
+        Some("write") if args.len() == 2 && args[1] == "breaks" => write_breaks(machine),
         Some(other) => Err(format!(
-            "layer-posix [breaks | ash]: unknown argument {other}"
+            "layer-posix [breaks | ash | write [breaks]]: unknown argument {other}"
         )),
     }
 }
 
 /// The image of the shell: the C probe's services with BusyBox's probe in its place.
 fn ash_programs() -> Vec<ImageProgram> {
-    let mut list = programs(&[], &[], &[], &[]);
+    let mut list = programs(Build::default());
     list[0].3 = &["table-layer-ash"];
     let at = list
         .iter()
@@ -340,27 +399,29 @@ pub fn read_ash(lines: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// One boot with the probe built with `probe` features, the RAM file service with `ramfs` features
-/// and the loader with `loader` features; the lines of the console.
-fn boot(
-    machine: &qemu::Machine,
-    probe: &'static [&'static str],
-    ramfs: &'static [&'static str],
-    loader: &'static [&'static str],
-    datafs: &'static [&'static str],
-) -> Result<(qemu::Outcome, u64), String> {
-    crate::relibc()?;
-    let kernel = build(Variant::Normal)?;
-    let image = write_boot_image_files(
-        IMAGE,
-        &programs(probe, ramfs, loader, datafs),
-        BOOT_PROFILE,
-        &[],
-        Vec::new(),
-    )?;
+/// A disk for a run: the volume of the probe, made offline.
+fn new_disk() -> Result<Disk, String> {
     let disk =
         Disk(std::env::temp_dir().join(format!("stafeto-layer-posix-{}.img", std::process::id())));
     crate::data_image::make_layer_posix_volume(&disk.0, DISK_BYTES)?;
+    Ok(disk)
+}
+
+/// One boot with the programs built as `build` says, on a disk of its own; the lines of the
+/// console.
+fn boot(machine: &qemu::Machine, with: Build) -> Result<(qemu::Outcome, u64), String> {
+    boot_on(machine, with, &new_disk()?)
+}
+
+/// One boot on `disk`: the second boot of the write probe reads what the first left on it.
+fn boot_on(
+    machine: &qemu::Machine,
+    with: Build,
+    disk: &Disk,
+) -> Result<(qemu::Outcome, u64), String> {
+    crate::relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = write_boot_image_files(IMAGE, &programs(with), BOOT_PROFILE, &[], Vec::new())?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::store(&disk.0, None));
     let started = std::time::Instant::now();
@@ -396,6 +457,11 @@ fn registered(lines: &[String]) -> Result<(), String> {
 /// Each check has exactly one line `ok`, in the order of `CHECKS`; no line says a check failed; the
 /// line of the end comes once, after every check.
 pub fn read_lines(lines: &[String]) -> Result<(), String> {
+    read_checks(lines, &CHECKS, PASSED)
+}
+
+/// `read_lines` for the checks `checks` and the line of the end `passed`.
+fn read_checks(lines: &[String], checks: &[&str], passed: &str) -> Result<(), String> {
     registered(lines)?;
     let mine = mine(lines);
     if let Some(bad) = mine
@@ -407,9 +473,9 @@ pub fn read_lines(lines: &[String]) -> Result<(), String> {
     let mut next = 0;
     let mut ended = false;
     for line in &mine {
-        if *line == &PASSED[PREFIX.len()..] {
-            if next != CHECKS.len() {
-                return Err(format!("the end after {next} of {} checks", CHECKS.len()));
+        if *line == &passed[PREFIX.len()..] {
+            if next != checks.len() {
+                return Err(format!("the end after {next} of {} checks", checks.len()));
             }
             ended = true;
             continue;
@@ -420,7 +486,7 @@ pub fn read_lines(lines: &[String]) -> Result<(), String> {
         if ended {
             return Err(format!("a line after the end: {line:?}"));
         }
-        match CHECKS.get(next) {
+        match checks.get(next) {
             Some(expected) if *expected == name => next += 1,
             Some(expected) => {
                 return Err(format!(
@@ -433,14 +499,14 @@ pub fn read_lines(lines: &[String]) -> Result<(), String> {
     if !ended {
         return Err(format!(
             "the probe said {next} of {} checks and no end",
-            CHECKS.len()
+            checks.len()
         ));
     }
     Ok(())
 }
 
 pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
-    let (output, seconds) = boot(machine, &[], &[], &[], &[])?;
+    let (output, seconds) = boot(machine, Build::default())?;
     read_lines(&output.lines)?;
     qemu::expect_stopped_on(
         &output,
@@ -459,12 +525,25 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
 pub fn breaks(machine: &qemu::Machine) -> Result<(), String> {
     for (feature, program, check) in BREAKS {
         let features: &'static [&'static str] = Box::leak(vec![feature].into_boxed_slice());
-        let (output, seconds) = match program {
-            "ramfs" => boot(machine, &["break-layer-refuse"], features, &[], &[])?,
-            "loader" => boot(machine, &[], &[], features, &[])?,
-            "datafsd" => boot(machine, &[], &[], &[], features)?,
-            _ => boot(machine, features, &[], &[], &[])?,
+        let build = match program {
+            "ramfs" => Build {
+                ramfs: features,
+                ..Build::default()
+            },
+            "loader" => Build {
+                loader: features,
+                ..Build::default()
+            },
+            "datafsd" => Build {
+                datafs: features,
+                ..Build::default()
+            },
+            _ => Build {
+                probe: features,
+                ..Build::default()
+            },
         };
+        let (output, seconds) = boot(machine, build)?;
         let mine = mine(&output.lines);
         if mine.iter().any(|l| *l == &PASSED[PREFIX.len()..]) {
             return Err(format!(
@@ -479,6 +558,91 @@ pub fn breaks(machine: &qemu::Machine) -> Result<(), String> {
             ));
         }
         println!("layer-posix breaks: {feature} is caught by {check:?} (in {seconds} s)");
+    }
+    Ok(())
+}
+
+const WRITE_PROBE: &[&str] = &["phase-write"];
+const REREAD_PROBE: &[&str] = &["phase-reread"];
+
+/// The write probe: the changes of names on the layer in one boot, and a second boot on the same disk
+/// that reads what the first left (the names, the marks, the opaque directory, the links, the
+/// numbers).
+pub fn write(machine: &qemu::Machine) -> Result<(), String> {
+    let disk = new_disk()?;
+    let (first, first_seconds) = boot_on(
+        machine,
+        Build {
+            probe: WRITE_PROBE,
+            ..Build::default()
+        },
+        &disk,
+    )?;
+    read_checks(&first.lines, &WRITE_CHECKS, PASSED_WRITE)?;
+    qemu::expect_stopped_on(
+        &first,
+        "init: layer-posix ended: exit code 0, not restarted",
+    )?;
+    let (second, second_seconds) = boot_on(
+        machine,
+        Build {
+            probe: REREAD_PROBE,
+            ..Build::default()
+        },
+        &disk,
+    )?;
+    read_checks(&second.lines, &REREAD_CHECKS, PASSED_REREAD)?;
+    qemu::expect_stopped_on(
+        &second,
+        "init: layer-posix ended: exit code 0, not restarted",
+    )?;
+    println!(
+        "layer-posix write on {}: {} checks of the changes in {first_seconds} s, {} checks of the names they left on a second boot in {second_seconds} s: ok",
+        machine.name,
+        WRITE_CHECKS.len(),
+        REREAD_CHECKS.len(),
+    );
+    Ok(())
+}
+
+/// Each break of the layer service, with the boots it needs: the probe must fail and name the check
+/// the break is for.
+pub fn write_breaks(machine: &qemu::Machine) -> Result<(), String> {
+    for (feature, reread, check) in WRITE_BREAKS {
+        let layerd: &'static [&'static str] = Box::leak(vec![feature].into_boxed_slice());
+        let disk = new_disk()?;
+        let write_build = Build {
+            probe: WRITE_PROBE,
+            layerd,
+            ..Build::default()
+        };
+        let (mut output, mut seconds) = boot_on(machine, write_build, &disk)?;
+        if reread {
+            // The first boot must pass (the break shows only after the service starts again).
+            read_checks(&output.lines, &WRITE_CHECKS, PASSED_WRITE)?;
+            let build = Build {
+                probe: REREAD_PROBE,
+                layerd,
+                ..Build::default()
+            };
+            let (second, more) = boot_on(machine, build, &disk)?;
+            (output, seconds) = (second, seconds + more);
+        }
+        let passed = if reread { PASSED_REREAD } else { PASSED_WRITE };
+        let mine = mine(&output.lines);
+        if mine.iter().any(|l| *l == &passed[PREFIX.len()..]) {
+            return Err(format!(
+                "layer-posix write breaks: {feature} did not fail the probe"
+            ));
+        }
+        let failed: Vec<&&str> = mine.iter().filter(|l| l.contains(" FAILED")).collect();
+        let wanted = format!("{check} FAILED");
+        if !failed.iter().any(|l| l.starts_with(&wanted)) {
+            return Err(format!(
+                "layer-posix write breaks: {feature} did not fail {check:?}; the checks that failed: {failed:?}"
+            ));
+        }
+        println!("layer-posix write breaks: {feature} is caught by {check:?} (in {seconds} s)");
     }
     Ok(())
 }
@@ -598,11 +762,24 @@ mod tests {
         }
         // The checks of the file are the checks of the C program, each once.
         let source = include_str!("../../tests/layer-posix/layer.c");
-        for check in CHECKS {
+        for check in CHECKS.iter().chain(&WRITE_CHECKS).chain(&REREAD_CHECKS) {
             let quoted = format!("run_check(\"{check}\"");
             assert_eq!(source.matches(&quoted).count(), 1, "{check}");
         }
-        assert_eq!(source.matches("run_check(\"").count(), CHECKS.len());
+        assert_eq!(
+            source.matches("run_check(\"").count(),
+            CHECKS.len() + WRITE_CHECKS.len() + REREAD_CHECKS.len()
+        );
+        // The breaks of the write probe name a check of its phase.
+        for (feature, reread, check) in WRITE_BREAKS {
+            let checks: &[&str] = if reread {
+                &REREAD_CHECKS
+            } else {
+                &WRITE_CHECKS
+            };
+            assert!(checks.contains(&check), "{feature}");
+            assert!(feature.starts_with("break-layerd-"));
+        }
     }
 
     #[test]

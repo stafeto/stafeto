@@ -13,13 +13,19 @@
 //!   checks the rights on the lower attributes;
 //! - a name below the root that `PASS_THROUGH` lists (`PassThrough`).
 //!
-//! A path is made plain before the walk (`normalize`): `.` and empty components go and `..` takes
-//! the component before it, lexically, so the walk meets no `..` and the path a redirect carries has
-//! none either (a `..` the walk met after it left the index would let `/bin/../etc/x` reach a name
-//! the layer deleted or shadowed). The departure: a lower symbolic link to a directory is not
-//! looked through for `..` (`/lowlink/..` is the parent of the link's name, not of its target); a
-//! later part makes the RAM file service answer `..` with a redirect to route by the path, and
-//! removes this.
+//! A path is made plain before the walk (`normalize`): `.` and empty components go and `..` stays.
+//! The walk takes a `..` in the index (the parent of a directory of the layer is exact), and a path
+//! that leaves the index (the first lower name, or a name the root passes through) goes whole to the
+//! RAM file service, which answers a `..` and the expansion of a link with a redirect that routes by
+//! the path (its `layered` argument), so a `..` after a lower symbolic link to a directory is the
+//! parent of the link's target, and a path that leaves the lower set by a `..` meets the marks and
+//! the search checks of the layer. The POSIX layer still makes a path of a program simple, by text,
+//! before it sends it (as for every service); a `..` that follows a link there is the parent of the
+//! name of the link.
+//!
+//! A symbolic link of the layer (`Kind::Link`) in the middle of a path, or at the end when the call
+//! follows links, ends the walk with `Outcome::Link`: the service answers a redirect that routes by
+//! the path with the link's text where the component stood.
 //!
 //! Each directory of the layer the walk goes through is checked for the right to search with
 //! `posix_perm::permits` on the attributes the index keeps (`Denied` is EACCES). The service checks
@@ -33,17 +39,23 @@ use posix_perm::{EXEC, Identity, permits};
 /// The components one step of the walk takes: a measure of its work.
 pub const STEP: usize = 16;
 
-/// The path made plain: `.` and empty components dropped, `..` taking the component before it (at
-/// the root it takes nothing), and a slash at the end kept when the path ended with a slash, `.` or
-/// `..` (a directory is meant). The bytes at the start of `out` and their count; the result is never
-/// longer than `path`, so 512 bytes hold every path of the protocol.
+/// The path made plain: `.` and empty components dropped, `..` kept, and a slash at the end kept
+/// when the path ended with a slash, `.` or `..` (a directory is meant). The bytes at the start of
+/// `out` and their count; the result is never longer than `path`, so 512 bytes hold every path of
+/// the protocol.
 pub fn normalize(path: &[u8], out: &mut [u8; 512]) -> usize {
+    normalize_dots(path, out).0
+}
+
+/// `normalize`, and whether a `..` component is in the plain path (it then does not name the chain
+/// of the entry it leads to).
+pub fn normalize_dots(path: &[u8], out: &mut [u8; 512]) -> (usize, bool) {
     // A path that is plain already (no empty component, no `.` or `..`) is itself: one pass over
     // its bytes and a copy, where the general walk over its components costs 35 ticks a byte
     // under -icount (17,000 for a path of 253 components).
     if path.len() <= out.len() && is_plain(path) {
         out[..path.len()].copy_from_slice(path);
-        return path.len();
+        return (path.len(), false);
     }
     normalize_slow(path, out)
 }
@@ -73,15 +85,16 @@ fn is_plain(path: &[u8]) -> bool {
     true
 }
 
-fn normalize_slow(path: &[u8], out: &mut [u8; 512]) -> usize {
+fn normalize_slow(path: &[u8], out: &mut [u8; 512]) -> (usize, bool) {
+    let mut dotted = false;
     let mut len = 0;
     let mut last: &[u8] = b"";
     for part in path.split(|&b| b == b'/') {
         match part {
             b"" => continue,
             b"." => {}
-            b".." => len = out[..len].iter().rposition(|&b| b == b'/').unwrap_or(0),
             name => {
+                dotted |= name == b"..";
                 if len + 1 + name.len() <= out.len() {
                     out[len] = b'/';
                     out[len + 1..len + 1 + name.len()].copy_from_slice(name);
@@ -93,14 +106,14 @@ fn normalize_slow(path: &[u8], out: &mut [u8; 512]) -> usize {
     }
     if len == 0 {
         out[0] = b'/';
-        return 1;
+        return (1, dotted);
     }
     let directory = path.last() == Some(&b'/') || last == b"." || last == b"..";
     if directory && len < out.len() {
         out[len] = b'/';
         len += 1;
     }
-    len
+    (len, dotted)
 }
 
 /// The components of a plain path (`normalize`): the names between its slashes.
@@ -115,6 +128,13 @@ pub fn components(plain: &[u8]) -> usize {
 pub enum Outcome {
     /// The id of a name of the layer: 0 is the root of the layer, any other the entry's id.
     Upper(u32),
+    /// A symbolic link of the layer: its id, and the bytes of the path where its component starts
+    /// and ends.
+    Link {
+        id: u32,
+        start: usize,
+        end: usize,
+    },
     Lower,
     PassThrough {
         data: bool,
@@ -132,10 +152,61 @@ pub enum Step {
     Done(Outcome),
 }
 
+/// The directories deep a walk carries the bit of: a path holds at most 253 components.
+const HIDDEN_DEPTH: usize = 256;
+
+/// Whether the lower set shows through the directory a walk is in: the bit of the directory
+/// (set when it or a directory above it is opaque) and the bits of the directories above it, which
+/// a `..` goes back to. A walk carries it from one step to the next, so that the question
+/// costs no look at the index above the directory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hidden {
+    bits: [u64; HIDDEN_DEPTH / 64],
+    depth: u16,
+    now: bool,
+    started: bool,
+}
+
+impl Hidden {
+    pub const fn new() -> Hidden {
+        Hidden {
+            bits: [0; HIDDEN_DEPTH / 64],
+            depth: 0,
+            now: false,
+            started: false,
+        }
+    }
+
+    fn push(&mut self) {
+        let at = usize::from(self.depth);
+        if at < HIDDEN_DEPTH {
+            let (word, bit) = (at / 64, at % 64);
+            self.bits[word] = (self.bits[word] & !(1 << bit)) | (u64::from(self.now) << bit);
+            self.depth += 1;
+        }
+    }
+
+    fn pop(&mut self) {
+        if self.depth > 0 {
+            self.depth -= 1;
+            let at = usize::from(self.depth);
+            self.now = self.bits[at / 64] >> (at % 64) & 1 != 0;
+        }
+    }
+}
+
 pub struct Walk<'p> {
     path: &'p [u8],
     pos: usize,
     cur: u32,
+    hidden: Hidden,
+    /// The bit of the directory the outcome names (see `hidden`).
+    result: bool,
+    /// A link at the end of the path is followed.
+    follow: bool,
+    /// Where a walk that ended with `Outcome::Lower` stopped: the directory of the layer and the
+    /// place of the first name it does not hold.
+    miss: (u32, usize),
 }
 
 impl<'p> Walk<'p> {
@@ -145,18 +216,49 @@ impl<'p> Walk<'p> {
             path,
             pos: 0,
             cur: 0,
+            hidden: Hidden::default(),
+            result: false,
+            follow: true,
+            miss: (0, 0),
         }
+    }
+
+    /// A link at the end of the path is not followed (lstat, readlink, the leaf of a removal).
+    pub fn no_follow(mut self) -> Walk<'p> {
+        self.follow = false;
+        self
+    }
+
+    /// The directory of the layer a walk that ended with `Outcome::Lower` was in, and where in
+    /// the path the first name the layer does not hold starts.
+    pub fn missed(&self) -> (u32, usize) {
+        self.miss
     }
 
     /// A walk of `path` that went on to the byte `pos` of it, in the directory `cur`: the state a
     /// walk of several requests keeps (`pos` and `cur` of an earlier one of the same path).
-    pub fn resume(path: &'p [u8], pos: usize, cur: u32) -> Walk<'p> {
-        Walk { path, pos, cur }
+    pub fn resume(path: &'p [u8], pos: usize, cur: u32, hidden: Hidden) -> Walk<'p> {
+        Walk {
+            path,
+            pos,
+            cur,
+            hidden,
+            result: false,
+            follow: true,
+            miss: (0, 0),
+        }
     }
 
     /// Where the walk stands: the byte of the path and the directory it has reached.
-    pub fn state(&self) -> (usize, u32) {
-        (self.pos, self.cur)
+    pub fn state(&self) -> (usize, u32, Hidden) {
+        (self.pos, self.cur, self.hidden)
+    }
+
+    /// Whether the lower set is hidden from the directory the outcome names (an outcome of the
+    /// layer: the directory itself and the ones above it; a miss: the directory the name is
+    /// missing from).
+    pub fn hidden(&self) -> bool {
+        self.result
     }
 
     /// Whether the path ends with a slash: the name must be a directory.
@@ -166,12 +268,17 @@ impl<'p> Walk<'p> {
 
     /// Takes at most `budget` components (`STEP`).
     pub fn advance(&mut self, index: &Index, who: Identity<'_>, budget: usize) -> Step {
+        if !self.hidden.started {
+            self.hidden.started = true;
+            self.hidden.now = index.flags(0) & OPAQUE != 0;
+        }
         for _ in 0..budget {
             // The next component: skip slashes, read the name.
             while self.pos < self.path.len() && self.path[self.pos] == b'/' {
                 self.pos += 1;
             }
             if self.pos >= self.path.len() {
+                self.result = self.hidden.now;
                 return Step::Done(Outcome::Upper(self.cur));
             }
             let start = self.pos;
@@ -195,7 +302,8 @@ impl<'p> Walk<'p> {
                 }
             }
             if name == b".." {
-                self.cur = index.entry(self.cur).map_or(0, |e| e.parent());
+                self.cur = index.parent_of(self.cur);
+                self.hidden.pop();
                 continue;
             }
             if self.cur == 0 && proto_fs::names::PASS_THROUGH.contains(&name) {
@@ -205,17 +313,38 @@ impl<'p> Walk<'p> {
             }
             match index.lookup(self.cur, name) {
                 Some((_, e)) if e.kind == Kind::Whiteout => return Step::Done(Outcome::Absent),
+                Some((id, e))
+                    if e.kind == Kind::Link && (!last || self.follow || self.trailing_slash()) =>
+                {
+                    return Step::Done(Outcome::Link {
+                        id,
+                        start,
+                        end: self.pos,
+                    });
+                }
                 Some((id, e)) if last => {
+                    self.result = self.hidden.now || e.flags & OPAQUE != 0;
                     return Step::Done(if e.kind == Kind::File && self.trailing_slash() {
                         Outcome::NotDir
                     } else {
                         Outcome::Upper(id)
                     });
                 }
-                Some((id, e)) if e.kind == Kind::Dir => self.cur = id,
+                Some((id, e)) if e.kind == Kind::Dir => {
+                    self.hidden.push();
+                    self.hidden.now |= e.flags & OPAQUE != 0;
+                    self.cur = id;
+                }
                 Some(_) => return Step::Done(Outcome::NotDir),
-                None if index.flags(self.cur) & OPAQUE != 0 => return Step::Done(Outcome::Absent),
-                None => return Step::Done(Outcome::Lower),
+                None if self.hidden.now => {
+                    self.result = true;
+                    return Step::Done(Outcome::Absent);
+                }
+                None => {
+                    self.result = false;
+                    self.miss = (self.cur, start);
+                    return Step::Done(Outcome::Lower);
+                }
             }
         }
         Step::More
@@ -236,7 +365,7 @@ impl<'p> Walk<'p> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::Fields;
+    use crate::index::{Fields, OPAQUE};
     use std::boxed::Box;
 
     fn who(uid: u32) -> Identity<'static> {
@@ -292,22 +421,57 @@ mod tests {
     }
 
     #[test]
+    fn the_hidden_bit_goes_down_with_the_walk_up_with_dots_and_across_resumed_steps() {
+        let ix = world();
+        let hidden_after = |path: &[u8], budget: usize| {
+            // One component at a time: the state a job keeps between its steps.
+            let (mut pos, mut cur, mut bits) = (0, 0, Hidden::default());
+            loop {
+                let mut w = Walk::resume(path, pos, cur, bits);
+                let step = w.advance(&ix, who(0), budget);
+                (pos, cur, bits) = w.state();
+                if let Step::Done(o) = step {
+                    return (o, w.hidden());
+                }
+            }
+        };
+        let etc = id(&ix, 0, b"etc");
+        let opaque = id(&ix, 0, b"opaque");
+        for budget in [1, 2, 8] {
+            assert_eq!(hidden_after(b"/etc/zz", budget), (Outcome::Lower, false));
+            assert_eq!(hidden_after(b"/opaque/zz", budget), (Outcome::Absent, true));
+            assert_eq!(
+                hidden_after(b"/opaque", budget),
+                (Outcome::Upper(opaque), true)
+            );
+            assert_eq!(hidden_after(b"/etc", budget), (Outcome::Upper(etc), false));
+            // Out of the opaque directory by `..`: the lower set shows through again.
+            assert_eq!(
+                hidden_after(b"/opaque/../etc/zz", budget),
+                (Outcome::Lower, false)
+            );
+            assert_eq!(
+                hidden_after(b"/etc/../opaque/zz", budget),
+                (Outcome::Absent, true)
+            );
+        }
+    }
+
+    #[test]
     fn a_path_is_made_plain_before_the_walk() {
         for (path, want) in [
             ("/", "/"),
             ("//", "/"),
             ("/a/b", "/a/b"),
             ("/a//b/./c", "/a/b/c"),
-            ("/a/b/..", "/a/"),
-            ("/a/b/../c", "/a/c"),
-            ("/bin/../etc/x", "/etc/x"),
-            ("/..", "/"),
-            ("/../a", "/a"),
-            ("/a/../..", "/"),
+            ("/a/b/..", "/a/b/../"),
+            ("/a/b/../c", "/a/b/../c"),
+            ("/bin/../etc/x", "/bin/../etc/x"),
+            ("/..", "/../"),
             ("/a/", "/a/"),
             ("/a/.", "/a/"),
             ("/a/./", "/a/"),
-            ("/tmp/..", "/"),
+            ("/tmp/..", "/tmp/../"),
         ] {
             assert_eq!(plain(path.as_bytes()), want.as_bytes(), "{path}");
         }
@@ -317,19 +481,22 @@ mod tests {
     }
 
     #[test]
-    fn a_dot_dot_after_a_lower_name_meets_the_marks_and_the_search_checks_of_the_layer() {
+    fn a_dot_dot_after_a_lower_name_ends_the_walk_there_and_one_before_it_is_exact() {
         let ix = world();
-        let walk_plain = |path: &[u8], uid: u32| {
-            let mut out = [0u8; 512];
-            let n = normalize(path, &mut out);
-            walk(&ix, &out[..n], uid)
-        };
-        // /bin is the lower set's; /etc/motd is deleted and /priv is closed in the layer.
-        assert_eq!(walk_plain(b"/bin/../etc/motd", 0), Outcome::Absent);
-        assert_eq!(walk_plain(b"/bin/../priv/x", 1000), Outcome::Denied);
-        assert_eq!(walk_plain(b"/tmp/../etc/motd", 0), Outcome::Absent);
+        // The walk stops at the first name of the lower set (the RAM file service answers the
+        // `..` after it with a redirect that routes by the path) and at a name the root passes
+        // through.
+        assert_eq!(walk(&ix, b"/bin/../etc/motd", 0), Outcome::Lower);
+        assert_eq!(walk(&ix, b"/bin/../priv/x", 1000), Outcome::Lower);
+        assert_eq!(
+            walk(&ix, b"/tmp/../etc/motd", 0),
+            Outcome::PassThrough { data: false }
+        );
+        // Through the layer the parent is exact: the marks and the search checks hold.
+        assert_eq!(walk(&ix, b"/etc/../etc/motd", 0), Outcome::Absent);
+        assert_eq!(walk(&ix, b"/etc/../priv/x", 1000), Outcome::Denied);
         assert!(matches!(
-            walk_plain(b"/data/../etc/hostname", 0),
+            walk(&ix, b"/etc/../etc/hostname", 0),
             Outcome::Upper(_)
         ));
     }
@@ -442,7 +609,7 @@ mod tests {
         for path in paths {
             let (mut fast, mut slow) = ([0u8; 512], [0u8; 512]);
             let a = normalize(path, &mut fast);
-            let b = normalize_slow(path, &mut slow);
+            let b = normalize_slow(path, &mut slow).0;
             assert_eq!(&fast[..a], &slow[..b], "{:?}", std::str::from_utf8(path));
         }
     }

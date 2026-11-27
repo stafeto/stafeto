@@ -8,18 +8,23 @@
 //! table bounds (a directory is an entry). The root of the layer is `/.layers/NN`.
 //!
 //! In a listing the name `.wh..wh..opq` makes its directory opaque, `.wh.<name>` is the mark of
-//! deletion of `<name>`, and any other name that begins `.wh..wh.` is reserved and ignored (a
-//! later part keeps the links of the live layer under `.wh..wh.lnk.`). The attributes of a
+//! deletion of `<name>`, `.wh..wh.lnk.<name>` is the symbolic link `<name>` (a file whose bytes are
+//! its target), and any other name that begins `.wh..wh.` is reserved and ignored. The attributes of a
 //! directory come from its stat; those of the files the listing does not need.
 
-use crate::index::{Fields, Index, Kind, OPAQUE, SLOTS, UNSCANNED};
+use crate::index::{Error, Fields, Index, Kind, OPAQUE, SLOTS, UNSCANNED};
 use crate::volume::{BATCH_BYTES, Volume, raw_entry};
 use proto_data::{DIRECTORY, KIND_DIRECTORY, READ};
 use proto_wire::Status;
 
+/// The directories one step of the pass of `index.lift` takes.
+const LIFTS_PER_STEP: usize = 64;
+
 pub const OPAQUE_NAME: &[u8] = b".wh..wh..opq";
 pub const WHITEOUT_PREFIX: &[u8] = b".wh.";
 const RESERVED: &[u8] = b".wh..wh.";
+/// The prefix of the file that holds a symbolic link of the layer (littlefs has none).
+pub const LINK_PREFIX: &[u8] = b".wh..wh.lnk.";
 
 /// What a name of a layer means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +35,8 @@ pub enum Special<'a> {
     Opaque,
     /// `.wh.<name>`: the name is deleted.
     Whiteout(&'a [u8]),
+    /// `.wh..wh.lnk.<name>`: the name is a symbolic link.
+    Link(&'a [u8]),
     /// `.wh..wh.*` other than the opaque marker.
     Reserved,
 }
@@ -37,6 +44,12 @@ pub enum Special<'a> {
 pub fn special(name: &[u8]) -> Special<'_> {
     if name == OPAQUE_NAME {
         Special::Opaque
+    } else if let Some(rest) = name.strip_prefix(LINK_PREFIX) {
+        if rest.is_empty() {
+            Special::Reserved
+        } else {
+            Special::Link(rest)
+        }
     } else if name.starts_with(RESERVED) {
         Special::Reserved
     } else if let Some(rest) = name.strip_prefix(WHITEOUT_PREFIX) {
@@ -52,8 +65,10 @@ pub fn special(name: &[u8]) -> Special<'_> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
-    /// The index is full: the layer holds more names than the table.
+    /// The index is full: the arena has no room for the names of the layer.
     NoSpace,
+    /// Both buckets of a name are full: the build starts again under another seed.
+    Reseed,
     /// The volume answered with this status.
     Volume(Status),
 }
@@ -65,10 +80,13 @@ pub enum Progress {
 }
 
 /// The entries of a batch one step takes into the index.
-pub const ENTRIES_PER_STEP: usize = 24;
+pub const ENTRIES_PER_STEP: usize = 16;
 
 pub struct Scan {
     queue: [u32; SLOTS],
+    /// Where the pass that lets each directory reach as far as its children stands (`index.lift`),
+    /// counting down the queue; 0 before the pass starts.
+    lifted: usize,
     /// The batch of the open directory (`Volume::read_dir_raw`) and how far it is taken; whether
     /// no more batches follow it.
     batch: [u8; BATCH_BYTES],
@@ -88,12 +106,22 @@ pub struct Scan {
     started: bool,
     /// The steps taken (for the probe's report).
     pub steps: u32,
+    /// The directories left unlisted because their path passes the volume's limit.
+    pub skipped: u32,
+    /// Whether a name that finds both buckets full ends the build (it starts again under another
+    /// seed); once the seeds are used up the name is left out and the build goes on.
+    pub patient: bool,
+    /// The names (and the directories among them, whose subtrees go with them) and the marks the
+    /// build left out for the buckets.
+    pub skipped_names: u32,
+    pub skipped_marks: u32,
 }
 
 impl Scan {
     pub const fn new() -> Scan {
         Scan {
             queue: [0; SLOTS],
+            lifted: 0,
             batch: [0; BATCH_BYTES],
             batch_len: 0,
             batch_pos: 0,
@@ -106,6 +134,10 @@ impl Scan {
             open: None,
             started: false,
             steps: 0,
+            skipped: 0,
+            patient: true,
+            skipped_names: 0,
+            skipped_marks: 0,
         }
     }
 
@@ -120,6 +152,10 @@ impl Scan {
         self.open = None;
         self.started = false;
         self.steps = 0;
+        self.skipped = 0;
+        self.skipped_names = 0;
+        self.skipped_marks = 0;
+        self.lifted = 0;
     }
 
     fn push(&mut self, id: u32) {
@@ -154,12 +190,34 @@ impl Scan {
     ) -> Result<Progress, Failure> {
         let Some((id, n)) = self.dir else {
             if self.head == self.tail {
-                return Ok(Progress::Done);
+                // Every directory is listed: the directories reach as far as their children, the
+                // last first, a few in each step.
+                if self.lifted == 0 {
+                    self.lifted = self.tail;
+                }
+                let mut taken = 0;
+                while self.lifted > 1 && taken < LIFTS_PER_STEP {
+                    self.lifted -= 1;
+                    index.lift(self.queue[self.lifted % SLOTS]);
+                    taken += 1;
+                }
+                return Ok(if self.lifted > 1 {
+                    Progress::More
+                } else {
+                    Progress::Done
+                });
             }
             let id = self.queue[self.head % SLOTS];
             self.head += 1;
-            let n = Self::volume_path(index, root, id, &mut self.dir_path)
-                .ok_or(Failure::Volume(proto_data::code(proto_data::NAME_TOO_LONG)))?;
+            // A directory whose path the volume would refuse is left out of the index and told
+            // of (`skipped`), so that one over-long name does not stop the build.
+            let n = match Self::volume_path(index, root, id, &mut self.dir_path) {
+                Some(n) if n <= proto_data::MAX_PATH => n,
+                _ => {
+                    self.skipped += 1;
+                    return Ok(Progress::More);
+                }
+            };
             self.dir = Some((id, n));
             self.statted = false;
             return Ok(Progress::More);
@@ -249,6 +307,7 @@ impl Scan {
                 }
                 Special::Reserved => continue,
                 Special::Whiteout(target) => (target, Kind::Whiteout),
+                Special::Link(target) => (target, Kind::Link),
                 Special::None if kind == KIND_DIRECTORY => (name, Kind::Dir),
                 Special::None => (name, Kind::File),
             };
@@ -260,11 +319,22 @@ impl Scan {
                 gid: 0,
                 mode: 0,
             };
-            match index.insert(id, name, fields) {
+            match index.insert_shallow(id, name, fields) {
                 Ok(child) => {
                     if kind == Kind::Dir {
                         found_queue[found] = child;
                         found += 1;
+                    }
+                }
+                Err(Error::Buckets) if self.patient => {
+                    failure = Some(Failure::Reseed);
+                    break;
+                }
+                Err(Error::Buckets) => {
+                    if kind == Kind::Whiteout {
+                        self.skipped_marks += 1;
+                    } else {
+                        self.skipped_names += 1;
                     }
                 }
                 Err(_) => {

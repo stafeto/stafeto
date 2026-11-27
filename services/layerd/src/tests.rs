@@ -79,6 +79,7 @@ fn lower() -> FakeLower {
 struct World {
     index: Box<Index>,
     scan: Box<Scan>,
+    work: Box<crate::reaper::Workers>,
 }
 
 impl World {
@@ -86,11 +87,19 @@ impl World {
         World {
             index: crate::index::boxed(),
             scan: Box::new(Scan::new()),
+            work: Box::new(crate::reaper::Workers::new()),
         }
     }
 
     fn core(&mut self, v: FakeVolume) -> Core<'_, FakeVolume, FakeLower> {
-        Core::new(&mut self.index, &mut self.scan, v, lower(), 5)
+        Core::new(
+            &mut self.index,
+            &mut self.scan,
+            &mut self.work,
+            v,
+            lower(),
+            5,
+        )
     }
 }
 
@@ -130,6 +139,35 @@ fn open(
             Done::Continue(_) => unreachable!("an open runs its calls to the end"),
         },
     ))
+}
+
+/// A CHANGE as the user `uid`: the reply bytes.
+fn change(
+    core: &mut Core<'_, FakeVolume, FakeLower>,
+    uid: u32,
+    op: n::ChangeOp,
+    a: u64,
+    b: u64,
+    first: &str,
+    second: &str,
+) -> Result<Vec<u8>, Status> {
+    let v = who(uid);
+    let c = Client {
+        owner: 40 + u64::from(uid),
+        who: &v,
+    };
+    let mut w = Writer::new();
+    let req = n::Change {
+        op,
+        a,
+        b,
+        first: first.as_bytes(),
+        second: second.as_bytes(),
+    };
+    let done = core.change(&c, &req, &mut w);
+    while core.reap_step() {}
+    done?;
+    Ok(w.as_bytes().to_vec())
 }
 
 fn handle_of(reply: &[u8]) -> u32 {
@@ -347,13 +385,9 @@ fn a_name_of_the_lower_set_is_a_redirect_to_the_ram_service_with_the_whole_path(
         match OpenAnswer::read(&reply).unwrap() {
             OpenAnswer::Redirect(r) => {
                 assert_eq!(r.target, f::REDIRECT_RAM);
-                // The path goes plain: no `..` in it.
-                let plain = if path == "/etc/../bin/ls" {
-                    "/bin/ls"
-                } else {
-                    path
-                };
-                assert_eq!(r.path, plain.as_bytes());
+                // The path goes whole: a `..` after the first lower name is the RAM file
+                // service's to answer.
+                assert_eq!(r.path, path.as_bytes());
                 assert_eq!((r.index, r.links), (0, 0));
             }
             other => panic!("{other:?}"),
@@ -472,23 +506,25 @@ fn each_directory_of_the_layer_is_checked_for_the_right_to_search() {
 }
 
 #[test]
-fn a_write_or_a_create_is_a_read_only_file_system() {
+fn a_write_to_a_lower_name_is_a_read_only_file_system() {
     let mut world = World::new();
     let mut core = world.core(volume());
     ready(&mut core);
+    // A name of the lower set (and the lower directories) is not written until the copy up.
     for flags in [f::WRITE_ONLY, f::READ_WRITE, f::READ_ONLY | f::TRUNCATE] {
         assert_eq!(
-            open(&mut core, 0, flags, "/etc/passwd").err(),
+            open(&mut core, 0, flags, "/bin/ls").err(),
             Some(st(f::READ_ONLY_FILESYSTEM)),
             "{flags}"
         );
         assert_eq!(
-            open(&mut core, 0, flags, "/etc").err(),
-            Some(st(f::READ_ONLY_FILESYSTEM))
+            open(&mut core, 0, flags | f::CREATE, "/bin/ls").err(),
+            Some(st(f::READ_ONLY_FILESYSTEM)),
+            "{flags}"
         );
     }
-    // A create of a name of the layer that is there opens it for reading, EXCLUSIVE says it exists,
-    // and an append with read access writes nothing.
+    // A create of a name that is there opens it for reading, EXCLUSIVE says it exists, and an
+    // append with read access writes nothing.
     assert!(
         open(&mut core, 0, f::READ_ONLY | f::CREATE, "/etc/passwd")
             .unwrap()
@@ -501,45 +537,46 @@ fn a_write_or_a_create_is_a_read_only_file_system() {
             .1
             .is_some()
     );
-    assert_eq!(
-        open(
-            &mut core,
-            0,
-            f::READ_ONLY | f::CREATE | f::EXCLUSIVE,
-            "/etc/passwd"
-        )
-        .err(),
-        Some(st(f::ALREADY_EXISTS))
-    );
-    // A name the layer deleted is no name to create over in this part.
-    assert_eq!(
-        open(&mut core, 0, f::READ_ONLY | f::CREATE, "/etc/motd").err(),
-        Some(st(f::READ_ONLY_FILESYSTEM))
-    );
-    assert_eq!(
-        open(&mut core, 0, f::READ_ONLY, "/etc/motd").err(),
-        Some(st(f::NO_ENTRY))
-    );
-    // A name of the lower set, one that exists and one that does not: the same.
-    for path in ["/bin/ls", "/bin/none", "/usr/new"] {
+    for path in ["/etc/passwd", "/bin/ls"] {
         assert_eq!(
-            open(&mut core, 0, f::READ_ONLY | f::CREATE, path).err(),
-            Some(st(f::READ_ONLY_FILESYSTEM)),
-            "{path}"
-        );
-        assert_eq!(
-            open(&mut core, 0, f::WRITE_ONLY, path).err(),
-            Some(st(f::READ_ONLY_FILESYSTEM)),
+            open(&mut core, 0, f::READ_ONLY | f::CREATE | f::EXCLUSIVE, path).err(),
+            Some(st(f::ALREADY_EXISTS)),
             "{path}"
         );
     }
+    let (reply, _) = open(&mut core, 0, f::READ_ONLY | f::CREATE, "/bin/ls").unwrap();
+    assert!(matches!(
+        OpenAnswer::read(&reply),
+        Ok(OpenAnswer::Redirect(r)) if r.path == b"/bin/ls"
+    ));
+    // A directory is not opened for writing.
+    assert_eq!(
+        open(&mut core, 0, f::WRITE_ONLY, "/etc").err(),
+        Some(st(f::IS_DIRECTORY))
+    );
     // The names the root passes through are the services' own.
     let (reply, _) = open(&mut core, 0, f::WRITE_ONLY | f::CREATE, "/tmp/x").unwrap();
     assert!(matches!(
         OpenAnswer::read(&reply),
         Ok(OpenAnswer::Redirect(_))
     ));
-    assert_eq!(core.change(), st(f::READ_ONLY_FILESYSTEM));
+    // The attributes of a lower name are not changed either.
+    for (op, a) in [
+        (n::ChangeOp::Chmod, 0o600),
+        (n::ChangeOp::Chown, 1000),
+        (n::ChangeOp::Truncate, 0),
+        (n::ChangeOp::Utimens, 5),
+    ] {
+        assert_eq!(
+            change(&mut core, 0, op, a, 0, "/bin/ls", "").err(),
+            Some(st(f::READ_ONLY_FILESYSTEM)),
+            "{op:?}"
+        );
+    }
+    assert_eq!(
+        change(&mut core, 0, n::ChangeOp::Chmod, 0o600, 0, "/bin/none", "").err(),
+        Some(st(f::NO_ENTRY))
+    );
 }
 
 #[test]
@@ -833,7 +870,7 @@ fn stat_numbers_come_from_the_service_that_holds_the_name() {
 }
 
 #[test]
-fn access_checks_the_bits_and_refuses_a_write() {
+fn access_checks_the_bits_of_the_file() {
     let mut world = World::new();
     let mut core = world.core(volume());
     ready(&mut core);
@@ -849,9 +886,10 @@ fn access_checks_the_bits_and_refuses_a_write() {
     let mut w = Writer::new();
     assert!(core.access(&c, 4, 0, b"/etc/passwd", &mut w).is_ok());
     let mut w = Writer::new();
+    // The rights are the file's own: /etc/passwd is 0644 of root, so another user may not write.
     assert_eq!(
         core.access(&c, 2, 0, b"/etc/passwd", &mut w),
-        Err(st(f::READ_ONLY_FILESYSTEM))
+        Err(st(f::ACCESS_DENIED))
     );
     let mut w = Writer::new();
     core.readlink(&c, b"/bin/ls", &mut w).unwrap();
@@ -917,7 +955,7 @@ fn a_long_path_walked_in_steps_comes_to_the_answer_of_the_walk_in_one_piece() {
             who: &who,
         };
         for path in &paths {
-            let mut pw = crate::names::Prewalk::new(path.as_bytes(), false);
+            let mut pw = crate::names::Prewalk::new(path.as_bytes(), false, true);
             let mut steps = 0;
             let walked = loop {
                 steps += 1;
@@ -959,7 +997,7 @@ fn a_long_path_walked_in_steps_comes_to_the_answer_of_the_walk_in_one_piece() {
             assert_eq!(pass(&a), pass(&b), "{path} as {uid}");
             let mut once = Writer::new();
             let mut stepped = Writer::new();
-            let mut pw = crate::names::Prewalk::new(path.as_bytes(), false);
+            let mut pw = crate::names::Prewalk::new(path.as_bytes(), false, true);
             let walked = loop {
                 if let Some(done) = core.prewalk_step(&who, &mut pw) {
                     break done;
@@ -1006,27 +1044,70 @@ fn a_step_of_the_build_makes_a_bounded_number_of_calls_to_the_volume() {
     assert!(steps >= 4000 / 59, "{steps}");
 }
 
+/// The build of a volume to its end: the steps it took.
+fn build_to_the_end(core: &mut Core<'_, FakeVolume, FakeLower>) -> u32 {
+    core.prepare();
+    let mut steps = 0;
+    while !core.build_step() {
+        steps += 1;
+        assert!(steps < 200_000);
+    }
+    steps
+}
+
+fn status_flags(core: &Core<'_, FakeVolume, FakeLower>) -> u32 {
+    let mut w = Writer::new();
+    core.status(&mut w).unwrap();
+    l::Stat::read(w.as_bytes()).unwrap().flags
+}
+
 #[test]
-fn a_full_index_fails_the_start_with_no_space() {
+fn a_build_that_overflows_a_bucket_starts_again_under_another_seed() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    core.index.fail_inserts = 1;
+    build_to_the_end(&mut core);
+    assert_eq!(core.state, State::Ready);
+    assert!(!core.partial);
+    assert_eq!(core.left_out(), (0, 0));
+    assert_eq!(status_flags(&core) & l::STATUS_PARTIAL, 0);
+    assert!(open(&mut core, 0, f::READ_ONLY, "/etc/own.conf").is_ok());
+}
+
+#[test]
+fn a_build_that_always_overflows_leaves_the_names_out_and_serves_the_root_read_only() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    core.index.fail_inserts = u32::MAX;
+    build_to_the_end(&mut core);
+    assert_eq!(core.state, State::Ready);
+    assert!(core.partial);
+    let (names, marks) = core.left_out();
+    assert!(names > 0, "{names} {marks}");
+    assert_ne!(status_flags(&core) & l::STATUS_PARTIAL, 0);
+    // The names the table could not take are the lower set's or absent; the root answers.
+    assert!(open(&mut core, 0, f::READ_ONLY, "/etc").is_ok());
+}
+
+#[test]
+fn a_layer_over_the_places_of_the_table_serves_what_it_holds_read_only() {
     let mut v = volume();
-    // More names than the table takes within the probes: 20,000 files in one directory.
-    for i in 0..20_000 {
+    // More names than the table has places: 17,000 files in one directory.
+    for i in 0..17_000 {
         v.file(&format!("/.layers/00/opq/f{i:05}"), 0o644, 0, b"");
     }
     v.batch = 20;
     let mut world = World::new();
     let mut core = world.core(v);
-    core.prepare();
-    let mut steps = 0;
-    while !core.build_step() {
-        steps += 1;
-        assert!(steps < 100_000);
-    }
-    assert_eq!(core.state, State::Failed(l::NO_SPACE));
-    assert_eq!(
-        open(&mut core, 0, f::READ_ONLY, "/etc").err(),
-        Some(st(l::NO_SPACE))
+    build_to_the_end(&mut core);
+    assert_eq!(core.state, State::Ready);
+    assert!(core.partial);
+    let (names, _) = core.left_out();
+    assert!(
+        names >= 17_000 + 100 - crate::index::SLOTS as u32,
+        "{names}"
     );
+    assert_ne!(status_flags(&core) & l::STATUS_PARTIAL, 0);
 }
 
 #[test]
@@ -1082,41 +1163,48 @@ fn a_request_looks_at_a_bounded_number_of_slots_of_the_index() {
 }
 
 #[test]
-fn a_dot_dot_is_resolved_before_the_walk_so_the_marks_and_the_search_checks_hold() {
+fn a_dot_dot_before_the_first_lower_name_is_the_index_s_and_after_it_the_ram_service_s() {
     let mut world = World::new();
     let mut core = world.core(volume());
     ready(&mut core);
-    // The mark of deletion of /etc/motd, the shadow of /etc/passwd and the closed /home are
-    // reached through a lower name and `..`.
+    // Through the index: the parent of a directory of the layer is exact, so the shadow of
+    // /etc/passwd, the mark of /etc/motd and the closed /home are met.
+    let (_, pass) = open(&mut core, 0, f::READ_ONLY, "/etc/../etc/passwd").unwrap();
+    assert_eq!(pass.as_deref(), Some(&b"/.layers/00/etc/passwd"[..]));
     assert_eq!(
-        open(&mut core, 0, f::READ_ONLY, "/bin/../etc/motd").err(),
+        open(&mut core, 0, f::READ_ONLY, "/etc/../etc/motd").err(),
         Some(st(f::NO_ENTRY))
     );
-    let (_, pass) = open(&mut core, 0, f::READ_ONLY, "/bin/../etc/passwd").unwrap();
-    assert_eq!(pass.as_deref(), Some(&b"/.layers/00/etc/passwd"[..]));
-    for path in [
-        "/bin/../home/other",
-        "/tmp/../home/secret",
-        "/data/../home/x",
+    assert_eq!(
+        open(&mut core, 1000, f::READ_ONLY, "/etc/../home/secret").err(),
+        Some(st(f::ACCESS_DENIED))
+    );
+    // After the first lower name (or a name the root passes through) the path goes whole to the
+    // RAM file service, which answers the `..` with a redirect that routes by the path.
+    for (path, target) in [
+        ("/bin/../etc/motd", f::REDIRECT_RAM),
+        ("/tmp/../home/secret", f::REDIRECT_RAM),
+        ("/data/../home/x", f::REDIRECT_DATA),
+        ("/bin/../usr/./x/../y", f::REDIRECT_RAM),
     ] {
-        assert_eq!(
-            open(&mut core, 1000, f::READ_ONLY, path).err(),
-            Some(st(f::ACCESS_DENIED)),
+        let (reply, _) = open(&mut core, 0, f::READ_ONLY, path).unwrap();
+        let plain = path.replace("/./", "/");
+        assert!(
+            matches!(
+                OpenAnswer::read(&reply),
+                Ok(OpenAnswer::Redirect(r)) if r.path == plain.as_bytes() && r.target == target
+            ),
             "{path}"
         );
     }
-    // The redirect of a path that stays in the lower set carries it plain.
-    let (reply, _) = open(&mut core, 0, f::READ_ONLY, "/bin/../usr/./x/../y").unwrap();
-    assert!(matches!(
-        OpenAnswer::read(&reply),
-        Ok(OpenAnswer::Redirect(r)) if r.path == b"/usr/y"
-    ));
-    // `/tmp/..` is the root of the layer.
-    let (reply, _) = open(&mut core, 0, f::READ_ONLY, "/tmp/..").unwrap();
-    assert!(matches!(
-        OpenAnswer::read(&reply),
-        Ok(OpenAnswer::Directory { .. })
-    ));
+    // `/etc/..` and `/tmp/..` are the root of the layer.
+    for path in ["/etc/..", "/etc/../etc/.."] {
+        let (reply, _) = open(&mut core, 0, f::READ_ONLY, path).unwrap();
+        assert!(
+            matches!(OpenAnswer::read(&reply), Ok(OpenAnswer::Directory { .. })),
+            "{path}"
+        );
+    }
 }
 
 #[test]

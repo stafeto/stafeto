@@ -31,7 +31,15 @@ fn main() {
         });
     // The role the init-started launcher passes to the program: the image of this probe
     // names it (`run`).
-    let mode = env::var("STAFETO_LAYER_POSIX_MODE").unwrap_or_else(|_| "run".to_owned());
+    let mut mode = env::var("STAFETO_LAYER_POSIX_MODE").unwrap_or_else(|_| "run".to_owned());
+    // The write probe has two boots on one disk: the phases are features (`cargo xtask layer-posix
+    // write`).
+    if env::var_os("CARGO_FEATURE_PHASE_WRITE").is_some() {
+        mode = "write".to_owned();
+    }
+    if env::var_os("CARGO_FEATURE_PHASE_REREAD").is_some() {
+        mode = "reread".to_owned();
+    }
     assert!(
         mode.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
         "STAFETO_LAYER_POSIX_MODE {mode:?} is a role name"

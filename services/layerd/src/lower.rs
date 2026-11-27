@@ -9,7 +9,7 @@
 //! of the general file layer (`posix_fs::PosixFs::opendir` is three of them, and its open alone
 //! costs more than the bound of a step).
 
-use layerd::volume::{Lower, R};
+use layerd::volume::{Lower, LowerStat, R};
 use rt::fs::Files;
 
 pub struct Ram {
@@ -44,5 +44,16 @@ impl Lower for Ram {
 
     fn readlink(&mut self, _path: &[u8], _out: &mut [u8]) -> R<usize> {
         Err(proto_wire::Status::Unknown(proto_fs::INVALID_ARGUMENT))
+    }
+
+    fn stat(&mut self, path: &[u8], follow: bool) -> R<LowerStat> {
+        let info = self.files.node_information_from(None, path, follow)?;
+        Ok(LowerStat {
+            kind: info.kind,
+            mode: info.permissions,
+            uid: info.uid,
+            gid: info.gid,
+            ino: info.inode,
+        })
     }
 }
