@@ -221,6 +221,9 @@ fn take_session(root: &Handle<Channel>) -> Result<Handle<Channel>, Attempt> {
     let mut reply = match rt::sys::send_handles(root, &request, [copy]) {
         Ok(reply) => reply,
         Err(refused) if refused.error == Error::Interrupted => return Err(Attempt::Retry),
+        // The root is of an instance that ended: init starts a new one, which registers its own root
+        // with the process service, replacing this one.
+        Err(refused) if refused.error == Error::PeerClosed => return Err(Attempt::Retry),
         Err(refused) => {
             why!("SESSION not sent to the root: {:?}", refused.error);
             return Err(Attempt::Failed(EIO));

@@ -472,7 +472,35 @@ pub const POWER: Record = Record {
     ..CONSOLE
 };
 
-pub const TABLE: &[Record] = &[
+/// The launcher of the table with the layer service: the shell's programs reach every path of the
+/// root through that service, so the launcher waits for its READY (the index of the live layer is
+/// built) as well as for the host key service. A waited service has no waits of its own and a
+/// record waits for two services at most, so the wait for `pkgd` of `LAUNCHER` is left to the
+/// order of the table here (the store of the package service starts before the data service).
+pub const LAUNCHER_LAYERED: Record = Record {
+    waits: &[
+        Wait {
+            service: "layerd",
+            deadline_ms: super::base::PKGD_READY_MS,
+        },
+        Wait {
+            service: "datakey",
+            deadline_ms: DATAKEY_READY_MS,
+        },
+    ],
+    ..LAUNCHER
+};
+
+/// The table of the shell on EC2 as the build makes it: with the layer service when init is built
+/// with the feature `layered-root`, which stays off until the layered root is complete (step C4).
+pub const TABLE: &[Record] = if cfg!(feature = "layered-root") {
+    TABLE_LAYERED
+} else {
+    TABLE_PLAIN
+};
+
+/// The table of the shell on EC2 without the layer service.
+const TABLE_PLAIN: &[Record] = &[
     CONSOLE,
     named(DIALOG, "ramfs"),
     // The process service with the pool of the shell's image and the quotas of a command of
@@ -494,11 +522,41 @@ pub const TABLE: &[Record] = &[
     POWER,
 ];
 
+/// The table of the shell on EC2 with the layer service after the data file service.
+pub const TABLE_LAYERED: &[Record] = &[
+    CONSOLE,
+    named(DIALOG, "ramfs"),
+    // The process service with the pool of the shell's image and the quotas of a command of
+    // the try-out (nginx, nginx-fast, the SSH server and its sessions).
+    PROCESS_SERVICE,
+    // No PL031 on EC2: the clock starts at the time of the firmware, which the EFI loader writes
+    // into the file `boot-time` of the image (UEFI GetTime); without it, at 2026-01-01.
+    named(super::ramfs::POSIX_ABI_TABLE, "clock"),
+    named(DIALOG, "pipe"),
+    ENTROPY,
+    LAUNCHER_LAYERED,
+    named(DIALOG, "tty"),
+    NET,
+    super::pkg::MEMBLK,
+    super::pkg::PKGD,
+    DATADISK,
+    super::pkg::DATAFS_CLOCKED,
+    super::pkg::LAYERD,
+    super::pkg::DATAKEY,
+    POWER,
+];
+
 /// The closest image on QEMU to the table above (`cargo xtask net-try`): the services of the
 /// table of EC2 with the PL011 for the console, the Virtio RNG for the entropy service, and the
 /// network service on Virtio over QEMU's user network with the switch (`netd.conf` has
 /// `switch 8`), in the order of the shell's image with the network.
-pub const QEMU_TABLE: &[Record] = &[
+pub const QEMU_TABLE: &[Record] = if cfg!(feature = "layered-root") {
+    QEMU_TABLE_LAYERED
+} else {
+    QEMU_TABLE_PLAIN
+};
+
+const QEMU_TABLE_PLAIN: &[Record] = &[
     super::net::NET_TABLE[0],
     super::net::NET_TABLE[1],
     PROCESS_SERVICE,
@@ -513,6 +571,26 @@ pub const QEMU_TABLE: &[Record] = &[
     super::pkg::PKGD,
     super::pkg::NVME_QEMU_DATA,
     super::pkg::DATAFS_CLOCKED,
+    super::pkg::DATAKEY,
+];
+
+/// The table above with the layer service after the data file service.
+pub const QEMU_TABLE_LAYERED: &[Record] = &[
+    super::net::NET_TABLE[0],
+    super::net::NET_TABLE[1],
+    PROCESS_SERVICE,
+    super::net::NET_TABLE[3],
+    super::net::NET_TABLE[4],
+    LAUNCHER_LAYERED,
+    super::net::NET_TABLE[6],
+    super::net::NET_TABLE[7],
+    super::net::NET_TABLE[8],
+    super::net::NETD_SWITCH,
+    super::pkg::MEMBLK,
+    super::pkg::PKGD,
+    super::pkg::NVME_QEMU_DATA,
+    super::pkg::DATAFS_CLOCKED,
+    super::pkg::LAYERD,
     super::pkg::DATAKEY,
 ];
 
@@ -542,7 +620,7 @@ mod tests {
 
     #[test]
     fn the_records_are_the_ones_the_names_say() {
-        let names: Vec<&str> = TABLE.iter().map(|r| r.name).collect();
+        let names: Vec<&str> = TABLE_PLAIN.iter().map(|r| r.name).collect();
         assert_eq!(
             names,
             [
@@ -565,11 +643,14 @@ mod tests {
         );
         // The posix record is the shell dialog's, with its larger quota; the
         // clock is the plain one, without the PL031's window.
-        let posix = TABLE.iter().find(|r| r.name == "posix").unwrap();
+        let posix = TABLE_PLAIN.iter().find(|r| r.name == "posix").unwrap();
         assert!(posix.quota > super::super::ramfs::POSIX_ABI_TABLE[1].quota);
-        let clock = TABLE.iter().find(|r| r.name == "clock").unwrap();
+        let clock = TABLE_PLAIN.iter().find(|r| r.name == "clock").unwrap();
         assert!(clock.windows.is_empty());
-        let launcher = TABLE.iter().find(|r| r.name == "busybox-probe").unwrap();
+        let launcher = TABLE_PLAIN
+            .iter()
+            .find(|r| r.name == "busybox-probe")
+            .unwrap();
         assert_eq!(launcher.program, "ash-launcher");
         // The launcher runs the boot script of the image next to the shell.
         assert_eq!(launcher.args, b"ash-launch\0/etc/rc\0");
@@ -644,7 +725,7 @@ mod tests {
         // The record has that window and that line, level, as a native service.
         // Only the table of EC2 has it: QEMU_TABLE boots under edk2 with ACPI too, where the
         // address holds no PL061.
-        assert!(QEMU_TABLE.iter().all(|r| r.name != "power"));
+        assert!(QEMU_TABLE_PLAIN.iter().all(|r| r.name != "power"));
         {
             let table = TABLE;
             let record = table.iter().find(|r| r.name == "power").unwrap();
@@ -711,7 +792,7 @@ mod tests {
 
     #[test]
     fn a_power_record_that_is_a_client_or_connects_to_the_process_service_is_refused() {
-        let mut client = *TABLE.iter().find(|r| r.name == "power").unwrap();
+        let mut client = *TABLE_PLAIN.iter().find(|r| r.name == "power").unwrap();
         client.kind = Kind::Client;
         client.windows = &[];
         client.bindings = &[];
@@ -870,9 +951,12 @@ mod tests {
             "the table holds {held} pages and with the image, the kernel and init's free pages {need} of the {T4G_SMALL_PAGES} of a t4g.small"
         );
         // The pool holds the quotas of a command the plan counts for.
-        let pool = TABLE.iter().find(|r| r.name == "posix").unwrap();
+        let pool = TABLE_PLAIN.iter().find(|r| r.name == "posix").unwrap();
         assert!(pool.quota >= COMMANDS * COMMAND_QUOTA);
-        let launcher = TABLE.iter().find(|r| r.name == "busybox-probe").unwrap();
+        let launcher = TABLE_PLAIN
+            .iter()
+            .find(|r| r.name == "busybox-probe")
+            .unwrap();
         // nginx-fast's master and worker run under the launcher's quota.
         assert_eq!(launcher.quota, super::super::fstack::FAST_COMMAND_QUOTA);
         // The memory disk of 256 MiB and the package service are in the sum above.
@@ -881,9 +965,9 @@ mod tests {
                 .iter()
                 .any(|r| r.name == "blk" && r.quota >= 256 << 20)
         );
-        assert!(TABLE.iter().any(|r| r.name == "pkgd"));
+        assert!(TABLE_PLAIN.iter().any(|r| r.name == "pkgd"));
         // The switch of the network service has the pages of its flows and rings.
-        let net = TABLE.iter().find(|r| r.name == "net").unwrap();
+        let net = TABLE_PLAIN.iter().find(|r| r.name == "net").unwrap();
         assert_eq!(
             net.quota,
             super::super::net::NETD.quota + super::super::net::SWITCH_QUOTA_PAGES * PAGE
@@ -896,7 +980,7 @@ mod tests {
     #[test]
     fn the_qemu_table_is_ec2s_with_the_pl011_the_virtio_rng_and_the_virtio_net() {
         assert!(crate::table::check(QEMU_TABLE).is_ok());
-        let names: Vec<&str> = QEMU_TABLE.iter().map(|r| r.name).collect();
+        let names: Vec<&str> = QEMU_TABLE_PLAIN.iter().map(|r| r.name).collect();
         assert_eq!(
             names,
             [
@@ -1005,7 +1089,7 @@ mod tests {
 
     #[test]
     fn only_datakey_connects_to_datafs_on_both_tables() {
-        for table in [TABLE, QEMU_TABLE] {
+        for table in [TABLE_PLAIN, QEMU_TABLE_PLAIN] {
             let clients: Vec<&str> = table
                 .iter()
                 .filter(|r| r.connects.contains(&"datafs"))
@@ -1021,7 +1105,7 @@ mod tests {
 
     #[test]
     fn the_launcher_waits_for_pkgd_and_for_the_host_key_service() {
-        for table in [TABLE, QEMU_TABLE] {
+        for table in [TABLE_PLAIN, QEMU_TABLE_PLAIN] {
             let launcher = table.iter().find(|r| r.name == "busybox-probe").unwrap();
             let waited: Vec<_> = launcher.waits.iter().map(|w| w.service).collect();
             assert_eq!(waited, ["pkgd", "datakey"]);
@@ -1040,7 +1124,7 @@ mod tests {
     /// cut of another record's budget.
     #[test]
     fn the_budgets_of_cpu_zero_on_ec2_are_74_5_percent_under_the_cap_of_75() {
-        for table in [TABLE, QEMU_TABLE] {
+        for table in [TABLE_PLAIN, QEMU_TABLE_PLAIN] {
             let on_zero: u64 = table
                 .iter()
                 .flat_map(|r| r.budgets.iter())
@@ -1055,7 +1139,7 @@ mod tests {
             assert!(on_zero + crate::table::CPU0_RESERVE_PPM <= crate::table::BUDGET_SHARE_MAX_PPM);
         }
         let share = |name: &str, cpu: u8| {
-            let r = TABLE.iter().find(|r| r.name == name).unwrap();
+            let r = TABLE_PLAIN.iter().find(|r| r.name == name).unwrap();
             r.budgets
                 .iter()
                 .filter(|b| b.cpu == cpu)
@@ -1067,6 +1151,58 @@ mod tests {
         // no room for it).
         assert_eq!(share("datafs", 0), 10_000);
         assert_eq!(share("datafs", 1), 300_000);
+    }
+
+    /// The tables with the layer service (the feature `layered-root`, off until step C4): the
+    /// service follows the data file service, the launcher waits for it and for the host key
+    /// service, and its budget of 0.5 % takes the sum of CPU 0 to the 75 % the budgets may take,
+    /// with the reserve of 3 % for the process and package services whole. The plain tables are
+    /// the ones before.
+    #[test]
+    fn the_layered_tables_add_the_layer_service_and_fill_the_budgets_of_cpu_zero() {
+        use crate::table::{BUDGET_SHARE_MAX_PPM, CPU0_RESERVE_PPM};
+        for (plain, layered) in [
+            (TABLE_PLAIN, TABLE_LAYERED),
+            (QEMU_TABLE_PLAIN, QEMU_TABLE_LAYERED),
+        ] {
+            assert!(plain.iter().all(|r| r.name != "layerd"));
+            let names: Vec<&str> = layered.iter().map(|r| r.name).collect();
+            let at = |n: &str| names.iter().position(|x| *x == n).unwrap();
+            assert_eq!(layered.len(), plain.len() + 1);
+            assert!(at("datafs") + 1 == at("layerd") && at("layerd") < at("datakey"));
+            let launcher = layered.iter().find(|r| r.name == "busybox-probe").unwrap();
+            let waited: Vec<_> = launcher.waits.iter().map(|w| w.service).collect();
+            assert_eq!(waited, ["layerd", "datakey"]);
+            let on_zero = |table: &[Record]| -> u64 {
+                table
+                    .iter()
+                    .flat_map(|r| r.budgets.iter())
+                    .filter(|b| b.cpu == 0)
+                    .map(crate::table::Budget::share_ppm)
+                    .sum::<u64>()
+                    + CPU0_RESERVE_PPM
+            };
+            assert_eq!(on_zero(layered), on_zero(plain) + 5_000);
+            assert!(on_zero(layered) <= BUDGET_SHARE_MAX_PPM);
+        }
+        assert_eq!(
+            TABLE_LAYERED
+                .iter()
+                .flat_map(|r| r.budgets.iter())
+                .filter(|b| b.cpu == 0)
+                .map(crate::table::Budget::share_ppm)
+                .sum::<u64>()
+                + crate::table::CPU0_RESERVE_PPM,
+            crate::table::BUDGET_SHARE_MAX_PPM,
+            "74.5 % and the layer service's 0.5 %"
+        );
+        // The build without the feature has the tables before.
+        assert_eq!(
+            TABLE.len(),
+            TABLE_PLAIN.len() + usize::from(cfg!(feature = "layered-root"))
+        );
+        assert!(crate::table::check(TABLE_LAYERED).is_ok());
+        assert!(crate::table::check(QEMU_TABLE_LAYERED).is_ok());
     }
 
     #[test]
