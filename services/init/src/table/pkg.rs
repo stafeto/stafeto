@@ -512,6 +512,58 @@ pub const DATAFS: Record = Record {
     broken_after: Some((6, 2)),
 };
 
+/// The layer service (services/layerd): the names of the layered root over the live layer on the
+/// data volume, read only in this part. Its loop works at 34, above the clients of POSIX (ceiling
+/// 31) and below the data file service (36) it is a native client of; the RAM file service of the
+/// lower set runs above both. It connects to the RAM file service (the boot profile, for the
+/// lower names) and to the data file service (the label `SERVICE`, for the live layer), and asks
+/// the process service who a client is through the notary session init gives a voucher; its root
+/// goes to that service with Register (the mark `LAYER`). It has no budget in this part and never
+/// restarts (a later part gives it both): the descriptions of directories it gave out end with
+/// the instance, and a program asks for a new session. The start is watched for 30 s: the first
+/// request to the data service waits for the end of its start (a blank volume is formatted
+/// first).
+pub const LAYERD: Record = Record {
+    name: "layerd",
+    program: "layerd",
+    kind: Kind::Service(Watch {
+        period_ns: 1000 * MS,
+        deadline_ns: 30_000 * MS,
+    }),
+    priority: 34,
+    ceiling: 34,
+    // The stack of the loop is the program's, the index and the pages of the descriptors are
+    // statics that init pays for as segments; the quota is the slots of the sessions the service
+    // gives (192) and its own channels.
+    quota: 192 * PAGE,
+    // The handles the service holds at most: 192 copies of identity sessions (one for each bound
+    // session, `SESSIONS` of the program), one pass or one Vouch copy in flight, and about 24 of its
+    // own (the channels, the notification of the steps, the sessions with the two file services and
+    // the notary, the page of the generations, the console, the timers of the heartbeat and of the
+    // registrar): 218, and a limit of 256.
+    handle_limit: 256,
+    restart: Restart::Never,
+    console: true,
+    log: false,
+    trace: false,
+    windows: &[],
+    bindings: &[],
+    connects: &["ramfs", "datafs"],
+    args: &[],
+    dma: &[],
+    quiesce: &[],
+    start: &[],
+    release: &[],
+    trusted: false,
+    root: false,
+    shares: Shares::CREATOR,
+    cpus: GENERAL_CPUS,
+    waits: &[],
+    budgets: &[],
+    free: 0,
+    broken_after: None,
+};
+
 /// The data file service in the tables that have the clock service: it also connects to `clock`, whose
 /// page of CLOCK_REALTIME stamps the times of files. The tables of the probes of the volume have no
 /// clock service and keep `DATAFS`, whose times the service stamps from its own count. Its identity
@@ -1120,6 +1172,27 @@ mod tests {
         let datafs = found.table.iter().find(|r| r.name == "datafs").unwrap();
         assert!(datafs.connects.is_empty());
         assert!(crate::table::check(found.table).is_ok());
+    }
+
+    /// The layer service sits between the clients of POSIX and the data file service, connects to
+    /// the two file services and to nothing else, has no budget and no restart in this part, and
+    /// the table of its probe starts it after the data service it is a client of.
+    #[test]
+    fn the_layer_service_sits_above_the_posix_clients_and_below_the_data_service() {
+        use crate::table::ramfs::{LAYER_NAMES_TABLE, POSIX};
+        assert_eq!((LAYERD.priority, LAYERD.ceiling), (34, 34));
+        assert!(POSIX.ceiling < LAYERD.priority && LAYERD.priority < DATAFS.priority);
+        assert_eq!(LAYERD.connects, &["ramfs", "datafs"]);
+        assert!(!LAYERD.connects.contains(&"posix"), "a POSIX record connects to it");
+        assert!(LAYERD.budgets.is_empty());
+        assert!(matches!(LAYERD.restart, Restart::Never));
+        assert_eq!(LAYERD.broken_after, None);
+        // 192 identity copies, a pass or a Vouch copy in flight and about 24 of its own.
+        assert!(LAYERD.handle_limit >= 192 + 1 + 24);
+        let at = |name: &str| LAYER_NAMES_TABLE.iter().position(|r| r.name == name).unwrap();
+        assert!(at("datafs") < at("layerd") && at("layerd") < at("layer-names"));
+        assert!(LAYER_NAMES_TABLE[at("layer-names")].waits.iter().any(|w| w.service == "layerd"));
+        assert!(crate::table::check(LAYER_NAMES_TABLE).is_ok());
     }
 
     #[test]
