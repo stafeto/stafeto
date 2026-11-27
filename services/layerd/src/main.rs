@@ -625,12 +625,6 @@ impl Layerd {
         status_of(self.core.share(parent, &handles[..count], to))
     }
 
-    /// The request waits for its walk: a long path is walked `lookup::STEP` components in each step
-    /// of the loop, and the step that finishes the walk finishes the request (`walk_job`). The
-    /// answer is `Deferred`, or busy (`STARTING`, which the clients ask again) when the table of
-    /// jobs has no place for the session (`jobs::place`): a long path is never walked inside the
-    /// step of its request. None when the service does not answer yet (the request then gives its
-    /// own refusal).
     /// The place of the table of jobs for a job of the session `label`, or the answer the request
     /// gets: busy (`STARTING`) when the table is full or the session holds its share.
     fn place_for(&self, label: u64) -> Result<usize, Answer> {
@@ -666,6 +660,12 @@ impl Layerd {
         Answer::Deferred
     }
 
+    /// The request waits for its walk: a long path is walked `lookup::STEP` components in each step
+    /// of the loop, and the step that finishes the walk finishes the request (`walk_job`). The
+    /// answer is `Deferred`, or busy (`STARTING`, which the clients ask again) when the table of
+    /// jobs has no place for the session (`jobs::place`): a long path is never walked inside the
+    /// step of its request. None when the service does not answer yet (the request then gives its
+    /// own refusal).
     fn defer_walk(
         &mut self,
         r: &mut Request<'_>,

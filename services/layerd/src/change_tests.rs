@@ -1405,7 +1405,7 @@ fn every_change_makes_one_call_in_a_step() {
             0,
             "/etc/ln",
             "/etc/passwd",
-            false,
+            true,
         ),
         ("chmod", ChangeOp::Chmod, 0o600, "/etc/passwd", "", false),
         ("chown", ChangeOp::Chown, 5, "/etc/passwd", "", false),
@@ -1482,7 +1482,8 @@ fn two_creates_of_one_name_take_turns_and_the_second_finds_it_there() {
     };
     assert!(matches!(done, Ok(Done::Pass(_))), "the first made the file");
     assert!(!core.change_locked());
-    // The second takes its turn and finds the name there.
+    // The second takes its turn and finds the name there: without EXCLUSIVE it opens the file
+    // and holds no lock, with EXCLUSIVE it is EEXIST.
     let answer = loop {
         match step_job(&mut core, 0, &mut second) {
             ChangeStep::More => {}
@@ -1490,8 +1491,124 @@ fn two_creates_of_one_name_take_turns_and_the_second_finds_it_there() {
             ChangeStep::Wait => panic!(),
         }
     };
+    assert!(matches!(answer, Ok(Done::Pass(_))), "the name is opened");
+    assert!(!core.change_locked());
+    let mut excl = J::new();
+    excl.start_create(
+        2,
+        creating(f::READ_WRITE | f::EXCLUSIVE, 0o644),
+        b"/etc/new",
+        false,
+    )
+    .unwrap();
+    let answer = loop {
+        match step_job(&mut core, 0, &mut excl) {
+            ChangeStep::More => {}
+            ChangeStep::Done(r) => break r,
+            ChangeStep::Wait => panic!(),
+        }
+    };
     assert_eq!(answer.err(), Some(st(f::ALREADY_EXISTS)));
     assert!(!core.change_locked());
+}
+
+/// The index and the volume of a removal over a lower name, looked at after each step: the mark
+/// is in the index in the step that makes the removal visible.
+fn removal_steps(
+    core: &mut C<'_>,
+    op: ChangeOp,
+    path: &str,
+    parent: &[&[u8]],
+    name: &[u8],
+    gone: &str,
+    appears: bool,
+) {
+    use crate::changejob::ChangeStep;
+    let dir_of = |core: &C<'_>| {
+        parent
+            .iter()
+            .try_fold(0, |at, part| core.index.lookup(at, part).map(|(id, _)| id))
+    };
+    let mut job = J::new();
+    job.start(0, op, 0, 0, path.as_bytes(), b"").unwrap();
+    loop {
+        let step = step_job(core, 0, &mut job);
+        let dir = dir_of(core);
+        let kind = dir.and_then(|d| core.index.lookup(d, name).map(|(_, e)| e.kind));
+        let here = core.volume.nodes.contains_key(gone.as_bytes());
+        let removed = here == appears;
+        // Once the volume lost the name (or got the mark), the index says it is deleted.
+        if removed {
+            assert_eq!(kind, Some(Kind::Whiteout), "{path}: the lower name shows");
+        }
+        match step {
+            ChangeStep::More => {}
+            ChangeStep::Done(r) => {
+                r.unwrap();
+                break;
+            }
+            ChangeStep::Wait => panic!(),
+        }
+    }
+    let dir = dir_of(core).unwrap();
+    assert_eq!(
+        core.index.lookup(dir, name).map(|(_, e)| e.kind),
+        Some(Kind::Whiteout)
+    );
+}
+
+#[test]
+fn a_reader_never_sees_the_lower_name_between_the_steps_of_an_unlink_or_rmdir_over_it() {
+    let mut world = World::new();
+    let mut v = volume();
+    v.dir("/.layers/00/lowdir", 0o755, 0)
+        .dir("/.layers/00/empty", 0o755, 0);
+    let mut core = world.core(v);
+    ready(&mut core);
+    // A file of the layer over a lower one: the file goes, the mark is in.
+    removal_steps(
+        &mut core,
+        ChangeOp::Unlink,
+        "/etc/passwd",
+        &[b"etc"],
+        b"passwd",
+        "/.layers/00/etc/passwd",
+        false,
+    );
+    // A directory of the layer over a lower one (empty there).
+    removal_steps(
+        &mut core,
+        ChangeOp::Rmdir,
+        "/empty",
+        &[],
+        b"empty",
+        "/.layers/00/empty",
+        false,
+    );
+    // A lower name alone: the mark is made and indexed together.
+    removal_steps(
+        &mut core,
+        ChangeOp::Unlink,
+        "/bin/ls",
+        &[b"bin"],
+        b"ls",
+        "/.layers/00/bin/.wh.ls",
+        true,
+    );
+}
+
+#[test]
+fn a_directory_that_moved_keeps_its_children_for_rmdir() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    mkdir(&mut core, 0, "/rv", 0o755).unwrap();
+    mkdir(&mut core, 0, "/rv/sub", 0o755).unwrap();
+    rename(&mut core, 0, "/rv", "/rw").unwrap();
+    assert_eq!(rmdir(&mut core, 0, "/rw"), Err(st(f::NOT_EMPTY)));
+    assert!(node(&core, "/.layers/00/rw/sub").is_some());
+    rmdir(&mut core, 0, "/rw/sub").unwrap();
+    rmdir(&mut core, 0, "/rw").unwrap();
 }
 
 #[test]

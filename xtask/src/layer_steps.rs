@@ -42,7 +42,7 @@ pub const CHECKS: [&str; 15] = [
     "a merged listing of 1,024 names of the layer",
     "a file made, written and removed at the depth of 240",
     "a directory made and removed at the depth of 240",
-    "a directory below a chain of 8 lower directories",
+    "a directory below a chain of 7 lower directories",
     "a directory of 1,024 names renamed and back",
     "a directory renamed into the opaque directory and back",
     "a directory of 2,000 marks removed and made again",
@@ -59,9 +59,9 @@ pub const BREAKS: [(&str, bool); 3] = [
 ];
 
 /// What the lower set of the run holds besides the system: a chain of directories with no
-/// counterpart in the layer (`/lowdeep/l1/.../l8`, below which the probe makes a directory, which
+/// counterpart in the layer (`/lowdeep/l1/.../l7`, below which the probe makes a directory, which
 /// copies them up; a stat of a lower path costs the service about 1,400 ticks for each component,
-/// so nine is the most one step of the gate holds), and a file in `/opq`, the directory of the layer that is opaque.
+/// so nine is the most one step of the gate holds, and the chain keeps two in hand), and a file in `/opq`, the directory of the layer that is opaque.
 fn lower_files() -> Vec<crate::rootfs::RootFile> {
     let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
     let dir = |path: &'static str| crate::rootfs::RootFile {
@@ -73,7 +73,7 @@ fn lower_files() -> Vec<crate::rootfs::RootFile> {
     };
     let mut files = vec![dir("/lowdeep")];
     let mut path = String::from("/lowdeep");
-    for k in 1..=8 {
+    for k in 1..=7 {
         path.push_str(&format!("/l{k}"));
         files.push(dir(leak(path.clone())));
     }

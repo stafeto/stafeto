@@ -6,7 +6,7 @@
 //! a file at its end (a path of 247 components), the directory `/etc` of 1,024 files that the lower
 //! `/etc` lists beside, files in `d00` and on, the directory `/marks` of 2,000 marks, the opaque
 //! directory `/opq` and `/mk2` of five marks. After the reads come the changes: at the depth of
-//! 240, over a chain of 8 lower directories, of a directory of 1,024 names, into the opaque
+//! 240, over a chain of 7 lower directories, of a directory of 1,024 names, into the opaque
 //! directory, of a directory of marks, and a rename onto a directory of marks. The service has built its index in steps by the time the probe starts; the
 //! longest step of each kind is what the service prints and the command reads (`steps` build).
 
@@ -26,8 +26,8 @@ const MARKS: u32 = 2005;
 /// The directories of the chain of lower directories below `/lowdeep` (`xtask::layer_steps`).
 /// A stat of a lower path costs the service about 1,400 ticks for each of its components (the RAM
 /// file service resolves the path in steps the caller polls), so the longest lower path a step may
-/// stat is nine components: `/lowdeep` and eight more.
-const LOW_DEPTH: u32 = 8;
+/// stat is nine components: `/lowdeep` and eight more (the chain stops at seven for margin).
+const LOW_DEPTH: u32 = 7;
 /// The names after the changes of the probe: `/lowdeep`, its directories and the one below them
 /// made over the lower chain, the
 /// `/mk2` the rename went over; the marks of `/marks` and of `/mk2` are gone.
@@ -350,7 +350,7 @@ fn changes(
             Ok(())
         }
     });
-    // 3. A directory below a chain of 8 lower directories: each is copied up into the layer.
+    // 3. A directory below a chain of 7 lower directories: each is copied up into the layer.
     let mut low = Text::new();
     {
         use core::fmt::Write as _;
@@ -360,7 +360,7 @@ fn changes(
         }
         let _ = low.write_str("/x");
     }
-    t.check("a directory below a chain of 8 lower directories", {
+    t.check("a directory below a chain of 7 lower directories", {
         if change(names, n::ChangeOp::Mkdir, 0o755, low.as_str(), "") != 0 {
             Err(format_args!("the mkdir failed"))
         } else if !is_dir(names, low.as_str()) {

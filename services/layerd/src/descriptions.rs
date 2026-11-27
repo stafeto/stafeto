@@ -44,7 +44,9 @@ pub struct Description<D> {
     /// The id of the directory in the index (0 is the root of the layer).
     pub dir: u32,
     /// The lower set was hidden from the directory when the description was made (it or a
-    /// directory above it is opaque): the listing has no second stage.
+    /// directory above it is opaque): the listing has no second stage. The bit stays as OPEN
+    /// found it: a rename of the directory into or out of an opaque one does not change a
+    /// description that is open.
     pub hidden: bool,
     pub position: Position,
     /// The furthest position the replies gave out: SEEK_DIR goes back to one, never past it.

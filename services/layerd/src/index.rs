@@ -714,8 +714,14 @@ impl Index {
     /// are orphans that `remove_children_step` takes out a few at a time. The key to hand to it.
     pub fn retire(&mut self, id: u32) -> Option<u32> {
         let key = self.entry(id).filter(|e| e.kind == Kind::Dir)?.dkey;
+        let children = self.entry(id).is_some_and(|e| e.flags & HAS_CHILDREN != 0);
         self.take_out(id, false);
         self.dslot[key as usize & (SLOTS - 1)] = 0;
+        if !children {
+            // Nothing lay in it: the key is free at once, and the reaper has no orphans to take.
+            self.give_back(key);
+            return Some(0);
+        }
         Some(key)
     }
 
@@ -760,6 +766,7 @@ impl Index {
         if let Some(slot) = (new as usize).checked_sub(1) {
             self.slots[slot].flags = e.flags & !UNSCANNED;
             self.slots[slot].reach = e.reach;
+            self.slots[slot].live_children = e.live_children;
             self.grow(parent, 1 + name.len() + usize::from(e.reach), false);
         }
         Ok(new)
@@ -1157,13 +1164,25 @@ mod tests {
                     }
                 }
                 5 => {
-                    // Move a name that is no directory.
+                    // Move a name; a directory not into itself or below itself.
                     let to = dirs[next(dirs.len())];
                     let new = std::format!("m{}", next(12));
-                    if let Some((id, e)) = ix.lookup(parent, name.as_bytes())
-                        && e.kind != Kind::Dir
+                    if let Some((id, kind)) =
+                        ix.lookup(parent, name.as_bytes()).map(|(i, e)| (i, e.kind))
                     {
-                        let _ = ix.move_to(id, to, new.as_bytes());
+                        let mut below = to == id;
+                        let mut up = to;
+                        while up != 0 && !below {
+                            up = ix.parent_of(up);
+                            below = up == id;
+                        }
+                        if !(kind == Kind::Dir && below)
+                            && let Ok(moved) = ix.move_to(id, to, new.as_bytes())
+                            && kind == Kind::Dir
+                        {
+                            dirs.retain(|&d| d != id);
+                            dirs.push(moved);
+                        }
                     }
                 }
                 _ => {

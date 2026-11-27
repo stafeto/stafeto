@@ -31,6 +31,8 @@ const PATH_MAX: usize = d::MAX_PATH;
 const NAME_MAX: usize = d::NAME_MAX;
 /// The names of a directory one listing takes before their removal.
 const BATCH: usize = 8;
+/// The failed removals of one item after which it is dropped.
+const RETRIES: u8 = 8;
 
 #[derive(Clone, Copy)]
 struct Item {
@@ -79,6 +81,9 @@ pub struct Workers {
     lens: [u8; BATCH],
     kinds: [u32; BATCH],
     listed: usize,
+    /// The removals of the item that failed: past `RETRIES` the item is dropped (the next start
+    /// empties `work/`).
+    fails: u8,
     /// The job that holds the lock of the changes, plus one (0 for none).
     lock: u8,
 }
@@ -96,6 +101,7 @@ impl Workers {
             lens: [0; BATCH],
             kinds: [0; BATCH],
             listed: 0,
+            fails: 0,
             lock: 0,
         }
     }
@@ -151,6 +157,7 @@ impl Workers {
     fn head_done(&mut self) {
         self.items.copy_within(1..self.count, 0);
         self.count -= 1;
+        self.fails = 0;
         self.phase = Phase::Orphans(0);
     }
 }
@@ -255,7 +262,13 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                     w.plen = at;
                     w.phase = Phase::Open;
                 } else {
-                    let _ = self.volume.unlink(&w.path[..at]);
+                    if self.volume.unlink(&w.path[..at]).is_err() {
+                        w.fails += 1;
+                        if w.fails >= RETRIES {
+                            w.head_done();
+                            return w.count > 0;
+                        }
+                    }
                     w.phase = if i + 1 < w.listed {
                         Phase::Names(i + 1)
                     } else {
@@ -267,7 +280,13 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 if w.plen == item_len {
                     w.phase = Phase::Last;
                 } else {
-                    let _ = self.volume.rmdir(&w.path[..w.plen]);
+                    if self.volume.rmdir(&w.path[..w.plen]).is_err() {
+                        w.fails += 1;
+                        if w.fails >= RETRIES {
+                            w.head_done();
+                            return w.count > 0;
+                        }
+                    }
                     let up = w.path[..w.plen]
                         .iter()
                         .rposition(|&b| b == b'/')

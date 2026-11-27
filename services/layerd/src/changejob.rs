@@ -9,8 +9,10 @@
 //! - `SLOTS_PER_READDIR` slots of a scan of the table (the reaper's, `reaper`), or
 //! - one call to the data file service or to the lower set (a batch of `LOWER_PER_STEP` calls
 //!   for the listing of the emptiness check), with the changes to the index that call makes
-//!   visible, the one exception being the step of a rename over a directory, which makes two
-//!   renames (the target into `work/`, the source over its name).
+//!   visible, the exceptions being the step of a rename over a directory, which makes two
+//!   renames (the target into `work/`, the source over its name) and a third when the second
+//!   fails (the target goes back), and the step of a link over a file (the rename and the
+//!   removal of the file).
 //!
 //! The phases: `PlainA` and `PlainB` make the paths plain; `WalkA` and `WalkB` walk the directory
 //! part; `LowerA` and `LowerB` stat the lower directories below the deepest one of the layer;
@@ -92,11 +94,10 @@ impl Stage {
             Stage::DropMark { .. } => 5,
             Stage::Opaque => 6,
             Stage::UnlinkVictim { .. } => 7,
-            Stage::UnlinkDst => 8,
             Stage::Retire => 9,
             Stage::RenameMain => 10,
             Stage::UnlinkOldLink => 11,
-            Stage::OpenFile => 12,
+            Stage::OpenFile { .. } => 12,
             Stage::Attr => 13,
         }
     }
@@ -134,8 +135,6 @@ enum Stage {
     Opaque,
     /// The file or link at the leaf of the first path is removed.
     UnlinkVictim { link: bool },
-    /// The file at the leaf of the second path is removed (a link goes over a file).
-    UnlinkDst,
     /// The directory at the leaf of the first path leaves the layer.
     Retire,
     /// The rename.
@@ -143,7 +142,7 @@ enum Stage {
     /// The file of the link a file went over is removed.
     UnlinkOldLink,
     /// The file made by an OPEN that creates is opened and its pass taken.
-    OpenFile,
+    OpenFile { check: bool },
     /// An attribute operation.
     Attr,
 }
@@ -316,6 +315,8 @@ pub struct ChangeJob<V: Volume, L: Lower> {
     /// its first call of `Commit` has been made.
     id: u8,
     locked: bool,
+    /// The job needs no lock (it changes nothing).
+    lockless: bool,
     committed: bool,
     phase: Phase,
     sub: u8,
@@ -362,6 +363,7 @@ impl<V: Volume, L: Lower> ChangeJob<V, L> {
             creating: false,
             id: 0,
             locked: false,
+            lockless: false,
             committed: false,
             phase: Phase::PlainA,
             sub: 0,
@@ -431,6 +433,7 @@ impl<V: Volume, L: Lower> ChangeJob<V, L> {
         self.flags = 0;
         self.id = id;
         self.locked = false;
+        self.lockless = false;
         self.committed = false;
         self.phase = Phase::PlainA;
         self.sub = 0;
@@ -661,7 +664,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         job: &mut ChangeJob<V, L>,
         w: &mut Writer,
     ) -> ChangeStep<V::Pass> {
-        if !job.locked {
+        if !job.locked && !job.lockless {
             if !self.work.lock(job.id) {
                 return ChangeStep::Wait;
             }
@@ -1240,7 +1243,24 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 let attr = p.attr;
                 let (hidden, lower_dir) = match leaf {
                     Leaf::Missing { hidden, lower_dir } => (hidden, lower_dir),
-                    Leaf::Upper { .. } => return fail(proto_fs::ALREADY_EXISTS),
+                    Leaf::Upper { kind, .. } => {
+                        if class != Class::Create || job.flags & proto_fs::EXCLUSIVE != 0 {
+                            return fail(proto_fs::ALREADY_EXISTS);
+                        }
+                        // Another job made the name in the meantime: only EXCLUSIVE minds. The
+                        // file is opened, and the lock goes at once (nothing is changed).
+                        match kind {
+                            Kind::Dir => return fail(proto_fs::IS_DIRECTORY),
+                            Kind::Link => return fail(proto_fs::LOOP),
+                            _ => {}
+                        }
+                        self.work.unlock(job.id);
+                        job.locked = false;
+                        job.lockless = true;
+                        job.push(Stage::OpenFile { check: true });
+                        Self::begin_commit(job);
+                        return Ok(None);
+                    }
                     Leaf::Lower(ls) => {
                         if class != Class::Create {
                             return fail(proto_fs::ALREADY_EXISTS);
@@ -1318,7 +1338,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                     });
                 }
                 if class == Class::Create {
-                    job.push(Stage::OpenFile);
+                    job.push(Stage::OpenFile { check: false });
                 }
                 job.pc = 0;
                 job.dsub = 0;
@@ -1816,10 +1836,6 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                     });
                     dst_marked = true;
                 }
-            } else if src_kind == Kind::Link && kind != Kind::Link {
-                // A link over a file: the file goes first, so a cut never leaves both (a file
-                // over a link leaves both, and the scan lets the file win).
-                job.push(Stage::UnlinkDst);
             } else if src_kind != Kind::Link && kind == Kind::Link {
                 old_link = true;
             }
@@ -2032,7 +2048,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 return self.finish_ok(job, w);
             }
             let stage = job.stages[job.pc];
-            match self.stage(job, stage)? {
+            match self.stage(c, job, stage)? {
                 Flow::Pure => {
                     job.pc += 1;
                     job.sub = 0;
@@ -2043,6 +2059,15 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                     job.pc += 1;
                     job.sub = 0;
                     job.dsub = 0;
+                    // The mark of the index goes in with the call that made the removal visible, so
+                    // a reader never sees the lower name in between.
+                    while let Some(stage @ Stage::IndexMark { .. }) =
+                        job.stages.get(job.pc).copied()
+                        && job.pc < job.nstages
+                    {
+                        self.stage(c, job, stage)?;
+                        job.pc += 1;
+                    }
                     if job.pc >= job.nstages {
                         return self.finish_ok(job, w);
                     }
@@ -2060,7 +2085,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         Stop::Status(from_volume(e))
     }
 
-    fn stage(&mut self, job: &mut ChangeJob<V, L>, stage: Stage) -> F<Flow> {
+    fn stage(&mut self, c: &Client<'_>, job: &mut ChangeJob<V, L>, stage: Stage) -> F<Flow> {
         match stage {
             Stage::Ensure { b } => self.stage_ensure(job, b),
             Stage::Dir { b, opaque, created } => {
@@ -2112,12 +2137,6 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 self.index.remove(job.victim.id);
                 Ok(Flow::CallDone)
             }
-            Stage::UnlinkDst => {
-                let mut path = [0u8; 512];
-                let n = self.leg_vpath(&job.b, job.b.parts.len, false, &mut path)?;
-                self.volume.unlink(&path[..n]).map_err(from_volume)?;
-                Ok(Flow::CallDone)
-            }
             Stage::Retire => {
                 let mut path = [0u8; 512];
                 let n = self.leg_vpath(&job.a, job.a.parts.len, false, &mut path)?;
@@ -2140,7 +2159,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 let _ = self.volume.unlink(&path[..n]);
                 Ok(Flow::CallDone)
             }
-            Stage::OpenFile => self.stage_open_file(job),
+            Stage::OpenFile { check } => self.stage_open_file(c, job, check),
             Stage::Attr => self.stage_attr(job),
         }
     }
@@ -2292,6 +2311,18 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 job.dsub = 6;
                 Ok(None)
             }
+            7 => {
+                let (work, wl) = Self::work_path_of(job.work);
+                let mut live = [0u8; 512];
+                let n = self.leg_vpath(job.leg(b), end, false, &mut live)?;
+                let item = if self.volume.rename(&live[..n], &work[..wl]).is_ok() {
+                    &work[..wl]
+                } else {
+                    &live[..n]
+                };
+                let _ = self.work.push(item, true, 0);
+                fail(proto_fs::NO_SPACE)
+            }
             _ => {
                 let (work, wl) = Self::work_path_of(job.work);
                 let mut live = [0u8; 512];
@@ -2321,8 +2352,10 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                         Ok(Some(id))
                     }
                     Err(_) => {
-                        let _ = self.work.push(&live[..n], true, 0);
-                        fail(proto_fs::NO_SPACE)
+                        // The directory goes back into `work/` in the next step, then the
+                        // reaper has it.
+                        job.dsub = 7;
+                        Ok(None)
                     }
                 }
             }
@@ -2494,6 +2527,18 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                     job.dsub = 7;
                     return Ok(Flow::Call);
                 }
+                30 => {
+                    let (work, wl) = Self::work_path_of(job.work);
+                    let mut live = [0u8; 512];
+                    let n = self.leg_vpath(&job.a, job.a.parts.len, link, &mut live)?;
+                    let item = if self.volume.rename(&live[..n], &work[..wl]).is_ok() {
+                        &work[..wl]
+                    } else {
+                        &live[..n]
+                    };
+                    let _ = self.work.push(item, false, 0);
+                    return fail(proto_fs::NO_SPACE);
+                }
                 _ => {
                     let (work, wl) = Self::work_path_of(job.work);
                     let mut live = [0u8; 512];
@@ -2515,8 +2560,8 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                             Ok(Flow::CallDone)
                         }
                         Err(_) => {
-                            let _ = self.work.push(&live[..n], false, 0);
-                            fail(proto_fs::NO_SPACE)
+                            job.dsub = 30;
+                            Ok(Flow::Call)
                         }
                     };
                 }
@@ -2622,7 +2667,15 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             self.volume
                 .rename(&old[..on], &new[..nn])
                 .map_err(from_volume)?;
-            if let Some((id, _)) = dst_up {
+            if let Some((id, kind)) = dst_up {
+                if src_link && kind != Kind::Link {
+                    // A link over a file: the file goes in the same step (the second call), so
+                    // the target is never missing; a cut between the calls leaves both, and the
+                    // scan lets the file win, which is the target before the rename.
+                    let mut file = [0u8; 512];
+                    let fnn = self.leg_vpath(&job.b, job.b.parts.len, false, &mut file)?;
+                    self.volume.unlink(&file[..fnn]).map_err(from_volume)?;
+                }
                 self.index.remove(id);
             }
         }
@@ -2661,9 +2714,22 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     }
 
     /// The file an OPEN that creates made: opened, its pass taken and the description closed.
-    fn stage_open_file(&mut self, job: &mut ChangeJob<V, L>) -> F<Flow> {
+    fn stage_open_file(
+        &mut self,
+        c: &Client<'_>,
+        job: &mut ChangeJob<V, L>,
+        check: bool,
+    ) -> F<Flow> {
         match job.dsub {
-            0 => {
+            0 if check => {
+                // A file that was there: the rights of the open are read from the volume.
+                let mut path = [0u8; 512];
+                let n = self.leg_vpath(&job.a, job.a.parts.len, false, &mut path)?;
+                self.open_rights(c, &path[..n], job.flags)?;
+                job.dsub = 10;
+                Ok(Flow::Call)
+            }
+            0 | 10 => {
                 let mut path = [0u8; 512];
                 let n = self.leg_vpath(&job.a, job.a.parts.len, false, &mut path)?;
                 job.handle = self
