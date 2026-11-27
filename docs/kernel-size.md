@@ -1,6 +1,6 @@
 # Kernel size per source file
 
-`cargo xtask kernel-size` builds the shipping kernel (the build that also boots under Apple Virtualization.framework) and prints where the bytes of its `.text` come from. It reports and never fails: no build or ci step checks the size. The record of the shipping image size is `kernel/size.txt` and `cargo xtask build` prints the difference from it.
+`cargo xtask kernel-size` builds the shipping kernel (the build that also boots under Apple Virtualization.framework) and prints where the bytes of its `.text` come from. It reports and never fails. The record of the shipping image size is `kernel/size.txt`; `cargo xtask build` prints the difference from it and fails when the image is more than 4 KiB over or under the record (the record then follows the kernel). It also fails when `.data` of the ELF file is over 4 KiB and names the largest data symbols.
 
 ```sh
 cargo xtask kernel-size
@@ -37,3 +37,7 @@ The kernel is four crates, and the path of each row names the crate:
 The boot-only column counts the instructions of functions that run once while the kernel starts (the list `BOOT_ONLY` in `xtask/src/kernel_size.rs`: boot parameters, initialization of memory, interrupt controller, timer, scheduler, ITS, secondary CPUs, boot report). It is a lower bound: boot code inlined into a function that also runs later is counted in that function.
 
 The tool needs `llvm-objdump` and `llvm-size` from the `llvm-tools` rustup component, which the repository already requires.
+
+## Statics that are not all zero
+
+`objcopy -O binary` stores `.data` in the flat image and leaves `.bss` out. A static whose initializer has one non-zero word moves from `.bss` to `.data` and adds its whole size to the image of every boot and AWS image. In 057beb0a the per-CPU array `CPUS` (94,208 bytes) did so through the idle mark `u64::MAX` of `Scheduler::gap`, and the image grew by 94 KB (#629). The scheduler now keeps the gap complemented, so a fresh `Scheduler` is all zero bytes (host test `a_fresh_scheduler_is_all_zero_bytes`), and `.data` of the kernel is 5 bytes. `cargo xtask build` fails on such a static by itself: `.data` over 4 KiB.
