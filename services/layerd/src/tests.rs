@@ -79,6 +79,7 @@ fn lower() -> FakeLower {
 struct World {
     index: Box<Index>,
     scan: Box<Scan>,
+    work: Box<crate::reaper::Workers>,
 }
 
 impl World {
@@ -86,11 +87,19 @@ impl World {
         World {
             index: crate::index::boxed(),
             scan: Box::new(Scan::new()),
+            work: Box::new(crate::reaper::Workers::new()),
         }
     }
 
     fn core(&mut self, v: FakeVolume) -> Core<'_, FakeVolume, FakeLower> {
-        Core::new(&mut self.index, &mut self.scan, v, lower(), 5)
+        Core::new(
+            &mut self.index,
+            &mut self.scan,
+            &mut self.work,
+            v,
+            lower(),
+            5,
+        )
     }
 }
 
@@ -155,7 +164,9 @@ fn change(
         first: first.as_bytes(),
         second: second.as_bytes(),
     };
-    core.change(&c, &req, &mut w)?;
+    let done = core.change(&c, &req, &mut w);
+    while core.reap_step() {}
+    done?;
     Ok(w.as_bytes().to_vec())
 }
 

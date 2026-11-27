@@ -22,6 +22,7 @@ pub mod jobs;
 pub mod listing;
 pub mod lookup;
 pub mod names;
+pub mod reaper;
 pub mod scan;
 pub mod volume;
 

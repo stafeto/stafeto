@@ -697,6 +697,9 @@ impl Index {
             return;
         }
         self.count_out(e.kind);
+        if e.kind != Kind::Whiteout {
+            self.lose_child(slot);
+        }
         self.slots[slot].kind = Kind::Gone;
         self.slots[slot].flags = 0;
         self.slots[slot].dkey = 0;
@@ -706,21 +709,32 @@ impl Index {
         }
     }
 
-    /// Removes every entry that lies in the directory `id` (a scan of the table). Returns how
-    /// many it removed. The root is not a directory a removal reaches.
-    pub fn remove_children(&mut self, id: u32) -> usize {
-        let Some(pkey) = self.dkey_of(id).filter(|&k| k != 0) else {
-            return 0;
-        };
-        let mut removed = 0;
-        for slot in 0..SLOTS {
+    /// The directory `id` leaves the layer with what is in it: its entry is taken out and its key
+    /// stays unused (no name is reachable through it from then on), so the entries that lie in it
+    /// are orphans that `remove_children_step` takes out a few at a time. The key to hand to it.
+    pub fn retire(&mut self, id: u32) -> Option<u32> {
+        let key = self.entry(id).filter(|e| e.kind == Kind::Dir)?.dkey;
+        self.take_out(id, false);
+        self.dslot[key as usize & (SLOTS - 1)] = 0;
+        Some(key)
+    }
+
+    /// Takes out the entries that lie in the retired directory with the key `key`, looking at
+    /// `budget` places of the table from `from` on. The place to go on from, or None when the
+    /// table is done (and the key is free to be used again).
+    pub fn remove_children_step(&mut self, key: u32, from: usize, budget: usize) -> Option<usize> {
+        let to = (from + budget).min(SLOTS);
+        for slot in from..to {
             let e = self.slots[slot];
-            if !matches!(e.kind, Kind::Empty | Kind::Gone) && e.pkey == pkey {
+            if !matches!(e.kind, Kind::Empty | Kind::Gone) && e.pkey == key {
                 self.take_out(slot as u32 + 1, true);
-                removed += 1;
             }
         }
-        removed
+        if to < SLOTS {
+            return Some(to);
+        }
+        self.give_back(key);
+        None
     }
 
     /// Moves the entry `id` to (`parent`, `name`), which must not be held by another entry: the
@@ -759,6 +773,9 @@ impl Index {
                 let dkey = self.key_for(f.kind, keep)?;
                 self.marks -= 1;
                 self.live += 1;
+                if let Some(p) = self.parent_slot(slot) {
+                    self.slots[p].live_children += 1;
+                }
                 let e = &mut self.slots[slot];
                 e.kind = f.kind;
                 e.dkey = dkey;
@@ -791,7 +808,8 @@ impl Index {
         Ok(slot as u32 + 1)
     }
 
-    fn mark_parent(&mut self, parent: u32, _kind: Kind) {
+    /// The directory `parent` has a child (and a child that is no mark counts as live).
+    fn mark_parent(&mut self, parent: u32, kind: Kind) {
         if parent == 0 {
             self.root.flags |= HAS_CHILDREN;
         } else if let Some(p) = (parent as usize)
@@ -799,7 +817,28 @@ impl Index {
             .and_then(|s| self.slots.get_mut(s))
         {
             p.flags |= HAS_CHILDREN;
+            if kind != Kind::Whiteout {
+                p.live_children += 1;
+            }
         }
+    }
+
+    /// The entry in the slot lost a child that is no mark: its directory counts one less (the
+    /// directory is none when it was retired, and the root has no entry).
+    fn lose_child(&mut self, slot: usize) {
+        if let Some(p) = self.parent_slot(slot) {
+            self.slots[p].live_children = self.slots[p].live_children.saturating_sub(1);
+        }
+    }
+
+    /// The slot of the directory the entry in `slot` lies in (None for the root, and for a directory
+    /// that was retired).
+    fn parent_slot(&self, slot: usize) -> Option<usize> {
+        let pkey = self.slots[slot].pkey;
+        if pkey == 0 {
+            return None;
+        }
+        (self.dslot[pkey as usize & (SLOTS - 1)] as usize).checked_sub(1)
     }
 
     /// Sets and clears flags of a directory (id 0 is the root).
@@ -1051,6 +1090,105 @@ mod tests {
         let gone = ix.lookup(0, b"n8").unwrap().0;
         ix.remove(gone);
         assert!(ix.insert(0, b"fresh", file(1)).is_ok());
+    }
+
+    /// The entries that lie in each directory (by key), and the ones of them that are no mark.
+    fn children_by_key(ix: &Index) -> (std::vec::Vec<usize>, std::vec::Vec<usize>) {
+        let (mut all, mut live) = (std::vec![0; SLOTS], std::vec![0; SLOTS]);
+        for e in ix.slots.iter() {
+            if !matches!(e.kind, Kind::Empty | Kind::Gone) {
+                all[e.pkey as usize] += 1;
+                if e.kind != Kind::Whiteout {
+                    live[e.pkey as usize] += 1;
+                }
+            }
+        }
+        (all, live)
+    }
+
+    #[test]
+    fn the_counter_of_live_children_follows_every_insert_remove_move_mark_and_replace() {
+        let mut ix = index();
+        ix.reseed(5);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let mark = Fields {
+            kind: Kind::Whiteout,
+            ..file(0)
+        };
+        let mut dirs = std::vec![0u32];
+        for round in 0..100_000 {
+            let parent = dirs[next(dirs.len())];
+            let name = std::format!("n{}", next(12));
+            // A directory is never replaced by a file or a link (the service removes it first).
+            let kind_of_name = ix.lookup(parent, name.as_bytes()).map(|(_, e)| e.kind);
+            let op = next(7);
+            if kind_of_name == Some(Kind::Dir) && matches!(op, 1 | 2 | 6) {
+                continue;
+            }
+            match op {
+                0 => {
+                    if let Ok(id) = ix.insert(parent, name.as_bytes(), dir(1)) {
+                        if !dirs.contains(&id) {
+                            dirs.push(id);
+                        }
+                    }
+                }
+                1 | 2 => {
+                    let _ = ix.insert(parent, name.as_bytes(), file(1));
+                }
+                3 => {
+                    let _ = ix.insert(parent, name.as_bytes(), mark);
+                }
+                4 => {
+                    // Remove a name that holds nothing.
+                    if let Some((id, e)) = ix.lookup(parent, name.as_bytes()) {
+                        let (kind, key) = (e.kind, e.dkey);
+                        let empty = kind != Kind::Dir || children_by_key(&ix).0[key as usize] == 0;
+                        if empty {
+                            ix.remove(id);
+                            dirs.retain(|&d| d != id);
+                        }
+                    }
+                }
+                5 => {
+                    // Move a name that is no directory.
+                    let to = dirs[next(dirs.len())];
+                    let new = std::format!("m{}", next(12));
+                    if let Some((id, e)) = ix.lookup(parent, name.as_bytes()) {
+                        if e.kind != Kind::Dir {
+                            let _ = ix.move_to(id, to, new.as_bytes());
+                        }
+                    }
+                }
+                _ => {
+                    // A name of another kind over the same name.
+                    let _ = ix.insert(parent, name.as_bytes(), file(2));
+                }
+            }
+            dirs.retain(|&d| d == 0 || ix.entry(d).is_some());
+            if round % 997 == 0 {
+                let (_, live) = children_by_key(&ix);
+                for &d in dirs.iter().filter(|&&d| d != 0) {
+                    let e = *ix.entry(d).unwrap();
+                    assert_eq!(
+                        usize::from(e.live_children),
+                        live[e.dkey as usize],
+                        "round {round}"
+                    );
+                }
+            }
+        }
+        let (_, live) = children_by_key(&ix);
+        for &d in dirs.iter().filter(|&&d| d != 0) {
+            let e = *ix.entry(d).unwrap();
+            assert_eq!(usize::from(e.live_children), live[e.dkey as usize]);
+        }
     }
 
     #[test]

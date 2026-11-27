@@ -101,6 +101,8 @@ pub struct Core<'a, V: Volume, L: Lower> {
     pub lower: L,
     pub index: &'a mut Index,
     scan: &'a mut Scan,
+    /// The reaper and the lock of the changes.
+    pub(crate) work: &'a mut crate::reaper::Workers,
     pub composition: Composition,
     pub state: State,
     /// The builds that started again under another seed, and the place of the clearing between
@@ -268,6 +270,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     pub fn new(
         index: &'a mut Index,
         scan: &'a mut Scan,
+        work: &'a mut crate::reaper::Workers,
         volume: V,
         lower: L,
         epoch: u16,
@@ -277,6 +280,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             lower,
             index,
             scan,
+            work,
             composition: Composition::first(),
             state: State::Starting,
             reseeds: 0,

@@ -120,6 +120,8 @@ unsafe impl<T> Sync for Cell<T> {}
 
 static INDEX: Cell<Index> = Cell(UnsafeCell::new(Index::new()));
 static SCAN: Cell<Scan> = Cell(UnsafeCell::new(Scan::new()));
+static WORKERS: Cell<layerd::reaper::Workers> =
+    Cell(UnsafeCell::new(layerd::reaper::Workers::new()));
 
 /// The registrar thread: the root goes to the process service, tried until it is there.
 static PARENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -241,7 +243,13 @@ fn main(_: u64) -> u64 {
         rt::service::table_steps_from(16);
     }
     // SAFETY: the statics are used by this thread alone from here on.
-    let (index, scan) = unsafe { (&mut *INDEX.0.get(), &mut *SCAN.0.get()) };
+    let (index, scan, workers) = unsafe {
+        (
+            &mut *INDEX.0.get(),
+            &mut *SCAN.0.get(),
+            &mut *WORKERS.0.get(),
+        )
+    };
     touch_stack();
     touch(INDEX.0.get().cast(), core::mem::size_of::<Index>());
     touch(SCAN.0.get().cast(), core::mem::size_of::<Scan>());
@@ -254,6 +262,7 @@ fn main(_: u64) -> u64 {
     let mut core = Core::new(
         index,
         scan,
+        workers,
         data::Data { session },
         lower::Ram { files },
         epoch,
@@ -276,6 +285,7 @@ fn main(_: u64) -> u64 {
         walk_step,
         jobs: [const { None }; JOBS],
         next_job: 0,
+        reap_turn: false,
         notary: notary::Notary::new(),
         next_label: 1,
         next_birth: 1,
@@ -372,6 +382,9 @@ struct Layerd {
     walk_step: Handle<Channel>,
     jobs: [Option<Job>; JOBS],
     next_job: usize,
+    /// The next step of the loop goes to the reaper when it has work (the jobs and the reaper
+    /// take turns).
+    reap_turn: bool,
     notary: notary::Notary,
     next_label: u64,
     next_birth: u32,
@@ -654,6 +667,17 @@ impl Layerd {
     /// the open of its file; a job that is done is answered. A job of a session that went is
     /// dropped (its reply goes to nobody, the description it holds closes).
     fn walk_job(&mut self) {
+        // The jobs and the reaper take turns: a step is one or the other.
+        if self.core.reaping() && (self.reap_turn || !self.jobs.iter().any(Option::is_some)) {
+            self.reap_turn = false;
+            #[cfg(feature = "steps")]
+            rt::service::step_detail(1300);
+            if self.core.reap_step() || self.jobs.iter().any(Option::is_some) {
+                let _ = sys::notify(&self.walk_step, 1);
+            }
+            return;
+        }
+        self.reap_turn = true;
         let Some(place) = (0..JOBS)
             .map(|k| (self.next_job + k) % JOBS)
             .find(|&i| self.jobs[i].is_some())
@@ -670,7 +694,7 @@ impl Layerd {
                 self.jobs[place] = self.advance(job);
             }
         }
-        if self.jobs.iter().any(Option::is_some) {
+        if self.jobs.iter().any(Option::is_some) || self.core.reaping() {
             let _ = sys::notify(&self.walk_step, 1);
         }
     }

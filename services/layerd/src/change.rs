@@ -39,7 +39,7 @@
 //! the directory part there (its canonical path) and asks again. An open that creates meets such a
 //! link as the same redirect, which the RAM file service expands itself.
 
-use crate::index::{Fields, HAS_CHILDREN, Kind, NAME_MAX, NextChild, OPAQUE, UNSCANNED};
+use crate::index::{Fields, Kind, NAME_MAX, OPAQUE, UNSCANNED};
 use crate::lookup::{Outcome, STEP, Step, Walk, normalize};
 use crate::names::{Client, Core, Done, Walked, attr_of, from_volume, st};
 use crate::scan::{LINK_PREFIX, OPAQUE_NAME, WHITEOUT_PREFIX};
@@ -522,12 +522,20 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
 
     // ------------------------------------------------------------------ making things
 
+    /// What a failed change made and left (the path of a file or of a directory with what is in it)
+    /// goes to the reaper; with its queue full the leftover waits for the next start, which empties
+    /// `work/`.
     fn scrub(&mut self, path: &[u8], dir: bool) {
-        if dir {
-            let _ = self.remove_inside(path);
-            let _ = self.volume.rmdir(path);
+        let _ = self.work.push(path, dir, 0);
+    }
+
+    /// A place of the reaper for the directory a change is about to retire, before the volume is
+    /// touched: STARTING (the client asks again) when the queue is full.
+    fn reaper_room(&self) -> F<()> {
+        if self.work.room() {
+            Ok(())
         } else {
-            let _ = self.volume.unlink(path);
+            fail(proto_layer::STARTING)
         }
     }
 
@@ -697,44 +705,28 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     }
 
     /// The directory `id` of the layer, whose contents are marks alone, leaves the layer: it is
-    /// renamed into `work/` (the removal is one step) and emptied there.
+    /// renamed into `work/` (the removal is one step) and its entry leaves the index; the marks
+    /// below it are orphans of the index, and it is emptied in `work/`, by the reaper. The caller
+    /// has asked for a place (`reaper_room`).
     fn retire_dir(&mut self, id: u32) -> R<()> {
         let mut vp = [0u8; 512];
         let n = self.vpath(id, &mut vp)?;
         let (gone, gone_len) = self.work_path();
         let gone = &gone[..gone_len];
         self.volume.rename(&vp[..n], gone).map_err(from_volume)?;
-        if self.index.flags(id) & HAS_CHILDREN != 0 {
-            self.index.remove_children(id);
-        }
-        self.index.remove(id);
+        let key = self.index.retire(id).unwrap_or(0);
         self.table.forget(id);
-        self.scrub(gone, true);
+        let _ = self.work.push(gone, true, key);
         Ok(())
     }
 
     /// Whether the directory is empty in the merged view: no name of the layer that is not a mark,
     /// and no lower name that a mark does not hide.
     fn merged_empty(&mut self, up: Option<u32>, path: &[u8], lower_dir: bool) -> R<bool> {
-        if let Some(id) = up {
-            let mut pos = 0;
-            let mut budget = usize::MAX;
-            loop {
-                match self.index.next_child(id, pos, &mut budget) {
-                    NextChild::Found(next, child) => {
-                        if self
-                            .index
-                            .entry(child)
-                            .is_some_and(|e| e.kind != Kind::Whiteout)
-                        {
-                            return Ok(false);
-                        }
-                        pos = next;
-                    }
-                    NextChild::Continue(next) => pos = next,
-                    NextChild::End => break,
-                }
-            }
+        if let Some(id) = up
+            && self.index.entry(id).is_some_and(|e| e.live_children != 0)
+        {
+            return Ok(false);
         }
         if !lower_dir || up.is_some_and(|id| self.index.flags(id) & OPAQUE != 0) {
             return Ok(true);
@@ -1064,6 +1056,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 {
                     return fail(proto_fs::NOT_EMPTY);
                 }
+                if is_dir {
+                    self.reaper_room()?;
+                }
                 let marked = lower.is_some();
                 if marked {
                     self.put_mark(up, leaf)?;
@@ -1237,6 +1232,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         // opaque marker on the source, the mark of the target name (the lower directory stays
         // hidden when the target directory goes), the removal of the target, the move, and the mark
         // of the target name goes after it.
+        if dst_up.is_some_and(|(_, kind)| kind == Kind::Dir) {
+            self.reaper_room()?;
+        }
         let to = self.ensure_parent(&pb, b_parent)?;
         if src_is_dir && dst_lower_dir && self.index.flags(src_id) & OPAQUE == 0 {
             self.mark_opaque(src_id)?;

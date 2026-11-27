@@ -90,6 +90,7 @@ fn lower() -> FakeLower {
 struct World {
     index: Box<Index>,
     scan: Box<Scan>,
+    work: Box<crate::reaper::Workers>,
 }
 
 impl World {
@@ -97,11 +98,19 @@ impl World {
         World {
             index: crate::index::boxed(),
             scan: Box::new(Scan::new()),
+            work: Box::new(crate::reaper::Workers::new()),
         }
     }
 
     fn core(&mut self, v: FakeVolume) -> C<'_> {
-        Core::new(&mut self.index, &mut self.scan, v, lower(), 5)
+        Core::new(
+            &mut self.index,
+            &mut self.scan,
+            &mut self.work,
+            v,
+            lower(),
+            5,
+        )
     }
 }
 
@@ -164,7 +173,10 @@ fn change(
         first: first.as_bytes(),
         second: second.as_bytes(),
     };
-    core.change(&c, &req, &mut w)?;
+    let done = core.change(&c, &req, &mut w);
+    // What the change left for the reaper is done before the next request.
+    while core.reap_step() {}
+    done?;
     Ok(w.as_bytes().to_vec())
 }
 
@@ -1116,6 +1128,104 @@ fn the_walk_carries_whether_the_lower_set_shows_through_a_directory() {
     );
 }
 
+/// A step of the reaper: the calls it made to the volume.
+fn reap_once(core: &mut C<'_>) -> (bool, usize) {
+    let before = core.volume.calls.len();
+    let more = core.reap_step();
+    (more, core.volume.calls.len() - before)
+}
+
+#[test]
+fn a_removed_directory_leaves_at_once_and_the_reaper_takes_what_it_held_a_piece_at_a_time() {
+    let mut v = volume();
+    v.dir("/.layers/00/mk", 0o755, 0);
+    for k in 0..40 {
+        v.file(&format!("/.layers/00/mk/.wh.m{k:02}"), 0o644, 0, b"");
+    }
+    let mut world = World::new();
+    let mut core = world.core(v);
+    ready(&mut core);
+    // The marks of the volume, and the forty in the directory.
+    let (names, marks) = core.index.counts();
+    assert!(marks > 40);
+    // The change itself, with no reaper step: the directory is gone from the view and from the
+    // volume, its marks are orphans of the index, and one item waits in the queue.
+    let v = who(0);
+    let c = Client { owner: 40, who: &v };
+    let req = n::Change {
+        op: ChangeOp::Rmdir,
+        a: 0,
+        b: 0,
+        first: b"/mk",
+        second: b"",
+    };
+    core.change(&c, &req, &mut Writer::new()).unwrap();
+    // The lower set has no such name, so the walk of it ends in a redirect to the lower set.
+    let opened = open(&mut core, 0, f::READ_ONLY, "/mk");
+    assert!(
+        matches!(opened, Ok((ref reply, None)) if is_redirect(reply).is_some()),
+        "{opened:?}"
+    );
+    assert!(node(&core, "/.layers/00/mk").is_none());
+    assert_eq!(core.index.counts(), (names - 1, marks));
+    assert!(core.reaping());
+    // The reaper: the orphans in windows of the table, then one call to the volume in a step.
+    let mut steps = 0;
+    loop {
+        let (more, calls) = reap_once(&mut core);
+        assert!(calls <= 1, "a step made {calls} calls");
+        steps += 1;
+        assert!(steps < 1000);
+        if !more {
+            break;
+        }
+    }
+    assert!(
+        steps >= crate::index::SLOTS / crate::listing::SLOTS_PER_READDIR,
+        "{steps}"
+    );
+    assert_eq!(core.index.counts(), (names - 1, marks - 40));
+    assert!(!core.reaping());
+    // Nothing of it is left in `work/`, and the name comes back as a new, empty directory.
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+    mkdir(&mut core, 0, "/mk", 0o755).unwrap();
+    assert_eq!(listing(&mut core, "/mk"), Vec::<String>::new());
+}
+
+#[test]
+fn a_change_that_would_retire_a_directory_with_the_reaper_full_is_busy() {
+    let mut v = volume();
+    for k in 0..crate::reaper::REAPS + 1 {
+        v.dir(&format!("/.layers/00/d{k}"), 0o755, 0);
+    }
+    let mut world = World::new();
+    let mut core = world.core(v);
+    ready(&mut core);
+    let v = who(0);
+    let c = Client { owner: 40, who: &v };
+    let mut rmdir_of = |core: &mut C<'_>, path: &str| {
+        let req = n::Change {
+            op: ChangeOp::Rmdir,
+            a: 0,
+            b: 0,
+            first: path.as_bytes(),
+            second: b"",
+        };
+        core.change(&c, &req, &mut Writer::new())
+    };
+    for k in 0..crate::reaper::REAPS {
+        rmdir_of(&mut core, &format!("/d{k}")).unwrap();
+    }
+    assert_eq!(
+        rmdir_of(&mut core, &format!("/d{}", crate::reaper::REAPS)).err(),
+        Some(st(proto_layer::STARTING))
+    );
+    // The directory is still there, and after the reaper made room the removal goes through.
+    assert!(node(&core, &format!("/.layers/00/d{}", crate::reaper::REAPS)).is_some());
+    while core.reap_step() {}
+    rmdir_of(&mut core, &format!("/d{}", crate::reaper::REAPS)).unwrap();
+}
+
 // ---------------------------------------------------------------------- rename
 
 #[test]
@@ -1668,10 +1778,30 @@ fn a_removed_name_leaves_the_probes_of_the_others_unbroken_and_is_taken_again() 
     let a = ix.insert(dir, b"a", f(2)).unwrap();
     ix.insert(dir, b"b", f(3)).unwrap();
     let other = ix.insert(0, b"a", f(4)).unwrap();
-    assert_eq!(ix.remove_children(dir), 2);
+    let counts = ix.counts();
+    let key = ix.retire(dir).unwrap();
+    assert!(ix.entry(dir).is_none());
+    // The children are orphans until the steps of the reaper take them out.
+    let (mut from, mut windows) = (0, 0);
+    while let Some(next) = ix.remove_children_step(key, from, 4096) {
+        from = next;
+        windows += 1;
+    }
+    assert!(windows >= 3, "{windows}");
     assert!(ix.entry(a).is_none());
+    assert_eq!(ix.counts().0, counts.0 - 3);
     assert_eq!(ix.lookup(0, b"a").map(|(i, _)| i), Some(other));
     // A move keeps the fields and takes the children along.
+    let dir = ix
+        .insert(
+            0,
+            b"dir",
+            crate::index::Fields {
+                kind: Kind::Dir,
+                ..f(1)
+            },
+        )
+        .unwrap();
     let kid = ix.insert(dir, b"kid", f(5)).unwrap();
     let moved = ix.move_to(dir, 0, b"dir2").unwrap();
     assert!(ix.lookup(0, b"dir").is_none());
