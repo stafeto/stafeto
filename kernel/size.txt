@@ -1,5 +1,7 @@
 # Kernel image sizes in bytes, one line per recorded build: stem, then size.
-# The kernel has no size limit. `cargo xtask build` and the host test
-# `kernel_size_record` print the difference from these numbers, and flag
-# a growth of more than 4 KiB. Update the line when the size changes on purpose.
-stafeto 212997
+# The kernel has no size limit, but a growth of more than 4 KiB over the
+# record fails `cargo xtask build`, so a growth gets looked at. `cargo xtask
+# build` and the host test `kernel_size_record` print the difference from
+# these numbers. When the growth is intended, set the line to the size that
+# the build prints.
+stafeto 311360

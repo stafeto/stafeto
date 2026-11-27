@@ -3816,7 +3816,7 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
     image::check_header(&bytes)?;
     let boot_image = build_boot_image("boot.img", &BOOT_PROGRAMS, BOOT_PROFILE)?;
     println!("kernel image {} ({} bytes)", image.display(), bytes.len());
-    image::report(variant.stem(), bytes.len() as u64);
+    image::report(variant.stem(), bytes.len() as u64)?;
     Ok(Artifacts {
         elf,
         image,

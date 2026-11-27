@@ -1,6 +1,6 @@
 # Kernel size per source file
 
-`cargo xtask kernel-size` builds the shipping kernel (the build that also boots under Apple Virtualization.framework) and prints where the bytes of its `.text` come from. It reports and never fails: no build or ci step checks the size. The record of the shipping image size is `kernel/size.txt` and `cargo xtask build` prints the difference from it.
+`cargo xtask kernel-size` builds the shipping kernel (the build that also boots under Apple Virtualization.framework) and prints where the bytes of its `.text` come from. It reports and never fails. The record of the shipping image size is `kernel/size.txt`; `cargo xtask build` prints the difference from it and fails when the image is more than 4 KiB over the record.
 
 ```sh
 cargo xtask kernel-size
