@@ -16,7 +16,7 @@
 //! of entries of the lower set taken so far.
 
 use crate::descriptions::Position;
-use crate::index::{Index, Kind, OPAQUE};
+use crate::index::{Index, Kind, NextChild, OPAQUE};
 use crate::volume::{Lower, R};
 use proto_fs::names::{DirEntry, DirReply, ENTRY_HEAD, LOWER_PER_READDIR, NAME_MAX, cursor};
 use proto_wire::Status;
@@ -27,6 +27,10 @@ pub struct Listed {
     pub more: bool,
     pub cursor: u64,
 }
+
+/// The slots of the index one request looks at in the first stage: 512 slots cost about 7,000
+/// ticks under `-icount` (14 for a slot, measured), under 0.9 B with the rest of the step.
+pub const SLOTS_PER_READDIR: usize = 512;
 
 const DIRECTORY: u32 = 1;
 const REGULAR: u32 = 2;
@@ -77,28 +81,38 @@ pub fn read_dir<L: Lower>(
         if position.at < 2 {
             return Ok(listed(position, true));
         }
+        let mut budget = SLOTS_PER_READDIR;
         while room(reply) {
             let from = (position.at - 2) as usize;
-            let Some((next, id)) = index.next_child(dir, from) else {
-                // The names of the layer are done.
-                *position = Position { stage: 1, at: 0 };
-                break;
-            };
-            position.at = next as u32 + 2;
-            let Some(e) = index.entry(id) else { continue };
-            let kind = match e.kind {
-                Kind::Whiteout | Kind::Empty => continue,
-                Kind::Dir => DIRECTORY,
-                Kind::File => REGULAR,
-            };
-            let name = index.name(id).unwrap_or(&[]);
-            reply
-                .push(&DirEntry {
-                    ino: e.number,
-                    kind,
-                    name,
-                })
-                .map_err(|_| Status::BadSize)?;
+            match index.next_child(dir, from, &mut budget) {
+                NextChild::End => {
+                    // The names of the layer are done.
+                    *position = Position { stage: 1, at: 0 };
+                    break;
+                }
+                NextChild::Continue(next) => {
+                    // The slots this request may look at are used up: the next one goes on.
+                    position.at = next as u32 + 2;
+                    break;
+                }
+                NextChild::Found(next, id) => {
+                    position.at = next as u32 + 2;
+                    let Some(e) = index.entry(id) else { continue };
+                    let kind = match e.kind {
+                        Kind::Whiteout | Kind::Empty => continue,
+                        Kind::Dir => DIRECTORY,
+                        Kind::File => REGULAR,
+                    };
+                    let name = index.name(id).unwrap_or(&[]);
+                    reply
+                        .push(&DirEntry {
+                            ino: e.number,
+                            kind,
+                            name,
+                        })
+                        .map_err(|_| Status::BadSize)?;
+                }
+            }
         }
         if position.stage == 0 {
             return Ok(listed(position, true));

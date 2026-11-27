@@ -59,6 +59,9 @@ fn ok_checks() -> &'static [&'static str] {
     &CHECKS
 }
 
+/// The tag of the step lines of the layer service (`rt::service::report_steps` in `main.rs`).
+const STEP_TAG: &str = "18";
+
 /// The deliberate breaks of the layer service and the check each one fails.
 pub const BREAKS: [(&str, &str); 2] = [
     ("break-layerd-whiteout", "merged listing of a directory"),
@@ -125,6 +128,7 @@ pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
     match args.first().map(String::as_str) {
         None => probe(machine),
         Some("breaks") if args.len() == 1 => breaks(machine),
+        Some("steps") if args.len() == 1 => steps(machine),
         Some(other) => Err(format!(
             "layer-names-probe [breaks]: unknown argument {other}"
         )),
@@ -136,6 +140,15 @@ fn boot(
     machine: &qemu::Machine,
     features: &'static [&'static str],
 ) -> Result<(qemu::Outcome, u64), String> {
+    boot_with(machine, features, false)
+}
+
+/// `boot`, under `-icount` on one CPU when `icount` (the figures of the steps repeat).
+fn boot_with(
+    machine: &qemu::Machine,
+    features: &'static [&'static str],
+    icount: bool,
+) -> Result<(qemu::Outcome, u64), String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
     let image = write_boot_image_files(IMAGE, &programs(features), BOOT_PROFILE, &[], Vec::new())?;
@@ -144,6 +157,9 @@ fn boot(
     crate::data_image::make_layer_volume(&disk.0, DISK_BYTES)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::store(&disk.0, None));
+    if icount {
+        cmd.args(["-smp", "1", "-icount", "shift=4,sleep=on"]);
+    }
     let started = std::time::Instant::now();
     let output = run_until(cmd, LIMIT, Some(ENDS), &kernel.elf)?;
     Ok((output, started.elapsed().as_secs()))
@@ -233,6 +249,31 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
         machine.name,
         ok_checks().len(),
         seconds
+    );
+    Ok(())
+}
+
+/// The steps of the service under `-icount` on one CPU, told and not judged: the probe passes and
+/// the longest step of each kind goes to the console. The kinds 64 and up of the loop's table are
+/// one kind (63) for the methods of the names, since their numbers are 70 and over. Part G of the
+/// split gives the main loop its bound; this part reports where it stands (the open of a directory
+/// of the lower set through `PosixFs` is a step of about 60,000 ticks, past term B).
+pub fn steps(machine: &qemu::Machine) -> Result<(), String> {
+    let (output, seconds) = boot_with(machine, &["steps"], true)?;
+    read_lines(&output.lines)?;
+    qemu::expect_stopped_on(
+        &output,
+        "init: layer-names ended: exit code 0, not restarted",
+    )?;
+    let rows = crate::step_line::longest(&output.lines, STEP_TAG);
+    if rows.is_empty() {
+        return Err("layer-names-probe steps: the service printed no step".into());
+    }
+    let over: Vec<&(usize, u64, u64)> = rows.iter().filter(|r| r.1 > crate::TERM_B).collect();
+    println!(
+        "layer-names-probe steps on {} under -icount: steps of the layer service (kind, ticks, detail) {rows:?}; past term B ({}): {over:?} (told, not judged) in {seconds} s: ok",
+        machine.name,
+        crate::TERM_B
     );
     Ok(())
 }

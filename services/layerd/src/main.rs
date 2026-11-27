@@ -92,6 +92,19 @@ extern "C" fn register_root(_: u64) -> ! {
     rt::roots::keep(&parent, &channel, l::ROOT, level, "layerd")
 }
 
+/// Writes a zero into each page of the `len` bytes at `base`, so that every page is mapped: the
+/// first touch of a page of a static is a fault the kernel serves, and it must not land in a step of
+/// the loop. It runs before the loop, when nothing else uses the memory and its bytes are zeros.
+fn touch(base: *mut u8, len: usize) {
+    let mut at = 0;
+    while at < len {
+        // SAFETY: `at` is within the static, which holds zeros and is used by nobody yet.
+        unsafe { base.add(at).write(0) };
+        at += 4096;
+    }
+    core::hint::black_box(base);
+}
+
 /// The files of the RAM file service (the boot profile), made once.
 fn connect_files(parent: &Handle<Channel>) -> Option<&'static mut PosixFs> {
     let startup = StartupFiles::connect(parent, false).ok()?;
@@ -177,6 +190,9 @@ fn main(_: u64) -> u64 {
     }
     // SAFETY: the statics are used by this thread alone from here on.
     let (index, scan) = unsafe { (&mut *INDEX.0.get(), &mut *SCAN.0.get()) };
+    touch(INDEX.0.get().cast(), core::mem::size_of::<Index>());
+    touch(SCAN.0.get().cast(), core::mem::size_of::<Scan>());
+    touch(PAGES.0.get().cast(), core::mem::size_of::<Pages>());
     let epoch = (rt::time::now() as u16) | 1;
     let mut core = Core::new(
         index,

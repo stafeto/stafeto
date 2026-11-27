@@ -757,3 +757,36 @@ fn the_volume_statuses_become_the_statuses_of_the_names() {
     );
     let _ = d::NO_ENTRY;
 }
+
+#[test]
+fn a_request_looks_at_a_bounded_number_of_slots_of_the_index() {
+    let mut v = volume();
+    v.dir("/.layers/00/filler", 0o755, 0);
+    for i in 0..1_500 {
+        v.file(&format!("/.layers/00/filler/f{i:04}"), 0o644, 0, b"");
+    }
+    v.batch = 59;
+    let mut world = World::new();
+    let mut core = world.core(v);
+    ready(&mut core);
+    let (reply, _) = open(&mut core, 0, f::READ_ONLY | f::DIRECTORY_ONLY, "/etc").unwrap();
+    let h = handle_of(&reply);
+    let (names, requests) = list(&mut core, 40, h);
+    let names = sorted(names);
+    for expected in [".", "..", "big00", "hostname", "own.conf", "passwd"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "{expected}: {names:?}"
+        );
+    }
+    // The first stage looks at 512 slots in a request: the whole table takes at least 16 requests,
+    // and a request that finds nothing says `more` with no entry.
+    assert!(
+        requests >= crate::index::SLOTS / crate::listing::SLOTS_PER_READDIR,
+        "{requests}"
+    );
+    let (reply, _) = open(&mut core, 0, f::READ_ONLY | f::DIRECTORY_ONLY, "/filler").unwrap();
+    let h = handle_of(&reply);
+    let (names, _) = list(&mut core, 40, h);
+    assert_eq!(names.len(), 1_500 + 2);
+}

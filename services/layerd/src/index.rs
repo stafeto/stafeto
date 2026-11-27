@@ -71,6 +71,15 @@ impl Entry {
     }
 }
 
+/// What `next_child` found: an entry (the position after it and its id), the end of the slots
+/// looked at with more to come (the position to go on from), or the end of the table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NextChild {
+    Found(usize, u32),
+    Continue(usize),
+    End,
+}
+
 /// What an insertion carries besides its key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fields {
@@ -133,12 +142,14 @@ impl Index {
             arena_len: 0,
             live: 0,
             marks: 0,
+            // All zeros, so that the static of the program is `.bss`: the build of the index
+            // sets the attributes of the root from the volume.
             root: Root {
                 number: 0,
                 uid: 0,
                 gid: 0,
-                mode: 0o755,
-                flags: UNSCANNED,
+                mode: 0,
+                flags: 0,
             },
         }
     }
@@ -198,13 +209,23 @@ impl Index {
         self.entry(id).map(|e| self.name_of(e))
     }
 
-    /// The slot after `from` (a position of a listing, 0 for the start) that holds an entry of the
-    /// directory `parent`, as (the next position to ask from, the id).
-    pub fn next_child(&self, parent: u32, from: usize) -> Option<(usize, u32)> {
-        (from..SLOTS).find_map(|slot| {
+    /// The next entry of the directory `parent` at a slot from `from` on (a position of a listing,
+    /// 0 for the start), looking at `budget` slots at most: each slot looked at is taken off the
+    /// budget, so the cost of a request does not depend on the size of the table.
+    pub fn next_child(&self, parent: u32, from: usize, budget: &mut usize) -> NextChild {
+        let mut slot = from;
+        while slot < SLOTS {
+            if *budget == 0 {
+                return NextChild::Continue(slot);
+            }
+            *budget -= 1;
             let e = &self.slots[slot];
-            (e.kind != Kind::Empty && e.parent == parent).then_some((slot + 1, slot as u32 + 1))
-        })
+            if e.kind != Kind::Empty && e.parent == parent {
+                return NextChild::Found(slot + 1, slot as u32 + 1);
+            }
+            slot += 1;
+        }
+        NextChild::End
     }
 
     /// Inserts a name. A mark of deletion over a name of the layer changes nothing, and a name over
@@ -520,13 +541,38 @@ mod tests {
         assert_eq!(ix.path_of(c, &mut [0u8; 8]), None);
         let mut pos = 0;
         let mut seen = std::vec::Vec::new();
-        while let Some((next, id)) = ix.next_child(a, pos) {
-            seen.push(id);
-            pos = next;
+        let mut budget = SLOTS;
+        loop {
+            match ix.next_child(a, pos, &mut budget) {
+                NextChild::Found(next, id) => {
+                    seen.push(id);
+                    pos = next;
+                }
+                NextChild::Continue(_) => panic!("the budget covers the table"),
+                NextChild::End => break,
+            }
         }
         assert_eq!(seen, std::vec![b]);
+        // A small budget stops where it runs out, and the next call goes on from there.
+        let mut budget = 3;
+        let mut pos = 0;
+        let mut windows = 0;
+        loop {
+            match ix.next_child(a, pos, &mut budget) {
+                NextChild::Found(next, _) => pos = next,
+                NextChild::Continue(next) => {
+                    windows += 1;
+                    pos = next;
+                    budget = 3;
+                }
+                NextChild::End => break,
+            }
+        }
+        assert!(windows >= SLOTS / 3 - 1, "{windows}");
         assert_eq!(ix.attr(a).unwrap().mode, 0o755);
         assert!(ix.attr(c).is_none());
+        assert_eq!(ix.attr(0).unwrap().mode, 0);
+        ix.set_attr(0, 1, 0, 0, 0o755);
         assert_eq!(ix.attr(0).unwrap().mode, 0o755);
     }
 }

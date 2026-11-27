@@ -2595,7 +2595,7 @@ commands:
   posix-random-net-two the same with two stack instances of the network service on two CPUs: a socket homed on the second instance survives
   posix-random-net-two-steps the same under -icount, the steps of both instances
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
-  layer-names-probe run the probe of the names of the layered root (a POSIX program of the root that speaks to the layer service directly: TakeRoot, SESSION, redirects of lower names, the pass of a file of the layer and its bytes, merged listings, marks of deletion, an opaque directory, the numbers of stat, EACCES for another user and EROFS) over a volume made offline, in QEMU; with the argument breaks: the same against the layer service built with each deliberate break, which it must catch
+  layer-names-probe run the probe of the names of the layered root (a POSIX program of the root that speaks to the layer service directly: TakeRoot, SESSION, redirects of lower names, the pass of a file of the layer and its bytes, merged listings, marks of deletion, an opaque directory, the numbers of stat, EACCES for another user and EROFS) over a volume made offline, in QEMU; with the argument breaks: the same against the layer service built with each deliberate break, which it must catch; with the argument steps: under -icount on one CPU with the steps of the service told
   data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU; with an argument: write, cap, full, restart, throughput, fast (64 MiB through the window against the bounds of the plan), atomic (atomicity, lease, signals, fork, restart of the large calls), steps (the service's steps and the CPU time of its parts under -icount, on one CPU and on two), atomic-break FEATURE (the atomic probe on a service with a deliberate break, which it must catch)
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
   wfc-probe run the scene demo on OpenWF Composition (<WF/wfc.h>) in QEMU with the compositor: two scenes of three elements (a stretch, quarter turns, a flip, the filters none and faster, a global alpha and a mask) over the windows of two producers, and a third scene of the window of the first revision shown straight, committed in turn 100 times and each composed on request, QEMU's screenshot compared with the CRC of the host's reference (tools/wfc-ref), then the scene changed 100 times on an active context with every screenshot one of the two and both of them among the shots; then scene D (the bilinear filter: two stretches, a flip, a quarter turn) committed once, its screenshot compared and its frame time printed; the counters of the service (no frame failed, bands grow, scene C a frame shown straight) and the device's trace; then the steps of the compositor and the driver under -icount
@@ -11732,6 +11732,8 @@ fn host_tests() -> Result<(), String> {
         "virtio-blk",
         "--package",
         "pkgd",
+        "--package",
+        "layerd",
         "--package",
         "netd",
         "--package",
