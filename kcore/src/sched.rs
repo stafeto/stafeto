@@ -830,6 +830,16 @@ impl<T: Schedulable> Scheduler<T> {
         self.gap_inv = !now;
     }
 
+    /// The CPU sleeps: no gap runs.
+    fn gap_idle(&mut self) {
+        self.gap_inv = 0;
+    }
+
+    /// Whether the CPU sleeps (`gap_idle`).
+    fn is_idle(&self) -> bool {
+        self.gap_inv == 0
+    }
+
     /// The gap begins at `now` unless it began earlier; an idle CPU's gap
     /// (0, the least complement) begins at `now`.
     fn gap_min(&mut self, now: u64) {
@@ -870,7 +880,7 @@ impl<T: Schedulable> Scheduler<T> {
                 return;
             }
         }
-        if self.gap_inv == 0 {
+        if self.is_idle() {
             self.gap_begins(now);
         }
     }
@@ -898,7 +908,7 @@ impl<T: Schedulable> Scheduler<T> {
             self.system = self
                 .system
                 .saturating_add(now.saturating_sub(self.gap_start()));
-            self.gap_inv = 0;
+            self.gap_idle();
         }
     }
 
@@ -1116,7 +1126,7 @@ impl<T: Schedulable> Scheduler<T> {
             self.system = self
                 .system
                 .saturating_add(now.saturating_sub(self.gap_start()));
-            self.gap_inv = 0;
+            self.gap_idle();
             return Decision::Idle;
         };
         let next = self.ready.first(top).must("a level with its bit set");
