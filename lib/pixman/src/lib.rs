@@ -843,6 +843,21 @@ pub fn product(
     )
 }
 
+/// The calling thread becomes the worker's: from here on the state pixman keeps
+/// between calls (the arena it allocates from, the cache of the paths it found) is
+/// the worker's own, and the thread shares none that a call writes with the
+/// thread that made the tables (ports/pixman/shim.c). Called once, by the worker,
+/// before its first call of pixman.
+#[cfg(target_os = "none")]
+pub fn worker_enter() {
+    unsafe extern "C" {
+        fn pxs_worker_enter();
+    }
+    // SAFETY: the function sets TPIDR_EL0 of the calling thread, which nothing
+    // else of the service reads.
+    unsafe { pxs_worker_enter() }
+}
+
 /// The image over the work band (`product`, `Mask::Work`) is made now and kept,
 /// so that no band pays for it. False when pixman refuses.
 #[cfg(target_os = "none")]

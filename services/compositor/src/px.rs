@@ -756,6 +756,81 @@ impl Pixman {
     }
 }
 
+/// The pixman of the worker thread (`compositor::prep`): its own table of images
+/// and, through `pixman::worker_enter`, its own arena and cache of paths, so that it
+/// shares no state that a call writes with the service's `Pixman`. It makes the
+/// transform of an element into a prepared image: the points of the window
+/// through the element's map, by the nearest point or the bilinear mean, copied.
+pub struct Worker {
+    images: Images,
+    refused: u32,
+}
+
+impl Worker {
+    /// The worker's pixman; the thread that calls it is the worker.
+    pub fn new() -> Worker {
+        pixman::worker_enter();
+        Worker {
+            images: Images::new(),
+            refused: 0,
+        }
+    }
+}
+
+impl compositor::prep::Maker for Worker {
+    fn make(
+        &mut self,
+        dst: &mut [u8],
+        stride: u32,
+        argb: bool,
+        size: (u32, u32),
+        element: &proto_comp::Element,
+        src: &compositor::prep::Surface2<'_>,
+        area: proto_comp::Rect,
+    ) {
+        let mut target = Target {
+            bytes: dst,
+            format: if argb { Px::Argb8888 } else { Px::Xrgb8888 },
+            stride,
+            width: size.0,
+            height: size.1,
+        };
+        // A window of ARGB8888 whose alpha the element does not use is read as
+        // XRGB8888, as a band reads it.
+        let kind = match (src.format, argb) {
+            (Format::Argb, false) => Px::Xrgb8888,
+            (f, _) => format(f),
+        };
+        let source = Source {
+            bytes: src.bytes,
+            format: kind,
+            stride: src.stride,
+            width: src.size.0,
+            height: src.size.1,
+            hint: src.image,
+        };
+        let drawn = composite_element(
+            &mut self.images,
+            false,
+            &mut target,
+            source,
+            Some(compositor::elements::matrix(element)),
+            (0, 0),
+            if element.filter == proto_comp::BILINEAR {
+                Filter::Bilinear
+            } else {
+                Filter::Nearest
+            },
+            Mask::None,
+            (area.x, area.y),
+            (area.w, area.h),
+        );
+        if !drawn {
+            self.refused = self.refused.wrapping_add(1);
+        }
+    }
+}
+
 impl Raster for Pixman {
     fn fill(&mut self, fb: &mut [u8], r: Rect, rgb: u32) {
         let mut target = Target {
