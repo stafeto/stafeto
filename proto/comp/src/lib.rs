@@ -1167,6 +1167,11 @@ pub const WINDOW_STATS_LEN: usize = 32;
 /// The most bytes of STATS' reply: the status, the counters, the buckets,
 /// the count and the records of every window.
 pub const STATS_MAX: usize = 4 + (COUNTERS + BUCKETS + 1) * 4 + STATS_WINDOWS * WINDOW_STATS_LEN;
+/// The most bytes of LIST's reply: the status, the count and the records of
+/// every window the service holds.
+pub const LIST_MAX: usize = 8 + STATS_WINDOWS * WINDOW_RECORD;
+// Both replies fit a message (at most 1 024 bytes).
+const _: () = assert!(STATS_MAX <= 1_024 && LIST_MAX <= 1_024);
 
 /// SET's body: the property and its value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1813,8 +1818,6 @@ mod tests {
         }
         // The longest reply is 720 bytes: 16 records of 32 bytes after 208.
         assert_eq!(STATS_MAX, 720);
-        // A message is at most 1 024 bytes.
-        const { assert!(STATS_MAX <= 1_024) };
         let full = StatsReply::new(sample_stats(), &(1..=16).map(window).collect::<Vec<_>>());
         assert_eq!(reply_bytes(&full.unwrap()).len(), 720);
     }

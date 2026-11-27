@@ -59,10 +59,15 @@ pub const COMPOSITOR: Record = Record {
     ceiling: 32,
     // The compositor's 150 pages and the pool of the prepared images of
     // its elements (2 MiB, `compositor::prep::POOL_BYTES`: 512 pages).
-    // Measured under -icount with sixteen windows of three buffers each (the
-    // arena of pixman is 64 KiB for them): 47 pages used of the 150 and 80
-    // handles live of the 128 (a window holds its session, its notice and
-    // its buffers), so the figures stand.
+    // Measured under -icount (a temporary print of `sys::process_memory` and
+    // `sys::process_handles` in the band step, the probe's windows made with
+    // three buffers each): the kernel's count of the quota used was 23 pages with
+    // one window and 47 with sixteen, the growth being the mappings of the
+    // buffers. Whether that count holds the program's own pages (the header says
+    // about 57) was not checked, so the 150 stand with a margin of 100 over the
+    // measure. The handles were 19 live with one window and 80 with sixteen: 4 a
+    // window (1 of its own and 1 for each of its 3 buffers, which is 2 with one
+    // buffer), so 16 x 4 = 64 and about 16 of the service's own, of the 128.
     quota: 662 * PAGE,
     handle_limit: 128,
     restart: Restart::Always,

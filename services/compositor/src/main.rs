@@ -99,6 +99,8 @@ const BUF_AT: usize = 0x11_0000_0000;
 /// to need, so the gap and the cursor's four pages cost no page-table page.
 const POOL_AT: usize = 0x12_0000_0000;
 // The buffers of every window (48 MiB at 16 windows) end before the pool.
+// STATS and LIST have a record for every window.
+const _: () = assert!(proto_comp::STATS_WINDOWS >= MAX_WINDOWS);
 const _: () = assert!(BUF_AT + MAX_WINDOWS * proto_comp::BUFFERS * BUFFER_MAX as usize <= POOL_AT);
 /// Where the service maps the cursor's picture (source 3 of the driver),
 /// past the pool inside the same 2 MiB span.

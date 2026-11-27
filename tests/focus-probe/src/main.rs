@@ -505,14 +505,16 @@ fn expected_crc(order: [bool; 2], only_a: bool) -> u32 {
 }
 
 /// Window `k` of the scene of sixteen windows (`Probe::many` with the monitor):
-/// staggered so that each overlaps the others, every third XRGB8888 (the value
+/// staggered so that all of them share one region, every third XRGB8888 (the value
 /// is the colour) and the others ARGB8888 (the value is premultiplied, an alpha
 /// of 0x60 to 0xD8 and each channel under it).
 fn sixteen_of(k: usize) -> (Rect, u32, u32) {
     let n = k as u32;
+    // Steps of 8 across and 5 down: every window holds the region from (140, 85)
+    // to (220, 120), so the damage of any post meets all sixteen.
     let rect = Rect {
-        x: 20 + 27 * n,
-        y: 10 + 16 * n + 13 * (n % 3),
+        x: 20 + 8 * n,
+        y: 10 + 5 * n,
         w: 200,
         h: 110,
     };
@@ -913,7 +915,7 @@ impl Probe<'_> {
         proto_comp::write_manage(manage::LIST, 0, 0, 0, &mut w).map_err(say("MANAGE's bytes"))?;
         let reply = sys::send(display, w.as_bytes()).map_err(say("LIST"))?;
         let mut buffer = [0; MESSAGE_MAX];
-        let mut windows = [WindowRecord::default(); 16];
+        let mut windows = [WindowRecord::default(); WINDOWS];
         let mut n = 0;
         proto_comp::read_list(reply.bytes(&mut buffer), |r| {
             if n < windows.len() {

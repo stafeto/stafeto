@@ -386,7 +386,7 @@ walks, the term the probe measured for the elements of a scene. With 8 windows o
 band is one band's layers as before (the same tile, the same prices). Sixteen translucent
 windows over one place make a black group and four groups of at most five layers (a layer
 laid over others is 903 ticks of call and 288 of the term of a layer, with the margin), where the calls of
-sixteen layers in one band (19 056 ticks) pass the 14 000 a band has.
+sixteen layers in one band (19 056 ticks) pass the 14 000 a band has. Model against measure for the longest band of sixteen layers: the model holds every band of a group within `BAND_TICKS` 14 000 of work (the host test of the groups finds 13 977 for sixteen translucent windows over the whole screen, terms included), and the step around a band costs about 1 080 ticks more, 15 080 in all; the probe's frame of sixteen layers over one place measured 14 348 ticks for its longest band step (the gate of a band is 16 328). The plan charges each window on its rectangle at the time it is made and a step draws the window on that rectangle cut to its current one, so a move in the middle of a place cannot lengthen a band.
 
 Under a scene each element is charged by its class (`elements::classes`; the rows of
 `compositor::PRICES` after the black, the copy and the laying over): a stretch, turn or
