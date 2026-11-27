@@ -375,6 +375,9 @@ pub const NAME_TOO_LONG: u32 = 311;
 pub const LOOP: u32 = 312;
 pub const STALE_PROOF: u32 = 313;
 pub const RESOLVING: u32 = 314;
+/// The path jobs, binding preparations and unpublished creations one session holds at once: the
+/// seventeenth start is refused with TOO_MANY_OPEN_FILES.
+pub const SESSION_PREPARATIONS: usize = 16;
 /// The original request made no file effect. FinishBinding completes the
 /// retained authority refresh before the caller retries the original request.
 pub const AUTHENTICATING: u32 = 315;

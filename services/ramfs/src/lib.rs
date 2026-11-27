@@ -352,7 +352,7 @@ pub struct Fds {
     pub auth_probe_gc: Option<Token>,
     #[cfg(feature = "auth-probe")]
     pub auth_probe_gc_reservation: Option<storage::Reservation>,
-    pub resolvers: [u64; 16],
+    pub resolvers: [u64; proto_fs::SESSION_PREPARATIONS],
     pub open_watermarks: [u64; proto_fs::JOB_KEY_PLACES],
     /// Independent exact numeric-close receipts survive physical descriptor reuse.
     close_receipts: [Option<proto_fs::CloseEvent>; proto_fs::CLOSE_KEY_PLACES],
@@ -381,7 +381,7 @@ impl Default for Fds {
             auth_probe_gc: None,
             #[cfg(feature = "auth-probe")]
             auth_probe_gc_reservation: None,
-            resolvers: [0; 16],
+            resolvers: [0; proto_fs::SESSION_PREPARATIONS],
             open_watermarks: [0; proto_fs::JOB_KEY_PLACES],
             close_receipts: [None; proto_fs::CLOSE_KEY_PLACES],
             image_hold: None,
