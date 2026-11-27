@@ -13,13 +13,19 @@
 //!   checks the rights on the lower attributes;
 //! - a name below the root that `PASS_THROUGH` lists (`PassThrough`).
 //!
-//! A path is made plain before the walk (`normalize`): `.` and empty components go and `..` takes
-//! the component before it, lexically, so the walk meets no `..` and the path a redirect carries has
-//! none either (a `..` the walk met after it left the index would let `/bin/../etc/x` reach a name
-//! the layer deleted or shadowed). The departure: a lower symbolic link to a directory is not
-//! looked through for `..` (`/lowlink/..` is the parent of the link's name, not of its target); a
-//! later part makes the RAM file service answer `..` with a redirect to route by the path, and
-//! removes this.
+//! A path is made plain before the walk (`normalize`): `.` and empty components go and `..` stays.
+//! The walk takes a `..` in the index (the parent of a directory of the layer is exact), and a path
+//! that leaves the index (the first lower name, or a name the root passes through) goes whole to the
+//! RAM file service, which answers a `..` and the expansion of a link with a redirect that routes by
+//! the path (its `layered` argument), so a `..` after a lower symbolic link to a directory is the
+//! parent of the link's target, and a path that leaves the lower set by a `..` meets the marks and
+//! the search checks of the layer. The POSIX layer still makes a path of a program simple, by text,
+//! before it sends it (as for every service); a `..` that follows a link there is the parent of the
+//! name of the link.
+//!
+//! A symbolic link of the layer (`Kind::Link`) in the middle of a path, or at the end when the call
+//! follows links, ends the walk with `Outcome::Link`: the service answers a redirect that routes by
+//! the path with the link's text where the component stood.
 //!
 //! Each directory of the layer the walk goes through is checked for the right to search with
 //! `posix_perm::permits` on the attributes the index keeps (`Denied` is EACCES). The service checks
@@ -33,10 +39,10 @@ use posix_perm::{EXEC, Identity, permits};
 /// The components one step of the walk takes: a measure of its work.
 pub const STEP: usize = 16;
 
-/// The path made plain: `.` and empty components dropped, `..` taking the component before it (at
-/// the root it takes nothing), and a slash at the end kept when the path ended with a slash, `.` or
-/// `..` (a directory is meant). The bytes at the start of `out` and their count; the result is never
-/// longer than `path`, so 512 bytes hold every path of the protocol.
+/// The path made plain: `.` and empty components dropped, `..` kept, and a slash at the end kept
+/// when the path ended with a slash, `.` or `..` (a directory is meant). The bytes at the start of
+/// `out` and their count; the result is never longer than `path`, so 512 bytes hold every path of
+/// the protocol.
 pub fn normalize(path: &[u8], out: &mut [u8; 512]) -> usize {
     let mut len = 0;
     let mut last: &[u8] = b"";
@@ -44,7 +50,6 @@ pub fn normalize(path: &[u8], out: &mut [u8; 512]) -> usize {
         match part {
             b"" => continue,
             b"." => {}
-            b".." => len = out[..len].iter().rposition(|&b| b == b'/').unwrap_or(0),
             name => {
                 if len + 1 + name.len() <= out.len() {
                     out[len] = b'/';
@@ -71,6 +76,13 @@ pub fn normalize(path: &[u8], out: &mut [u8; 512]) -> usize {
 pub enum Outcome {
     /// The id of a name of the layer: 0 is the root of the layer, any other the entry's id.
     Upper(u32),
+    /// A symbolic link of the layer: its id, and the bytes of the path where its component starts
+    /// and ends.
+    Link {
+        id: u32,
+        start: usize,
+        end: usize,
+    },
     Lower,
     PassThrough {
         data: bool,
@@ -92,6 +104,11 @@ pub struct Walk<'p> {
     path: &'p [u8],
     pos: usize,
     cur: u32,
+    /// A link at the end of the path is followed.
+    follow: bool,
+    /// Where a walk that ended with `Outcome::Lower` stopped: the directory of the layer and the
+    /// place of the first name it does not hold.
+    miss: (u32, usize),
 }
 
 impl<'p> Walk<'p> {
@@ -101,7 +118,21 @@ impl<'p> Walk<'p> {
             path,
             pos: 0,
             cur: 0,
+            follow: true,
+            miss: (0, 0),
         }
+    }
+
+    /// A link at the end of the path is not followed (lstat, readlink, the leaf of a removal).
+    pub fn no_follow(mut self) -> Walk<'p> {
+        self.follow = false;
+        self
+    }
+
+    /// The directory of the layer a walk that ended with `Outcome::Lower` was in, and where in
+    /// the path the first name the layer does not hold starts.
+    pub fn missed(&self) -> (u32, usize) {
+        self.miss
     }
 
     /// Whether the path ends with a slash: the name must be a directory.
@@ -140,7 +171,7 @@ impl<'p> Walk<'p> {
                 }
             }
             if name == b".." {
-                self.cur = index.entry(self.cur).map_or(0, |e| e.parent());
+                self.cur = index.parent_of(self.cur);
                 continue;
             }
             if self.cur == 0 && proto_fs::names::PASS_THROUGH.contains(&name) {
@@ -150,6 +181,15 @@ impl<'p> Walk<'p> {
             }
             match index.lookup(self.cur, name) {
                 Some((_, e)) if e.kind == Kind::Whiteout => return Step::Done(Outcome::Absent),
+                Some((id, e))
+                    if e.kind == Kind::Link && (!last || self.follow || self.trailing_slash()) =>
+                {
+                    return Step::Done(Outcome::Link {
+                        id,
+                        start,
+                        end: self.pos,
+                    });
+                }
                 Some((id, e)) if last => {
                     return Step::Done(if e.kind == Kind::File && self.trailing_slash() {
                         Outcome::NotDir
@@ -160,7 +200,10 @@ impl<'p> Walk<'p> {
                 Some((id, e)) if e.kind == Kind::Dir => self.cur = id,
                 Some(_) => return Step::Done(Outcome::NotDir),
                 None if index.flags(self.cur) & OPAQUE != 0 => return Step::Done(Outcome::Absent),
-                None => return Step::Done(Outcome::Lower),
+                None => {
+                    self.miss = (self.cur, start);
+                    return Step::Done(Outcome::Lower);
+                }
             }
         }
         Step::More
@@ -243,16 +286,14 @@ mod tests {
             ("//", "/"),
             ("/a/b", "/a/b"),
             ("/a//b/./c", "/a/b/c"),
-            ("/a/b/..", "/a/"),
-            ("/a/b/../c", "/a/c"),
-            ("/bin/../etc/x", "/etc/x"),
-            ("/..", "/"),
-            ("/../a", "/a"),
-            ("/a/../..", "/"),
+            ("/a/b/..", "/a/b/../"),
+            ("/a/b/../c", "/a/b/../c"),
+            ("/bin/../etc/x", "/bin/../etc/x"),
+            ("/..", "/../"),
             ("/a/", "/a/"),
             ("/a/.", "/a/"),
             ("/a/./", "/a/"),
-            ("/tmp/..", "/"),
+            ("/tmp/..", "/tmp/../"),
         ] {
             assert_eq!(plain(path.as_bytes()), want.as_bytes(), "{path}");
         }
@@ -262,19 +303,22 @@ mod tests {
     }
 
     #[test]
-    fn a_dot_dot_after_a_lower_name_meets_the_marks_and_the_search_checks_of_the_layer() {
+    fn a_dot_dot_after_a_lower_name_ends_the_walk_there_and_one_before_it_is_exact() {
         let ix = world();
-        let walk_plain = |path: &[u8], uid: u32| {
-            let mut out = [0u8; 512];
-            let n = normalize(path, &mut out);
-            walk(&ix, &out[..n], uid)
-        };
-        // /bin is the lower set's; /etc/motd is deleted and /priv is closed in the layer.
-        assert_eq!(walk_plain(b"/bin/../etc/motd", 0), Outcome::Absent);
-        assert_eq!(walk_plain(b"/bin/../priv/x", 1000), Outcome::Denied);
-        assert_eq!(walk_plain(b"/tmp/../etc/motd", 0), Outcome::Absent);
+        // The walk stops at the first name of the lower set (the RAM file service answers the
+        // `..` after it with a redirect that routes by the path) and at a name the root passes
+        // through.
+        assert_eq!(walk(&ix, b"/bin/../etc/motd", 0), Outcome::Lower);
+        assert_eq!(walk(&ix, b"/bin/../priv/x", 1000), Outcome::Lower);
+        assert_eq!(
+            walk(&ix, b"/tmp/../etc/motd", 0),
+            Outcome::PassThrough { data: false }
+        );
+        // Through the layer the parent is exact: the marks and the search checks hold.
+        assert_eq!(walk(&ix, b"/etc/../etc/motd", 0), Outcome::Absent);
+        assert_eq!(walk(&ix, b"/etc/../priv/x", 1000), Outcome::Denied);
         assert!(matches!(
-            walk_plain(b"/data/../etc/hostname", 0),
+            walk(&ix, b"/etc/../etc/hostname", 0),
             Outcome::Upper(_)
         ));
     }

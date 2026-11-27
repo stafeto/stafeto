@@ -51,6 +51,36 @@ impl Volume for Data {
         r.u32()
     }
 
+    fn open_numbered(&mut self, path: &[u8], flags: u32, mode: u32, ino: u64) -> R<u32> {
+        let buf = self.call(|w| p::open_numbered(path, flags, mode, ino, w))?;
+        let mut r = p::reply(&buf.bytes[..buf.len])?;
+        r.u32()
+    }
+
+    fn truncate(&mut self, handle: u32, size: u64) -> R<()> {
+        self.call(|w| p::truncate(handle, size, w)).map(drop)
+    }
+
+    fn chmod(&mut self, path: &[u8], mode: u32) -> R<()> {
+        self.call(|w| p::chmod(path, mode, w)).map(drop)
+    }
+
+    fn chown(&mut self, path: &[u8], uid: u32, gid: u32) -> R<()> {
+        self.call(|w| p::chown(path, uid, gid, w)).map(drop)
+    }
+
+    fn utimens(&mut self, path: &[u8], atime: i64, mtime: i64) -> R<()> {
+        self.call(|w| {
+            p::utimens(
+                path,
+                p::TimeSpec::from_word(atime)?,
+                p::TimeSpec::from_word(mtime)?,
+                w,
+            )
+        })
+        .map(drop)
+    }
+
     fn close(&mut self, handle: u32) -> R<()> {
         self.call(|w| p::handle_call(Method::Close, handle, w))
             .map(drop)

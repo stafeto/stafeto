@@ -35,7 +35,7 @@ use proto_fs::{NodeInfo, Redirect, Timestamp};
 use proto_layer as l;
 use proto_wire::{Status, Writer};
 
-fn st(code: u32) -> Status {
+pub(crate) fn st(code: u32) -> Status {
     Status::Unknown(code)
 }
 
@@ -84,25 +84,27 @@ pub struct Core<'a, V: Volume, L: Lower> {
     /// `/.layers/NN`, the live layer's directory.
     live: [u8; 16],
     live_len: usize,
-    table: Table<L::Dir>,
+    pub(crate) table: Table<L::Dir>,
+    /// What the changes keep between requests (`change`).
+    pub(crate) writes: crate::change::Writes,
 }
 
 /// The result of a walk and the plain path it walked, which a redirect carries.
-struct Walked {
-    outcome: Outcome,
-    trailing: bool,
+pub(crate) struct Walked {
+    pub(crate) outcome: Outcome,
+    pub(crate) trailing: bool,
     path: [u8; 512],
     len: usize,
 }
 
 impl Walked {
-    fn path(&self) -> &[u8] {
+    pub(crate) fn path(&self) -> &[u8] {
         &self.path[..self.len]
     }
 }
 
 /// The mapping of a status of the volume to the status of the names.
-fn from_volume(status: Status) -> Status {
+pub(crate) fn from_volume(status: Status) -> Status {
     match status {
         Status::Unknown(code) => st(match code {
             d::NO_ENTRY => proto_fs::NO_ENTRY,
@@ -122,7 +124,7 @@ fn from_volume(status: Status) -> Status {
     }
 }
 
-fn node_from(s: &d::Stat) -> R<NodeInfo> {
+pub(crate) fn node_from(s: &d::Stat) -> R<NodeInfo> {
     let time = |ns: i64| Timestamp::from_ns(i128::from(ns));
     Ok(NodeInfo {
         kind: if s.kind == d::KIND_DIRECTORY { 1 } else { 2 },
@@ -142,7 +144,7 @@ fn node_from(s: &d::Stat) -> R<NodeInfo> {
     })
 }
 
-fn attr_of(s: &d::Stat) -> posix_perm::Attr {
+pub(crate) fn attr_of(s: &d::Stat) -> posix_perm::Attr {
     posix_perm::Attr {
         kind: if s.kind == d::KIND_DIRECTORY {
             posix_perm::Kind::Directory
@@ -173,6 +175,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             live: *b"/.layers/00\0\0\0\0\0",
             live_len: 11,
             table: Table::new(epoch),
+            writes: crate::change::Writes::default(),
         }
     }
 
@@ -184,7 +187,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         self.table.count()
     }
 
-    fn live_path(&self) -> &[u8] {
+    pub(crate) fn live_path(&self) -> &[u8] {
         &self.live[..self.live_len]
     }
 
@@ -239,7 +242,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         self.clear_work().map_err(failed)
     }
 
-    fn read_file(&mut self, path: &[u8], out: &mut [u8]) -> R<usize> {
+    pub(crate) fn read_file(&mut self, path: &[u8], out: &mut [u8]) -> R<usize> {
         let h = self.volume.open(path, d::READ, 0)?;
         let mut len = 0;
         let result = loop {
@@ -302,7 +305,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         self.remove_inside(WORK_DIR, 0)
     }
 
-    fn remove_inside(&mut self, dir: &[u8], depth: usize) -> R<()> {
+    pub(crate) fn remove_inside(&mut self, dir: &[u8], depth: usize) -> R<()> {
         // The names of one batch, then their removal; the listing starts again until it is empty.
         loop {
             let mut names = [[0u8; 64]; 8];
@@ -387,7 +390,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     // ------------------------------------------------------------------ proto_layer
 
     /// The code a request of the names answers while the service cannot serve.
-    fn gate(&self) -> Result<(), Status> {
+    pub(crate) fn gate(&self) -> Result<(), Status> {
         match self.state {
             State::Ready => Ok(()),
             State::Starting => Err(st(l::STARTING)),
@@ -471,17 +474,34 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
 
     // ------------------------------------------------------------------ the names
 
-    fn vpath(&self, id: u32, out: &mut [u8; 512]) -> R<usize> {
-        Scan::volume_path(self.index, self.live_path(), id, out)
-            .ok_or_else(|| st(proto_fs::NAME_TOO_LONG))
+    /// The path of the entry `id` on the volume. A symbolic link is the file
+    /// `.wh..wh.lnk.<name>` in the directory of the name.
+    pub(crate) fn vpath(&self, id: u32, out: &mut [u8; 512]) -> R<usize> {
+        let n = Scan::volume_path(self.index, self.live_path(), id, out)
+            .ok_or_else(|| st(proto_fs::NAME_TOO_LONG))?;
+        if self.index.entry(id).is_none_or(|e| e.kind != Kind::Link) {
+            return Ok(n);
+        }
+        let at = out[..n].iter().rposition(|&b| b == b'/').unwrap_or(0) + 1;
+        let prefix = crate::scan::LINK_PREFIX;
+        if n + prefix.len() > out.len() {
+            return Err(st(proto_fs::NAME_TOO_LONG));
+        }
+        out.copy_within(at..n, at + prefix.len());
+        out[at..at + prefix.len()].copy_from_slice(prefix);
+        Ok(n + prefix.len())
     }
 
     /// The walk of `path` after it is made plain (`lookup::normalize`), with the real identifiers
     /// when `real` (ACCESS with `ACCESS_REAL`) and the effective ones otherwise.
-    fn walk(&self, c: &Client<'_>, path: &[u8], real: bool) -> Walked {
+    pub(crate) fn walk(&self, c: &Client<'_>, path: &[u8], real: bool, follow: bool) -> Walked {
         let mut plain = [0u8; 512];
         let len = normalize(path, &mut plain);
-        let walk = Walk::new(&plain[..len]);
+        let walk = if follow {
+            Walk::new(&plain[..len])
+        } else {
+            Walk::new(&plain[..len]).no_follow()
+        };
         let trailing = walk.trailing_slash();
         let outcome = walk.run(self.index, c.who.identity(real)).0;
         Walked {
@@ -493,7 +513,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     }
 
     /// A failure of a walk, as a status.
-    fn refusal(outcome: Outcome) -> Status {
+    pub(crate) fn refusal(outcome: Outcome) -> Status {
         st(match outcome {
             Outcome::Absent => proto_fs::NO_ENTRY,
             Outcome::NotDir => proto_fs::NOT_DIRECTORY,
@@ -503,7 +523,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         })
     }
 
-    fn redirect(path: &[u8], target: u32, w: &mut Writer) -> R<()> {
+    pub(crate) fn redirect(path: &[u8], target: u32, w: &mut Writer) -> R<()> {
         Redirect {
             target,
             index: 0,
@@ -534,15 +554,28 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         w: &mut Writer,
     ) -> R<Done<V::Pass>> {
         self.gate()?;
-        let walked = self.walk(c, path, false);
-        let (outcome, trailing) = (walked.outcome, walked.trailing);
-        // The names the root passes through are the services' own, writes included. A name of
-        // the lower set is read only in this part: the RAM file service would write it below the
-        // layers, so a write or a create is refused here (whether the name exists is the RAM
-        // file service's to say, and a create of a name that may be there is as much a write).
-        let writes = n::open_writes(flags);
         let creates = flags & proto_fs::CREATE != 0;
-        if (writes || creates) && matches!(outcome, Outcome::Lower | Outcome::Absent) {
+        let excl = flags & proto_fs::EXCLUSIVE != 0;
+        // A name that is made (CREATE and EXCLUSIVE) is not followed at its end.
+        let follow = flags & proto_fs::NO_FOLLOW == 0 && !(creates && excl);
+        let walked = self.walk(c, path, false, follow);
+        let (outcome, trailing) = (walked.outcome, walked.trailing);
+        if let Outcome::Link { id, start, end } = outcome {
+            return self
+                .link_redirect(&walked, id, start, end, w)
+                .map(|()| Done::Written);
+        }
+        // The names the root passes through are the services' own, writes included. A name that
+        // the layer of the user does not hold is made in the layer when it is not there (in the
+        // lower set too), and a write to a name of the lower set is refused until the copy up.
+        let writes = n::open_writes(flags);
+        if creates
+            && matches!(outcome, Outcome::Lower | Outcome::Absent)
+            && let Some(done) = self.create_and_open(c, flags, &walked, w)?
+        {
+            return Ok(done);
+        }
+        if writes && outcome == Outcome::Lower {
             return Err(st(proto_fs::READ_ONLY_FILESYSTEM));
         }
         if let Some(done) = Self::redirect_for(outcome, walked.path(), w) {
@@ -551,15 +584,19 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         let Outcome::Upper(id) = outcome else {
             return Err(Self::refusal(outcome));
         };
-        if writes {
-            return Err(st(proto_fs::READ_ONLY_FILESYSTEM));
-        }
-        // A create of a name of the layer opens it for reading, and with EXCLUSIVE it is there.
-        if creates && flags & proto_fs::EXCLUSIVE != 0 {
+        // A create of a name of the layer opens it, and with EXCLUSIVE it is there.
+        if creates && excl {
             return Err(st(proto_fs::ALREADY_EXISTS));
         }
-        let is_dir = id == 0 || self.index.entry(id).is_some_and(|e| e.kind == Kind::Dir);
+        let entry_kind = self.index.entry(id).map(|e| e.kind);
+        if entry_kind == Some(Kind::Link) {
+            return Err(st(proto_fs::LOOP));
+        }
+        let is_dir = id == 0 || entry_kind == Some(Kind::Dir);
         if is_dir {
+            if writes {
+                return Err(st(proto_fs::IS_DIRECTORY));
+            }
             let attr = self
                 .index
                 .attr(id)
@@ -579,19 +616,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         if flags & proto_fs::DIRECTORY_ONLY != 0 || trailing {
             return Err(st(proto_fs::NOT_DIRECTORY));
         }
-        let mut vp = [0u8; 512];
-        let len = self.vpath(id, &mut vp)?;
-        let stat = self.volume.stat(&vp[..len]).map_err(from_volume)?;
-        if !permits(c.who.identity(false), &attr_of(&stat), READ) {
-            return Err(st(proto_fs::ACCESS_DENIED));
-        }
-        let handle = self
-            .volume
-            .open(&vp[..len], d::READ, 0)
-            .map_err(from_volume)?;
-        let pass = self.volume.export(handle);
-        let _ = self.volume.close(handle);
-        let pass = pass.map_err(from_volume)?;
+        let pass = self.open_file(c, flags, id, true)?;
         OpenAnswer::Pass.write(w)?;
         Ok(Done::Pass(pass))
     }
@@ -599,9 +624,12 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     /// STAT: the node information of a name of the layer. A name of the lower set, and the names
     /// the root passes through, are a redirect: the RAM file service answers with the rights of the
     /// caller's own session and follows the links as the flags say.
-    pub fn stat(&mut self, c: &Client<'_>, _flags: u32, path: &[u8], w: &mut Writer) -> R<()> {
+    pub fn stat(&mut self, c: &Client<'_>, flags: u32, path: &[u8], w: &mut Writer) -> R<()> {
         self.gate()?;
-        let walked = self.walk(c, path, false);
+        let walked = self.walk(c, path, false, flags & n::STAT_NO_FOLLOW == 0);
+        if let Outcome::Link { id, start, end } = walked.outcome {
+            return self.link_redirect(&walked, id, start, end, w);
+        }
         if let Some(done) = Self::redirect_for(walked.outcome, walked.path(), w) {
             return done;
         }
@@ -611,10 +639,15 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         let mut vp = [0u8; 512];
         let len = self.vpath(id, &mut vp)?;
         let stat = self.volume.stat(&vp[..len]).map_err(from_volume)?;
-        if walked.trailing && stat.kind != d::KIND_DIRECTORY {
+        let is_link = self.index.entry(id).is_some_and(|e| e.kind == Kind::Link);
+        if walked.trailing && (stat.kind != d::KIND_DIRECTORY || is_link) {
             return Err(st(proto_fs::NOT_DIRECTORY));
         }
-        n::write_info(&node_from(&stat)?, w)
+        let mut info = node_from(&stat)?;
+        if is_link {
+            info.kind = 5;
+        }
+        n::write_info(&info, w)
     }
 
     /// ACCESS: whether the bits are allowed; a name of the lower set is the RAM file service's.
@@ -628,16 +661,16 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     ) -> R<()> {
         self.gate()?;
         // The path is walked with the identifiers the bits are checked with.
-        let walked = self.walk(c, path, flags & d::ACCESS_REAL != 0);
+        let walked = self.walk(c, path, flags & d::ACCESS_REAL != 0, true);
+        if let Outcome::Link { id, start, end } = walked.outcome {
+            return self.link_redirect(&walked, id, start, end, w);
+        }
         if let Some(done) = Self::redirect_for(walked.outcome, walked.path(), w) {
             return done;
         }
         let Outcome::Upper(id) = walked.outcome else {
             return Err(Self::refusal(walked.outcome));
         };
-        if bits & WRITE != 0 {
-            return Err(st(proto_fs::READ_ONLY_FILESYSTEM));
-        }
         let mut vp = [0u8; 512];
         let len = self.vpath(id, &mut vp)?;
         let stat = self.volume.stat(&vp[..len]).map_err(from_volume)?;
@@ -645,31 +678,33 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             c.who.ids,
             c.who.groups(),
             &attr_of(&stat),
-            bits & (READ | EXEC),
+            bits & (READ | WRITE | EXEC),
             flags & d::ACCESS_REAL != 0,
         )
         .map_err(|_| st(proto_fs::ACCESS_DENIED))?;
         w.u32(0)
     }
 
-    /// READLINK: the layer of the user holds no link in this part, so a name of it is no link.
+    /// READLINK: the text of a link of the layer of the user; a name of the layer that is no link
+    /// is INVALID_ARGUMENT, and a lower name is the RAM file service's.
     pub fn readlink(&mut self, c: &Client<'_>, path: &[u8], w: &mut Writer) -> R<()> {
         self.gate()?;
-        let walked = self.walk(c, path, false);
+        let walked = self.walk(c, path, false, false);
+        if let Outcome::Link { id, start, end } = walked.outcome {
+            return self.link_redirect(&walked, id, start, end, w);
+        }
         if let Some(done) = Self::redirect_for(walked.outcome, walked.path(), w) {
             return done;
         }
         match walked.outcome {
+            Outcome::Upper(id) if self.index.entry(id).is_some_and(|e| e.kind == Kind::Link) => {
+                let mut text = [0u8; 512];
+                let len = self.link_text(id, &mut text)?;
+                w.u32(0)?;
+                w.bytes(&text[..len])
+            }
             Outcome::Upper(_) => Err(st(proto_fs::INVALID_ARGUMENT)),
             other => Err(Self::refusal(other)),
-        }
-    }
-
-    /// CHANGE: the service writes no names in this part.
-    pub fn change(&self) -> Status {
-        match self.gate() {
-            Err(s) => s,
-            Ok(()) => st(proto_fs::READ_ONLY_FILESYSTEM),
         }
     }
 
@@ -683,6 +718,9 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     pub fn fstat(&mut self, owner: u64, handle: u32, w: &mut Writer) -> R<()> {
         self.gate()?;
         let dir = self.table.get(owner, handle).map_err(Self::lost)?.dir;
+        if dir == crate::descriptions::GONE {
+            return Err(st(proto_fs::NO_ENTRY));
+        }
         let mut vp = [0u8; 512];
         let len = self.vpath(dir, &mut vp)?;
         let stat = self.volume.stat(&vp[..len]).map_err(from_volume)?;
@@ -700,6 +738,10 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         } = self;
         let desc = table.get(owner, handle).map_err(Self::lost)?;
         let mut reply = DirReply::new()?;
+        if desc.dir == crate::descriptions::GONE {
+            let len = reply.len();
+            return Ok((reply.finish(false, 0)?, len));
+        }
         let listed = listing::read_dir(
             index,
             lower,

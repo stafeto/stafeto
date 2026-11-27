@@ -25,6 +25,10 @@ pub const PER_PROCESS: usize = 32;
 pub const HOLDERS: usize = 8;
 const _: () = assert!(PLACES <= proto_fs::names::PLACES_MAX);
 
+/// The directory of a description whose directory was removed: it lists nothing and has no
+/// attributes.
+pub const GONE: u32 = u32::MAX;
+
 /// Where a listing stands: the stage and the position in it (`proto_fs::names::cursor`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Position {
@@ -199,6 +203,19 @@ impl<D> Table<D> {
             }
         }
         Ok(())
+    }
+
+    /// The directory `old` of the index is now `new` (a rename moved it to a slot of its own):
+    /// the descriptions of it follow.
+    pub fn retarget(&mut self, old: u32, new: u32) {
+        for d in self.slots.iter_mut().flatten().filter(|d| d.dir == old) {
+            d.dir = new;
+        }
+    }
+
+    /// The directory `dir` of the index is gone (removed): its descriptions list nothing.
+    pub fn forget(&mut self, dir: u32) {
+        self.retarget(dir, GONE);
     }
 
     /// The session `owner` went: the descriptions it was the last holder of, one by one (the

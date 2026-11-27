@@ -7,11 +7,13 @@
 //! COMPOSITION file (`composition`), the index of the names of the live layer (`index`) and its
 //! construction from the volume in steps (`scan`), the walk of a path (`lookup`), the merged
 //! listing of a directory (`listing`), the identity of a client (`identity`), the descriptions the
-//! service keeps (`descriptions`) and the answers to the requests (`names`). The program
+//! service keeps (`descriptions`), the answers to the requests (`names`) and the changes of names
+//! (`change`). The program
 //! (`main.rs`) is for stafeto alone.
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod change;
 pub mod composition;
 pub mod descriptions;
 pub mod identity;
@@ -22,6 +24,8 @@ pub mod names;
 pub mod scan;
 pub mod volume;
 
+#[cfg(test)]
+mod change_tests;
 #[cfg(test)]
 mod testkit;
 #[cfg(test)]

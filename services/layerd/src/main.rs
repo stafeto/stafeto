@@ -16,7 +16,7 @@
 //! The root channel (label `proto_layer::ROOT`) takes SESSION (18 of proto_layer, 70 of the names)
 //! and VERIFY_SESSION (71). A session is bound at birth to the process the copy of the identity
 //! session names (Vouch), and serves LIST and STATUS of proto_layer and the names OPEN, STAT,
-//! FSTAT, READ_DIR, REWIND, SEEK_DIR, CLOSE, BIND, ACCESS, READLINK and CHANGE (read only). The
+//! FSTAT, READ_DIR, REWIND, SEEK_DIR, CLOSE, BIND, ACCESS, READLINK and CHANGE. The
 //! other methods of proto_layer that carry a selector answer NOT_FOUND. CLONE makes a session for
 //! a child of a fork or a spawn that shares the descriptions it names (one position for the
 //! holders, as POSIX shares an open file description), and CLONE_MORE adds descriptions to it
@@ -602,13 +602,18 @@ impl Layerd {
                 reply_of(self.core.readlink(&c, path, r.reply()))
             }
             NameMethod::Change => {
-                if who.is_none() {
-                    return Answer::Status(unbound());
-                }
-                if n::Change::read(body).is_err() {
+                let who = match needs(&who) {
+                    Ok(w) => w,
+                    Err(a) => return a,
+                };
+                let Ok(change) = n::Change::read(body) else {
                     return bad;
-                }
-                Answer::Status(self.core.change())
+                };
+                let c = Client {
+                    owner: label,
+                    who: &who,
+                };
+                reply_of(self.core.change(&c, &change, r.reply()))
             }
             NameMethod::Fstat => {
                 let Ok(handle) = n::read_handle(body) else {

@@ -8,8 +8,8 @@
 //! table bounds (a directory is an entry). The root of the layer is `/.layers/NN`.
 //!
 //! In a listing the name `.wh..wh..opq` makes its directory opaque, `.wh.<name>` is the mark of
-//! deletion of `<name>`, and any other name that begins `.wh..wh.` is reserved and ignored (a
-//! later part keeps the links of the live layer under `.wh..wh.lnk.`). The attributes of a
+//! deletion of `<name>`, `.wh..wh.lnk.<name>` is the symbolic link `<name>` (a file whose bytes are
+//! its target), and any other name that begins `.wh..wh.` is reserved and ignored. The attributes of a
 //! directory come from its stat; those of the files the listing does not need.
 
 use crate::index::{Fields, Index, Kind, OPAQUE, SLOTS, UNSCANNED};
@@ -20,6 +20,8 @@ use proto_wire::Status;
 pub const OPAQUE_NAME: &[u8] = b".wh..wh..opq";
 pub const WHITEOUT_PREFIX: &[u8] = b".wh.";
 const RESERVED: &[u8] = b".wh..wh.";
+/// The prefix of the file that holds a symbolic link of the layer (littlefs has none).
+pub const LINK_PREFIX: &[u8] = b".wh..wh.lnk.";
 
 /// What a name of a layer means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +32,8 @@ pub enum Special<'a> {
     Opaque,
     /// `.wh.<name>`: the name is deleted.
     Whiteout(&'a [u8]),
+    /// `.wh..wh.lnk.<name>`: the name is a symbolic link.
+    Link(&'a [u8]),
     /// `.wh..wh.*` other than the opaque marker.
     Reserved,
 }
@@ -37,6 +41,12 @@ pub enum Special<'a> {
 pub fn special(name: &[u8]) -> Special<'_> {
     if name == OPAQUE_NAME {
         Special::Opaque
+    } else if let Some(rest) = name.strip_prefix(LINK_PREFIX) {
+        if rest.is_empty() {
+            Special::Reserved
+        } else {
+            Special::Link(rest)
+        }
     } else if name.starts_with(RESERVED) {
         Special::Reserved
     } else if let Some(rest) = name.strip_prefix(WHITEOUT_PREFIX) {
@@ -175,6 +185,7 @@ impl Scan {
                     }
                     Special::Reserved => return,
                     Special::Whiteout(target) => (target, Kind::Whiteout),
+                    Special::Link(target) => (target, Kind::Link),
                     Special::None if kind == KIND_DIRECTORY => (name, Kind::Dir),
                     Special::None => (name, Kind::File),
                 };

@@ -10,8 +10,9 @@
 //! within the probes, or no room in the arena, is NO_SPACE (ENOSPC for the program that created
 //! the name).
 //!
-//! An entry has the layer it lies in, its kind (a file, a directory, or the mark of a deletion:
-//! the file `.wh.<name>` of the layer says "the name of the lower set is gone"), the number the
+//! An entry has the layer it lies in, its kind (a file, a directory, a symbolic link, or the mark of
+//! a deletion: the file `.wh.<name>` of the layer says "the name of the lower set is gone"; a link
+//! is the file `.wh..wh.lnk.<name>` and its text), the number the
 //! data file service gave it and, for a directory, its owner, group and mode (the walk of a path
 //! checks the right to search a directory of the layer of the user from these, with no call), and
 //! the flags OPAQUE (the directory holds the file `.wh..wh..opq`: the lower set shows through it
@@ -29,6 +30,11 @@ pub enum Kind {
     Whiteout = 1,
     File = 2,
     Dir = 3,
+    /// A symbolic link: littlefs has none, so the layer keeps it as the file `.wh..wh.lnk.<name>`
+    /// whose bytes are the target.
+    Link = 4,
+    /// A name that was removed: the slot keeps its name for a probe that passes it.
+    Gone = 5,
 }
 
 /// The directory is opaque: the lower set does not show through it.
@@ -38,9 +44,15 @@ pub const HAS_CHILDREN: u8 = 2;
 /// The directory has not been listed yet by the build of the index (`scan`).
 pub const UNSCANNED: u8 = 4;
 
+/// An entry. The key of its place is (the key of its directory, its name). A directory has a key
+/// of its own that never changes (`dkey`, 1 to `SLOTS`), so a directory that moves to another place
+/// of the table (a rename) keeps its children, which name it by that key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {
-    parent: u32,
+    /// The key of the directory the entry lies in (0 for the root of the layer).
+    pkey: u32,
+    /// The key of this entry when it is a directory, else 0.
+    dkey: u32,
     name_at: u32,
     name_len: u8,
     pub kind: Kind,
@@ -53,7 +65,8 @@ pub struct Entry {
 }
 
 const EMPTY: Entry = Entry {
-    parent: 0,
+    pkey: 0,
+    dkey: 0,
     name_at: 0,
     name_len: 0,
     kind: Kind::Empty,
@@ -64,12 +77,6 @@ const EMPTY: Entry = Entry {
     gid: 0,
     mode: 0,
 };
-
-impl Entry {
-    pub fn parent(&self) -> u32 {
-        self.parent
-    }
-}
 
 /// What `next_child` found: an entry (the position after it and its id), the end of the slots
 /// looked at with more to come (the position to go on from), or the end of the table.
@@ -115,11 +122,17 @@ pub struct Index {
     arena_len: usize,
     live: u32,
     marks: u32,
+    /// The slot plus one of the directory with the key `k`, at `dslot[k]` (0 for a key in no use).
+    dslot: [u32; SLOTS + 1],
+    /// The keys issued so far, and the keys given back, which are used again first.
+    keys_issued: u32,
+    free_keys: [u32; SLOTS],
+    free_len: usize,
     pub root: Root,
 }
 
 fn hash(parent: u32, name: &[u8]) -> usize {
-    // FNV-1a over the id and the name, folded into the table.
+    // FNV-1a over the key and the name, folded into the table.
     let mut h: u32 = 0x811c_9dc5;
     for b in parent.to_le_bytes().iter().chain(name) {
         h ^= u32::from(*b);
@@ -142,6 +155,10 @@ impl Index {
             arena_len: 0,
             live: 0,
             marks: 0,
+            dslot: [0; SLOTS + 1],
+            keys_issued: 0,
+            free_keys: [0; SLOTS],
+            free_len: 0,
             // All zeros, so that the static of the program is `.bss`: the build of the index
             // sets the attributes of the root from the volume.
             root: Root {
@@ -157,9 +174,12 @@ impl Index {
     /// Empties the index (the build starts again).
     pub fn clear(&mut self) {
         self.slots.fill(EMPTY);
+        self.dslot.fill(0);
         self.arena_len = 0;
         self.live = 0;
         self.marks = 0;
+        self.keys_issued = 0;
+        self.free_len = 0;
         self.root = Index::new().root;
     }
 
@@ -177,24 +197,43 @@ impl Index {
         &self.arena[e.name_at as usize..e.name_at as usize + usize::from(e.name_len)]
     }
 
-    /// The slot of (`parent`, `name`) within the probes.
-    fn find(&self, parent: u32, name: &[u8]) -> Option<usize> {
-        let start = hash(parent, name);
+    /// The key of the directory `id` (0 for the root); None for an entry that is no directory.
+    fn dkey_of(&self, id: u32) -> Option<u32> {
+        if id == 0 {
+            return Some(0);
+        }
+        self.entry(id)
+            .filter(|e| e.kind == Kind::Dir)
+            .map(|e| e.dkey)
+    }
+
+    /// The id of the directory `id` lies in (0 for the root, and for an id that is none).
+    pub fn parent_of(&self, id: u32) -> u32 {
+        match self.entry(id) {
+            Some(e) if e.pkey != 0 => self.dslot[e.pkey as usize],
+            _ => 0,
+        }
+    }
+
+    /// The slot of (`pkey`, `name`) within the probes.
+    fn find(&self, pkey: u32, name: &[u8]) -> Option<usize> {
+        let start = hash(pkey, name);
         for i in 0..PROBES {
             let slot = (start + i) & (SLOTS - 1);
             let e = &self.slots[slot];
             match e.kind {
                 Kind::Empty => return None,
-                _ if e.parent == parent && self.name_of(e) == name => return Some(slot),
+                Kind::Gone => {}
+                _ if e.pkey == pkey && self.name_of(e) == name => return Some(slot),
                 _ => {}
             }
         }
         None
     }
 
-    /// The entry of `name` in the directory `parent`, with its id.
+    /// The entry of `name` in the directory `parent`, with its id; a gone entry is none.
     pub fn lookup(&self, parent: u32, name: &[u8]) -> Option<(u32, &Entry)> {
-        let slot = self.find(parent, name)?;
+        let slot = self.find(self.dkey_of(parent)?, name)?;
         Some((slot as u32 + 1, &self.slots[slot]))
     }
 
@@ -202,7 +241,7 @@ impl Index {
     pub fn entry(&self, id: u32) -> Option<&Entry> {
         let slot = (id as usize).checked_sub(1)?;
         let e = self.slots.get(slot)?;
-        (e.kind != Kind::Empty).then_some(e)
+        (!matches!(e.kind, Kind::Empty | Kind::Gone)).then_some(e)
     }
 
     pub fn name(&self, id: u32) -> Option<&[u8]> {
@@ -213,6 +252,9 @@ impl Index {
     /// 0 for the start), looking at `budget` slots at most: each slot looked at is taken off the
     /// budget, so the cost of a request does not depend on the size of the table.
     pub fn next_child(&self, parent: u32, from: usize, budget: &mut usize) -> NextChild {
+        let Some(pkey) = self.dkey_of(parent) else {
+            return NextChild::End;
+        };
         let mut slot = from;
         while slot < SLOTS {
             if *budget == 0 {
@@ -220,7 +262,7 @@ impl Index {
             }
             *budget -= 1;
             let e = &self.slots[slot];
-            if e.kind != Kind::Empty && e.parent == parent {
+            if !matches!(e.kind, Kind::Empty | Kind::Gone) && e.pkey == pkey {
                 return NextChild::Found(slot + 1, slot as u32 + 1);
             }
             slot += 1;
@@ -228,37 +270,94 @@ impl Index {
         NextChild::End
     }
 
+    /// A key for a new directory.
+    fn issue_key(&mut self) -> Result<u32, Error> {
+        if self.free_len > 0 {
+            self.free_len -= 1;
+            return Ok(self.free_keys[self.free_len]);
+        }
+        if self.keys_issued as usize >= SLOTS {
+            return Err(Error::NoSpace);
+        }
+        self.keys_issued += 1;
+        Ok(self.keys_issued)
+    }
+
+    fn give_back(&mut self, key: u32) {
+        if key != 0 {
+            self.dslot[key as usize] = 0;
+            self.free_keys[self.free_len] = key;
+            self.free_len += 1;
+        }
+    }
+
     /// Inserts a name. A mark of deletion over a name of the layer changes nothing, and a name over
     /// a mark replaces it (the layer says the name is there). Returns the id.
     pub fn insert(&mut self, parent: u32, name: &[u8], f: Fields) -> Result<u32, Error> {
+        self.insert_with(parent, name, f, None)
+    }
+
+    /// `insert`, giving a directory the key `keep` (a directory that moved) when there is one.
+    fn insert_with(
+        &mut self,
+        parent: u32,
+        name: &[u8],
+        f: Fields,
+        keep: Option<u32>,
+    ) -> Result<u32, Error> {
         if name.is_empty() || name.len() > NAME_MAX || f.kind == Kind::Empty {
             return Err(Error::Invalid);
         }
-        if parent != 0 && self.entry(parent).is_none_or(|p| p.kind != Kind::Dir) {
-            return Err(Error::Invalid);
-        }
-        let start = hash(parent, name);
+        let pkey = self.dkey_of(parent).ok_or(Error::Invalid)?;
+        let start = hash(pkey, name);
         let mut free = None;
         for i in 0..PROBES {
             let slot = (start + i) & (SLOTS - 1);
             let e = self.slots[slot];
-            if e.kind == Kind::Empty {
-                free = Some(slot);
-                break;
-            }
-            if e.parent == parent && self.name_of(&e) == name {
-                return Ok(self.replace(slot, f));
+            match e.kind {
+                Kind::Empty => {
+                    free.get_or_insert(slot);
+                    break;
+                }
+                Kind::Gone => {
+                    if e.pkey == pkey && self.name_of(&e) == name {
+                        // The same name again: the slot and the name in the arena are taken up.
+                        let dkey = self.key_for(f.kind, keep)?;
+                        self.slots[slot] = Entry {
+                            dkey,
+                            kind: f.kind,
+                            flags: if f.kind == Kind::Dir { UNSCANNED } else { 0 },
+                            layer: f.layer,
+                            number: f.number,
+                            uid: f.uid,
+                            gid: f.gid,
+                            mode: f.mode,
+                            ..e
+                        };
+                        self.place_key(dkey, slot);
+                        self.count_in(f.kind);
+                        self.mark_parent(parent);
+                        return Ok(slot as u32 + 1);
+                    }
+                    free.get_or_insert(slot);
+                }
+                _ if e.pkey == pkey && self.name_of(&e) == name => {
+                    return self.replace(slot, f, keep);
+                }
+                _ => {}
             }
         }
         let slot = free.ok_or(Error::NoSpace)?;
         if self.arena_len + name.len() > ARENA {
             return Err(Error::NoSpace);
         }
+        let dkey = self.key_for(f.kind, keep)?;
         let at = self.arena_len;
         self.arena[at..at + name.len()].copy_from_slice(name);
         self.arena_len += name.len();
         self.slots[slot] = Entry {
-            parent,
+            pkey,
+            dkey,
             name_at: at as u32,
             name_len: name.len() as u8,
             kind: f.kind,
@@ -269,35 +368,147 @@ impl Index {
             gid: f.gid,
             mode: f.mode,
         };
-        if f.kind == Kind::Whiteout {
-            self.marks += 1;
-        } else {
-            self.live += 1;
-        }
+        self.place_key(dkey, slot);
+        self.count_in(f.kind);
         self.mark_parent(parent);
         Ok(slot as u32 + 1)
     }
 
-    fn replace(&mut self, slot: usize, f: Fields) -> u32 {
-        let e = &mut self.slots[slot];
-        match (e.kind, f.kind) {
+    fn key_for(&mut self, kind: Kind, keep: Option<u32>) -> Result<u32, Error> {
+        if kind != Kind::Dir {
+            return Ok(0);
+        }
+        match keep {
+            Some(key) => Ok(key),
+            None => self.issue_key(),
+        }
+    }
+
+    fn place_key(&mut self, dkey: u32, slot: usize) {
+        if dkey != 0 {
+            self.dslot[dkey as usize] = slot as u32 + 1;
+        }
+    }
+
+    fn count_in(&mut self, kind: Kind) {
+        if kind == Kind::Whiteout {
+            self.marks += 1;
+        } else {
+            self.live += 1;
+        }
+    }
+
+    fn count_out(&mut self, kind: Kind) {
+        if kind == Kind::Whiteout {
+            self.marks -= 1;
+        } else {
+            self.live -= 1;
+        }
+    }
+
+    /// Removes the entry `id`: its slot keeps the name as a gone entry. The children of a
+    /// directory stay (`remove_children` takes them).
+    pub fn remove(&mut self, id: u32) {
+        self.take_out(id, true);
+    }
+
+    fn take_out(&mut self, id: u32, give_key_back: bool) {
+        let Some(slot) = (id as usize).checked_sub(1) else {
+            return;
+        };
+        let Some(e) = self.slots.get(slot).copied() else {
+            return;
+        };
+        if matches!(e.kind, Kind::Empty | Kind::Gone) {
+            return;
+        }
+        self.count_out(e.kind);
+        self.slots[slot].kind = Kind::Gone;
+        self.slots[slot].flags = 0;
+        self.slots[slot].dkey = 0;
+        if give_key_back {
+            self.give_back(e.dkey);
+        }
+    }
+
+    /// Removes every entry that lies in the directory `id` (a scan of the table). Returns how
+    /// many it removed. The root is not a directory a removal reaches.
+    pub fn remove_children(&mut self, id: u32) -> usize {
+        let Some(pkey) = self.dkey_of(id).filter(|&k| k != 0) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for slot in 0..SLOTS {
+            let e = self.slots[slot];
+            if !matches!(e.kind, Kind::Empty | Kind::Gone) && e.pkey == pkey {
+                self.take_out(slot as u32 + 1, true);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Moves the entry `id` to (`parent`, `name`), which must not be held by another entry: the
+    /// entry keeps its fields and flags, a directory keeps its key (so its children stay in it).
+    /// Returns the new id.
+    pub fn move_to(&mut self, id: u32, parent: u32, name: &[u8]) -> Result<u32, Error> {
+        let e = *self.entry(id).ok_or(Error::Invalid)?;
+        let fields = Fields {
+            kind: e.kind,
+            layer: e.layer,
+            number: e.number,
+            uid: e.uid,
+            gid: e.gid,
+            mode: e.mode,
+        };
+        if self.lookup(parent, name).is_some() {
+            return Err(Error::Invalid);
+        }
+        // The new place first, so a refusal leaves the entry where it was.
+        let keep = (e.kind == Kind::Dir).then_some(e.dkey);
+        let new = self.insert_with(parent, name, fields, keep)?;
+        self.take_out(id, false);
+        if let Some(slot) = (new as usize).checked_sub(1) {
+            self.slots[slot].flags = e.flags & !UNSCANNED;
+        }
+        Ok(new)
+    }
+
+    fn replace(&mut self, slot: usize, f: Fields, keep: Option<u32>) -> Result<u32, Error> {
+        let old = self.slots[slot];
+        match (old.kind, f.kind) {
             // A name of the layer wins over its own mark of deletion, and a mark never over a name.
-            (Kind::Whiteout, Kind::File | Kind::Dir) => {
+            (Kind::Whiteout, Kind::File | Kind::Dir | Kind::Link) => {
+                let dkey = self.key_for(f.kind, keep)?;
                 self.marks -= 1;
                 self.live += 1;
+                let e = &mut self.slots[slot];
                 e.kind = f.kind;
+                e.dkey = dkey;
                 e.flags = if f.kind == Kind::Dir { UNSCANNED } else { 0 };
                 (e.layer, e.number, e.uid, e.gid, e.mode) =
                     (f.layer, f.number, f.uid, f.gid, f.mode);
+                self.place_key(dkey, slot);
             }
-            (Kind::File | Kind::Dir, Kind::Whiteout) | (Kind::Whiteout, Kind::Whiteout) => {}
+            (Kind::File | Kind::Dir | Kind::Link, Kind::Whiteout)
+            | (Kind::Whiteout, Kind::Whiteout) => {}
             _ => {
+                let dkey = if old.kind == f.kind {
+                    old.dkey
+                } else {
+                    let new = self.key_for(f.kind, keep)?;
+                    self.give_back(old.dkey);
+                    new
+                };
+                let e = &mut self.slots[slot];
                 e.kind = f.kind;
+                e.dkey = dkey;
                 (e.layer, e.number, e.uid, e.gid, e.mode) =
                     (f.layer, f.number, f.uid, f.gid, f.mode);
+                self.place_key(dkey, slot);
             }
         }
-        slot as u32 + 1
+        Ok(slot as u32 + 1)
     }
 
     fn mark_parent(&mut self, parent: u32) {
@@ -383,7 +594,7 @@ impl Index {
             out[start] = b'/';
             out[start + 1..end].copy_from_slice(name);
             end = start;
-            at = e.parent;
+            at = self.parent_of(at);
             depth += 1;
             if depth > 4096 {
                 return None;

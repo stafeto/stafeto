@@ -36,6 +36,7 @@ pub const SLOTS_PER_READDIR: usize = 512;
 
 const DIRECTORY: u32 = 1;
 const REGULAR: u32 = 2;
+const SYMLINK: u32 = 5;
 
 fn room(reply: &DirReply) -> bool {
     reply.len() + ENTRY_HEAD + NAME_MAX <= abi::MESSAGE_MAX
@@ -50,7 +51,7 @@ fn numbers(index: &Index, id: u32) -> (u64, u64) {
             index.entry(id).map_or(0, |e| e.number)
         }
     };
-    let parent = index.entry(id).map_or(0, |e| e.parent());
+    let parent = index.parent_of(id);
     (number(id), number(parent))
 }
 
@@ -101,9 +102,10 @@ pub fn read_dir<L: Lower>(
                     position.at = next as u32 + 2;
                     let Some(e) = index.entry(id) else { continue };
                     let kind = match e.kind {
-                        Kind::Whiteout | Kind::Empty => continue,
+                        Kind::Whiteout | Kind::Empty | Kind::Gone => continue,
                         Kind::Dir => DIRECTORY,
                         Kind::File => REGULAR,
+                        Kind::Link => SYMLINK,
                     };
                     let name = index.name(id).unwrap_or(&[]);
                     reply

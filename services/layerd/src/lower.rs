@@ -6,7 +6,7 @@
 //! key service does. A directory is read with READ_DIR_FD and kept open between the requests of
 //! a listing.
 
-use layerd::volume::{Lower, R};
+use layerd::volume::{Lower, LowerStat, R};
 use posix_fs::{Directory, FileKind, FsError, PosixFs};
 use proto_wire::Status;
 
@@ -65,5 +65,24 @@ impl Lower for Ram {
 
     fn readlink(&mut self, _path: &[u8], _out: &mut [u8]) -> R<usize> {
         Err(Status::Unknown(proto_fs::INVALID_ARGUMENT))
+    }
+
+    fn stat(&mut self, path: &[u8], follow: bool) -> R<LowerStat> {
+        let info = self
+            .files
+            .transport()
+            .files()
+            .node_information_from(None, path, follow)
+            .map_err(|e| match e {
+                Status::Unknown(c) => Status::Unknown(c),
+                other => other,
+            })?;
+        Ok(LowerStat {
+            kind: info.kind,
+            mode: info.permissions,
+            uid: info.uid,
+            gid: info.gid,
+            ino: info.inode,
+        })
     }
 }
