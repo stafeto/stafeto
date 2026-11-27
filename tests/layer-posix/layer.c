@@ -159,7 +159,7 @@ static unsigned char type_of(const struct names *l, const char *name) {
     return 0;
 }
 
-/* The names a listing of /etc must have: the layer's and the lower set's, each once, and not the
+/* The names a listing of /etc must have: the layer's and the lower set's, each once, without the
  * one the layer deletes. */
 static int etc_list_is_right(const struct names *l) {
     return occurrences(l, ".") == 1 && occurrences(l, "..") == 1 && occurrences(l, "layer-note") == 1 &&
@@ -196,7 +196,7 @@ static int lower_file(void) {
     LP_CHECK(close(fd) == 0);
     LP_CHECK(S_ISREG(st.st_mode) && (st.st_mode & 07777) == 0644 && st.st_uid == 0);
     /* The same device and the same number from the path and from the description, and the device
-     * is the root's, not the RAM file service's. */
+     * is the root's one number. */
     LP_CHECK(st.st_dev == LAYERED_DEVICE && fst.st_dev == LAYERED_DEVICE);
     LP_CHECK(st.st_ino == fst.st_ino && (st.st_ino >> 62) == 0);
     LP_CHECK(stat("/bin/layer-posix", &st) == 0 && S_ISREG(st.st_mode) &&
@@ -689,8 +689,8 @@ static int setid_role(void) {
 }
 
 /* The role `genuine`: a set-ID program that got the parent's genuine session keeps it with the
- * description the parent holds, and the session is bound to the program's identity, not the
- * parent's: the effective user 1000 is refused what the superuser parent reads. */
+ * description the parent holds, and the session is bound to the program's own identity: the
+ * effective user 1000 is refused what the superuser parent reads. */
 static int genuine_role(char **argv) {
     struct names l;
     int fd = atoi(argv[2]);
