@@ -140,7 +140,7 @@ fn attach(device: MemDevice, win: Win) -> Vol {
     let state: &'static mut Storage = Box::leak(Storage::boxed());
     let mut fs = Fs::new(device, state).unwrap();
     // These tests count the reads of littlefs's walks and lookups: the cache of metadata blocks is
-    // off (the tests of the cache are in tests_cache.rs).
+    // off (the tests of the cache are in tests.rs and in the walk tests below).
     fs.set_cache(false);
     fs.set_block_cycles(BLOCK_CYCLES.with(|c| c.get()));
     if win == Win::Narrow {
@@ -1883,12 +1883,16 @@ fn read_everything(fs: &mut Vol) -> Res<()> {
 fn a_walk_stopped_at_every_read_leaves_a_volume_that_works() {
     let device = kept_device();
     let mut probe = mounted(&device, Win::Whole);
+    // The cache of metadata blocks is on here (the other tests of this file count reads).
+    probe.set_cache(true);
+    probe.stat(b"/top").unwrap();
     let at = now(&mut probe);
     probe.walk().unwrap();
     let reads = now(&mut probe).since(at).reads;
     assert!(reads >= 10, "a walk of {reads} reads is too short to test");
     for point in 0..reads {
         let mut fs = mounted(&device, Win::Whole);
+        fs.set_cache(true);
         // Warm the read cache with the root, as a service that has served requests would have it.
         fs.stat(b"/top").unwrap();
         fs.device().fail_read_after(Some(point));
@@ -2048,11 +2052,16 @@ impl Device for Yielding {
         self.inner.sectors()
     }
 
-    fn read(&mut self, sector: u64, out: &mut [u8]) -> Result<(), crate::DeviceError> {
+    fn checkpoint(&mut self) -> Result<(), crate::DeviceError> {
         if self.may_yield.get() && self.queued.get() {
             self.stopped.set(self.stopped.get() + 1);
             return Err(crate::DeviceError);
         }
+        Ok(())
+    }
+
+    fn read(&mut self, sector: u64, out: &mut [u8]) -> Result<(), crate::DeviceError> {
+        self.checkpoint()?;
         self.inner.read(sector, out)
     }
 
@@ -2079,10 +2088,15 @@ impl Device for Marked {
         self.inner.sectors()
     }
 
-    fn read(&mut self, sector: u64, out: &mut [u8]) -> Result<(), crate::DeviceError> {
+    fn checkpoint(&mut self) -> Result<(), crate::DeviceError> {
         if self.on && self.stop {
             return Err(crate::DeviceError);
         }
+        Ok(())
+    }
+
+    fn read(&mut self, sector: u64, out: &mut [u8]) -> Result<(), crate::DeviceError> {
+        self.checkpoint()?;
         self.inner.read(sector, out)
     }
 
@@ -2138,14 +2152,18 @@ fn a_job_during_a_walk_stops_it_is_served_in_a_few_reads_and_the_walk_completes_
         may_yield: may_yield.clone(),
         stopped: stopped.clone(),
     };
+    // The cache of metadata blocks is on: its hits meet the stop points of the walk as reads do.
     let mut fs = Fs::new(gate, state).unwrap();
-    fs.set_cache(false);
     fs.mount().unwrap();
-    // The walk alone: how many reads it takes.
+    // The walk alone: how many reads it takes with no cache; then the cache is on and warm, so
+    // the walk that the job stops starts with a block the cache answers.
+    fs.set_cache(false);
     let before = fs.device().inner.reads;
     fs.walk().unwrap();
     let whole = fs.device().inner.reads - before;
     assert!(whole >= 10);
+    fs.set_cache(true);
+    fs.walk().unwrap();
     // A walk that a job stops at its first read (the job was queued as the walk began).
     may_yield.set(true);
     queued.set(true);
@@ -2167,6 +2185,52 @@ fn a_job_during_a_walk_stops_it_is_served_in_a_few_reads_and_the_walk_completes_
     // The walk is tried again when the queue is empty, and completes.
     fs.walk().unwrap();
     assert_eq!(fs.free_blocks().unwrap(), 1024 - fs.used_blocks().unwrap());
+}
+
+/// A walk of a volume of directories alone, with every block in the cache of metadata blocks, reads
+/// the device not once; a queued job still stops it at its next block, and a stop notice too.
+#[test]
+fn a_walk_answered_by_the_cache_still_meets_the_stop_and_the_yield_points() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let queued = Rc::new(Cell::new(false));
+    let may_yield = Rc::new(Cell::new(false));
+    let stopped = Rc::new(Cell::new(0));
+    let state: &'static mut Storage = Box::leak(Storage::boxed());
+    let mut fs = Fs::new(
+        Yielding {
+            inner: MemDevice::new(2048 * BLOCK_SECTORS),
+            queued: queued.clone(),
+            may_yield: may_yield.clone(),
+            stopped: stopped.clone(),
+        },
+        state,
+    )
+    .unwrap();
+    fs.format().unwrap();
+    fs.mount().unwrap();
+    for d in 0..12 {
+        fs.mkdir(format!("/d{d}").as_bytes()).unwrap();
+    }
+    fs.walk().unwrap();
+    let reads = fs.device().inner.reads;
+    fs.walk().unwrap();
+    assert_eq!(
+        fs.device().inner.reads,
+        reads,
+        "the second walk reads the device"
+    );
+    assert!(fs.cache_stats().0 > 0);
+    may_yield.set(true);
+    queued.set(true);
+    assert_eq!(fs.walk(), Err(Error::Io));
+    assert_eq!(stopped.get(), 1, "the walk stopped at its first block");
+    assert_eq!(fs.device().inner.reads, reads);
+    queued.set(false);
+    may_yield.set(false);
+    // The volume is whole after the stop, and the walk goes on to its end when asked again.
+    assert_eq!(fs.stat(b"/d3").unwrap().size, 0);
+    fs.walk().unwrap();
 }
 
 #[test]

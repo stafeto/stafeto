@@ -767,6 +767,20 @@ fn a_walk_into_a_directory_split_over_many_pairs_gives_the_attribute_of_the_entr
     }
 }
 
+fn walk_pair(
+    fs: &mut Vol,
+    path: &str,
+    capacity: usize,
+) -> (
+    usize,
+    Result<crate::Info, Error>,
+    Option<crate::fs::DirPair>,
+) {
+    let mut entries = std::vec![PathEntry::EMPTY; capacity];
+    let mut bytes = std::vec![0u8; capacity * EACH];
+    fs.path_attrs_pair(path.as_bytes(), ATTR, &mut entries, &mut bytes, EACH)
+}
+
 /// A walk that names a directory gives its pair, and the directory opens from it with no walk of
 /// the path: the same entries as `opendir`, and the reads of the open are a few where the walk of
 /// a deep path is hundreds.
@@ -793,9 +807,9 @@ fn a_directory_named_by_a_walk_opens_by_its_pair_for_a_few_reads() {
         names
     };
     let mut fs = restarted(fs);
-    let walked = walk(&mut fs, &path, depth + 1);
-    assert!(walked.1.is_ok());
-    let pair = fs.walked_pair().expect("a directory has a pair");
+    let (_, info, pair) = walk_pair(&mut fs, &path, depth + 1);
+    assert!(info.is_ok());
+    let pair = pair.expect("a directory has a pair");
     let at = reads(&mut fs);
     let dir = fs.opendir_pair(pair).unwrap();
     let by_pair = reads(&mut fs) - at;
@@ -813,11 +827,54 @@ fn a_directory_named_by_a_walk_opens_by_its_pair_for_a_few_reads() {
     assert_eq!(by_pair_names.len(), 4, "`.`, `..`, x and y");
     // A walk of a file, or of a missing name, names no directory.
     let file = format!("{path}/x");
-    let _ = walk(&mut fs, &file, depth + 2);
-    assert_eq!(fs.walked_pair(), None);
-    let _ = walk(&mut fs, "/missing", 4);
-    assert_eq!(fs.walked_pair(), None);
+    assert_eq!(walk_pair(&mut fs, &file, depth + 2).2, None);
+    assert_eq!(walk_pair(&mut fs, "/missing", 4).2, None);
     // The root names its own pair.
-    let _ = walk(&mut fs, "/", 4);
-    assert!(fs.walked_pair().is_some());
+    assert!(walk_pair(&mut fs, "/", 4).2.is_some());
+}
+
+/// The pair a walk gave is a value of that walk: after the directory was written many times (its
+/// pair compacted over and over, a tail added when it filled) a new walk gives the pair to open by,
+/// and the listing by it is the directory as it is. A removed directory has no pair.
+#[test]
+fn the_pair_of_a_walk_is_read_again_by_the_next_walk_after_the_directory_was_compacted() {
+    let mut fs = fresh();
+    fs.mkdir(b"/dir").unwrap();
+    let before = walk_pair(&mut fs, "/dir", 4)
+        .2
+        .expect("a directory has a pair");
+    let mut want = Vec::new();
+    for round in 0..6 {
+        for i in 0..40 {
+            let name = format!("/dir/f{round}-{i:02}-{}", "n".repeat(40));
+            let f = fs
+                .open(name.as_bytes(), Open::WRITE.with(Open::CREATE))
+                .unwrap();
+            fs.close(f).unwrap();
+            want.push(name);
+        }
+        // Half of them go again: the pair compacts, and the entries move up.
+        for name in want.split_off(want.len() - 20) {
+            fs.remove(name.as_bytes()).unwrap();
+        }
+    }
+    let after = walk_pair(&mut fs, "/dir", 4).2.expect("still a directory");
+    let dir = fs.opendir_pair(after).unwrap();
+    let mut names = Vec::new();
+    while let Some(e) = fs.readdir(dir).unwrap() {
+        if e.name() != b"." && e.name() != b".." {
+            names.push(String::from_utf8(e.name().to_vec()).unwrap());
+        }
+    }
+    fs.closedir(dir).unwrap();
+    names.sort();
+    let mut wanted: Vec<String> = want.iter().map(|n| n[5..].to_string()).collect();
+    wanted.sort();
+    assert_eq!(names, wanted);
+    println!("the pair before {before:?}, after {after:?}");
+    for name in &want {
+        fs.remove(name.as_bytes()).unwrap();
+    }
+    fs.remove(b"/dir").unwrap();
+    assert_eq!(walk_pair(&mut fs, "/dir", 4).2, None);
 }

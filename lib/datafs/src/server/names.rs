@@ -66,7 +66,7 @@ impl Server {
         } else {
             path.iter().filter(|&&b| b == b'/').count()
         };
-        let (count, status) = fs.path_attrs(
+        let (count, status, pair) = fs.path_attrs_pair(
             path,
             ATTR_TYPE,
             &mut self.walk.entries,
@@ -95,12 +95,14 @@ impl Server {
                 Ok(Found {
                     last: Some((info, entry)),
                     parent: parent(self),
+                    pair,
                 })
             }
             // Only the last name is missing: every ancestor was reached.
             Err(Error::NoEntry) if count == comps && comps > 0 => Ok(Found {
                 last: None,
                 parent: parent(self),
+                pair: None,
             }),
             Err(Error::NoEntry) => Err(p::code(p::NO_ENTRY)),
             Err(e) => Err(status_of(e)),
@@ -801,6 +803,22 @@ impl Server {
                                     break;
                                 }
                             };
+                            // As STAT says it: the write time and the set-ID bits of a file that is
+                            // written and not yet folded into its record (`overlay_pending`).
+                            let mut attr = attr;
+                            if attrs && entry.kind == Kind::File {
+                                let mut path = [0u8; MAX_PATH + 1 + crate::NAME_MAX];
+                                let mut n = dir.get().len();
+                                path[..n].copy_from_slice(dir.get());
+                                if dir.get() != b"/" {
+                                    path[n] = b'/';
+                                    n += 1;
+                                }
+                                path[n..n + entry.name().len()].copy_from_slice(entry.name());
+                                if let Some(ni) = self.node_at(&path[..n + entry.name().len()]) {
+                                    self.overlay_pending(ni, &mut attr);
+                                }
+                            }
                             let mut pending = Pending {
                                 ino: attr.ino,
                                 mode: attr.mode,
@@ -940,6 +958,9 @@ pub(super) fn stat_record(kind: Kind, size: u32, attr: &Attr, nlink: u32) -> p::
 pub(super) struct Found {
     pub last: Option<(crate::fs::Info, Record)>,
     pub parent: Option<Record>,
+    /// The metadata pair of the last name when it is a directory: good for an open in the same
+    /// request, while nothing is written to the volume.
+    pub pair: Option<crate::fs::DirPair>,
 }
 
 /// The path of entry `i` of a walk: the root for 0, the path up to the end of component `i`.

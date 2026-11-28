@@ -73,7 +73,6 @@ unsafe extern "C" {
         name: *mut u8,
     ) -> c_int;
     fn datafs_opendir(d: *mut c_void, ctx: *mut c_void, path: *const c_char) -> c_int;
-    fn datafs_walked_pair(d: *const c_void, out: *mut u32) -> c_int;
     fn datafs_opendir_pair(d: *mut c_void, ctx: *mut c_void, pair0: u32, pair1: u32) -> c_int;
     fn datafs_closedir(d: *mut c_void, ctx: *mut c_void, slot: c_int) -> c_int;
     fn datafs_readdir(
@@ -188,6 +187,20 @@ unsafe extern "C" fn datafs_rs_prog(
     }
     let sector = u64::from(block) * BLOCK_SECTORS + u64::from(off) / SECTOR as u64;
     match device.write(sector, data) {
+        Ok(()) => 0,
+        Err(_) => Error::Io.code(),
+    }
+}
+
+/// The stop and yield points of a walk for a read the cache answered (`Device::checkpoint`).
+///
+/// # Safety
+/// As `datafs_rs_read`.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn datafs_rs_check(ctx: Ctx) -> c_int {
+    // SAFETY: as above.
+    let device = unsafe { &mut *(ctx as *mut &mut dyn Device) };
+    match device.checkpoint() {
         Ok(()) => 0,
         Err(_) => Error::Io.code(),
     }
@@ -760,17 +773,9 @@ impl<'a, D: Device> Fs<'a, D> {
         check(slot).map(|slot| Dir(slot as u8))
     }
 
-    /// The metadata pair of the directory that the last `path_attrs` named (None when it named
-    /// something else or failed), for `opendir_pair`.
-    pub fn walked_pair(&self) -> Option<DirPair> {
-        let mut out = [0u32; 2];
-        // SAFETY: the state is the one `Fs::new` set up, and `out` has room for two words.
-        let named = unsafe { datafs_walked_pair(self.state.0.as_ptr().cast(), out.as_mut_ptr()) };
-        (named != 0).then_some(DirPair(out))
-    }
-
-    /// `opendir` of the directory a walk just named (`walked_pair`), with no walk of its path:
-    /// nothing may have been written since the walk.
+    /// `opendir` of the directory a walk just named (the pair `path_attrs_pair` gave), with no walk
+    /// of its path: nothing may have been written to the volume since the walk, so the pair is used
+    /// in the call that got it and kept nowhere.
     pub fn opendir_pair(&mut self, pair: DirPair) -> Res<Dir> {
         // SAFETY: as above.
         let slot = self.call(|d, ctx| unsafe { datafs_opendir_pair(d, ctx, pair.0[0], pair.0[1]) });
@@ -1016,6 +1021,7 @@ unsafe extern "C" {
         each: u32,
         capacity: u32,
         count: *mut u32,
+        pair: *mut u32,
     ) -> c_int;
     fn datafs_stat_attr(
         d: *mut c_void,
@@ -1132,10 +1138,25 @@ impl<D: Device> Fs<'_, D> {
         bytes: &mut [u8],
         each: usize,
     ) -> (usize, Res<Info>) {
+        let (count, info, _) = self.path_attrs_pair(path, attr, entries, bytes, each);
+        (count, info)
+    }
+
+    /// `path_attrs`, and the metadata pair of the directory the path names (None for a file and
+    /// for a failed walk), for `opendir_pair`.
+    pub fn path_attrs_pair(
+        &mut self,
+        path: &[u8],
+        attr: u8,
+        entries: &mut [PathEntry],
+        bytes: &mut [u8],
+        each: usize,
+    ) -> (usize, Res<Info>, Option<DirPair>) {
         let path = match CPath::new(path) {
             Ok(path) => path,
-            Err(e) => return (0, Err(e)),
+            Err(e) => return (0, Err(e), None),
         };
+        let mut pair = [u32::MAX; 2];
         let capacity = entries
             .len()
             .min(bytes.len().checked_div(each).unwrap_or(usize::MAX));
@@ -1157,17 +1178,22 @@ impl<D: Device> Fs<'_, D> {
                 u32::try_from(each).unwrap_or(u32::MAX),
                 u32::try_from(capacity).unwrap_or(u32::MAX),
                 &mut count,
+                pair.as_mut_ptr(),
             )
         });
         let count = count as usize;
         match check(status).and_then(|_| kind_of(kind)) {
-            Ok(kind) => (count, Ok(Info { kind, size })),
-            Err(e) => (count, Err(e)),
+            Ok(kind) => (
+                count,
+                Ok(Info { kind, size }),
+                (pair[0] != u32::MAX).then_some(DirPair(pair)),
+            ),
+            Err(e) => (count, Err(e), None),
         }
     }
 }
 
-/// The blocks of the metadata pair of a directory (`Fs::walked_pair`).
+/// The blocks of the metadata pair of a directory (`Fs::path_attrs_pair`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirPair([u32; 2]);
 

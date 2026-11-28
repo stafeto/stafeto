@@ -143,7 +143,9 @@
 //! attributes of its entries and without `.` and `..`. The reply is `more` u32 and entries; an
 //! entry is `ino` u64, `kind` u32, `name_len` u32 (1 to `NAME_MAX`), `mode` u32, `uid` u32, `gid`
 //! u32 and the name: `DIR_ATTR_ENTRY_HEAD` (28) bytes and the name. The `ino`, `mode`, `uid` and
-//! `gid` of an entry equal what STAT gives for that name. The rest is as READDIR: the description
+//! `gid` of an entry equal what STAT gives for that name, the pending writes folded in as STAT
+//! folds them: a file that is open, written and not yet synced shows the mode its writes leave
+//! (the set-ID bits cleared). The rest is as READDIR: the description
 //! needs the READ and DIRECTORY flags, the position moves past the entries given, `more` and the
 //! end are as below, and the two methods may be mixed on one description (each continues where the
 //! other stopped). Any other session is refused with PERMISSION.

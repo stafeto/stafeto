@@ -841,3 +841,21 @@ fn readdir_attr_gives_each_entry_what_stat_gives_without_the_dots_and_to_a_nativ
         Err(p::code(p::BAD_HANDLE))
     );
 }
+
+#[test]
+fn readdir_attr_folds_the_pending_writes_of_an_open_file_as_stat_does() {
+    let mut rig = volume();
+    let h = rig
+        .open(ROOT, b"/d/s", p::WRITE | p::CREATE, 0o644)
+        .unwrap();
+    rig.chmod(ROOT, b"/d/s", 0o4755).unwrap();
+    assert_eq!(rig.stat(ROOT, b"/d/s").unwrap().mode, 0o4755);
+    rig.call(ROOT, |w| p::write(h, b"bytes", w)).unwrap();
+    // The write cleared the set-ID bit in what STAT says, before any sync folded it into the record.
+    let stat = rig.stat(ROOT, b"/d/s").unwrap();
+    assert_eq!(stat.mode, 0o755);
+    let dir = rig.open(ROOT, b"/d", p::DIRECTORY | p::READ, 0).unwrap();
+    let got = listed_with_attributes(&mut rig, dir);
+    let entry = got.iter().find(|e| e.0 == b"s").unwrap();
+    assert_eq!((entry.3, entry.2), (stat.mode, stat.ino));
+}

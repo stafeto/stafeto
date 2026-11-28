@@ -33,9 +33,12 @@
 #define CTZ_HINTS 16u
 
 // The cache of metadata blocks (the device's read function below): 128 sets of 4 ways, 512 blocks of
-// 4 KiB (2 MiB), the least recently used way of a set goes first. 512 blocks hold the pairs of the
-// directories of a deep chain whole (a path walked from the root again and again reads the same
-// pairs), and the pairs of `/` and `/.layers`.
+// 4 KiB (2 MiB), the least recently used way of a set goes first. A path walked from the root again
+// and again reads the same pairs, so the blocks of the directories on the paths in use are what the
+// cache holds: the 246 directories of the chain of the scale volume are 492 blocks, with `/` and
+// `/.layers` just under the 512. The limit is the working set: past 512 blocks of the paths in use
+// the walks read about one walk of pairs from the device for each directory (about 90,000 reads for
+// the build of the scale volume).
 #define MCACHE_SETS 128u
 #define MCACHE_WAYS 4u
 #define MCACHE_BLOCKS (MCACHE_SETS * MCACHE_WAYS)
@@ -50,6 +53,7 @@
 int datafs_rs_read(void *ctx, uint32_t block, uint32_t off, void *buffer, uint32_t size);
 int datafs_rs_prog(void *ctx, uint32_t block, uint32_t off, const void *buffer, uint32_t size);
 int datafs_rs_sync(void *ctx);
+int datafs_rs_check(void *ctx);
 
 struct datafs {
     lfs_t lfs;
@@ -76,8 +80,8 @@ struct datafs {
     uint32_t mc_hits;
     uint32_t mc_misses;
     uint32_t mc_off;
-    // The metadata pair of the directory the last datafs_path_attrs named, or NO_BLOCK.
-    uint32_t walk_pair[2];
+    // Set while datafs_walk runs: a read the cache answers asks the device for its stop points.
+    uint32_t walking;
     uint8_t mc_data[MCACHE_BLOCKS][BLOCK];
 };
 
@@ -117,7 +121,8 @@ static void forget_failed_read(struct datafs *d, lfs_block_t block)
 // device.
 static uint32_t mc_first(lfs_block_t block)
 {
-    return (((uint32_t)block * 2654435761u) >> 25) % MCACHE_SETS * MCACHE_WAYS;
+    // The top 7 bits of the product are the set: 128 sets.
+    return (((uint32_t)block * 2654435761u) >> 25) * MCACHE_WAYS;
 }
 
 // The slot that holds `block`, or -1.
@@ -184,6 +189,13 @@ static int dev_read(const struct lfs_config *c, lfs_block_t block, lfs_off_t off
     if (cached) {
         int slot = mc_find(d, block);
         if (slot >= 0 && off + size <= BLOCK) {
+            if (d->walking) {
+                int stop = datafs_rs_check(d->ctx);
+                if (stop) {
+                    forget_failed_read(d, block);
+                    return stop;
+                }
+            }
             memcpy(buffer, d->mc_data[slot] + off, size);
             mc_touch(d, (uint32_t)slot);
             d->mc_hits++;
@@ -410,7 +422,9 @@ int datafs_walk(struct datafs *d, void *ctx)
     d->lfs.lookahead.size = 0;
     d->lfs.lookahead.next = 0;
     d->lfs.lookahead.ckpoint = d->lfs.block_count;
+    d->walking = 1;
     int err = lfs_fs_gc(&d->lfs);
+    d->walking = 0;
     if (err) {
         // A walk that failed (or was stopped) leaves the window empty (littlefs drops it) and
         // no cache labelled with a block it did not load.
@@ -706,20 +720,8 @@ int datafs_stat(struct datafs *d, void *ctx, const char *path, uint8_t *type, ui
     return 0;
 }
 
-// Whether the last datafs_path_attrs named a directory, and then its metadata pair in out[0] and
-// out[1] (1), or 0.
-int datafs_walked_pair(const struct datafs *d, uint32_t *out)
-{
-    if (d->walk_pair[0] == NO_BLOCK) {
-        return 0;
-    }
-    out[0] = d->walk_pair[0];
-    out[1] = d->walk_pair[1];
-    return 1;
-}
-
-// The directory whose metadata pair is `pair0` and `pair1` (from datafs_walked_pair), opened with no
-// walk of its path: the slot, or a negative error.
+// The directory whose metadata pair is `pair0` and `pair1` (from the `pair` of datafs_path_attrs),
+// opened with no walk of its path: the slot, or a negative error.
 int datafs_opendir_pair(struct datafs *d, void *ctx, uint32_t pair0, uint32_t pair1)
 {
     d->ctx = ctx;
@@ -898,19 +900,19 @@ int datafs_stat_attr(struct datafs *d, void *ctx, const char *path, uint8_t *typ
 
 // The status of `path` and the user attribute `attr` of the root and of every entry of the path in
 // one walk of it (lfs_path_attrs): `out` and `buffer` (`each` bytes for an entry) have room for
-// `capacity` entries, and *count says how many are filled, also when the call fails.
+// `capacity` entries, and *count says how many are filled, also when the call fails. When the path
+// names a directory, `pair` receives the two blocks of its metadata pair, else NO_BLOCK in both.
 int datafs_path_attrs(struct datafs *d, void *ctx, const char *path, uint8_t *type, uint32_t *size,
                       char *name, uint8_t attr, struct lfs_path_attr *out, uint8_t *buffer,
-                      uint32_t each, uint32_t capacity, uint32_t *count)
+                      uint32_t each, uint32_t capacity, uint32_t *count, uint32_t *pair)
 {
     struct lfs_info info;
     lfs_size_t filled = 0;
     memset(&info, 0, sizeof(info));
     d->ctx = ctx;
-    d->walk_pair[0] = NO_BLOCK;
-    d->walk_pair[1] = NO_BLOCK;
-    int err = lfs_path_attrs(&d->lfs, path, &info, attr, out, buffer, each, capacity, &filled,
-                             d->walk_pair);
+    pair[0] = NO_BLOCK;
+    pair[1] = NO_BLOCK;
+    int err = lfs_path_attrs(&d->lfs, path, &info, attr, out, buffer, each, capacity, &filled, pair);
     *count = filled;
     if (err < 0) {
         return err;

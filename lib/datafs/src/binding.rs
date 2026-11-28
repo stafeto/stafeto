@@ -172,7 +172,8 @@ pub fn initial(label: u64) -> Binding {
 
 /// Whether a request needs the session to be bound (rule 2): everything except BIND, CLOSE, CLONE,
 /// CLONE_MORE, WINDOW, RELEASE and the requests that only read or hand on a description the session
-/// holds (READ, PREAD and their READ_INTO and PREAD_INTO).
+/// holds (READ, PREAD and their READ_INTO and PREAD_INTO, READDIR and READDIR_ATTR; the second is
+/// refused to a session that is not a native client after this check).
 pub const fn needs_binding(method: Method) -> bool {
     !matches!(
         method,
@@ -185,6 +186,7 @@ pub const fn needs_binding(method: Method) -> bool {
             | Method::Seek
             | Method::Fstat
             | Method::Readdir
+            | Method::ReaddirAttr
             | Method::Rewind
             | Method::Where
             | Method::GetFlags
@@ -282,6 +284,7 @@ mod tests {
                     | Method::Seek
                     | Method::Fstat
                     | Method::Readdir
+                    | Method::ReaddirAttr
                     | Method::Rewind
                     | Method::Where
                     | Method::GetFlags

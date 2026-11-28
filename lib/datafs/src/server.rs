@@ -259,7 +259,8 @@ struct Pass {
 #[derive(Clone, Copy)]
 struct Pending {
     ino: u64,
-    /// The mode, owner and group of the entry, read for READDIR_ATTR (0 for READDIR).
+    /// The mode, owner and group of the entry, read with it (READDIR sends only its number and
+    /// kind, not these three).
     mode: u32,
     uid: u32,
     gid: u32,
@@ -869,7 +870,7 @@ impl Server {
         closed
     }
 
-    fn node_at(&self, path: &[u8]) -> Option<usize> {
+    pub(super) fn node_at(&self, path: &[u8]) -> Option<usize> {
         self.nodes
             .iter()
             .position(|n| n.used && !n.orphan && n.path.get() == path)
@@ -2037,7 +2038,7 @@ impl Server {
 
     /// What the attribute of the file of node `ni` will say once its pending writes are folded in:
     /// the time of the last write as `mtime` and `ctime`, the set-ID bits cleared (see `write_times`).
-    fn overlay_pending(&self, ni: usize, attr: &mut Attr) {
+    pub(super) fn overlay_pending(&self, ni: usize, attr: &mut Attr) {
         let n = &self.nodes[ni];
         if n.wrote {
             attr.mtime = n.wrote_at;
@@ -2141,8 +2142,8 @@ impl Server {
                     description.object = di as u8;
                 } else {
                     // The walk of the lookup named the directory's pair: it is opened with no
-                    // second walk of the path (nothing was written since).
-                    let opened = match fs.walked_pair() {
+                    // second walk of the path (nothing was written since, in this request).
+                    let opened = match found.pair {
                         Some(pair) => fs.opendir_pair(pair),
                         None => fs.opendir(path),
                     };

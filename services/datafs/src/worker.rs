@@ -423,10 +423,11 @@ impl Device for Disk {
         WALKING.store(on, Release);
     }
 
-    fn read(&mut self, sector: u64, out: &mut [u8]) -> Result<(), DeviceError> {
+    fn checkpoint(&mut self) -> Result<(), DeviceError> {
         // A stop notice ends a walk at its next read, and so does a queued job when the walk may
         // give way to one: the walk only reads, nothing is lost, and the glue leaves the caches of
-        // littlefs without the block of the failed read.
+        // littlefs without the block of the failed read. A read the cache of metadata blocks
+        // answers asks the same (`Device::checkpoint`).
         if WALKING.load(Acquire) {
             if STOPPING.load(Acquire) {
                 return Err(DeviceError);
@@ -436,6 +437,11 @@ impl Device for Disk {
                 return Err(DeviceError);
             }
         }
+        Ok(())
+    }
+
+    fn read(&mut self, sector: u64, out: &mut [u8]) -> Result<(), DeviceError> {
+        self.checkpoint()?;
         self.reads += 1;
         #[cfg(feature = "steps")]
         stretch::end();

@@ -1980,6 +1980,17 @@ fn a_cold_stat_at_depth_200_costs_about_three_reads_a_level_and_depth_253_is_acc
 
 #[test]
 fn a_read_that_fails_in_a_listing_loses_no_entry_and_repeats_none() {
+    failing_reads_in_a_listing(false);
+}
+
+/// The same with the cache of metadata blocks on: a failed read of the device is no block of the
+/// cache, and the reads the cache answers are not points of failure.
+#[test]
+fn a_read_that_fails_in_a_listing_with_the_cache_on_loses_no_entry_and_repeats_none() {
+    failing_reads_in_a_listing(true);
+}
+
+fn failing_reads_in_a_listing(cache: bool) {
     let mut rig = Rig::new();
     rig.mkdir(ROOT, b"/d", 0o755).unwrap();
     let mut want: Vec<String> = vec![".".into(), "..".into()];
@@ -1991,11 +2002,13 @@ fn a_read_that_fails_in_a_listing_loses_no_entry_and_repeats_none() {
     rig.fs.unmount().unwrap();
     let device = rig.fs.into_device();
     let mut tried = 0;
-    for k in 0..40 {
+    // With the cache a listing reads the device a few times only: the points are the first reads.
+    for k in 0..if cache { 6 } else { 40 } {
         let mut rig = Rig::on(device.clone());
-        // The point counts the reads of the device: none is answered by the cache.
-        rig.fs.set_cache(false);
         let dir = rig.open(ROOT, b"/d", p::DIRECTORY | p::READ, 0).unwrap();
+        // Off: the point counts the reads of the device, none answered by the cache. On: the cache
+        // is empty when the listing starts, so the first reads are the points.
+        rig.fs.set_cache(cache);
         rig.fs.device().fail_read_after(Some(k));
         let (mut got, mut errors) = (Vec::new(), 0);
         loop {
