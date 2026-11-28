@@ -702,11 +702,13 @@ fn steps(machine: &'static qemu::Machine, host: &Report) -> Result<(), String> {
         "display driver",
         &DRIVER_KINDS,
     )?;
-    check_waits(
-        &output.lines,
-        &[comp_probe::COMP_TAG, INPUT_TAG, comp_probe::DRIVER_TAG],
-        "lvgl-probe",
-    )?;
+    // The compositor's waits are judged by the bound of its call to the display driver in
+    // the table of this image (the budgets above the driver), the driver's by the flat
+    // maximum.
+    let waits =
+        crate::frame_probe::check_waits(&output.lines, init::table::lvgl::TABLE, "lvgl-probe")?;
+    check_waits(&output.lines, &[INPUT_TAG], "lvgl-probe")?;
+    println!("{waits}");
     let text = |rows: &[(usize, u64, u64)]| -> String {
         rows.iter()
             .map(|(kind, ticks, _)| format!("kind {kind} {ticks}"))
