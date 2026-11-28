@@ -304,6 +304,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "desk"
+version = "0.7.0-pre.0"
+dependencies = [
+ "posix-abi",
+ "posix-crt",
+]
+
+[[package]]
+name = "desk-client"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "digest"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -2910,11 +2910,33 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
-        // The desk starts the file of its program once, as the client it frames.
-        "boot-desk.img" => {
+        // The C probe of the manager's calls runs as the program `desk` and starts
+        // its own file once, as the client it frames.
+        "boot-desk-api.img" => {
             let mut files = vec![
                 dir("/bin"),
-                file("/bin/posix-manager", 0o755, ROOT, "posix-manager"),
+                file("/bin/desk", 0o755, ROOT, "desk"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
+        // The desk: the manager, the clients of the probe it starts, and the font of
+        // its titles (the package of LVGL puts the same file in the same place).
+        "boot-desk.img" | "boot-desk-steps.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/desk", 0o755, ROOT, "desk"),
+                file("/bin/desk-client", 0o755, ROOT, "desk-client"),
+                dir("/usr"),
+                dir("/usr/share"),
+                dir("/usr/share/fonts"),
+                of(
+                    "/usr/share/fonts/LiberationSans-Regular.ttf",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("LiberationSans-Regular.ttf", lvgl_font()),
+                ),
                 dir("/dev"),
             ];
             files.extend(devices());
@@ -4063,7 +4085,9 @@ mod tests {
             "boot-layer-posix.img",
             "boot-layer-ash.img",
             "boot-posix-window.img",
+            "boot-desk-api.img",
             "boot-desk.img",
+            "boot-desk-steps.img",
             "boot-cxx-probe.img",
             "boot-gles-pbuffer.img",
             "boot-deqp.img",

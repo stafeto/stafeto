@@ -2660,6 +2660,7 @@ commands:
   wfd-probe run the display demo on OpenWF Display (<WF/wfd.h>) in QEMU with the display driver alone: 100 frames bound to the primary pipeline in turn, each compared with the guest's CRC, the host's own and QEMU's screenshot, and the cursor moved 100 times (the device's trace); then the driver's steps under -icount
   posix-window run the C probe of the window library (<stafeto/window.h>) in QEMU: a window with two buffers, the bits that free them, events, fork, a signal and close, the frames compared with QEMU's screenshot
   desk-probe --api run the C probe of the manager's calls (<stafeto/manager.h>) in QEMU over the compositor with a keyboard (transport 15) and a tablet (transport 6): the manager subscribes, sees a client's window and gives it the focus, reads its title by INFO, frames it with a window of its own tied by LINK, moves the pair, resizes the client by CONFIGURE and hears RESIZED, hides and shows the pair, asks the client to close; the child of the manager is refused with EPERM; a key and a tablet click sent from QEMU reach the window with the focus
+  desk-probe run the window manager `desk` in QEMU over the compositor with a keyboard and a tablet: it starts three clients and frames them, and the probe does what a person does with the pointer and the keys of QEMU (a click on a title, a drag of a title, Super and Tab, Super, Shift and Tab, a click on a cell of the panel, the close button, Super and Q on a client that ignores the request and gets SIGTERM after 5 s, Super and Escape and the record's restart) and waits after each action for the list of windows it must make; the same run under -icount judges the compositor's steps
   display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
   layer-probe [steps] attach and detach layers of the RAM file service in QEMU; steps
             measures the steps of the layer calls under -icount
@@ -11524,6 +11525,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The manager's calls of the C library over a compositor with a keyboard
         // and a tablet on transports of their own, a key and a click from QEMU.
         job("desk-probe --api", || desk::api(&qemu::VIRT)),
+        // The manager `desk` itself over the same devices: frames, the panel, a
+        // drag, focus, Super and Tab, the close button and SIGTERM, a restart.
+        job("desk-probe", || desk::probe(&qemu::VIRT)),
         // OpenWF Display over the driver alone: the frames against QEMU's
         // screenshot, the scanout and cursor trace, the driver's steps.
         job("wfd-probe", || wfd::probe(&qemu::VIRT)),
@@ -11712,6 +11716,7 @@ fn host_tests() -> Result<(), String> {
         "tools/test_build_deqp_reference.py",
         "tools/test_build_lvgl.py",
         "tools/test_lvgl_port.py",
+        "tools/test_desk_port.py",
         "tools/test_build_libc_so.py",
         "tools/test_pkg_source.py",
         "tools/test_pkg_mirror.py",
@@ -15297,6 +15302,10 @@ fn ci_lints() -> Result<(), String> {
         "posix-window-probe",
         "--package",
         "posix-manager-probe",
+        "--package",
+        "desk",
+        "--package",
+        "desk-client",
         "--package",
         "wfd-demo",
         "--package",

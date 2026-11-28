@@ -403,11 +403,11 @@ nothing loops in the library.
   is a race the manager expects and goes on from.
 
 `cargo xtask desk-probe --api` runs the C probe of these calls (`tests/posix-manager`) in
-the image of the desk (`table::desk`, `boot-desk.img`): the services of the POSIX
+an image with the table of the desk (`table::desk`, `boot-desk-api.img`): the services of the POSIX
 programs, the display driver, the keyboard's driver (transport 15), the tablet's driver
 (transport 6) and the compositor with both, and the record `desk`, a process of POSIX at
-level 22 under the ceiling 23, which runs the probe until the manager of the desk takes its
-place. The keyboard and the tablet each map a page of their own (0xa001000 and 0xa000000):
+level 22 under the ceiling 23, which runs the probe under the name `desk` (the manager of
+the desk, `docs/desk.md`, is that record's program in `boot-desk.img`). The keyboard and the tablet each map a page of their own (0xa001000 and 0xa000000):
 the transports 13 and 15 of the other images share one page, which a table gives to a
 single record, so no image had both devices before. The probe subscribes, starts its own
 file as a client, gives the client's window the focus, reads its title by INFO, frames it

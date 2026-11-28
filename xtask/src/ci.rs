@@ -340,6 +340,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("vi-dialog", 30),
     ("posix-window", 25),
     ("desk-probe --api", 30),
+    ("desk-probe", 60),
     ("wfd-probe", 40),
     ("wfc-probe", 202),
     ("display-probe", 25),
