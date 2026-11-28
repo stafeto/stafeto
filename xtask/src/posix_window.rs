@@ -12,9 +12,12 @@
 //! line, xtask asks the monitor of QEMU for a `screendump` and takes the
 //! CRC-32 of the colours (`comp-probe`'s way): the two are equal, so the
 //! window library's buffers, the compositor's frame and the driver's show
-//! agree. The other checks (the bits that free the buffers, the events, the
-//! child that has no window, the signal that ends a wait, the close) are the
-//! probe's lines.
+//! agree. The probe then makes three windows of the process (one of them
+//! resizable) that show together, and resizes one: two more screenshots. The
+//! other checks (the bits that free the buffers, the events, the child that
+//! has no window, the signal that ends a wait, the close, the bits of each
+//! window, the title, the exec that closes every window) are the probe's
+//! lines.
 
 use std::time::Duration;
 
@@ -63,22 +66,30 @@ pub const PROGRAMS: [ImageProgram; 11] = [
 ];
 
 /// The lines with a CRC the screenshots are compared with, in order.
-const SHOTS: [&str; 3] = [
+const SHOTS: [&str; 5] = [
     "posix-window: window crc ",
     "posix-window: partial crc ",
     "posix-window: merged crc ",
+    "posix-window: several crc ",
+    "posix-window: resized crc ",
 ];
 
 /// The lines of the probe, each a check that passed.
-const LINES: [&str; 8] = [
+const LINES: [&str; 14] = [
     "posix-window: the screen is described, no window yet, and bad arguments leave nothing",
-    "posix-window: a window of 200 by 100 with two zeroed buffers, a second open is EBUSY, info repeats open",
+    "posix-window: a window of 200 by 100 with two zeroed buffers, a second window is number 1, info repeats open",
     "posix-window: post refuses a wrong buffer, window or rectangle, and a buffer that is out",
     "posix-window: the frame is shown and its bit frees the replaced buffer",
     "posix-window: five rectangles merge into their bounding box",
     "posix-window: the events are the focus events only and the ring is empty after",
     "posix-window: a forked child has no window, and a signal ends a wait with EINTR",
     "posix-window: close ends the window, and a new one opens",
+    "posix-window: three windows of one process show together, the fifth is refused and the lowest number comes back",
+    "posix-window: the bits of each window go to that window, and a wait across windows tells which",
+    "posix-window: title and application id go to the service, which refuses what is not UTF-8",
+    "posix-window: a window is resized inside its capacity and shows the new size with the next post",
+    "posix-window: a window opens and posts while another thread waits, and a close ends a wait on it",
+    "posix-window: exec closes every window of the old image",
 ];
 
 const ENDED: &str = "init: posix-window ended: exit code 0, not restarted";
@@ -91,12 +102,12 @@ fn failure(line: &str) -> Option<String> {
     failed.then(|| line.to_owned())
 }
 
-/// Follows the run: the three screenshots against the guest's CRC lines,
+/// Follows the run: the five screenshots against the guest's CRC lines,
 /// then the end of the probe. The CRC-32 of each screenshot.
-fn drive(run: &mut Run, scratch: &Scratch) -> Result<[u32; 3], String> {
+fn drive(run: &mut Run, scratch: &Scratch) -> Result<[u32; 5], String> {
     const WITHIN: Duration = Duration::from_secs(120);
     let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
-    let mut shots = [0; 3];
+    let mut shots = [0; 5];
     for (shot, prefix) in shots.iter_mut().zip(SHOTS) {
         // A check that failed or an end with another code ends the probe: no
         // CRC line will come, and the wait for it would run to the end of the
@@ -118,11 +129,13 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<[u32; 3], String> {
     Ok(shots)
 }
 
-/// Judges the lines of a run and the CRC-32 of the three screenshots: no
+/// Judges the lines of a run and the CRC-32 of the five screenshots: no
 /// check failed, each line of the probe came once, the screenshot after the
 /// merged post is the first one again (the first buffer's top byte is 0xFF
-/// and the screen ignores it), and the one after the second buffer differs.
-fn verdict(lines: &[String], shots: [u32; 3]) -> Result<(), String> {
+/// and the screen ignores it), the one after the second buffer differs, the
+/// three windows differ from the single window of the first shots and the
+/// resized one from the three.
+fn verdict(lines: &[String], shots: [u32; 5]) -> Result<(), String> {
     if let Some(failed) = lines
         .iter()
         .find(|l| l.starts_with("posix-window: check failed"))
@@ -143,6 +156,12 @@ fn verdict(lines: &[String], shots: [u32; 3]) -> Result<(), String> {
     }
     if shots[0] == shots[1] {
         return Err("the screen did not change with the second buffer".into());
+    }
+    if shots[3] == shots[0] || shots[3] == shots[1] {
+        return Err("the three windows did not change the screen".into());
+    }
+    if shots[4] == shots[3] {
+        return Err("the screen did not change with the new size of the window".into());
     }
     Ok(())
 }
@@ -166,7 +185,7 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     let shots = driven.map_err(|e| format!("posix-window on {}: {e}", machine.name))?;
     verdict(&outcome.lines, shots).map_err(|e| format!("posix-window on {}: {e}", machine.name))?;
     println!(
-        "posix-window on {}: a window of the C library with two buffers matched QEMU's screenshot for the first frame, a rectangle of the second buffer and the merge of five rectangles; the bits freed the buffers, the child had no window, a signal ended the wait, close and a new window: ok",
+        "posix-window on {}: a window of the C library with two buffers matched QEMU's screenshot for the first frame, a rectangle of the second buffer and the merge of five rectangles, three windows of the process and the new size of one; the bits freed the buffers and went to their windows, the child had no window, a signal ended the wait, close and a new window, the title and exec closing every window: ok",
         machine.name
     );
     Ok(())
@@ -185,7 +204,7 @@ mod tests {
     #[test]
     fn a_run_whose_merge_restores_the_first_screenshot_passes() {
         assert_eq!(
-            verdict(&run(), [0x0a0b_0c0d, 0x1122_3344, 0x0a0b_0c0d]),
+            verdict(&run(), [0x0a0b_0c0d, 0x1122_3344, 0x0a0b_0c0d, 0x5, 0x6]),
             Ok(())
         );
     }
@@ -200,17 +219,25 @@ mod tests {
 
     #[test]
     fn the_verdict_names_what_is_wrong() {
-        let err = verdict(&run(), [1, 2, 3]).unwrap_err();
+        let err = verdict(&run(), [1, 2, 3, 4, 5]).unwrap_err();
         assert!(err.contains("merged"), "{err}");
-        let err = verdict(&run(), [1, 1, 1]).unwrap_err();
+        let err = verdict(&run(), [1, 1, 1, 4, 5]).unwrap_err();
         assert!(err.contains("did not change"), "{err}");
+        let err = verdict(&run(), [1, 2, 1, 1, 5]).unwrap_err();
+        assert!(err.contains("three windows"), "{err}");
+        let err = verdict(&run(), [1, 2, 1, 4, 4]).unwrap_err();
+        assert!(err.contains("new size"), "{err}");
         let mut lines = run();
         lines.remove(0);
-        assert!(verdict(&lines, [1, 2, 1]).unwrap_err().contains("expected"));
+        assert!(
+            verdict(&lines, [1, 2, 1, 4, 5])
+                .unwrap_err()
+                .contains("expected")
+        );
         let mut lines = run();
         lines.push("posix-window: check failed at line 9: x (errno 1)".to_owned());
         assert!(
-            verdict(&lines, [1, 2, 1])
+            verdict(&lines, [1, 2, 1, 4, 5])
                 .unwrap_err()
                 .contains("check failed")
         );

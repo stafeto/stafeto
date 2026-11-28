@@ -11,6 +11,8 @@
 //! * `account`: which buffers are free, by the bits the service sends.
 //! * `damage`: the rectangles of a POST, merged to what the service takes.
 //! * `flag`: a flag one thread holds for a scope.
+//! * `table`: the process's windows on one channel: labels, numbers, the
+//!   capacity of a window and the report of a wait across them.
 //! * `events`: the 16 bytes of an event, both ways.
 //! * `errno`: the service's refusals and the kernel's as errno.
 
@@ -22,3 +24,4 @@ pub mod errno;
 pub mod events;
 pub mod flag;
 pub mod layout;
+pub mod table;
