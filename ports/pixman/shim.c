@@ -17,7 +17,7 @@
 
 #include "pxs.h"
 
-#define ARENA_BYTES (32 * 1024)
+#define ARENA_BYTES (64 * 1024)
 // The worker draws one source and one target at a time through its own
 // table of images, so its arena is half of the service's.
 #define WORKER_ARENA_BYTES (16 * 1024)
