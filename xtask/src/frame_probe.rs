@@ -893,16 +893,21 @@ pub fn verdict(lines: &[String], timed: bool) -> Result<Vec<String>, String> {
                     // Skips are printed only: with the client unable to post while
                     // its frame is in work almost no change waits at a period start.
                     //
-                    // `late` counts the frames that released a buffer of the windows,
-                    // the ones of the scene, and each is late. A frame shown in the phase that
-                    // released none (at most one) is the frame the end of the earlier
-                    // phase made, black or tiny, which falls on either side of the
-                    // boundary of the two readings of STATS by a few thousand ticks
-                    // of difference in the cost of a band: it is made in its period.
-                    if p.late != p.frames && !(p.late + 1 == p.frames && p.releases == p.late) {
+                    // The count runs from SETTLE_NS after the start of the phase to
+                    // READ_BEFORE_END_NS before its end, and the client keeps its windows to
+                    // the end. The service counts a frame in `frames` when it is shown, in
+                    // `releases` when it is taken, and in `late` only when it was taken in
+                    // the count (`Pacer::shown`). Every frame taken and shown in the count is
+                    // a frame of the scene and late. One frame at most stands over each end
+                    // of the count: the first frame of the phase, taken before the reset and
+                    // shown in the count (in `frames` alone), and the frame in work at the
+                    // read, taken in the count and shown after it (in `releases` alone).
+                    let first = p.frames.saturating_sub(p.late);
+                    let last = p.releases.saturating_sub(p.late);
+                    if p.late > p.frames || p.late > p.releases || first > 1 || last > 1 {
                         return fail(format!(
-                            "late {} of {} frames (a frame of {bands} bands over a cap of {cap} is late every time)",
-                            p.late, p.frames
+                            "late {} of {} frames, {} released (one frame over each end of the count at most): a frame of {bands} bands over a cap of {cap} is late every time",
+                            p.late, p.frames, p.releases
                         ));
                     }
                     if p.frames < floor {
@@ -2144,51 +2149,52 @@ mod tests {
         // One taking short is a read of STATS between a taking and the last band of a period.
         let mut lines = good();
         overload_line(&mut lines, "capped 240", "capped 120");
-        overload_line(&mut lines, &format!("releases {f}"), "releases 121");
-        assert!(verdict(&lines, true).is_ok());
-        // A frame shown in its period though the scene cannot make one.
-        let mut lines = good();
-        let f = overload_floor_frames();
-        overload_line(&mut lines, &format!("late {f}"), &format!("late {}", f - 1));
-        let e = verdict(&lines, true).unwrap_err();
-        assert!(
-            e.starts_with(&format!("overload: late {} of {f} frames", f - 1)),
-            "{e}"
-        );
-        // One frame shown in the phase that released no buffer, in its period (the
-        // frame of the end of the earlier phase read on this side of the boundary):
-        // the frames of the scene are all late, and it passes. Two do not.
-        let mut lines = good();
-        let f = overload_floor_frames();
-        overload_line(
-            &mut lines,
-            &format!("frames {f}"),
-            &format!("frames {}", f + 1),
-        );
-        assert!(verdict(&lines, true).is_ok());
-        let mut lines = good();
-        overload_line(
-            &mut lines,
-            &format!("frames {f}"),
-            &format!("frames {}", f + 2),
-        );
-        assert!(verdict(&lines, true).is_err());
-        // A frame of the scene on time with a frame that released nothing: one
-        // more frame and one more release than late frames. `late` counts the
-        // released frames alone, so these counts pass no longer.
-        let mut lines = good();
-        overload_line(
-            &mut lines,
-            &format!("frames {f}"),
-            &format!("frames {}", f + 1),
-        );
         overload_line(
             &mut lines,
             &format!("releases {f}"),
             &format!("releases {}", f + 1),
         );
-        let e = verdict(&lines, true).unwrap_err();
-        assert!(e.starts_with("overload: late"), "{e}");
+        assert!(verdict(&lines, true).is_ok());
+        // The ends of the count: the first frame of the phase shown in it (one more
+        // frame than late), the frame in work at the read (one more release), or both,
+        // pass; the counts of the runs: 6/5/6, 7/6/7, 7/6/6.
+        let f = overload_floor_frames();
+        for (frames, late, releases) in [(f, f - 1, f), (f + 1, f, f + 1), (f + 1, f, f)] {
+            let mut lines = good();
+            overload_line(
+                &mut lines,
+                &format!("frames {f}"),
+                &format!("frames {frames}"),
+            );
+            overload_line(&mut lines, &format!("late {f}"), &format!("late {late}"));
+            overload_line(
+                &mut lines,
+                &format!("releases {f}"),
+                &format!("releases {releases}"),
+            );
+            assert!(verdict(&lines, true).is_ok(), "{frames}/{late}/{releases}");
+        }
+        // A frame of the scene on time inside the count (8/6/7: the frame that took the
+        // windows away read before the end) and two frames not late (6/4/6) fail.
+        for (frames, late, releases) in [(f + 2, f, f + 1), (f, f - 2, f)] {
+            let mut lines = good();
+            overload_line(
+                &mut lines,
+                &format!("frames {f}"),
+                &format!("frames {frames}"),
+            );
+            overload_line(&mut lines, &format!("late {f}"), &format!("late {late}"));
+            overload_line(
+                &mut lines,
+                &format!("releases {f}"),
+                &format!("releases {releases}"),
+            );
+            let e = verdict(&lines, true).unwrap_err();
+            assert!(
+                e.starts_with("overload: late"),
+                "{frames}/{late}/{releases}: {e}"
+            );
+        }
         // Skips are printed and judge nothing.
         let mut lines = good();
         overload_line(
