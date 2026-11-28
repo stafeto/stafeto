@@ -151,7 +151,7 @@ pub const COMP_INPUT_MARK: u64 = 1 << 59;
 pub const COMP_SCENE_MARK: u64 = 1 << 54;
 /// The window manager of the images that have one, and the probe that stands
 /// in for it.
-pub const COMP_MANAGERS: &[&str] = &["wm", "focus-wm"];
+pub const COMP_MANAGERS: &[&str] = &["wm", "focus-wm", "top-wm"];
 /// The programs that inject events as a device would: the probes only.
 pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject", "lvgl-inject", "frame-load"];
 
@@ -1663,6 +1663,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-comp") as usize
     + cfg!(feature = "table-focus") as usize
     + cfg!(feature = "table-focus-wm") as usize
+    + cfg!(feature = "table-focus-top") as usize
     + cfg!(feature = "table-net") as usize
     + cfg!(feature = "table-net-probe") as usize
     + cfg!(feature = "table-pci-walk-vz") as usize
@@ -1783,6 +1784,7 @@ const _: () = assert!(
     feature = "table-comp",
     feature = "table-focus",
     feature = "table-focus-wm",
+    feature = "table-focus-top",
     feature = "table-net",
     feature = "table-net-probe",
     feature = "table-pci-walk-vz",
@@ -1979,6 +1981,8 @@ pub const TABLE: &[Record] = comp::TABLE;
 pub const TABLE: &[Record] = focus::TABLE;
 #[cfg(feature = "table-focus-wm")]
 pub const TABLE: &[Record] = focus::WM_TABLE;
+#[cfg(feature = "table-focus-top")]
+pub const TABLE: &[Record] = focus::TOP_TABLE;
 #[cfg(feature = "table-net")]
 pub const TABLE: &[Record] = net::NET_TABLE;
 #[cfg(feature = "table-net-probe")]
@@ -2095,6 +2099,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     comp::TABLE,
     focus::TABLE,
     focus::WM_TABLE,
+    focus::TOP_TABLE,
     input::TABLE,
     entropy::TABLE,
     entropy::VZ_TABLE,
@@ -4211,6 +4216,10 @@ mod tests {
             ]
         );
         assert_eq!(
+            order_of(focus::TOP_TABLE),
+            ["display", "gpu", "top-client", "top-wm"]
+        );
+        assert_eq!(
             order_of(net::NET_PROBE_TABLE),
             ["ramfs", "rng", "entropy", "net", "net-probe"]
         );
@@ -4252,6 +4261,11 @@ mod tests {
         let wm = |name: &str| focus::WM_TABLE.iter().find(|r| r.name == name).unwrap();
         assert_eq!(comp_mark(wm("wm"), b"gpu"), Some(COMP_MANAGER_MARK));
         assert_eq!(comp_mark(wm("wm-inject"), b"gpu"), Some(COMP_INPUT_MARK));
+        // The top-window image: the manager of its probe has the manager's mark and
+        // its client none.
+        let top = |name: &str| focus::TOP_TABLE.iter().find(|r| r.name == name).unwrap();
+        assert_eq!(comp_mark(top("top-wm"), b"gpu"), Some(COMP_MANAGER_MARK));
+        assert_eq!(comp_mark(top("top-client"), b"gpu"), None);
         // The LVGL demo's image: the injector alone has the input session.
         let lvgl = |name: &str| lvgl::TABLE.iter().find(|r| r.name == name).unwrap();
         assert_eq!(
