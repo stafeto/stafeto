@@ -602,14 +602,14 @@ fn cursor_trace_verdict(
 
 /// A connection to QEMU's QMP socket: the events of the input devices, which
 /// the monitor of HMP cannot make for a tablet.
-struct Qmp {
+pub(crate) struct Qmp {
     reader: BufReader<UnixStream>,
 }
 
 impl Qmp {
     /// Connects to `path` (it appears when QEMU starts), reads the greeting
     /// and negotiates the capabilities.
-    fn connect(path: &Path, timeout: Duration) -> Result<Qmp, String> {
+    pub(crate) fn connect(path: &Path, timeout: Duration) -> Result<Qmp, String> {
         let deadline = Instant::now() + timeout;
         let stream = loop {
             match UnixStream::connect(path) {
@@ -659,14 +659,20 @@ impl Qmp {
     }
 
     /// The tablet to (`x`, `y`) of a screen of `width` by `height` points.
-    fn move_to(&mut self, x: u32, y: u32, width: u32, height: u32) -> Result<(), String> {
+    pub(crate) fn move_to(
+        &mut self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
         let (ax, ay) = (x * 0x8000 / width, y * 0x8000 / height);
         self.execute(&format!(
             r#"{{"execute":"input-send-event","arguments":{{"events":[{{"type":"abs","data":{{"axis":"x","value":{ax}}}}},{{"type":"abs","data":{{"axis":"y","value":{ay}}}}}]}}}}"#
         ))
     }
 
-    fn left_button(&mut self, down: bool) -> Result<(), String> {
+    pub(crate) fn left_button(&mut self, down: bool) -> Result<(), String> {
         self.execute(&format!(
             r#"{{"execute":"input-send-event","arguments":{{"events":[{{"type":"btn","data":{{"down":{down},"button":"left"}}}}]}}}}"#
         ))

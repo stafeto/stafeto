@@ -288,6 +288,8 @@ table-layer-posix = []
 table-layer-ash = []
 # The C probe of the window library (xtask posix-window).
 table-posix-window = []
+# The image of the desk: the manager's calls over the compositor with a keyboard and a tablet (xtask desk-probe).
+table-desk = []
 # The scene demo on OpenWF Composition over the compositor (xtask wfc-probe).
 table-wfc = []
 # The same under -icount: the demo leaves out the pauses of the screenshots and the services count their steps.
