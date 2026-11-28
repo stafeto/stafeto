@@ -1,0 +1,17 @@
+[package]
+name = "desk-client"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The client of the desk's probe: one window with a title, a pattern of its colour and the answers a client gives a window manager (CONFIGURE, CLOSE_REQUEST)"
+build = "build.rs"
+
+[[bin]]
+name = "desk-client"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt", features = ["window"] }

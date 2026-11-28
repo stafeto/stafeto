@@ -1,0 +1,18 @@
+[package]
+name = "desk"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The window manager of the desk: frames with title bars, a panel, moving, focus and closing, a statically linked C program with LVGL on relibc"
+build = "build.rs"
+
+[[bin]]
+name = "desk"
+test = false
+bench = false
+
+[dependencies]
+posix-abi = { path = "../../lib/posix-abi", features = ["thread-probe"] }
+posix-crt = { path = "../../lib/posix-crt", features = ["window"] }
