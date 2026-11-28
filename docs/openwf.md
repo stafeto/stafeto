@@ -90,7 +90,7 @@ that has no mark gets no device from `wfcCreateDevice`. A child made by
   call count, up to 32) and makes a `WFCSource` of it with
   `wfcCreateSourceFromStream`. A mask is a window of the format A8
   (`STAFETO_WINDOW_A8` of `<stafeto/window.h>`), which the holder makes itself
-  (a process has one window) and makes a `WFCMask` of with
+  (a process has up to eight windows, the service gives a context four) and makes a `WFCMask` of with
   `wfcCreateMaskFromStream`. Up to 8 sources and 8 masks live at once.
 - **Elements.** Up to 16 elements, each with a source rectangle (floats, in
   the source's points), a destination rectangle (integers), the source
