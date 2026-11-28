@@ -4060,7 +4060,9 @@ fn write_boot_image_files(
             } else {
                 cargo_output(&target, PROGRAM_TARGET, profile, package)
             };
-            if layered && relibc.iter().any(|r| r == package) {
+            // The probe of the names speaks to the layer service itself and needs no client in its
+            // library (its paths are the probe's own requests).
+            if layered && package != "layer-names" && relibc.iter().any(|r| r == package) {
                 if is_dynamic(features) {
                     layer_client::check(&target.join("libc-so").join("libc.so"), true)?;
                 } else {

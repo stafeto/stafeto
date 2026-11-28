@@ -545,8 +545,8 @@ fn registered(lines: &[String]) -> Result<(), String> {
 }
 
 /// The layer service has asked the RAM file service for its write guard once its index was built
-/// (`layerd: write guard of the root on`, after the line that says the build began and before the
-/// probe's first line), and the file service accepted it.
+/// (`layerd: write guard of the root on`, after the line that says the build began; it comes a step
+/// after READY, so the probe may speak first), and the file service accepted it.
 fn guarded(lines: &[String]) -> Result<(), String> {
     let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
     let (Some(guard), Some(begun)) = (
@@ -563,13 +563,6 @@ fn guarded(lines: &[String]) -> Result<(), String> {
     };
     if guard < begun {
         return Err("the write guard was on before the index began to build".to_owned());
-    }
-    if lines
-        .iter()
-        .position(|l| l.contains(PREFIX))
-        .is_some_and(|probe| probe < guard)
-    {
-        return Err("the probe started before the write guard was on".to_owned());
     }
     if lines.iter().any(|l| l.contains("layerd: GUARD refused")) {
         return Err("the RAM file service refused GUARD".to_owned());
@@ -1791,12 +1784,6 @@ mod tests {
             all_ok().into_iter().filter(|l| !l.contains(drop)).collect()
         };
         assert!(read_lines(&without("write guard")).is_err());
-        let mut late = without("write guard");
-        late.push("layerd: write guard of the root on".to_owned());
-        assert!(
-            read_lines(&late).is_err(),
-            "the guard after the probe's lines"
-        );
         let mut early = all_ok();
         let guard = early.remove(2);
         early.insert(0, guard);
@@ -1861,13 +1848,13 @@ mod tests {
         v.insert(3, format!("{PREFIX}check failed at line 9: x (errno 2)"));
         assert!(read_lines(&v).is_err());
         let mut v = all_ok();
-        v.remove(4);
+        v.remove(6);
         assert!(read_lines(&v).is_err());
         let mut v = all_ok();
         v.pop();
         assert!(read_lines(&v).is_err());
         let mut v = all_ok();
-        v.swap(2, 3);
+        v.swap(5, 6);
         assert!(read_lines(&v).is_err());
         let mut v = all_ok();
         v.remove(0);

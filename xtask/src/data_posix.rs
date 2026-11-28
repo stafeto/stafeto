@@ -616,19 +616,24 @@ pub fn absent_break(machine: &qemu::Machine) -> Result<(), String> {
     let feature = "break-process-absent-wait";
     let check = READ_CHECKS[0];
     let (output, seconds) = boot_with(Mode::Read, machine, Boot::default(), &[feature], None)?;
-    let failed: Vec<&str> = output
-        .lines
-        .iter()
-        .filter_map(|l| l.find(PREFIX).map(|at| &l[at..]))
-        .filter(|l| l.ends_with(" FAILED"))
-        .collect();
-    let want = format!("{PREFIX}{check} FAILED");
-    if !failed.iter().any(|l| **l == *want) {
+    let said = |needle: &str| output.lines.iter().any(|l| l.contains(needle));
+    // The launcher's own first path waits five seconds and fails, so the probe may never start;
+    // or it starts, and its first check fails. A run that passes is a break that is not caught.
+    let failed = said(&format!("{PREFIX}{check} FAILED"));
+    let no_start = said("posix-data: the launcher could not start");
+    if said("posix-data: read checks passed") || !(failed || no_start) {
         return Err(format!(
-            "data-posix absent-break: {feature} did not fail {check:?}; the checks that failed: {failed:?}"
+            "data-posix absent-break: {feature} did not fail the probe (first check {check:?}, launcher not started: {no_start})"
         ));
     }
-    println!("data-posix absent-break: {feature} is caught by {check:?} (in {seconds} s)");
+    println!(
+        "data-posix absent-break: {feature} is caught ({}) in {seconds} s",
+        if failed {
+            format!("by {check:?}")
+        } else {
+            "the first path of the launcher waits five seconds and fails".to_owned()
+        }
+    );
     Ok(())
 }
 
