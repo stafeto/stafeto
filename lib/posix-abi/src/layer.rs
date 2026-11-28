@@ -41,7 +41,8 @@
 //!   `receive` on its own channel for as long as the file is big, and a signal ends the wait as it
 //!   ends a long operation: EINTR unless the handler has SA_RESTART, and the copy goes on either way)
 //!   and then sends the same request again. A copy that fails is ENOSPC, EROFS (a program is never
-//!   copied) or EIO.
+//!   copied; EXDEV for a `rename`) or EIO. A `rename` of a file or a link of the lower set takes the
+//!   same way: the copy first, then the move with a mark on the old name.
 //!   The directory part of a path of a change is canonical: a link of a layer of the user in it is a
 //!   redirect that routes by the path (followed here), and a link of the lower set is answered with a
 //!   redirect to the RAM file service for the path: the directory part is made canonical here
@@ -1171,10 +1172,13 @@ pub fn symlink(target: &[u8], abs: &Abs) -> Result<Changed, i32> {
     change(n::ChangeOp::Symlink, 0, 0, abs, None, Some(target))
 }
 
-/// `rename` of a path of the root to another one: a name of the lower set and a name that a link
+/// `rename` of a path of the root to another one. A file or a link of the lower set is copied up
+/// and then moved (the copy of a program is refused, which is EXDEV here: `mv` goes on by copying
+/// and fails as a write to the program does); a directory of the lower set and a name that a link
 /// leads out of the root are EXDEV.
 pub fn rename(from: &Abs, to: &Abs) -> Result<(), i32> {
-    match change(n::ChangeOp::Rename, 0, 0, from, Some(to), None)? {
+    let done = change(n::ChangeOp::Rename, 0, 0, from, Some(to), None);
+    match done.map_err(|errno| if errno == EROFS { EXDEV } else { errno })? {
         Changed::Done => Ok(()),
         Changed::Elsewhere(_) => Err(EXDEV),
     }

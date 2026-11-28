@@ -332,6 +332,9 @@ struct Rn {
     src_attr: Option<posix_perm::Attr>,
     dst: Option<Leaf>,
     dst_attr: Option<posix_perm::Attr>,
+    /// The source is a name of the lower set: the rename copies it up first (the program asks
+    /// again when the copy is there) and then moves the copy.
+    lower_src: bool,
 }
 
 const NO_STAGE: Stage = Stage::Attr;
@@ -448,6 +451,7 @@ impl<V: Volume, L: Lower> ChangeJob<V, L> {
                 src_attr: None,
                 dst: None,
                 dst_attr: None,
+                lower_src: false,
             },
             empty: Empty {
                 up: None,
@@ -1849,7 +1853,13 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 };
                 let (src_id, src_kind, src_lower) = match leaf {
                     Leaf::Missing { .. } => return fail(proto_fs::NO_ENTRY),
-                    Leaf::Lower(_) => return fail(proto_fs::CROSS_DEVICE),
+                    // A file or a link of the lower set is copied up and then renamed; a
+                    // directory of the lower set stays CROSS_DEVICE (the program copies it).
+                    Leaf::Lower(ls) => match ls.kind {
+                        2 => (0, Kind::File, Some(ls)),
+                        5 => (0, Kind::Link, Some(ls)),
+                        _ => return fail(proto_fs::CROSS_DEVICE),
+                    },
                     Leaf::Upper { id, kind, lower } => (id, kind, lower),
                 };
                 let src_is_dir = src_kind == Kind::Dir;
@@ -1899,6 +1909,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                     src_attr: None,
                     dst: None,
                     dst_attr: None,
+                    lower_src: matches!(leaf, Leaf::Lower(_)),
                 };
                 Self::begin_walk(job, true);
                 Ok(None)
@@ -1907,12 +1918,13 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 let Some(dst) = job.b.leaf else {
                     return fail(proto_fs::NO_ENTRY);
                 };
-                let src_parent = job
-                    .a
-                    .parent
-                    .as_ref()
-                    .and_then(|p| p.up)
-                    .ok_or_else(|| Stop::Status(st(proto_fs::NO_ENTRY)))?;
+                let src_up = job.a.parent.as_ref().and_then(|p| p.up);
+                // The directory of a lower source may be the lower set's alone: the copy makes it.
+                let src_parent = if job.rn.lower_src {
+                    src_up.unwrap_or(0)
+                } else {
+                    src_up.ok_or_else(|| Stop::Status(st(proto_fs::NO_ENTRY)))?
+                };
                 let mut vp = [0u8; 512];
                 self.leg_vpath(
                     &job.b,
@@ -1922,6 +1934,10 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 )?;
                 job.rn.src_parent = src_parent;
                 job.rn.dst = Some(dst);
+                if let (true, Some(ls)) = (job.rn.lower_src, job.rn.src_lower) {
+                    job.rn.src_attr = Some(lower_attr(&ls));
+                    return self.rename_after_src(c, job);
+                }
                 if job.rn.src_kind == Kind::Dir {
                     job.rn.src_attr = Some(
                         self.index
@@ -2054,9 +2070,16 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         {
             return fail(proto_fs::NO_SPACE);
         }
-        if job.rn.src_lower.is_some() && !self.index.has_room(job.rn.src_parent, job.a.leaf_name())
+        if job.rn.src_lower.is_some()
+            && !job.rn.lower_src
+            && !self.index.has_room(job.rn.src_parent, job.a.leaf_name())
         {
             return fail(proto_fs::NO_SPACE);
+        }
+        if let (true, Some(ls)) = (job.rn.lower_src, job.rn.src_lower) {
+            // Every right is checked: the copy is made, and the same request goes again and
+            // renames it.
+            return self.plan_rename_copy(job, ls);
         }
         let (src_id, src_kind, src_lower, src_parent) = (
             job.rn.src_id,
@@ -2093,7 +2116,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 old_link = true;
             }
         }
-        if src_lower.is_some() {
+        // The break `break-layerd-rename-no-mark` leaves the old name of a lower file unmarked: the
+        // lower name shows again after the rename.
+        if src_lower.is_some() && !cfg!(feature = "break-layerd-rename-no-mark") {
             job.push(Stage::Mark {
                 dir: DirRef::Id(src_parent),
                 b: false,
@@ -2110,6 +2135,24 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             });
         }
         Self::begin_commit(job);
+        Ok(None)
+    }
+
+    /// The copy up of the source of a rename: a file is queued (COPYING, the bytes move outside
+    /// the loop), a link is made in the layer in this job once its text is read. Either way the
+    /// answer sends the program to WAIT and then to the same request, which finds the copy.
+    fn plan_rename_copy(
+        &mut self,
+        job: &mut ChangeJob<V, L>,
+        ls: LowerStat,
+    ) -> F<Option<Done<V::Pass>>> {
+        if ls.kind == 2 {
+            return self.plan_copy(job, ls, crate::copy::Kind::Whole);
+        }
+        self.number_kept(&ls)?;
+        job.copy_stat = ls;
+        job.committed = true;
+        job.phase = Phase::LowerLink;
         Ok(None)
     }
 
@@ -2403,7 +2446,11 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                     },
                     lower: Some(ls.ino),
                 });
-                job.push(Stage::Attr);
+                if job.op == ChangeOp::Rename {
+                    job.ticket = crate::copy::DONE_TICKET;
+                } else {
+                    job.push(Stage::Attr);
+                }
                 job.pc = 0;
                 job.dsub = 0;
                 job.phase = Phase::Commit;
@@ -3195,6 +3242,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 if let Err(e) = self.volume.rename(&work[..wl], &path[..n]) {
                     return Err(self.scrub_fail(job, false, e));
                 }
+                if job.op == ChangeOp::Rename && crate::cut::armed(crate::cut::MARKED) {
+                    self.volume.cut(crate::cut::MARKED);
+                }
                 Ok(Flow::CallDone)
             }
         }
@@ -3265,6 +3315,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 self.index.remove(id);
             }
         }
+        if crate::cut::armed(crate::cut::MOVED) {
+            self.volume.cut(crate::cut::MOVED);
+        }
         let (to, src_id) = (job.dir_b, job.rn.src_id);
         let b_leaf = job.b.leaf_name();
         if let Leaf::Missing { hidden: true, .. } = dst
@@ -3279,7 +3332,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         if job.rn.src_kind == Kind::Dir {
             self.table.retarget(src_id, new_id);
         }
-        if job.rn.src_lower.is_some() {
+        if job.rn.src_lower.is_some() && !cfg!(feature = "break-layerd-rename-no-mark") {
             let fields = Fields {
                 kind: Kind::Whiteout,
                 layer: self.composition.live().number,
@@ -3372,6 +3425,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         }
         if let Err(e) = self.volume.rename(&work[..wl], &live[..n]) {
             return self.copy_gone(job, from_volume_code(e));
+        }
+        if crate::cut::armed(crate::cut::COPY_RENAMED) {
+            self.volume.cut(crate::cut::COPY_RENAMED);
         }
         let fields = Fields {
             kind: Kind::File,

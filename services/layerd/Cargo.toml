@@ -36,6 +36,10 @@ probe-restart = []
 # ...`) whenever one moves, which `cargo xtask layer-posix copy` reads (a read open makes no copy,
 # two writers of one file make one).
 probe-copies = []
+# `probe-cut`: with `STAFETO_LAYERD_CUT_AT=<point>` (`layerd::cut`) the service prints `layerd: cut point
+# N` at that point of a copy up or of the rename of a lower name and stops there for good, for `cargo
+# xtask layer-cut copy`, which kills the machine on the line and starts it again on the same disk.
+probe-cut = []
 # `break-layerd-epoch`: every instance carries the one epoch, so a handle of an earlier instance is
 # no stranger (`cargo xtask layer-restart breaks`).
 break-layerd-epoch = []
@@ -59,6 +63,12 @@ break-layerd-copy-attrs = []
 break-layerd-copy-in-loop = []
 break-layerd-copy-elf = []
 break-layerd-copy-recheck = []
+# Breaks of part B: `break-layerd-copy-rename-open` the worker makes the copy at its final name in the
+# layer, so the name is there before its bytes are (`cargo xtask layer-cut copy` catches the partial
+# file after a cut); `break-layerd-rename-no-mark` the rename of a lower file leaves its old name
+# unmarked, so the lower name shows again (`cargo xtask layer-posix write breaks` and the host tests).
+break-layerd-copy-rename-open = []
+break-layerd-rename-no-mark = []
 break-layerd-whiteout = []
 break-layerd-search = []
 break-layerd-no-mark = []

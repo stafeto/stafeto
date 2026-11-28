@@ -49,6 +49,20 @@ impl Data {
     }
 }
 
+/// The build for `cargo xtask layer-cut` prints the line of its point and stops there for good: the
+/// host kills the machine on the line and starts it again on the same disk.
+pub fn stop(point: u8) -> ! {
+    rt::println!("layerd: cut point {point}");
+    let held = sys::channel_create(crate::worker::LEVEL);
+    loop {
+        if let Ok(channel) = &held {
+            let _ = sys::receive(channel);
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 impl Data {
     /// WINDOW with a copy of `memory` that has MAP_READ, MAP_WRITE and TRANSFER (the worker's).
     pub fn window(&mut self, memory: &rt::handle::Handle<rt::handle::Memory>) -> R<()> {
@@ -171,6 +185,10 @@ impl Volume for Data {
     fn mkdir_numbered(&mut self, path: &[u8], mode: u32, ino: u64) -> R<()> {
         self.call(|w| p::mkdir_numbered(path, mode, ino, w))
             .map(drop)
+    }
+
+    fn cut(&mut self, point: u8) {
+        stop(point)
     }
 
     fn rename(&mut self, from: &[u8], to: &[u8]) -> R<()> {

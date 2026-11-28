@@ -176,6 +176,11 @@ pub const fn ticket_parts(ticket: u64) -> (u8, u32) {
     (ticket as u8, (ticket >> 8) as u32)
 }
 
+/// The ticket of a copy that is over before it is asked for (the link a rename copies is made in
+/// the job): WAIT answers 0 at once and the program asks again. Place 0 with the generation
+/// `u32::MAX`, which the table reaches after four billion copies of one place.
+pub const DONE_TICKET: u64 = ticket_of(0, u32::MAX);
+
 /// Whether `ticket` is one the table gave: a place and a generation of at most 32 bits, and nothing
 /// above them. A WAIT with another value is INVALID_ARGUMENT (the bits above would be dropped by
 /// `ticket_parts`, and the notification kept under a value no copy ever ends).
@@ -476,6 +481,24 @@ pub fn code_of(status: Status) -> u32 {
     }
 }
 
+/// Where the worker makes the copy: the file in `work/`. The break `break-layerd-copy-rename-open`
+/// makes it at its final name in the live layer 00, so the name is visible before the bytes are
+/// there (a cut leaves a partial file under the name: `cargo xtask layer-cut copy`).
+fn target(order: &Order) -> ([u8; PATH + 16], usize) {
+    let mut out = [0u8; PATH + 16];
+    let head: &[u8] = if cfg!(feature = "break-layerd-copy-rename-open") {
+        b"/.layers/00"
+    } else {
+        let (work, wl) = order.work();
+        out[..wl].copy_from_slice(&work[..wl]);
+        return (out, wl);
+    };
+    let path = order.path();
+    out[..head.len()].copy_from_slice(head);
+    out[head.len()..head.len() + path.len()].copy_from_slice(path);
+    (out, head.len() + path.len())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     /// Open the lower file, check its first bytes, make the file in `work/`.
@@ -607,6 +630,12 @@ impl Copier {
                 return Err(proto_fs::NO_SPACE);
             }
             run.offset += filled as u64;
+            if filled == CELL
+                && run.offset == CELL as u64
+                && crate::cut::armed(crate::cut::MID_COPY)
+            {
+                bulk.cut(crate::cut::MID_COPY);
+            }
         }
         if filled < CELL {
             run.phase = Phase::Finish;
@@ -635,7 +664,7 @@ impl Copier {
                 {
                     return Err(proto_fs::READ_ONLY_FILESYSTEM);
                 }
-                let (work, wl) = run.order.work();
+                let (work, wl) = target(&run.order);
                 // The number of the copy is the lower file's (the break: one of the counter).
                 let ino = if cfg!(feature = "break-layerd-copy-counter-ino") {
                     run.order.stat.ino | proto_fs::names::UPPER_INO_TAG
@@ -645,6 +674,9 @@ impl Copier {
                 let h = bulk.open_work(&work[..wl], 0o600, ino).map_err(fail)?;
                 run.work = Some(h);
                 run.made = true;
+                if crate::cut::armed(crate::cut::WORK_MADE) {
+                    bulk.cut(crate::cut::WORK_MADE);
+                }
                 if run.order.kind == Kind::Empty {
                     run.phase = Phase::Finish;
                     return Ok(false);
@@ -659,7 +691,7 @@ impl Copier {
                 let (Some(fd), Some(h)) = (run.lower, run.work) else {
                     return Err(proto_layer::IO);
                 };
-                let (work, wl) = run.order.work();
+                let (work, wl) = target(&run.order);
                 let work = &work[..wl];
                 let s = run.order.stat;
                 bulk.fsync(h).map_err(fail)?;
@@ -673,6 +705,9 @@ impl Copier {
                 }
                 run.work = None;
                 bulk.close(h).map_err(fail)?;
+                if crate::cut::armed(crate::cut::WORK_CLOSED) {
+                    bulk.cut(crate::cut::WORK_CLOSED);
+                }
                 run.lower = None;
                 bulk.close_lower(fd);
                 Ok(true)
