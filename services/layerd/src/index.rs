@@ -54,15 +54,21 @@ const HEADER: usize = 4;
 /// The dead flag of a block header; the slot is in the low 16 bits and the length of the name in
 /// the next 8.
 const DEAD: u32 = 1 << 31;
-/// The bytes of the arena one step of compaction reads (a block that starts below this is read
-/// whole, so a step moves up to `COMPACT_BYTES + NAME_MAX + HEADER`). The measurement under
-/// `-icount` (`cargo xtask layer-steps`) puts a step of 2 KiB over the gate: the blocks of the
-/// scale volume are 9 bytes and cost about 105 ticks each, 24,300 ticks for 2 KiB; 1 KiB takes
-/// about 12,000 (0.9 B is 18,369).
+/// What one step of compaction does at most: it reads `COMPACT_BYTES` of the arena (a block that
+/// starts below this is read whole, so a step moves up to `COMPACT_BYTES + NAME_MAX + HEADER`),
+/// and looks at `COMPACT_BLOCKS` blocks. The measurement under `-icount` (`cargo xtask
+/// layer-steps`) shows the cost is by the block, about 200 ticks for one that moves (the blocks of
+/// the scale volume are 9 bytes): 1 KiB of them took 17,300 ticks, over the margin of the gate
+/// (0.9 B is 18,369); 48 blocks take about 10,000.
 pub const COMPACT_BYTES: usize = if cfg!(feature = "break-layerd-compact-one-step") {
     ARENA
 } else {
     1024
+};
+pub const COMPACT_BLOCKS: usize = if cfg!(feature = "break-layerd-compact-one-step") {
+    usize::MAX
+} else {
+    48
 };
 /// The `Gone` entries one step of the sweep takes out, and the places it looks at.
 pub const SWEEP_FREES: usize = 32;
@@ -1014,8 +1020,8 @@ impl Index {
             self.c_steps = 0;
         }
         self.c_steps += 1;
-        let mut read = 0;
-        while read < COMPACT_BYTES && self.c_read < self.arena_len {
+        let (mut read, mut blocks) = (0, 0);
+        while read < COMPACT_BYTES && blocks < COMPACT_BLOCKS && self.c_read < self.arena_len {
             let at = self.c_read;
             let mut header = [0u8; HEADER];
             header.copy_from_slice(&self.arena[at..at + HEADER]);
@@ -1030,6 +1036,7 @@ impl Index {
             }
             self.c_read += block;
             read += block;
+            blocks += 1;
         }
         if self.c_read >= self.arena_len {
             self.arena_len = self.c_write;
