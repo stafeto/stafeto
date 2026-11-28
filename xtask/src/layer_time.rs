@@ -30,6 +30,8 @@ pub fn report(lines: &[String]) -> Vec<String> {
         .iter()
         .filter(|l| {
             l.contains("layer-time:")
+                || l.contains("datafs: READY at ")
+                || l.contains("layerd: STARTING answered")
                 || l.contains("layerd: index of ")
                 || l.contains("layerd: serve ran")
                 || l.contains("init: free pages ")
@@ -68,6 +70,25 @@ pub fn check(lines: &[String]) -> Result<(), String> {
     }
     if !lines.iter().any(|l| l.contains("layerd: index of ")) {
         return Err("the layer service said nothing of the build of its index".to_owned());
+    }
+    // The uptime at READY of both services, to read the time from one to the other.
+    if !lines.iter().any(|l| l.contains("datafs: READY at ")) {
+        return Err("the data file service said nothing of its uptime at READY".to_owned());
+    }
+    if !lines
+        .iter()
+        .any(|l| l.contains("layerd: index of ") && l.contains("READY at "))
+    {
+        return Err("the line of the index has no uptime at READY".to_owned());
+    }
+    // The counts of the answers STARTING by cause: one line with the READY line, and one after
+    // the measurement (the program asks once more after a pause).
+    let counts = lines
+        .iter()
+        .filter(|l| l.contains("layerd: STARTING answered"))
+        .count();
+    if counts < 1 {
+        return Err("the layer service printed no count of its answers STARTING".to_owned());
     }
     Ok(())
 }
@@ -162,8 +183,10 @@ mod tests {
 
     fn lines() -> Vec<String> {
         let mut v = vec![
-            "layerd: index of 8192 names and 2005 deletions built in 900 ms, 1700 steps, 3 overruns"
+            "datafs: READY at 1500 ms of uptime".to_owned(),
+            "layerd: index of 8192 names and 2005 deletions built in 900 ms, 1700 steps, 3 overruns, READY at 2500 ms of uptime"
                 .to_owned(),
+            "layerd: STARTING answered 3: build 3 notary 0 jobs 0 copies 0 compaction 0 reaper 0 listing 0 lock 0".to_owned(),
         ];
         v.extend(DUE.iter().map(|d| format!("{d}: 5 us")));
         v
@@ -177,13 +200,19 @@ mod tests {
     #[test]
     fn a_missing_measurement_or_a_failed_one_does_not() {
         let mut v = lines();
-        v.remove(3);
+        v.remove(5);
         assert!(check(&v).is_err());
         let mut v = lines();
         v.push("layer-time: open of /x failed, errno 2".to_owned());
         assert!(check(&v).is_err());
         let mut v = lines();
+        v.remove(1);
+        assert!(check(&v).is_err());
+        let mut v = lines();
         v.remove(0);
+        assert!(check(&v).is_err());
+        let mut v = lines();
+        v.remove(2);
         assert!(check(&v).is_err());
     }
 

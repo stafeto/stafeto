@@ -65,7 +65,7 @@ fn ticks_of(us: u64) -> u64 {
 }
 
 /// The checks of the probe in scale mode, in the order it runs them.
-pub const CHECKS: [&str; 17] = [
+pub const CHECKS: [&str; 18] = [
     "sessions",
     "status counts the names of the layer",
     "a file at the end of a chain of 247 components",
@@ -82,6 +82,7 @@ pub const CHECKS: [&str; 17] = [
     "a directory of 2,000 marks removed and made again",
     "a rename onto a directory of marks alone",
     "links with long names made and removed make the arena compact",
+    "a directory that mixes 200 names and 200 marks lists whole",
     "status counts the names after the changes",
 ];
 
@@ -140,6 +141,21 @@ fn lower_files() -> Vec<crate::rootfs::RootFile> {
             ),
         )),
     });
+    // A directory of 200 files, next to each of which the probe makes a link and removes the file:
+    // a list of the layer that alternates names and marks.
+    files.push(dir("/lowmix"));
+    for k in 0..200 {
+        files.push(crate::rootfs::RootFile {
+            path: leak(format!("/lowmix/l{k:03}")),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            source: Some(crate::rootfs::Source::Bytes(
+                "layer-steps-lowmix",
+                b"lower\n",
+            )),
+        });
+    }
     files.push(dir("/opq"));
     files.push(crate::rootfs::RootFile {
         path: "/opq/lowfile",

@@ -789,6 +789,12 @@ impl Service<0> for Datafs {
         if n.source == Source::Session && n.label == LABEL_DONE {
             if !self.ready && !STARTING.load(Acquire) {
                 self.ready = true;
+                // The time of the machine at READY, to be read against the one of the layer
+                // service (`layerd: index of ...`): the build of its index starts after this.
+                rt::println!(
+                    "datafs: READY at {} ms of uptime",
+                    rt::time::ticks_to_ns(rt::time::now()) / 1_000_000
+                );
                 if let Err(why) = rt::service::ready(&self.parent) {
                     rt::println!("datafs: READY refused: {why:?}");
                 }

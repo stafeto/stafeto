@@ -565,8 +565,8 @@ pub const LAYERD: Record = Record {
     priority: 34,
     ceiling: 34,
     // The stack of the loop and of the worker thread, the index (16,384 places, the keys of its
-    // directories, their lists of children and the arena: .bss of 1.2 MiB) and the pages of the descriptors are statics that
-    // init pays for as segments; the quota is the slots of the sessions the service gives (192), its
+    // directories, their lists of children and the arena: .bss of 1.2 MiB) and the pages of the
+    // descriptors are statics that init pays for as segments; the quota is the slots of the sessions the service gives (192), its
     // own channels and the window of the copies up (`proto_data::WINDOW_BYTES`, 32 pages, a memory
     // object of the worker thread).
     quota: (192 + 32) * PAGE,

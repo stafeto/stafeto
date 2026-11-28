@@ -32,10 +32,14 @@ pub struct Listed {
 }
 
 /// The entries of the list of a directory one request looks at in the first stage (a mark of
-/// deletion is looked at and dropped): about 57 ticks under `-icount` for each (the walk of the
-/// list, the checks of the entry), measured on a directory of 2,000 marks, where 384 took 22,000;
-/// the entries of a reply (up to 46 of the message's 1 KiB) cost about 9,000 more, so 96 keep a
-/// request under 0.9 B with the rest of the step.
+/// deletion is looked at and dropped inside the walk): under `-icount` each costs about 57 ticks
+/// (`cargo xtask layer-steps`, a directory of 2,000 marks: 384 of them took 22,000); the names of a
+/// reply (up to 46 of the message's 1 KiB) cost about 9,000 more, so 96 keep a request under 0.9 B
+/// with the rest of the step. The count is of looks, whatever the memory does: on hardware the
+/// walk of a list jumps across the table (the entries of a directory lie where their hashes put
+/// them, 40 bytes each in 640 KiB), so a look can miss the cache where `-icount` counts an
+/// instruction; the number is a bound on the work, and the time of a request on a machine is for
+/// the measurement on it to say.
 pub const SLOTS_PER_READDIR: usize = if cfg!(feature = "break-layerd-slots") {
     4096
 } else {
@@ -193,7 +197,9 @@ pub fn read_dir<L: Lower>(
         // library of the C programs does so for STARTING); a reply with `more` and no entry is
         // for the steps that make progress.
         if *resolving >= LISTINGS_RESOLVING || mine >= LISTINGS_PER_SESSION {
-            return Err(Status::Unknown(proto_layer::STARTING));
+            return Err(Status::Unknown(crate::starting::code(
+                crate::starting::Cause::Listing,
+            )));
         }
         let mut path = [0u8; 512];
         let n = index.path_of(dir, &mut path).ok_or(Status::BadSize)?;
@@ -210,9 +216,9 @@ pub fn read_dir<L: Lower>(
                 Ok(listed(position, false))
             }
             // The session has no path job free: busy.
-            Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES)) => {
-                Err(Status::Unknown(proto_layer::STARTING))
-            }
+            Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES)) => Err(Status::Unknown(
+                crate::starting::code(crate::starting::Cause::Listing),
+            )),
             Err(e) => Err(e),
         };
     }

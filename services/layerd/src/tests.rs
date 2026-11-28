@@ -1416,9 +1416,12 @@ fn a_seek_goes_back_to_a_position_the_replies_gave_and_never_past() {
         core.seek_dir(owner, h, n::cursor(stage, at + 1)),
         Err(st(f::INVALID_ARGUMENT))
     );
-    // After a rewind the furthest position stays what it was.
+    // A rewind forgets the furthest position: the cursors given before are no more.
     core.rewind(owner, h).unwrap();
-    assert_eq!(core.seek_dir(owner, h, cursor), Ok(()));
+    assert_eq!(
+        core.seek_dir(owner, h, cursor),
+        Err(st(f::INVALID_ARGUMENT))
+    );
 }
 
 #[test]

@@ -178,7 +178,8 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     /// upkeep of the index, or one call to the data file service. True while work is left.
     pub fn reap_step(&mut self) -> bool {
         self.index.last_work = 0;
-        if self.work.count == 0 {
+        // An insertion waits for the compaction of the arena: its step goes ahead of the items.
+        if self.work.count == 0 || self.index.starved() {
             return self.index.maintain_step();
         }
         let w = &mut *self.work;

@@ -44,6 +44,7 @@ use crate::listing::LOWER_PER_STEP;
 use crate::lookup::{Hidden, Outcome, STEP, Step, Walk, normalize_dots};
 use crate::names::{COMPOSITION, COMPOSITION_TMP, Client, Core, Done, attr_of, from_volume, st};
 use crate::scan::{LINK_PREFIX, OPAQUE_NAME, WHITEOUT_PREFIX};
+use crate::starting::{self, Cause};
 use crate::volume::{Lower, LowerStat, R, Volume};
 use posix_perm::{Created, EXEC, TimesRequest, WRITE, permits};
 use proto_data as d;
@@ -745,7 +746,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         for _ in 0..1_000_000 {
             match self.change_step(c, job, w) {
                 ChangeStep::More => {}
-                ChangeStep::Wait => return Err(st(proto_layer::STARTING)),
+                ChangeStep::Wait => return Err(st(starting::code(Cause::Lock))),
                 ChangeStep::Done(r) => return r,
             }
         }
@@ -1645,7 +1646,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         if self.work.room() {
             Ok(())
         } else {
-            fail(proto_layer::STARTING)
+            fail(starting::code(Cause::Reaper))
         }
     }
 
@@ -2438,7 +2439,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             job.nstages = 0;
         } else {
             if !self.copies.room() {
-                return fail(proto_layer::STARTING);
+                return fail(starting::code(Cause::Copies));
             }
             job.copy_kind = kind;
             job.copy_stat = ls;
@@ -3346,9 +3347,14 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     /// The code a change fails with when the index has no room for `name` in `parent`: NO_SPACE,
     /// or STARTING when the arena has room once its compaction ran (the client asks again).
     fn no_room(&mut self, parent: u32, name: &[u8]) -> Option<u32> {
-        match self.index.room(parent, name) {
+        let room = self.index.room(parent, name);
+        Self::room_code(room)
+    }
+
+    fn room_code(room: Room) -> Option<u32> {
+        match room {
             Room::Yes => None,
-            Room::Later => Some(proto_layer::STARTING),
+            Room::Later => Some(starting::code(Cause::Compaction)),
             Room::No => Some(proto_fs::NO_SPACE),
         }
     }
@@ -3356,8 +3362,18 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     /// The copy of the lower file at the leaf of the first leg is queued; its ticket is the answer.
     fn stage_copy_reserve(&mut self, job: &mut ChangeJob<V, L>) -> F<Flow> {
         let path = &job.a.plain[..job.a.parts.len];
+        // The names of the path (the directories that are copied up and the file) take room in the
+        // arena at the commit: ask now, so that the copy is not made and thrown away.
+        let need: usize = path
+            .split(|&b| b == b'/')
+            .filter(|c| !c.is_empty())
+            .map(|c| crate::index::HEADER + c.len())
+            .sum();
+        if let Some(code) = Self::room_code(self.index.room_bytes(need)) {
+            return fail(code);
+        }
         let Some(ticket) = self.copies.reserve(path, job.copy_kind, job.copy_stat) else {
-            return fail(proto_layer::STARTING);
+            return fail(starting::code(Cause::Copies));
         };
         job.ticket = ticket;
         Ok(Flow::Pure)
@@ -3376,13 +3392,15 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         let mut live = [0u8; 512];
         let n = self.leg_vpath(&job.a, job.a.parts.len, false, &mut live)?;
         let parent = job.dir_a;
-        if let Some(code) = self.no_room(parent, job.a.leaf_name()) {
-            // The arena is waiting for its compaction: the copy is dropped quietly, the waiters
-            // ask again and find the name as it is then.
-            let code = if code == proto_layer::STARTING {
+        let room = self.index.room(parent, job.a.leaf_name());
+        if room != Room::Yes {
+            // The reserve asked for room before the copy, so this is a rare race: the copy is
+            // dropped. The arena waiting for its compaction drops it quietly (the waiters ask again
+            // and find the name as it is then); no space is an answer.
+            let code = if room == Room::Later {
                 0
             } else {
-                code
+                proto_fs::NO_SPACE
             };
             return self.copy_gone(job, code);
         }

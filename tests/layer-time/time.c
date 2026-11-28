@@ -2,12 +2,14 @@
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
 /*
- * The measurement of the layered root on a machine. A POSIX process of the root that init starts
- * after the layer service said READY (the feature `layer-time` of init, `cargo xtask aws image
- * --layered`). It prints one line for each number and ends with "layer-time: done":
+ * The measurement of the layered root on a machine. A fresh process of the shell that the boot
+ * script runs (/etc/rc.d/layer-time) once the layer service said READY (the image of `cargo xtask
+ * aws image --layered`). It prints one line for each number and ends with "layer-time: done":
  *
- *   the first path of a fresh process: the stat of /etc takes the root of the layer service
- *   (TakeRoot), a session (SESSION) and the STAT itself; the second stat is the steady cost
+ *   the first path of a fresh process: the stat of /etc binds the identity to the session the
+ *   process has from its parent (BIND) and does the STAT; a process with no session takes the root
+ *   (TakeRoot) and a session (SESSION) first. The line tells how many of each it made; the second
+ *   stat is the steady cost
  *   the copy up of lower files of 1 KiB, 1 MiB and 16 MiB: the time of the open for writing, which
  *   returns when the copy is visible, and the MiB per second
  *   the open of the same files again, after the copy (the file of the layer)
@@ -27,6 +29,9 @@
 #include <unistd.h>
 
 extern uint32_t lt_starting(void);
+extern uint32_t lt_take_roots(void);
+extern uint32_t lt_sessions(void);
+extern uint32_t lt_binds(void);
 
 #define DIR "/usr/share/layer-time/"
 #define KIB (1024ULL)
@@ -89,9 +94,23 @@ int main(void) {
         printf("layer-time: stat of /etc failed, errno %d\n", errno);
         failed++;
     } else {
-        printf("layer-time: first path of a fresh process (TakeRoot, SESSION, STAT of /etc): "
-               "%llu us\n",
+        /* The label of the line says what the first path does: the calls are counted, and a
+         * line that names TakeRoot, SESSION and BIND needs one of each. */
+        uint32_t roots = lt_take_roots(), sessions = lt_sessions(), binds = lt_binds();
+        printf("layer-time: first path of a fresh process (TakeRoot %u, SESSION %u, BIND %u, STAT "
+               "of /etc): %llu us\n",
+               (unsigned)roots, (unsigned)sessions, (unsigned)binds,
                (unsigned long long)(t1 - t0));
+        /* A child of the shell has its session with the layer service from the parent (a clone
+         * made at the spawn): its first path is a BIND and the STAT. A process with no session
+         * takes the root and a session first, one of each. Anything else is a label that is wrong. */
+        if (binds != 1 || sessions != roots || roots > 1) {
+            printf("layer-time: the first path made %u TakeRoot, %u SESSION, %u BIND calls: not "
+                   "the BIND of a child and not the TakeRoot, SESSION, BIND of a process with no "
+                   "session\n",
+                   (unsigned)roots, (unsigned)sessions, (unsigned)binds);
+            failed++;
+        }
     }
     t0 = now_us();
     r = stat("/etc", &st);
@@ -112,6 +131,11 @@ int main(void) {
                "%lld us\n",
                (long long)us);
     }
+    /* The layer service prints the counts of the answers STARTING by cause when they grow and a
+     * request comes after half a second: wait, and ask once more. */
+    struct timespec pause = {0, 700000000L};
+    nanosleep(&pause, NULL);
+    r = stat("/etc", &st);
     printf("layer-time: answers STARTING of the layer service to this process: %u\n",
            (unsigned)lt_starting());
     if (failed != 0) {

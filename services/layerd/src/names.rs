@@ -86,28 +86,22 @@ pub enum Done<P> {
 /// The times a build starts again under another seed before it leaves names out.
 pub const RESEEDS: u8 = 3;
 
-/// The seed of the next build: a mix of the last one and the number of the attempt.
-/// A listing in the middle of the list of a directory's names (the first stage, past `.` and `..`)
-/// holds the directory open in the index; one at the start, in the second stage, or put back by a
-/// seek does not.
+/// A listing holds the directory open in the index from the first name it gives (the first
+/// stage, past `.` and `..`) until it closes, the directory goes, or it is put back to the start:
+/// a seek may return to any cursor the replies gave, so the entry at one must stay in the list of
+/// the directory (as a gone entry when it is removed) for as long as the cursor may be used.
 fn settle<D>(index: &mut Index, desc: &mut crate::descriptions::Description<D>) {
     let inside = desc.position.stage == 0 && desc.position.at > 2;
-    match (inside, desc.walk) {
-        (true, None) => {
-            if let Some(key) = index.dir_key(desc.dir)
-                && index.walk_enter(key)
-            {
-                desc.walk = Some(key);
-            }
-        }
-        (false, Some(key)) => {
-            index.walk_leave(key);
-            desc.walk = None;
-        }
-        _ => {}
+    if inside
+        && desc.walk.is_none()
+        && let Some(key) = index.dir_key(desc.dir)
+        && index.walk_enter(key)
+    {
+        desc.walk = Some(key);
     }
 }
 
+/// The seed of the next build: a mix of the last one and the number of the attempt.
 fn next_seed(seed: u64, attempt: u64) -> u64 {
     let mut h = seed ^ attempt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     h ^= h >> 30;
@@ -602,7 +596,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     pub(crate) fn gate(&self) -> Result<(), Status> {
         match self.state {
             State::Ready => Ok(()),
-            State::Starting => Err(st(l::STARTING)),
+            State::Starting => Err(st(crate::starting::code(crate::starting::Cause::Build))),
             State::NoStore => Err(st(l::NO_STORE)),
             State::Damaged => Err(st(l::DAMAGED)),
             State::Failed(code) => Err(st(code)),
@@ -1219,7 +1213,11 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             resolving,
             &mut desc.replayed,
         )?;
-        settle(index, desc);
+        // Back at the start: the cursors given so far are no more, so the hold goes with them.
+        desc.given = crate::descriptions::Position::default();
+        if let Some(key) = desc.walk.take() {
+            index.walk_leave(key);
+        }
         Ok(())
     }
 

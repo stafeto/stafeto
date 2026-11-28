@@ -205,6 +205,7 @@ enum Attempt {
 
 /// The root of the service from the process service (TakeRoot).
 fn take_root() -> Result<Handle<Channel>, Attempt> {
+    TAKEN[0].fetch_add(1, Ordering::Relaxed);
     let mut request = Writer::new();
     proto_process::take_root(proto_process::ROOT_LAYER, &mut request)
         .map_err(|_| Attempt::Failed(EIO))?;
@@ -243,6 +244,19 @@ fn is_busy(status: u32) -> bool {
 /// start reads it).
 static STARTING_ANSWERS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// The calls this process made to take its place with the layer service: TakeRoot, SESSION and BIND
+/// (the measurement of the first path of a process counts them, so its label is checked).
+static TAKEN: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+
+/// The calls of TakeRoot, SESSION and BIND this process has made.
+pub fn taken() -> (u32, u32, u32) {
+    (
+        TAKEN[0].load(Ordering::Relaxed),
+        TAKEN[1].load(Ordering::Relaxed),
+        TAKEN[2].load(Ordering::Relaxed),
+    )
+}
+
 /// How many times the layer service answered STARTING to this process.
 pub fn starting_answers() -> u32 {
     STARTING_ANSWERS.load(Ordering::Relaxed)
@@ -251,6 +265,7 @@ pub fn starting_answers() -> u32 {
 /// A session from the root: SESSION with a copy of the identity session, which the service vouches
 /// for before it answers. One try.
 fn take_session(root: &Handle<Channel>) -> Result<Handle<Channel>, Attempt> {
+    TAKEN[1].fetch_add(1, Ordering::Relaxed);
     let request = NameMethod::Session.header().bytes();
     let copy = crate::data::identity_copy().map_err(Attempt::Failed)?;
     let mut reply = match rt::sys::send_handles(root, &request, [copy]) {
@@ -284,7 +299,12 @@ fn take_session(root: &Handle<Channel>) -> Result<Handle<Channel>, Attempt> {
 static TAKE: posix_sync::LayerLock = posix_sync::LayerLock::new();
 
 /// The calls repeated for a service that is busy or builds its index, a millisecond apart: a
-/// second for a busy service, five for the first requests of a service that starts.
+/// second for a busy service, five for the first requests of a service that starts. The longest
+/// wait the service itself asks for is a compaction of its arena of names that a new name waits for
+/// (STARTING for every such change until it ends): a step moves at most 48 blocks, and each step is
+/// a few microseconds of a CPU under the 50 microseconds in 10 ms of the loop's budget, so the
+/// arena of 256 KiB takes under a second at the worst (names of one byte) and about 0.3 s with
+/// names of 100 bytes: the window covers it five times over.
 const BUSY_TRIES: u32 = 5000;
 
 /// Waits a millisecond with a timed sleep that is no point of cancellation, as `data` does.
@@ -379,6 +399,7 @@ struct Got {
 /// BIND with a copy of the identity session: INVALID_ARGUMENT for a session that is bound already
 /// (a thread of the process was first) counts as done.
 fn bind(session: rt::abi::Handle) -> Result<(), i32> {
+    TAKEN[2].fetch_add(1, Ordering::Relaxed);
     let request = NameMethod::Bind.header().bytes();
     let channel = Handle::<Channel>::borrowed(session);
     let mut tries = 0;

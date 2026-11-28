@@ -143,6 +143,51 @@ fn build_time() -> (u64, u64) {
     )
 }
 
+/// The total of the answers STARTING when the last line was printed, and the time of it (ns).
+static STARTING_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static STARTING_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The line of the answers STARTING by cause, `layerd: STARTING answered build 3, jobs 0, ...`, when
+/// the counts have grown since the last line and half a second has passed (`force`: at once). The
+/// service has no timer, so the lines come with the requests; the measurement asks once more after
+/// a pause.
+fn starting_line(force: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let counts = layerd::starting::counts();
+    let total: u32 = counts.iter().sum();
+    let now = rt::time::ticks_to_ns(rt::time::now());
+    if total == STARTING_SEEN.load(Relaxed) && !force {
+        return;
+    }
+    if !force && now < STARTING_AT.load(Relaxed) + 500_000_000 {
+        return;
+    }
+    STARTING_SEEN.store(total, Relaxed);
+    STARTING_AT.store(now, Relaxed);
+    let c = counts;
+    rt::println!(
+        "layerd: STARTING answered {total}: build {} notary {} jobs {} copies {} compaction {} reaper {} listing {} lock {}",
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        c[4],
+        c[5],
+        c[6],
+        c[7]
+    );
+}
+
+/// The numbers of the line of the build of the index.
+struct BuildReport {
+    added: u32,
+    deleted: u32,
+    ms: u64,
+    steps: u32,
+    overruns: u64,
+    up: u64,
+}
+
 struct Cell<T>(UnsafeCell<T>);
 
 // SAFETY: every cell is used from the one thread of the loop (the registrar thread only reads
@@ -212,6 +257,10 @@ fn touch_stack() {
 }
 
 fn main(_: u64) -> u64 {
+    // The clock of the build of the index starts here: the connections, the first read of the
+    // volume and the table all count (the measurement reads READY of the data file service to
+    // READY of this one).
+    SERVE_START.store(rt::time::ticks_to_ns(rt::time::now()), Release);
     let Ok(mut s) = rt::startup() else {
         return NO_START_DATA;
     };
@@ -371,10 +420,10 @@ fn main(_: u64) -> u64 {
         next_birth: 1,
         sessions: [const { None }; SESSIONS],
         ready: false,
+        report: None,
     };
     // The loop is this thread: it works under its budget from here on, and a budget the kernel
     // refuses is a start error, since the thread would run without a limit.
-    SERVE_START.store(rt::time::ticks_to_ns(rt::time::now()), Release);
     match rt::budget::bind("layerd", rt::budget::SERVE, serve, &s.thread) {
         Err(_) => return BUDGET,
         Ok(Some(kept)) => {
@@ -472,6 +521,8 @@ struct Layerd {
     next_birth: u32,
     sessions: [Option<Record>; SESSIONS],
     ready: bool,
+    /// What the line of the build says, kept from the step that ended it to the next one.
+    report: Option<BuildReport>,
 }
 
 /// The numbers of the methods the service takes: LIST, STATUS and the methods of proto_layer that
@@ -525,7 +576,7 @@ impl Layerd {
             return Answer::Status(Status::Kernel(abi::Error::WrongType));
         };
         if !self.notary.ready(&self.parent, &self.process) {
-            return st(l::STARTING);
+            return st(layerd::starting::code(layerd::starting::Cause::Notary));
         }
         let Some(who) = self.notary.vouch(&brought).as_ref().and_then(vouched_from) else {
             return st(proto_fs::ACCESS_DENIED);
@@ -608,7 +659,7 @@ impl Layerd {
             return st(proto_fs::INVALID_ARGUMENT);
         }
         if !self.notary.ready(&self.parent, &self.process) {
-            return st(l::STARTING);
+            return st(layerd::starting::code(layerd::starting::Cause::Notary));
         }
         let Some(who) = self.notary.vouch(&brought).as_ref().and_then(vouched_from) else {
             return st(proto_fs::ACCESS_DENIED);
@@ -711,11 +762,12 @@ impl Layerd {
     /// gets: busy (`STARTING`) when the table is full or the session holds its share.
     fn place_for(&self, label: u64) -> Result<usize, Answer> {
         if !self.core.walkable() {
-            return Err(st(l::STARTING));
+            return Err(st(layerd::starting::code(layerd::starting::Cause::Build)));
         }
         let held: [Option<u64>; JOBS] =
             core::array::from_fn(|i| self.jobs[i].as_ref().map(|j| j.label));
-        layerd::jobs::place(&held, label).map_err(|_| st(l::STARTING))
+        layerd::jobs::place(&held, label)
+            .map_err(|_| st(layerd::starting::code(layerd::starting::Cause::Jobs)))
     }
 
     /// The request waits as the job in `place`.
@@ -765,7 +817,7 @@ impl Layerd {
             if let Stage::Opening(cont) = stage {
                 self.core.open_abandon(cont);
             }
-            return Some(st(l::STARTING));
+            return Some(st(layerd::starting::code(layerd::starting::Cause::Jobs)));
         };
         let Some(pending) = r.defer() else {
             return Some(Answer::Status(Status::BadSize));
@@ -1338,7 +1390,7 @@ impl Layerd {
                             // signal); none is told before its copy ends. A session over its share
                             // is told STARTING, and its program backs off.
                             if let copy::Added::Full(_) = self.waiters.add(label, ticket, handle) {
-                                return st(l::STARTING);
+                                return st(layerd::starting::code(layerd::starting::Cause::Copies));
                             }
                         }
                         match n::write_copying(ticket, r.reply()) {
@@ -1479,6 +1531,7 @@ impl Service<0> for Layerd {
     }
 
     fn request(&mut self, _: &mut Session<(), 0>, r: &mut Request<'_>) -> Answer {
+        starting_line(false);
         let method = r.method();
         // The method is the detail of the longest step of its kind (the line of the steps).
         #[cfg(feature = "steps")]
@@ -1536,17 +1589,37 @@ impl Service<0> for Layerd {
         if notice.label != LABEL_STEP {
             return;
         }
+        if let Some(r) = self.report.take() {
+            rt::println!(
+                "layerd: index of {} names and {} deletions built in {} ms, {} steps, {} overruns, READY at {} ms of uptime",
+                r.added,
+                r.deleted,
+                r.ms,
+                r.steps,
+                r.overruns,
+                r.up
+            );
+            starting_line(true);
+            return;
+        }
         if self.core.build_step() {
             if !self.ready {
                 self.ready = true;
                 let (added, deleted) = self.core.index.counts();
                 match self.core.state {
                     State::Ready => {
+                        // The lines wait for a step of their own: a line of the console is a
+                        // few thousand ticks, and the step that ends the build is long enough.
                         let (ms, overruns) = build_time();
-                        rt::println!(
-                            "layerd: index of {added} names and {deleted} deletions built in {ms} ms, {} steps, {overruns} overruns",
-                            self.core.build_steps()
-                        )
+                        let up = rt::time::ticks_to_ns(rt::time::now()) / 1_000_000;
+                        self.report = Some(BuildReport {
+                            added,
+                            deleted,
+                            ms,
+                            steps: self.core.build_steps(),
+                            overruns,
+                            up,
+                        });
                     }
                     other => rt::println!("layerd: not serving: {other:?}"),
                 }
@@ -1564,6 +1637,9 @@ impl Service<0> for Layerd {
                 }
                 if let Err(why) = rt::service::ready(&self.parent) {
                     rt::println!("layerd: READY refused: {why:?}");
+                }
+                if self.report.is_some() {
+                    let _ = sys::notify(&self.step, 1);
                 }
             }
         } else {

@@ -46,7 +46,7 @@ const COPY: bool = match option_env!("STAFETO_LAYER_NAMES_COPY") {
     None => true,
 };
 const COPIED_NAMES: u32 = if COPY { 2 } else { 0 };
-const NAMES_AFTER: u32 = NAMES + LOW_DEPTH + 2 - 1 + COPIED_NAMES;
+const NAMES_AFTER: u32 = NAMES + LOW_DEPTH + 2 - 1 + COPIED_NAMES + 1 + LOWMIX;
 const BIG: &str = "/lowbig/big";
 const BIG_BYTES: u64 = 64 << 20;
 const LISTED: usize = 1024;
@@ -54,6 +54,9 @@ const CHAIN: usize = 246;
 /// The links with long names the probe makes and removes (200 bytes: more than a quarter of the
 /// arena of 256 KiB once they are gone).
 const CHURN: usize = 380;
+/// The lower files of `/lowmix` (`xtask::layer_steps`): the probe makes a link next to each and
+/// removes the file, so the directory holds as many names of the layer as marks, in turn.
+const LOWMIX: u32 = 200;
 
 /// `count` times `piece`, then `tail`, in `out`; the text.
 fn chain<'a>(out: &'a mut [u8; 512], count: usize, piece: &str, tail: &str) -> &'a str {
@@ -121,6 +124,34 @@ fn list_etc(names: &rt::handle::Handle<rt::handle::Channel>) -> Option<Listed> {
             let _ = n::write_handle(NameMethod::Close, h, &mut w);
             let _ = call(names, w.as_bytes(), rt::handle::Outgoing::new());
             return Some(out);
+        }
+    }
+    None
+}
+
+/// The merged listing of `path` to its end: the entries, and those that start with `l` (the lower
+/// files the layer removed must not show).
+fn list_count(names: &Handle<Channel>, path: &str) -> Option<(u32, u32)> {
+    let Opened::Directory(h) = open(names, proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY, path)
+    else {
+        return None;
+    };
+    let (mut all, mut lower) = (0, 0);
+    for _ in 0..2000 {
+        let mut w = Writer::new();
+        n::write_handle(NameMethod::ReadDir, h, &mut w).ok()?;
+        let a = call(names, w.as_bytes(), rt::handle::Outgoing::new())?;
+        let (more, _, entries) = n::read_dir_reply(a.all()).ok()?;
+        for e in entries {
+            let e = e.ok()?;
+            all += 1;
+            lower += u32::from(e.name.first() == Some(&b'l'));
+        }
+        if !more {
+            let mut w = Writer::new();
+            let _ = n::write_handle(NameMethod::Close, h, &mut w);
+            let _ = call(names, w.as_bytes(), rt::handle::Outgoing::new());
+            return Some((all, lower));
         }
     }
     None
@@ -576,25 +607,63 @@ fn changes(
             result
         },
     );
-    // 9. The counts after all of it, when the reaper is done.
+    // 9. A directory that mixes names and marks: a link made next to each lower file, and the file
+    // removed, so the list of the directory alternates one and the other. The listing is the
+    // worst request of the first stage: it looks at the most entries (marks that it drops among
+    // the names it gives), and the gate judges it.
+    t.check(
+        "a directory that mixes 200 names and 200 marks lists whole",
+        {
+            let mut result = Ok(());
+            for k in 0..LOWMIX {
+                let mut link = Text::new();
+                let mut lower = Text::new();
+                {
+                    use core::fmt::Write as _;
+                    let _ = write!(link, "/lowmix/s{k:03}");
+                    let _ = write!(lower, "/lowmix/l{k:03}");
+                }
+                if change(names, n::ChangeOp::Symlink, 0, link.as_str(), "/target") != 0 {
+                    result = Err(format_args!("a link was not made"));
+                    break;
+                }
+                if change(names, n::ChangeOp::Unlink, 0, lower.as_str(), "") != 0 {
+                    result = Err(format_args!("a lower file was not removed"));
+                    break;
+                }
+            }
+            if result.is_ok() {
+                result = match list_count(names, "/lowmix") {
+                    Some((all, 0)) if all == LOWMIX + 2 => Ok(()),
+                    _ => Err(format_args!(
+                        "the listing is not the 200 links and the dots"
+                    )),
+                };
+            }
+            result
+        },
+    );
+    // 10. The counts after all of it, when the reaper is done.
     let name = "status counts the names after the changes";
     let mut last = None;
     for _ in 0..6000 {
         last = status_of(control);
-        if last.is_some_and(|s| s.deleted == 0 && s.names == NAMES_AFTER) {
+        if last.is_some_and(|s| s.deleted == LOWMIX && s.names == NAMES_AFTER + LOWMIX) {
             break;
         }
         // SAFETY: a plain call of relibc.
         unsafe { usleep(10_000) };
     }
     match last {
-        Some(s) if s.added == NAMES_AFTER && s.deleted == 0 && s.names == NAMES_AFTER => {
+        Some(s)
+            if s.added == NAMES_AFTER && s.deleted == LOWMIX && s.names == NAMES_AFTER + LOWMIX =>
+        {
             t.ok(name);
         }
         Some(s) => t.fail(
             name,
             format_args!(
-                "added {} deleted {} names {}, due {NAMES_AFTER} and none",
+                "added {} deleted {} names {}, due {NAMES_AFTER}, {LOWMIX} and their sum",
                 s.added, s.deleted, s.names
             ),
         ),

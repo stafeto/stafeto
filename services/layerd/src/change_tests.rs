@@ -3075,7 +3075,12 @@ fn a_listing_in_the_middle_of_a_directory_loses_nothing_when_names_are_removed_a
             assert!(seen.contains(&name), "{name} was lost");
         }
     }
-    // The listing ended with the list of the directory, and the entries it held are taken out.
+    // The listing holds the directory until it closes (a seek may go back to a cursor it gave),
+    // and the entries it held are taken out then.
+    assert_eq!(core.index.walkers(box_key), 1);
+    while core.reap_step() {}
+    assert_eq!(core.index.pending(), 2 + 3 - 1);
+    core.close(40, h).unwrap();
     assert_eq!(core.index.walkers(box_key), 0);
     while core.reap_step() {}
     assert_eq!(core.index.pending(), 0);
@@ -3120,4 +3125,93 @@ fn a_merged_listing_of_1024_names_takes_a_request_for_each_46_names_and_one_for_
     // The names are six bytes: an entry takes `ENTRY_HEAD` and the name, so a reply holds
     // `abi::MESSAGE_MAX / (ENTRY_HEAD + 5)` at most and at least 46.
     assert!(requests <= 1024 / 46 + 4, "{requests}");
+}
+
+#[test]
+fn a_seek_back_into_the_layer_names_after_the_entry_there_was_removed_loses_and_repeats_nothing() {
+    let mut v = volume();
+    v.dir("/.layers/00/box", 0o755, 0);
+    for k in 0..120 {
+        v.file(&format!("/.layers/00/box/f{k:03}"), 0o644, 0, b"x");
+    }
+    let mut world = World::new();
+    let mut core = world.core(v);
+    ready(&mut core);
+    let (reply, _) = open(&mut core, 0, f::READ_ONLY | f::DIRECTORY_ONLY, "/box").unwrap();
+    let h = match OpenAnswer::read(&reply).unwrap() {
+        OpenAnswer::Directory { handle } => handle,
+        other => panic!("{other:?}"),
+    };
+    // The first reply, whose cursor stands at its last name; then the listing runs on into the
+    // second stage (the lower set has no /box, so it ends there).
+    let (bytes, len) = core.read_dir(40, h).unwrap();
+    let (_, cursor, entries) = n::read_dir_reply(&bytes[..len]).unwrap();
+    let first: Vec<String> = entries
+        .map(|e| String::from_utf8(e.unwrap().name.to_vec()).unwrap())
+        .filter(|n| n != "." && n != "..")
+        .collect();
+    let at_cursor = first.last().unwrap().clone();
+    let mut seen = first.clone();
+    loop {
+        let (bytes, len) = core.read_dir(40, h).unwrap();
+        let (more, c, entries) = n::read_dir_reply(&bytes[..len]).unwrap();
+        for e in entries {
+            let name = String::from_utf8(e.unwrap().name.to_vec()).unwrap();
+            if name != "." && name != ".." {
+                seen.push(name);
+            }
+        }
+        if !more {
+            assert_eq!(proto_fs::names::split_cursor(c).0, 1);
+            break;
+        }
+    }
+    assert_eq!(seen.len(), 120);
+    // The entry the cursor stands at is removed, and the listing goes back to the cursor.
+    unlink(&mut core, 0, &format!("/box/{at_cursor}")).unwrap();
+    core.seek_dir(40, h, cursor).unwrap();
+    let mut again = Vec::new();
+    loop {
+        let (bytes, len) = core.read_dir(40, h).unwrap();
+        let (more, _, entries) = n::read_dir_reply(&bytes[..len]).unwrap();
+        for e in entries {
+            let name = String::from_utf8(e.unwrap().name.to_vec()).unwrap();
+            if name != "." && name != ".." {
+                again.push(name);
+            }
+        }
+        if !more {
+            break;
+        }
+    }
+    // Every name that came after the cursor the first time comes again, once, and the removed
+    // name does not.
+    let after: Vec<&String> = seen[first.len()..].iter().collect();
+    let mut want: Vec<&String> = after;
+    want.sort();
+    let mut got: Vec<&String> = again.iter().collect();
+    got.sort();
+    assert_eq!(got, want);
+    // Back at the start the hold goes, and the gone entry is taken out.
+    core.rewind(40, h).unwrap();
+    while core.reap_step() {}
+    assert_eq!(core.index.pending(), 0);
+}
+
+#[test]
+fn a_copy_up_asks_for_room_in_the_arena_before_it_copies() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    // The arena waits for its compaction: the open for writing answers STARTING, nothing is
+    // queued and nothing is made in work/.
+    core.index.starve();
+    let opened = open(&mut core, 7, f::READ_WRITE, "/etc/copyme");
+    assert_eq!(opened.err(), Some(st(proto_layer::STARTING)));
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+    // After the compaction the copy goes.
+    while core.reap_step() {}
+    assert!(!core.index.starved());
+    let (reply, _) = open(&mut core, 7, f::READ_WRITE, "/etc/copyme").unwrap();
+    let _ = copying(&reply);
 }

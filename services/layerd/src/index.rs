@@ -19,8 +19,8 @@
 //!
 //! The names live in an arena (`ARENA` bytes, each name once) as blocks: a 4-byte header (the slot
 //! of the entry, the length of the name, a flag that says the block is dead) and the name. A name
-//! that leaves the index leaves a dead block, and the arena is compacted in place, a few hundred
-//! bytes in each step (`maintain_step`): a read pointer and a write pointer go up the arena, a live
+//! that leaves the index leaves a dead block, and the arena is compacted in place, 1 KiB and 48
+//! blocks at most in each step (`maintain_step`): a read pointer and a write pointer go up the arena, a live
 //! block moves down and its entry learns the new place in the same step. An insertion that finds no
 //! room in the arena is NO_SPACE too, unless compaction would make room (`Room::Later`: the change
 //! answers STARTING and the client asks again).
@@ -50,7 +50,7 @@ pub const ENTRIES_MAX: usize = 10_240;
 pub const ARENA: usize = 256 * 1024;
 pub const NAME_MAX: usize = 255;
 /// The bytes in front of a name in the arena.
-const HEADER: usize = 4;
+pub(crate) const HEADER: usize = 4;
 /// The dead flag of a block header; the slot is in the low 16 bits and the length of the name in
 /// the next 8.
 const DEAD: u32 = 1 << 31;
@@ -527,7 +527,8 @@ impl Index {
         self.dkey_of(id)
     }
 
-    /// `next_child` for the directory with the key `pkey`. A position whose entry is no longer in
+    /// `next_child` for the directory with the key `pkey`; it gives names (files, directories,
+    /// links), and passes marks and gone entries. A position whose entry is no longer in
     /// the directory (it was taken out after the listing let go of the directory) ends the list.
     pub fn next_child_of(&self, pkey: u32, after: usize, budget: &mut usize) -> NextChild {
         let mut at = if after == 0 {
@@ -546,7 +547,10 @@ impl Index {
             *budget -= 1;
             let slot = usize::from(at) - 1;
             last = usize::from(at);
-            if self.slots[slot].kind != Kind::Gone {
+            // A mark of deletion and a gone entry are no name: they are passed here, at the cost
+            // of a look (a listing has no use for them, and a trip out to its loop for each costs
+            // more than the walk).
+            if !matches!(self.slots[slot].kind, Kind::Gone | Kind::Whiteout) {
                 return NextChild::Found(last, u32::from(at));
             }
             at = self.next[slot];
@@ -739,8 +743,23 @@ impl Index {
         if p.place.is_none() {
             return Room::No;
         }
-        let need = HEADER + name.len();
-        if self.arena_len + need <= ARENA {
+        self.room_bytes(HEADER + name.len())
+    }
+
+    /// `room` for new names that take `need` bytes of the arena in all (their headers included): a
+    /// copy up asks for the names of its path before it copies, so a finished copy is not thrown
+    /// away at the commit. While a compaction that an insertion waits for runs (`starved`), every
+    /// such request waits for its end (`Later`): nothing is appended behind the pointers, and the
+    /// compaction takes one step ahead of the reaper's items in each turn, so it ends within
+    /// `ARENA / COMPACT_BYTES` steps at best and `ARENA / (HEADER + 1) / COMPACT_BLOCKS` at worst
+    /// (the client's window of STARTING covers the time, see `posix_abi::layer`).
+    pub fn room_bytes(&mut self, need: usize) -> Room {
+        if self.names() as usize >= ENTRIES_MAX || self.pending as usize >= PENDING_MAX {
+            return Room::No;
+        }
+        if self.starved {
+            Room::Later
+        } else if self.arena_len + need <= ARENA {
             Room::Yes
         } else if self.live_bytes + need <= ARENA {
             self.starved = true;
@@ -748,6 +767,17 @@ impl Index {
         } else {
             Room::No
         }
+    }
+
+    /// A test hook: an insertion waits for a compaction.
+    #[cfg(test)]
+    pub fn starve(&mut self) {
+        self.starved = true;
+    }
+
+    /// An insertion waits for the compaction of the arena.
+    pub fn starved(&self) -> bool {
+        self.starved
     }
 
     /// The most bytes a name below the directory `id` adds to its path.
@@ -979,7 +1009,7 @@ impl Index {
     /// One step of the work in the background: the sweep first, then the compaction. True while
     /// more is due.
     pub fn maintain_step(&mut self) -> bool {
-        if self.sweep_at.is_some() || self.sweep_dirty {
+        if !self.starved && (self.sweep_at.is_some() || self.sweep_dirty) {
             self.last_work = 2;
             self.sweep_step();
         } else if self.compacting || self.starved || self.garbage() * 4 > ARENA {
@@ -1687,7 +1717,10 @@ mod tests {
                         let mut must = std::vec::Vec::new();
                         let mut at = ix.head[pkey as usize];
                         while at != 0 {
-                            if ix.slots[usize::from(at) - 1].kind != Kind::Gone {
+                            if !matches!(
+                                ix.slots[usize::from(at) - 1].kind,
+                                Kind::Gone | Kind::Whiteout
+                            ) {
                                 must.push(u32::from(at));
                             }
                             at = ix.next[usize::from(at) - 1];
@@ -1865,6 +1898,47 @@ mod tests {
                 assert_eq!(ix.name(*id), Some(&name[..]));
             }
         }
+        check(&ix);
+    }
+
+    #[test]
+    fn while_a_compaction_waited_for_runs_every_new_name_waits_and_the_reaper_takes_its_step_first()
+    {
+        let mut ix = index();
+        ix.reseed(9);
+        let mut ids = std::vec::Vec::new();
+        let mut k = 0u32;
+        // Fill the arena with names of 200 bytes, then remove every other one.
+        loop {
+            let mut name = std::format!("n{k:05}-").into_bytes();
+            name.resize(200, b'q');
+            match ix.room(0, &name) {
+                Room::Yes => ids.push(ix.insert(0, &name, file(1)).unwrap()),
+                _ => break,
+            }
+            k += 1;
+        }
+        for (i, id) in ids.iter().enumerate() {
+            if i % 2 == 0 {
+                ix.remove(*id);
+            }
+        }
+        let name = [b'z'; 150];
+        // No room at the end of the arena, room after the compaction: wait.
+        assert_eq!(ix.room(0, &name), Room::Later);
+        assert!(ix.starved());
+        // Even a short name (that would fit behind the pointers) waits until the end.
+        for _ in 0..3 {
+            assert_eq!(ix.room(0, b"short"), Room::Later);
+            assert_eq!(ix.room_bytes(10), Room::Later);
+            if !ix.maintain_step() {
+                break;
+            }
+        }
+        while ix.maintain_step() {}
+        assert!(!ix.starved());
+        assert_eq!(ix.room(0, &name), Room::Yes);
+        assert_eq!(ix.room_bytes(1000), Room::Yes);
         check(&ix);
     }
 
