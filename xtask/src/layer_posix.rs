@@ -32,6 +32,18 @@ const ENDS: &str = "init: layer-posix ended: ";
 const PASSED: &str = "layer-posix: checks passed";
 const IMAGE: &str = "boot-layer-posix.img";
 
+/// The image is written under one name (the files of its lower set are the ones `rootfs::files_of`
+/// lists for the name), and the jobs of one `xtask ci` run side by side in a process, so the write is
+/// done one at a time and each run boots from a copy of its own.
+static IMAGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A number no other run of this process has.
+fn seq() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 const ASH_IMAGE: &str = "boot-layer-ash.img";
 const ASH_ENDS: &str = "init: busybox-probe ended: ";
 
@@ -419,8 +431,11 @@ pub fn read_ash(lines: &[String]) -> Result<(), String> {
 
 /// A disk for a run: the volume of the probe, made offline.
 fn new_disk() -> Result<Disk, String> {
-    let disk =
-        Disk(std::env::temp_dir().join(format!("stafeto-layer-posix-{}.img", std::process::id())));
+    let disk = Disk(std::env::temp_dir().join(format!(
+        "stafeto-layer-posix-{}-{}.img",
+        std::process::id(),
+        seq()
+    )));
     crate::data_image::make_layer_posix_volume(&disk.0, DISK_BYTES)?;
     Ok(disk)
 }
@@ -463,12 +478,24 @@ fn boot_until(
 ) -> Result<(qemu::Outcome, u64), String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
-    let image = write_boot_image_files(IMAGE, &programs(with), BOOT_PROFILE, env, extra)?;
+    let image = {
+        let _writing = IMAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let made = write_boot_image_files(IMAGE, &programs(with), BOOT_PROFILE, env, extra)?;
+        let own = made.with_file_name(format!(
+            "boot-layer-posix-run-{}-{}.img",
+            std::process::id(),
+            seq()
+        ));
+        std::fs::copy(&made, &own).map_err(|e| format!("{}: {e}", own.display()))?;
+        own
+    };
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::store(&disk.0, None));
     let started = std::time::Instant::now();
-    let output = run_until(cmd, limit, Some(stop), &kernel.elf)?;
-    Ok((output, started.elapsed().as_secs()))
+    let output = run_until(cmd, limit, Some(stop), &kernel.elf);
+    // The image is this run's alone.
+    let _ = std::fs::remove_file(&image);
+    Ok((output?, started.elapsed().as_secs()))
 }
 
 /// The lines of the probe, text after the prefix.
@@ -1031,8 +1058,9 @@ pub fn copy(machine: &qemu::Machine) -> Result<(), String> {
 
 fn copy_disk() -> Result<Disk, String> {
     let disk = Disk(std::env::temp_dir().join(format!(
-        "stafeto-layer-posix-copy-{}.img",
-        std::process::id()
+        "stafeto-layer-posix-copy-{}-{}.img",
+        std::process::id(),
+        seq()
     )));
     crate::data_image::make_layer_posix_volume(&disk.0, COPY_DISK_BYTES)?;
     Ok(disk)
@@ -1196,8 +1224,9 @@ pub fn cut_lower_files() -> Vec<crate::rootfs::RootFile> {
 
 fn small_disk(name: &str, bytes: u64) -> Result<Disk, String> {
     let disk = Disk(std::env::temp_dir().join(format!(
-        "stafeto-layer-posix-{name}-{}.img",
-        std::process::id()
+        "stafeto-layer-posix-{name}-{}-{}.img",
+        std::process::id(),
+        seq()
     )));
     crate::data_image::make_layer_posix_volume(&disk.0, bytes)?;
     Ok(disk)
@@ -1597,6 +1626,29 @@ mod tests {
         bad.retain(|l| l != "write-refused");
         assert!(read_ash(&bad).is_err());
         assert!(read_ash(&lines[1..]).is_err());
+    }
+
+    #[test]
+    fn jobs_that_run_side_by_side_never_share_a_disk() {
+        // The jobs of one `xtask ci` run in threads of one process: the name of the
+        // disk of a run is its own (a shared disk made QEMU fail to get its write lock).
+        let names: Vec<(String, std::path::PathBuf)> = std::thread::scope(|scope| {
+            let runs: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let disk = new_disk().unwrap();
+                        (format!("{}", seq()), disk.0.clone())
+                    })
+                })
+                .collect();
+            runs.into_iter().map(|run| run.join().unwrap()).collect()
+        });
+        for (i, a) in names.iter().enumerate() {
+            for b in &names[i + 1..] {
+                assert_ne!(a.0, b.0);
+                assert_ne!(a.1, b.1);
+            }
+        }
     }
 
     #[test]
