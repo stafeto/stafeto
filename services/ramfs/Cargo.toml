@@ -21,6 +21,9 @@ break-budget-unbound = []
 # Deliberate break (`cargo xtask layer-posix breaks`): a POSIX walk of a layered image that starts at
 # a descriptor expands a link or a `..` that reaches the root itself, and the write guard is off.
 break-layered-guard = []
+# Deliberate break (`cargo xtask layer-posix boot breaks`): the write guard is on from the start of
+# a layered service and not at GUARD, so a machine with no data volume cannot write.
+break-ramfs-guard-early = []
 # Read-only retained-session observation for the owner-death regression.
 auth-probe = []
 # A bounded receive pause for genuine queued-request signal cancellation.

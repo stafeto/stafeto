@@ -113,8 +113,10 @@ pub struct Start<'a> {
 }
 
 /// Starts the thread: the window made and given to the data file service, the thread created. The
-/// handle the loop kicks it with.
-pub fn start(start: Start<'_>) -> Result<Handle<Channel>, &'static str> {
+/// handle the loop kicks it with; None when the data file service has no volume (it answers the
+/// window NOT_READY): there is no layer to copy into, the service passes every path to the RAM file
+/// service (`Core::passes_all`), and no thread starts.
+pub fn start(start: Start<'_>) -> Result<Option<Handle<Channel>>, &'static str> {
     let memory = sys::mem_create(p::WINDOW_BYTES as u64).map_err(|_| "no memory for the window")?;
     sys::mem_map(
         start.process,
@@ -125,10 +127,12 @@ pub fn start(start: Start<'_>) -> Result<Handle<Channel>, &'static str> {
         Access::ReadWrite,
     )
     .map_err(|_| "the window did not map")?;
-    let mut data = Data {
-        session: start.data,
-    };
-    data.window(&memory).map_err(|_| "the window was refused")?;
+    let mut data = Data::new(start.data);
+    match data.window(&memory) {
+        Ok(()) => {}
+        Err(proto_wire::Status::Unknown(p::NOT_READY)) => return Ok(None),
+        Err(_) => return Err("the window was refused"),
+    }
     let jobs = sys::channel_create(LEVEL).map_err(|_| "no channel for the thread")?;
     let kick = sys::handle_label(&jobs, Rights::NOTIFY, LABEL_KICK, LEVEL)
         .map_err(|_| "no kick for the thread")?;
@@ -141,7 +145,7 @@ pub fn start(start: Start<'_>) -> Result<Handle<Channel>, &'static str> {
     MEMORY.store(memory.into_raw().0, Release);
     // The break `break-layerd-copy-in-loop` has no thread: the loop copies in its own steps.
     if cfg!(feature = "break-layerd-copy-in-loop") {
-        return Ok(kick);
+        return Ok(Some(kick));
     }
     // SAFETY: STACK is the thread's alone, and the page after the registrar's message buffer is
     // free.
@@ -159,7 +163,7 @@ pub fn start(start: Start<'_>) -> Result<Handle<Channel>, &'static str> {
     .map_err(|_| "no thread")?;
     sys::thread_start(&thread).map_err(|_| "the thread did not start")?;
     core::mem::forget(thread);
-    Ok(kick)
+    Ok(Some(kick))
 }
 
 /// The calls of a copy: the sessions, the window, and the cell, the first of the window.
@@ -174,9 +178,7 @@ impl Moves {
     fn from_statics() -> Moves {
         Moves {
             files: Files::from_sessions(Handle::from_raw(abi::Handle(FILES.load(Acquire))), None),
-            data: Data {
-                session: Handle::from_raw(abi::Handle(DATA.load(Acquire))),
-            },
+            data: Data::new(Handle::from_raw(abi::Handle(DATA.load(Acquire)))),
             memory: Handle::from_raw(abi::Handle(MEMORY.load(Acquire))),
         }
     }

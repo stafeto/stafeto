@@ -379,7 +379,7 @@ fn main(_: u64) -> u64 {
         index,
         scan,
         workers,
-        data::Data { session },
+        data::Data::new(session),
         lower::Ram::new(files),
         epoch,
     );
@@ -421,6 +421,8 @@ fn main(_: u64) -> u64 {
         sessions: [const { None }; SESSIONS],
         ready: false,
         report: None,
+        longest_step: 0,
+        longest_method: 0,
     };
     // The loop is this thread: it works under its budget from here on, and a budget the kernel
     // refuses is a start error, since the thread would run without a limit.
@@ -507,8 +509,8 @@ struct Layerd {
     changes: &'static mut [Change; JOBS + 1],
     /// The commit job (the last of `changes`) has a copy to make visible.
     commit: bool,
-    /// The kick of the worker thread.
-    kick: Handle<Channel>,
+    /// The kick of the worker thread (None with no data volume: the thread does not start).
+    kick: Option<Handle<Channel>>,
     /// The counters of the copies at the last line the service printed.
     copy_seen: (u32, u32, u32, u32),
     /// The notifications of the programs that wait for a copy (WAIT with a handle).
@@ -523,6 +525,10 @@ struct Layerd {
     ready: bool,
     /// What the line of the build says, kept from the step that ended it to the next one.
     report: Option<BuildReport>,
+    /// The longest step of the build by the clock (ticks), and the method of the longest call it
+    /// made to the data file service (0 for a step that made none).
+    longest_step: u64,
+    longest_method: u16,
 }
 
 /// The numbers of the methods the service takes: LIST, STATUS and the methods of proto_layer that
@@ -575,6 +581,10 @@ impl Layerd {
         let Ok(brought) = r.handles.take::<Channel>(0) else {
             return Answer::Status(Status::Kernel(abi::Error::WrongType));
         };
+        // No data volume: the root is the RAM file service's alone, and a program is told so.
+        if self.core.passes_all() {
+            return st(l::NO_STORE);
+        }
         if !self.notary.ready(&self.parent, &self.process) {
             return st(layerd::starting::code(layerd::starting::Cause::Notary));
         }
@@ -955,8 +965,8 @@ impl Layerd {
             sent = true;
         }
         self.note_copies("queued");
-        if sent {
-            let _ = sys::notify(&self.kick, 1);
+        if sent && let Some(kick) = &self.kick {
+            let _ = sys::notify(kick, 1);
             // The deliberate break `break-layerd-copy-in-loop`: the copy is made here, in this step.
             #[cfg(feature = "break-layerd-copy-in-loop")]
             {
@@ -1599,10 +1609,27 @@ impl Service<0> for Layerd {
                 r.overruns,
                 r.up
             );
+            let (calls, waited) = self.core.volume.stats.totals();
+            rt::println!(
+                "layerd: build made {calls} calls to the data file service and waited {} ms for them, the longest step took {} us ({})",
+                rt::time::ticks_to_ns(waited) / 1_000_000,
+                rt::time::ticks_to_ns(self.longest_step) / 1000,
+                data::method_name(self.longest_method)
+            );
             starting_line(true);
             return;
         }
-        if self.core.build_step() {
+        let started = rt::time::now();
+        self.core.volume.stats.begin_step();
+        let finished = self.core.build_step();
+        if !self.ready {
+            let took = rt::time::now().saturating_sub(started);
+            if took > self.longest_step {
+                self.longest_step = took;
+                self.longest_method = self.core.volume.stats.step_method();
+            }
+        }
+        if finished {
             if !self.ready {
                 self.ready = true;
                 let (added, deleted) = self.core.index.counts();
@@ -1637,6 +1664,14 @@ impl Service<0> for Layerd {
                 }
                 if let Err(why) = rt::service::ready(&self.parent) {
                     rt::println!("layerd: READY refused: {why:?}");
+                }
+                // The root is decided by the names now: the write guard of the RAM file service goes
+                // on (a machine with no data volume passes every path to that service and asks
+                // none).
+                match self.core.guard_lower() {
+                    Ok(true) => rt::println!("layerd: write guard of the root on"),
+                    Ok(false) => {}
+                    Err(why) => rt::println!("layerd: GUARD refused: {why:?}"),
                 }
                 if self.report.is_some() {
                     let _ = sys::notify(&self.step, 1);

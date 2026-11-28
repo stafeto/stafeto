@@ -13,6 +13,71 @@ use rt::sys;
 
 pub struct Data {
     pub session: Handle<Channel>,
+    /// What the calls cost the loop in time (the loop's calls alone are read; the worker's session
+    /// counts its own and nobody reads them).
+    pub stats: Stats,
+}
+
+impl Data {
+    pub fn new(session: Handle<Channel>) -> Data {
+        Data {
+            session,
+            stats: Stats::default(),
+        }
+    }
+}
+
+/// The calls to the data file service and the time spent waiting for their answers, in ticks: the
+/// measurement of the build of the index (`layerd: datafs ...` at READY) says how much of it the
+/// disk took. One thread uses it, so the cells are plain.
+#[derive(Default)]
+pub struct Stats {
+    calls: core::cell::Cell<u32>,
+    waited: core::cell::Cell<u64>,
+    /// The longest call since `begin_step`: its time and its method.
+    step_longest: core::cell::Cell<u64>,
+    step_method: core::cell::Cell<u16>,
+}
+
+impl Stats {
+    /// The calls made and the ticks waited for them since the start.
+    pub fn totals(&self) -> (u32, u64) {
+        (self.calls.get(), self.waited.get())
+    }
+
+    /// A step of the loop begins: the longest call of the step is looked for anew.
+    pub fn begin_step(&self) {
+        self.step_longest.set(0);
+        self.step_method.set(0);
+    }
+
+    /// The method of the longest call of the step since `begin_step` (0 when it made none).
+    pub fn step_method(&self) -> u16 {
+        self.step_method.get()
+    }
+
+    fn record(&self, method: u16, ticks: u64) {
+        self.calls.set(self.calls.get().wrapping_add(1));
+        self.waited.set(self.waited.get().saturating_add(ticks));
+        if ticks >= self.step_longest.get() {
+            self.step_longest.set(ticks);
+            self.step_method.set(method);
+        }
+    }
+}
+
+/// The name of a method of the data file service for a line of the measurement.
+pub fn method_name(method: u16) -> &'static str {
+    match Method::from_number(method) {
+        Some(Method::Open) => "OPEN",
+        Some(Method::Close) => "CLOSE",
+        Some(Method::Stat) => "STAT",
+        Some(Method::Readdir) => "READDIR",
+        Some(Method::Mkdir | Method::MkdirNumbered) => "MKDIR",
+        Some(_) => "other call",
+        None if method == 0 => "no call (the CPU)",
+        None => "unknown",
+    }
 }
 
 struct Buf {
@@ -27,7 +92,12 @@ impl Data {
     ) -> R<(sys::Reply, Buf)> {
         let mut w = Writer::new();
         build(&mut w)?;
-        let reply = match sys::send(&self.session, w.as_bytes()) {
+        let method = u16::from_le_bytes([w.as_bytes()[0], w.as_bytes()[1]]);
+        let sent = rt::time::now();
+        let answer = sys::send(&self.session, w.as_bytes());
+        self.stats
+            .record(method, rt::time::now().saturating_sub(sent));
+        let reply = match answer {
             Ok(reply) => reply,
             Err(abi::Error::PeerClosed) => {
                 rt::println!("layerd: the data file service went, ending for a new instance");

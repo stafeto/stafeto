@@ -478,6 +478,9 @@ fn main(_: u64) -> u64 {
         _windows: [ecam, bar],
         slba: [0; CELLS_N],
         errors: ERRORS_SHOWN,
+        budget: None,
+        budget_seen: 0,
+        budget_at: 0,
     };
     #[cfg(feature = "steps")]
     {
@@ -494,8 +497,10 @@ fn main(_: u64) -> u64 {
     };
     // The loop is this thread: it works under its budget from here on, and a budget the kernel
     // refuses is a start error, since the thread would run without a limit.
-    if rt::budget::bind("nvme", rt::budget::SERVE, serve, &s.thread).is_err() {
-        return BUDGET;
+    match rt::budget::bind("nvme", rt::budget::SERVE, serve, &s.thread) {
+        Err(_) => return BUDGET,
+        // Kept to count the overruns of the budget (`Disk::budget_line`).
+        Ok(kept) => disk.budget = kept,
     }
     let _ = rt::service::run::<Disk, SESSIONS, 0>(&channel, &mut disk, config);
     STOPPED
@@ -533,7 +538,16 @@ struct Disk {
     slba: [u64; CELLS_N],
     /// The I/O errors that may still print a line.
     errors: u8,
+    /// The loop's budget, to tell its overruns (a service that spends its budget goes to the
+    /// level 32 until the next period, and the reads of the volume wait for it).
+    budget: Option<Handle<rt::handle::Budget>>,
+    /// The overruns told so far and the time (ns) of the last line.
+    budget_seen: u64,
+    budget_at: u64,
 }
+
+/// The least time between two lines about the overruns of the budget.
+const BUDGET_LINE_NS: u64 = 1_000_000_000;
 
 /// The places of the staging cells.
 const CELLS_N: usize = proto_blk::CELLS as usize;
@@ -566,6 +580,34 @@ fn rejected(reject: Reject) -> Answer {
 }
 
 impl Disk {
+    /// A line when the loop's budget has overrun since the last one (at most one a second):
+    /// `nvme: serve budget overran <n> times, <m> since the last line, ran <us> us`. The
+    /// measurement of the layered root reads it to tell whether the reads of a build waited for the
+    /// budget (a service over its budget works at the level 32 until the next period).
+    fn budget_line(&mut self) {
+        let Some(budget) = &self.budget else {
+            return;
+        };
+        let Ok(info) = sys::budget_info(budget) else {
+            return;
+        };
+        if info.overruns == self.budget_seen {
+            return;
+        }
+        let now = time::ticks_to_ns(time::now());
+        if now < self.budget_at + BUDGET_LINE_NS {
+            return;
+        }
+        rt::println!(
+            "nvme: serve budget overran {} times, {} since the last line, ran {} us",
+            info.overruns,
+            info.overruns - self.budget_seen,
+            time::ticks_to_ns(info.ran) / 1000
+        );
+        self.budget_seen = info.overruns;
+        self.budget_at = now;
+    }
+
     /// The steps the library has for now, up to `STEPS`: the completions found tell their
     /// clients; the timer is armed again while a command is out.
     fn pump(&mut self) {
@@ -935,6 +977,7 @@ impl Service<0> for Disk {
     }
 
     fn notification(&mut self, n: Notice) {
+        self.budget_line();
         match n.source {
             Source::Interrupt => self.interrupt(n.label),
             Source::Timer if n.label == TIMER_LABEL && time::reached(self.deadline) => {
@@ -949,6 +992,7 @@ impl Service<0> for Disk {
     /// to see a controller that failed or a function that is gone.
     fn between_notifications(&mut self, n: Notice) {
         if n.source == Source::Timer && n.label == 0 {
+            self.budget_line();
             self.pump();
         }
     }

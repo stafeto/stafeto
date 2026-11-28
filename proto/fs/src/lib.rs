@@ -646,6 +646,15 @@ pub enum Method {
     /// client may keep a copy of the bytes of an immutable file for as long as it holds the
     /// description. No handles; one step of the service, O(1) in the description.
     SnapshotFd = 69,
+    /// No body, no handles; only a session of the boot profile (the layer service). The write
+    /// guard of a layered root goes on: from now a session of a POSIX process cannot write a name
+    /// outside the pass-through names (`names::PASS_THROUGH`, READ_ONLY_FILESYSTEM). The switch is
+    /// one way: a repeat changes nothing and nothing switches it off. PERMISSION for any other
+    /// session and for a service that is not layered (no `layered` argument from init). The layer
+    /// service sends it after its READY (the root is then decided by its names) and not at all when
+    /// the data volume is missing (the root then writes to memory). The number lies past the
+    /// methods 70 to 85 of the layer service, which this service does not serve.
+    Guard = 86,
 }
 
 impl Method {
@@ -720,6 +729,7 @@ impl Method {
             67 => Some(Self::ReadFdInto),
             68 => Some(Self::ReadAtFdInto),
             69 => Some(Self::SnapshotFd),
+            86 => Some(Self::Guard),
             _ => None,
         }
     }
@@ -728,7 +738,7 @@ impl Method {
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 67, 68, 69,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 67, 68, 69, 86,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
@@ -805,6 +815,18 @@ mod tests {
         assert!(METHODS.contains(&67) && METHODS.contains(&68));
         for number in 64..=66 {
             assert_eq!(Method::from_number(number), None);
+        }
+    }
+
+    /// GUARD has a number of its own, past the layer service's methods 70 to 85 (the two numberings
+    /// share a channel type in the tables of the probes).
+    #[test]
+    fn guard_is_listed_apart_from_the_names_of_the_layer_service() {
+        assert_eq!(Method::from_number(86), Some(Method::Guard));
+        assert!(METHODS.contains(&86));
+        for number in 70..=85 {
+            assert_eq!(Method::from_number(number), None, "{number}");
+            assert!(!METHODS.contains(&number));
         }
     }
 

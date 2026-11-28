@@ -3234,6 +3234,17 @@ impl Service<0> for Fs {
                     Err(code) => status(code),
                 }
             }
+            Some(Method::Guard) => {
+                if body.finish().is_err() || !r.handles.is_empty() {
+                    return Answer::Status(Status::BadSize);
+                }
+                // Only the boot profile (the layer service), and only a layered root.
+                if !matches!(s.data.binding, Binding::Boot) || !self.ram.storage.state.set_guarded()
+                {
+                    return status(proto_fs::PERMISSION);
+                }
+                Answer::Status(Status::Ok)
+            }
             Some(Method::Write) => {
                 if let Err(code) = self.authenticate(&mut s.data, r.label()) {
                     return status(code);

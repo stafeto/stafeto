@@ -464,6 +464,8 @@ pub struct FakeLower {
     pub times: BTreeMap<Vec<u8>, (i64, i64)>,
     /// The reads of links in flight, as the stats are.
     pub links: usize,
+    /// The GUARD requests the lower set got.
+    pub guards: usize,
 }
 
 /// A read of a link in flight.
@@ -604,6 +606,11 @@ impl Lower for FakeLower {
     type Dir = LowerDir;
     type Probe = FakeProbe;
     type Link = FakeLink;
+
+    fn guard(&mut self) -> R<()> {
+        self.guards += 1;
+        Ok(())
+    }
 
     fn open_dir_start(&mut self, path: &[u8]) -> R<LowerDir> {
         self.begin()?;
