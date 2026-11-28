@@ -474,18 +474,21 @@ pub const POWER: Record = Record {
 
 /// The launcher of the table with the layer service: the shell's programs reach every path of the
 /// root through that service, so the launcher waits for its READY (the index of the live layer is
-/// built) as well as for the host key service. A waited service has no waits of its own and a
-/// record waits for two services at most, so the wait for `pkgd` of `LAUNCHER` is left to the
-/// order of the table here (the store of the package service starts before the data service).
+/// built, at most `LAYERD_READY_MS`) as well as for the host key service and for the package
+/// service (a record waits for three services at most).
 pub const LAUNCHER_LAYERED: Record = Record {
     waits: &[
         Wait {
             service: "layerd",
-            deadline_ms: super::base::PKGD_READY_MS,
+            deadline_ms: super::base::LAYERD_READY_MS,
         },
         Wait {
             service: "datakey",
             deadline_ms: DATAKEY_READY_MS,
+        },
+        Wait {
+            service: "pkgd",
+            deadline_ms: super::base::PKGD_READY_MS,
         },
     ],
     ..LAUNCHER
@@ -1172,7 +1175,7 @@ mod tests {
             assert!(at("datafs") + 1 == at("layerd") && at("layerd") < at("datakey"));
             let launcher = layered.iter().find(|r| r.name == "busybox-probe").unwrap();
             let waited: Vec<_> = launcher.waits.iter().map(|w| w.service).collect();
-            assert_eq!(waited, ["layerd", "datakey"]);
+            assert_eq!(waited, ["layerd", "datakey", "pkgd"]);
             let on_zero = |table: &[Record]| -> u64 {
                 table
                     .iter()

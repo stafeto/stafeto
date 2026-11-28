@@ -17,6 +17,7 @@ pub mod drain;
 pub mod fifo;
 pub mod layer;
 pub mod open;
+pub mod script;
 mod target;
 pub use target::{FifoTarget, RamTarget};
 

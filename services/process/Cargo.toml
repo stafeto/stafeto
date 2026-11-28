@@ -28,6 +28,10 @@ exit-early = []
 # feature step-stats; xtask process-steps, under -icount).
 steps = ["rt/step-stats"]
 tty-probe = []
+# Deliberate breakage (`cargo xtask data-posix absent-break`): TakeRoot for a root the table does
+# not have answers UNREGISTERED ("not yet", where ABSENT is due), so a program of an image with no
+# layer service waits five seconds for a root that never comes.
+break-process-absent-wait = []
 # Exact SetId reply corruption and readonly Image handoff diagnostics.
 image-probe = []
 # Only the dedicated PID-lifetime image can query the shared page.

@@ -17,6 +17,13 @@ break-layer-clone = ["posix-crt/break-layer-clone"]
 break-layer-fd-guard = ["posix-crt/break-layer-fd-guard"]
 # The phases of the write probe (`cargo xtask layer-posix write`): the changes of names, and the
 # second boot on the same disk that reads what they left.
+# The scripts of a layer of the user, and a machine with no data volume (`cargo xtask layer-posix
+# script`, `cargo xtask layer-posix boot`).
+phase-script = []
+phase-bare = []
+# Deliberate breakage (cargo xtask layer-posix script breaks): the interpreter of a script is not
+# checked by the layer service.
+break-layer-script = ["posix-crt/break-layer-script"]
 phase-write = []
 phase-reread = []
 # The phases of the copy probe (`cargo xtask layer-posix copy`): the copy up of lower files, and the

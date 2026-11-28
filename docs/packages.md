@@ -859,7 +859,7 @@ command is out and no completion has come (and is the only way without MSI-X). A
 of 4 KiB reports `block` 4096, and a request that does not begin and end on a block is `INVALID`.
 `FLUSH` goes to the controller when it has a volatile write cache (VWC) and is done when the
 writes before it are, otherwise. The service is at level 39 with the budget `serve`, 100 us of each
-10 ms on CPU 0 (1 %, so the sum of CPU 0 in the shell image is 72 % of the 75 % the table allows). The layer service (`layerd`, init's feature `layered-root`, off until step C4 of the layered file system) takes 50 us of each 10 ms on CPU 0 (0.5 %, the loop's `serve`): the table of EC2 is then at the 75 % the budgets may take, with the reserve of 3 % for the process and package services whole.
+10 ms on CPU 0 (1 %, so the sum of CPU 0 in the shell image is 72 % of the 75 % the table allows). The layer service (`layerd`, init's feature `layered-root`, off by default until the index of a large layer builds fast: issue 657) takes 50 us of each 10 ms on CPU 0 (0.5 %, the loop's `serve`): the table of EC2 is then at the 75 % the budgets may take, with the reserve of 3 % for the process and package services whole.
 Init stops the controller with a normal shutdown (`CC.SHN`, confirmed by `CSTS.SHST`) and `CC` 0
 before it lets the DMA objects of an instance that ended go. The service writes to the whole disk
 it is given: the table names the data disk, and a disk with a system on it is never named.

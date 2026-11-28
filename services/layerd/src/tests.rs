@@ -319,6 +319,42 @@ fn with_no_volume_the_service_says_so() {
     );
 }
 
+/// The guard of the lower set's service goes on once, when the index is built and the root served:
+/// it is never asked while the index builds or on a machine with no volume, and a repeat asks
+/// nothing more.
+/// (The planted fault: the guard asked at the start, which `break-ramfs-guard-early` also plants in
+/// the service and `layer-posix boot breaks` catches on a machine with no volume.)
+#[test]
+fn the_write_guard_is_asked_once_after_the_index_is_built() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    core.prepare();
+    assert_eq!(core.guard_lower(), Ok(false), "the index is not built");
+    assert_eq!(core.lower.guards, 0);
+    while !core.build_step() {}
+    assert!(!core.passes_all());
+    assert_eq!(core.guard_lower(), Ok(true));
+    assert_eq!(core.guard_lower(), Ok(true));
+    assert_eq!(
+        core.lower.guards, 1,
+        "one request, however often it is asked"
+    );
+
+    let mut v = volume();
+    v.not_ready = true;
+    let mut world = World::new();
+    let mut core = world.core(v);
+    core.prepare();
+    assert!(core.passes_all());
+    assert!(core.build_step());
+    assert_eq!(
+        core.guard_lower(),
+        Ok(false),
+        "a root with no volume is not guarded"
+    );
+    assert_eq!(core.lower.guards, 0);
+}
+
 #[test]
 fn until_the_index_is_built_the_names_answer_starting() {
     let mut world = World::new();

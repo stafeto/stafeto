@@ -181,8 +181,10 @@
 //! handle without TRANSFER; there is no DUPLICATE), so that the process can send the root its two
 //! requests (SESSION and VERIFY_SESSION) and cannot copy it. The root hands out only sessions whose
 //! identity the process service vouches for, so a copy handed on is harmless.
-//! UNREGISTERED when the service has sent none, PERMISSION for any other root and for a session
-//! that is a loader's or a notary's. The work is one `handle_duplicate`: the process service
+//! UNREGISTERED when the service has sent none, ABSENT when the table of init has no such service at
+//! all (the list `roots=` in the own arguments of the process service, built from the table: a
+//! client that sees it will never get the root and does not wait), PERMISSION for any other root and
+//! for a session that is a loader's or a notary's. The work is one `handle_duplicate`: the process service
 //! never calls the data service for it.
 //!
 //! TtySignal, SetCtty and DropCtty, through a notary session whose label
@@ -272,6 +274,10 @@ pub const ORPHAN: u32 = 509;
 /// ShareHeld: the record's generation is not the one asked about; the client
 /// the question was for is gone (it asks Vouch again).
 pub const STALE: u32 = 510;
+/// TakeRoot for a root whose service the table of init does not have: no root will ever come, so
+/// the client remembers it and does not wait (UNREGISTERED means "not yet"). Added inside the open
+/// series 0.7 with no step of the version.
+pub const ABSENT: u32 = 511;
 
 /// The flags of Spawn: those of posix_spawnattr_setflags (Linux values).
 pub const SPAWN_SETPGROUP: u32 = 0x02;

@@ -1199,6 +1199,58 @@ fn parse_line(line: &[u8]) -> Option<GrantLine> {
     (seen == 31).then_some(out)
 }
 
+/// The line of the own arguments of the process service that lists the roots its table registers
+/// (`proto_process::ROOT_TERMINAL` and the others, by number, separated by commas): `roots=0,1,4\n`.
+/// A TakeRoot for a root that is not in the list answers ABSENT at once. Init builds the line from
+/// its table; `Grants::parse` leaves it out.
+pub const ROOTS_PREFIX: &[u8] = b"roots=";
+/// The longest line `write_roots` writes: the prefix, seven numbers, six commas and the newline.
+pub const ROOTS_LINE_MAX: usize =
+    ROOTS_PREFIX.len() + proto_process::ROOTS + (proto_process::ROOTS - 1) + 1;
+// One digit for each root, so a root number is below 10.
+const _: () = assert!(proto_process::ROOTS <= 10);
+
+/// Writes the line of the roots in `mask` (bit n for root n, below 10) into `out`, and returns its
+/// length. An empty mask writes the line with no number, which lists no root.
+pub fn write_roots(mask: u32, out: &mut [u8; ROOTS_LINE_MAX]) -> usize {
+    out[..ROOTS_PREFIX.len()].copy_from_slice(ROOTS_PREFIX);
+    let mut at = ROOTS_PREFIX.len();
+    let mut first = true;
+    for root in 0..proto_process::ROOTS as u8 {
+        if mask & (1 << root) != 0 {
+            if !first {
+                out[at] = b',';
+                at += 1;
+            }
+            out[at] = b'0' + root;
+            at += 1;
+            first = false;
+        }
+    }
+    out[at] = b'\n';
+    at + 1
+}
+
+/// The roots the own arguments `own` list, as a mask: None when they have no line of roots (the
+/// process service then answers UNREGISTERED alone), or when the line is at fault.
+pub fn roots_mask(own: &[u8]) -> Option<u32> {
+    let line = own
+        .split(|&b| b == b'\n')
+        .find(|line| line.starts_with(ROOTS_PREFIX))?;
+    let mut mask = 0;
+    for word in line[ROOTS_PREFIX.len()..]
+        .split(|&b| b == b',')
+        .filter(|w| !w.is_empty())
+    {
+        let n = number(word)?;
+        if n >= 32 {
+            return None;
+        }
+        mask |= 1 << n;
+    }
+    Some(mask)
+}
+
 impl Grants {
     pub const NONE: Grants = Grants {
         lines: [GrantLine::ZERO; GRANTS_MAX],
@@ -1212,7 +1264,8 @@ impl Grants {
         let mut grants = Grants::NONE;
         for (n, line) in own.split(|&b| b == b'\n').enumerate() {
             let line = text(line);
-            if line.iter().all(|&b| b == b' ') || line[0] == b'#' {
+            if line.iter().all(|&b| b == b' ') || line[0] == b'#' || line.starts_with(ROOTS_PREFIX)
+            {
                 continue;
             }
             let parsed = parse_line(line).ok_or(GrantsError(n + 1))?;
@@ -1604,6 +1657,27 @@ mod tests {
             ..stats
         };
         assert_eq!(far.write(&mut Writer::new()), Err(Status::BadSize));
+    }
+
+    /// The line of the roots is written as the process service reads it, and the grants skip it.
+    #[test]
+    fn the_line_of_roots_round_trips_and_the_grants_skip_it() {
+        let mut buf = [0; ROOTS_LINE_MAX];
+        for mask in [0, 1, 0b101_0010, 0b111_1111, 1 << 6] {
+            let n = write_roots(mask, &mut buf);
+            assert!(n <= ROOTS_LINE_MAX && buf[n - 1] == b'\n');
+            assert_eq!(roots_mask(&buf[..n]), Some(mask), "{mask:b}");
+            assert_eq!(Grants::parse(&buf[..n]).unwrap().len, 0);
+        }
+        // A line among the grants, in any place.
+        let own = b"grant a program=/bin/a under=x memory=64M places=1 depth=1\nroots=4,6\n";
+        assert_eq!(roots_mask(own), Some(0b101_0000));
+        assert_eq!(Grants::parse(own).unwrap().len, 1);
+        // No line, a word that is no number, a number past the mask.
+        assert_eq!(roots_mask(b""), None);
+        assert_eq!(roots_mask(b"grant a\n"), None);
+        assert_eq!(roots_mask(b"roots=4,x\n"), None);
+        assert_eq!(roots_mask(b"roots=40\n"), None);
     }
 
     #[test]

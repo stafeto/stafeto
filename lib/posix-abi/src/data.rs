@@ -15,8 +15,8 @@
 //!   bound to the process. A path under `/data` never goes to the RAM file service: while the
 //!   process service has no root (UNREGISTERED: the service has not registered it yet at boot, or
 //!   it is marked broken) the layer asks again every millisecond for a second, then answers EIO. An
-//!   image that has no data service gets EIO after that second for a path under `/data`; its files
-//!   are never below `/data` (xtask refuses them). A session that arrived in the slot
+//!   image that has no data service (ABSENT: its table lists none) gets EIO at once for a path under
+//!   `/data`, with no wait; its files are never below `/data` (xtask refuses them). A session that arrived in the slot
 //!   Data (a fork, a spawn or an exec) is unbound or has lapsed: the first call that needs an
 //!   identity answers NOT_BOUND, and the layer sends BIND with a copy of the identity session and
 //!   asks once more. What a description holds is read without a binding.
@@ -170,6 +170,8 @@ pub fn session() -> Option<rt::abi::Handle> {
 enum Attempt {
     /// Not yet: the process service has no root (UNREGISTERED) or the service is busy.
     Retry,
+    /// The table of init has no data service (ABSENT): none will come.
+    Absent,
     /// The errno of the failure.
     Failed(i32),
 }
@@ -192,6 +194,10 @@ fn take_root() -> Result<Handle<Channel>, Attempt> {
         Ok(proto_process::UNREGISTERED) => {
             why!("TakeRoot: UNREGISTERED, no root yet");
             Err(Attempt::Retry)
+        }
+        Ok(proto_process::ABSENT) => {
+            why!("TakeRoot: ABSENT, no data service in this image");
+            Err(Attempt::Absent)
         }
         other => {
             why!("TakeRoot refused: {other:?}");
@@ -262,6 +268,9 @@ fn ensure() -> Result<rt::abi::Handle, i32> {
         if let Some(session) = session() {
             return Ok(session);
         }
+        if NEVER.load(Ordering::Acquire) {
+            return Err(EIO);
+        }
         let attempt = {
             let _held = TAKE.lock();
             if let Some(session) = session() {
@@ -285,10 +294,20 @@ fn ensure() -> Result<rt::abi::Handle, i32> {
                 why!("no session after a second of tries");
                 return Err(EIO);
             }
+            Attempt::Absent => {
+                // An image with no data service: a path under `/data` is EIO at once, now and
+                // for the rest of the process, with no second of waiting.
+                NEVER.store(true, Ordering::Release);
+                return Err(EIO);
+            }
             Attempt::Failed(errno) => return Err(errno),
         }
     }
 }
+
+/// The table of init has no data service (the process service answered ABSENT): the paths under
+/// `/data` are EIO with no further question.
+static NEVER: AtomicBool = AtomicBool::new(false);
 
 /// The session died with its instance: a later call takes a session of the new one.
 fn forget(raw: rt::abi::Handle) {

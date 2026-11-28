@@ -30,6 +30,9 @@ break-layer-route = ["layer"]
 break-layer-clone = ["layer"]
 # Deliberate breakage: a change of attributes through a description of a lower file is not refused.
 break-layer-fd-guard = ["layer"]
+# Deliberate breakage (cargo xtask layer-posix script breaks): the interpreter of a script of a layer of
+# the user is not checked by the layer service.
+break-layer-script = ["layer"]
 # Read-only resident named-open witness, absent from shipped builds.
 fifo-probe = []
 # threads::set_level, the levels of rtbench 2's threads (tests/rtbench-posix).

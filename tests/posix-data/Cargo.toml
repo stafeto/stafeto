@@ -14,7 +14,9 @@ test = false
 bench = false
 
 [dependencies]
-# The layer with the data file service at /data (the features `data` and `trace` of
+# The layer with the data file service at /data (the features `data`, `layer` and `trace` of
 # tools/layer-features.txt: libc.so has them, and a static program has them when it asks; `trace`
-# makes the layer print the step and the status behind each EIO).
-posix-crt = { path = "../../lib/posix-crt", features = ["data", "trace"] }
+# makes the layer print the step and the status behind each EIO). The image has no layer service:
+# the first check of the probe is that the process service says ABSENT and the layer client does
+# not wait.
+posix-crt = { path = "../../lib/posix-crt", features = ["data", "layer", "trace"] }

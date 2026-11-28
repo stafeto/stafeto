@@ -81,6 +81,10 @@ impl Lower for Ram {
     type Probe = Resolve;
     type Link = Link;
 
+    fn guard(&mut self) -> R<()> {
+        self.files.guard()
+    }
+
     fn open_dir_start(&mut self, path: &[u8]) -> R<Dir> {
         let flags = proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY;
         Ok(Dir::Opening(Resolve {

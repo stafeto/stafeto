@@ -1478,3 +1478,69 @@ fn a_root_entry_named_as_the_mount_is_a_conflict_only_when_the_mount_is_set() {
         LayerReply::Done { .. }
     ));
 }
+
+/// With the write guard on, the storage still attaches, replaces and detaches a layer (the calls
+/// `LayerStart` and `LayerStep` make, which no walk of a POSIX session guards), the new bytes show
+/// after the replacement and the name is gone after the detach, and a guarded walk that would create
+/// a name in the same directory is refused at each point. It does not run the layer session, the
+/// package service, a user's layer or an image.
+#[test]
+fn a_package_installs_upgrades_and_goes_under_the_write_guard() {
+    let mut ram = ram();
+    ram.storage.state.set_layered(true);
+    assert!(ram.storage.state.set_guarded());
+    let etc = Token {
+        slot: 1,
+        generation: 1,
+    };
+    let refuses_a_write = |ram: &mut Ram<'_>| {
+        let mut resolver = Resolve::with_intent(
+            &mut ram.storage,
+            b"/etc/user-file",
+            ROOT,
+            ROOT_USER,
+            Intent::Open {
+                flags: proto_fs::CREATE | proto_fs::READ_WRITE,
+            },
+        )
+        .unwrap();
+        resolver.guard_layered(false);
+        let result = loop {
+            match resolver.step(&mut ram.storage, ROOT_USER) {
+                Ok(Progress::More) => {}
+                other => break other,
+            }
+        };
+        resolver.release(&mut ram.storage);
+        result == Err(READ_ONLY_FILESYSTEM)
+    };
+    assert!(refuses_a_write(&mut ram));
+    // The install: the file of the package joins /etc, whose own names stay.
+    let v1 = Spec::new()
+        .push("/etc", rootfs_dir(0o755), 0)
+        .file("/etc/pkg.conf", 0o644, b"version 1")
+        .build();
+    assert_eq!(attach(&mut ram, 1, v1), LayerReply::Done { names: 2 });
+    let conf = path(&ram, "/etc/pkg.conf").unwrap();
+    assert_eq!(read_all(&ram, conf), b"version 1");
+    assert!(names(&ram, etc).contains(&"pkg.conf".into()));
+    assert!(
+        refuses_a_write(&mut ram),
+        "the guard stands while the layer is attached"
+    );
+    // The upgrade: the old layer goes and the new one comes; the lower set has the new bytes.
+    assert_eq!(detach(&mut ram, 1), LayerReply::Done { names: 2 });
+    settle(&mut ram);
+    let v2 = Spec::new()
+        .push("/etc", rootfs_dir(0o755), 0)
+        .file("/etc/pkg.conf", 0o644, b"version 2, longer")
+        .build();
+    assert_eq!(attach(&mut ram, 1, v2), LayerReply::Done { names: 2 });
+    let conf = path(&ram, "/etc/pkg.conf").unwrap();
+    assert_eq!(read_all(&ram, conf), b"version 2, longer");
+    // The removal: the file is gone from the lower set.
+    assert_eq!(detach(&mut ram, 1), LayerReply::Done { names: 2 });
+    settle(&mut ram);
+    assert_eq!(path(&ram, "/etc/pkg.conf"), Err(NO_ENTRY));
+    assert!(refuses_a_write(&mut ram));
+}

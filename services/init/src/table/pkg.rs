@@ -552,7 +552,8 @@ pub const LAYERD_BUDGETS: &[Budget] = &[Budget {
 /// The instance ends itself when its session with the data file service answers PEER_CLOSED (exit
 /// code 6), and init starts the next one, which waits for the new instance of that service. No
 /// exit code marks it broken: a start that fails the same way five times in a minute does (the
-/// rule of every record). The start is watched for 30 s: the first request to the data file service
+/// rule of every record). The start is watched for 60 s (`LAYERD_READY_MS`, the cap of the waits; temporary
+/// until the fast build of the index): the first request to the data file service
 /// waits for the end of its start (a blank volume is formatted first), and the build of the index
 /// of a layer of 8,192 names runs in steps after READY is not yet said.
 pub const LAYERD: Record = Record {
@@ -560,7 +561,7 @@ pub const LAYERD: Record = Record {
     program: "layerd",
     kind: Kind::Service(Watch {
         period_ns: 1000 * MS,
-        deadline_ns: 30_000 * MS,
+        deadline_ns: super::base::LAYERD_READY_MS as u64 * MS,
     }),
     priority: 34,
     ceiling: 34,

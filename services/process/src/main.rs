@@ -595,6 +595,10 @@ fn main(_: u64) -> u64 {
             }
         }
     }
+    // The roots the table of init registers: TakeRoot for another answers ABSENT.
+    if let Some(mask) = args.and_then(|a| proto_init::roots_mask(a.own)) {
+        owner.loader_roots.list(mask);
+    }
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {
