@@ -32,6 +32,11 @@ class LeakedNames(unittest.TestCase):
             MODULE.leaked_names({"stafeto_window_open", "stafeto_screen_describe", "malloc"}),
             ["stafeto_screen_describe", "stafeto_window_open"])
 
+    def test_the_wait_across_windows_is_found(self):
+        self.assertEqual(
+            MODULE.leaked_names({"stafeto_windows_wait", "stafeto_window_resize", "malloc"}),
+            ["stafeto_window_resize", "stafeto_windows_wait"])
+
     def test_the_functions_of_openwf_are_found(self):
         names = {"wfdCreateDevice", "wfdStafetoStream", "wfcCreateContext", "wfcCompose", "write"}
         self.assertEqual(

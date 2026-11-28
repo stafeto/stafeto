@@ -570,6 +570,25 @@ impl<H> Map<H> {
         Some((address, pages, object))
     }
 
+    /// The pages of the piece of `kind` that starts at `address`; None when no such piece is
+    /// there.
+    pub fn kind_piece_at(&self, kind: Kind, address: usize) -> Option<usize> {
+        let piece = self.piece(self.find(address)?);
+        (piece.address == address && self.object(piece.object()).kind == kind)
+            .then(|| piece.pages())
+    }
+
+    /// The piece of `kind` that starts at `address` leaves the map (the kernel's `mem_unmap` of
+    /// it succeeded) and its object goes to the caller to close. None when no such piece is
+    /// there.
+    pub fn unmap_kind_at(&mut self, kind: Kind, address: usize) -> Option<Object<H>> {
+        self.kind_piece_at(kind, address)?;
+        let at = self.find(address)?;
+        let object = self.piece(at).object();
+        self.remove_piece(at);
+        self.objects[object].take()
+    }
+
     /// The pages of the whole piece of a file cache's arena that starts at `address`; None when
     /// no such piece is there.
     pub fn cache_piece(&self, address: usize) -> Option<usize> {
@@ -1246,6 +1265,29 @@ mod tests {
         assert!(map.unmap_kind(Kind::Window).is_none());
         assert!(!map.meets_special(0x5000_0000, 100));
         assert_eq!(map.display_piece(), Some((0x2000_0000, 250)));
+    }
+
+    /// One window's buffers leave the map by address while the other windows' stay.
+    #[test]
+    fn a_window_buffer_leaves_by_its_address() {
+        let mut map = with_screen();
+        for (n, at) in [0x5000_0000usize, 0x5010_0000, 0x5020_0000]
+            .into_iter()
+            .enumerate()
+        {
+            let mut object = Object::new(20 + n as u32, false, None);
+            object.kind = Kind::Window;
+            map.push(at, 100, Access::ReadWrite, 0, object).unwrap();
+        }
+        assert_eq!(map.kind_piece_at(Kind::Window, 0x5010_0000), Some(100));
+        assert_eq!(map.kind_piece_at(Kind::Display, 0x5010_0000), None);
+        assert_eq!(map.kind_piece_at(Kind::Window, 0x5010_1000), None);
+        let object = map.unmap_kind_at(Kind::Window, 0x5010_0000).unwrap();
+        assert_eq!(object.handle, 21);
+        assert!(map.unmap_kind_at(Kind::Window, 0x5010_0000).is_none());
+        assert_eq!(map.kind_pieces(Kind::Window).count(), 2);
+        assert!(map.unmap_kind_at(Kind::Display, 0x5000_0000).is_none());
+        assert_eq!(map.kind_pieces(Kind::Window).count(), 2);
     }
 
     /// The sources of the display driver (the pool and the cursor picture)

@@ -253,17 +253,44 @@ the C functions (`window_c.rs`), `posix-abi` with the same feature the calls
 `libc.so` is built without the feature and the header lies outside the libc
 sysroot, so the series 0.5 of the ABI is as it was, and `tools/build-libc-so.py`
 refuses a build of `libc.so` that defines a name of the library
-(`stafeto_window_*`, `stafeto_screen_*`). A program that uses windows is a
+(`stafeto_window_*`, `stafeto_windows_*`, `stafeto_screen_*`). A program that uses windows is a
 statically linked one (`tests/posix-window` is the model); a later series
 moves the library into `libc.so` and gives the window's channel to `poll`.
 
-- The process has one window, number 0. `stafeto_window_open` asks DESCRIBE
-  for the screen (it waits for a display that is being set up), makes the
-  buffers (memory objects of the process, mapped as pieces of the memory map
-  of the kind `Window`, a page-rounded `4 w h` bytes each), a channel of its
-  own with a timer, WINDOW_CREATE with a copy of the channel (NOTIFY and
+- The process has up to 8 windows (`STAFETO_WINDOWS_MAX`), numbered from 0;
+  a new window takes the lowest free number, and the ninth is EAGAIN (so is
+  the service's own limit, which gives a context 4 windows). `stafeto_window_open`
+  asks DESCRIBE for the screen (it waits for a display that is being set up),
+  makes the buffers (memory objects of the process, mapped as pieces of the
+  memory map of the kind `Window`, a page-rounded `4 w h` bytes each), a
+  channel with a timer (the process's, made with its first window and closed
+  with its last), WINDOW_CREATE with a copy of the channel (NOTIFY and
   TRANSFER) and ATTACH with a copy of each buffer (MAP_READ and TRANSFER). A
   failure at any step closes what was made, so a failed open leaves nothing.
+  `struct stafeto_window` is the same 48 bytes as before.
+- One channel serves all the windows. The service holds a copy for each
+  window, labelled by `comp_client::table::label` (a tag, a sequence number
+  that grows with every copy handed out, and the window's number), and a
+  notification comes with that label, so the library lays the bits into the
+  right window's account (`absorb`). The sequence number keeps the end of a
+  closed window's copy (CLIENT_GONE) from marking the window that took its
+  number later. `stafeto_windows_wait(timeout, bits[8])` waits for bits of any
+  window: it returns the mask of the windows that have some and fills `bits`
+  (a window the service took away has `STAFETO_WINDOW_GONE`; bit 31 of the mask
+  is kept for the manager's ring). `stafeto_window_wait(win, ...)` keeps its
+  meaning; the bits it does not take stay in their windows' accounts. The
+  header says a program skips the events of a kind it does not know.
+- A window made with `STAFETO_WINDOW_RESIZABLE` has buffers of the whole
+  screen's lines (the stride of the screen, at most 1 MiB each), so its
+  capacity is the screen (`stafeto_window_capacity`); another window's capacity
+  is its line and the lines its pages hold (`comp_client::table::capacity`
+  computes what the service does at ATTACH). `stafeto_window_resize(win, w, h,
+  serial)` checks the capacity, sends SIZE and, once the service took it,
+  changes the size `stafeto_window_info` and the rectangles of POST use; the
+  service shows the new size when a frame takes the next posted buffer.
+  `stafeto_window_set_title` and `_set_app_id` send SET_TEXT (at most 64 bytes;
+  the service judges the UTF-8). The events CONFIGURE (8) and CLOSE_REQUEST (9)
+  and the state bits are in the header.
 - The account of the buffers is `comp_client::account`: a buffer is free at
   the start, a POST takes it out before the request goes (a failed POST gives
   it back), and only the service's bit for it brings it back. The service
@@ -276,22 +303,23 @@ moves the library into `libc.so` and gives the window's channel to `poll`.
   the window before anything is sent.
 - `stafeto_window_wait` is the wait of `fast::wait`: a try without waiting,
   the signals, the entries deferred, a receive with a timer for the bound.
-  A signal with a handler ends it with EINTR. One thread at a time waits and
-  one takes events; another gets EBUSY. Events the service gave beyond the
+  A signal with a handler ends it with EINTR. One thread at a time waits (on
+  any window) and one takes the events of a window; another gets EBUSY. Events the service gave beyond the
   caller's room wait in the library for the next call.
 - `stafeto_window_info(win, &out)` gives a library that draws into the window another
   part of the program opened (the EGL platform of stafeto, `docs/egl.md`) what
   `stafeto_window_open` gave: the size, the line, the format, the buffers and where they lie.
   EBADF for a number that is no open window. It asks nothing of the service.
-- `fork` gives the child no window (the state is reset in `after_fork`, and
-  the map of the child has no piece of a buffer); `exec` and
-  `stafeto_window_close` close the session, which ends the window in the
-  service, unmap the buffers and close the channel and the timer (a failed
-  unmap is told once on the console). A call that finds the service ended
+- `fork` gives the child no windows (the state is reset in `after_fork`, and
+  the map of the child has no piece of a buffer); `exec` closes every window
+  and `stafeto_window_close` one: the session closes, which ends the window in
+  the service, and the buffers are unmapped one by one by address (a failed
+  unmap is told once on the console); the channel and the timer close with the
+  last window. A call that finds the service ended
   (post, events, shown) answers ENODEV, and the calls after it too. The
   service holds a labelled copy of the window's channel (`handle_label`, one
   label for each try of WINDOW_CREATE): when its last copy goes the kernel
-  posts CLIENT_GONE in that session's slot of the window's channel, the
+  posts CLIENT_GONE in that session's slot of the channel, the
   library marks the window gone, and a `stafeto_window_wait` or
   `stafeto_window_wait_free` under way returns ENODEV. The label tells the end
   of the service's copy from the end of a copy it refused.
@@ -304,7 +332,7 @@ moves the library into `libc.so` and gives the window's channel to `poll`.
   answer EBUSY.
 - The generation: `stafeto_window_open` and `stafeto_window_info` give
   `struct stafeto_window.generation`, 1 for the first window of the process and
-  raised by each open. `stafeto_window_info` reads it before and after the
+  raised by each open (one counter for all windows). `stafeto_window_info` reads it before and after the
   description and answers EBADF when it moved, so a description never mixes two
   windows.
 - `stafeto_window_events` asks the service again while its replies are full
@@ -317,9 +345,11 @@ moves the library into `libc.so` and gives the window's channel to `poll`.
 
 `cargo xtask posix-window` runs `tests/posix-window` in an image of its own
 (`boot-posix-window.img`, the table `table::window`): the screenshots of QEMU
-after the first frame, a rectangle of the second buffer and the merge of
-five rectangles have the CRC-32 the program computed, and the bits, events,
-fork, a signal and close are checked by the program.
+after the first frame, a rectangle of the second buffer, the merge of
+five rectangles, three windows of one process shown together and the new size
+of one of them have the CRC-32 the program computed, and the bits of each
+window, the wait across windows, the title, the events, fork, a signal, close
+and exec are checked by the program.
 
 ## Limits accepted in stage G1
 
@@ -910,8 +940,8 @@ stays with them.
   the `id` of WINDOW_CREATE. `wfcNextStreamSTAFETO(dev, timeoutMs, &stream)`
   waits for the creation of a window (the scene's ring, up to 32 numbers kept)
   and gives its number. A source is made of the window of a producer, a mask of a
-  window of the format A8 (the process has one window; make the mask's window in
-  the holder). The service's LIST gives a window's size and no format, so the
+  window of the format A8 (the process has several windows now, and the service allows
+  a context four; make the mask's window in the holder). The service's LIST gives a window's size and no format, so the
   library takes the format as unknown at the creation and the service refuses a
   wrong kind at the commit.
 - **Calls.** Every attribute, element and the order of the scene lives in the

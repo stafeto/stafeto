@@ -14,9 +14,11 @@
  * `window` of the Rust crate posix-crt), outside libc.so, and the header is
  * outside the headers of the libc sysroot: a program that includes it has
  * its own copy of the layer's session with the display service. A process
- * has one window at a time (its number is 0); the number is in every call
- * so that a later revision of the library can lift the limit with no change
- * of the functions.
+ * has up to STAFETO_WINDOWS_MAX windows, numbered from 0: a new window takes
+ * the lowest number that is free, and the number is in every call. All the
+ * windows of a process share one channel to the service; the label the
+ * service sends with each notification says which window it is for, and
+ * stafeto_windows_wait waits across all of them.
  *
  * The size of the screen is what stafeto_screen_describe says. A point is a
  * 32-bit word stored low byte first: 0xXXRRGGBB (XRGB8888: the top byte is
@@ -27,10 +29,17 @@
  * and the child has no window. The window and its buffers go with
  * stafeto_window_close, exec and the end of the process.
  *
- * The window's size is fixed for its life (the protocol has no resize). A
- * window manager, when the image has one, may move the window, hide it and
- * give it the focus; the window learns of its focus from
- * STAFETO_WINDOW_EVENT_FOCUS_IN and _FOCUS_OUT events.
+ * A window made with STAFETO_WINDOW_RESIZABLE has buffers that hold the whole
+ * screen, and stafeto_window_resize changes its size inside what its buffers
+ * hold (stafeto_window_capacity). A window without the flag holds its own
+ * size, and it may be made smaller and grown back. A window manager, when
+ * the image has one, may move the window, hide it, give it the focus, ask it
+ * to change size (CONFIGURE) and ask it to close (CLOSE_REQUEST); the window
+ * learns of these from events. A window gives its title and the kind of its
+ * program to the manager with stafeto_window_set_title and _set_app_id.
+ *
+ * A program skips the events whose kind it does not know: later revisions of
+ * the service add kinds (the list below grows).
  *
  * Every function returns 0, a count, a mask or the window's number, or -1
  * with errno, as <stafeto/display.h> does (stafeto_window_free_buffers
@@ -58,6 +67,14 @@ extern "C" {
  * (OpenWF Composition's mask). It is never shown on the screen by itself. */
 #define STAFETO_WINDOW_A8 4
 
+/* The most windows of a process. */
+#define STAFETO_WINDOWS_MAX 8
+
+/* The flag of stafeto_window_open: the window's buffers hold the whole
+ * screen (at most 1 MiB each), so that stafeto_window_resize can grow it to
+ * the screen's size. The stride of such a window is the screen's line. */
+#define STAFETO_WINDOW_RESIZABLE 1u
+
 /* The most buffers of a window, the most rectangles the service takes in
  * one post (the library merges more, see stafeto_window_post), and the most
  * events one stafeto_window_events call returns. */
@@ -70,6 +87,10 @@ extern "C" {
  * 2) is free, and STAFETO_WINDOW_EVENTS says events came. */
 #define STAFETO_WINDOW_BUFFER(k) (1u << (k))
 #define STAFETO_WINDOW_EVENTS (1u << 3)
+/* Returned by stafeto_windows_wait alone, for a window the service took
+ * away or ended: the window's element of the bits array has it, and the
+ * calls on that window return ENODEV. */
+#define STAFETO_WINDOW_GONE (1u << 4)
 
 /* The flag of stafeto_window_events: events were dropped (the ring of 64
  * overflowed) since the call before. */
@@ -81,6 +102,18 @@ extern "C" {
 #define STAFETO_WINDOW_EVENT_BUTTON 3
 #define STAFETO_WINDOW_EVENT_FOCUS_IN 4
 #define STAFETO_WINDOW_EVENT_FOCUS_OUT 5
+/* The manager asks for a size: code holds the state bits below, value is
+ * the serial to give back to stafeto_window_resize, x and y are the width
+ * and height asked for (0 and 0: the program chooses). The program may
+ * answer with another size inside its capacity, or not answer. */
+#define STAFETO_WINDOW_EVENT_CONFIGURE 8
+/* The manager asks the window to close. The program decides. No fields. */
+#define STAFETO_WINDOW_EVENT_CLOSE_REQUEST 9
+
+/* The state bits of a CONFIGURE event's code. */
+#define STAFETO_WINDOW_STATE_MAXIMIZED 1u
+#define STAFETO_WINDOW_STATE_FULLSCREEN 2u
+#define STAFETO_WINDOW_STATE_RESIZING 4u
 
 /* The size of the screen and its format, as stafeto_screen_describe gives
  * them. flags and reserved are 0 in this revision. */
@@ -106,12 +139,13 @@ struct stafeto_rect {
     int32_t x, y, w, h;
 };
 
-/* An event of the window. KEY: code is Linux's key code, value 1 for the
+/* An event of the window. A kind the program does not know is skipped. KEY: code is Linux's key code, value 1 for the
  * press and 0 for the release (no repeat). MOVE: x and y are the pointer's
  * place in the window's coordinates. BUTTON: code is the button (Linux's
  * BTN_LEFT, 0x110, and the others), value as a key's, x and y as a
- * MOVE's. FOCUS_IN and FOCUS_OUT carry no number. The 16 bytes are the
- * service's own event. */
+ * MOVE's. FOCUS_IN and FOCUS_OUT carry no number. CONFIGURE and
+ * CLOSE_REQUEST are described above. The 16 bytes are the service's own
+ * event. */
 struct stafeto_window_event {
     uint16_t kind, code;
     int32_t value, x, y;
@@ -165,27 +199,29 @@ int stafeto_screen_describe(struct stafeto_screen *s);
 
 /* Makes a window of w by h points at (x, y) of the screen, with `buffers`
  * (1 to 3) buffers of the given format, and describes it in *out. flags is
- * 0 (EINVAL otherwise). The buffers are zero. All of them are free. The
+ * 0 or STAFETO_WINDOW_RESIZABLE (EINVAL otherwise). The buffers are zero.
+ * All of them are free. The
  * window shows once the first post is taken into a frame. With one buffer
  * the window shows one picture: its buffer never comes back. A program that
  * draws again uses two or three. Returns the window's number (0), or -1
  * with errno:
  *   ENODEV  as stafeto_screen_describe;
- *   EBUSY   the process has a window already, or the service is busy with
- *           another client's buffers and stayed so for half a second;
+ *   EBUSY   the service is busy with another client's buffers and stayed so
+ *           for half a second;
  *   EINVAL  the window is not inside the screen or is empty, the format is
  *           not one above, buffers is not 1 to 3, a buffer would be more
- *           than 1 MiB, flags is not 0, or out is null;
+ *           than 1 MiB, flags is not one above, or out is null;
  *   ENOMEM  the buffers do not fit the address space or the process's
  *           memory;
- *   EAGAIN  the service has no room for another window;
+ *   EAGAIN  the process has STAFETO_WINDOWS_MAX windows, or the service has
+ *           no room for another window (it limits the windows of a process);
  *   EINTR   a signal ended a wait for a display that is being set up or
  *           for the service;
  *   EIO     the service answered in a way the layer does not know.
- * On any failure the process has no window and nothing of it remains. The
+ * On any failure the window is not made and nothing of it remains. The
  * pixel memory of a window is the process's own and the service only reads
- * it, so no cache maintenance is needed. The window's size does not
- * change. */
+ * it, so no cache maintenance is needed. The window's size changes only with
+ * stafeto_window_resize. */
 int stafeto_window_open(int x, int y, int w, int h, uint32_t format,
                         uint32_t buffers, uint32_t flags,
                         struct stafeto_window *out);
@@ -199,7 +235,8 @@ int stafeto_window_open(int x, int y, int w, int h, uint32_t format,
  *   EINVAL  out is null.
  * The values are those of the window that is open now: a window closed and
  * opened again may have the same number and has another generation. No call
- * to the service. */
+ * to the service. The size is the one of the last stafeto_window_resize the
+ * library took. */
 int stafeto_window_info(int win, struct stafeto_window *out);
 
 /* Posts buffer `buffer` of window `win`: the service shows it in its next
@@ -209,7 +246,8 @@ int stafeto_window_info(int win, struct stafeto_window *out);
  * (this revision copies their bounding box) and keeps what the screen shows
  * outside what it copied. count 0 (r may be null) means the whole window.
  * Up to 4 rectangles go to the service as they are; 5 or more are merged
- * into one, their bounding box. Each must be inside the window. While
+ * into one, their bounding box. Each must be inside the window, in the size
+ * of the last stafeto_window_resize. While
  * posted, the buffer is the service's: the program may read it and does not
  * write it, until its bit says it is free (stafeto_window_wait). The latest
  * post wins: a buffer posted and not yet taken into a frame is replaced by
@@ -235,7 +273,7 @@ int stafeto_window_post(int win, uint32_t buffer, const struct stafeto_rect *r,
  * service. 0 for a win that is not open. */
 uint32_t stafeto_window_free_buffers(int win);
 
-/* Waits for a bit of the service on the window's own channel, at most
+/* Waits for a bit of the service for window `win` on the process's channel, at most
  * timeout_ns nanoseconds (0 looks without waiting, UINT64_MAX waits with no
  * limit), and returns in *bits (null is allowed) the bits that came since
  * the last call: STAFETO_WINDOW_BUFFER(k) bits and STAFETO_WINDOW_EVENTS.
@@ -250,8 +288,8 @@ uint32_t stafeto_window_free_buffers(int win);
  *   EINTR      a signal with a handler ran during the wait;
  *   EBADF      win is not the window's number;
  *   ENODEV     the service ended (known from an earlier call; see below);
- *   EBUSY      another thread of the process is waiting on the window in
- *              stafeto_window_wait (a thread in stafeto_window_wait_free is
+ *   EBUSY      another thread of the process is waiting for bits in
+ *              stafeto_window_wait or stafeto_windows_wait (a thread in stafeto_window_wait_free is
  *              no reason for it: this call then takes what waits on the
  *              channel without blocking and pauses a millisecond between
  *              looks, so a poll with a timeout of 0 answers at once);
@@ -264,6 +302,25 @@ uint32_t stafeto_window_free_buffers(int win);
  * A later descriptor for poll will only add a way to sleep;
  * stafeto_window_wait(win, 0, &bits) stays the call that takes the bits. */
 int stafeto_window_wait(int win, uint64_t timeout_ns, uint32_t *bits);
+
+/* Waits for bits of any window of the process, at most timeout_ns
+ * nanoseconds (0 looks without waiting, UINT64_MAX waits with no limit).
+ * bits (null is allowed) points to STAFETO_WINDOWS_MAX words: bits[k] gets
+ * the bits that came for window k since the last call that took them (each
+ * bit is returned by one call of this function or of stafeto_window_wait),
+ * 0 for a window with none or none open. A window the service took away has
+ * STAFETO_WINDOW_GONE in its word, and keeps it until the window is closed.
+ * The buffer bits are applied to the masks of stafeto_window_free_buffers
+ * before the call returns. Returns the mask of the windows that have bits
+ * (bit k for window k; bit 31 is kept for the manager's events, which this
+ * revision does not return), or -1 with errno:
+ *   ETIMEDOUT  no bit came in time;
+ *   EINTR      a signal with a handler ran during the wait;
+ *   EBADF      the process has no window;
+ *   EBUSY      another thread of the process is waiting for bits (in this
+ *              function or in stafeto_window_wait);
+ *   EIO        the kernel refused the wait. */
+int stafeto_windows_wait(uint64_t timeout_ns, uint32_t *bits);
 
 /* Waits until a buffer of `mask` (a mask of STAFETO_WINDOW_BUFFER(k) bits) is
  * free by the library's account, at most timeout_ns nanoseconds (0 looks
@@ -301,6 +358,39 @@ int stafeto_window_wait_free(int win, uint32_t mask, uint64_t timeout_ns,
 int stafeto_window_events(int win, struct stafeto_window_event *e, int max,
                           uint32_t *flags);
 
+/* Gives the window a title and the kind of its program (an application
+ * id), each a string of at most 64 bytes of UTF-8. A window manager shows
+ * them. 0, or -1 with errno:
+ *   EBADF   win is not an open window;
+ *   EINVAL  the string is null, longer than 64 bytes or not UTF-8 (the
+ *           service judges that);
+ *   ENODEV  the service ended or took the window away;
+ *   EIO     the service answered in a way the layer does not know. */
+int stafeto_window_set_title(int win, const char *title);
+int stafeto_window_set_app_id(int win, const char *app_id);
+
+/* The most width and height stafeto_window_resize takes for the window: for
+ * a window made with STAFETO_WINDOW_RESIZABLE the screen's size (less when
+ * a buffer of 1 MiB does not hold the screen); for another window the width
+ * of its line and the lines the pages of its buffers hold (a little over its
+ * height). 0, or -1 with errno EBADF when win is not an open window. w and h
+ * may be null. No call to the service. */
+int stafeto_window_capacity(int win, uint32_t *w, uint32_t *h);
+
+/* Changes the size of the window to w by h: the size of the next post (the
+ * service shows the old buffer in the old size until a frame takes the
+ * posted one, and a second resize before that post replaces the first). The
+ * window keeps its place, so it grows and shrinks at its right and bottom
+ * edges. serial is the serial of the CONFIGURE event this answers, or 0. The
+ * rectangles of the next post are in the new size, and so is the size
+ * stafeto_window_info gives (the stride stays). 0, or -1 with errno:
+ *   EBADF   win is not an open window;
+ *   EINVAL  w or h is 0 or past the capacity, or the service refused the
+ *           size (the window would reach outside the screen);
+ *   ENODEV  the service ended or took the window away;
+ *   EIO     the service answered in a way the layer does not know. */
+int stafeto_window_resize(int win, uint32_t w, uint32_t h, uint32_t serial);
+
 /* A helper for probes and screenshots: waits until the frame of the last
  * post is on the screen, that is, the service has shown a frame since and
  * is making none. It looks at the service every 2 ms, so it costs a call to
@@ -313,14 +403,15 @@ int stafeto_window_events(int win, struct stafeto_window_event *e, int max,
 int stafeto_window_shown(int win, uint64_t timeout_ns);
 
 /* Closes the window: the service forgets it (its place is painted again in
- * the next frame), the buffers leave the process and the channel and the
- * timer of the window close. 0, or -1 with errno EBADF when win is not the
- * window's number. */
+ * the next frame) and the buffers leave the process; the channel and the
+ * timer close with the last window. 0, or -1 with errno EBADF when win is
+ * not an open window's number. */
 int stafeto_window_close(int win);
 
 /* The calls are safe in several threads, except that one thread at a time
- * may wait (stafeto_window_wait; the second gets EBUSY), one at a time may
- * take events (the second gets EBUSY), and a call at the same time as
+ * may wait (stafeto_window_wait or stafeto_windows_wait, for all windows
+ * together; the second gets EBUSY), one at a time may take the events of a
+ * window (the second gets EBUSY), and a call at the same time as
  * stafeto_window_close in another thread is undefined (EBADF is the likely
  * answer). */
 

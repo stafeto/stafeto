@@ -9,8 +9,9 @@
 //! the window's number, or -1 with errno. The layouts of the structures are
 //! `comp_client::layout`, which holds the same assertions as the header.
 
-use comp_client::layout::{Rect, Screen, Window, WindowEvent};
-use core::ffi::c_int;
+use comp_client::layout::{self, Rect, Screen, Window, WindowEvent};
+use comp_client::table;
+use core::ffi::{c_char, c_int};
 use posix_abi::constants::EINVAL;
 use posix_abi::window;
 
@@ -62,10 +63,10 @@ pub unsafe extern "C" fn stafeto_window_open(
         return fail(EINVAL);
     }
     match window::open(x, y, w, h, format, buffers, flags) {
-        Ok(opened) => {
+        Ok((number, opened)) => {
             // SAFETY: the caller's pointer, checked for null.
             unsafe { out.write(opened) };
-            0
+            number
         }
         Err(errno) => fail(errno),
     }
@@ -207,6 +208,97 @@ pub extern "C" fn stafeto_window_shown(win: c_int, timeout_ns: u64) -> c_int {
 pub extern "C" fn stafeto_window_close(win: c_int) -> c_int {
     match window::close(win) {
         Ok(()) => 0,
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Waits for the bits of any window of the process; `bits[k]` gets window
+/// k's bits (0 for the windows with none) and the call returns the mask of
+/// the windows that have some.
+///
+/// # Safety
+/// `bits` is null or points to eight writable `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_windows_wait(timeout_ns: u64, bits: *mut u32) -> c_int {
+    let mut got = [0u32; table::WINDOWS_MAX];
+    match window::wait_all(timeout_ns, &mut got) {
+        Ok(mask) => {
+            if !bits.is_null() {
+                // SAFETY: the caller gives room for eight words.
+                unsafe { core::ptr::copy_nonoverlapping(got.as_ptr(), bits, got.len()) };
+            }
+            mask as c_int
+        }
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Gives the window a title (a C string of at most 64 bytes).
+///
+/// # Safety
+/// `title` is null or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_window_set_title(win: c_int, title: *const c_char) -> c_int {
+    set_text(win, layout::TEXT_TITLE, title)
+}
+
+/// Gives the window the kind of its program (a C string of at most 64
+/// bytes).
+///
+/// # Safety
+/// `app_id` is null or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_window_set_app_id(win: c_int, app_id: *const c_char) -> c_int {
+    set_text(win, layout::TEXT_APP, app_id)
+}
+
+fn set_text(win: c_int, which: u32, text: *const c_char) -> c_int {
+    if text.is_null() {
+        return fail(EINVAL);
+    }
+    // SAFETY: the caller's string, checked for null. A string past the longest
+    // text is cut one byte past it, which the layer refuses.
+    let bytes = unsafe {
+        let mut len = 0;
+        while len <= layout::TEXT_MAX && *text.add(len) != 0 {
+            len += 1;
+        }
+        core::slice::from_raw_parts(text.cast::<u8>(), len)
+    };
+    match window::set_text(win, which, bytes) {
+        Ok(()) => 0,
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Changes the window's size inside its capacity: the size of the next post.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_window_resize(win: c_int, w: u32, h: u32, serial: u32) -> c_int {
+    match window::resize(win, w, h, serial) {
+        Ok(()) => 0,
+        Err(errno) => fail(errno),
+    }
+}
+
+/// The most width and height `stafeto_window_resize` takes.
+///
+/// # Safety
+/// `w` and `h` are null or point to a writable `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_window_capacity(win: c_int, w: *mut u32, h: *mut u32) -> c_int {
+    match window::capacity(win) {
+        Ok((cap_w, cap_h)) => {
+            // SAFETY: the caller's pointers, checked for null.
+            unsafe {
+                if !w.is_null() {
+                    w.write(cap_w);
+                }
+                if !h.is_null() {
+                    h.write(cap_h);
+                }
+            }
+            0
+        }
         Err(errno) => fail(errno),
     }
 }

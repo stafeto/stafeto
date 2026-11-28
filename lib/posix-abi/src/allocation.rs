@@ -180,6 +180,8 @@ const KEPT: Rights = Rights::MAP_READ
 /// the cursor picture of the display driver (the target is a `Display` piece).
 /// `after_fork` keeps room for this many.
 pub(crate) const SOURCE_PIECES: usize = 2;
+/// The buffers of the windows of a process: eight windows of three buffers.
+const WINDOW_PIECES: usize = 24;
 
 /// Runs `f` on the heap and the map under the heap's lock.
 pub(crate) fn heap<R>(f: impl FnOnce(&mut State) -> R) -> R {
@@ -387,8 +389,8 @@ pub unsafe fn after_fork(
     {
         *slot = piece;
     }
-    // The buffers of the parent's window (up to three pieces).
-    let mut windows = [(0usize, 0usize); 3];
+    // The buffers of the parent's windows (up to three pieces each).
+    let mut windows = [(0usize, 0usize); WINDOW_PIECES];
     for (slot, piece) in windows
         .iter_mut()
         .zip(state.map.kind_pieces(posix_map::Kind::Window))
@@ -766,14 +768,20 @@ impl State {
         self.map_special_more(handle, pages, posix_map::Kind::Window)
     }
 
-    /// Every buffer of the window leaves the process (`mem_unmap`) and its
-    /// objects close; Ok when there are none. A refusal of the kernel stops
-    /// the walk with its errno, and the pieces not yet taken stay.
+    /// The buffer of a window at `address` leaves the process (`mem_unmap`) and
+    /// its object closes; EINVAL for an address that is no window buffer. A
+    /// refusal of the kernel gives its errno and the piece stays.
     #[cfg(feature = "window")]
-    pub(crate) fn unmap_windows(&mut self) -> Result<(), i32> {
-        while self.map.kind_piece(posix_map::Kind::Window).is_some() {
-            self.unmap_special(posix_map::Kind::Window)?;
-        }
+    pub(crate) fn unmap_window_piece(&mut self, address: usize) -> Result<(), i32> {
+        let Some(pages) = self.map.kind_piece_at(posix_map::Kind::Window, address) else {
+            return Err(EINVAL);
+        };
+        // SAFETY: the pages are the layer's own piece of the window's buffer,
+        // which the caller gives up.
+        unsafe { sys::mem_unmap(&config().process, address, (pages * PAGE) as u64) }
+            .map_err(|e| self.refused(e))?;
+        self.map.unmap_kind_at(posix_map::Kind::Window, address);
+        self.space.set(address, pages, Page::Unbacked);
         Ok(())
     }
 
