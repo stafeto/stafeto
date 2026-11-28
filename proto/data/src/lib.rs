@@ -139,6 +139,15 @@
 //!
 //! # Directory listing
 //!
+//! READDIR_ATTR (44, a native client's: the layered file service) lists a directory with the
+//! attributes of its entries and without `.` and `..`. The reply is `more` u32 and entries; an
+//! entry is `ino` u64, `kind` u32, `name_len` u32 (1 to `NAME_MAX`), `mode` u32, `uid` u32, `gid`
+//! u32 and the name: `DIR_ATTR_ENTRY_HEAD` (28) bytes and the name. The `ino`, `mode`, `uid` and
+//! `gid` of an entry equal what STAT gives for that name. The rest is as READDIR: the description
+//! needs the READ and DIRECTORY flags, the position moves past the entries given, `more` and the
+//! end are as below, and the two methods may be mixed on one description (each continues where the
+//! other stopped). Any other session is refused with PERMISSION.
+//!
 //! READDIR answers `more` u32, then entries to the end of the message. An entry is `ino` u64,
 //! `kind` u32, `name_len` u32 (1 to `NAME_MAX`) and the name: `DIR_ENTRY_HEAD` (16) bytes and the
 //! name. The service puts in the reply as many entries as it chooses up to what the message holds,
@@ -798,10 +807,11 @@ pub enum Method {
     Release = 41,
     OpenNumbered = 42,
     MkdirNumbered = 43,
+    ReaddirAttr = 44,
 }
 
 /// The number of methods.
-pub const METHOD_COUNT: usize = 43;
+pub const METHOD_COUNT: usize = 44;
 
 impl Method {
     pub const ALL: [Method; METHOD_COUNT] = [
@@ -848,6 +858,7 @@ impl Method {
         Method::Release,
         Method::OpenNumbered,
         Method::MkdirNumbered,
+        Method::ReaddirAttr,
     ];
 
     pub const fn number(self) -> u16 {
@@ -1508,6 +1519,9 @@ impl Stat {
 
 /// The bytes of an entry of READDIR before its name: `ino` u64, `kind` u32, `name_len` u32.
 pub const DIR_ENTRY_HEAD: usize = 16;
+/// The bytes of an entry of READDIR_ATTR before its name: `ino` u64, `kind` u32, `name_len` u32,
+/// `mode` u32, `uid` u32, `gid` u32.
+pub const DIR_ATTR_ENTRY_HEAD: usize = 28;
 /// The bytes of a READDIR reply before its entries: the status and `more`.
 pub const DIR_REPLY_HEAD: usize = 8;
 
@@ -1541,6 +1555,25 @@ impl DirBatch {
         true
     }
 
+    /// Adds an entry of READDIR_ATTR when it fits, as `push` does.
+    pub fn push_attr(&mut self, entry: &DirAttrEntry<'_>) -> bool {
+        let name = entry.name;
+        let need = DIR_ATTR_ENTRY_HEAD + name.len();
+        if name.is_empty() || name.len() > NAME_MAX || self.len + need > self.bytes.len() {
+            return false;
+        }
+        let at = self.len;
+        self.bytes[at..at + 8].copy_from_slice(&entry.ino.to_le_bytes());
+        self.bytes[at + 8..at + 12].copy_from_slice(&entry.kind.to_le_bytes());
+        self.bytes[at + 12..at + 16].copy_from_slice(&(name.len() as u32).to_le_bytes());
+        self.bytes[at + 16..at + 20].copy_from_slice(&entry.mode.to_le_bytes());
+        self.bytes[at + 20..at + 24].copy_from_slice(&entry.uid.to_le_bytes());
+        self.bytes[at + 24..at + 28].copy_from_slice(&entry.gid.to_le_bytes());
+        self.bytes[at + DIR_ATTR_ENTRY_HEAD..at + need].copy_from_slice(name);
+        self.len += need;
+        true
+    }
+
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -1568,6 +1601,39 @@ pub struct DirEntry<'a> {
     pub ino: u64,
     pub kind: u32,
     pub name: &'a [u8],
+}
+
+/// One entry of a READDIR_ATTR reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirAttrEntry<'a> {
+    pub ino: u64,
+    pub kind: u32,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub name: &'a [u8],
+}
+
+/// The entry of a READDIR_ATTR batch at `at` (the bytes after `more`): the entry and the offset
+/// after it; None at or past the end, and None for a broken entry (a short head, a name of no
+/// length or longer than `NAME_MAX`, a name that runs past the end).
+pub fn dir_attr_entry(batch: &[u8], at: usize) -> Option<(DirAttrEntry<'_>, usize)> {
+    let head = batch.get(at..at + DIR_ATTR_ENTRY_HEAD)?;
+    let word = |i: usize| u32::from_le_bytes(head[i..i + 4].try_into().unwrap());
+    let len = word(12) as usize;
+    if len == 0 || len > NAME_MAX {
+        return None;
+    }
+    let end = at + DIR_ATTR_ENTRY_HEAD + len;
+    let entry = DirAttrEntry {
+        ino: u64::from_le_bytes(head[..8].try_into().unwrap()),
+        kind: word(8),
+        mode: word(16),
+        uid: word(20),
+        gid: word(24),
+        name: batch.get(at + DIR_ATTR_ENTRY_HEAD..end)?,
+    };
+    Some((entry, end))
 }
 
 /// The entries of a READDIR reply after the status.
@@ -1614,7 +1680,7 @@ impl<'a> DirEntries<'a> {
 // the batch of the longest names must fit the message and the numbers.
 const _: () = {
     assert!(STAT_LEN == 64);
-    assert!(DIR_ENTRY_HEAD == 16);
+    assert!(DIR_ENTRY_HEAD == 16 && DIR_ATTR_ENTRY_HEAD == 28);
     // `/data` and a path reach the file service's longest path.
     assert!(MAX_PATH + "/data".len() == proto_fs_max_path());
     // The longest request of each method with a path fits one message, RENAME exactly.
@@ -1628,6 +1694,7 @@ const _: () = {
     assert!(HEADER_LEN + 8 + 4 * CLONE_MAX <= MESSAGE_MAX);
     // One entry with the longest name fits a READDIR reply.
     assert!(DIR_REPLY_HEAD + DIR_ENTRY_HEAD + NAME_MAX <= MESSAGE_MAX);
+    assert!(DIR_REPLY_HEAD + DIR_ATTR_ENTRY_HEAD + NAME_MAX <= MESSAGE_MAX);
     // A name fits a path, the flags do not overlap, a session can hold what a clone carries.
     assert!(NAME_MAX < MAX_PATH);
     assert!(FLAGS_ALL == 255);
@@ -1724,7 +1791,7 @@ mod tests {
             assert_eq!(Method::from_number(m.number()), Some(m));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(44), None);
+        assert_eq!(Method::from_number(45), None);
         for (method, number) in [
             (Method::Window, 36),
             (Method::ReadInto, 37),
@@ -1734,10 +1801,11 @@ mod tests {
             (Method::Release, 41),
             (Method::OpenNumbered, 42),
             (Method::MkdirNumbered, 43),
+            (Method::ReaddirAttr, 44),
         ] {
             assert_eq!(method.number(), number);
         }
-        assert_eq!(METHOD_COUNT, 43);
+        assert_eq!(METHOD_COUNT, 44);
         for (i, a) in CODES.iter().enumerate() {
             assert!(*a > 1200 && *a < 1300, "{a}");
             assert!(!CODES[i + 1..].contains(a));
@@ -2110,6 +2178,43 @@ mod tests {
                 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, b'a', b'b'
             ]
         );
+    }
+
+    #[test]
+    fn an_entry_with_attributes_is_pinned_byte_for_byte_and_read_back() {
+        let mut batch = DirBatch::new();
+        let entry = DirAttrEntry {
+            ino: 0x0102,
+            kind: KIND_DIRECTORY,
+            mode: 0o755,
+            uid: 7,
+            gid: 8,
+            name: b"ab",
+        };
+        assert!(batch.push_attr(&entry));
+        let mut w = Writer::new();
+        batch.write(false, &mut w).unwrap();
+        assert_eq!(
+            w.as_bytes(),
+            [
+                0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 0xed, 1, 0, 0, 7, 0, 0,
+                0, 8, 0, 0, 0, b'a', b'b'
+            ]
+        );
+        let body = &w.as_bytes()[4..];
+        assert_eq!(dir_attr_entry(body, 0), Some((entry, body.len())));
+        assert_eq!(dir_attr_entry(body, body.len()), None);
+        // A broken entry: a name that runs past the end, an empty name, a name over NAME_MAX.
+        assert_eq!(dir_attr_entry(&body[..body.len() - 1], 0), None);
+        let mut bad = body.to_vec();
+        bad[12..16].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(dir_attr_entry(&bad, 0), None);
+        bad[12..16].copy_from_slice(&256u32.to_le_bytes());
+        assert_eq!(dir_attr_entry(&bad, 0), None);
+        assert!(!DirBatch::new().push_attr(&DirAttrEntry {
+            name: &[b'x'; NAME_MAX + 1],
+            ..entry
+        }));
     }
 
     #[test]
@@ -2557,6 +2662,7 @@ mod tests {
             Method::Release,
             Method::OpenNumbered,
             Method::MkdirNumbered,
+            Method::ReaddirAttr,
         ] {
             assert!(!m.is_root_method());
             assert_eq!(m.header(), Header::new(m.number(), 4));

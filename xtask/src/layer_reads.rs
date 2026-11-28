@@ -109,8 +109,11 @@ impl Volume for Direct<'_, '_> {
     fn export(&mut self, _: u32) -> R<()> {
         unused()
     }
-    fn read_dir_raw(&mut self, handle: u32, out: &mut [u8; BATCH_BYTES]) -> R<(usize, bool)> {
-        let bytes = self.call(|w| p::handle_call(Method::Readdir, handle, w))?;
+    fn read_dir_raw(&mut self, _: u32, _: &mut [u8; BATCH_BYTES]) -> R<(usize, bool)> {
+        unused()
+    }
+    fn read_dir_attr_raw(&mut self, handle: u32, out: &mut [u8; BATCH_BYTES]) -> R<(usize, bool)> {
+        let bytes = self.call(|w| p::handle_call(Method::ReaddirAttr, handle, w))?;
         let more = match u32::from_le_bytes(bytes[..4].try_into().unwrap()) {
             0 => false,
             1 => true,

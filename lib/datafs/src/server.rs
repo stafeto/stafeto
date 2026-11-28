@@ -259,6 +259,10 @@ struct Pass {
 #[derive(Clone, Copy)]
 struct Pending {
     ino: u64,
+    /// The mode, owner and group of the entry, read for READDIR_ATTR (0 for READDIR).
+    mode: u32,
+    uid: u32,
+    gid: u32,
     kind: Kind,
     name: [u8; crate::NAME_MAX],
     len: usize,
@@ -1345,7 +1349,16 @@ impl Server {
             Method::Readdir => {
                 let di = self.find(si, r.u32()?)?;
                 r.finish()?;
-                self.do_readdir(fs, di, native, w)
+                self.do_readdir(fs, di, native, false, w)
+            }
+            Method::ReaddirAttr => {
+                // Only a native client lists with the attributes: the layered file service.
+                if !p::is_service(owner) {
+                    return Err(p::code(p::PERMISSION));
+                }
+                let di = self.find(si, r.u32()?)?;
+                r.finish()?;
+                self.do_readdir(fs, di, native, true, w)
             }
             Method::Rewind => {
                 let di = self.find(si, r.u32()?)?;

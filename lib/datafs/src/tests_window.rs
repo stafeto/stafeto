@@ -723,3 +723,121 @@ fn part_of_tells_the_worker_the_cell_and_the_count() {
     p::read(3, 4, &mut w).unwrap();
     assert_eq!(part_of(w.as_bytes()), None);
 }
+
+/// The entries of a directory description as READDIR_ATTR gives them, batch after batch: (name,
+/// kind, ino, mode, uid, gid).
+type Listed = Vec<(Vec<u8>, u32, u64, u32, u32, u32)>;
+
+fn listed_with_attributes(rig: &mut Rig, dir: u32) -> Listed {
+    let mut out = Vec::new();
+    loop {
+        let reply = rig
+            .call(ROOT, |w| p::handle_call(Method::ReaddirAttr, dir, w))
+            .unwrap();
+        let more = u32::from_le_bytes(reply[..4].try_into().unwrap());
+        let body = &reply[4..];
+        let mut at = 0;
+        while let Some((e, next)) = p::dir_attr_entry(body, at) {
+            out.push((e.name.to_vec(), e.kind, e.ino, e.mode, e.uid, e.gid));
+            at = next;
+        }
+        assert_eq!(at, body.len(), "every byte of the batch is an entry");
+        if more == 0 {
+            return out;
+        }
+        assert!(!body.is_empty(), "a batch with more carries an entry");
+    }
+}
+
+#[test]
+fn readdir_attr_gives_each_entry_what_stat_gives_without_the_dots_and_to_a_native_client_only() {
+    let mut rig = volume();
+    // More entries than a batch holds, files and directories, owners and modes of every kind.
+    let mut names = Vec::new();
+    for i in 0..120 {
+        let name = std::format!("/d/entry-{i:03}-{}", "n".repeat(60));
+        if i % 7 == 0 {
+            rig.mkdir(ROOT, name.as_bytes(), 0o750).unwrap();
+        } else {
+            let h = rig
+                .open(ROOT, name.as_bytes(), p::WRITE | p::CREATE, 0o640)
+                .unwrap();
+            rig.close(ROOT, h);
+        }
+        if i % 3 == 0 {
+            rig.chown(ROOT, name.as_bytes(), 1000 + i, 100 + i).unwrap();
+        }
+        if i % 5 == 0 {
+            rig.chmod(ROOT, name.as_bytes(), 0o4755).unwrap();
+        }
+        names.push(name);
+    }
+    let dir = rig.open(ROOT, b"/d", p::DIRECTORY | p::READ, 0).unwrap();
+    let got = listed_with_attributes(&mut rig, dir);
+    assert_eq!(got.len(), names.len(), "no `.` and `..`");
+    for (name, kind, ino, mode, uid, gid) in &got {
+        assert!(name != b"." && name != b"..");
+        let stat = rig.stat(ROOT, &[b"/d/".as_slice(), name].concat()).unwrap();
+        assert_eq!(
+            (*kind, *ino, *mode, *uid, *gid),
+            (stat.kind, stat.ino, stat.mode, stat.uid, stat.gid),
+            "{}",
+            String::from_utf8_lossy(name)
+        );
+    }
+    // The same names as READDIR gives after the two dots.
+    rig.call(ROOT, |w| p::handle_call(Method::Rewind, dir, w))
+        .unwrap();
+    let mut plain = Vec::new();
+    loop {
+        let reply = rig
+            .call(ROOT, |w| p::handle_call(Method::Readdir, dir, w))
+            .unwrap();
+        let mut entries = p::read_dir_reply(Reader::new(&reply)).unwrap();
+        while let Some(e) = entries.next_entry().unwrap() {
+            if e.name != b"." && e.name != b".." {
+                plain.push(e.name.to_vec());
+            }
+        }
+        if !entries.more {
+            break;
+        }
+    }
+    assert_eq!(
+        got.iter().map(|e| e.0.clone()).collect::<Vec<_>>(),
+        plain,
+        "the order of the directory"
+    );
+    // The two methods go on from one another on one description.
+    rig.call(ROOT, |w| p::handle_call(Method::Rewind, dir, w))
+        .unwrap();
+    let first = rig
+        .call(ROOT, |w| p::handle_call(Method::Readdir, dir, w))
+        .unwrap();
+    let mut entries = p::read_dir_reply(Reader::new(&first)).unwrap();
+    let mut taken = 0;
+    while entries.next_entry().unwrap().is_some() {
+        taken += 1;
+    }
+    assert!(entries.more && taken > 2);
+    let rest = listed_with_attributes(&mut rig, dir);
+    assert_eq!(
+        rest.len(),
+        names.len() + 2 - taken,
+        "`.` and `..` were in the first batch"
+    );
+    rig.close(ROOT, dir);
+    // A session of a program is refused, and a file description is not a directory.
+    let dir = rig.open(OWNER, b"/d", p::DIRECTORY | p::READ, 0).unwrap();
+    assert_eq!(
+        rig.call(OWNER, |w| p::handle_call(Method::ReaddirAttr, dir, w)),
+        Err(p::code(p::PERMISSION))
+    );
+    let file = rig
+        .open(ROOT, &names[1].clone().into_bytes(), p::READ, 0)
+        .unwrap();
+    assert_eq!(
+        rig.call(ROOT, |w| p::handle_call(Method::ReaddirAttr, file, w)),
+        Err(p::code(p::BAD_HANDLE))
+    );
+}

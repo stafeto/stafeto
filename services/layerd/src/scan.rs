@@ -2,19 +2,20 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The build of the index from the live layer, in steps (section 5.1: "a job by steps up to
-//! READY"). A step is one of: stat and open the next directory of the queue, or read one batch of
-//! entries of the directory that is open (a READDIR of the data file service, at most one message
-//! of entries). A directory is listed once; its subdirectories join the queue, whose size the
+//! READY"). A step is one of: open the next directory of the queue (the root of the layer is
+//! statted first), or read one batch of entries of the directory that is open (a READDIR_ATTR of
+//! the data file service, at most one message of entries with the mode, owner and group of each). A directory is listed once; its subdirectories join the queue, whose size the
 //! table bounds (a directory is an entry). The root of the layer is `/.layers/NN`.
 //!
 //! In a listing the name `.wh..wh..opq` makes its directory opaque, `.wh.<name>` is the mark of
 //! deletion of `<name>`, `.wh..wh.lnk.<name>` is the symbolic link `<name>` (a file whose bytes are
 //! its target), and any other name that begins `.wh..wh.` is reserved and ignored. The attributes of a
-//! directory come from its stat; those of the files the listing does not need.
+//! directory come from the listing of its parent (the root's from its stat); those of the files the listing does not
+//! need.
 
 use crate::index::{Error, Fields, Index, Kind, OPAQUE, SLOTS, UNSCANNED};
-use crate::volume::{BATCH_BYTES, Volume, raw_entry};
-use proto_data::{DIRECTORY, KIND_DIRECTORY, READ};
+use crate::volume::{BATCH_BYTES, Volume};
+use proto_data::{DIRECTORY, KIND_DIRECTORY, READ, dir_attr_entry};
 use proto_wire::Status;
 
 /// The directories one step of the pass of `index.lift` takes.
@@ -94,7 +95,8 @@ pub struct Scan {
     batch_pos: usize,
     batch_last: bool,
     /// The directory whose start is in progress: its id and the length of its path in `dir_path`,
-    /// and whether its attributes have been read.
+    /// and whether its attributes are known (a directory below the root has them from the listing
+    /// of its parent; the root's come from a STAT).
     dir: Option<(u32, usize)>,
     dir_path: [u8; 512],
     statted: bool,
@@ -181,7 +183,7 @@ impl Scan {
     }
 
     /// The start of a directory, a step for each part: its path (a deep path takes the longest
-    /// walk up the index), its attributes (STAT), its description (OPEN).
+    /// walk up the index), the attributes of the root (STAT), its description (OPEN).
     fn start_directory<V: Volume>(
         &mut self,
         index: &mut Index,
@@ -219,7 +221,7 @@ impl Scan {
                 }
             };
             self.dir = Some((id, n));
-            self.statted = false;
+            self.statted = id != 0;
             return Ok(Progress::More);
         };
         let path = &self.dir_path[..n];
@@ -270,7 +272,7 @@ impl Scan {
         if self.batch_pos == self.batch_len && !self.batch_last {
             self.batch_pos = 0;
             self.batch_len = 0;
-            match volume.read_dir_raw(handle, &mut self.batch) {
+            match volume.read_dir_attr_raw(handle, &mut self.batch) {
                 Ok((len, more)) => {
                     self.batch_len = len;
                     self.batch_last = !more;
@@ -290,16 +292,13 @@ impl Scan {
         let mut taken = 0;
         let mut failure = None;
         while taken < ENTRIES_PER_STEP {
-            let Some((ino, kind, name, next)) =
-                raw_entry(&self.batch[..self.batch_len], self.batch_pos)
+            let Some((entry, next)) = dir_attr_entry(&self.batch[..self.batch_len], self.batch_pos)
             else {
                 break;
             };
             self.batch_pos = next;
             taken += 1;
-            if name == b"." || name == b".." {
-                continue;
-            }
+            let (ino, kind, name) = (entry.ino, entry.kind, entry.name);
             let (name, kind) = match special(name) {
                 Special::Opaque => {
                     index.set_flags(id, OPAQUE, 0);
@@ -322,6 +321,13 @@ impl Scan {
             match index.insert_shallow(id, name, fields) {
                 Ok(child) => {
                     if kind == Kind::Dir {
+                        index.set_attr(
+                            child,
+                            ino,
+                            entry.uid,
+                            entry.gid,
+                            (entry.mode & 0o7777) as u16,
+                        );
                         found_queue[found] = child;
                         found += 1;
                     }
