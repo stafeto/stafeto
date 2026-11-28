@@ -49,6 +49,47 @@ impl Data {
     }
 }
 
+impl Data {
+    /// WINDOW with a copy of `memory` that has MAP_READ, MAP_WRITE and TRANSFER (the worker's).
+    pub fn window(&mut self, memory: &rt::handle::Handle<rt::handle::Memory>) -> R<()> {
+        let copy = sys::handle_duplicate(
+            memory,
+            abi::Rights::MAP_READ | abi::Rights::MAP_WRITE | abi::Rights::TRANSFER,
+        )
+        .map_err(Status::Kernel)?;
+        let mut w = Writer::new();
+        p::window(&mut w)?;
+        let reply = sys::send_handles(&self.session, w.as_bytes(), [copy.erase()])
+            .map_err(|refused| Status::Kernel(refused.error))?;
+        let mut bytes = [0u8; abi::MESSAGE_MAX];
+        let len = reply.bytes(&mut bytes).len();
+        p::reply(&bytes[..len]).map(drop)
+    }
+
+    /// PWRITE_FROM of `count` bytes of the first cell at `offset` of `handle`, one part with no
+    /// lease; the count written.
+    pub fn part(&mut self, handle: u32, offset: u64, count: usize) -> R<usize> {
+        let part = p::Part {
+            handle,
+            count: count as u32,
+            offset,
+            cell: 0,
+            flags: 0,
+            lease: 0,
+        };
+        let buf = self.call(|w| p::pwrite_from(&part, &[], w))?;
+        let mut r = p::reply(&buf.bytes[..buf.len])?;
+        let wrote = r.u32()? as usize;
+        let flags = r.u32()?;
+        let _lease = r.u32()?;
+        // A part that lapsed wrote nothing that can be counted on.
+        if flags & p::LAPSED != 0 {
+            return Err(Status::Unknown(p::IO));
+        }
+        Ok(wrote)
+    }
+}
+
 impl Volume for Data {
     type Pass = rt::handle::Handle<rt::handle::Any>;
 
@@ -125,6 +166,11 @@ impl Volume for Data {
 
     fn mkdir(&mut self, path: &[u8], mode: u32) -> R<()> {
         self.call(|w| p::mkdir(path, mode, w)).map(drop)
+    }
+
+    fn mkdir_numbered(&mut self, path: &[u8], mode: u32, ino: u64) -> R<()> {
+        self.call(|w| p::mkdir_numbered(path, mode, ino, w))
+            .map(drop)
     }
 
     fn rename(&mut self, from: &[u8], to: &[u8]) -> R<()> {

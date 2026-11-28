@@ -330,6 +330,8 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("layer-posix breaks", 18),
     ("layer-posix write", 30),
     ("layer-posix write breaks", 45),
+    ("layer-posix copy", 30),
+    ("layer-posix copy breaks", 45),
     ("layer-posix ash", 12),
     ("vi-dialog", 30),
     ("posix-window", 25),

@@ -57,6 +57,10 @@ fn volume() -> FakeVolume {
     v
 }
 
+fn copy_bytes(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i % 251) as u8 | 1).collect()
+}
+
 fn lower() -> FakeLower {
     let mut l = FakeLower::new();
     l.dir("/etc", 10)
@@ -82,6 +86,29 @@ fn lower() -> FakeLower {
         .link("/lowlink", 80)
         .file("/rootonly", 81)
         .attr("/rootonly", 0o600, 0, 0);
+    for i in 0..20 {
+        l.file(&format!("/etc/big{i:02}"), 100 + i);
+    }
+    // The files of the tests of the copy up: a file with its own attributes and times, a program,
+    // a link, and a file below directories the layer does not hold.
+    l.file("/etc/group", 14)
+        .file("/etc/copyme", 4_000_000_000_200)
+        .bytes("/etc/copyme", &copy_bytes(150_000))
+        .attr("/etc/copyme", 0o4750, 7, 8)
+        .times_of("/etc/copyme", 111, 222)
+        .file("/etc/prog", 201)
+        .bytes("/etc/prog", b"\x7fELF and then some bytes")
+        .link("/etc/lnk", 202)
+        .text("/etc/lnk", "/etc/motd")
+        .attr("/etc/lnk", 0o777, 7, 8)
+        .dir("/usr", 205)
+        .dir("/usr/share", 206)
+        .attr("/usr/share", 0o755, 3, 4)
+        .dir("/usr/share/doc", 207)
+        .file("/usr/share/doc/readme", 208)
+        .bytes("/usr/share/doc/readme", b"read me")
+        .file("/usr/share/doc/elf", 209)
+        .bytes("/usr/share/doc/elf", b"\x7fELF here");
     let long = "a".repeat(250);
     l.dir(&format!("/{long}"), 90);
     l
@@ -535,17 +562,16 @@ fn an_upper_file_is_opened_for_writing_by_who_may_write_it() {
         open(&mut core, 1001, f::READ_ONLY | f::TRUNCATE, "/etc/passwd").err(),
         Some(st(f::ACCESS_DENIED))
     );
-    // The shadow of a lower file is the layer's file: written. The lower one is not.
+    // The shadow of a lower file is the layer's file: written. The lower one is copied up first.
     assert!(
         open(&mut core, 0, f::WRITE_ONLY, "/etc/passwd")
             .unwrap()
             .1
             .is_some()
     );
-    assert_eq!(
-        open(&mut core, 0, f::WRITE_ONLY, "/etc/hostname").err(),
-        Some(st(f::READ_ONLY_FILESYSTEM))
-    );
+    let copying = open(&mut core, 0, f::WRITE_ONLY, "/etc/hostname").unwrap();
+    assert!(copying.1.is_none());
+    assert!(n::read_copying(&copying.0).is_some_and(|t| t.is_ok()));
 }
 
 // ---------------------------------------------------------------------- mkdir
@@ -1411,6 +1437,38 @@ fn every_change_makes_one_call_in_a_step() {
         ("chown", ChangeOp::Chown, 5, "/etc/passwd", "", false),
         ("utimens", ChangeOp::Utimens, 5, "/etc/passwd", "", false),
         ("truncate", ChangeOp::Truncate, 2, "/etc/passwd", "", false),
+        (
+            "chmod of a lower directory",
+            ChangeOp::Chmod,
+            0o700,
+            "/lowdir",
+            "",
+            false,
+        ),
+        (
+            "chown of a lower file (a copy reserved)",
+            ChangeOp::Chown,
+            5,
+            "/etc/copyme",
+            "",
+            false,
+        ),
+        (
+            "truncate of a lower file below lower directories",
+            ChangeOp::Truncate,
+            1,
+            "/usr/share/doc/readme",
+            "",
+            false,
+        ),
+        (
+            "chown of a lower link (a copy of the link)",
+            ChangeOp::Chown,
+            5,
+            "/etc/lnk",
+            "",
+            false,
+        ),
     ];
     for &(what, op, a, first, second, over) in runs {
         let (result, counts) = by_steps(&mut core, 0, op, a, first, second);
@@ -2472,4 +2530,486 @@ fn the_index_that_is_full_refuses_a_create_with_no_space_and_leaves_nothing_behi
         Some(st(f::NO_SPACE))
     );
     assert_eq!(core.volume.nodes.len(), before, "the file is gone again");
+}
+
+// ---------------------------------------------------------------------- the copy up
+
+use crate::changejob::{ChangeJob, ChangeStep};
+use crate::copy::{Copier, Wait};
+use crate::testkit::FakeBulk;
+
+/// The ticket of a COPYING reply.
+fn copying(reply: &[u8]) -> u64 {
+    n::read_copying(reply)
+        .expect("the reply is COPYING")
+        .unwrap()
+}
+
+/// The worker and the loop to the end: the orders go to a copier over the volume and the lower set
+/// of the core, what it ends is told to the table, and the commit job makes each copy visible or
+/// drops it. The reaper has what was left in `work/`.
+fn settle(core: &mut C<'_>) {
+    let mut copier = Copier::new();
+    for _ in 0..100 {
+        while let Some(order) = core.copies.next_order() {
+            assert!(copier.add(order));
+        }
+        if copier.busy() == 0 && core.copies.finished().is_none() {
+            break;
+        }
+        {
+            let mut bulk = FakeBulk::new(&mut core.volume, &mut core.lower);
+            while copier.busy() > 0 {
+                if let Some(ended) = copier.turn(&mut bulk) {
+                    assert!(core.copies.ended(ended));
+                }
+            }
+        }
+        commit_all(core);
+    }
+    while core.reap_step() {}
+}
+
+/// The commit jobs, one after the other, as the loop runs them.
+fn commit_all(core: &mut C<'_>) {
+    let root = Vouched::root();
+    let c = Client {
+        owner: 0,
+        who: &root,
+    };
+    let mut job = ChangeJob::<FakeVolume, FakeLower>::new();
+    while matches!(
+        core.commit_start(&mut job, 8),
+        crate::changejob::CommitStart::Job
+    ) {
+        let mut w = Writer::new();
+        let mut counts = Vec::new();
+        for _ in 0..10_000 {
+            let before = (core.volume.calls.len(), lower_calls(core));
+            let step = core.change_step(&c, &mut job, &mut w);
+            counts.push((
+                core.volume.calls.len() - before.0,
+                lower_calls(core) - before.1,
+            ));
+            match step {
+                ChangeStep::More => {}
+                ChangeStep::Wait => panic!("the lock is held"),
+                ChangeStep::Done(_) => break,
+            }
+        }
+        // The commit job is a change job like the others: a call in a step.
+        assert_one_call_a_step("commit", &counts, false);
+        core.commit_done(&mut job, None);
+    }
+}
+
+fn ino_of(reply: &[u8]) -> u64 {
+    n::read_info(reply).unwrap().inode
+}
+
+#[test]
+fn a_lower_file_opened_for_writing_is_copied_with_its_number_owner_mode_and_times_then_opened() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let lower_ino = 4_000_000_000_200;
+    // The owner (user 7) opens it for writing: the answer is COPYING, nothing is in the layer yet,
+    // and a read is still the lower set's.
+    let (reply, pass) = open(&mut core, 7, f::READ_WRITE, "/etc/copyme").unwrap();
+    assert!(pass.is_none());
+    let ticket = copying(&reply);
+    assert_eq!(core.copy_wait(ticket), Wait::Pending);
+    assert!(node(&core, "/.layers/00/etc/copyme").is_none());
+    let (reply, _) = open(&mut core, 7, f::READ_ONLY, "/etc/copyme").unwrap();
+    assert!(is_redirect(&reply).is_some());
+    // A second request for the file waits for the same copy.
+    let (reply, _) = open(&mut core, 7, f::WRITE_ONLY | f::APPEND, "/etc/copyme").unwrap();
+    assert_eq!(copying(&reply), ticket);
+    settle(&mut core);
+    assert_eq!(core.copy_wait(ticket), Wait::Over(0));
+    let made = node(&core, "/.layers/00/etc/copyme").unwrap();
+    assert_eq!(made.data, copy_bytes(150_000));
+    assert_eq!(
+        (made.ino, made.uid, made.gid, made.mode, made.times),
+        (lower_ino, 7, 8, 0o4750, (111, 222))
+    );
+    // Nothing is left in work/, and the copy is the layer's file now: the open passes it, and
+    // the number a stat tells is the lower file's.
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+    let (reply, pass) = open(&mut core, 7, f::READ_WRITE, "/etc/copyme").unwrap();
+    assert_eq!(OpenAnswer::read(&reply), Ok(OpenAnswer::Pass));
+    assert_eq!(pass.as_deref(), Some(&b"/.layers/00/etc/copyme"[..]));
+    let info = stat(&mut core, 7, "/etc/copyme", 0).unwrap();
+    assert_eq!(ino_of(&info), lower_ino);
+    assert_eq!((core.copies.committed, core.copies.failed), (1, 0));
+}
+
+#[test]
+fn the_directories_of_the_path_are_made_with_the_copy_with_the_numbers_attributes_and_times_of_the_lower_ones()
+ {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let (reply, _) = open(&mut core, 0, f::WRITE_ONLY, "/usr/share/doc/readme").unwrap();
+    copying(&reply);
+    // The reserve makes no directory: the commit does, with the copy, so a copy that is refused
+    // leaves none.
+    assert!(node(&core, "/.layers/00/usr").is_none());
+    settle(&mut core);
+    for (path, ino) in [
+        ("/.layers/00/usr", 205),
+        ("/.layers/00/usr/share", 206),
+        ("/.layers/00/usr/share/doc", 207),
+    ] {
+        let dir = node(&core, path).unwrap();
+        assert!(dir.dir, "{path}");
+        assert_eq!((dir.ino, dir.times), (ino, (4_000, 5_000)), "{path}");
+    }
+    let share = node(&core, "/.layers/00/usr/share").unwrap();
+    assert_eq!((share.uid, share.gid, share.mode), (3, 4, 0o755));
+    assert_eq!(
+        node(&core, "/.layers/00/usr/share/doc/readme")
+            .unwrap()
+            .data,
+        b"read me"
+    );
+    assert_eq!(
+        ino_of(&stat(&mut core, 0, "/usr/share", 0).unwrap()),
+        206,
+        "the number of a directory is the same before and after the copy"
+    );
+}
+
+#[test]
+fn a_directory_the_service_makes_has_a_number_of_the_counter_not_of_the_volume() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    mkdir(&mut core, 0, "/etc/newdir", 0o755).unwrap();
+    mkdir(&mut core, 0, "/etc/newdir/sub", 0o755).unwrap();
+    let a = node(&core, "/.layers/00/etc/newdir").unwrap().ino;
+    let b = node(&core, "/.layers/00/etc/newdir/sub").unwrap().ino;
+    for ino in [a, b] {
+        assert!(ino & UPPER_INO_TAG != 0 && ino & (1 << 63) == 0, "{ino:#x}");
+    }
+    assert_ne!(a, b);
+    assert_eq!(core.volume.calls_of("mkdir"), 0);
+}
+
+#[test]
+fn directories_and_files_share_one_counter_that_is_written_back_when_its_block_is_used_up() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let mut seen = std::collections::BTreeSet::new();
+    // More names than one block of the counter: the block is written back in the middle, by the
+    // step of a directory as it is by the step of a file.
+    for k in 0..300 {
+        let path = format!("/etc/n{k}");
+        if k % 2 == 0 {
+            mkdir(&mut core, 0, &path, 0o755).unwrap();
+        } else {
+            let (_, pass) = open(&mut core, 0, creating(f::WRITE_ONLY, 0o644), &path).unwrap();
+            assert!(pass.is_some());
+        }
+        let ino = node(&core, &format!("/.layers/00{path}")).unwrap().ino;
+        assert!(ino & UPPER_INO_TAG != 0 && ino & (1 << 63) == 0, "{ino:#x}");
+        assert!(seen.insert(ino), "{ino:#x} twice");
+    }
+    // The counter on the volume is past the numbers given, so a start again takes up after them.
+    let text = node(&core, "/.layers/COMPOSITION").unwrap().data.clone();
+    let text = String::from_utf8(text).unwrap();
+    let line = text.lines().find(|l| l.starts_with("ino ")).unwrap();
+    let written: u64 = line[4..].trim().parse().unwrap();
+    assert!(written > 300, "{line}");
+    assert_eq!(core.volume.calls_of("mkdir"), 0);
+}
+
+#[test]
+fn a_cut_open_makes_an_empty_copy_with_the_attributes_of_the_lower_file() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let (reply, _) = open(&mut core, 7, f::WRITE_ONLY | f::TRUNCATE, "/etc/copyme").unwrap();
+    let ticket = copying(&reply);
+    settle(&mut core);
+    assert_eq!(core.copy_wait(ticket), Wait::Over(0));
+    let made = node(&core, "/.layers/00/etc/copyme").unwrap();
+    assert!(made.data.is_empty());
+    assert_eq!(
+        (made.ino, made.uid, made.gid, made.mode, made.times),
+        (4_000_000_000_200, 7, 8, 0o4750, (111, 222))
+    );
+}
+
+#[test]
+fn chmod_chown_utimensat_and_truncate_of_a_lower_file_copy_it_and_then_apply() {
+    for (op, a, check) in [
+        (ChangeOp::Chmod, 0o600u64, 0),
+        (ChangeOp::Chown, 9, 1),
+        (ChangeOp::Utimens, 333, 2),
+        (ChangeOp::Truncate, 10, 3),
+    ] {
+        let mut world = World::new();
+        let mut core = world.core(volume());
+        ready(&mut core);
+        let reply = change(&mut core, 0, op, a, "/etc/copyme", "").unwrap();
+        let ticket = copying(&reply);
+        assert!(node(&core, "/.layers/00/etc/copyme").is_none());
+        settle(&mut core);
+        assert_eq!(core.copy_wait(ticket), Wait::Over(0));
+        // The request sent again finds the copy and does what it says.
+        change(&mut core, 0, op, a, "/etc/copyme", "").unwrap();
+        let made = node(&core, "/.layers/00/etc/copyme").unwrap();
+        assert_eq!(made.ino, 4_000_000_000_200, "{op:?}");
+        match check {
+            0 => assert_eq!(made.mode, 0o600),
+            1 => assert_eq!(made.uid, 9),
+            2 => assert_eq!(made.times.0, 333),
+            _ => assert_eq!(made.data.len(), 10),
+        }
+    }
+}
+
+#[test]
+fn the_rights_of_the_lower_attributes_are_checked_before_a_byte_is_copied() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    // User 1000 is not the owner (7) nor in group 8 of /etc/copyme (0o4750: no access for others).
+    assert_eq!(
+        open(&mut core, 1000, f::WRITE_ONLY, "/etc/copyme").err(),
+        Some(st(f::ACCESS_DENIED))
+    );
+    assert_eq!(
+        change(&mut core, 1000, ChangeOp::Chmod, 0o777, "/etc/copyme", "").err(),
+        Some(st(f::PERMISSION))
+    );
+    assert_eq!(core.copies.in_work(), 0);
+    assert_eq!(core.copies.reserved, 0);
+    // A directory is not opened for writing, and a missing name is not copied.
+    assert_eq!(
+        open(&mut core, 0, f::WRITE_ONLY, "/lowdir").err(),
+        Some(st(f::IS_DIRECTORY))
+    );
+    assert_eq!(
+        open(&mut core, 0, f::WRITE_ONLY, "/etc/none").err(),
+        Some(st(f::NO_ENTRY))
+    );
+}
+
+#[test]
+fn a_program_of_the_lower_set_is_never_copied_up() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    for round in 0..2 {
+        let (reply, _) = open(&mut core, 0, f::WRITE_ONLY, "/etc/prog").unwrap();
+        let ticket = copying(&reply);
+        settle(&mut core);
+        assert_eq!(
+            core.copy_wait(ticket),
+            Wait::Over(f::READ_ONLY_FILESYSTEM),
+            "{round}"
+        );
+        assert!(node(&core, "/.layers/00/etc/prog").is_none());
+        assert!(core.volume.children(b"/.layers/work").is_empty());
+    }
+    // The next request is a copy of its own that fails the same way, and the program is still
+    // the lower set's to read.
+    let (reply, _) = open(&mut core, 0, f::READ_ONLY, "/etc/prog").unwrap();
+    assert!(is_redirect(&reply).is_some());
+    assert_eq!(core.copies.failed, 2);
+}
+
+#[test]
+fn a_program_that_is_refused_leaves_no_directory_in_the_layer() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let (reply, _) = open(&mut core, 0, f::WRITE_ONLY, "/usr/share/doc/elf").unwrap();
+    let ticket = copying(&reply);
+    settle(&mut core);
+    assert_eq!(core.copy_wait(ticket), Wait::Over(f::READ_ONLY_FILESYSTEM));
+    assert!(node(&core, "/.layers/00/usr").is_none());
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+}
+
+#[test]
+fn a_lower_number_with_bit_62_or_63_is_refused_before_anything_is_made() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    core.lower.file("/etc/oddnum", UPPER_INO_TAG | 5);
+    core.lower.file("/etc/oddnum2", 1 << 63 | 5);
+    for path in ["/etc/oddnum", "/etc/oddnum2"] {
+        assert_eq!(
+            open(&mut core, 0, f::WRITE_ONLY, path).err(),
+            Some(st(f::INVALID_ARGUMENT)),
+            "{path}"
+        );
+    }
+    assert_eq!(core.copies.reserved, 0);
+}
+
+#[test]
+fn a_name_deleted_during_the_copy_stays_deleted_and_the_copy_goes_to_the_reaper() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let (reply, _) = open(&mut core, 0, f::WRITE_ONLY, "/etc/group").unwrap();
+    let ticket = copying(&reply);
+    // The change that removes the name is made while the worker copies it.
+    unlink(&mut core, 0, "/etc/group").unwrap();
+    settle(&mut core);
+    // The waiters are told the copy is over with no failure; they send their request again and
+    // see the name deleted.
+    assert_eq!(core.copy_wait(ticket), Wait::Over(0));
+    assert!(node(&core, "/.layers/00/etc/group").is_none());
+    assert!(node(&core, "/.layers/00/etc/.wh.group").is_some());
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+    assert_eq!(
+        open(&mut core, 0, f::WRITE_ONLY, "/etc/group").err(),
+        Some(st(f::NO_ENTRY))
+    );
+    assert_eq!((core.copies.committed, core.copies.dropped), (0, 1));
+}
+
+#[test]
+fn a_name_made_during_the_copy_by_another_change_is_not_replaced_by_the_copy() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let (reply, _) = open(&mut core, 0, f::WRITE_ONLY, "/etc/group").unwrap();
+    let ticket = copying(&reply);
+    // Another writer makes the name in the layer (unlink, then create: the layer's file).
+    unlink(&mut core, 0, "/etc/group").unwrap();
+    let (_, pass) = open(&mut core, 0, creating(f::WRITE_ONLY, 0o644), "/etc/group").unwrap();
+    assert!(pass.is_some());
+    let made = node(&core, "/.layers/00/etc/group").unwrap().ino;
+    settle(&mut core);
+    assert_eq!(core.copy_wait(ticket), Wait::Over(0));
+    assert_eq!(node(&core, "/.layers/00/etc/group").unwrap().ino, made);
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+}
+
+#[test]
+fn a_failed_copy_tells_its_waiters_the_failure_and_leaves_nothing_in_work() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let (reply, _) = open(&mut core, 7, f::WRITE_ONLY, "/etc/copyme").unwrap();
+    let ticket = copying(&reply);
+    let mut copier = Copier::new();
+    while let Some(order) = core.copies.next_order() {
+        assert!(copier.add(order));
+    }
+    {
+        let mut bulk = FakeBulk::new(&mut core.volume, &mut core.lower);
+        bulk.fail = Some(("write_cell", st(d::NO_SPACE)));
+        while copier.busy() > 0 {
+            if let Some(ended) = copier.turn(&mut bulk) {
+                assert!(core.copies.ended(ended));
+            }
+        }
+    }
+    // The file the worker made is in work/ until the commit job gives it to the reaper.
+    assert_eq!(core.volume.children(b"/.layers/work").len(), 1);
+    commit_all(&mut core);
+    while core.reap_step() {}
+    assert_eq!(core.copy_wait(ticket), Wait::Over(f::NO_SPACE));
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+    assert!(node(&core, "/.layers/00/etc/copyme").is_none());
+    // The request sent again is a new copy.
+    let (reply, _) = open(&mut core, 7, f::WRITE_ONLY, "/etc/copyme").unwrap();
+    assert_ne!(copying(&reply), ticket);
+}
+
+#[test]
+fn twelve_copies_are_taken_and_the_next_request_is_told_to_ask_again() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let mut pumped = std::vec::Vec::new();
+    for i in 0..12 {
+        let (reply, _) = open(&mut core, 0, f::WRITE_ONLY, &format!("/etc/big{i:02}")).unwrap();
+        copying(&reply);
+        if let Some(order) = core.copies.next_order() {
+            pumped.push(order);
+        }
+    }
+    assert_eq!(pumped.len(), crate::copy::ACTIVE);
+    assert_eq!(
+        open(&mut core, 0, f::WRITE_ONLY, "/etc/big12").err(),
+        Some(st(proto_layer::STARTING))
+    );
+    // The same file as one of the twelve is no new place: its ticket again.
+    let (reply, _) = open(&mut core, 0, f::WRITE_ONLY, "/etc/big05").unwrap();
+    copying(&reply);
+}
+
+#[test]
+fn a_lower_directory_is_copied_without_content_for_chmod_chown_and_utimensat() {
+    for (op, a) in [
+        (ChangeOp::Chmod, 0o700u64),
+        (ChangeOp::Chown, 5),
+        (ChangeOp::Utimens, 77),
+    ] {
+        let mut world = World::new();
+        let mut core = world.core(volume());
+        ready(&mut core);
+        // The owner of /lowdir (user 7) changes it: no waiting, the directory is the layer's now.
+        let reply = change(&mut core, 0, op, a, "/lowdir", "").unwrap();
+        assert!(n::read_copying(&reply).is_none(), "{op:?}");
+        let dir = node(&core, "/.layers/00/lowdir").unwrap();
+        assert!(dir.dir);
+        assert_eq!(dir.ino, 30, "{op:?}");
+        match op {
+            ChangeOp::Chmod => assert_eq!((dir.mode, dir.times), (0o700, (4_000, 5_000))),
+            ChangeOp::Chown => assert_eq!(dir.uid, 5),
+            _ => assert_eq!(dir.times.0, 77),
+        }
+        // No content moved: the lower file shows through, and the number is the same.
+        assert!(node(&core, "/.layers/00/lowdir/l1").is_none());
+        assert!(listing(&mut core, "/lowdir").contains(&"l1".to_string()));
+        assert_eq!(ino_of(&stat(&mut core, 0, "/lowdir", 0).unwrap()), 30);
+        assert_eq!(core.copies.reserved, 0);
+    }
+}
+
+#[test]
+fn lchown_of_a_lower_link_copies_the_link_with_its_text_and_number() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let v = who(0);
+    let c = Client { owner: 40, who: &v };
+    let mut w = Writer::new();
+    core.change(
+        &c,
+        &n::Change {
+            op: ChangeOp::Chown,
+            a: 5,
+            b: 6,
+            first: b"/etc/lnk",
+            second: b"",
+        },
+        &mut w,
+    )
+    .unwrap();
+    assert!(n::read_copying(w.as_bytes()).is_none());
+    let link = node(&core, "/.layers/00/etc/.wh..wh.lnk.lnk").unwrap();
+    assert_eq!(link.data, b"/etc/motd");
+    assert_eq!((link.ino, link.uid, link.gid), (202, 5, 6));
+    assert_eq!(readlink(&mut core, 0, "/etc/lnk").unwrap(), b"/etc/motd");
+    // The other changes of a link of the lower set are not supported, and make no copy.
+    let reserved = core.copies.reserved;
+    for op in [ChangeOp::Chmod, ChangeOp::Utimens] {
+        assert_eq!(
+            change(&mut core, 0, op, 1, "/lowlink", "").err(),
+            Some(st(f::NOT_SUPPORTED))
+        );
+    }
+    assert!(node(&core, "/.layers/00/.wh..wh.lnk.lowlink").is_none());
+    assert_eq!(core.copies.reserved, reserved);
 }

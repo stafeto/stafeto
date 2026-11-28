@@ -19,6 +19,10 @@ break-layer-fd-guard = ["posix-crt/break-layer-fd-guard"]
 # second boot on the same disk that reads what they left.
 phase-write = []
 phase-reread = []
+# The phases of the copy probe (`cargo xtask layer-posix copy`): the copy up of lower files, and the
+# second boot on the same disk that reads the copies.
+phase-copy = []
+phase-copyreread = []
 
 [[bin]]
 name = "layer-posix-probe"

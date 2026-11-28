@@ -302,6 +302,7 @@ mod tests {
             Method::WriteFrom,
             Method::PwriteFrom,
             Method::OpenNumbered,
+            Method::MkdirNumbered,
             Method::Truncate,
             Method::Fsync,
             Method::SetFlags,

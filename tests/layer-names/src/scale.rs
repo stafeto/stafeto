@@ -9,9 +9,15 @@
 //! 240, over a chain of 32 lower directories, of a directory of 1,024 names, into the opaque
 //! directory, of a directory of marks, and a rename onto a directory of marks. The service has built its index in steps by the time the probe starts; the
 //! longest step of each kind is what the service prints and the command reads (`steps` build).
+//!
+//! The copy up is measured with them: the probe writes a lower file of 64 MiB (`/lowbig/big`) before
+//! the first read and waits for its copy after the last one, so that every request of the checks is
+//! served while the worker thread of the service moves the bytes, and no step of the loop is longer
+//! for it.
 
 use super::{
-    Checks, Opened, call, expect_bytes, open, say, session, stat_redirect_is, take_root, usleep,
+    Checks, Opened, call, expect_bytes, open, read_pass, say, session, stat, stat_redirect_is,
+    take_root, usleep,
 };
 use proto_data as p;
 use proto_fs::names::{self as n, NameMethod};
@@ -31,7 +37,18 @@ const LOW_DEPTH: u32 = 32;
 /// The names after the changes of the probe: `/lowdeep`, its directories and the one below them
 /// made over the lower chain, the
 /// `/mk2` the rename went over; the marks of `/marks` and of `/mk2` are gone.
-const NAMES_AFTER: u32 = NAMES + LOW_DEPTH + 2 - 1;
+/// The lower file of 64 MiB the probe writes while it measures: its copy makes `/lowbig` and
+/// `/lowbig/big` names of the layer (`xtask::layer_steps`).
+/// A build with `STAFETO_LAYER_NAMES_COPY=0` leaves the copy out (`cargo xtask layer-steps nocopy`:
+/// the waits of the loop without it, to compare with the waits with it).
+const COPY: bool = match option_env!("STAFETO_LAYER_NAMES_COPY") {
+    Some(v) => !(v.len() == 1 && v.as_bytes()[0] == b'0'),
+    None => true,
+};
+const COPIED_NAMES: u32 = if COPY { 2 } else { 0 };
+const NAMES_AFTER: u32 = NAMES + LOW_DEPTH + 2 - 1 + COPIED_NAMES;
+const BIG: &str = "/lowbig/big";
+const BIG_BYTES: u64 = 64 << 20;
 const LISTED: usize = 1024;
 const CHAIN: usize = 246;
 
@@ -106,6 +123,63 @@ fn list_etc(names: &rt::handle::Handle<rt::handle::Channel>) -> Option<Listed> {
     None
 }
 
+/// The write of the lower file of 64 MiB begins its copy: the ticket of COPYING.
+fn begin_copy(names: &Handle<Channel>) -> Result<u64, u32> {
+    let mut w = Writer::new();
+    n::write_open(proto_fs::WRITE_ONLY, BIG.as_bytes(), &mut w).map_err(|_| u32::MAX)?;
+    let a = call(names, w.as_bytes(), rt::handle::Outgoing::new()).ok_or(u32::MAX)?;
+    match n::read_copying(a.all()) {
+        Some(Ok(ticket)) => Ok(ticket),
+        _ => Err(a.status()),
+    }
+}
+
+/// WAIT for the copy, asked again every 200 ms of the probe's time until it is over: 0, or the
+/// failure of the copy.
+fn wait_copy(names: &Handle<Channel>, ticket: u64) -> u32 {
+    for _ in 0..4000 {
+        let mut w = Writer::new();
+        if n::write_wait(ticket, &mut w).is_err() {
+            return u32::MAX;
+        }
+        let Some(a) = call(names, w.as_bytes(), rt::handle::Outgoing::new()) else {
+            return u32::MAX;
+        };
+        match a.status() {
+            proto_fs::COPYING | l::STARTING => {
+                // SAFETY: a plain call of relibc.
+                unsafe { usleep(200_000) };
+            }
+            status => return status,
+        }
+    }
+    u32::MAX
+}
+
+/// The copy is the layer's file: its size, and the bytes the lower file began with.
+fn big_copy_is_there(
+    data: &Handle<Channel>,
+    names: &Handle<Channel>,
+) -> Result<(), core::fmt::Arguments<'static>> {
+    match stat(names, BIG) {
+        Ok(info) if info.kind == 2 && info.size == BIG_BYTES => {}
+        Ok(_) => return Err(format_args!("the copy is not a file of 64 MiB")),
+        Err(_) => return Err(format_args!("no STAT of the copy")),
+    }
+    let Opened::Pass(pass) = open(names, proto_fs::READ_ONLY, BIG) else {
+        return Err(format_args!("the copy gives no pass"));
+    };
+    let mut buf = [0u8; 128];
+    let Some(count) = read_pass(data, pass, &mut buf) else {
+        return Err(format_args!("the pass was not spent or read"));
+    };
+    // The lower file: the byte at i is (i % 251) | 1.
+    if count != 100 || !(0..count).all(|i| buf[i] == ((i % 251) as u8 | 1)) {
+        return Err(format_args!("the first bytes of the copy differ"));
+    }
+    Ok(())
+}
+
 pub fn run() -> i32 {
     let mut t = Checks { failed: 0 };
     let (Some(root), Some(data_root)) = (
@@ -140,6 +214,13 @@ pub fn run() -> i32 {
             _ => Err(format_args!("no status")),
         },
     );
+    // The copy of a lower file of 64 MiB goes on while the checks that follow are made.
+    let ticket = if COPY { begin_copy(&names) } else { Ok(0) };
+    if ticket.is_err() {
+        say(format_args!(
+            "a lower file of 64 MiB is written: no COPYING"
+        ));
+    }
     // A file at the end of a chain of 246 directories: 247 components, and the volume's path of it
     // 505 of 506 bytes.
     let mut buffer = [0u8; 512];
@@ -201,6 +282,20 @@ pub fn run() -> i32 {
             ),
         ),
         None => t.fail(name, format_args!("no listing")),
+    }
+    // The copy ends, however long the checks took: the service says the copy is over, and the file
+    // is the layer's, whole.
+    let name = "a lower file of 64 MiB is copied up while the checks run";
+    match ticket {
+        Ok(_) if !COPY => {}
+        Ok(ticket) => match wait_copy(&names, ticket) {
+            0 => t.check(name, big_copy_is_there(&data, &names)),
+            status => t.fail(
+                name,
+                format_args!("the copy ended with the status {status}"),
+            ),
+        },
+        Err(status) => t.fail(name, format_args!("the write was answered {status}")),
     }
     changes(&mut t, &names, &control, &data);
     if t.failed == 0 {

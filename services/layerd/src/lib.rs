@@ -16,6 +16,7 @@
 pub mod change;
 pub mod changejob;
 pub mod composition;
+pub mod copy;
 pub mod descriptions;
 pub mod identity;
 pub mod index;

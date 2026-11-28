@@ -537,6 +537,13 @@ pub const LAYERD_BUDGETS: &[Budget] = &[Budget {
 /// with Register (the mark `LAYER`). The loop runs under the budget `LAYERD_BUDGETS` and the
 /// thread that registers the root works at the level `free`, 31.
 ///
+/// A second thread, the worker of the copies up (`services/layerd/src/worker.rs`), works at 30 with
+/// no budget, on the CPUs of the record: it moves the bytes of a lower file that is written for the
+/// first time into the layer, with sessions of its own with the two file services (a second CONNECT
+/// to each gives a session of its own: init labels each) and a window of 128 KiB. It does little
+/// itself; the work of the RAM file service goes on at its level in steps of 12 KiB, and the work
+/// of the data file service under its budget.
+///
 /// It restarts. A new instance registers its root again (the process service replaces the old
 /// one), builds the index of the live layer anew and answers STARTING until it is done; the
 /// descriptions of directories the old instance gave out answer STALE (the epoch of the handle),
@@ -557,16 +564,20 @@ pub const LAYERD: Record = Record {
     }),
     priority: 34,
     ceiling: 34,
-    // The stack of the loop is the program's, the index (16,384 places, the keys of its directories
-    // and the arena: .bss of 1.1 MiB) and the pages of the descriptors are statics that init pays
-    // for as segments; the quota is the slots of the sessions the service
-    // gives (192) and its own channels.
-    quota: 192 * PAGE,
+    // The stack of the loop and of the worker thread, the index (16,384 places, the keys of its
+    // directories and the arena: .bss of 1.1 MiB) and the pages of the descriptors are statics that
+    // init pays for as segments; the quota is the slots of the sessions the service gives (192), its
+    // own channels and the window of the copies up (`proto_data::WINDOW_BYTES`, 32 pages, a memory
+    // object of the worker thread).
+    quota: (192 + 32) * PAGE,
     // The handles the service holds at most: 192 copies of identity sessions (one for each bound
     // session, `SESSIONS` of the program), one pass or one Vouch copy in flight, and about 24 of its
     // own (the channels, the notification of the steps, the sessions with the two file services and
     // the notary, the page of the generations, the console, the timers of the heartbeat and of the
-    // registrar): 218, and a limit of 256.
+    // registrar), 8 of the worker thread (its two sessions, the window, the channel it waits on
+    // with the kick, the notification it gives and the thread) and the 16 copies of channels of
+    // programs that wait for a copy (WAIT with a handle, kept until the copy ends): 242, and a
+    // limit of 256.
     handle_limit: 256,
     restart: Restart::Always,
     console: true,

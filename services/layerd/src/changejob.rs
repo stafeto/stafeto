@@ -50,6 +50,16 @@ use proto_fs::names::{self as n, Change, ChangeOp, OpenAnswer, UPPER_INO_TAG};
 use proto_fs::{MAX_PATH, Redirect};
 use proto_wire::{Reader, Status, Writer};
 
+/// What `Core::commit_start` did.
+pub enum CommitStart {
+    /// No copy waits for a commit.
+    None,
+    /// The commit job has a copy.
+    Job,
+    /// The copy of this ticket is over at once, failed.
+    Failed(u64),
+}
+
 /// What a step of a change job came to.
 #[allow(clippy::large_enum_variant)]
 pub enum ChangeStep<P> {
@@ -75,7 +85,8 @@ enum Phase {
     StatB,
     /// The attribute operations walk the whole path.
     WalkFull,
-    LowerTarget,
+    /// The read of the text of a link of the lower set (a copy of the link).
+    LowerLink,
     Empty,
     Commit,
     LinkOpen,
@@ -99,6 +110,9 @@ impl Stage {
             Stage::UnlinkOldLink => 11,
             Stage::OpenFile { .. } => 12,
             Stage::Attr => 13,
+            Stage::CopyReserve => 14,
+            Stage::CopyIn => 15,
+            Stage::CopyDrop => 16,
         }
     }
 }
@@ -117,14 +131,21 @@ enum DirRef {
 enum Stage {
     /// The directories of the lower components of a leg are made in the layer.
     Ensure { b: bool },
-    /// A directory at the leaf of a leg.
+    /// A directory at the leaf of a leg; the number of the directory of the lower set when it is
+    /// the copy of one (a new directory takes the next number of the counter).
     Dir {
         b: bool,
         opaque: bool,
         created: Created,
+        lower: Option<u64>,
     },
-    /// A file or a link at the leaf of the first leg.
-    File { kind: Kind, created: Created },
+    /// A file or a link at the leaf of the first leg; the number of the link of the lower set when
+    /// it is the copy of one.
+    File {
+        kind: Kind,
+        created: Created,
+        lower: Option<u64>,
+    },
     /// The mark of the leaf of a leg in `dir`: the volume.
     Mark { dir: DirRef, b: bool },
     /// The mark of the leaf of a leg in `dir`: the index.
@@ -145,6 +166,14 @@ enum Stage {
     OpenFile { check: bool },
     /// An attribute operation.
     Attr,
+    /// The copy of a file of the lower set is queued: its ticket is the answer (COPYING).
+    CopyReserve,
+    /// The copy the worker made is renamed into the layer and entered in the index, in one
+    /// visible step.
+    CopyIn,
+    /// The copy the worker made is of no use (the name changed meanwhile, or the copy failed):
+    /// the file in `work/` goes to the reaper.
+    CopyDrop,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -157,6 +186,8 @@ enum Class {
     Rename,
     Attr,
     Link,
+    /// The step that makes a finished copy visible (no request: the loop starts it).
+    Commit,
 }
 
 /// One of the two paths of a change.
@@ -269,6 +300,10 @@ struct AttrPlan {
     atime: i64,
     mtime: i64,
     size: u64,
+    /// The entry the operation acts on was made by this job (the copy of a lower directory or
+    /// link): `Stage::Attr` takes its id from `made` and its path from the first leg.
+    fresh: bool,
+    link: bool,
 }
 
 const NO_ATTR: AttrPlan = AttrPlan {
@@ -283,6 +318,8 @@ const NO_ATTR: AttrPlan = AttrPlan {
     atime: 0,
     mtime: 0,
     size: 0,
+    fresh: false,
+    link: false,
 };
 
 /// What the rename remembers between its phases.
@@ -350,6 +387,29 @@ pub struct ChangeJob<V: Volume, L: Lower> {
     link: LinkRead,
     attr: AttrPlan,
     pass: Option<V::Pass>,
+    /// The copy up the job plans: what it copies and the stat of the lower file; the ticket the
+    /// answer COPYING carries (0 for none).
+    copy_kind: crate::copy::Kind,
+    copy_stat: LowerStat,
+    ticket: u64,
+    /// The copy a commit job makes visible: its place and generation.
+    commit_of: Option<(u8, u32)>,
+    /// The state of the counter of numbers (`next_number`), the number of the directory of the lower
+    /// set a copy of one keeps, and the read of the text of a link of the lower set.
+    csub: u8,
+    ens_ino: u64,
+    /// The times (access, modification) of the lower directory a copy of one keeps: of the
+    /// directory `stage_ensure` is making, of the leaf of an attribute operation, and the ones
+    /// `dir_step` gives the directory it makes (None for a new directory).
+    ens_times: (i64, i64),
+    leaf_times: (i64, i64),
+    dir_times: Option<(i64, i64)>,
+    lprobe: Option<L::Link>,
+    /// What a commit job did with its copy: made it visible, or dropped it (the file in `work/`
+    /// is the reaper's); and the code the waiters get when the copy could not be made visible.
+    copy_visible: bool,
+    dropped: bool,
+    copy_code: u32,
 }
 
 impl<V: Volume, L: Lower> ChangeJob<V, L> {
@@ -428,6 +488,27 @@ impl<V: Volume, L: Lower> ChangeJob<V, L> {
             },
             attr: NO_ATTR,
             pass: None,
+            copy_kind: crate::copy::Kind::Whole,
+            copy_stat: LowerStat {
+                kind: 2,
+                mode: 0,
+                uid: 0,
+                gid: 0,
+                ino: 0,
+                atime: 0,
+                mtime: 0,
+            },
+            ticket: 0,
+            commit_of: None,
+            csub: 0,
+            ens_ino: 0,
+            ens_times: (0, 0),
+            leaf_times: (0, 0),
+            dir_times: None,
+            lprobe: None,
+            copy_visible: false,
+            dropped: false,
+            copy_code: 0,
         }
     }
 
@@ -453,6 +534,14 @@ impl<V: Volume, L: Lower> ChangeJob<V, L> {
         self.err = None;
         self.pass = None;
         self.attr = NO_ATTR;
+        self.ticket = 0;
+        self.commit_of = None;
+        self.csub = 0;
+        self.ens_ino = 0;
+        self.lprobe = None;
+        self.copy_visible = false;
+        self.dropped = false;
+        self.copy_code = 0;
     }
 
     /// A CHANGE: the operation and its two paths (copied; the body of the request is gone when
@@ -506,6 +595,24 @@ impl<V: Volume, L: Lower> ChangeJob<V, L> {
         Ok(())
     }
 
+    /// The step that makes the finished copy of `place` and `generation` visible: its path is the
+    /// one of the lower file the copy was made for.
+    pub fn start_commit(&mut self, id: u8, place: u8, generation: u32, path: &[u8]) -> R<()> {
+        if path.len() > self.a.plain.len() {
+            return Err(Status::BadSize);
+        }
+        self.reset(id);
+        self.commit_of = Some((place, generation));
+        self.a.plain[..path.len()].copy_from_slice(path);
+        self.a.len = path.len();
+        Ok(())
+    }
+
+    /// The copy a commit job works for.
+    pub fn commit_of(&self) -> Option<(u8, u32)> {
+        self.commit_of
+    }
+
     /// Whether the job holds the lock of the changes.
     pub fn holds_lock(&self) -> bool {
         self.locked
@@ -550,6 +657,9 @@ impl<V: Volume, L: Lower> ChangeJob<V, L> {
     }
 
     fn class(&self) -> Class {
+        if self.commit_of.is_some() {
+            return Class::Commit;
+        }
         if self.creating {
             return Class::Create;
         }
@@ -702,6 +812,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         if let Some(probe) = job.probe.take() {
             self.lower.stat_cancel(probe);
         }
+        if let Some(link) = job.lprobe.take() {
+            self.lower.readlink_cancel(link);
+        }
         if job.locked {
             self.work.unlock(job.id);
             job.locked = false;
@@ -753,7 +866,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 if job.class() == Class::Link {
                     return fail(proto_fs::TOO_MANY_LINKS);
                 }
-                if job.creating {
+                if job.creating || job.commit_of.is_some() {
                     // The walk of the request made the path plain.
                 } else {
                     let (from, to) = job.first;
@@ -795,13 +908,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 self.decide(c, job, Phase::StatB)
             }
             Phase::WalkFull => self.step_walk_full(c, job),
-            Phase::LowerTarget => {
-                match self.lower_stat(&mut job.probe, &job.a.plain[..job.a.len])? {
-                    None => Ok(None),
-                    Some(Some(_)) => fail(proto_fs::READ_ONLY_FILESYSTEM),
-                    Some(None) => fail(proto_fs::NO_ENTRY),
-                }
-            }
+            Phase::LowerLink => self.step_lower_link(c, job),
             Phase::Empty => {
                 if self.step_empty(job)? {
                     self.decide(c, job, Phase::Empty)
@@ -1244,6 +1351,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             Class::Rename => self.decide_rename(c, job, done),
             Class::Attr => self.decide_attr(c, job, done),
             Class::Link => fail(proto_fs::TOO_MANY_LINKS),
+            Class::Commit => self.decide_commit(job, done),
         }
     }
 
@@ -1251,6 +1359,62 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         let leg = if b { &mut job.b } else { &mut job.a };
         leg.restart();
         job.phase = if b { Phase::WalkB } else { Phase::WalkA };
+    }
+
+    /// A finished copy: its name is walked again, and the copy is made visible when the name is
+    /// still the lower set's and visible and the layer has the directory of the path; otherwise,
+    /// and when the worker failed, the copy goes to the reaper.
+    fn decide_commit(
+        &mut self,
+        job: &mut ChangeJob<V, L>,
+        done: Phase,
+    ) -> F<Option<Done<V::Pass>>> {
+        let Some((place, generation)) = job.commit_of else {
+            return fail(proto_fs::INVALID_ARGUMENT);
+        };
+        match done {
+            Phase::PlainA => {
+                let Some((_, _, code, _)) = self.copies.facts(place, generation) else {
+                    return fail(proto_fs::INVALID_ARGUMENT);
+                };
+                if code != 0 {
+                    // The worker failed: nothing to walk.
+                    job.committed = true;
+                    job.push(Stage::CopyDrop);
+                    job.pc = 0;
+                    job.dsub = 0;
+                    job.phase = Phase::Commit;
+                    return Ok(None);
+                }
+                job.a.parts = split(&job.a.plain[..job.a.len])?;
+                job.committed = true;
+                Self::begin_walk(job, false);
+                Ok(None)
+            }
+            Phase::LeafA => {
+                let leaf = job.a.leaf;
+                let ino = self
+                    .copies
+                    .facts(place, generation)
+                    .map_or(0, |(_, stat, _, _)| stat.ino);
+                let same = matches!(leaf, Some(Leaf::Lower(ls)) if ls.ino == ino && ls.kind == 2);
+                // The deliberate break `break-layerd-copy-recheck`: the copy is made visible whatever
+                // the walk found at the name.
+                let same = same || cfg!(feature = "break-layerd-copy-recheck");
+                // The directories of the path the layer does not hold are made with the copy.
+                if same {
+                    job.push(Stage::Ensure { b: false });
+                    job.push(Stage::CopyIn);
+                } else {
+                    job.push(Stage::CopyDrop);
+                }
+                job.pc = 0;
+                job.dsub = 0;
+                job.phase = Phase::Commit;
+                Ok(None)
+            }
+            _ => fail(proto_fs::INVALID_ARGUMENT),
+        }
     }
 
     /// `mkdir`, `symlink` and the OPEN that creates.
@@ -1324,14 +1488,39 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                         if ls.kind == 5 && job.flags & proto_fs::NO_FOLLOW == 0 {
                             return Err(Stop::LowerLink { which: 0 });
                         }
-                        if n::open_writes(job.flags) {
-                            return fail(proto_fs::READ_ONLY_FILESYSTEM);
+                        if !n::open_writes(job.flags) {
+                            // The name is the lower set's to open for reading: the redirect to the
+                            // RAM file service, which is the one of a link of the lower set.
+                            return Err(Stop::LowerLink { which: 0 });
                         }
-                        // The name is the lower set's to open for reading: the redirect to the
-                        // RAM file service, which is the one of a link of the lower set.
-                        return Err(Stop::LowerLink { which: 0 });
+                        // An open for writing of a name of the lower set: the file is copied up
+                        // (the cut of `O_TRUNC` makes the copy empty), and the open is made again
+                        // when the copy is there.
+                        match ls.kind {
+                            1 => return fail(proto_fs::IS_DIRECTORY),
+                            2 => {}
+                            5 => return fail(proto_fs::LOOP),
+                            _ => return fail(proto_fs::NOT_SUPPORTED),
+                        }
+                        let mut bits = WRITE;
+                        if job.flags & 3 != proto_fs::WRITE_ONLY {
+                            bits |= posix_perm::READ;
+                        }
+                        if !permits(who, &lower_attr(&ls), bits) {
+                            return fail(proto_fs::ACCESS_DENIED);
+                        }
+                        let kind = if job.flags & proto_fs::TRUNCATE != 0 {
+                            crate::copy::Kind::Empty
+                        } else {
+                            crate::copy::Kind::Whole
+                        };
+                        return self.plan_copy(job, ls, kind);
                     }
                 };
+                // Without CREATE a name that is not there is NO_ENTRY.
+                if class == Class::Create && job.flags & proto_fs::CREATE == 0 {
+                    return fail(proto_fs::NO_ENTRY);
+                }
                 if !permits(who, &attr, WRITE | EXEC) {
                     return fail(proto_fs::ACCESS_DENIED);
                 }
@@ -1353,6 +1542,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                             b: false,
                             opaque: lower_dir,
                             created,
+                            lower: None,
                         });
                     }
                     Class::Symlink => {
@@ -1367,6 +1557,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                         job.push(Stage::File {
                             kind: Kind::Link,
                             created,
+                            lower: None,
                         });
                     }
                     _ => {
@@ -1381,6 +1572,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                         job.push(Stage::File {
                             kind: Kind::File,
                             created,
+                            lower: None,
                         });
                     }
                 }
@@ -1400,6 +1592,14 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             }
             _ => Err(Stop::Status(st(proto_fs::INVALID_ARGUMENT))),
         }
+    }
+}
+
+/// The code of the answer for a failure of the volume.
+fn from_volume_code(status: Status) -> u32 {
+    match from_volume(status) {
+        Status::Unknown(code) => code,
+        _ => proto_layer::IO,
     }
 }
 
@@ -1968,7 +2168,10 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 end,
             }),
             Outcome::Lower => {
-                job.phase = Phase::LowerTarget;
+                // The name is the lower set's: the walk goes again by the directory part and the
+                // leaf, as a change that makes a name does (`decide_attr` at `LeafA`).
+                job.a.parts = split(&job.a.plain[..job.a.len])?;
+                Self::begin_walk(job, false);
                 Ok(None)
             }
             Outcome::PassThrough { .. } => fail(proto_fs::CROSS_DEVICE),
@@ -1989,7 +2192,6 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 Ok(None)
             }
             Phase::StatA => {
-                let who = c.who.identity(false);
                 let id = job.attr.id;
                 let Some(stat) = job.a.stat else {
                     return fail(proto_fs::NO_ENTRY);
@@ -2006,67 +2208,315 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 } else {
                     attr_of(&stat)
                 };
-                let mut plan = AttrPlan {
-                    id,
-                    dir: kind == Kind::Dir,
-                    ino: stat.ino,
-                    uid: attr.uid,
-                    gid: attr.gid,
-                    mode: attr.mode,
-                    ..NO_ATTR
-                };
-                match job.op {
-                    ChangeOp::Chmod => {
-                        if kind == Kind::Link {
-                            return fail(proto_fs::NOT_SUPPORTED);
-                        }
-                        plan.mode =
-                            posix_perm::chmod_result(who, &attr, (job.a_val & 0o7777) as u32)
-                                .map_err(denial)?;
-                    }
-                    ChangeOp::Chown => {
-                        let keep = |v: u64| (v as u32 != u32::MAX).then_some(v as u32);
-                        let (uid, gid) = (keep(job.a_val), keep(job.b_val));
-                        let owned =
-                            posix_perm::chown_result(who, &attr, uid, gid).map_err(denial)?;
-                        plan.keep_uid = uid.unwrap_or(d::UID_KEEP);
-                        plan.keep_gid = gid.unwrap_or(d::UID_KEEP);
-                        plan.uid = owned.uid;
-                        plan.gid = owned.gid;
-                        plan.mode = owned.mode;
-                    }
-                    ChangeOp::Utimens => {
-                        if kind == Kind::Link {
-                            return fail(proto_fs::NOT_SUPPORTED);
-                        }
-                        let (atime, mtime) = (job.a_val as i64, job.b_val as i64);
-                        let request = match (atime, mtime) {
-                            (d::UTIME_OMIT, d::UTIME_OMIT) => TimesRequest::Omit,
-                            (d::UTIME_NOW, d::UTIME_NOW) => TimesRequest::Now,
-                            _ => TimesRequest::Explicit,
-                        };
-                        posix_perm::utimens_allowed(who, &attr, request).map_err(denial)?;
-                        plan.atime = atime;
-                        plan.mtime = mtime;
-                    }
-                    ChangeOp::Truncate => {
-                        if kind == Kind::Dir {
-                            return fail(proto_fs::IS_DIRECTORY);
-                        }
-                        if !permits(who, &attr, WRITE) {
-                            return fail(proto_fs::ACCESS_DENIED);
-                        }
-                        plan.size = job.a_val;
-                    }
-                    _ => return fail(proto_fs::INVALID_ARGUMENT),
-                }
+                let plan = Self::attr_plan(c, job, id, kind, &attr, stat.ino)?;
                 job.attr = plan;
                 job.push(Stage::Attr);
                 Self::begin_commit(job);
                 Ok(None)
             }
+            // A name the layer does not hold: the lower set's, which is copied up first.
+            Phase::LeafA => {
+                let Some(leaf) = job.a.leaf else {
+                    return fail(proto_fs::NO_ENTRY);
+                };
+                match leaf {
+                    Leaf::Missing { .. } => fail(proto_fs::NO_ENTRY),
+                    // The layer made the name since the walk of the whole path: it is walked again.
+                    Leaf::Upper { .. } => {
+                        job.a.restart();
+                        job.phase = Phase::WalkFull;
+                        Ok(None)
+                    }
+                    Leaf::Lower(ls) => self.plan_lower_attr(c, job, ls),
+                }
+            }
             _ => fail(proto_fs::INVALID_ARGUMENT),
         }
+    }
+
+    /// What an attribute operation does to a name with `attr`, its rights checked: the plan of
+    /// the stage `Attr`.
+    fn attr_plan(
+        c: &Client<'_>,
+        job: &ChangeJob<V, L>,
+        id: u32,
+        kind: Kind,
+        attr: &posix_perm::Attr,
+        ino: u64,
+    ) -> F<AttrPlan> {
+        let who = c.who.identity(false);
+        let mut plan = AttrPlan {
+            id,
+            dir: kind == Kind::Dir,
+            ino,
+            uid: attr.uid,
+            gid: attr.gid,
+            mode: attr.mode,
+            ..NO_ATTR
+        };
+        match job.op {
+            ChangeOp::Chmod => {
+                if kind == Kind::Link {
+                    return fail(proto_fs::NOT_SUPPORTED);
+                }
+                plan.mode = posix_perm::chmod_result(who, attr, (job.a_val & 0o7777) as u32)
+                    .map_err(denial)?;
+            }
+            ChangeOp::Chown => {
+                let keep = |v: u64| (v as u32 != u32::MAX).then_some(v as u32);
+                let (uid, gid) = (keep(job.a_val), keep(job.b_val));
+                let owned = posix_perm::chown_result(who, attr, uid, gid).map_err(denial)?;
+                plan.keep_uid = uid.unwrap_or(d::UID_KEEP);
+                plan.keep_gid = gid.unwrap_or(d::UID_KEEP);
+                plan.uid = owned.uid;
+                plan.gid = owned.gid;
+                plan.mode = owned.mode;
+            }
+            ChangeOp::Utimens => {
+                if kind == Kind::Link {
+                    return fail(proto_fs::NOT_SUPPORTED);
+                }
+                let (atime, mtime) = (job.a_val as i64, job.b_val as i64);
+                let request = match (atime, mtime) {
+                    (d::UTIME_OMIT, d::UTIME_OMIT) => TimesRequest::Omit,
+                    (d::UTIME_NOW, d::UTIME_NOW) => TimesRequest::Now,
+                    _ => TimesRequest::Explicit,
+                };
+                posix_perm::utimens_allowed(who, attr, request).map_err(denial)?;
+                plan.atime = atime;
+                plan.mtime = mtime;
+            }
+            ChangeOp::Truncate => {
+                if kind == Kind::Dir {
+                    return fail(proto_fs::IS_DIRECTORY);
+                }
+                if !permits(who, attr, WRITE) {
+                    return fail(proto_fs::ACCESS_DENIED);
+                }
+                plan.size = job.a_val;
+            }
+            _ => return fail(proto_fs::INVALID_ARGUMENT),
+        }
+        Ok(plan)
+    }
+
+    /// An attribute operation on a name of the lower set: a file is copied up whole (and the
+    /// request sent again finds the copy), a directory is made in the layer with the attributes and
+    /// the number of the lower one and then changed, a link (`lchown`) is made the same way once its
+    /// text is read.
+    fn plan_lower_attr(
+        &mut self,
+        c: &Client<'_>,
+        job: &mut ChangeJob<V, L>,
+        ls: LowerStat,
+    ) -> F<Option<Done<V::Pass>>> {
+        let attr = lower_attr(&ls);
+        let trailing = job.a.parts.trailing;
+        self.number_kept(&ls)?;
+        match ls.kind {
+            1 => {
+                let mut plan = Self::attr_plan(c, job, 0, Kind::Dir, &attr, ls.ino)?;
+                plan.fresh = true;
+                job.attr = plan;
+                job.leaf_times = (ls.atime, ls.mtime);
+                job.committed = true;
+                job.push(Stage::Ensure { b: false });
+                job.push(Stage::Dir {
+                    b: false,
+                    opaque: false,
+                    created: Created {
+                        uid: ls.uid,
+                        gid: ls.gid,
+                        mode: ls.mode & 0o7777,
+                    },
+                    lower: Some(ls.ino),
+                });
+                job.push(Stage::Attr);
+                job.pc = 0;
+                job.dsub = 0;
+                job.phase = Phase::Commit;
+                Ok(None)
+            }
+            2 => {
+                if trailing {
+                    return fail(proto_fs::NOT_DIRECTORY);
+                }
+                // The rights are those of the lower attributes: the request that fails fails now,
+                // before a byte is copied.
+                Self::attr_plan(c, job, 0, Kind::File, &attr, ls.ino)?;
+                self.plan_copy(job, ls, crate::copy::Kind::Whole)
+            }
+            5 => {
+                // A link takes `lchown` only (its mode and times are not the volume's to keep).
+                if job.op != ChangeOp::Chown || trailing {
+                    return fail(proto_fs::NOT_SUPPORTED);
+                }
+                let mut plan = Self::attr_plan(c, job, 0, Kind::Link, &attr, ls.ino)?;
+                plan.fresh = true;
+                plan.link = true;
+                job.attr = plan;
+                job.copy_stat = ls;
+                job.committed = true;
+                job.phase = Phase::LowerLink;
+                Ok(None)
+            }
+            _ => fail(proto_fs::NOT_SUPPORTED),
+        }
+    }
+
+    /// The text of the lower link is in the second path: the link is made in the layer.
+    fn step_lower_link(
+        &mut self,
+        _c: &Client<'_>,
+        job: &mut ChangeJob<V, L>,
+    ) -> F<Option<Done<V::Pass>>> {
+        let Some(probe) = job.lprobe.as_mut() else {
+            let path = &job.a.plain[..job.a.parts.len];
+            match self.lower.readlink_start(path) {
+                Ok(link) => job.lprobe = Some(link),
+                // No place for a job of the RAM file service: asked again in the next step.
+                Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES)) => {}
+                Err(e) => return Err(e.into()),
+            }
+            return Ok(None);
+        };
+        let mut text = [0u8; 512];
+        match self.lower.readlink_poll(probe, &mut text) {
+            Ok(None) => Ok(None),
+            Ok(Some(len)) => {
+                job.lprobe = None;
+                let at = job.first.1;
+                if len == 0 || at + len > job.req.len() {
+                    return fail(proto_fs::NAME_TOO_LONG);
+                }
+                job.req[at..at + len].copy_from_slice(&text[..len]);
+                job.second = (at, at + len);
+                let ls = job.copy_stat;
+                job.push(Stage::Ensure { b: false });
+                job.push(Stage::File {
+                    kind: Kind::Link,
+                    // The file of a link is 0644 on the volume; `stat` reports 0777.
+                    created: Created {
+                        uid: ls.uid,
+                        gid: ls.gid,
+                        mode: 0o644,
+                    },
+                    lower: Some(ls.ino),
+                });
+                job.push(Stage::Attr);
+                job.pc = 0;
+                job.dsub = 0;
+                job.phase = Phase::Commit;
+                Ok(None)
+            }
+            Err(e) => {
+                job.lprobe = None;
+                Err(Stop::Status(e))
+            }
+        }
+    }
+
+    /// The copy up of the lower file at the leaf of the first leg: the ticket of the copy that is
+    /// in work, or the directories of the path made in the layer and a place in the table. The
+    /// answer is COPYING (`finish_ok`), and the lock goes with it: the bytes move outside the
+    /// loop.
+    fn plan_copy(
+        &mut self,
+        job: &mut ChangeJob<V, L>,
+        ls: LowerStat,
+        kind: crate::copy::Kind,
+    ) -> F<Option<Done<V::Pass>>> {
+        // The names the layer would make must fit the volume.
+        let mut vp = [0u8; 512];
+        self.leg_vpath(&job.a, job.a.parts.len, false, &mut vp)?;
+        self.number_kept(&ls)?;
+        let found = self.copies.find(&job.a.plain[..job.a.parts.len]);
+        if let Some(ticket) = found {
+            job.ticket = ticket;
+            job.nstages = 0;
+        } else {
+            if !self.copies.room() {
+                return fail(proto_layer::STARTING);
+            }
+            job.copy_kind = kind;
+            job.copy_stat = ls;
+            // The directories of the path are not made here: the commit makes them with the copy,
+            // so a copy that is refused (a program) leaves no directory in the layer.
+            job.push(Stage::CopyReserve);
+        }
+        Self::begin_commit(job);
+        Ok(None)
+    }
+
+    /// The number of a lower name is kept by its copy, so it must be one the layer's own numbers
+    /// (bit 62) and the numbers of the volume's paths (bit 63) cannot be: a lower number with either
+    /// bit set is INVALID_ARGUMENT, before anything is made. (A number kept can still equal that of
+    /// another lower file after an image or package change: a matter for a later part.)
+    fn number_kept(&self, ls: &LowerStat) -> F<()> {
+        if ls.ino & (proto_data::INO_NUMBERED | proto_data::INO_PATH) != 0 {
+            return fail(proto_fs::INVALID_ARGUMENT);
+        }
+        Ok(())
+    }
+}
+
+impl<V: Volume, L: Lower> Core<'_, V, L> {
+    // ------------------------------------------------------------------ the copies the worker ended
+
+    /// The next copy the worker ended becomes the work of the commit job `job` (with the place
+    /// `id` of the lock). A copy whose job cannot start is over at once with an I/O error and its
+    /// file goes to the reaper: its ticket is given back, for the waiters to be told.
+    pub fn commit_start(&mut self, job: &mut ChangeJob<V, L>, id: u8) -> CommitStart {
+        let Some((place, generation)) = self.copies.finished() else {
+            return CommitStart::None;
+        };
+        let mut path = [0u8; crate::copy::PATH];
+        let (len, made) = match self.copies.facts(place, generation) {
+            Some((p, _, _, made)) => {
+                path[..p.len()].copy_from_slice(p);
+                (p.len(), made)
+            }
+            None => return CommitStart::None,
+        };
+        if job
+            .start_commit(id, place, generation, &path[..len])
+            .is_err()
+        {
+            if made {
+                let (work, wl) = crate::copy::work_path(place, generation);
+                let _ = self.work.push(&work[..wl], false, 0);
+            }
+            self.copies.over(place, generation, proto_layer::IO, true);
+            return CommitStart::Failed(crate::copy::ticket_of(place, generation));
+        }
+        CommitStart::Job
+    }
+
+    /// The commit job is over, whatever it came to: the copy is made visible or it is not, and a
+    /// file in `work/` that nobody took is the reaper's. `failed` is the code of the job's own
+    /// failure, which the waiters get when the worker had none. The waiters are answered from the
+    /// table.
+    pub fn commit_done(&mut self, job: &mut ChangeJob<V, L>, failed: Option<u32>) {
+        let Some((place, generation)) = job.commit_of.take() else {
+            return;
+        };
+        let Some((_, _, worker, made)) = self.copies.facts(place, generation) else {
+            return;
+        };
+        if !job.copy_visible && !job.dropped && made {
+            let (work, wl) = crate::copy::work_path(place, generation);
+            let _ = self.work.push(&work[..wl], false, 0);
+        }
+        let code = [worker, job.copy_code, failed.unwrap_or(0)]
+            .into_iter()
+            .find(|&c| c != 0)
+            .unwrap_or(0);
+        self.copies.over(place, generation, code, !job.copy_visible);
+    }
+
+    /// The code the waiters of the commit job's copy get: the outcome the table keeps.
+    pub fn copy_wait(&self, ticket: u64) -> crate::copy::Wait {
+        self.copies.wait(ticket)
     }
 }
 
@@ -2074,6 +2524,12 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     // ------------------------------------------------------------------ the commit
 
     fn finish_ok(&mut self, job: &mut ChangeJob<V, L>, w: &mut Writer) -> F<Option<Done<V::Pass>>> {
+        if job.ticket != 0 {
+            // The file is copied up outside the loop: the program waits for the ticket and asks
+            // again.
+            n::write_copying(job.ticket, w)?;
+            return Ok(Some(Done::Written));
+        }
         if job.creating {
             OpenAnswer::Pass.write(w)?;
             let pass = job
@@ -2141,18 +2597,28 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     fn stage(&mut self, c: &Client<'_>, job: &mut ChangeJob<V, L>, stage: Stage) -> F<Flow> {
         match stage {
             Stage::Ensure { b } => self.stage_ensure(job, b),
-            Stage::Dir { b, opaque, created } => {
+            Stage::Dir {
+                b,
+                opaque,
+                created,
+                lower,
+            } => {
                 let parent = if b { job.dir_b } else { job.dir_a };
                 let (at, len) = {
                     let leg = job.leg(b);
                     (leg.parts.leaf_at, leg.parts.len)
                 };
-                match self.dir_step(job, b, parent, (at, len), len, created, opaque)? {
+                job.dir_times = lower.map(|_| job.leaf_times);
+                match self.dir_step(job, b, parent, (at, len), len, (created, lower), opaque)? {
                     Some(_) => Ok(Flow::CallDone),
                     None => Ok(Flow::Call),
                 }
             }
-            Stage::File { kind, created } => self.stage_file(job, kind, created),
+            Stage::File {
+                kind,
+                created,
+                lower,
+            } => self.stage_file(job, kind, created, lower),
             Stage::Mark { dir, b } => self.stage_mark(job, dir, b),
             Stage::IndexMark { dir, b } => {
                 let fields = Fields {
@@ -2214,6 +2680,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             }
             Stage::OpenFile { check } => self.stage_open_file(c, job, check),
             Stage::Attr => self.stage_attr(job),
+            Stage::CopyReserve => self.stage_copy_reserve(job),
+            Stage::CopyIn => self.stage_copy_in(job),
+            Stage::CopyDrop => self.stage_copy_drop(job),
         }
     }
 
@@ -2270,11 +2739,16 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 gid: ls.gid,
                 mode: ls.mode & 0o7777,
             };
+            // The directory of the layer keeps the number of the lower one.
+            self.number_kept(&ls)?;
+            job.ens_ino = ls.ino;
+            job.ens_times = (ls.atime, ls.mtime);
             job.sub = 2;
             return Ok(Flow::Call);
         }
-        let (cur, created) = (job.ens_cur, job.ens_created);
-        match self.dir_step(job, b, cur, (pos, end), end, created, false)? {
+        let (cur, created, lower) = (job.ens_cur, job.ens_created, job.ens_ino);
+        job.dir_times = Some(job.ens_times);
+        match self.dir_step(job, b, cur, (pos, end), end, (created, Some(lower)), false)? {
             Some(id) => {
                 job.ens_cur = id;
                 job.ens_pos = end + 1;
@@ -2301,10 +2775,13 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         parent: u32,
         name: (usize, usize),
         end: usize,
-        created: Created,
+        made: (Created, Option<u64>),
         opaque: bool,
     ) -> F<Option<u32>> {
-        let Created { uid, gid, mode } = created;
+        let (Created { uid, gid, mode }, lower) = made;
+        // The deliberate break `break-layerd-copy-counter-ino`: a directory of a copy takes a
+        // number of the counter and loses the lower one.
+        let lower = lower.filter(|_| !cfg!(feature = "break-layerd-copy-counter-ino"));
         match job.dsub {
             0 => {
                 let mut live = [0u8; 512];
@@ -2315,18 +2792,26 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 {
                     return fail(proto_fs::NO_SPACE);
                 }
-                let (num, work, wl) = self.work_path();
-                job.work = num;
-                self.volume.mkdir(&work[..wl], 0o700).map_err(from_volume)?;
-                job.dsub = 1;
+                job.dsub = 8;
                 Ok(None)
             }
-            1 => {
-                let (work, wl) = Self::work_path_of(job.work);
-                match self.volume.stat(&work[..wl]) {
-                    Ok(stat) => job.ino = stat.ino,
-                    Err(e) => return Err(self.scrub_fail(job, true, e)),
-                }
+            // The number: the lower directory's when this is the copy of one, else the next of the
+            // counter (so no two names of the root share a number: the numbers of the data file
+            // service's counter and those of the RAM file service meet).
+            8 => {
+                let ino = match lower {
+                    Some(ino) => ino,
+                    None => match self.next_number(job)? {
+                        Some(ino) => ino,
+                        None => return Ok(None),
+                    },
+                };
+                job.ino = ino;
+                let (num, work, wl) = self.work_path();
+                job.work = num;
+                self.volume
+                    .mkdir_numbered(&work[..wl], 0o700, ino)
+                    .map_err(from_volume)?;
                 job.dsub = if opaque { 2 } else { 4 };
                 Ok(None)
             }
@@ -2365,6 +2850,16 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             5 => {
                 let (work, wl) = Self::work_path_of(job.work);
                 if let Err(e) = self.volume.chmod(&work[..wl], mode) {
+                    return Err(self.scrub_fail(job, true, e));
+                }
+                job.dsub = if job.dir_times.is_some() { 9 } else { 6 };
+                Ok(None)
+            }
+            // The times of the lower directory a copy of one keeps.
+            9 => {
+                let (work, wl) = Self::work_path_of(job.work);
+                let (atime, mtime) = job.dir_times.unwrap_or((d::UTIME_OMIT, d::UTIME_OMIT));
+                if let Err(e) = self.volume.utimens(&work[..wl], atime, mtime) {
                     return Err(self.scrub_fail(job, true, e));
                 }
                 job.dsub = 6;
@@ -2421,22 +2916,13 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         }
     }
 
-    /// A file or a link at the leaf of the first leg, with the text of a link for its bytes,
-    /// prepared in `work/`: the number from the counter of COMPOSITION (written back, in steps, when
-    /// its block is used up), the file, its bytes, its owner and mode, the rename.
-    fn stage_file(&mut self, job: &mut ChangeJob<V, L>, kind: Kind, created: Created) -> F<Flow> {
-        let link = kind == Kind::Link;
-        let parent = job.dir_a;
-        let Created { uid, gid, mode } = created;
-        let (text_from, text_to) = if link { job.second } else { (0, 0) };
+    /// The next number of a name the service makes, `UPPER_INO_TAG | n` of the counter of
+    /// COMPOSITION, which is written back, in steps, when its block is used up. None while the
+    /// write goes on (a call was made; the stage asks again in its next step).
+    fn next_number(&mut self, job: &mut ChangeJob<V, L>) -> F<Option<u64>> {
         loop {
-            match job.dsub {
+            match job.csub {
                 0 => {
-                    let mut live = [0u8; 512];
-                    self.leg_vpath(&job.a, job.a.parts.len, link, &mut live)?;
-                    if !self.index.has_room(parent, job.a.leaf_name()) {
-                        return fail(proto_fs::NO_SPACE);
-                    }
                     if !self.writes.started {
                         self.writes.ino_next = self.composition.ino;
                         self.writes.ino_limit = self.composition.ino;
@@ -2451,9 +2937,11 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                         next.ino = limit;
                         job.clen = next.render(&mut job.ctext);
                         job.cnext = Some(next);
-                        job.dsub = 20;
+                        job.csub = 20;
                     } else {
-                        job.dsub = 1;
+                        let ino = UPPER_INO_TAG | self.writes.ino_next;
+                        self.writes.ino_next += 1;
+                        return Ok(Some(ino));
                     }
                 }
                 20 => {
@@ -2463,8 +2951,8 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                         .map_err(from_volume)?;
                     job.written = 0;
                     job.err = None;
-                    job.dsub = 21;
-                    return Ok(Flow::Call);
+                    job.csub = 21;
+                    return Ok(None);
                 }
                 21 => {
                     match self
@@ -2473,38 +2961,39 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                     {
                         Ok(0) => {
                             job.err = Some(st(d::NO_SPACE));
-                            job.dsub = 23;
+                            job.csub = 23;
                         }
                         Ok(k) => {
                             job.written += k;
                             if job.written >= job.clen {
-                                job.dsub = 22;
+                                job.csub = 22;
                             }
                         }
                         Err(e) => {
                             job.err = Some(e);
-                            job.dsub = 23;
+                            job.csub = 23;
                         }
                     }
-                    return Ok(Flow::Call);
+                    return Ok(None);
                 }
                 22 => {
                     if let Err(e) = self.volume.fsync(job.handle) {
                         job.err = Some(e);
                     }
-                    job.dsub = 23;
-                    return Ok(Flow::Call);
+                    job.csub = 23;
+                    return Ok(None);
                 }
                 23 => {
                     let closed = self.volume.close(job.handle);
                     if let Some(e) = job.err.take() {
+                        job.csub = 0;
                         return Err(Stop::Status(from_volume(e)));
                     }
                     closed.map_err(from_volume)?;
-                    job.dsub = 24;
-                    return Ok(Flow::Call);
+                    job.csub = 24;
+                    return Ok(None);
                 }
-                24 => {
+                _ => {
                     self.volume
                         .rename(COMPOSITION_TMP, COMPOSITION)
                         .map_err(from_volume)?;
@@ -2512,13 +3001,51 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                         self.writes.ino_limit = next.ino;
                         self.composition = next;
                     }
+                    job.csub = 0;
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    /// A file or a link at the leaf of the first leg, with the text of a link for its bytes,
+    /// prepared in `work/`: the number from the counter of COMPOSITION (written back, in steps, when
+    /// its block is used up), the file, its bytes, its owner and mode, the rename.
+    fn stage_file(
+        &mut self,
+        job: &mut ChangeJob<V, L>,
+        kind: Kind,
+        created: Created,
+        lower: Option<u64>,
+    ) -> F<Flow> {
+        let link = kind == Kind::Link;
+        let parent = job.dir_a;
+        let Created { uid, gid, mode } = created;
+        let (text_from, text_to) = if link { job.second } else { (0, 0) };
+        loop {
+            match job.dsub {
+                0 => {
+                    let mut live = [0u8; 512];
+                    self.leg_vpath(&job.a, job.a.parts.len, link, &mut live)?;
+                    if !self.index.has_room(parent, job.a.leaf_name()) {
+                        return fail(proto_fs::NO_SPACE);
+                    }
+                    job.dsub = 25;
+                }
+                // The number: the lower link's when this is the copy of one, else the next of the
+                // counter.
+                25 => {
+                    job.ino = match lower {
+                        Some(ino) => ino,
+                        None => match self.next_number(job)? {
+                            Some(ino) => ino,
+                            None => return Ok(Flow::Call),
+                        },
+                    };
                     job.dsub = 1;
-                    return Ok(Flow::Call);
                 }
                 1 => {
-                    let ino = UPPER_INO_TAG | self.writes.ino_next;
-                    self.writes.ino_next += 1;
-                    job.ino = ino;
+                    let ino = job.ino;
                     let (num, work, wl) = self.work_path();
                     job.work = num;
                     job.handle = self
@@ -2817,8 +3344,99 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         }
     }
 
+    /// The copy of the lower file at the leaf of the first leg is queued; its ticket is the answer.
+    fn stage_copy_reserve(&mut self, job: &mut ChangeJob<V, L>) -> F<Flow> {
+        let path = &job.a.plain[..job.a.parts.len];
+        let Some(ticket) = self.copies.reserve(path, job.copy_kind, job.copy_stat) else {
+            return fail(proto_layer::STARTING);
+        };
+        job.ticket = ticket;
+        Ok(Flow::Pure)
+    }
+
+    /// The copy of `commit_of` is renamed from `work/` into the layer and entered in the index in
+    /// one step (the visible one): the directory of the layer is the one the walk found.
+    fn stage_copy_in(&mut self, job: &mut ChangeJob<V, L>) -> F<Flow> {
+        let Some((place, generation)) = job.commit_of else {
+            return fail(proto_fs::INVALID_ARGUMENT);
+        };
+        let Some((_, stat, _, _)) = self.copies.facts(place, generation) else {
+            return fail(proto_fs::INVALID_ARGUMENT);
+        };
+        let (work, wl) = crate::copy::work_path(place, generation);
+        let mut live = [0u8; 512];
+        let n = self.leg_vpath(&job.a, job.a.parts.len, false, &mut live)?;
+        let parent = job.dir_a;
+        if !self.index.has_room(parent, job.a.leaf_name()) {
+            return self.copy_gone(job, proto_fs::NO_SPACE);
+        }
+        if let Err(e) = self.volume.rename(&work[..wl], &live[..n]) {
+            return self.copy_gone(job, from_volume_code(e));
+        }
+        let fields = Fields {
+            kind: Kind::File,
+            layer: self.composition.live().number,
+            number: stat.ino,
+            uid: stat.uid,
+            gid: stat.gid,
+            mode: (stat.mode & 0o7777) as u16,
+        };
+        if self
+            .index
+            .insert(parent, job.a.leaf_name(), fields)
+            .is_err()
+        {
+            // Out of room in the index after all: the file goes back into `work/` and the reaper has it.
+            let item = if self.volume.rename(&live[..n], &work[..wl]).is_ok() {
+                &work[..wl]
+            } else {
+                &live[..n]
+            };
+            let _ = self.work.push(item, false, 0);
+            return self.copy_gone(job, proto_fs::NO_SPACE);
+        }
+        job.copy_visible = true;
+        Ok(Flow::CallDone)
+    }
+
+    /// A copy that cannot be made visible: the file in `work/` is the reaper's, and the waiters
+    /// are answered with `code` (0 when the name changed under the copy: they ask again and see
+    /// the present state).
+    fn copy_gone(&mut self, job: &mut ChangeJob<V, L>, code: u32) -> F<Flow> {
+        job.copy_code = code;
+        self.stage_copy_drop(job)
+    }
+
+    fn stage_copy_drop(&mut self, job: &mut ChangeJob<V, L>) -> F<Flow> {
+        let Some((place, generation)) = job.commit_of else {
+            return fail(proto_fs::INVALID_ARGUMENT);
+        };
+        let made = self
+            .copies
+            .facts(place, generation)
+            .is_some_and(|(_, _, _, made)| made);
+        if made {
+            let (work, wl) = crate::copy::work_path(place, generation);
+            let _ = self.work.push(&work[..wl], false, 0);
+        }
+        job.dropped = true;
+        // The stages that follow are of no use.
+        job.nstages = job.pc + 1;
+        Ok(Flow::Pure)
+    }
+
     /// `chmod`, `chown`, `utimensat` and `truncate` of the name the walk found.
     fn stage_attr(&mut self, job: &mut ChangeJob<V, L>) -> F<Flow> {
+        if job.attr.fresh {
+            // The entry was made by this job (the copy of a lower directory or link): its id is
+            // the last one made, and its path on the volume is the first leg's.
+            job.attr.fresh = false;
+            job.attr.id = job.made;
+            let mut vp = [0u8; 512];
+            let len = self.leg_vpath(&job.a, job.a.parts.len, job.attr.link, &mut vp)?;
+            job.b.plain[..len].copy_from_slice(&vp[..len]);
+            job.b.len = len;
+        }
         let plan = job.attr;
         let n = job.b.len;
         match job.op {
