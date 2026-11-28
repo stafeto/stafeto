@@ -27,7 +27,7 @@ exec </dev/null >/dev/console 2>&1
     done
 )
 
-for name in ec2-key dropbear landing web fast; do
+for name in ec2-key dropbear landing web fast layer-time; do
     if [ -f "/etc/rc.d/$name" ]; then
         ash "/etc/rc.d/$name"
     fi

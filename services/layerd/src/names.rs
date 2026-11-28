@@ -86,6 +86,21 @@ pub enum Done<P> {
 /// The times a build starts again under another seed before it leaves names out.
 pub const RESEEDS: u8 = 3;
 
+/// A listing holds the directory open in the index from the first name it gives (the first
+/// stage, past `.` and `..`) until it closes, the directory goes, or it is put back to the start:
+/// a seek may return to any cursor the replies gave, so the entry at one must stay in the list of
+/// the directory (as a gone entry when it is removed) for as long as the cursor may be used.
+fn settle<D>(index: &mut Index, desc: &mut crate::descriptions::Description<D>) {
+    let inside = desc.position.stage == 0 && desc.position.at > 2;
+    if inside
+        && desc.walk.is_none()
+        && let Some(key) = index.dir_key(desc.dir)
+        && index.walk_enter(key)
+    {
+        desc.walk = Some(key);
+    }
+}
+
 /// The seed of the next build: a mix of the last one and the number of the attempt.
 fn next_seed(seed: u64, attempt: u64) -> u64 {
     let mut h = seed ^ attempt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
@@ -581,7 +596,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     pub(crate) fn gate(&self) -> Result<(), Status> {
         match self.state {
             State::Ready => Ok(()),
-            State::Starting => Err(st(l::STARTING)),
+            State::Starting => Err(st(crate::starting::code(crate::starting::Cause::Build))),
             State::NoStore => Err(st(l::NO_STORE)),
             State::Damaged => Err(st(l::DAMAGED)),
             State::Failed(code) => Err(st(code)),
@@ -1164,6 +1179,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         )?;
         // What the replies have given out, which SEEK_DIR may go back to and not past.
         desc.given = desc.given.max(desc.position);
+        settle(index, desc);
         let len = reply.len();
         reply.finish_into(listed.more, listed.cursor, out)?;
         Ok(len)
@@ -1183,6 +1199,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         self.gate()?;
         let Core {
             table,
+            index,
             lower,
             resolving,
             ..
@@ -1195,13 +1212,20 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             &mut desc.opening,
             resolving,
             &mut desc.replayed,
-        )
+        )?;
+        // Back at the start: the cursors given so far are no more, so the hold goes with them.
+        desc.given = crate::descriptions::Position::default();
+        if let Some(key) = desc.walk.take() {
+            index.walk_leave(key);
+        }
+        Ok(())
     }
 
     pub fn seek_dir(&mut self, owner: u64, handle: u32, cursor: u64) -> R<()> {
         self.gate()?;
         let Core {
             table,
+            index,
             lower,
             resolving,
             ..
@@ -1216,13 +1240,18 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             resolving,
             &mut desc.replayed,
             cursor,
-        )
+        )?;
+        settle(index, desc);
+        Ok(())
     }
 
     /// `owner` lets go of a description; the lower directory it kept closes with the last holder.
     pub fn close(&mut self, owner: u64, handle: u32) -> R<()> {
         let freed = self.table.close(owner, handle).map_err(Self::lost)?;
         if let Some(d) = freed {
+            if let Some(key) = d.walk {
+                self.index.walk_leave(key);
+            }
             self.give_back(d.lower, d.opening);
         }
         Ok(())
@@ -1241,6 +1270,9 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     /// The session `owner` went: what it held closes.
     pub fn gone(&mut self, owner: u64) {
         while let Some(d) = self.table.take_owned(owner) {
+            if let Some(key) = d.walk {
+                self.index.walk_leave(key);
+            }
             self.give_back(d.lower, d.opening);
         }
     }

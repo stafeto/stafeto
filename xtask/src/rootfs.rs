@@ -107,6 +107,44 @@ fn grow_data(mut elf: Vec<u8>, extra: u64) -> Result<Vec<u8>, String> {
     Err("no writable segment".into())
 }
 
+/// The bytes of the lower files `layer-time` copies up: the byte at i is (i % 251) | 1, so that no
+/// file starts with the mark of a program (a program is never copied up).
+fn pattern(bytes: usize) -> &'static [u8] {
+    Box::leak(
+        (0..bytes)
+            .map(|i| (i % 251) as u8 | 1)
+            .collect::<Vec<u8>>()
+            .into_boxed_slice(),
+    )
+}
+
+/// The files of the measurement of the layered root (`cargo xtask aws image --layered`): the program
+/// and the lower files it opens for writing, of 1 KiB, 1 MiB and 16 MiB, and a file of 1 MiB it opens
+/// with a truncation.
+pub fn layer_time_files() -> Vec<RootFile> {
+    let data = |path: &'static str, tag: &'static str, bytes: usize| RootFile {
+        path,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        source: Some(Source::Bytes(tag, pattern(bytes))),
+    };
+    vec![
+        file("/bin/layer-time", 0o755, ROOT, "layer-time"),
+        of(
+            "/etc/rc.d/layer-time",
+            0o755,
+            ROOT,
+            Source::Bytes("layer-time-rc", include_bytes!("../../tools/rc/layer-time")),
+        ),
+        dir("/usr/share/layer-time"),
+        data("/usr/share/layer-time/small", "layer-time-small", 1024),
+        data("/usr/share/layer-time/medium", "layer-time-medium", 1 << 20),
+        data("/usr/share/layer-time/big", "layer-time-big", 16 << 20),
+        data("/usr/share/layer-time/trunc", "layer-time-trunc", 1 << 20),
+    ]
+}
+
 const fn dir(path: &'static str) -> RootFile {
     RootFile {
         path,
@@ -2379,6 +2417,9 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             if name == "boot-aws.img" || name == "boot-aws-qemu.img" {
                 files.extend(rc_files());
                 files.extend(try_files());
+                if crate::layer_time() {
+                    files.extend(layer_time_files());
+                }
                 if name == "boot-aws-qemu.img" {
                     let script = crate::net_try::key_script();
                     for f in files.iter_mut().filter(|f| f.path == "/etc/rc.d/ec2-key") {

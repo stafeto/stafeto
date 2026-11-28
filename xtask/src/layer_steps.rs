@@ -65,7 +65,7 @@ fn ticks_of(us: u64) -> u64 {
 }
 
 /// The checks of the probe in scale mode, in the order it runs them.
-pub const CHECKS: [&str; 16] = [
+pub const CHECKS: [&str; 18] = [
     "sessions",
     "status counts the names of the layer",
     "a file at the end of a chain of 247 components",
@@ -81,14 +81,18 @@ pub const CHECKS: [&str; 16] = [
     "a directory renamed into the opaque directory and back",
     "a directory of 2,000 marks removed and made again",
     "a rename onto a directory of marks alone",
+    "links with long names made and removed make the arena compact",
+    "a directory that mixes 200 names and 200 marks lists whole",
     "status counts the names after the changes",
 ];
 
 /// The deliberate breaks, and whether the step gate must catch the break itself (the walk of the
 /// whole layer in one step is also caught by the watch of init, which kills the silent service).
-pub const BREAKS: [(&str, bool); 4] = [
+pub const BREAKS: [(&str, bool); 5] = [
     ("break-layerd-one-step", false),
     ("break-layerd-slots", true),
+    // The compaction of the arena of names in one step.
+    ("break-layerd-compact-one-step", true),
     ("break-layerd-change-one-step", true),
     // The copy of 64 MiB in the step of the loop: the step gate, or the watch of init when the
     // service is silent for the time of the copy.
@@ -137,6 +141,21 @@ fn lower_files() -> Vec<crate::rootfs::RootFile> {
             ),
         )),
     });
+    // A directory of 200 files, next to each of which the probe makes a link and removes the file:
+    // a list of the layer that alternates names and marks.
+    files.push(dir("/lowmix"));
+    for k in 0..200 {
+        files.push(crate::rootfs::RootFile {
+            path: leak(format!("/lowmix/l{k:03}")),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            source: Some(crate::rootfs::Source::Bytes(
+                "layer-steps-lowmix",
+                b"lower\n",
+            )),
+        });
+    }
     files.push(dir("/opq"));
     files.push(crate::rootfs::RootFile {
         path: "/opq/lowfile",
@@ -354,19 +373,46 @@ pub fn copy_gate(lines: &[String]) -> Result<(u64, u64), String> {
     Ok((ticks_of(part), wait))
 }
 
+/// The line the service says when it has compacted its arena of names (the build with `steps`): the
+/// dead bytes taken back and the steps it took.
+fn compaction_line(lines: &[String]) -> Result<(usize, u32), String> {
+    let line = lines
+        .iter()
+        .find_map(|l| {
+            l.split_once("layerd: arena compacted: ")
+                .map(|(_, rest)| rest)
+        })
+        .ok_or("the service did not compact its arena of names")?;
+    // `<D> dead bytes in <S> steps`
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let number = |at: usize| -> Result<usize, String> {
+        words
+            .get(at)
+            .and_then(|w| w.parse().ok())
+            .ok_or_else(|| format!("the line {line:?} has no number at {at}"))
+    };
+    Ok((number(0)?, number(4)? as u32))
+}
+
 /// The line the service says when its index is built: the names, the marks and the steps it took.
 fn index_line(lines: &[String]) -> Result<(u32, u32, u32), String> {
     let line = lines
         .iter()
-        .find_map(|l| l.split_once("layerd: index built: ").map(|(_, rest)| rest))
+        .find_map(|l| l.split_once("layerd: index of ").map(|(_, rest)| rest))
         .ok_or("the service did not say its index is built")?;
-    let number = |at: usize| -> Result<u32, String> {
-        line.split_whitespace()
-            .nth(at)
-            .and_then(|w| w.parse().ok())
-            .ok_or_else(|| format!("the line {line:?} has no number at {at}"))
+    // `<N> names and <M> deletions built in <X> ms, <S> steps, <O> overruns`
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let before = |word: &str| -> Result<u32, String> {
+        let at = words
+            .iter()
+            .position(|w| w.trim_end_matches(',') == word)
+            .filter(|&at| at > 0)
+            .ok_or_else(|| format!("the line {line:?} has no {word}"))?;
+        words[at - 1]
+            .parse()
+            .map_err(|_| format!("the line {line:?} has no number before {word}"))
     };
-    Ok((number(0)?, number(3)?, number(6)?))
+    Ok((before("names")?, before("deletions")?, before("steps")?))
 }
 
 pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
@@ -387,6 +433,15 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     let rows = gate(&output.lines)?;
     let read = ram_gate(&output.lines)?;
     let (part_ticks, wait63) = copy_gate(&output.lines)?;
+    let (dead, compact_steps) = compaction_line(&output.lines)?;
+    if compact_steps < 2 {
+        return Err(format!(
+            "the arena of names was compacted in {compact_steps} step: {dead} dead bytes"
+        ));
+    }
+    println!(
+        "layer-steps: the arena of names was compacted: {dead} dead bytes in {compact_steps} steps"
+    );
     println!(
         "layer-steps: longest wait of the loop in a call (kind, ticks) {:?} (kind 63 {wait63}, one part {part_ticks} ticks); longest job of the data file service: a part {} us, an FSYNC {} us, a CHOWN {} us, a Rename {} us, an Unlink {} us; ResolveStart of the RAM file service {} ticks",
         waits(&output.lines),
@@ -569,8 +624,18 @@ mod tests {
     }
 
     #[test]
+    fn the_compaction_line_is_read() {
+        let lines = vec!["layerd: arena compacted: 77520 dead bytes in 38 steps".to_owned()];
+        assert_eq!(compaction_line(&lines), Ok((77520, 38)));
+        assert!(compaction_line(&[]).is_err());
+    }
+
+    #[test]
     fn the_index_line_is_read() {
-        let lines = vec!["layerd: index built: 8192 names and 0 deletions in 120 steps".to_owned()];
+        let lines = vec![
+            "layerd: index of 8192 names and 0 deletions built in 90 ms, 120 steps, 0 overruns"
+                .to_owned(),
+        ];
         assert_eq!(index_line(&lines), Ok((8192, 0, 120)));
         assert!(index_line(&[]).is_err());
     }

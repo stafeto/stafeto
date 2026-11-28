@@ -1092,8 +1092,8 @@ fn create_and_unlink_churn_never_fills_the_probes() {
 #[test]
 fn the_index_says_whether_a_name_has_room_before_the_volume_is_touched() {
     let mut ix = crate::index::boxed();
-    assert!(ix.has_room(0, b"x"));
-    assert!(!ix.has_room(99, b"x"));
+    assert_eq!(ix.room(0, b"x"), crate::index::Room::Yes);
+    assert_eq!(ix.room(99, b"x"), crate::index::Room::No);
     let f = crate::index::Fields {
         kind: Kind::File,
         layer: 0,
@@ -1107,8 +1107,11 @@ fn the_index_says_whether_a_name_has_room_before_the_volume_is_touched() {
         i += 1;
     }
     // The name that failed has no room, and a name that is there does.
-    assert!(!ix.has_room(0, format!("n{i}").as_bytes()));
-    assert!(ix.has_room(0, b"n0"));
+    assert_ne!(
+        ix.room(0, format!("n{i}").as_bytes()),
+        crate::index::Room::Yes
+    );
+    assert_eq!(ix.room(0, b"n0"), crate::index::Room::Yes);
 }
 
 #[test]
@@ -1195,7 +1198,7 @@ fn a_removed_directory_leaves_at_once_and_the_reaper_takes_what_it_held_a_piece_
     assert!(node(&core, "/.layers/00/mk").is_none());
     assert_eq!(core.index.counts(), (names - 1, marks));
     assert!(core.reaping());
-    // The reaper: the orphans in windows of the table, then one call to the volume in a step.
+    // The reaper: the orphans from the list of the directory, then one call to the volume in a step.
     let mut steps = 0;
     loop {
         let (more, calls) = reap_once(&mut core);
@@ -1206,10 +1209,8 @@ fn a_removed_directory_leaves_at_once_and_the_reaper_takes_what_it_held_a_piece_
             break;
         }
     }
-    assert!(
-        steps >= crate::index::SLOTS / crate::listing::SLOTS_PER_READDIR,
-        "{steps}"
-    );
+    // The forty orphans go ORPHANS_PER_STEP at a time, then the calls to the volume.
+    assert!(steps >= 40 / crate::index::ORPHANS_PER_STEP + 3, "{steps}");
     assert_eq!(core.index.counts(), (names - 1, marks - 40));
     assert!(!core.reaping());
     // Nothing of it is left in `work/`, and the name comes back as a new, empty directory.
@@ -2439,12 +2440,11 @@ fn a_removed_name_leaves_the_probes_of_the_others_unbroken_and_is_taken_again() 
     let key = ix.retire(dir).unwrap();
     assert!(ix.entry(dir).is_none());
     // The children are orphans until the steps of the reaper take them out.
-    let (mut from, mut windows) = (0, 0);
-    while let Some(next) = ix.remove_children_step(key, from, 4096) {
-        from = next;
-        windows += 1;
+    let mut steps = 0;
+    while ix.remove_children_step(key) {
+        steps += 1;
     }
-    assert!(windows >= 3, "{windows}");
+    assert_eq!(steps, 0, "three orphans are one step");
     assert!(ix.entry(a).is_none());
     assert_eq!(ix.counts().0, counts.0 - 3);
     assert_eq!(ix.lookup(0, b"a").map(|(i, _)| i), Some(other));
@@ -3009,6 +3009,208 @@ fn lchown_of_a_lower_link_copies_the_link_with_its_text_and_number() {
     }
     assert!(node(&core, "/.layers/00/.wh..wh.lnk.lowlink").is_none());
     assert_eq!(core.copies.reserved, reserved);
+}
+
+#[test]
+fn a_listing_in_the_middle_of_a_directory_loses_nothing_when_names_are_removed_and_made() {
+    let mut v = volume();
+    v.dir("/.layers/00/box", 0o755, 0);
+    for k in 0..120 {
+        v.file(&format!("/.layers/00/box/f{k:03}"), 0o644, 0, b"x");
+    }
+    let mut world = World::new();
+    let mut core = world.core(v);
+    ready(&mut core);
+    let (reply, _) = open(&mut core, 0, f::READ_ONLY | f::DIRECTORY_ONLY, "/box").unwrap();
+    let h = match OpenAnswer::read(&reply).unwrap() {
+        OpenAnswer::Directory { handle } => handle,
+        other => panic!("{other:?}"),
+    };
+    let read = |core: &mut C<'_>| {
+        let (bytes, len) = core.read_dir(40, h).unwrap();
+        let (more, _, entries) = n::read_dir_reply(&bytes[..len]).unwrap();
+        let names: Vec<String> = entries
+            .map(|e| String::from_utf8(e.unwrap().name.to_vec()).unwrap())
+            .filter(|n| n != "." && n != "..")
+            .collect();
+        (names, more)
+    };
+    // The first reply is `.` and `..` and the first names; the listing is in the middle.
+    let (mut seen, more) = read(&mut core);
+    assert!(more && !seen.is_empty() && seen.len() < 120);
+    let box_key = core
+        .index
+        .dir_key(core.index.lookup(0, b"box").unwrap().0)
+        .unwrap();
+    assert_eq!(core.index.walkers(box_key), 1);
+    // The names given so far, the next ones and some of the last go, and a new one comes.
+    let victims: Vec<String> = seen
+        .iter()
+        .take(2)
+        .cloned()
+        .chain(["f000", "f050", "f119"].map(String::from))
+        .collect();
+    for name in &victims {
+        let _ = unlink(&mut core, 0, &format!("/box/{name}"));
+    }
+    mkdir(&mut core, 0, "/box/fresh", 0o755).unwrap();
+    assert!(core.index.pending() >= 2);
+    loop {
+        let (names, more) = read(&mut core);
+        seen.extend(names);
+        if !more {
+            break;
+        }
+    }
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), seen.len(), "a name twice: {seen:?}");
+    for k in 0..120 {
+        let name = format!("f{k:03}");
+        if !victims.contains(&name) {
+            assert!(seen.contains(&name), "{name} was lost");
+        }
+    }
+    // The listing holds the directory until it closes (a seek may go back to a cursor it gave),
+    // and the entries it held are taken out then.
+    assert_eq!(core.index.walkers(box_key), 1);
+    while core.reap_step() {}
+    assert_eq!(core.index.pending(), 2 + 3 - 1);
+    core.close(40, h).unwrap();
+    assert_eq!(core.index.walkers(box_key), 0);
+    while core.reap_step() {}
+    assert_eq!(core.index.pending(), 0);
+    // A listing that is closed in the middle lets go too.
+    let (reply, _) = open(&mut core, 0, f::READ_ONLY | f::DIRECTORY_ONLY, "/box").unwrap();
+    let h2 = match OpenAnswer::read(&reply).unwrap() {
+        OpenAnswer::Directory { handle } => handle,
+        other => panic!("{other:?}"),
+    };
+    let _ = core.read_dir(40, h2).unwrap();
+    assert_eq!(core.index.walkers(box_key), 1);
+    core.close(40, h2).unwrap();
+    assert_eq!(core.index.walkers(box_key), 0);
+}
+
+#[test]
+fn a_merged_listing_of_1024_names_takes_a_request_for_each_46_names_and_one_for_the_lower_set() {
+    let mut v = volume();
+    v.dir("/.layers/00/many", 0o755, 0);
+    for k in 0..1024 {
+        v.file(&format!("/.layers/00/many/f{k:04}"), 0o644, 0, b"");
+    }
+    let mut world = World::new();
+    let mut core = world.core(v);
+    ready(&mut core);
+    let (reply, _) = open(&mut core, 0, f::READ_ONLY | f::DIRECTORY_ONLY, "/many").unwrap();
+    let h = match OpenAnswer::read(&reply).unwrap() {
+        OpenAnswer::Directory { handle } => handle,
+        other => panic!("{other:?}"),
+    };
+    let (mut requests, mut names) = (0, 0);
+    loop {
+        let (bytes, len) = core.read_dir(40, h).unwrap();
+        requests += 1;
+        let (more, _, entries) = n::read_dir_reply(&bytes[..len]).unwrap();
+        names += entries.count();
+        if !more {
+            break;
+        }
+    }
+    assert_eq!(names, 1024 + 2);
+    // The names are six bytes: an entry takes `ENTRY_HEAD` and the name, so a reply holds
+    // `abi::MESSAGE_MAX / (ENTRY_HEAD + 5)` at most and at least 46.
+    assert!(requests <= 1024 / 46 + 4, "{requests}");
+}
+
+#[test]
+fn a_seek_back_into_the_layer_names_after_the_entry_there_was_removed_loses_and_repeats_nothing() {
+    let mut v = volume();
+    v.dir("/.layers/00/box", 0o755, 0);
+    for k in 0..120 {
+        v.file(&format!("/.layers/00/box/f{k:03}"), 0o644, 0, b"x");
+    }
+    let mut world = World::new();
+    let mut core = world.core(v);
+    ready(&mut core);
+    let (reply, _) = open(&mut core, 0, f::READ_ONLY | f::DIRECTORY_ONLY, "/box").unwrap();
+    let h = match OpenAnswer::read(&reply).unwrap() {
+        OpenAnswer::Directory { handle } => handle,
+        other => panic!("{other:?}"),
+    };
+    // The first reply, whose cursor stands at its last name; then the listing runs on into the
+    // second stage (the lower set has no /box, so it ends there).
+    let (bytes, len) = core.read_dir(40, h).unwrap();
+    let (_, cursor, entries) = n::read_dir_reply(&bytes[..len]).unwrap();
+    let first: Vec<String> = entries
+        .map(|e| String::from_utf8(e.unwrap().name.to_vec()).unwrap())
+        .filter(|n| n != "." && n != "..")
+        .collect();
+    let at_cursor = first.last().unwrap().clone();
+    let mut seen = first.clone();
+    loop {
+        let (bytes, len) = core.read_dir(40, h).unwrap();
+        let (more, c, entries) = n::read_dir_reply(&bytes[..len]).unwrap();
+        for e in entries {
+            let name = String::from_utf8(e.unwrap().name.to_vec()).unwrap();
+            if name != "." && name != ".." {
+                seen.push(name);
+            }
+        }
+        if !more {
+            assert_eq!(proto_fs::names::split_cursor(c).0, 1);
+            break;
+        }
+    }
+    assert_eq!(seen.len(), 120);
+    // The entry the cursor stands at is removed, and the listing goes back to the cursor.
+    unlink(&mut core, 0, &format!("/box/{at_cursor}")).unwrap();
+    core.seek_dir(40, h, cursor).unwrap();
+    let mut again = Vec::new();
+    loop {
+        let (bytes, len) = core.read_dir(40, h).unwrap();
+        let (more, _, entries) = n::read_dir_reply(&bytes[..len]).unwrap();
+        for e in entries {
+            let name = String::from_utf8(e.unwrap().name.to_vec()).unwrap();
+            if name != "." && name != ".." {
+                again.push(name);
+            }
+        }
+        if !more {
+            break;
+        }
+    }
+    // Every name that came after the cursor the first time comes again, once, and the removed
+    // name does not.
+    let after: Vec<&String> = seen[first.len()..].iter().collect();
+    let mut want: Vec<&String> = after;
+    want.sort();
+    let mut got: Vec<&String> = again.iter().collect();
+    got.sort();
+    assert_eq!(got, want);
+    // Back at the start the hold goes, and the gone entry is taken out.
+    core.rewind(40, h).unwrap();
+    while core.reap_step() {}
+    assert_eq!(core.index.pending(), 0);
+}
+
+#[test]
+fn a_copy_up_asks_for_room_in_the_arena_before_it_copies() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    // The arena waits for its compaction: the open for writing answers STARTING, nothing is
+    // queued and nothing is made in work/.
+    core.index.starve();
+    let opened = open(&mut core, 7, f::READ_WRITE, "/etc/copyme");
+    assert_eq!(opened.err(), Some(st(proto_layer::STARTING)));
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+    // After the compaction the copy goes.
+    while core.reap_step() {}
+    assert!(!core.index.starved());
+    let (reply, _) = open(&mut core, 7, f::READ_WRITE, "/etc/copyme").unwrap();
+    let _ = copying(&reply);
 }
 
 // ---------------------------------------------------------------------- rename of lower names

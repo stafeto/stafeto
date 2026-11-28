@@ -51,6 +51,9 @@ pub struct Description<D> {
     pub position: Position,
     /// The furthest position the replies gave out: SEEK_DIR goes back to one, never past it.
     pub given: Position,
+    /// The key of the directory in the index while the listing stands in the middle of the list of
+    /// its names (the index keeps what leaves the directory until the listing lets go).
+    pub walk: Option<u32>,
     /// The directory of the lower set, open from the first request of the second stage.
     pub lower: Option<D>,
     /// The lower directory is still being opened (a preparation of the RAM file service that the
@@ -159,6 +162,7 @@ impl<D> Table<D> {
             hidden,
             position: Position::default(),
             given: Position::default(),
+            walk: None,
             lower: None,
             opening: false,
             replayed: 0,
@@ -236,8 +240,14 @@ impl<D> Table<D> {
         }
     }
 
-    /// The directory `dir` of the index is gone (removed): its descriptions list nothing.
-    pub fn forget(&mut self, dir: u32) {
+    /// The directory `dir` of the index is gone (removed): its descriptions list nothing, and
+    /// the ones that stood in the list of its names let go of it (`leave` gets the key).
+    pub fn forget(&mut self, dir: u32, mut leave: impl FnMut(u32)) {
+        for d in self.slots.iter_mut().flatten().filter(|d| d.dir == dir) {
+            if let Some(key) = d.walk.take() {
+                leave(key);
+            }
+        }
         self.retarget(dir, GONE);
     }
 

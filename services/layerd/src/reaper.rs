@@ -7,9 +7,9 @@
 //! loop and never more than the bound of a step allows:
 //!
 //! - the entries that lay in the directory (marks of deletion, the only names a directory that is
-//!   empty in the merged view can hold) are taken out of the index, `SLOTS_PER_READDIR` places of
-//!   the table a step (`Index::remove_children_step`), and the key of the directory is given back
-//!   after the last one;
+//!   empty in the merged view can hold) are taken out of the index from the list of the directory,
+//!   `ORPHANS_PER_STEP` a step (`Index::remove_children_step`), and the key of the directory is
+//!   given back after the last one;
 //! - the directory in `work/` is removed from the volume, one call to the data file service in each
 //!   step: the listing of a directory, the removal of each name in it, the removal of the directory.
 //!
@@ -20,7 +20,6 @@
 //! none, and an item of a failure that finds the queue full is dropped (the next start empties
 //! `work/`).
 
-use crate::listing::SLOTS_PER_READDIR;
 use crate::names::Core;
 use crate::volume::{Lower, Volume};
 use proto_data as d;
@@ -55,7 +54,7 @@ const NO_ITEM: Item = Item {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// Nothing started: the entries in the index first.
-    Orphans(usize),
+    Orphans,
     /// The listing of the directory being emptied is to be opened, is open (`handle`), or its names
     /// are being removed one by one.
     Open,
@@ -93,7 +92,7 @@ impl Workers {
         Workers {
             items: [NO_ITEM; REAPS],
             count: 0,
-            phase: Phase::Orphans(0),
+            phase: Phase::Orphans,
             path: [0; PATH_MAX],
             plen: 0,
             handle: 0,
@@ -158,7 +157,7 @@ impl Workers {
         self.items.copy_within(1..self.count, 0);
         self.count -= 1;
         self.fails = 0;
-        self.phase = Phase::Orphans(0);
+        self.phase = Phase::Orphans;
     }
 }
 
@@ -169,31 +168,32 @@ impl Default for Workers {
 }
 
 impl<V: Volume, L: Lower> Core<'_, V, L> {
-    /// Whether the reaper has work.
+    /// Whether the reaper has work: items, or the upkeep of the index (the sweep of the entries
+    /// a listing held and the compaction of the arena).
     pub fn reaping(&self) -> bool {
-        self.work.busy()
+        self.work.busy() || self.index.maintenance_due()
     }
 
-    /// One step of the reaper: at most `SLOTS_PER_READDIR` places of the table, or one call to the
-    /// data file service. True while work is left.
+    /// One step of the reaper: at most `ORPHANS_PER_STEP` entries of the index, a step of the
+    /// upkeep of the index, or one call to the data file service. True while work is left.
     pub fn reap_step(&mut self) -> bool {
-        if self.work.count == 0 {
-            return false;
+        self.index.last_work = 0;
+        // An insertion waits for the compaction of the arena: its step goes ahead of the items.
+        if self.work.count == 0 || self.index.starved() {
+            return self.index.maintain_step();
         }
         let w = &mut *self.work;
         let (item_len, item_dir, item_key) =
             (usize::from(w.items[0].len), w.items[0].dir, w.items[0].key);
         match w.phase {
-            Phase::Orphans(from) => {
+            Phase::Orphans => {
                 w.phase = if item_key == 0 {
                     Phase::Open
                 } else {
-                    match self
-                        .index
-                        .remove_children_step(item_key, from, SLOTS_PER_READDIR)
-                    {
-                        Some(next) => Phase::Orphans(next),
-                        None => Phase::Open,
+                    if self.index.remove_children_step(item_key) {
+                        Phase::Orphans
+                    } else {
+                        Phase::Open
                     }
                 };
                 if w.phase == Phase::Open {

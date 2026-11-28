@@ -1,0 +1,19 @@
+[package]
+name = "layer-time"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The measurement of the layered root on a machine: the first path of a fresh process, the copy up of lower files of 1 KiB, 1 MiB and 16 MiB and the copy of a truncating open"
+build = "build.rs"
+
+[[bin]]
+name = "layer-time"
+test = false
+bench = false
+
+[dependencies]
+# The layer with the layer service at the root and the data file service behind it.
+posix-crt = { path = "../../lib/posix-crt", features = ["layer"] }
+posix-abi = { path = "../../lib/posix-abi", features = ["layer"] }

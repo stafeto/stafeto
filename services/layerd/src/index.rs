@@ -17,8 +17,19 @@
 //! names, under the seed of the next start, inside what the buckets take. A build that does
 //! overflow a bucket (`Error::Buckets`) starts again under another seed.
 //!
-//! The names live in an arena (`ARENA` bytes, each name once); an insertion that finds no room
-//! in the arena is NO_SPACE too.
+//! The names live in an arena (`ARENA` bytes, each name once) as blocks: a 4-byte header (the slot
+//! of the entry, the length of the name, a flag that says the block is dead) and the name. A name
+//! that leaves the index leaves a dead block, and the arena is compacted in place, 1 KiB and 48
+//! blocks at most in each step (`maintain_step`): a read pointer and a write pointer go up the arena, a live
+//! block moves down and its entry learns the new place in the same step. An insertion that finds no
+//! room in the arena is NO_SPACE too, unless compaction would make room (`Room::Later`: the change
+//! answers STARTING and the client asks again).
+//!
+//! The entries of a directory are a doubly linked list (`head`, `prev`, `next`, all by slot), so a
+//! merged listing costs the number of the children. A listing that is in the middle of the
+//! list holds the directory open (`walk_enter`): an entry that leaves such a directory stays in
+//! the list as a `Gone` entry (its place is taken by no other name) until the last listing lets
+//! go, and `maintain_step` takes those out a few at a time.
 //!
 //! An entry has the layer it lies in, its kind (a file, a directory, a symbolic link, or the mark of
 //! a deletion: the file `.wh.<name>` of the layer says "the name of the lower set is gone"; a link
@@ -38,6 +49,35 @@ pub const SLOTS: usize = BUCKETS * WAYS;
 pub const ENTRIES_MAX: usize = 10_240;
 pub const ARENA: usize = 256 * 1024;
 pub const NAME_MAX: usize = 255;
+/// The bytes in front of a name in the arena.
+pub(crate) const HEADER: usize = 4;
+/// The dead flag of a block header; the slot is in the low 16 bits and the length of the name in
+/// the next 8.
+const DEAD: u32 = 1 << 31;
+/// What one step of compaction does at most: it reads `COMPACT_BYTES` of the arena (a block that
+/// starts below this is read whole, so a step moves up to `COMPACT_BYTES + NAME_MAX + HEADER`),
+/// and looks at `COMPACT_BLOCKS` blocks. The measurement under `-icount` (`cargo xtask
+/// layer-steps`) shows the cost is by the block, about 200 ticks for one that moves (the blocks of
+/// the scale volume are 9 bytes): 1 KiB of them took 17,300 ticks, over the margin of the gate
+/// (0.9 B is 18,369); 48 blocks take about 10,000.
+pub const COMPACT_BYTES: usize = if cfg!(feature = "break-layerd-compact-one-step") {
+    ARENA
+} else {
+    1024
+};
+pub const COMPACT_BLOCKS: usize = if cfg!(feature = "break-layerd-compact-one-step") {
+    usize::MAX
+} else {
+    48
+};
+/// The `Gone` entries one step of the sweep takes out, and the places it looks at.
+pub const SWEEP_FREES: usize = 32;
+pub const SWEEP_SLOTS: usize = 384;
+/// The entries one step of `remove_children_step` takes out.
+pub const ORPHANS_PER_STEP: usize = 32;
+/// The `Gone` entries the table holds at most (the directories held open by a listing); a new name
+/// over that is NO_SPACE.
+pub const PENDING_MAX: usize = 2048;
 /// The bytes a link's file name (`.wh..wh.lnk.`) and a mark (`.wh.`) add to a name, and the marker of
 /// an opaque directory (`/.wh..wh..opq`) to a directory.
 const LINK_EXTRA: usize = 12;
@@ -48,8 +88,10 @@ pub const OPAQUE_EXTRA: usize = 13;
 #[repr(u8)]
 pub enum Kind {
     Empty = 0,
-    /// A name that was removed: the slot keeps its name for a probe that passes it. It follows
-    /// `Empty` so that "no entry" is one comparison (`kind < 2`) in the loops that look at slots.
+    /// A name that was removed from a directory a listing holds open: the slot stays in the list
+    /// of the directory (so the listing can go on from it) and keeps its name, until the last
+    /// listing lets go. It follows `Empty` so that "no entry" is one comparison (`kind < 2`) in
+    /// the loops that look at slots.
     Gone = 1,
     Whiteout = 2,
     File = 3,
@@ -116,6 +158,15 @@ pub enum NextChild {
     End,
 }
 
+/// What `Index::room` says of a new name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Room {
+    Yes,
+    /// The arena is full of dead blocks: compaction makes room, ask again.
+    Later,
+    No,
+}
+
 /// What an insertion carries besides its key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fields {
@@ -157,8 +208,36 @@ pub struct Index {
     loads: [u8; BUCKETS],
     arena: [u8; ARENA],
     arena_len: usize,
+    /// The bytes of the live blocks of the arena (headers included).
+    live_bytes: usize,
+    /// Compaction: it runs (the read and write pointers) or is wanted for an insertion that found
+    /// no room.
+    compacting: bool,
+    starved: bool,
+    c_read: usize,
+    c_write: usize,
+    /// The dead bytes the running compaction took on at its start and the steps it has made, and
+    /// the report of the last one that ended (`take_compaction`).
+    c_dead: usize,
+    c_steps: u32,
+    c_report: Option<(usize, u32)>,
+    /// What the last step of the index did, for the report of the steps: 1 the orphans of a
+    /// retired directory, 2 the sweep, 3 the compaction.
+    pub last_work: u8,
     live: u32,
     marks: u32,
+    /// The first entry of each directory, by key (the root is key 0), as a slot plus one; and the
+    /// entry before and after each entry in its directory's list, also slot plus one.
+    head: [u16; SLOTS],
+    prev: [u16; SLOTS],
+    next: [u16; SLOTS],
+    /// The listings that hold the directory with the key open.
+    walkers: [u8; SLOTS],
+    /// The `Gone` entries, and the sweep that takes them out: where it stands, and whether a
+    /// listing let go since it started.
+    pending: u32,
+    sweep_at: Option<usize>,
+    sweep_dirty: bool,
     /// The slot plus one of the directory with the key `k`, at `dslot[k]` (0 for a key in no use).
     dslot: [u32; SLOTS],
     /// The keys issued so far, and the keys given back, which are used again first.
@@ -215,9 +294,9 @@ pub const CLEAR_SLOTS: usize = 256;
 struct Probe {
     /// The slot of the live entry of the key.
     live: Option<usize>,
-    /// The slot of a gone entry of the same key (its name is in the arena still).
+    /// The slot of a gone entry of the same key (it is in the list of its directory still).
     gone: Option<usize>,
-    /// The place a new entry would take: in the less loaded bucket, a free way, else a gone one.
+    /// The place a new entry would take: a free way of the less loaded bucket.
     place: Option<usize>,
 }
 
@@ -229,8 +308,24 @@ impl Index {
             loads: [0; BUCKETS],
             arena: [0; ARENA],
             arena_len: 0,
+            live_bytes: 0,
+            compacting: false,
+            starved: false,
+            c_read: 0,
+            c_write: 0,
+            c_dead: 0,
+            c_steps: 0,
+            c_report: None,
+            last_work: 0,
             live: 0,
             marks: 0,
+            head: [0; SLOTS],
+            prev: [0; SLOTS],
+            next: [0; SLOTS],
+            walkers: [0; SLOTS],
+            pending: 0,
+            sweep_at: None,
+            sweep_dirty: false,
             dslot: [0; SLOTS],
             keys_issued: 0,
             free_keys: [0; SLOTS],
@@ -288,9 +383,19 @@ impl Index {
             }
             self.tags[from..to].fill(0);
             self.dslot[from..to].fill(0);
+            self.prev[from..to].fill(0);
+            self.next[from..to].fill(0);
             return Some(to);
         }
         self.loads.fill(0);
+        self.head.fill(0);
+        self.walkers.fill(0);
+        self.pending = 0;
+        self.sweep_at = None;
+        self.sweep_dirty = false;
+        self.compacting = false;
+        self.starved = false;
+        self.live_bytes = 0;
         self.arena_len = 0;
         self.live = 0;
         self.marks = 0;
@@ -361,14 +466,8 @@ impl Index {
             b1
         };
         if usize::from(self.loads[b]) < WAYS {
-            let ways = b * WAYS..(b + 1) * WAYS;
-            found.place = ways
-                .clone()
-                .find(|&slot| self.slots[slot].kind == Kind::Empty)
-                .or_else(|| {
-                    ways.into_iter()
-                        .find(|&slot| self.slots[slot].kind == Kind::Gone)
-                });
+            found.place =
+                (b * WAYS..(b + 1) * WAYS).find(|&slot| self.slots[slot].kind == Kind::Empty);
         }
         found
     }
@@ -412,14 +511,15 @@ impl Index {
         self.entry(id).map(|e| self.name_of(e))
     }
 
-    /// The next entry of the directory `parent` at a slot from `from` on (a position of a listing,
-    /// 0 for the start), looking at `budget` slots at most: each slot looked at is taken off the
-    /// budget, so the cost of a request does not depend on the size of the table.
-    pub fn next_child(&self, parent: u32, from: usize, budget: &mut usize) -> NextChild {
+    /// The next entry of the directory `parent` after the entry `after` (a position of a listing: 0
+    /// for the start, else the id of the entry the listing stood at), looking at `budget` entries
+    /// at most: each entry looked at is taken off the budget, so the cost of a request does not
+    /// depend on the size of the table.
+    pub fn next_child(&self, parent: u32, after: usize, budget: &mut usize) -> NextChild {
         let Some(pkey) = self.dkey_of(parent) else {
             return NextChild::End;
         };
-        self.next_child_of(pkey, from, budget)
+        self.next_child_of(pkey, after, budget)
     }
 
     /// The key of the directory `id` (0 for the root): a listing asks for it once.
@@ -427,21 +527,98 @@ impl Index {
         self.dkey_of(id)
     }
 
-    /// `next_child` for the directory with the key `pkey`.
-    pub fn next_child_of(&self, pkey: u32, from: usize, budget: &mut usize) -> NextChild {
-        let mut slot = from;
-        while slot < SLOTS {
+    /// `next_child` for the directory with the key `pkey`; it gives names (files, directories,
+    /// links), and passes marks and gone entries. A position whose entry is no longer in
+    /// the directory (it was taken out after the listing let go of the directory) ends the list.
+    pub fn next_child_of(&self, pkey: u32, after: usize, budget: &mut usize) -> NextChild {
+        let mut at = if after == 0 {
+            self.head[pkey as usize & (SLOTS - 1)]
+        } else {
+            match self.slots.get(after - 1) {
+                Some(e) if e.kind != Kind::Empty && e.pkey == pkey => self.next[after - 1],
+                _ => return NextChild::End,
+            }
+        };
+        let mut last = after;
+        while at != 0 {
             if *budget == 0 {
-                return NextChild::Continue(slot);
+                return NextChild::Continue(last);
             }
             *budget -= 1;
-            let e = &self.slots[slot];
-            if !matches!(e.kind, Kind::Empty | Kind::Gone) && e.pkey == pkey {
-                return NextChild::Found(slot + 1, slot as u32 + 1);
+            let slot = usize::from(at) - 1;
+            last = usize::from(at);
+            // A mark of deletion and a gone entry are no name: they are passed here, at the cost
+            // of a look (a listing has no use for them, and a trip out to its loop for each costs
+            // more than the walk).
+            if !matches!(self.slots[slot].kind, Kind::Gone | Kind::Whiteout) {
+                return NextChild::Found(last, u32::from(at));
             }
-            slot += 1;
+            at = self.next[slot];
         }
         NextChild::End
+    }
+
+    /// A listing of the directory with the key `key` stands in the middle of its list: entries
+    /// that leave the directory stay as `Gone` entries until `walk_leave`. False when 255
+    /// listings hold it already (the service has far fewer descriptions).
+    pub fn walk_enter(&mut self, key: u32) -> bool {
+        let w = &mut self.walkers[key as usize & (SLOTS - 1)];
+        if *w == u8::MAX {
+            return false;
+        }
+        *w += 1;
+        true
+    }
+
+    /// A listing let go of the directory with the key `key`.
+    pub fn walk_leave(&mut self, key: u32) {
+        let w = &mut self.walkers[key as usize & (SLOTS - 1)];
+        if *w > 0 {
+            *w -= 1;
+            if *w == 0 && self.pending > 0 {
+                self.sweep_dirty = true;
+            }
+        }
+    }
+
+    /// The listings that hold the directory with the key `key`.
+    pub fn walkers(&self, key: u32) -> u8 {
+        self.walkers[key as usize & (SLOTS - 1)]
+    }
+
+    /// The `Gone` entries.
+    pub fn pending(&self) -> u32 {
+        self.pending
+    }
+
+    /// The bytes of the arena that dead blocks hold (a compaction gives them back).
+    pub fn garbage(&self) -> usize {
+        self.arena_len - self.live_bytes
+    }
+
+    fn link(&mut self, slot: usize, pkey: u32) {
+        let k = pkey as usize & (SLOTS - 1);
+        let h = self.head[k];
+        self.prev[slot] = 0;
+        self.next[slot] = h;
+        if h != 0 {
+            self.prev[usize::from(h) - 1] = slot as u16 + 1;
+        }
+        self.head[k] = slot as u16 + 1;
+    }
+
+    fn unlink(&mut self, slot: usize, pkey: u32) {
+        let (p, n) = (self.prev[slot], self.next[slot]);
+        if p != 0 {
+            self.next[usize::from(p) - 1] = n;
+        } else {
+            self.head[pkey as usize & (SLOTS - 1)] = n;
+        }
+        if n != 0 {
+            self.prev[usize::from(n) - 1] = p;
+        }
+        self.prev[slot] = 0;
+        self.next[slot] = 0;
     }
 
     /// A key for a new directory.
@@ -546,19 +723,61 @@ impl Index {
 
     /// Whether `insert` of `name` in `parent` would find a place: the name's own place (a live
     /// entry of it, which an insertion replaces), or a free one with the table under `ENTRIES_MAX`
-    /// and room in the arena. The service asks before it touches the volume.
-    pub fn has_room(&self, parent: u32, name: &[u8]) -> bool {
+    /// and room in the arena. The service asks before it touches the volume. `Later` says the
+    /// arena has room once the compaction ran (it is wanted from now on): the change answers
+    /// STARTING.
+    pub fn room(&mut self, parent: u32, name: &[u8]) -> Room {
         let Some(pkey) = self.dkey_of(parent) else {
-            return false;
+            return Room::No;
         };
         let p = self.probe(pkey, name);
         if p.live.is_some() {
-            return true;
+            return Room::Yes;
         }
-        if self.names() as usize >= ENTRIES_MAX {
-            return false;
+        if self.names() as usize >= ENTRIES_MAX || self.pending as usize >= PENDING_MAX {
+            return Room::No;
         }
-        p.gone.is_some() || (p.place.is_some() && self.arena_len + name.len() <= ARENA)
+        if p.gone.is_some() {
+            return Room::Yes;
+        }
+        if p.place.is_none() {
+            return Room::No;
+        }
+        self.room_bytes(HEADER + name.len())
+    }
+
+    /// `room` for new names that take `need` bytes of the arena in all (their headers included): a
+    /// copy up asks for the names of its path before it copies, so a finished copy is not thrown
+    /// away at the commit. While a compaction that an insertion waits for runs (`starved`), every
+    /// such request waits for its end (`Later`): nothing is appended behind the pointers, and the
+    /// compaction takes one step ahead of the reaper's items in each turn, so it ends within
+    /// `ARENA / COMPACT_BYTES` steps at best and `ARENA / (HEADER + 1) / COMPACT_BLOCKS` at worst
+    /// (the client's window of STARTING covers the time, see `posix_abi::layer`).
+    pub fn room_bytes(&mut self, need: usize) -> Room {
+        if self.names() as usize >= ENTRIES_MAX || self.pending as usize >= PENDING_MAX {
+            return Room::No;
+        }
+        if self.starved {
+            Room::Later
+        } else if self.arena_len + need <= ARENA {
+            Room::Yes
+        } else if self.live_bytes + need <= ARENA {
+            self.starved = true;
+            Room::Later
+        } else {
+            Room::No
+        }
+    }
+
+    /// A test hook: an insertion waits for a compaction.
+    #[cfg(test)]
+    pub fn starve(&mut self) {
+        self.starved = true;
+    }
+
+    /// An insertion waits for the compaction of the arena.
+    pub fn starved(&self) -> bool {
+        self.starved
     }
 
     /// The most bytes a name below the directory `id` adds to its path.
@@ -611,20 +830,25 @@ impl Index {
                 mode: f.mode,
                 ..e
             };
-            self.loads[slot / WAYS] += 1;
+            self.pending -= 1;
             self.place_key(dkey, slot);
             self.count_in(f.kind);
             self.mark_parent(parent, f.kind);
             return Ok(slot as u32 + 1);
         }
         let slot = p.place.ok_or(Error::Buckets)?;
-        if self.arena_len + name.len() > ARENA {
+        let block = HEADER + name.len();
+        if self.arena_len + block > ARENA {
             return Err(Error::NoSpace);
         }
         let dkey = self.key_for(f.kind, keep)?;
-        let at = self.arena_len;
+        let at = self.arena_len + HEADER;
+        let header = slot as u32 | ((name.len() as u32) << 16);
+        self.arena[at - HEADER..at].copy_from_slice(&header.to_le_bytes());
         self.arena[at..at + name.len()].copy_from_slice(name);
-        self.arena_len += name.len();
+        self.arena_len += block;
+        self.live_bytes += block;
+        self.link(slot, pkey);
         self.slots[slot] = Entry {
             pkey,
             dkey,
@@ -700,13 +924,39 @@ impl Index {
         if e.kind != Kind::Whiteout {
             self.lose_child(slot);
         }
-        self.slots[slot].kind = Kind::Gone;
-        self.slots[slot].flags = 0;
-        self.slots[slot].dkey = 0;
-        self.loads[slot / WAYS] -= 1;
+        if self.walkers[e.pkey as usize & (SLOTS - 1)] > 0
+            && cfg!(not(feature = "break-layerd-chain-unlink"))
+        {
+            // A listing stands in the directory: the entry stays in its list, gone.
+            let s = &mut self.slots[slot];
+            s.kind = Kind::Gone;
+            s.flags = 0;
+            s.dkey = 0;
+            self.pending += 1;
+        } else {
+            self.free_slot(slot);
+        }
         if give_key_back {
             self.give_back(e.dkey);
         }
+    }
+
+    /// Empties the slot: it leaves the list of its directory and its block in the arena is dead.
+    fn free_slot(&mut self, slot: usize) {
+        let e = self.slots[slot];
+        self.unlink(slot, e.pkey);
+        let at = e.name_at as usize - HEADER;
+        let mut header = [0u8; HEADER];
+        header.copy_from_slice(&self.arena[at..at + HEADER]);
+        let header = u32::from_le_bytes(header) | DEAD;
+        self.arena[at..at + HEADER].copy_from_slice(&header.to_le_bytes());
+        self.live_bytes -= HEADER + usize::from(e.name_len);
+        if e.kind == Kind::Gone {
+            self.pending -= 1;
+        }
+        self.slots[slot] = EMPTY;
+        self.tags[slot] = 0;
+        self.loads[slot / WAYS] -= 1;
     }
 
     /// The directory `id` leaves the layer with what is in it: its entry is taken out and its key
@@ -725,22 +975,110 @@ impl Index {
         Some(key)
     }
 
-    /// Takes out the entries that lie in the retired directory with the key `key`, looking at
-    /// `budget` places of the table from `from` on. The place to go on from, or None when the
-    /// table is done (and the key is free to be used again).
-    pub fn remove_children_step(&mut self, key: u32, from: usize, budget: usize) -> Option<usize> {
-        let to = (from + budget).min(SLOTS);
-        for slot in from..to {
-            let e = self.slots[slot];
-            if !matches!(e.kind, Kind::Empty | Kind::Gone) && e.pkey == key {
-                self.take_out(slot as u32 + 1, true);
+    /// Takes out the entries that lie in the retired directory with the key `key`, `ORPHANS_PER_STEP`
+    /// at most, from the head of its list. True while some are left; after the last one the key
+    /// is free to be used again.
+    pub fn remove_children_step(&mut self, key: u32) -> bool {
+        self.last_work = 1;
+        for _ in 0..ORPHANS_PER_STEP {
+            let h = self.head[key as usize & (SLOTS - 1)];
+            if h == 0 {
+                self.give_back(key);
+                return false;
+            }
+            let slot = usize::from(h) - 1;
+            if self.slots[slot].kind == Kind::Gone {
+                self.free_slot(slot);
+            } else {
+                self.take_out(h.into(), true);
             }
         }
-        if to < SLOTS {
-            return Some(to);
+        true
+    }
+
+    /// Whether `maintain_step` has work: a sweep of the `Gone` entries, or a compaction of the
+    /// arena (a quarter of it is dead blocks, or an insertion found no room).
+    pub fn maintenance_due(&self) -> bool {
+        self.sweep_at.is_some()
+            || self.sweep_dirty
+            || self.compacting
+            || self.starved
+            || self.garbage() * 4 > ARENA
+    }
+
+    /// One step of the work in the background: the sweep first, then the compaction. True while
+    /// more is due.
+    pub fn maintain_step(&mut self) -> bool {
+        if !self.starved && (self.sweep_at.is_some() || self.sweep_dirty) {
+            self.last_work = 2;
+            self.sweep_step();
+        } else if self.compacting || self.starved || self.garbage() * 4 > ARENA {
+            self.last_work = 3;
+            self.compact_step();
         }
-        self.give_back(key);
-        None
+        self.maintenance_due()
+    }
+
+    fn sweep_step(&mut self) {
+        let from = match self.sweep_at {
+            Some(from) => from,
+            None => {
+                self.sweep_dirty = false;
+                0
+            }
+        };
+        let to = (from + SWEEP_SLOTS).min(SLOTS);
+        let mut freed = 0;
+        let mut slot = from;
+        while slot < to && freed < SWEEP_FREES {
+            let e = &self.slots[slot];
+            if e.kind == Kind::Gone && self.walkers[e.pkey as usize & (SLOTS - 1)] == 0 {
+                self.free_slot(slot);
+                freed += 1;
+            }
+            slot += 1;
+        }
+        self.sweep_at = (slot < SLOTS).then_some(slot);
+    }
+
+    fn compact_step(&mut self) {
+        if !self.compacting {
+            self.compacting = true;
+            self.c_read = 0;
+            self.c_write = 0;
+            self.c_dead = self.garbage();
+            self.c_steps = 0;
+        }
+        self.c_steps += 1;
+        let (mut read, mut blocks) = (0, 0);
+        while read < COMPACT_BYTES && blocks < COMPACT_BLOCKS && self.c_read < self.arena_len {
+            let at = self.c_read;
+            let mut header = [0u8; HEADER];
+            header.copy_from_slice(&self.arena[at..at + HEADER]);
+            let header = u32::from_le_bytes(header);
+            let block = HEADER + ((header >> 16) & 0xff) as usize;
+            if header & DEAD == 0 {
+                if at != self.c_write {
+                    self.arena.copy_within(at..at + block, self.c_write);
+                    self.slots[(header & 0xffff) as usize].name_at = (self.c_write + HEADER) as u32;
+                }
+                self.c_write += block;
+            }
+            self.c_read += block;
+            read += block;
+            blocks += 1;
+        }
+        if self.c_read >= self.arena_len {
+            self.arena_len = self.c_write;
+            self.compacting = false;
+            self.starved = false;
+            self.c_report = Some((self.c_dead, self.c_steps));
+        }
+    }
+
+    /// The dead bytes and the steps of the compaction that ended since the last call.
+    pub fn take_compaction(&mut self) -> Option<(usize, u32)> {
+        self.c_report.take()
     }
 
     /// Moves the entry `id` to (`parent`, `name`), which must not be held by another entry: the
@@ -1076,9 +1414,9 @@ mod tests {
             ..file(0)
         };
         assert_eq!(ix.insert(0, b"fresh", file(1)), Err(Error::NoSpace));
-        assert!(!ix.has_room(0, b"fresh"));
+        assert_eq!(ix.room(0, b"fresh"), Room::No);
         // A name over its own mark: net zero.
-        assert!(ix.has_room(0, b"mark"));
+        assert_eq!(ix.room(0, b"mark"), Room::Yes);
         let id = ix.insert(0, b"mark", file(2)).unwrap();
         assert_eq!(ix.entry(id).unwrap().kind, Kind::File);
         assert_eq!(ix.names() as usize, ENTRIES_MAX);
@@ -1192,6 +1530,7 @@ mod tests {
             }
             dirs.retain(|&d| d == 0 || ix.entry(d).is_some());
             if round % 997 == 0 {
+                check(&ix);
                 let (_, live) = children_by_key(&ix);
                 for &d in dirs.iter().filter(|&&d| d != 0) {
                     let e = *ix.entry(d).unwrap();
@@ -1210,6 +1549,399 @@ mod tests {
         }
     }
 
+    /// Every invariant of the lists, the counters and the arena, against a scan of the table.
+    fn check(ix: &Index) {
+        // The list of each directory holds exactly the entries the table scan finds for its key,
+        // and the links are two-way.
+        let mut per_key = std::collections::HashMap::<u32, std::vec::Vec<usize>>::new();
+        let (mut pending, mut live, mut marks, mut bytes) = (0u32, 0u32, 0u32, 0usize);
+        let mut loads = std::vec![0usize; BUCKETS];
+        for (slot, e) in ix.slots.iter().enumerate() {
+            if e.kind == Kind::Empty {
+                assert_eq!(ix.tags[slot], 0, "slot {slot}");
+                assert_eq!((ix.prev[slot], ix.next[slot]), (0, 0), "slot {slot}");
+                continue;
+            }
+            per_key.entry(e.pkey).or_default().push(slot);
+            loads[slot / WAYS] += 1;
+            bytes += HEADER + usize::from(e.name_len);
+            match e.kind {
+                Kind::Gone => pending += 1,
+                Kind::Whiteout => marks += 1,
+                _ => live += 1,
+            }
+            // The block of the name: its header names the slot and the length, and is not dead.
+            let at = e.name_at as usize - HEADER;
+            let h = u32::from_le_bytes(ix.arena[at..at + HEADER].try_into().unwrap());
+            assert_eq!(h & DEAD, 0, "slot {slot}");
+            assert_eq!(h & 0xffff, slot as u32);
+            assert_eq!((h >> 16) & 0xff, u32::from(e.name_len));
+        }
+        assert_eq!((pending, live, marks), (ix.pending, ix.live, ix.marks));
+        assert_eq!(bytes, ix.live_bytes);
+        for (b, &l) in loads.iter().enumerate() {
+            assert_eq!(l, usize::from(ix.loads[b]), "bucket {b}");
+        }
+        for key in 0..SLOTS as u32 {
+            let want = per_key.remove(&key).unwrap_or_default();
+            let mut got = std::vec::Vec::new();
+            let mut at = ix.head[key as usize];
+            let mut before = 0u16;
+            while at != 0 {
+                let slot = usize::from(at) - 1;
+                assert_eq!(ix.prev[slot], before, "key {key}");
+                assert_eq!(ix.slots[slot].pkey, key);
+                got.push(slot);
+                assert!(got.len() <= SLOTS);
+                before = at;
+                at = ix.next[slot];
+            }
+            let mut sorted = got.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, want, "key {key}");
+            // A `Gone` entry waits for a listing or for the sweep.
+            for &slot in &got {
+                if ix.slots[slot].kind == Kind::Gone && ix.walkers[key as usize] == 0 {
+                    assert!(ix.sweep_dirty || ix.sweep_at.is_some(), "key {key}");
+                }
+            }
+        }
+        // With no compaction running, the blocks of the arena tile it, and the live ones are the
+        // entries' names.
+        if !ix.compacting {
+            let (mut at, mut live_bytes) = (0, 0);
+            while at < ix.arena_len {
+                let h = u32::from_le_bytes(ix.arena[at..at + HEADER].try_into().unwrap());
+                let block = HEADER + ((h >> 16) & 0xff) as usize;
+                if h & DEAD == 0 {
+                    let e = &ix.slots[(h & 0xffff) as usize];
+                    assert_ne!(e.kind, Kind::Empty);
+                    assert_eq!(e.name_at as usize, at + HEADER);
+                    live_bytes += block;
+                }
+                at += block;
+            }
+            assert_eq!(at, ix.arena_len);
+            assert_eq!(live_bytes, ix.live_bytes);
+        }
+    }
+
+    /// A listing of a directory the way the service keeps one: the position, the entries given.
+    struct Listing {
+        key: u32,
+        after: usize,
+        seen: std::vec::Vec<u32>,
+        /// The ids of the entries the directory held at the start.
+        must: std::vec::Vec<u32>,
+        removed: std::vec::Vec<u32>,
+        done: bool,
+    }
+
+    #[test]
+    fn the_child_lists_and_the_arena_follow_100000_random_operations() {
+        let mut ix = index();
+        ix.reseed(11);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let mark = Fields {
+            kind: Kind::Whiteout,
+            ..file(0)
+        };
+        // Eight directories, made first; they stay.
+        let mut dirs = std::vec![0u32];
+        for k in 0..7 {
+            dirs.push(
+                ix.insert(0, std::format!("d{k}").as_bytes(), dir(1))
+                    .unwrap(),
+            );
+        }
+        let mut listings: std::vec::Vec<Listing> = std::vec::Vec::new();
+        let mut max_read = 0;
+        let mut compactions = 0;
+        let mut finished = 0;
+        for round in 0..100_000 {
+            let parent = dirs[next(dirs.len())];
+            let pkey = ix.dir_key(parent).unwrap();
+            // Short names (so that names collide and are replaced and removed) and long ones (so
+            // that the arena fills and dead blocks pile up).
+            let name = if next(4) == 0 {
+                let mut n = std::format!("long{}-", next(60)).into_bytes();
+                n.resize(8 + next(240), b'x');
+                n
+            } else {
+                std::format!("n{}", next(40)).into_bytes()
+            };
+            match next(12) {
+                0..=3 => {
+                    let f = if next(5) == 0 {
+                        mark
+                    } else {
+                        file(round as u64)
+                    };
+                    match ix.room(parent, &name) {
+                        Room::Yes => {
+                            // (A name removed during a listing may or may not show if it comes
+                            // back: the listing may be past its place.)
+                            ix.insert(parent, &name, f).unwrap();
+                        }
+                        Room::Later => {
+                            compactions += 1;
+                            let mut guard = 0;
+                            while ix.room(parent, &name) == Room::Later {
+                                ix.maintain_step();
+                                guard += 1;
+                                assert!(guard < 100_000);
+                            }
+                        }
+                        Room::No => {}
+                    }
+                }
+                4..=6 => {
+                    if let Some((id, e)) = ix.lookup(parent, &name).map(|(i, e)| (i, *e))
+                        && e.kind != Kind::Dir
+                    {
+                        for l in listings.iter_mut().filter(|l| l.key == pkey) {
+                            l.removed.push(id);
+                        }
+                        ix.remove(id);
+                    }
+                }
+                7 => {
+                    // A listing starts: every entry of the directory now is due.
+                    if listings.len() < 12 && ix.walk_enter(pkey) {
+                        let mut must = std::vec::Vec::new();
+                        let mut at = ix.head[pkey as usize];
+                        while at != 0 {
+                            if !matches!(
+                                ix.slots[usize::from(at) - 1].kind,
+                                Kind::Gone | Kind::Whiteout
+                            ) {
+                                must.push(u32::from(at));
+                            }
+                            at = ix.next[usize::from(at) - 1];
+                        }
+                        listings.push(Listing {
+                            key: pkey,
+                            after: 0,
+                            seen: std::vec::Vec::new(),
+                            must,
+                            removed: std::vec::Vec::new(),
+                            done: false,
+                        });
+                    }
+                }
+                8 | 9 => {
+                    // A listing goes on by a few entries.
+                    if !listings.is_empty() {
+                        let pick = next(listings.len());
+                        let l = &mut listings[pick];
+                        let mut budget = 1 + next(12);
+                        while !l.done {
+                            match ix.next_child_of(l.key, l.after, &mut budget) {
+                                NextChild::Found(pos, id) => {
+                                    l.seen.push(id);
+                                    l.after = pos;
+                                }
+                                NextChild::Continue(pos) => {
+                                    l.after = pos;
+                                    break;
+                                }
+                                NextChild::End => l.done = true,
+                            }
+                        }
+                    }
+                }
+                10 => {
+                    // A listing ends (or is dropped half way): the ones that read the whole list
+                    // saw every entry that stayed, and none twice.
+                    if !listings.is_empty() {
+                        let l = listings.swap_remove(next(listings.len()));
+                        ix.walk_leave(l.key);
+                        if l.done {
+                            finished += 1;
+                            let mut sorted = l.seen.clone();
+                            sorted.sort_unstable();
+                            sorted.dedup();
+                            assert_eq!(sorted.len(), l.seen.len(), "an entry twice");
+                            for id in &l.must {
+                                assert!(
+                                    l.seen.contains(id) || l.removed.contains(id),
+                                    "round {round}: the entry {id} was lost"
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    let read = ix.c_read;
+                    let was = ix.compacting;
+                    ix.maintain_step();
+                    if was && ix.compacting {
+                        max_read = max_read.max(ix.c_read - read);
+                    }
+                }
+            }
+            if round % 499 == 0 {
+                check(&ix);
+            }
+        }
+        for l in listings.drain(..) {
+            ix.walk_leave(l.key);
+        }
+        while ix.maintain_step() {}
+        check(&ix);
+        assert_eq!(ix.pending, 0);
+        assert!(max_read <= COMPACT_BYTES + NAME_MAX + HEADER, "{max_read}");
+        assert!(compactions > 0 && finished > 20, "{compactions} {finished}");
+    }
+
+    #[test]
+    fn an_entry_that_leaves_a_directory_a_listing_holds_stays_until_the_listing_lets_go() {
+        let mut ix = index();
+        let d = ix.insert(0, b"d", dir(1)).unwrap();
+        let key = ix.dir_key(d).unwrap();
+        for k in 0..6 {
+            ix.insert(d, std::format!("e{k}").as_bytes(), file(k))
+                .unwrap();
+        }
+        let list = |ix: &Index, from: usize| {
+            let (mut out, mut p, mut b) = (std::vec::Vec::new(), from, 100);
+            while let NextChild::Found(next, id) = ix.next_child_of(key, p, &mut b) {
+                out.push(id);
+                p = next;
+            }
+            out
+        };
+        let order = list(&ix, 0);
+        assert_eq!(order.len(), 6);
+        // A listing stood at the second entry; that entry and the one after it are removed.
+        assert!(ix.walk_enter(key));
+        let (stands, after_it) = (order[1], order[2]);
+        ix.remove(stands);
+        ix.remove(after_it);
+        assert_eq!(ix.pending(), 2);
+        assert!(ix.lookup(d, b"e0").is_some() || ix.lookup(d, b"e1").is_some());
+        // The listing goes on from the entry it stood at, over the gone ones, to the rest.
+        assert_eq!(list(&ix, stands as usize), order[3..].to_vec());
+        // The place of a gone entry is taken by no other name.
+        for k in 0..200 {
+            let id = ix
+                .insert(0, std::format!("other{k}").as_bytes(), file(9))
+                .unwrap();
+            assert!(id != stands && id != after_it);
+        }
+        // Nothing is taken out while the listing holds the directory.
+        while ix.maintain_step() {}
+        assert_eq!(ix.pending(), 2);
+        ix.walk_leave(key);
+        assert!(ix.maintenance_due());
+        while ix.maintain_step() {}
+        assert_eq!(ix.pending(), 0);
+        check(&ix);
+        // The same name again, with the entry still gone, comes back to its place.
+        let mut ix = index();
+        let d = ix.insert(0, b"d", dir(1)).unwrap();
+        let key = ix.dir_key(d).unwrap();
+        let a = ix.insert(d, b"a", file(1)).unwrap();
+        assert!(ix.walk_enter(key));
+        ix.remove(a);
+        assert!(ix.lookup(d, b"a").is_none());
+        assert_eq!(ix.insert(d, b"a", file(2)).unwrap(), a);
+        assert_eq!(ix.pending(), 0);
+        check(&ix);
+    }
+
+    #[test]
+    fn a_compaction_moves_the_names_down_a_few_hundred_bytes_in_a_step() {
+        let mut ix = index();
+        ix.reseed(3);
+        let mut ids = std::vec::Vec::new();
+        for k in 0..800u32 {
+            let mut name = std::format!("name{k:04}-").into_bytes();
+            name.resize(100, b'y');
+            ids.push((k, ix.insert(0, &name, file(u64::from(k))).unwrap(), name));
+        }
+        // Every other name leaves: half of the arena is dead blocks.
+        for (k, id, _) in &ids {
+            if k % 2 == 0 {
+                ix.remove(*id);
+            }
+        }
+        let before = ix.arena_len;
+        assert_eq!(ix.garbage() * 2, before);
+        // A quarter of the arena is not yet dead: no compaction is due until it is.
+        assert_eq!(ix.maintenance_due(), ix.garbage() * 4 > ARENA);
+        ix.starved = true;
+        let mut steps = 0;
+        while ix.maintain_step() {
+            steps += 1;
+            // The names are found by the entries at every moment of the compaction.
+            for (k, _, name) in &ids {
+                assert_eq!(ix.lookup(0, name).is_some(), k % 2 == 1);
+            }
+            check(&ix);
+        }
+        // A step reads `COMPACT_BYTES` and the block that crosses it.
+        assert!(
+            steps + 1 >= before / (COMPACT_BYTES + NAME_MAX + HEADER),
+            "{steps}"
+        );
+        assert_eq!(ix.garbage(), 0);
+        assert_eq!(ix.arena_len, 400 * 104);
+        for (k, id, name) in &ids {
+            if k % 2 == 1 {
+                assert_eq!(ix.name(*id), Some(&name[..]));
+            }
+        }
+        check(&ix);
+    }
+
+    #[test]
+    fn while_a_compaction_waited_for_runs_every_new_name_waits_and_the_reaper_takes_its_step_first()
+    {
+        let mut ix = index();
+        ix.reseed(9);
+        let mut ids = std::vec::Vec::new();
+        let mut k = 0u32;
+        // Fill the arena with names of 200 bytes, then remove every other one.
+        loop {
+            let mut name = std::format!("n{k:05}-").into_bytes();
+            name.resize(200, b'q');
+            match ix.room(0, &name) {
+                Room::Yes => ids.push(ix.insert(0, &name, file(1)).unwrap()),
+                _ => break,
+            }
+            k += 1;
+        }
+        for (i, id) in ids.iter().enumerate() {
+            if i % 2 == 0 {
+                ix.remove(*id);
+            }
+        }
+        let name = [b'z'; 150];
+        // No room at the end of the arena, room after the compaction: wait.
+        assert_eq!(ix.room(0, &name), Room::Later);
+        assert!(ix.starved());
+        // Even a short name (that would fit behind the pointers) waits until the end.
+        for _ in 0..3 {
+            assert_eq!(ix.room(0, b"short"), Room::Later);
+            assert_eq!(ix.room_bytes(10), Room::Later);
+            if !ix.maintain_step() {
+                break;
+            }
+        }
+        while ix.maintain_step() {}
+        assert!(!ix.starved());
+        assert_eq!(ix.room(0, &name), Room::Yes);
+        assert_eq!(ix.room_bytes(1000), Room::Yes);
+        check(&ix);
+    }
+
     #[test]
     fn the_entry_is_forty_bytes() {
         assert_eq!(core::mem::size_of::<Entry>(), 40);
@@ -1219,16 +1951,21 @@ mod tests {
     fn a_name_created_and_removed_over_and_over_never_runs_out_of_space() {
         let mut ix = index();
         ix.reseed(77);
-        let mut arena = None;
+        let mut compactions = 0;
         for n in 0..100_000u32 {
-            let id = ix.insert(0, b"churn", file(u64::from(n))).unwrap();
-            if arena.is_none() {
-                arena = Some(ix.arena_len);
+            // The service asks for room first, and a change that is told to wait is asked again
+            // after the steps of the loop made the compaction.
+            while ix.room(0, b"churn") == Room::Later {
+                compactions += 1;
+                while ix.maintain_step() {}
             }
+            let id = ix.insert(0, b"churn", file(u64::from(n))).unwrap();
             ix.remove(id);
-            assert_eq!(ix.arena_len, arena.unwrap(), "{n}");
+            assert!(ix.arena_len <= ARENA, "{n}");
         }
+        assert!(compactions > 0);
         assert_eq!(ix.counts(), (0, 0));
+        assert_eq!(ix.live_bytes, 0);
     }
 
     /// The most live entries any bucket holds.
@@ -1293,7 +2030,8 @@ mod tests {
         };
         assert_eq!(err, Error::NoSpace);
         assert!(
-            n as usize >= ARENA / NAME_MAX - 8 && n as usize <= ARENA / NAME_MAX,
+            n as usize >= ARENA / (NAME_MAX + HEADER) - 8
+                && n as usize <= ARENA / (NAME_MAX + HEADER),
             "{n}"
         );
         let mut ix = index();
@@ -1333,13 +2071,24 @@ mod tests {
             }
         }
         assert_eq!(seen, std::vec![b]);
-        // A small budget stops where it runs out, and the next call goes on from there.
+        // A small budget stops where it runs out, and the next call goes on from there: the cost
+        // of a listing is the number of the children.
+        let kids: std::vec::Vec<u32> = (0..10)
+            .map(|k| {
+                ix.insert(a, std::format!("k{k}").as_bytes(), file(k))
+                    .unwrap()
+            })
+            .collect();
         let mut budget = 3;
         let mut pos = 0;
         let mut windows = 0;
+        let mut seen = std::vec::Vec::new();
         loop {
             match ix.next_child(a, pos, &mut budget) {
-                NextChild::Found(next, _) => pos = next,
+                NextChild::Found(next, id) => {
+                    pos = next;
+                    seen.push(id);
+                }
                 NextChild::Continue(next) => {
                     windows += 1;
                     pos = next;
@@ -1348,7 +2097,9 @@ mod tests {
                 NextChild::End => break,
             }
         }
-        assert!(windows >= SLOTS / 3 - 1, "{windows}");
+        assert_eq!(seen.len(), 11);
+        assert!(kids.iter().all(|k| seen.contains(k)));
+        assert!(windows <= 5, "{windows}");
         assert_eq!(ix.attr(a).unwrap().mode, 0o755);
         assert!(ix.attr(c).is_none());
         assert_eq!(ix.attr(0).unwrap().mode, 0);
