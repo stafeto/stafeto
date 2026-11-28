@@ -4,11 +4,16 @@
 //! The image of the desk (`boot-desk.img`, xtask desk-probe): the services of
 //! the POSIX programs, the display driver, the keyboard's driver, the tablet's
 //! driver, the compositor with both devices, and the window manager `desk`, a
-//! process of POSIX with the manager's mark (`table::COMP_POSIX_MANAGERS`). Until
-//! the manager of the desk exists (steps 5 and 6 of the plan of M1), the record
-//! runs the C probe of the manager's calls (`tests/posix-manager`), which
-//! subscribes, frames the window of a client it starts, and answers the keys and
-//! the pointer.
+//! process of POSIX with the manager's mark (`table::COMP_POSIX_MANAGERS`). The
+//! record `desk` runs the manager (`apps/desk`, `ports/desk`) and restarts it
+//! whenever it ends (`Restart::Always`): a manager that restarts frames the
+//! windows that are open, as the new ones. Its arguments start three clients of
+//! the probe (`tests/desk-client`) one after the other, the third of which
+//! ignores a request to close, and make the manager print the list of the
+//! windows after each change (`--trace`); the probe of the desk (xtask
+//! `desk-probe`) drives the pointer and the keyboard and reads those lines. The
+//! C probe of the manager's calls (`tests/posix-manager`, xtask `desk-probe
+//! --api`) runs in the same record under the name `desk` in an image of its own.
 //!
 //! The keyboard is the transport 15 at 0xa001e00 on the page 0xa001000 (INTID
 //! 63) and the tablet the transport 6 at 0xa000c00 on the page 0xa000000 (INTID
@@ -31,17 +36,26 @@
 //! The record has no budget: the image has no tasks of real time, and the manager
 //! is held back only by threads at its own level or below.
 
-use super::ramfs::{PIPE, POSIX, POSIX_ABI_TABLE, PROCS_QUOTA, RAM_FIFO_CLOCKED};
+use super::ramfs::{PIPE, POSIX, POSIX_ABI_TABLE, RAM_FIFO_CLOCKED};
 use super::{Record, Restart, comp, entropy, focus, input};
 use crate::PAGE;
 
-/// The pages of the window buffers the manager and the clients it starts have
-/// open at once, as in `window.rs`: a resizable XRGB8888 window of 640 by 400
-/// is 250 pages a buffer (two buffers, 500) and the small windows add about 40.
-/// The manager's record and the POSIX service's record, which pays for the
-/// clients, carry it. The sum is sized for the C probe of step 4; the manager of
-/// the desk (step 5) measures its own.
-const WINDOW_PAGES: u64 = 540;
+/// The quota of the manager, and of each program it starts (a child gets its
+/// parent's quota). The manager's pages are those of its windows and a little
+/// else: the panel (640 by 24 points) and each frame (the size of the window it
+/// frames and its edges: 408 by 328 points is 131 pages a buffer) are objects of
+/// its own, 45 pages for the panel with what the manager holds at the start and
+/// 262 for each frame (`desk: memory` lines of the probe: 45, 307, 569, 831 and
+/// 1 093 own pages with the panel and one to four frames). With a quota of 1 000
+/// pages the manager held the panel and three frames (831 pages) and left the
+/// fourth out (ENOMEM, the window stays without a frame), so what it has besides
+/// its windows is under 169 pages. 2 200 pages hold the panel and seven frames
+/// (45 + 7 * 262 = 1 879 pages) with 321 over, twice what the manager holds
+/// besides them. A frame the quota does not hold is left out, whatever its size.
+const QUOTA: u64 = 2200 * PAGE;
+
+/// The programs the manager starts at once and the room one more needs.
+const CHILDREN: u64 = 4;
 
 /// The compositor of the desk: the display driver, the keyboard's driver and the
 /// tablet's driver.
@@ -50,20 +64,27 @@ pub const COMPOSITOR: Record = Record {
     ..comp::COMPOSITOR
 };
 
-/// The window manager: a process of POSIX at level 22, ceiling 23 (the program is
-/// the C probe of the manager's calls until `apps/desk` takes its place). It is
-/// not restarted while it runs the probe, which ends with code 0; step 5 sets
-/// `Restart::Always` for the manager of the desk.
+/// The arguments of the manager: the list of the windows after each change, and
+/// the three clients of the probe, each started when the one before has its
+/// window (APPID,PATH,NAME,X,Y,W,H,COLOUR[,stubborn]). `gamma` ignores a request
+/// to close.
+const ARGS: &[u8] = b"desk\0--trace\0\
+--spawn\0alpha,/bin/desk-client,alpha,60,80,200,120,C04040\0\
+--spawn\0beta,/bin/desk-client,beta,300,105,220,140,40A040\0\
+--spawn\0gamma,/bin/desk-client,gamma,100,230,180,100,4040C0,stubborn\0";
+
+/// The window manager: a process of POSIX at level 22, ceiling 23, restarted
+/// whenever it ends.
 pub const DESK: Record = Record {
     name: "desk",
-    program: "posix-manager",
-    args: b"posix-manager\0",
+    program: "desk",
+    args: ARGS,
     connects: &["ramfs", "pipe", "clock", "posix", "entropy", "gpu"],
     priority: 22,
     ceiling: 23,
     root: true,
-    restart: Restart::Never,
-    quota: PROCS_QUOTA + WINDOW_PAGES * PAGE,
+    restart: Restart::Always,
+    quota: QUOTA,
     ..POSIX
 };
 
@@ -71,7 +92,7 @@ pub const DESK: Record = Record {
 pub const TABLE: &[Record] = &[
     RAM_FIFO_CLOCKED,
     Record {
-        quota: POSIX_ABI_TABLE[1].quota + 3 * PROCS_QUOTA + (384 + WINDOW_PAGES) * PAGE,
+        quota: POSIX_ABI_TABLE[1].quota + CHILDREN * QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
     },
     POSIX_ABI_TABLE[2],
@@ -135,6 +156,47 @@ mod tests {
         assert!(desk.connects.contains(&"gpu"));
         let at = |name: &str| TABLE.iter().position(|r| r.name == name).unwrap();
         assert!(at("input") < at("gpu") && at("pointer") < at("gpu") && at("gpu") < at("desk"));
+    }
+
+    /// The record restarts the manager whenever it ends, and its arguments are the
+    /// manager's: the trace and the three clients of the probe, each a file of the
+    /// image, the last one a client that ignores a request to close.
+    #[test]
+    fn the_manager_restarts_and_starts_the_clients_of_the_probe() {
+        let desk = named("desk");
+        assert_eq!(desk.restart, Restart::Always);
+        assert_eq!(desk.program, "desk");
+        let args: Vec<&str> = desk
+            .args
+            .split(|&b| b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| std::str::from_utf8(a).unwrap())
+            .collect();
+        assert_eq!(&args[..2], ["desk", "--trace"]);
+        let specs: Vec<&str> = args[2..].chunks(2).map(|c| c[1]).collect();
+        assert_eq!(specs.len(), 3);
+        for (flag, spec) in args[2..].chunks(2).map(|c| (c[0], c[1])) {
+            assert_eq!(flag, "--spawn");
+            let fields: Vec<&str> = spec.split(',').collect();
+            assert_eq!(fields[1], "/bin/desk-client");
+            assert_eq!(
+                fields[0], fields[2],
+                "the application id is the window's name"
+            );
+        }
+        assert!(specs[2].ends_with(",stubborn"));
+    }
+
+    /// The quota holds the panel and seven frames of 408 by 328 points with what
+    /// the manager holds besides them, and the process service's pool holds the
+    /// manager's children at the same quota (the measures are in the comment of
+    /// `QUOTA`).
+    #[test]
+    fn the_quota_holds_the_panel_and_seven_frames_and_the_pool_the_children() {
+        let desk = named("desk");
+        assert!(desk.quota >= (45 + 7 * 262 + 169) * PAGE);
+        let service = named("posix");
+        assert!(service.quota >= POSIX_ABI_TABLE[1].quota + CHILDREN * desk.quota);
     }
 
     /// The manager's mark goes to `desk`, though it is a process of POSIX, by its

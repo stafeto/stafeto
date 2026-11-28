@@ -4595,6 +4595,7 @@ mod tests {
                     "posix-data",
                     "posix-window",
                     "posix-manager",
+                    "desk",
                     "wfd-demo",
                     "wfc-demo",
                     "display-run",

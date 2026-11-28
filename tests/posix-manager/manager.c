@@ -6,8 +6,9 @@
  * composition service, in a static program built with -fno-builtin. Every
  * result is compared.
  *
- * Init starts the program as the record `desk`, a process of POSIX that has
- * the manager's mark. It subscribes, starts its own file as the client (the
+ * Init starts the program as the record `desk` (the image of this probe holds
+ * it under that name; the record restarts a program that ends), a process of
+ * POSIX that has the manager's mark. It subscribes, starts its own file as the client (the
  * role `client`, a child that holds a clone of the manager's session, which
  * has no mark), and drives the client's window:
  *
@@ -285,10 +286,10 @@ static int manager_role(void) {
     /* The session with the manager's mark would move to the new image, so exec
      * is refused while the process is a manager. */
     errno = 0;
-    CHECK(execv("/bin/posix-manager", argv) == -1 && errno == EPERM);
+    CHECK(execv("/bin/desk", argv) == -1 && errno == EPERM);
     printf("posix-manager: exec is refused with EPERM while the process is a manager\n");
 
-    CHECK(posix_spawn(&pid, "/bin/posix-manager", NULL, NULL, argv, environ) == 0);
+    CHECK(posix_spawn(&pid, "/bin/desk", NULL, NULL, argv, environ) == 0);
 
     /* The manager's ring tells a wait across the windows (the manager has none
      * of its own yet) with the bit of its own, and no other bit. */
@@ -442,7 +443,12 @@ static int manager_role(void) {
     CHECK(stafeto_window_close(win) == 0);
     printf("posix-manager: close asks the client, whose window goes, and the frame is hidden\n");
     printf("posix-manager: ok\n");
-    return 0;
+    fflush(stdout);
+    /* The record restarts the manager whenever it ends, so the probe stays up
+     * and the host stops the machine on the line above. */
+    for (;;) {
+        sleep(3600);
+    }
 }
 
 int main(int argc, char **argv) {
