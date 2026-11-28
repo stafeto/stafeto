@@ -40,6 +40,9 @@ pub trait Volume {
     /// MKDIR with the number `ino` for the new directory (a native client's request).
     fn mkdir_numbered(&mut self, path: &[u8], mode: u32, ino: u64) -> R<()>;
     fn rename(&mut self, from: &[u8], to: &[u8]) -> R<()>;
+    /// A cut point of the build for `cargo xtask layer-cut` (`crate::cut`): stops there for good
+    /// when the build names `point`. No other build calls it.
+    fn cut(&mut self, _point: u8) {}
     fn unlink(&mut self, path: &[u8]) -> R<()>;
     fn rmdir(&mut self, path: &[u8]) -> R<()>;
     /// One batch of the entries of the directory description `handle`, `.` and `..` included;
@@ -163,6 +166,8 @@ pub trait Bulk {
     /// The bytes of the cell.
     fn cell(&self) -> &[u8];
     fn close_lower(&mut self, fd: u32);
+    /// A cut point of the build for `cargo xtask layer-cut` (`crate::cut`).
+    fn cut(&mut self, _point: u8) {}
     /// Makes the file at `path` on the volume with the number `ino` (CREATE and EXCLUSIVE).
     fn open_work(&mut self, path: &[u8], mode: u32, ino: u64) -> R<u32>;
     /// Writes `count` bytes of the cell at `offset` of the file `handle` as one part with no

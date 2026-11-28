@@ -211,7 +211,10 @@ exit 0";
 
 /// The script of the shell of the layered root (xtask layer-posix ash): a long listing of a directory
 /// the layer of the user and the lower set share, reads of a name of each and of a shadowed one, a
-/// name the layer deletes, a listing in which the layer hides lower names, and a write below `/tmp`.
+/// name the layer deletes, a listing in which the layer hides lower names, a write below `/tmp`, and
+/// the program's own file: a write and `mv` of it fail (EROFS, so `mv` does not copy and unlink it)
+/// and the file is still there and executable (the C probe starts the program again after such a
+/// `rename`: the shell of this probe cannot fork).
 /// The long listing reads `/etc/passwd` for the owners' names through the layer service as well.
 #[cfg(feature = "ash-layer")]
 const ASH_LAYER_SCRIPT: &core::ffi::CStr = c"echo layer-shell-ready
@@ -228,6 +231,9 @@ cd /
 echo tmp-bytes > /tmp/f
 cat /tmp/f
 echo write > /bin/busybox-probe || echo write-refused
+mv /bin/busybox-probe /bin/busybox-probe-moved || echo mv-refused
+test -e /bin/busybox-probe-moved || echo moved-none
+test -x /bin/busybox-probe && echo program-kept
 exit 0";
 
 /// The probe's C main: the applet and its arguments of the build's

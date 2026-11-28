@@ -199,6 +199,10 @@ impl Bulk for Moves {
             .read_into(fd, Some(offset), len, &self.memory, at as u64)
     }
 
+    fn cut(&mut self, point: u8) {
+        crate::data::stop(point)
+    }
+
     fn cell(&self) -> &[u8] {
         // SAFETY: the window is mapped at `WINDOW_AT` for `WINDOW_BYTES`; this thread reads the cell
         // between its calls, when neither service moves bytes of it.

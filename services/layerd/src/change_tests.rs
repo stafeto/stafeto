@@ -2020,17 +2020,14 @@ fn rename_refuses_what_it_should() {
     let mut world = World::new();
     let mut core = world.core(volume());
     ready(&mut core);
-    // A name of the lower set, and a directory that has a lower one: until the copy up.
-    assert_eq!(
-        rename(&mut core, 0, "/etc/hostname", "/etc/h2").err(),
-        Some(st(f::CROSS_DEVICE))
-    );
+    // A directory of the lower set, and a directory that has a lower one: CROSS_DEVICE (the
+    // program copies it). A file of the lower set is copied up first (see the tests of part B).
     assert_eq!(
         rename(&mut core, 0, "/etc", "/etc2").err(),
         Some(st(f::CROSS_DEVICE))
     );
     assert_eq!(
-        rename(&mut core, 0, "/bin/ls", "/bin/ls2").err(),
+        rename(&mut core, 0, "/lowdir", "/lowdir2").err(),
         Some(st(f::CROSS_DEVICE))
     );
     assert!(
@@ -3012,4 +3009,487 @@ fn lchown_of_a_lower_link_copies_the_link_with_its_text_and_number() {
     }
     assert!(node(&core, "/.layers/00/.wh..wh.lnk.lowlink").is_none());
     assert_eq!(core.copies.reserved, reserved);
+}
+
+// ---------------------------------------------------------------------- rename of lower names
+
+/// The rename of `from` to `to` as the program sends it: while the reply is COPYING the copy is
+/// settled and the request goes again (the client's WAIT and retry). The tickets the replies
+/// carried.
+fn rename_waiting(
+    core: &mut C<'_>,
+    uid: u32,
+    from: &str,
+    to: &str,
+) -> (Result<(), Status>, Vec<u64>) {
+    let mut tickets = Vec::new();
+    for _ in 0..4 {
+        match change(core, uid, ChangeOp::Rename, 0, from, to) {
+            Ok(reply) if n::read_copying(&reply).is_some() => {
+                tickets.push(copying(&reply));
+                settle(core);
+            }
+            other => return (other.map(drop), tickets),
+        }
+    }
+    panic!("the rename went on being told to wait");
+}
+
+#[test]
+fn a_lower_file_is_copied_and_then_renamed_with_a_mark_on_its_old_name() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let lower_ino = 4_000_000_000_200;
+    // The first request is told to wait and changes no name.
+    let reply = change(
+        &mut core,
+        0,
+        ChangeOp::Rename,
+        0,
+        "/etc/copyme",
+        "/etc/moved",
+    )
+    .unwrap();
+    let ticket = copying(&reply);
+    assert_eq!(core.copy_wait(ticket), Wait::Pending);
+    assert!(node(&core, "/.layers/00/etc/moved").is_none());
+    assert!(node(&core, "/.layers/00/etc/.wh.copyme").is_none());
+    assert!(
+        open(&mut core, 0, f::READ_ONLY, "/etc/copyme")
+            .map(|r| is_redirect(&r.0).is_some())
+            .unwrap()
+    );
+    // A second request for the same rename waits for the same copy.
+    let reply = change(
+        &mut core,
+        0,
+        ChangeOp::Rename,
+        0,
+        "/etc/copyme",
+        "/etc/moved",
+    )
+    .unwrap();
+    assert_eq!(copying(&reply), ticket);
+    settle(&mut core);
+    assert_eq!(core.copy_wait(ticket), Wait::Over(0));
+    // The request goes again: the copy is the layer's file now, and it moves.
+    rename(&mut core, 0, "/etc/copyme", "/etc/moved").unwrap();
+    let made = node(&core, "/.layers/00/etc/moved").unwrap();
+    assert_eq!(made.data, copy_bytes(150_000));
+    assert_eq!(
+        (made.ino, made.uid, made.gid, made.mode, made.times),
+        (lower_ino, 7, 8, 0o4750, (111, 222))
+    );
+    assert!(node(&core, "/.layers/00/etc/copyme").is_none());
+    assert!(node(&core, "/.layers/00/etc/.wh.copyme").is_some());
+    assert_eq!(
+        open(&mut core, 0, f::READ_ONLY, "/etc/copyme").err(),
+        Some(st(f::NO_ENTRY))
+    );
+    let listed = listing(&mut core, "/etc");
+    assert!(listed.contains(&"moved".to_owned()) && !listed.contains(&"copyme".to_owned()));
+    assert_eq!(
+        ino_of(&stat(&mut core, 0, "/etc/moved", 0).unwrap()),
+        lower_ino
+    );
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+    // A start again from the volume sees the same names.
+    let v = core.volume;
+    let mut again = World::new();
+    let mut core = again.core(v);
+    ready(&mut core);
+    assert_eq!(
+        open(&mut core, 0, f::READ_ONLY, "/etc/copyme").err(),
+        Some(st(f::NO_ENTRY))
+    );
+    assert!(
+        open(&mut core, 0, f::READ_ONLY, "/etc/moved")
+            .unwrap()
+            .1
+            .is_some()
+    );
+}
+
+#[test]
+fn a_lower_file_below_directories_the_layer_lacks_is_renamed_in_its_own_place_and_out_of_it() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let (done, tickets) = rename_waiting(
+        &mut core,
+        0,
+        "/usr/share/doc/readme",
+        "/usr/share/doc/readme2",
+    );
+    assert_eq!((done, tickets.len()), (Ok(()), 1));
+    assert_eq!(
+        node(&core, "/.layers/00/usr/share/doc/readme2")
+            .unwrap()
+            .data,
+        b"read me"
+    );
+    assert!(node(&core, "/.layers/00/usr/share/doc/.wh.readme").is_some());
+    assert!(node(&core, "/.layers/00/usr/share/doc/readme").is_none());
+    // Out of a lower directory into one the layer has (and a name the layer deleted).
+    let (done, _) = rename_waiting(&mut core, 0, "/etc/group", "/etc/motd");
+    assert_eq!(done, Ok(()));
+    assert!(node(&core, "/.layers/00/etc/.wh.motd").is_none());
+    assert!(node(&core, "/.layers/00/etc/.wh.group").is_some());
+    assert_eq!(node(&core, "/.layers/00/etc/motd").unwrap().ino, 14);
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+}
+
+#[test]
+fn a_lower_link_is_copied_in_the_job_and_then_renamed_with_a_mark() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let reply = change(&mut core, 0, ChangeOp::Rename, 0, "/etc/lnk", "/etc/lnk2").unwrap();
+    // The copy of a link is made in the job: the ticket is one that is over, so the wait ends at
+    // once and the request goes again.
+    let ticket = copying(&reply);
+    assert_eq!(ticket, crate::copy::DONE_TICKET);
+    assert!(crate::copy::ticket_valid(ticket));
+    assert_eq!(core.copy_wait(ticket), Wait::Over(0));
+    let copy = node(&core, "/.layers/00/etc/.wh..wh.lnk.lnk").unwrap();
+    assert_eq!((copy.ino, copy.uid, copy.gid), (202, 7, 8));
+    assert!(node(&core, "/.layers/00/etc/.wh..wh.lnk.lnk2").is_none());
+    assert_eq!(readlink(&mut core, 0, "/etc/lnk").unwrap(), b"/etc/motd");
+    rename(&mut core, 0, "/etc/lnk", "/etc/lnk2").unwrap();
+    let moved = node(&core, "/.layers/00/etc/.wh..wh.lnk.lnk2").unwrap();
+    assert_eq!((moved.data.as_slice(), moved.ino), (&b"/etc/motd"[..], 202));
+    assert!(node(&core, "/.layers/00/etc/.wh..wh.lnk.lnk").is_none());
+    assert!(node(&core, "/.layers/00/etc/.wh.lnk").is_some());
+    assert_eq!(readlink(&mut core, 0, "/etc/lnk2").unwrap(), b"/etc/motd");
+    assert_eq!(
+        readlink(&mut core, 0, "/etc/lnk").err(),
+        Some(st(f::NO_ENTRY))
+    );
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+    assert_eq!(core.copies.reserved, 0);
+}
+
+#[test]
+fn a_lower_program_is_not_renamed_the_copy_is_refused_and_nothing_is_left() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    for round in 0..2 {
+        let reply = change(
+            &mut core,
+            0,
+            ChangeOp::Rename,
+            0,
+            "/usr/share/doc/elf",
+            "/usr/share/doc/elf2",
+        )
+        .unwrap();
+        let ticket = copying(&reply);
+        settle(&mut core);
+        assert_eq!(
+            core.copy_wait(ticket),
+            Wait::Over(f::READ_ONLY_FILESYSTEM),
+            "{round}"
+        );
+    }
+    assert!(node(&core, "/.layers/00/usr").is_none());
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+    assert!(open(&mut core, 0, f::READ_ONLY, "/usr/share/doc/elf").is_ok());
+}
+
+#[test]
+fn the_rights_and_the_target_of_a_rename_are_checked_before_a_byte_is_copied() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    // User 7 owns the file and cannot write /etc.
+    assert_eq!(
+        rename(&mut core, 7, "/etc/copyme", "/etc/mine").err(),
+        Some(st(f::ACCESS_DENIED))
+    );
+    // A file onto a directory, a file with a trailing slash.
+    assert_eq!(
+        rename(&mut core, 0, "/etc/copyme", "/lowdir").err(),
+        Some(st(f::IS_DIRECTORY))
+    );
+    assert_eq!(
+        rename(&mut core, 0, "/etc/copyme/", "/etc/x").err(),
+        Some(st(f::NOT_DIRECTORY))
+    );
+    assert_eq!(
+        rename(&mut core, 0, "/etc/copyme", "/etc/.wh.x").err(),
+        Some(st(f::INVALID_ARGUMENT))
+    );
+    // The same name is nothing at all.
+    rename(&mut core, 0, "/etc/copyme", "/etc/copyme").unwrap();
+    assert_eq!(core.copies.reserved, 0);
+    assert!(node(&core, "/.layers/00/etc/.wh.copyme").is_none());
+}
+
+#[test]
+fn a_name_deleted_or_made_during_the_copy_of_a_rename_is_what_the_request_sent_again_finds() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    // Deleted: the copy is dropped, the request sent again finds nothing.
+    let reply = change(&mut core, 0, ChangeOp::Rename, 0, "/etc/group", "/etc/g2").unwrap();
+    let ticket = copying(&reply);
+    unlink(&mut core, 0, "/etc/group").unwrap();
+    settle(&mut core);
+    assert_eq!(core.copy_wait(ticket), Wait::Over(0));
+    assert_eq!(
+        rename(&mut core, 0, "/etc/group", "/etc/g2").err(),
+        Some(st(f::NO_ENTRY))
+    );
+    assert!(node(&core, "/.layers/00/etc/g2").is_none());
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+    // Made again by another change: the layer's file is the one that moves.
+    let reply = change(
+        &mut core,
+        0,
+        ChangeOp::Rename,
+        0,
+        "/etc/hostname",
+        "/etc/h2",
+    )
+    .unwrap();
+    let ticket = copying(&reply);
+    unlink(&mut core, 0, "/etc/hostname").unwrap();
+    open(
+        &mut core,
+        0,
+        creating(f::WRITE_ONLY, 0o644),
+        "/etc/hostname",
+    )
+    .unwrap();
+    let made = node(&core, "/.layers/00/etc/hostname").unwrap().ino;
+    settle(&mut core);
+    assert_eq!(core.copy_wait(ticket), Wait::Over(0));
+    rename(&mut core, 0, "/etc/hostname", "/etc/h2").unwrap();
+    assert_eq!(node(&core, "/.layers/00/etc/h2").unwrap().ino, made);
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+}
+
+#[test]
+fn two_renames_of_one_file_share_a_copy_and_the_second_finds_the_name_gone() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let a = copying(&change(&mut core, 0, ChangeOp::Rename, 0, "/etc/copyme", "/etc/a").unwrap());
+    let b = copying(&change(&mut core, 0, ChangeOp::Rename, 0, "/etc/copyme", "/etc/b").unwrap());
+    assert_eq!(a, b);
+    settle(&mut core);
+    assert_eq!(core.copies.reserved, 1);
+    rename(&mut core, 0, "/etc/copyme", "/etc/a").unwrap();
+    assert_eq!(
+        rename(&mut core, 0, "/etc/copyme", "/etc/b").err(),
+        Some(st(f::NO_ENTRY))
+    );
+    assert!(node(&core, "/.layers/00/etc/a").is_some());
+    assert!(node(&core, "/.layers/00/etc/b").is_none());
+}
+
+#[test]
+fn a_full_table_of_copies_tells_a_rename_to_ask_again() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    for i in 0..12 {
+        let (reply, _) = open(&mut core, 0, f::WRITE_ONLY, &format!("/etc/big{i:02}")).unwrap();
+        copying(&reply);
+        // The loop hands a copy to the worker as soon as one of its places is free.
+        let _ = core.copies.next_order();
+    }
+    assert_eq!(
+        rename(&mut core, 0, "/etc/copyme", "/etc/x").err(),
+        Some(st(proto_layer::STARTING))
+    );
+    assert!(node(&core, "/.layers/00/etc/.wh.copyme").is_none());
+    // A file in work is no new place.
+    let reply = change(&mut core, 0, ChangeOp::Rename, 0, "/etc/big05", "/etc/x").unwrap();
+    copying(&reply);
+}
+
+#[test]
+fn a_rename_whose_copy_runs_out_of_space_tells_the_waiters_and_leaves_nothing() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let reply = change(&mut core, 0, ChangeOp::Rename, 0, "/etc/copyme", "/etc/x").unwrap();
+    let ticket = copying(&reply);
+    let mut copier = Copier::new();
+    while let Some(order) = core.copies.next_order() {
+        assert!(copier.add(order));
+    }
+    {
+        let mut bulk = FakeBulk::new(&mut core.volume, &mut core.lower);
+        bulk.fail = Some(("write_cell", st(d::NO_SPACE)));
+        while copier.busy() > 0 {
+            if let Some(ended) = copier.turn(&mut bulk) {
+                assert!(core.copies.ended(ended));
+            }
+        }
+    }
+    commit_all(&mut core);
+    while core.reap_step() {}
+    assert_eq!(core.copy_wait(ticket), Wait::Over(f::NO_SPACE));
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+    assert!(node(&core, "/.layers/00/etc/copyme").is_none());
+    assert!(node(&core, "/.layers/00/etc/x").is_none());
+    assert!(node(&core, "/.layers/00/etc/.wh.copyme").is_none());
+    // The lower file is still there to read, and a later rename starts a new copy.
+    assert!(
+        open(&mut core, 0, f::READ_ONLY, "/etc/copyme")
+            .map(|r| is_redirect(&r.0).is_some())
+            .unwrap()
+    );
+    let reply = change(&mut core, 0, ChangeOp::Rename, 0, "/etc/copyme", "/etc/x").unwrap();
+    assert_ne!(copying(&reply), ticket);
+}
+
+#[test]
+fn a_rename_of_a_lower_file_makes_one_call_in_each_step() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    for (from, to) in [
+        ("/etc/copyme", "/etc/x"),
+        ("/etc/lnk", "/etc/lnk2"),
+        ("/etc/hostname", "/shared/h"),
+    ] {
+        for _ in 0..2 {
+            let (done, counts) = by_steps(&mut core, 0, ChangeOp::Rename, 0, from, to);
+            assert!(done.is_ok(), "{from}");
+            assert_one_call_a_step(from, &counts, false);
+            settle(&mut core);
+        }
+    }
+    assert!(node(&core, "/.layers/00/etc/x").is_some());
+    assert!(node(&core, "/.layers/00/etc/.wh..wh.lnk.lnk2").is_some());
+    assert!(node(&core, "/.layers/00/shared/h").is_some());
+}
+
+#[test]
+fn two_names_of_one_lower_file_renamed_onto_each_other_succeed_and_change_nothing() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    core.lower.file("/etc/hard1", 300).file("/etc/hard2", 300);
+    let before = core.volume.calls.len();
+    rename(&mut core, 0, "/etc/hard1", "/etc/hard2").unwrap();
+    // No copy, no mark, nothing in the layer: both names are the lower set's still.
+    assert_eq!(core.copies.reserved, 0);
+    assert!(node(&core, "/.layers/00/etc/hard1").is_none());
+    assert!(node(&core, "/.layers/00/etc/.wh.hard1").is_none());
+    assert!(node(&core, "/.layers/00/etc/hard2").is_none());
+    assert_eq!(core.volume.calls.len(), before);
+    for name in ["/etc/hard1", "/etc/hard2"] {
+        assert!(
+            open(&mut core, 0, f::READ_ONLY, name)
+                .map(|r| is_redirect(&r.0).is_some())
+                .unwrap()
+        );
+    }
+    // Two different files are a rename: a copy first.
+    core.lower.file("/etc/other", 301);
+    let reply = change(
+        &mut core,
+        0,
+        ChangeOp::Rename,
+        0,
+        "/etc/hard1",
+        "/etc/other",
+    )
+    .unwrap();
+    copying(&reply);
+}
+
+#[test]
+fn a_sticky_lower_directory_refuses_a_caller_who_owns_neither_the_file_nor_the_directory() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    core.lower
+        .dir("/stick", 400)
+        .attr("/stick", 0o1777, 0, 0)
+        .file("/stick/f", 401)
+        .attr("/stick/f", 0o666, 5, 5);
+    // User 7 may write the directory and the file, and owns neither: the sticky bit refuses.
+    assert_eq!(
+        rename(&mut core, 7, "/stick/f", "/stick/g").err(),
+        Some(st(f::PERMISSION))
+    );
+    assert_eq!(core.copies.reserved, 0);
+    assert!(node(&core, "/.layers/00/stick").is_none());
+    // The owner of the file may, and the copy is asked.
+    let reply = change(&mut core, 5, ChangeOp::Rename, 0, "/stick/f", "/stick/g").unwrap();
+    copying(&reply);
+}
+
+#[test]
+fn a_rename_needs_write_on_the_target_directory_before_the_lower_file_is_copied() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    core.lower
+        .dir("/srcw", 410)
+        .attr("/srcw", 0o777, 0, 0)
+        .dir("/dstro", 411)
+        .attr("/dstro", 0o755, 0, 0)
+        .file("/srcw/f", 412)
+        .attr("/srcw/f", 0o644, 7, 7);
+    assert_eq!(
+        rename(&mut core, 7, "/srcw/f", "/dstro/f").err(),
+        Some(st(f::ACCESS_DENIED))
+    );
+    assert_eq!(core.copies.reserved, 0);
+    assert!(
+        node(&core, "/.layers/00/srcw").is_none() && node(&core, "/.layers/00/dstro").is_none()
+    );
+}
+
+#[test]
+fn a_lower_link_in_a_lower_only_directory_is_copied_with_its_directory_and_renamed() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    core.lower
+        .dir("/linkdir", 420)
+        .attr("/linkdir", 0o755, 0, 0)
+        .link("/linkdir/l", 421)
+        .text("/linkdir/l", "target")
+        .attr("/linkdir/l", 0o777, 0, 0);
+    let reply = change(
+        &mut core,
+        0,
+        ChangeOp::Rename,
+        0,
+        "/linkdir/l",
+        "/linkdir/l2",
+    )
+    .unwrap();
+    assert_eq!(copying(&reply), crate::copy::DONE_TICKET);
+    // The directory of the layer is made with the link's copy.
+    assert!(node(&core, "/.layers/00/linkdir").unwrap().dir);
+    assert_eq!(
+        node(&core, "/.layers/00/linkdir/.wh..wh.lnk.l")
+            .unwrap()
+            .ino,
+        421
+    );
+    rename(&mut core, 0, "/linkdir/l", "/linkdir/l2").unwrap();
+    assert_eq!(
+        node(&core, "/.layers/00/linkdir/.wh..wh.lnk.l2")
+            .unwrap()
+            .data,
+        b"target"
+    );
+    assert!(node(&core, "/.layers/00/linkdir/.wh.l").is_some());
+    assert_eq!(readlink(&mut core, 0, "/linkdir/l2").unwrap(), b"target");
+    assert_eq!(
+        readlink(&mut core, 0, "/linkdir/l").err(),
+        Some(st(f::NO_ENTRY))
+    );
+    assert!(core.volume.children(b"/.layers/work").is_empty());
 }
