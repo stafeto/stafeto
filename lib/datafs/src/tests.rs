@@ -25,7 +25,7 @@ use std::{format, vec};
 const SECTORS: u64 = 4096;
 
 fn storage() -> std::boxed::Box<Storage> {
-    std::boxed::Box::new(Storage::new())
+    Storage::boxed()
 }
 
 fn fresh() -> (MemDevice, std::boxed::Box<Storage>) {
@@ -726,6 +726,104 @@ fn a_cut_at_every_sector_leaves_a_whole_state() {
         steps.len(),
         "the last cuts come after the last steps but one"
     );
+}
+
+/// The medium the steps leave with the cache of metadata blocks on or off, a cut after `cut`
+/// sectors and the power back with `survive`; the sectors the steps wrote and, with the cache on
+/// (the walk of the tree before every step warms it), the tree read through the cache after each
+/// step that returned, against the model.
+fn medium_after(
+    cache: bool,
+    cut: Option<u64>,
+    survive: Survive,
+    steps: &[Step],
+    models: &[Tree],
+) -> (Vec<u8>, u64) {
+    let mut state = storage();
+    let mut fs = Fs::new(MemDevice::new(SECTORS), &mut state).unwrap();
+    fs.set_cache(cache);
+    fs.format().unwrap();
+    fs.mount().unwrap();
+    fs.device().flush().unwrap();
+    let before = fs.device().written;
+    fs.device().cut_after(cut);
+    for (i, step) in steps.iter().enumerate() {
+        // The warm cache holds the pairs the step is about to rewrite.
+        if read_tree(&mut fs).is_err() {
+            break;
+        }
+        if run(&mut fs, step).is_err() {
+            break;
+        }
+        if cut.is_none() {
+            assert_eq!(
+                read_tree(&mut fs).unwrap(),
+                models[i + 1],
+                "cache {cache}: the tree after step {i} ({step:?})"
+            );
+        }
+    }
+    let written = fs.device().written - before;
+    let mut device = fs.into_device();
+    device.power_cycle(survive);
+    (device.medium().to_vec(), written)
+}
+
+/// The cache is written through: a cut at every sector of the workload leaves the same medium
+/// with it as without it, whatever part of the volatile cache of the device survives, and with
+/// the cache the tree read after each step is the model's (a block rewritten and still held in
+/// the cache would show the old tree).
+#[test]
+fn a_cut_at_every_sector_leaves_the_same_medium_with_the_cache_of_metadata_blocks_and_without() {
+    let steps = steps();
+    let states = models(&steps);
+    let (_, total) = medium_after(true, None, Survive::All, &steps, &states);
+    assert_eq!(
+        medium_after(false, None, Survive::All, &steps, &states).1,
+        total,
+        "the same sectors are written"
+    );
+    for cut in (0..total).step_by(3) {
+        for survive in [Survive::None, Survive::All, Survive::Random(cut * 2 + 1)] {
+            let with = medium_after(true, Some(cut), survive, &steps, &states);
+            let without = medium_after(false, Some(cut), survive, &steps, &states);
+            assert_eq!(with.1, without.1, "cut {cut} {survive:?}: sectors written");
+            assert!(
+                with.0 == without.0,
+                "cut {cut} {survive:?}: the media differ"
+            );
+        }
+    }
+}
+
+/// A walk of a path that the cache has seen costs no read of the device, and a rewritten pair is
+/// read new.
+#[test]
+fn a_path_walked_again_is_read_from_the_cache_and_a_rewritten_pair_is_read_new() {
+    let mut state = storage();
+    let mut fs = Fs::new(MemDevice::new(SECTORS), &mut state).unwrap();
+    fs.format().unwrap();
+    fs.mount().unwrap();
+    let mut path = String::new();
+    for _ in 0..12 {
+        path.push_str("/a");
+        fs.mkdir(path.as_bytes()).unwrap();
+    }
+    fs.stat(path.as_bytes()).unwrap();
+    let reads = fs.device().reads;
+    let (hits, _) = fs.cache_stats();
+    fs.stat(path.as_bytes()).unwrap();
+    assert_eq!(fs.device().reads, reads, "the second walk reads the device");
+    assert!(fs.cache_stats().0 > hits);
+    // A new name in the deepest directory rewrites its pair; a stat of the name sees it.
+    let file = format!("{path}/new");
+    let f = fs
+        .open(file.as_bytes(), Open::WRITE.with(Open::CREATE))
+        .unwrap();
+    fs.close(f).unwrap();
+    assert_eq!(fs.stat(file.as_bytes()).unwrap().size, 0);
+    fs.remove(file.as_bytes()).unwrap();
+    assert_eq!(fs.stat(file.as_bytes()), Err(Error::NoEntry));
 }
 
 /// What the cut leaves is a volume that goes on working: the file system takes the next writes.

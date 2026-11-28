@@ -6,6 +6,7 @@
 // slot numbers. The device is behind five functions of the Rust side (datafs_rs_*).
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "lfs.h"
 
@@ -30,6 +31,14 @@
 // The wayposts each open file keeps for finding the blocks of a read (lfs_config.ctz_hints, at most
 // LFS_CTZ_HINTS_MAX). The disk is the same with any number, 0 included.
 #define CTZ_HINTS 16u
+
+// The cache of metadata blocks (the device's read function below): 128 sets of 4 ways, 512 blocks of
+// 4 KiB (2 MiB), the least recently used way of a set goes first. 512 blocks hold the pairs of the
+// directories of a deep chain whole (a path walked from the root again and again reads the same
+// pairs), and the pairs of `/` and `/.layers`.
+#define MCACHE_SETS 128u
+#define MCACHE_WAYS 4u
+#define MCACHE_BLOCKS (MCACHE_SETS * MCACHE_WAYS)
 
 #ifndef DATAFS_FILES
 #define DATAFS_FILES 24
@@ -59,6 +68,15 @@ struct datafs {
     uint32_t erases;
     lfs_dir_t dir[DATAFS_DIRS];
     uint8_t dir_used[DATAFS_DIRS];
+    // The cache of metadata blocks: the block each slot holds, the time of its last use (0 for an
+    // empty slot), the clock, the hits and misses so far, whether the cache is on, and the blocks.
+    uint32_t mc_block[MCACHE_BLOCKS];
+    uint32_t mc_stamp[MCACHE_BLOCKS];
+    uint32_t mc_clock;
+    uint32_t mc_hits;
+    uint32_t mc_misses;
+    uint32_t mc_off;
+    uint8_t mc_data[MCACHE_BLOCKS][BLOCK];
 };
 
 size_t datafs_state_size(void) { return sizeof(struct datafs); }
@@ -86,13 +104,96 @@ static void forget_failed_read(struct datafs *d, lfs_block_t block)
     }
 }
 
+// The cache of metadata blocks. littlefs reads a pair of metadata blocks again for each step of
+// each path, and a block of a directory's pair is read from the device in 4 KiB each time with no
+// other cache than the one block of `rcache`. A block that a read for metadata loaded (lfs_t's
+// `data_read` clear) is kept here, whole. It is written through: the device's program function
+// writes the device first and then the same bytes into the copy, the erase function drops the copy,
+// and a program that fails drops it, so that what the cache holds is always what the device holds
+// (the order of the writes to the device, and with it what a power cut leaves, is the one of a
+// volume with no cache). The memory is lost with the service, so a restart after a cut reads the
+// device.
+static uint32_t mc_first(lfs_block_t block)
+{
+    return (((uint32_t)block * 2654435761u) >> 25) % MCACHE_SETS * MCACHE_WAYS;
+}
+
+// The slot that holds `block`, or -1.
+static int mc_find(const struct datafs *d, lfs_block_t block)
+{
+    uint32_t first = mc_first(block);
+    for (uint32_t w = 0; w < MCACHE_WAYS; w++) {
+        uint32_t i = first + w;
+        if (d->mc_stamp[i] != 0 && d->mc_block[i] == block) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void mc_touch(struct datafs *d, uint32_t slot)
+{
+    d->mc_clock++;
+    if (d->mc_clock == 0) {
+        d->mc_clock = 1;
+    }
+    d->mc_stamp[slot] = d->mc_clock;
+}
+
+// Keeps the block, in an empty slot of its set or in the one used least recently.
+static void mc_insert(struct datafs *d, lfs_block_t block, const void *bytes)
+{
+    uint32_t first = mc_first(block);
+    uint32_t slot = first;
+    uint32_t oldest = 0;
+    for (uint32_t w = 0; w < MCACHE_WAYS; w++) {
+        uint32_t i = first + w;
+        uint32_t age = d->mc_stamp[i] == 0 ? 0xffffffffu : d->mc_clock - d->mc_stamp[i];
+        if (age >= oldest) {
+            oldest = age;
+            slot = i;
+        }
+    }
+    d->mc_block[slot] = block;
+    memcpy(d->mc_data[slot], bytes, BLOCK);
+    mc_touch(d, slot);
+}
+
+static void mc_drop(struct datafs *d, lfs_block_t block)
+{
+    int slot = mc_find(d, block);
+    if (slot >= 0) {
+        d->mc_stamp[slot] = 0;
+    }
+}
+
+static void mc_clear(struct datafs *d)
+{
+    for (uint32_t i = 0; i < MCACHE_BLOCKS; i++) {
+        d->mc_stamp[i] = 0;
+    }
+}
+
 static int dev_read(const struct lfs_config *c, lfs_block_t block, lfs_off_t off, void *buffer,
                     lfs_size_t size)
 {
     struct datafs *d = c->context;
+    int cached = !d->mc_off && !d->lfs.data_read;
+    if (cached) {
+        int slot = mc_find(d, block);
+        if (slot >= 0 && off + size <= BLOCK) {
+            memcpy(buffer, d->mc_data[slot] + off, size);
+            mc_touch(d, (uint32_t)slot);
+            d->mc_hits++;
+            return 0;
+        }
+    }
     int err = datafs_rs_read(d->ctx, block, off, buffer, size);
     if (err) {
         forget_failed_read(d, block);
+    } else if (cached && off == 0 && size == BLOCK) {
+        d->mc_misses++;
+        mc_insert(d, block, buffer);
     }
     return err;
 }
@@ -101,7 +202,18 @@ static int dev_prog(const struct lfs_config *c, lfs_block_t block, lfs_off_t off
                     const void *buffer, lfs_size_t size)
 {
     struct datafs *d = c->context;
-    return datafs_rs_prog(d->ctx, block, off, buffer, size);
+    int err = datafs_rs_prog(d->ctx, block, off, buffer, size);
+#ifndef DATAFS_BREAK_CACHE_STALE
+    int slot = mc_find(d, block);
+    if (slot >= 0) {
+        if (err || off + size > BLOCK) {
+            d->mc_stamp[slot] = 0;
+        } else {
+            memcpy(d->mc_data[slot] + off, buffer, size);
+        }
+    }
+#endif
+    return err;
 }
 
 // The blocks need no erase: the device overwrites in place.
@@ -109,8 +221,10 @@ static int dev_prog(const struct lfs_config *c, lfs_block_t block, lfs_off_t off
 static int dev_erase(const struct lfs_config *c, lfs_block_t block)
 {
     struct datafs *d = c->context;
-    (void)block;
     d->erases++;
+#ifndef DATAFS_BREAK_CACHE_STALE
+    mc_drop(d, block);
+#endif
     return 0;
 }
 
@@ -123,10 +237,9 @@ static int dev_sync(const struct lfs_config *c)
 // Sets the volume up over a device of `blocks` blocks of 4 KiB. Nothing is read.
 void datafs_setup(struct datafs *d, uint32_t blocks)
 {
-    uint8_t *bytes = (uint8_t *)d;
-    for (size_t i = 0; i < sizeof(*d); i++) {
-        bytes[i] = 0;
-    }
+    // All but the blocks of the cache: a slot's stamp says whether its block is there (and the blocks
+    // are 2 MiB, which a clear would touch page by page).
+    memset(d, 0, offsetof(struct datafs, mc_data));
     d->cfg.context = d;
     d->cfg.read = dev_read;
     d->cfg.prog = dev_prog;
@@ -225,6 +338,20 @@ void datafs_set_orphan_cells(struct datafs *d, uint32_t cells)
     d->cfg.orphan_size = cells * 12u;
 }
 
+// The host measurements and tests: the cache of metadata blocks off (0) or on (1), and the hits and
+// misses it has counted since the setup (out[0], out[1]).
+void datafs_set_cache(struct datafs *d, uint32_t on)
+{
+    d->mc_off = on ? 0 : 1;
+    mc_clear(d);
+}
+
+void datafs_cache_stats(const struct datafs *d, uint32_t *out)
+{
+    out[0] = d->mc_hits;
+    out[1] = d->mc_misses;
+}
+
 // The size of the window the volume was set up with, in blocks.
 uint32_t datafs_window_blocks(const struct datafs *d) { return d->cfg.lookahead_size * 8u; }
 
@@ -293,6 +420,7 @@ int datafs_walk(struct datafs *d, void *ctx)
 int datafs_format(struct datafs *d, void *ctx)
 {
     d->ctx = ctx;
+    mc_clear(d);
     return lfs_format(&d->lfs, &d->cfg);
 }
 
@@ -303,6 +431,7 @@ int datafs_format(struct datafs *d, void *ctx)
 int datafs_mount(struct datafs *d, void *ctx)
 {
     d->ctx = ctx;
+    mc_clear(d);
     int err = lfs_mount(&d->lfs, &d->cfg);
     if (err < 0) {
         return err;

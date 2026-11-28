@@ -234,6 +234,14 @@ block, and 258 programs) and 131 reads with the change (0.51 for each block, the
 - A cut of the power in the middle of the copy leaves the old file whole: the entry of the directory names the old list until the commit of the sync, and the blocks of the new list are not reachable from any entry (the next walk of the allocator counts them free).
 - Nothing changes on the disk. The tests are `lib/datafs/src/tests_tail.rs`: a rewrite from the middle of a file of 1 MiB read by another file between the steps, a sequence of calls with steps in random places against a model in memory on a volume where the allocator wraps, a call that meets a half done copy, and a cut of the power at every third sector of a sequence that has a commit of another file between two steps. The build feature `break-datafs-tail-whole` of `lib/datafs` stops the service from beginning copies in steps, and `cargo xtask datafs-breaks` checks that the host tests fail with it.
 
+## A change to the reads: file data is marked for the cache of metadata blocks
+
+The data service keeps the metadata blocks it reads in a cache of its own, in the read function of its configuration (`lib/datafs/csrc/glue.c`, `dev_read`), and the cache must not fill with the blocks of file data (a file read from end to end would push the pairs of the directories out). The release's read function cannot tell the two apart, so the change marks the reads of data.
+
+- `lfs_t` has one more field at its end (before the migration field), `data_read`, one byte. It is 1 while `lfs_bd_read_data` runs and 0 otherwise; the configuration's read function reads it as the hint that the block holds file data.
+- `lfs_bd_read_data` is `lfs_bd_read` with the field set around the call. Seven reads of the release call it, where the release calls `lfs_bd_read`: the reads of the skip list and the bytes of a file (`lfs_ctz_find`, `lfs_ctz_find_hinted`, `lfs_file_flushedread`), the copy of a block when a list is extended or a block is moved (`lfs_ctz_extend` twice, `lfs_file_relocate`) and the walk of a list (`lfs_ctz_traverse`). Every other read (the fetch of a pair, the get of a tag, the commit) is for metadata.
+- Nothing changes on the disk and no read or write of the device is added or dropped: the field only describes the read being made. A device that ignores it behaves as the release does.
+
 ## A known defect of the release that the service works around
 
 With `inline_max = -1` (no inlined files) littlefs 2.11.3, with or without this change, loses a write at the start or in the middle of an existing inline file (a file that an earlier configuration kept inside the pair of its directory): moving the file out (`lfs_file_outline`, `lfs_file_relocate`) copies only the bytes before the write position, flushing the rest then fails, and the close answers `LFS_ERR_CORRUPT`; the write is lost and the old bytes stay. Appending, `O_TRUNC` and truncating down work. The service moves every inline file out before a write can meet this: open for writing, seek to the end and write no byte (one commit, the whole file moves), by the conversion job after the mount and, for a file the job has not reached, at the first open of the path for writing or truncation. The test that reproduces the defect is `without_the_move_out_a_write_in_the_middle_of_an_old_inline_file_is_lost` in `lib/datafs/src/tests_perm.rs`: it fails when a release stops losing the write, and then the move-out can go. The release's own message about it is not sent yet.
@@ -251,8 +259,8 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 0cb4ff1daf5fdc1359c6a6ee3116092f08fc100c9d58b1b77ab17bfd801f856d  LICENSE.md
 6dd74dfc58ac93589f8e002bb73c0830a59206912cfe8c951c07eb2bd5fccad0  SPEC.md
 2a8b3459d74b9fa8bdd947738522c46331739405b1fc3d70f057f636a1dea768  DESIGN.md
-ff1199db116f6bf5d53f283308504b8c47af5af2b33d8d471f450ebced9d524a  lfs.c (with the change)
-c9f7c2b7c76eee3be0634c41daf2b0738d68d5e2ca65037844338f74083dd68b  lfs.h (with the change)
+19ebd429072a0c3837d36e532235c7a34cce5f2b1ee30a64b73e9cc1619a6be5  lfs.c (with the change)
+0de254fa10368186ace6d2f9e652099041c0c942a96047bcbc814daacd1bd095  lfs.h (with the change)
 ```
 
 `tools/check-littlefs.py` (run by `cargo xtask ci` as "littlefs sources") fails when a file of the

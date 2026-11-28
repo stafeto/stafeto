@@ -20,8 +20,11 @@ const ATTR: u8 = 0x70;
 const ENTRIES: usize = 1000;
 
 fn attach(device: MemDevice) -> Vol {
-    let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
-    Fs::new(device, state).unwrap()
+    let state: &'static mut Storage = Box::leak(Storage::boxed());
+    let mut fs = Fs::new(device, state).unwrap();
+    // The tests count the reads of littlefs: the cache of metadata blocks is off.
+    fs.set_cache(false);
+    fs
 }
 
 /// A formatted volume of 4096 blocks, mounted.

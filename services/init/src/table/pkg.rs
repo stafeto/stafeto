@@ -467,9 +467,11 @@ pub const DATAFS_BUDGETS: &[Budget] = &[
 /// service. Its request thread works at 36 under a budget, above the clients of POSIX (ceiling 31) and
 /// below the disk service (39) whose client its worker is, at 30. Its quota is the worker's stack, the
 /// disk buffer and the pages of the volume's memory with room over. The allocator's window (one bit for
-/// each block, 128 KiB for a volume of 4 GiB, 32 pages) is in the volume's memory, which is a static of
-/// the program: init pays for it as a segment at the load (`quota::need_pages` counts the segments of
-/// the program besides the quota), so the quota stays at 512 pages. It connects to the disk service and restarts: a new
+/// each block, 128 KiB for a volume of 4 GiB, 32 pages) and the cache of 512 metadata blocks (2 MiB,
+/// 512 pages, which the build of the layer index needs: stafeto#657) are in the volume's memory, which
+/// is a static of the program: init pays for it as a segment at the load (`quota::need_pages` counts the
+/// segments of the program besides the quota). The quota grew by the 512 pages of the cache, from 512 to
+/// 1,024, for the pages the program touches in the first use. It connects to the disk service and restarts: a new
 /// instance mounts the volume again, and a client opens its files again. A service that ends twice in a
 /// row with the stuck exit (6, no disk call completed for 20 s with a job waiting) is marked broken: a
 /// restart would mount the same volume again and wait on it again, for ever (stafeto#443).
@@ -482,7 +484,7 @@ pub const DATAFS: Record = Record {
     }),
     priority: 36,
     ceiling: 36,
-    quota: 512 * PAGE,
+    quota: 1024 * PAGE,
     // The handles the service holds at most: 64 windows (one for each session, until it goes),
     // 64 copies of identity sessions (one for each bound session), 32 identity handles of SESSION
     // requests that wait for a job (`admit::WAITING_MAX`), 24 handles in the jobs in flight (a queued
@@ -1180,8 +1182,9 @@ mod tests {
                 assert_eq!(record.broken_after, None, "{}", record.name);
             }
         }
-        // The allocator's window of 32 pages is a segment of the program, paid at load; the quota does not hold it.
-        assert_eq!(DATAFS.quota, 512 * PAGE);
+        // The allocator's window of 32 pages and the cache of 512 blocks are in a segment of the program, paid at load; the quota
+        // (512 pages and the 512 of the cache) does not hold them.
+        assert_eq!(DATAFS.quota, 1024 * PAGE);
         assert_eq!(DATAKEY_PROBE_TABLE[2].name, "datadisk");
         assert!(DATA_PROBE_TABLE.iter().any(|r| r.name == "datadisk"));
         assert!(DATA_PROBE_TABLE.iter().all(|r| r.name != "blk"));

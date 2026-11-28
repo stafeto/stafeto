@@ -125,6 +125,19 @@ static int lfs_bd_read(lfs_t *lfs,
     return 0;
 }
 
+// A read of the blocks of a file's data (the skip list, the bytes, the copy of a block): the
+// device is told the block holds file data, which the metadata block cache of the service does
+// not keep (lfs_t.data_read, read by the device's read function).
+static int lfs_bd_read_data(lfs_t *lfs,
+        const lfs_cache_t *pcache, lfs_cache_t *rcache, lfs_size_t hint,
+        lfs_block_t block, lfs_off_t off,
+        void *buffer, lfs_size_t size) {
+    lfs->data_read = 1;
+    int err = lfs_bd_read(lfs, pcache, rcache, hint, block, off, buffer, size);
+    lfs->data_read = 0;
+    return err;
+}
+
 static int lfs_bd_cmp(lfs_t *lfs,
         const lfs_cache_t *pcache, lfs_cache_t *rcache, lfs_size_t hint,
         lfs_block_t block, lfs_off_t off,
@@ -3031,7 +3044,7 @@ static int lfs_ctz_find(lfs_t *lfs,
                 lfs_npw2(current-target+1) - 1,
                 lfs_ctz(current));
 
-        int err = lfs_bd_read(lfs,
+        int err = lfs_bd_read_data(lfs,
                 pcache, rcache, sizeof(head),
                 head, 4*skip, &head, sizeof(head));
         head = lfs_fromle32(head);
@@ -3128,7 +3141,7 @@ static int lfs_ctz_find_hinted(lfs_t *lfs, lfs_file_t *file,
                 lfs_npw2(current-target+1) - 1,
                 lfs_ctz(current));
 
-        int err = lfs_bd_read(lfs,
+        int err = lfs_bd_read_data(lfs,
                 NULL, &file->cache, sizeof(head),
                 head, 4*skip, &head, sizeof(head));
         head = lfs_fromle32(head);
@@ -3181,7 +3194,7 @@ static int lfs_ctz_extend(lfs_t *lfs,
             if (noff != lfs->cfg->block_size) {
                 for (lfs_off_t i = 0; i < noff; i++) {
                     uint8_t data;
-                    err = lfs_bd_read(lfs,
+                    err = lfs_bd_read_data(lfs,
                             NULL, rcache, noff-i,
                             head, i, &data, 1);
                     if (err) {
@@ -3221,7 +3234,7 @@ static int lfs_ctz_extend(lfs_t *lfs,
                 }
 
                 if (i != skips-1) {
-                    err = lfs_bd_read(lfs,
+                    err = lfs_bd_read_data(lfs,
                             NULL, rcache, sizeof(nhead),
                             nhead, 4*i, &nhead, sizeof(nhead));
                     nhead = lfs_fromle32(nhead);
@@ -3267,7 +3280,7 @@ static int lfs_ctz_traverse(lfs_t *lfs,
 
         lfs_block_t heads[2];
         int count = 2 - (index & 1);
-        err = lfs_bd_read(lfs,
+        err = lfs_bd_read_data(lfs,
                 pcache, rcache, count*sizeof(head),
                 head, 0, &heads, count*sizeof(head));
         heads[0] = lfs_fromle32(heads[0]);
@@ -3527,7 +3540,7 @@ static int lfs_file_relocate(lfs_t *lfs, lfs_file_t *file) {
                     return err;
                 }
             } else {
-                err = lfs_bd_read(lfs,
+                err = lfs_bd_read_data(lfs,
                         &file->cache, &lfs->rcache, file->off-i,
                         file->block, i, &data, 1);
                 if (err) {
@@ -3832,7 +3845,7 @@ static lfs_ssize_t lfs_file_flushedread(lfs_t *lfs, lfs_file_t *file,
                 return err;
             }
         } else {
-            int err = lfs_bd_read(lfs,
+            int err = lfs_bd_read_data(lfs,
                     NULL, &file->cache, lfs->cfg->block_size,
                     file->block, file->off, data, diff);
             if (err) {

@@ -137,8 +137,11 @@ std::thread_local! {
 }
 
 fn attach(device: MemDevice, win: Win) -> Vol {
-    let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+    let state: &'static mut Storage = Box::leak(Storage::boxed());
     let mut fs = Fs::new(device, state).unwrap();
+    // These tests count the reads of littlefs's walks and lookups: the cache of metadata blocks is
+    // off (the tests of the cache are in tests_cache.rs).
+    fs.set_cache(false);
     fs.set_block_cycles(BLOCK_CYCLES.with(|c| c.get()));
     if win == Win::Narrow {
         // The window the first release had; the service's own is one bit for every block.
@@ -2019,7 +2022,7 @@ fn a_disk_with_a_data_partition_over_4_gib_is_refused_and_not_written() {
             Ok(())
         }
     }
-    let mut state = Box::new(Storage::new());
+    let mut state = Storage::boxed();
     let refused = volume::open(Huge, &mut state, 1).err();
     assert_eq!(refused, Some(Refusal::TooLarge));
     assert!(Refusal::TooLarge.text().contains("4 GiB"));
@@ -2099,7 +2102,7 @@ impl Device for Marked {
 
 #[test]
 fn a_walk_is_marked_to_the_device_and_a_stop_ends_it_with_io_whichever_way_it_was_asked_for() {
-    let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+    let state: &'static mut Storage = Box::leak(Storage::boxed());
     let device = Marked {
         inner: kept_device(),
         on: false,
@@ -2128,7 +2131,7 @@ fn a_job_during_a_walk_stops_it_is_served_in_a_few_reads_and_the_walk_completes_
     let may_yield = Rc::new(Cell::new(false));
     let stopped = Rc::new(Cell::new(0));
     let device = kept_device();
-    let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+    let state: &'static mut Storage = Box::leak(Storage::boxed());
     let gate = Yielding {
         inner: device,
         queued: queued.clone(),
@@ -2136,6 +2139,7 @@ fn a_job_during_a_walk_stops_it_is_served_in_a_few_reads_and_the_walk_completes_
         stopped: stopped.clone(),
     };
     let mut fs = Fs::new(gate, state).unwrap();
+    fs.set_cache(false);
     fs.mount().unwrap();
     // The walk alone: how many reads it takes.
     let before = fs.device().inner.reads;
@@ -2173,7 +2177,7 @@ fn after_the_allowed_tries_a_walk_runs_to_its_end_though_jobs_keep_coming() {
     let queued = Rc::new(Cell::new(true));
     let allowed = Rc::new(Cell::new(false));
     let stopped = Rc::new(Cell::new(0));
-    let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+    let state: &'static mut Storage = Box::leak(Storage::boxed());
     let mut fs = Fs::new(
         Yielding {
             inner: kept_device(),

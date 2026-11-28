@@ -14,8 +14,11 @@ pub const PATH_MAX: usize = 511;
 /// A larger volume would walk the tree on every STATFS and every wrap of the allocator, so
 /// `volume::open` refuses it.
 pub const BLOCKS_MAX: u64 = 1 << 20;
+/// The blocks of the cache of metadata blocks (`csrc/glue.c`: 128 sets of 4 ways), each of 4 KiB.
+pub const CACHE_BLOCKS: usize = 512;
 /// The bytes of memory a volume uses at most (`Storage`); the C structure is checked against it.
-pub const STORAGE_BYTES: usize = (56 + 68 + 128 + 48) * 1024;
+/// The cache of metadata blocks is 2 MiB of it (the statics of the service grow by 512 pages).
+pub const STORAGE_BYTES: usize = (56 + 68 + 128 + 48) * 1024 + CACHE_BLOCKS * 4096 + 8 * 1024;
 
 unsafe extern "C" {
     fn datafs_state_size() -> usize;
@@ -115,6 +118,8 @@ unsafe extern "C" {
     fn datafs_set_block_cycles(d: *mut c_void, cycles: i32);
     fn datafs_set_ctz_hints(d: *mut c_void, hints: u32);
     fn datafs_set_trust_prog(d: *mut c_void, on: u32);
+    fn datafs_set_cache(d: *mut c_void, on: u32);
+    fn datafs_cache_stats(d: *const c_void, out: *mut u32);
     fn datafs_erases(d: *const c_void) -> u32;
     fn datafs_open_attr(
         d: *mut c_void,
@@ -914,6 +919,21 @@ impl<D: Device> Fs<'_, D> {
     pub fn set_trust_prog(&mut self, on: u32) {
         // SAFETY: as `set_orphan_table`.
         unsafe { datafs_set_trust_prog(self.state.0.as_mut_ptr().cast(), on) };
+    }
+
+    /// The cache of metadata blocks on (the service's setting, from the setup) or off, for the
+    /// measurements and the tests that compare the two.
+    pub fn set_cache(&mut self, on: bool) {
+        // SAFETY: as `set_orphan_table`.
+        unsafe { datafs_set_cache(self.state.0.as_mut_ptr().cast(), u32::from(on)) };
+    }
+
+    /// The reads the cache of metadata blocks answered and the blocks it loaded since the setup.
+    pub fn cache_stats(&self) -> (u32, u32) {
+        let mut out = [0u32; 2];
+        // SAFETY: the state is the one `Fs::new` set up, and `out` has room for two words.
+        unsafe { datafs_cache_stats(self.state.0.as_ptr().cast(), out.as_mut_ptr()) };
+        (out[0], out[1])
     }
 
     /// A table of the repair of orphans of `cells` cells (0 is none), before the next mount.

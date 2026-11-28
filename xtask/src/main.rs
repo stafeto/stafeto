@@ -94,8 +94,8 @@ mod kernel_size;
 mod keys;
 mod layer_names;
 mod layer_posix;
-mod layer_reads;
 mod layer_probe;
+mod layer_reads;
 mod layer_restart;
 mod layer_steps;
 mod layer_time;
@@ -3386,7 +3386,7 @@ const NVME_BREAKS: [&str; 10] = [
 /// The deliberate breaks of the data volume (`cargo xtask datafs-breaks`): each is a feature of
 /// `lib/datafs` that does one wrong thing, and its host tests (a cut of the power at every sector of a
 /// workload, the table of a new volume, the protocol) pass without it and fail with it.
-const DATAFS_BREAKS: [&str; 16] = [
+const DATAFS_BREAKS: [&str; 17] = [
     "break-datafs-sync",
     "break-datafs-consistent",
     "break-datafs-busy",
@@ -3403,6 +3403,7 @@ const DATAFS_BREAKS: [&str; 16] = [
     "break-datafs-layers-visible",
     "break-datafs-tail-whole",
     "break-datafs-numbered-any",
+    "break-datafs-cache-stale",
 ];
 
 /// The breaks to run: every one of `DATAFS_BREAKS`, or only the ones `named` (each must be one of

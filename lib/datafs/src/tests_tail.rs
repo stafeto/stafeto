@@ -409,7 +409,7 @@ fn a_cut_between_the_steps_of_a_copy_leaves_the_old_file_or_the_new() {
     let mut new = old.clone();
     new[100..104].copy_from_slice(b"WXYZ");
     let sequence = |cut: Option<u64>, survive: Survive| -> (Vec<u8>, Vec<u8>, u64) {
-        let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+        let state: &'static mut Storage = Box::leak(Storage::boxed());
         let mut rig = Rig {
             server: crate::server::Server::with_epoch(1),
             fs: Fs::new(MemDevice::new(4_096), state).unwrap(),
@@ -472,7 +472,7 @@ fn a_cut_between_the_steps_of_a_copy_leaves_the_old_file_or_the_new() {
         let written = rig.fs.device().written - before;
         let mut device = rig.fs.into_device();
         device.power_cycle(survive);
-        let mut state = Box::new(Storage::new());
+        let mut state = Storage::boxed();
         let mut fs = Fs::new(device, &mut state).unwrap();
         fs.mount().expect("the volume mounts after the cut");
         let mut read = |path: &[u8]| -> Vec<u8> {

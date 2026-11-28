@@ -14,7 +14,6 @@ use crate::tests::{Node, Tree, pattern, read_tree};
 use crate::{Device, Error};
 use proto_data as p;
 use proto_wire::{Status, Writer};
-use std::boxed::Box;
 use std::string::{String, ToString};
 use std::vec::Vec;
 
@@ -142,7 +141,7 @@ fn scenarios() -> Vec<Scenario> {
 /// One run: the setup (durable), the action with a cut after `cut` sectors, the power back with
 /// `survive`, the mount, the recovery. The tree, what the recovery did, and the sectors written.
 fn run(s: &Scenario, cut: Option<u64>, survive: Survive) -> (Tree, Recovered, u64) {
-    let mut state = Box::new(Storage::new());
+    let mut state = Storage::boxed();
     let mut rig = Rig {
         server: Server::with_epoch(1),
         fs: Fs::new(MemDevice::new(SECTORS), &mut state).unwrap(),
@@ -158,7 +157,7 @@ fn run(s: &Scenario, cut: Option<u64>, survive: Survive) -> (Tree, Recovered, u6
     let written = rig.fs.device().written - before;
     let mut device = rig.fs.into_device();
     device.power_cycle(survive);
-    let mut state = Box::new(Storage::new());
+    let mut state = Storage::boxed();
     let mut fs = Fs::new(device, &mut state).unwrap();
     fs.mount().expect("the volume mounts after the cut");
     let done = server::recover_orphans(&mut fs).expect("the recovery runs");
@@ -227,7 +226,7 @@ fn a_cut_at_every_sector_of_a_move_of_an_open_file_leaves_the_old_name_or_the_ne
 fn a_cut_in_the_recovery_is_finished_by_the_next_one() {
     let data = pattern(7000, 5);
     let crafted = |cut: Option<u64>, survive: Survive| -> Tree {
-        let mut state = Box::new(Storage::new());
+        let mut state = Storage::boxed();
         let mut fs = Fs::new(MemDevice::new(SECTORS), &mut state).unwrap();
         fs.format().unwrap();
         fs.mount().unwrap();
@@ -257,7 +256,7 @@ fn a_cut_in_the_recovery_is_finished_by_the_next_one() {
         let _ = server::recover_orphans(&mut fs);
         let mut device = fs.into_device();
         device.power_cycle(survive);
-        let mut state = Box::new(Storage::new());
+        let mut state = Storage::boxed();
         let mut fs = Fs::new(device, &mut state).unwrap();
         fs.mount().unwrap();
         server::recover_orphans(&mut fs).unwrap();
@@ -290,7 +289,7 @@ fn a_cut_at_every_sector_of_a_write_in_parts_of_64_kib_leaves_a_prefix_and_a_syn
     // Three parts of a cell and a rest.
     let data = pattern(3 * p::CELL_BYTES + 1000, 6);
     let run = |cut: Option<u64>, survive: Survive| -> (Vec<u8>, u64, u64) {
-        let mut state = Box::new(Storage::new());
+        let mut state = Storage::boxed();
         let mut rig = Rig {
             server: Server::with_epoch(1),
             fs: Fs::new(MemDevice::new(SECTORS), &mut state).unwrap(),
@@ -338,7 +337,7 @@ fn a_cut_at_every_sector_of_a_write_in_parts_of_64_kib_leaves_a_prefix_and_a_syn
         let written = rig.fs.device().written - before;
         let mut device = rig.fs.into_device();
         device.power_cycle(survive);
-        let mut state = Box::new(Storage::new());
+        let mut state = Storage::boxed();
         let mut fs = Fs::new(device, &mut state).unwrap();
         fs.mount().expect("the volume mounts after the cut");
         server::recover_orphans(&mut fs).expect("the recovery runs");
@@ -481,7 +480,7 @@ mod attributes {
 
     /// A volume as the 0.5 service left it: no attribute anywhere.
     fn version_two() -> MemDevice {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut fs = Fs::new(MemDevice::new(SECTORS), &mut state).unwrap();
         fs.format().unwrap();
         fs.mount().unwrap();
@@ -504,7 +503,7 @@ mod attributes {
 
     /// A volume a build with inline data on left: small files inside the pairs of their directories.
     fn inline_volume() -> MemDevice {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut fs = Fs::new(MemDevice::new(SECTORS), &mut state).unwrap();
         fs.set_inline_max(0);
         fs.format().unwrap();
@@ -539,7 +538,7 @@ mod attributes {
     fn a_cut_at_every_sector_of_the_move_out_of_inline_files_leaves_the_old_file_or_the_moved_one()
     {
         // The sectors of the whole mount work, uncut.
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut fs = Fs::new(inline_volume(), &mut state).unwrap();
         fs.mount().unwrap();
         let mut server = server::Server::new();
@@ -552,7 +551,7 @@ mod attributes {
         assert!(sectors >= 4, "{sectors} sectors");
         for cut in 0..=sectors {
             for survive in SURVIVE {
-                let mut state = Storage::new();
+                let mut state = Storage::boxed();
                 let mut fs = Fs::new(inline_volume(), &mut state).unwrap();
                 fs.mount().unwrap();
                 let mut server = server::Server::new();
@@ -566,7 +565,7 @@ mod attributes {
                 let mut device = fs.into_device();
                 device.power_cycle(survive);
                 // The volume mounts, and every file is whole: the old bytes, moved or not.
-                let mut state = Storage::new();
+                let mut state = Storage::boxed();
                 let mut fs = Fs::new(device, &mut state).unwrap();
                 fs.mount().unwrap();
                 for (path, data) in INLINE_FILES {
@@ -604,7 +603,7 @@ mod attributes {
         ];
         // The sectors of the whole conversion, uncut.
         let device = version_two();
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut fs = Fs::new(device, &mut state).unwrap();
         fs.mount().unwrap();
         let mut server = server::Server::new();
@@ -617,7 +616,7 @@ mod attributes {
         assert!(sectors >= 9, "{sectors} sectors");
         for cut in 0..=sectors {
             for survive in SURVIVE {
-                let mut state = Storage::new();
+                let mut state = Storage::boxed();
                 let mut fs = Fs::new(version_two(), &mut state).unwrap();
                 fs.mount().unwrap();
                 let mut server = server::Server::new();

@@ -51,6 +51,9 @@ break-datafs-append-end = []
 # `break-datafs-numbered-any`: OPEN_NUMBERED and MKDIR_NUMBERED take only a number with bit 62 (the
 # counter of the layered file service), so the number of a lower file is refused.
 break-datafs-numbered-any = []
+# `break-datafs-cache-stale`: the cache of metadata blocks keeps a block after it is rewritten (a program
+# does not update the copy and an erase does not drop it), so a read after a commit returns the old pair.
+break-datafs-cache-stale = []
 
 [dependencies]
 littlefs = { path = "../../third-party/littlefs" }

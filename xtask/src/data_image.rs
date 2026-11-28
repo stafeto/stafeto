@@ -102,7 +102,7 @@ pub fn make(path: &Path, size: u64) -> Result<Did, String> {
     file.set_len(size)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     drop(file);
-    let mut state = Box::new(Storage::new());
+    let mut state = Storage::boxed();
     let device = FileDevice::open(path)?;
     let (mut fs, did, _) = volume::open(device, &mut state, SEED)
         .map_err(|r| format!("{}: datafs refused the file: {}", path.display(), r.text()))?;
@@ -168,7 +168,7 @@ fn posix_volume_entries() -> Vec<Entry> {
 pub fn make_posix_volume(path: &Path, size: u64) -> Result<(), String> {
     use datafs::attr::{ATTR_COUNTER_TYPE, ATTR_FORMAT_TYPE, ATTR_TYPE, Attr, VOLUME_FORMAT};
     make(path, size)?;
-    let mut state = Box::new(Storage::new());
+    let mut state = Storage::boxed();
     let (mut fs, _, _) = volume::open(FileDevice::open(path)?, &mut state, SEED)
         .map_err(|r| format!("{}: datafs refused the file: {}", path.display(), r.text()))?;
     let record = |mode: u32, uid: u32, gid: u32, ino: u64| {
@@ -568,7 +568,7 @@ pub fn make_layer_posix_volume(path: &Path, size: u64) -> Result<(), String> {
 fn make_layer_volume_of(path: &Path, size: u64, entries: &[LayerEntry]) -> Result<(), String> {
     use datafs::attr::{ATTR_COUNTER_TYPE, ATTR_FORMAT_TYPE, ATTR_TYPE, Attr, VOLUME_FORMAT};
     make(path, size)?;
-    let mut state = Box::new(Storage::new());
+    let mut state = Storage::boxed();
     let (mut fs, _, _) = volume::open(Quick(FileDevice::open(path)?), &mut state, SEED)
         .map_err(|r| format!("{}: datafs refused the file: {}", path.display(), r.text()))?;
     let record = |mode: u32, uid: u32, gid: u32, ino: u64| {
@@ -731,7 +731,7 @@ fn put<D: Device>(
 /// `/big/b<N>`, `/rd/r<N>`, `/rm/e<N>`.
 pub fn make_filled(path: &Path, size: u64, profile: Profile) -> Result<(), String> {
     make(path, size)?;
-    let mut state = Box::new(Storage::new());
+    let mut state = Storage::boxed();
     let device = Quick(FileDevice::open(path)?);
     let (mut fs, _, _) = volume::open(device, &mut state, SEED)
         .map_err(|r| format!("{}: datafs refused the file: {}", path.display(), r.text()))?;
@@ -785,7 +785,7 @@ pub const KEY_PATH: &str = "/ssh/dropbear_ed25519_host_key";
 /// shows no attribute of the version-3 service anywhere on it.
 pub fn make_v051(path: &Path, size: u64, key: &[u8]) -> Result<(), String> {
     make(path, size)?;
-    let mut state = Box::new(Storage::new());
+    let mut state = Storage::boxed();
     let (mut fs, _, _) = volume::open(FileDevice::open(path)?, &mut state, SEED)
         .map_err(|r| format!("{}: datafs refused the file: {}", path.display(), r.text()))?;
     // The 0.5.1 service had littlefs's default: a small file lives inside the pair of its directory,
@@ -953,7 +953,7 @@ mod tests {
         );
         // The first boot on EC2 runs `volume::open` on this file: it mounts, and nothing is formatted
         // or partitioned.
-        let mut state = Box::new(Storage::new());
+        let mut state = Storage::boxed();
         let (mut fs, did, part) =
             volume::open(FileDevice::open(&a).unwrap(), &mut state, 1).unwrap();
         assert_eq!(did, Did::Mounted);
@@ -968,7 +968,7 @@ mod tests {
         fs.close(f).unwrap();
         fs.unmount().unwrap();
         drop(fs);
-        let mut state = Box::new(Storage::new());
+        let mut state = Storage::boxed();
         let (mut fs, did, _) = volume::open(FileDevice::open(&a).unwrap(), &mut state, 2).unwrap();
         assert_eq!(did, Did::Mounted);
         assert_eq!(fs.stat(b"/key").unwrap().size, 4);
@@ -990,7 +990,7 @@ mod tests {
             empty: 4,
         };
         make_filled(&path, 64 << 20, profile).unwrap();
-        let mut state = Box::new(Storage::new());
+        let mut state = Storage::boxed();
         let (mut fs, did, _) =
             volume::open(FileDevice::open(&path).unwrap(), &mut state, 1).unwrap();
         assert_eq!(did, Did::Mounted);
@@ -1020,7 +1020,7 @@ mod tests {
         let path = temp("v051");
         let key = [0x42u8; 120];
         make_v051(&path, 64 << 20, &key).unwrap();
-        let mut state = Box::new(Storage::new());
+        let mut state = Storage::boxed();
         let (mut fs, did, _) =
             volume::open(FileDevice::open(&path).unwrap(), &mut state, 1).unwrap();
         assert_eq!(did, Did::Mounted);
@@ -1064,7 +1064,7 @@ mod tests {
         use datafs::attr::{ATTR_COUNTER_TYPE, ATTR_FORMAT_TYPE, ATTR_TYPE, Attr, VOLUME_FORMAT};
         let path = temp("posix");
         make_posix_volume(&path, 64 << 20).unwrap();
-        let mut state = Box::new(Storage::new());
+        let mut state = Storage::boxed();
         let (mut fs, did, _) =
             volume::open(FileDevice::open(&path).unwrap(), &mut state, 1).unwrap();
         assert_eq!(did, Did::Mounted);
@@ -1117,12 +1117,12 @@ mod tests {
         let file = std::fs::OpenOptions::new().write(true).open(&a).unwrap();
         file.set_len(128 << 20).unwrap();
         drop(file);
-        let mut state = Box::new(Storage::new());
+        let mut state = Storage::boxed();
         let (mut fs, did, _) = volume::open(FileDevice::open(&a).unwrap(), &mut state, 1).unwrap();
         assert_eq!(did, Did::Relocated);
         fs.unmount().unwrap();
         drop(fs);
-        let mut state = Box::new(Storage::new());
+        let mut state = Storage::boxed();
         let (_, did, _) = volume::open(FileDevice::open(&a).unwrap(), &mut state, 1).unwrap();
         assert_eq!(did, Did::Mounted);
         let _ = std::fs::remove_file(&a);

@@ -521,6 +521,10 @@ typedef struct lfs {
     lfs_size_t attr_max;
     lfs_size_t inline_max;
 
+    // Set while a read is for the data of a file, clear for metadata: the read function of
+    // the configuration may keep metadata blocks only (a change of stafeto).
+    uint8_t data_read;
+
 #ifdef LFS_MIGRATE
     struct lfs1 *lfs1;
 #endif
