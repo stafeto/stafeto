@@ -1198,7 +1198,7 @@ fn a_removed_directory_leaves_at_once_and_the_reaper_takes_what_it_held_a_piece_
     assert!(node(&core, "/.layers/00/mk").is_none());
     assert_eq!(core.index.counts(), (names - 1, marks));
     assert!(core.reaping());
-    // The reaper: the orphans in windows of the table, then one call to the volume in a step.
+    // The reaper: the orphans from the list of the directory, then one call to the volume in a step.
     let mut steps = 0;
     loop {
         let (more, calls) = reap_once(&mut core);
@@ -1209,10 +1209,8 @@ fn a_removed_directory_leaves_at_once_and_the_reaper_takes_what_it_held_a_piece_
             break;
         }
     }
-    assert!(
-        steps >= crate::index::SLOTS / crate::listing::SLOTS_PER_READDIR,
-        "{steps}"
-    );
+    // The forty orphans go ORPHANS_PER_STEP at a time, then the calls to the volume.
+    assert!(steps >= 40 / crate::index::ORPHANS_PER_STEP + 3, "{steps}");
     assert_eq!(core.index.counts(), (names - 1, marks - 40));
     assert!(!core.reaping());
     // Nothing of it is left in `work/`, and the name comes back as a new, empty directory.

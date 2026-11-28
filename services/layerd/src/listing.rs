@@ -31,13 +31,15 @@ pub struct Listed {
     pub cursor: u64,
 }
 
-/// The slots of the index one request looks at in the first stage: 384 slots cost about 5,400
-/// ticks under `-icount` (14 for a slot, measured), and the entries of a reply (up to 46 of the
-/// message's 1 KiB) about 9,000 more: under 0.9 B with the rest of the step.
+/// The entries of the list of a directory one request looks at in the first stage (a mark of
+/// deletion is looked at and dropped): about 57 ticks under `-icount` for each (the walk of the
+/// list, the checks of the entry), measured on a directory of 2,000 marks, where 384 took 22,000;
+/// the entries of a reply (up to 46 of the message's 1 KiB) cost about 9,000 more, so 96 keep a
+/// request under 0.9 B with the rest of the step.
 pub const SLOTS_PER_READDIR: usize = if cfg!(feature = "break-layerd-slots") {
     4096
 } else {
-    384
+    96
 };
 
 /// The entries of the lower set one request reads, kept, dropped or replayed (never more than

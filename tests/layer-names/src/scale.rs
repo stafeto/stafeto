@@ -506,7 +506,12 @@ fn changes(
     // the reaper is done, and a new directory of the name lists empty.
     t.check("a directory of 2,000 marks removed and made again", {
         let before = status_of(control).map_or(0, |s| s.names);
-        if change(names, n::ChangeOp::Rmdir, 0, "/marks", "") != 0 {
+        // The listing of the directory walks 2,000 marks, none of them a name: a request looks at
+        // a bounded number of entries (`SLOTS_PER_READDIR`) and the listing takes several.
+        let listed = super::list_of(names, "/marks");
+        if !matches!(&listed, Some(l) if l.count <= 2 && !l.any_starts("m")) {
+            Err(format_args!("the directory of marks lists a name"))
+        } else if change(names, n::ChangeOp::Rmdir, 0, "/marks", "") != 0 {
             Err(format_args!("the rmdir failed"))
         } else {
             let mut fell = false;

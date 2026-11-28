@@ -6,7 +6,8 @@
 //! second), and where it stands. `Core::change_step` takes one step of it, and a step does at most
 //!
 //! - `lookup::STEP` lookups of the index (a walk of the directory part), or
-//! - `SLOTS_PER_READDIR` slots of a scan of the table (the reaper's, `reaper`), or
+//! - `ORPHANS_PER_STEP` entries of the list of a retired directory, or a step of the upkeep of the
+//!   index (the reaper's, `reaper`), or
 //! - one call to the data file service or to the lower set (a batch of `LOWER_PER_STEP` calls
 //!   for the listing of the emptiness check), with the changes to the index that call makes
 //!   visible, the exceptions being the step of a rename over a directory, which makes two
