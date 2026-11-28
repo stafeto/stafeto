@@ -38,7 +38,7 @@ use crate::change::{
     split,
 };
 use crate::composition::{Composition, MAX_TEXT};
-use crate::index::{Fields, Kind, NAME_MAX, OPAQUE, UNSCANNED};
+use crate::index::{Fields, Kind, NAME_MAX, OPAQUE, Room, UNSCANNED};
 use crate::listing::LOWER_PER_STEP;
 use crate::lookup::{Hidden, Outcome, STEP, Step, Walk, normalize_dots};
 use crate::names::{COMPOSITION, COMPOSITION_TMP, Client, Core, Done, attr_of, from_volume, st};
@@ -2050,13 +2050,14 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         // The index must have room for the new name, and for the mark of the old one, before the
         // volume is touched.
         if let Some(up) = pb.up
-            && !self.index.has_room(up, job.b.leaf_name())
+            && let Some(code) = self.no_room(up, job.b.leaf_name())
         {
-            return fail(proto_fs::NO_SPACE);
+            return fail(code);
         }
-        if job.rn.src_lower.is_some() && !self.index.has_room(job.rn.src_parent, job.a.leaf_name())
+        if job.rn.src_lower.is_some()
+            && let Some(code) = self.no_room(job.rn.src_parent, job.a.leaf_name())
         {
-            return fail(proto_fs::NO_SPACE);
+            return fail(code);
         }
         let (src_id, src_kind, src_lower, src_parent) = (
             job.rn.src_id,
@@ -2666,7 +2667,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                     .map_err(from_volume)?;
                 let id = job.victim.id;
                 let key = self.index.retire(id).unwrap_or(0);
-                self.table.forget(id);
+                self.table.forget(id, |key| self.index.walk_leave(key));
                 let _ = self.work.push(&work[..wl], true, key);
                 Ok(Flow::CallDone)
             }
@@ -2786,11 +2787,8 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             0 => {
                 let mut live = [0u8; 512];
                 self.leg_vpath(job.leg(b), end, false, &mut live)?;
-                if !self
-                    .index
-                    .has_room(parent, &job.leg(b).plain[name.0..name.1])
-                {
-                    return fail(proto_fs::NO_SPACE);
+                if let Some(code) = self.no_room(parent, &job.leg(b).plain[name.0..name.1]) {
+                    return fail(code);
                 }
                 job.dsub = 8;
                 Ok(None)
@@ -3027,8 +3025,8 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 0 => {
                     let mut live = [0u8; 512];
                     self.leg_vpath(&job.a, job.a.parts.len, link, &mut live)?;
-                    if !self.index.has_room(parent, job.a.leaf_name()) {
-                        return fail(proto_fs::NO_SPACE);
+                    if let Some(code) = self.no_room(parent, job.a.leaf_name()) {
+                        return fail(code);
                     }
                     job.dsub = 25;
                 }
@@ -3169,8 +3167,8 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 }
                 let mut path = [0u8; 512];
                 self.leg_leaf_path(job.leg(b), WHITEOUT_PREFIX, &mut path)?;
-                if !self.index.has_room(job.dir_of(dir), job.leg(b).leaf_name()) {
-                    return fail(proto_fs::NO_SPACE);
+                if let Some(code) = self.no_room(job.dir_of(dir), job.leg(b).leaf_name()) {
+                    return fail(code);
                 }
                 let (num, work, wl) = self.work_path();
                 job.work = num;
@@ -3247,7 +3245,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 return Err(Stop::Status(from_volume(e)));
             }
             let key = self.index.retire(id).unwrap_or(0);
-            self.table.forget(id);
+            self.table.forget(id, |key| self.index.walk_leave(key));
             let _ = self.work.push(&work[..wl], true, key);
         } else {
             self.volume
@@ -3344,6 +3342,16 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         }
     }
 
+    /// The code a change fails with when the index has no room for `name` in `parent`: NO_SPACE,
+    /// or STARTING when the arena has room once its compaction ran (the client asks again).
+    fn no_room(&mut self, parent: u32, name: &[u8]) -> Option<u32> {
+        match self.index.room(parent, name) {
+            Room::Yes => None,
+            Room::Later => Some(proto_layer::STARTING),
+            Room::No => Some(proto_fs::NO_SPACE),
+        }
+    }
+
     /// The copy of the lower file at the leaf of the first leg is queued; its ticket is the answer.
     fn stage_copy_reserve(&mut self, job: &mut ChangeJob<V, L>) -> F<Flow> {
         let path = &job.a.plain[..job.a.parts.len];
@@ -3367,8 +3375,15 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         let mut live = [0u8; 512];
         let n = self.leg_vpath(&job.a, job.a.parts.len, false, &mut live)?;
         let parent = job.dir_a;
-        if !self.index.has_room(parent, job.a.leaf_name()) {
-            return self.copy_gone(job, proto_fs::NO_SPACE);
+        if let Some(code) = self.no_room(parent, job.a.leaf_name()) {
+            // The arena is waiting for its compaction: the copy is dropped quietly, the waiters
+            // ask again and find the name as it is then.
+            let code = if code == proto_layer::STARTING {
+                0
+            } else {
+                code
+            };
+            return self.copy_gone(job, code);
         }
         if let Err(e) = self.volume.rename(&work[..wl], &live[..n]) {
             return self.copy_gone(job, from_volume_code(e));

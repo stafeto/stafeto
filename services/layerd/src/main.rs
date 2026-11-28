@@ -93,10 +93,9 @@ const JOBS: usize = layerd::jobs::JOBS;
 /// Bit 63 marks the labels the service gives itself: a count of sessions that is never used twice.
 const OWN: u64 = 1 << 63;
 
-/// The handle of the loop's own budget, kept for the steps build, and the time (ns) the loop began.
-#[cfg(feature = "steps")]
+/// The handle of the loop's own budget (for the line of the build of the index and the steps
+/// build), and the time (ns) the loop began.
 static SERVE_BUDGET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "steps")]
 static SERVE_START: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Under the feature `steps`, a line when the CPU the loop's budget has charged has grown by 1 ms
@@ -126,6 +125,22 @@ fn serve_line() {
         now.saturating_sub(SERVE_START.load(Relaxed)) / 1_000_000,
         info.overruns
     );
+}
+
+/// The milliseconds since the loop began and the overruns of its budget so far: the cost of the build
+/// of the index, which the measurement on the machines reads (0 overruns without a budget).
+fn build_time() -> (u64, u64) {
+    let now = rt::time::ticks_to_ns(rt::time::now());
+    let ms = now.saturating_sub(SERVE_START.load(Acquire)) / 1_000_000;
+    let raw = SERVE_BUDGET.load(Acquire);
+    if raw == 0 {
+        return (ms, 0);
+    }
+    let budget = Handle::<rt::handle::Budget>::borrowed(abi::Handle(raw));
+    (
+        ms,
+        sys::budget_info(&budget).map_or(0, |info| info.overruns),
+    )
 }
 
 struct Cell<T>(UnsafeCell<T>);
@@ -359,12 +374,11 @@ fn main(_: u64) -> u64 {
     };
     // The loop is this thread: it works under its budget from here on, and a budget the kernel
     // refuses is a start error, since the thread would run without a limit.
+    SERVE_START.store(rt::time::ticks_to_ns(rt::time::now()), Release);
     match rt::budget::bind("layerd", rt::budget::SERVE, serve, &s.thread) {
         Err(_) => return BUDGET,
-        #[cfg(feature = "steps")]
         Ok(Some(kept)) => {
             SERVE_BUDGET.store(kept.raw().0, Release);
-            SERVE_START.store(rt::time::ticks_to_ns(rt::time::now()), Release);
             core::mem::forget(kept);
         }
         Ok(_) => {}
@@ -774,9 +788,14 @@ impl Layerd {
         // The jobs and the reaper take turns: a step is one or the other.
         if self.core.reaping() && (self.reap_turn || !self.has_jobs()) {
             self.reap_turn = false;
+            let more = self.core.reap_step();
             #[cfg(feature = "steps")]
-            rt::service::step_detail(1300);
-            if self.core.reap_step() || self.has_jobs() {
+            rt::service::step_detail(1300 + u64::from(self.core.index.last_work));
+            #[cfg(feature = "steps")]
+            if let Some((dead, steps)) = self.core.index.take_compaction() {
+                rt::println!("layerd: arena compacted: {dead} dead bytes in {steps} steps");
+            }
+            if more || self.has_jobs() || self.core.reaping() {
                 let _ = sys::notify(&self.walk_step, 1);
             }
             return;
@@ -1522,10 +1541,13 @@ impl Service<0> for Layerd {
                 self.ready = true;
                 let (added, deleted) = self.core.index.counts();
                 match self.core.state {
-                    State::Ready => rt::println!(
-                        "layerd: index built: {added} names and {deleted} deletions in {} steps",
-                        self.core.build_steps()
-                    ),
+                    State::Ready => {
+                        let (ms, overruns) = build_time();
+                        rt::println!(
+                            "layerd: index of {added} names and {deleted} deletions built in {ms} ms, {} steps, {overruns} overruns",
+                            self.core.build_steps()
+                        )
+                    }
                     other => rt::println!("layerd: not serving: {other:?}"),
                 }
                 let (names, marks) = self.core.left_out();

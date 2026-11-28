@@ -116,7 +116,7 @@ const PRICE_IPV4: f64 = 0.005;
 const TRY_LIFETIME_HOURS: u64 = 2;
 
 const USAGE: &str = "usage: xtask aws check
-       xtask aws image [--dump] [--marks] [--its-int] [--its-align-4k] [--disk FILE] [--ena-break-aenq] [--ena-break-exit] [--session S]
+       xtask aws image [--layered] [--dump] [--marks] [--its-int] [--its-align-4k] [--disk FILE] [--ena-break-aenq] [--ena-break-exit] [--session S]
        xtask aws boot --ami AMI [--type T] [--end TEXT] [--timeout SECONDS] [--serial SECONDS] [--stop] [--try [--lifetime-hours N]] [--no-data-volume | --data-volume-size GIB] [--blank-volume GIB] [--session S]
        xtask aws dump [--session S] [--all]
        xtask aws neighbour [--snapshot SNAP | --blank-sdf] [--session S]
@@ -1809,6 +1809,17 @@ fn image(args: &[String]) -> Result<(), String> {
         // SAFETY: xtask is single-threaded here, before the image is built.
         unsafe { std::env::set_var("STAFETO_ENA_BREAK", if exits { "exit" } else { "1" }) };
     }
+    // The layered root with the measurement of it (`layer-time`): the image has the layer service,
+    // the program and its lower files, and the data volume holds a layer of 8,192 names.
+    let layered = args.iter().any(|a| a == "--layered");
+    if layered {
+        // Read once, where the program list of the image is made.
+        // SAFETY: xtask is single-threaded here, before the image is built.
+        unsafe {
+            std::env::set_var("STAFETO_LAYERED_ROOT", "1");
+            std::env::set_var("STAFETO_LAYER_TIME", "1");
+        }
+    }
     let its_align = args.iter().any(|a| a == "--its-align-4k");
     let its_int = its_align || args.iter().any(|a| a == "--its-int");
     // A disk built before: registered as it is, nothing is built.
@@ -1843,6 +1854,8 @@ fn image(args: &[String]) -> Result<(), String> {
     let t = Instant::now();
     let flavour = if old_disk.is_some() {
         "old-disk"
+    } else if layered {
+        "layered"
     } else if its_align {
         "its-align4k"
     } else if dump {
@@ -1860,7 +1873,12 @@ fn image(args: &[String]) -> Result<(), String> {
     };
     // The data volume, made offline by the code of the first boot of datafs (no AWS call yet).
     let data_file = s.dir.join("data.raw");
-    data_image::make(&data_file, data_image::DEFAULT_SIZE)?;
+    if layered {
+        // The volume of the steps probe: 8,192 names in the live layer, the size of the data volume.
+        data_image::make_layer_steps_volume(&data_file, data_image::DEFAULT_SIZE)?;
+    } else {
+        data_image::make(&data_file, data_image::DEFAULT_SIZE)?;
+    }
     let snap = direct_snapshot(&s, &disk, flavour)?;
     let data_snap = direct_snapshot(&s, &data_file, "data")?;
     let ami = register(

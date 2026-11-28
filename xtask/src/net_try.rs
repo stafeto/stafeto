@@ -61,8 +61,17 @@ const OPEN: [u16; 4] = [22, 80, 443, 8080];
 /// The port of the mirror of the probe (the image names it, `pkg_probe::official_address`).
 const MIRROR_PORT: u16 = 8443;
 
-/// The boot scripts the list of `/etc/rc` may name: the five servers' and helpers' of the image.
-const SCRIPTS: [&str; 5] = ["ec2-key", "dropbear", "landing", "web", "fast"];
+/// The boot scripts the list of `/etc/rc` may name: the five servers' and helpers' of the image, and
+/// `layer-time`, which only the image of the measurement of the layered root has (`aws image
+/// --layered`; the list skips a script the image has no file for).
+const SCRIPTS: [&str; 6] = [
+    "ec2-key",
+    "dropbear",
+    "landing",
+    "web",
+    "fast",
+    "layer-time",
+];
 /// Programs that listen on a port when started, which no boot script of the image runs.
 const FORBIDDEN: [&str; 7] = [
     "httpd", "telnetd", "inetd", "ftpd", "tftpd", "dnsd", "udhcpd",
@@ -1668,7 +1677,10 @@ mod tests {
     fn the_boot_script_lists_the_scripts_in_the_order_of_their_needs() {
         let rc = include_str!("../../tools/rc/rc");
         let line = rc.lines().find(|l| l.starts_with("for name in ")).unwrap();
-        assert_eq!(line, "for name in ec2-key dropbear landing web fast; do");
+        assert_eq!(
+            line,
+            "for name in ec2-key dropbear landing web fast layer-time; do"
+        );
         let names: Vec<&str> = line["for name in ".len()..line.len() - 4]
             .split_whitespace()
             .collect();

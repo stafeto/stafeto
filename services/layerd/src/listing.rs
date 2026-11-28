@@ -121,7 +121,9 @@ pub fn read_dir<L: Lower>(
         }
         let mut budget = SLOTS_PER_READDIR;
         let key = index.dir_key(dir);
-        while room(reply) {
+        // A name is taken while it fits: the room is asked for the name at hand, so a reply is
+        // full of short names (46 of six bytes in the message's 1 KiB).
+        while reply.len() + ENTRY_HEAD < abi::MESSAGE_MAX {
             let from = (position.at - 2) as usize;
             let found = match key {
                 Some(key) => index.next_child_of(key, from, &mut budget),
@@ -134,20 +136,30 @@ pub fn read_dir<L: Lower>(
                     break;
                 }
                 NextChild::Continue(next) => {
-                    // The slots this request may look at are used up: the next one goes on.
+                    // The entries this request may look at are used up: the next one goes on.
                     position.at = next as u32 + 2;
                     break;
                 }
                 NextChild::Found(next, id) => {
-                    position.at = next as u32 + 2;
-                    let Some(e) = index.entry(id) else { continue };
+                    let Some(e) = index.entry(id) else {
+                        position.at = next as u32 + 2;
+                        continue;
+                    };
                     let kind = match e.kind {
-                        Kind::Whiteout | Kind::Empty | Kind::Gone => continue,
+                        Kind::Whiteout | Kind::Empty | Kind::Gone => {
+                            position.at = next as u32 + 2;
+                            continue;
+                        }
                         Kind::Dir => DIRECTORY,
                         Kind::File => REGULAR,
                         Kind::Link => SYMLINK,
                     };
                     let name = index.name(id).unwrap_or(&[]);
+                    if reply.len() + ENTRY_HEAD + name.len() > abi::MESSAGE_MAX {
+                        // It does not fit: the next request starts with it.
+                        break;
+                    }
+                    position.at = next as u32 + 2;
                     reply
                         .push(&DirEntry {
                             ino: e.number,

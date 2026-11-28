@@ -43,6 +43,13 @@ break-layerd-one-step = []
 # `break-layerd-slots`: a request of a listing looks at 4,096 slots of the index, so the step is over
 # 0.9 B and the step gate of `cargo xtask layer-steps breaks` alone catches it.
 break-layerd-slots = []
+# `break-layerd-compact-one-step`: the compaction of the arena of names is done in one step of the
+# loop, so the longest step grows with the arena and the step gate alone catches it.
+break-layerd-compact-one-step = []
+# `break-layerd-chain-unlink`: an entry that leaves a directory a listing holds open is taken out of
+# the list of the directory at once, so the listing loses its place and the names after it
+# (`cargo test -p layerd`).
+break-layerd-chain-unlink = []
 # `break-layerd-change-one-step`: a change job does all its work in one step of the loop, so the longest
 # step grows with the change and the step gate alone catches it.
 break-layerd-change-one-step = []

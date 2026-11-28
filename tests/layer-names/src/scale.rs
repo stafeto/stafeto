@@ -51,6 +51,9 @@ const BIG: &str = "/lowbig/big";
 const BIG_BYTES: u64 = 64 << 20;
 const LISTED: usize = 1024;
 const CHAIN: usize = 246;
+/// The links with long names the probe makes and removes (200 bytes: more than a quarter of the
+/// arena of 256 KiB once they are gone).
+const CHURN: usize = 380;
 
 /// `count` times `piece`, then `tail`, in `out`; the text.
 fn chain<'a>(out: &'a mut [u8; 512], count: usize, piece: &str, tail: &str) -> &'a str {
@@ -541,7 +544,34 @@ fn changes(
             Ok(())
         }
     });
-    // 8. The counts after all of it, when the reaper is done.
+    // 8. Links with names of 200 bytes made and removed: their dead blocks fill more than a quarter
+    // of the arena of names, and the service compacts it in steps (the gate judges them).
+    t.check(
+        "links with long names made and removed make the arena compact",
+        {
+            let mut result = Ok(());
+            for k in 0..CHURN {
+                let mut path = Text::new();
+                {
+                    use core::fmt::Write as _;
+                    let _ = write!(path, "/q{k:04}");
+                    for _ in 0..195 {
+                        let _ = path.write_str("z");
+                    }
+                }
+                if change(names, n::ChangeOp::Symlink, 0, path.as_str(), "/target") != 0 {
+                    result = Err(format_args!("a link was not made"));
+                    break;
+                }
+                if change(names, n::ChangeOp::Unlink, 0, path.as_str(), "") != 0 {
+                    result = Err(format_args!("a link was not removed"));
+                    break;
+                }
+            }
+            result
+        },
+    );
+    // 9. The counts after all of it, when the reaper is done.
     let name = "status counts the names after the changes";
     let mut last = None;
     for _ in 0..6000 {

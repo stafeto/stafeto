@@ -1311,17 +1311,19 @@ fn a_request_looks_at_a_bounded_number_of_slots_of_the_index() {
             "{expected}: {names:?}"
         );
     }
-    // The first stage looks at `SLOTS_PER_READDIR` slots in a request: the whole table takes at least
-    // `SLOTS` over that many requests,
-    // and a request that finds nothing says `more` with no entry.
+    // The first stage follows the list of the directory's children: a directory of a few names
+    // takes a few requests however large the table, a request looks at
+    // `SLOTS_PER_READDIR` entries at most, and one that finds nothing says `more` with no entry.
     assert!(
-        requests >= crate::index::SLOTS / crate::listing::SLOTS_PER_READDIR,
+        requests < crate::index::SLOTS / crate::listing::SLOTS_PER_READDIR,
         "{requests}"
     );
     let (reply, _) = open(&mut core, 0, f::READ_ONLY | f::DIRECTORY_ONLY, "/filler").unwrap();
     let h = handle_of(&reply);
-    let (names, _) = list(&mut core, 40, h);
+    let (names, requests) = list(&mut core, 40, h);
     assert_eq!(names.len(), 1_500 + 2);
+    // `ceil(1500 / 46)` requests at most for the names, one for `.` and `..`, the second stage.
+    assert!(requests <= 1_500 / 20 + 4, "{requests}");
 }
 
 #[test]

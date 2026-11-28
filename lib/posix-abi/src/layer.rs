@@ -232,7 +232,20 @@ fn take_root() -> Result<Handle<Channel>, Attempt> {
 /// Whether a status asks the caller to ask again: the service has no job free, or it builds its
 /// index.
 fn is_busy(status: u32) -> bool {
-    status == crate::data::busy_code() || status == pure::STARTING
+    if status == pure::STARTING {
+        STARTING_ANSWERS.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    status == crate::data::busy_code()
+}
+
+/// The answers STARTING this process has had from the layer service (the measurement of the
+/// start reads it).
+static STARTING_ANSWERS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// How many times the layer service answered STARTING to this process.
+pub fn starting_answers() -> u32 {
+    STARTING_ANSWERS.load(Ordering::Relaxed)
 }
 
 /// A session from the root: SESSION with a copy of the identity session, which the service vouches

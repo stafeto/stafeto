@@ -87,6 +87,27 @@ pub enum Done<P> {
 pub const RESEEDS: u8 = 3;
 
 /// The seed of the next build: a mix of the last one and the number of the attempt.
+/// A listing in the middle of the list of a directory's names (the first stage, past `.` and `..`)
+/// holds the directory open in the index; one at the start, in the second stage, or put back by a
+/// seek does not.
+fn settle<D>(index: &mut Index, desc: &mut crate::descriptions::Description<D>) {
+    let inside = desc.position.stage == 0 && desc.position.at > 2;
+    match (inside, desc.walk) {
+        (true, None) => {
+            if let Some(key) = index.dir_key(desc.dir)
+                && index.walk_enter(key)
+            {
+                desc.walk = Some(key);
+            }
+        }
+        (false, Some(key)) => {
+            index.walk_leave(key);
+            desc.walk = None;
+        }
+        _ => {}
+    }
+}
+
 fn next_seed(seed: u64, attempt: u64) -> u64 {
     let mut h = seed ^ attempt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     h ^= h >> 30;
@@ -1164,6 +1185,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         )?;
         // What the replies have given out, which SEEK_DIR may go back to and not past.
         desc.given = desc.given.max(desc.position);
+        settle(index, desc);
         let len = reply.len();
         reply.finish_into(listed.more, listed.cursor, out)?;
         Ok(len)
@@ -1183,6 +1205,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
         self.gate()?;
         let Core {
             table,
+            index,
             lower,
             resolving,
             ..
@@ -1195,13 +1218,16 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             &mut desc.opening,
             resolving,
             &mut desc.replayed,
-        )
+        )?;
+        settle(index, desc);
+        Ok(())
     }
 
     pub fn seek_dir(&mut self, owner: u64, handle: u32, cursor: u64) -> R<()> {
         self.gate()?;
         let Core {
             table,
+            index,
             lower,
             resolving,
             ..
@@ -1216,13 +1242,18 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             resolving,
             &mut desc.replayed,
             cursor,
-        )
+        )?;
+        settle(index, desc);
+        Ok(())
     }
 
     /// `owner` lets go of a description; the lower directory it kept closes with the last holder.
     pub fn close(&mut self, owner: u64, handle: u32) -> R<()> {
         let freed = self.table.close(owner, handle).map_err(Self::lost)?;
         if let Some(d) = freed {
+            if let Some(key) = d.walk {
+                self.index.walk_leave(key);
+            }
             self.give_back(d.lower, d.opening);
         }
         Ok(())
@@ -1241,6 +1272,9 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     /// The session `owner` went: what it held closes.
     pub fn gone(&mut self, owner: u64) {
         while let Some(d) = self.table.take_owned(owner) {
+            if let Some(key) = d.walk {
+                self.index.walk_leave(key);
+            }
             self.give_back(d.lower, d.opening);
         }
     }
