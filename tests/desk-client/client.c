@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <sys/resource.h>
+
 #include <stafeto/window.h>
 
 #include "pattern.h"
@@ -74,7 +76,12 @@ int main(int argc, char **argv)
         printf("desk-client %s: cannot set up the window: errno %d\n", name, errno);
         return 1;
     }
-    printf("desk-client %s: up\n", name);
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_AS, &limit) != 0) {
+        limit.rlim_cur = 0;
+    }
+    printf("desk-client %s: up, address space limit %llu\n", name,
+           (unsigned long long)limit.rlim_cur);
     fflush(stdout);
     for (;;) {
         struct stafeto_window_event e[STAFETO_WINDOW_EVENTS_MAX];

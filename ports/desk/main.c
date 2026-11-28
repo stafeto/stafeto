@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <sys/resource.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +45,7 @@
 #include "desk_io.h"
 #include "draw.h"
 #include "policy.h"
+#include "launch.h"
 
 extern char **environ;
 
@@ -57,8 +59,11 @@ extern unsigned long desk_own_pages(void);
  * click on a window with no frame (the focus moves) only from the list. */
 #define POLL_MS 500
 #define SPAWN_MAX 8
-#define SPAWN_ARGS 8
 #define SPAWN_WAIT_MS 15000
+/* The address space a program the manager starts may have, in bytes: its own
+ * quota (a child gets the manager's quota, which holds the manager's windows;
+ * the limit is set in the manager for the spawn and put back). */
+#define SPAWN_LIMIT_BYTES (6ull << 20)
 #define MS 1000000ull
 
 static desk_policy policy;
@@ -77,13 +82,7 @@ struct child {
 };
 static struct child children[SPAWN_MAX];
 
-struct spawn_spec {
-    char app_id[DESK_TEXT_MAX + 1];
-    char path[128];
-    char *argv[SPAWN_ARGS + 2];
-    char text[256];
-};
-static struct spawn_spec specs[SPAWN_MAX];
+static desk_spawn specs[SPAWN_MAX];
 static unsigned spec_count, spawned;
 static long spawned_at_ms;
 
@@ -167,15 +166,17 @@ static void make_frame(uint32_t client)
         return;
     }
     s.client = client;
-    desk_frame_view_init(&s.frame, s.display, font, fw, fh);
-    set_frame_view(&s);
-    desk_surface_refresh(&s);
+    /* Linked first: the frame is under its window from the start, and drawn
+     * (shown) only after that. */
     if (stafeto_manager_link(client, s.id) != 0) {
         say("no link for a frame: errno %d", errno);
         desk_surface_close(&s);
         desk_frame_failed(&policy, client);
         return;
     }
+    desk_frame_view_init(&s.frame, s.display, font, fw, fh);
+    set_frame_view(&s);
+    desk_surface_refresh(&s);
     surfaces[s.win] = s;
     /* The display keeps a pointer to the surface that was on the stack. */
     lv_display_set_user_data(s.display, &surfaces[s.win]);
@@ -237,11 +238,23 @@ static void reap(void)
 
 static void spawn_next(void)
 {
-    struct spawn_spec *sp = &specs[spawned];
+    desk_spawn *sp = &specs[spawned];
     for (unsigned i = 0; i < SPAWN_MAX; i++) {
         if (children[i].pid == 0) {
             pid_t pid = 0;
+            struct rlimit before, limited;
+            int have = getrlimit(RLIMIT_AS, &before) == 0;
+            if (have) {
+                limited = before;
+                if (limited.rlim_cur > SPAWN_LIMIT_BYTES) {
+                    limited.rlim_cur = SPAWN_LIMIT_BYTES;
+                }
+                setrlimit(RLIMIT_AS, &limited);
+            }
             int err = posix_spawn(&pid, sp->path, NULL, NULL, sp->argv, environ);
+            if (have) {
+                setrlimit(RLIMIT_AS, &before);
+            }
             if (err != 0) {
                 say("cannot start %s: errno %d", sp->path, err);
             } else {
@@ -413,10 +426,12 @@ static void term(uint32_t id)
     say("no process of ours has the window that did not close");
 }
 
-static void run_actions(void)
+static unsigned run_actions(void)
 {
     desk_action a;
+    unsigned count = 0;
     while (desk_next(&policy, &a)) {
+        count++;
         desk_surface *s;
         switch (a.kind) {
         case DESK_ACT_FOCUS:
@@ -466,6 +481,7 @@ static void run_actions(void)
             break;
         }
     }
+    return count;
 }
 
 /* ---- the trace ---- */
@@ -507,32 +523,9 @@ static void trace(const struct stafeto_manager_window *list, int n)
 
 static int parse_spawn(const char *text)
 {
-    if (spec_count >= SPAWN_MAX) {
+    if (spec_count >= SPAWN_MAX || desk_spawn_parse(&specs[spec_count], text) != 0) {
         return -1;
     }
-    struct spawn_spec *sp = &specs[spec_count];
-    snprintf(sp->text, sizeof sp->text, "%s", text);
-    char *fields[SPAWN_ARGS + 3];
-    int count = 0;
-    for (char *p = sp->text; count < SPAWN_ARGS + 3;) {
-        fields[count++] = p;
-        char *comma = strchr(p, ',');
-        if (!comma) {
-            break;
-        }
-        *comma = 0;
-        p = comma + 1;
-    }
-    if (count < 2) {
-        return -1;
-    }
-    snprintf(sp->app_id, sizeof sp->app_id, "%s", fields[0]);
-    snprintf(sp->path, sizeof sp->path, "%s", fields[1]);
-    sp->argv[0] = sp->path;
-    for (int i = 2; i < count; i++) {
-        sp->argv[i - 1] = fields[i];
-    }
-    sp->argv[count - 1] = NULL;
     spec_count++;
     return 0;
 }
@@ -657,6 +650,7 @@ int main(int argc, char **argv)
             return 1;
         }
         /* The ring: the keys, the titles, the windows that went. */
+        unsigned work = 0;
         for (;;) {
             struct stafeto_window_event e[STAFETO_WINDOW_EVENTS_MAX];
             int got = stafeto_manager_events(e, STAFETO_WINDOW_EVENTS_MAX, NULL);
@@ -667,6 +661,7 @@ int main(int argc, char **argv)
             for (int i = 0; i < got; i++) {
                 ring_event(&e[i]);
             }
+            work += (unsigned)got;
             if (got < STAFETO_WINDOW_EVENTS_MAX) {
                 break;
             }
@@ -680,13 +675,18 @@ int main(int argc, char **argv)
             }
             if (mask > 0 && (mask & (1 << i))) {
                 surface_events(&surfaces[i]);
+                work++;
             }
         }
         desk_tick(&policy);
-        run_actions();
+        work += run_actions();
         draw_dirty();
         if (trace_on) {
-            n = stafeto_manager_list(list, STAFETO_MANAGER_WINDOWS_MAX);
+            /* The list of the start of the turn is still the service's when nothing
+             * happened since (a wait that ran out): one call to the service a turn. */
+            if (work != 0) {
+                n = stafeto_manager_list(list, STAFETO_MANAGER_WINDOWS_MAX);
+            }
             if (n >= 0) {
                 trace(list, n);
             }

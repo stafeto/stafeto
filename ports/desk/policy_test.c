@@ -487,13 +487,23 @@ static void the_title_bar_drags_the_window(void)
     desk_frame_move(&p, 1, 144, 69);
     ACTIONS(&p, "MOVE 1 110 130;");
     EXPECT(desk_find(&p, 1)->x == 110 && desk_find(&p, 1)->y == 130);
-    /* The frame is at its new place: the point of the pointer in it is the
-     * grab point, so no move. */
+    /* A second point of the pointer waiting in the same batch is in the frame
+     * where it was (the service lists the new place only at the next turn), so
+     * the window goes where the pointer is and no further (it once went by the
+     * first distance and the second). */
+    desk_frame_move(&p, 1, 154, 79);
+    ACTIONS(&p, "MOVE 1 120 140;");
+    /* The next turn: the service lists the window at its new place, and the
+     * point of the pointer in the frame is the grab point, so no move. */
+    desk_sync(&p, 1, 120, 140, 200, 120, 1);
+    (void)drain(&p);
     desk_frame_move(&p, 1, 94, 19);
     ACTIONS(&p, "");
     /* Past the left edge and the top: the frame stays inside, below the panel. */
     desk_frame_move(&p, 1, -500, -500);
     ACTIONS(&p, "MOVE 1 4 48;");
+    desk_sync(&p, 1, 4, 48, 200, 120, 1);
+    (void)drain(&p);
     /* Past the right edge and the bottom: x is 640 - 200 - 4, y is 400 - 120 - 4. */
     desk_frame_move(&p, 1, 900, 900);
     ACTIONS(&p, "MOVE 1 436 276;");

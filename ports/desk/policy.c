@@ -265,6 +265,10 @@ void desk_sync(desk_policy *p, uint32_t id, int32_t x, int32_t y, int32_t w, int
     c->y = y;
     c->w = w;
     c->h = h;
+    if (p->drag.active && p->drag.id == id) {
+        p->drag.base_x = x;
+        p->drag.base_y = y;
+    }
     if (focused && p->focus != id) {
         focus_to(p, c, 0);
     }
@@ -407,6 +411,8 @@ void desk_frame_button(desk_policy *p, uint32_t id, int down, int32_t x, int32_t
             p->drag.id = id;
             p->drag.grab_x = x;
             p->drag.grab_y = y;
+            p->drag.base_x = w->x;
+            p->drag.base_y = w->y;
         }
         /* The press gave the window the focus (the service did, with the top place). */
         focus_to(p, w, 0);
@@ -431,8 +437,10 @@ void desk_frame_move(desk_policy *p, uint32_t id, int32_t x, int32_t y)
     if (!w) {
         return;
     }
-    int32_t nx = w->x + (x - p->drag.grab_x);
-    int32_t ny = w->y + (y - p->drag.grab_y);
+    /* From the place the service listed (the one last asked for may be ahead of it): the points
+     * of the pointer waiting in a batch are in the frame where it was then. */
+    int32_t nx = p->drag.base_x + (x - p->drag.grab_x);
+    int32_t ny = p->drag.base_y + (y - p->drag.grab_y);
     keep_frame_inside(p, w->w, w->h, &nx, &ny);
     if (nx != w->x || ny != w->y) {
         w->x = nx;

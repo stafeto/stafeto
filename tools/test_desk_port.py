@@ -10,13 +10,16 @@ tests catch faults, each planted in a changed copy of the source:
 
   - Super and Tab not skipping a hidden window;
   - a window dragged out of the screen at the right (the clamp too wide);
+  - a drag computed from the place last asked for (two points in a batch overshoot);
   - a window dragged under the panel (the clamp has no panel);
   - SIGTERM sent after 4 s (the limit is 5);
   - the close button asking at the press (it asks at the release);
   - a window of the first revision given a frame;
   - a frame left behind when its window goes;
   - Super and Q asking the first window (the one with the focus is asked);
-  - a click on the panel's cell not giving the focus back to the window.
+  - a click on the panel's cell not giving the focus back to the window;
+  - the --spawn line parser (launch.c, launch_test.c): the bound on the fields (an argument
+    too many wrote past argv) and the cut of an id, a path or the text.
 
 One real run of each: each gave a line "check failed" and exit code 1."""
 
@@ -32,10 +35,12 @@ PORT = HERE.parent / "ports" / "desk"
 CC = shutil.which("clang") or shutil.which("cc") or "cc"
 
 
-def build(port: Path, out: Path) -> Path:
-    exe = out / "policy_test"
+def build(port: Path, out: Path, test: str = "policy") -> Path:
+    exe = out / f"{test}_test"
+    sources = {"policy": ["policy.c"], "launch": ["launch.c"]}[test]
     subprocess.run([CC, "-std=gnu11", "-O1", "-Wall", "-Wextra", "-Werror", f"-I{port}",
-                    str(port / "policy_test.c"), str(port / "policy.c"), "-o", str(exe)], check=True)
+                    str(port / f"{test}_test.c"), *[str(port / f) for f in sources],
+                    "-o", str(exe)], check=True)
     return exe
 
 
@@ -62,13 +67,16 @@ class PolicyTests(unittest.TestCase):
         count = int(done.stdout.split()[1])
         self.assertGreater(count, 150)
 
-    def planted(self, name: str, old: str, new: str) -> str:
+    def planted(self, name: str, old: str, new: str, test: str = "policy") -> str:
         """The output of the test over a copy with the fault; it must fail."""
         with tempfile.TemporaryDirectory() as tmp:
             port = mutated(Path(tmp), name, old, new)
-            done = run(build(port, Path(tmp)))
-        self.assertEqual(done.returncode, 1, done.stdout)
-        self.assertIn("check failed", done.stdout)
+            done = run(build(port, Path(tmp), test))
+        # A fault that writes past a buffer may stop the program by its stack
+        # protector (a signal) before a check says so.
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        if done.returncode == 1:
+            self.assertIn("check failed", done.stdout)
         return done.stdout
 
     def test_super_and_tab_that_do_not_skip_a_hidden_window_fail(self):
@@ -90,6 +98,10 @@ class PolicyTests(unittest.TestCase):
                      "        p->press.id = id;\n        p->press.zone = zone;\n"
                      "        if (zone == DESK_ZONE_CLOSE) {\n            request_close(p, w);\n        }\n")
 
+    def test_a_drag_from_the_place_last_asked_for_overshoots_and_fails(self):
+        self.planted("policy.c", "int32_t nx = p->drag.base_x + (x - p->drag.grab_x);",
+                     "int32_t nx = w->x + (x - p->drag.grab_x);")
+
     def test_a_frame_for_a_window_of_the_first_revision_fails(self):
         self.planted("policy.c", "return !legacy && w > 0", "return (legacy || legacy == 0) && w > 0")
 
@@ -104,6 +116,26 @@ class PolicyTests(unittest.TestCase):
     def test_a_panel_click_that_gives_no_focus_fails(self):
         self.planted("policy.c", "        focus_to(p, (desk_win *)w, 0);\n        act(p, DESK_ACT_FOCUS, w->id, 0, 0);\n    }\n}",
                      "        focus_to(p, (desk_win *)w, 0);\n    }\n}")
+
+    def test_the_spawn_line_parser_passes_its_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            done = run(build(PORT, Path(tmp), "launch"))
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertRegex(done.stdout, r"launch_test: \d+ checks passed")
+
+    def test_a_spawn_line_with_one_argument_too_many_fails(self):
+        # The bound that once let argv[10] be written.
+        self.planted("launch.c", "if (count == DESK_SPAWN_ARGS + 2) {",
+                     "if (count == DESK_SPAWN_ARGS + 3) {", "launch")
+
+    def test_a_spawn_line_with_a_cut_application_id_fails(self):
+        self.planted("launch.c", "strlen(fields[0]) > DESK_TEXT_MAX", "strlen(fields[0]) > 1000", "launch")
+
+    def test_a_spawn_line_with_a_cut_path_fails(self):
+        self.planted("launch.c", "strlen(fields[1]) >= sizeof out->path", "strlen(fields[1]) >= 1000", "launch")
+
+    def test_a_spawn_line_with_a_cut_text_fails(self):
+        self.planted("launch.c", "strlen(text) >= sizeof out->text", "strlen(text) >= 1000", "launch")
 
 
 if __name__ == "__main__":

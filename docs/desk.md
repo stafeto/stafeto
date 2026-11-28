@@ -42,7 +42,15 @@ sources are in `ports/desk` and `apps/desk`.
   starts finds the windows that are open (the service lists them and tells a
   CREATE for each) and frames them as new ones. The old manager's frames and panel
   go with its session and the windows of the clients stay where they were. A manager
-  that restarts waits (EBUSY) until the service has seen the old session go.
+  that restarts waits (EBUSY) until the service has seen the old session go. A
+  restarted manager knows none of the programs the first one started, so it can send
+  SIGTERM to no window (Super and Q on a client that ignores the request never ends it;
+  the window stays until the client ends). The process of a window is found by the
+  application id the program sets, so a program that sets the id of a program the
+  manager started, before that program has opened its window, takes over its entry and
+  gets its SIGTERM (the harm stops at the manager's own children). Part B settles it
+  properly: INFO carries the window's process, or a manager call revokes the window on
+  the service's side.
 
 ## Files
 
@@ -78,7 +86,13 @@ list (the windows from the lowest, each `name@x,y/WxH/flags`, flags `s` shown an
 (`tests/desk-client`), the third of which ignores a request to close. A program of
 the list starts when the one before it has a window, and only when the manager
 finds no client window at its start. The list is what the probe needs;
-`/etc/desk.conf` will take its place.
+`/etc/desk.conf` will take its place, and it has to close two gaps of the spawn-once rule: a
+restart while a started program has no window yet starts it again, and a manager that
+crashes in a loop before any window exists starts every program of the list at each
+restart. Each program starts with an address space limit of 6 MiB (the quota of the manager is 8.6 MiB) (the manager sets
+RLIMIT_AS for the spawn and puts it back; the client prints the limit it got, which
+the probe checks). The program's quota is the manager's, 2 200 pages, since a child of
+POSIX gets its parent's: the process service's pool is sized for it.
 
 ## Memory
 

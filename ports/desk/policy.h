@@ -102,6 +102,8 @@ typedef struct desk_policy {
         int active;
         uint32_t id;
         int32_t grab_x, grab_y;       /* the point of the bar the press was at */
+        int32_t base_x, base_y;       /* the window's place the service listed last: the points
+                                         of the pointer in the frame are from there */
     } drag;
     struct {
         uint32_t id;

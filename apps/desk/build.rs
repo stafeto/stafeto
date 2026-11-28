@@ -15,7 +15,7 @@ use std::process::Command;
 
 /// The C files of the program: the loop, the policy, the drawing and the glue
 /// between LVGL and the windows.
-const SOURCES: [&str; 4] = ["main.c", "policy.c", "draw.c", "desk_io.c"];
+const SOURCES: [&str; 5] = ["main.c", "policy.c", "draw.c", "desk_io.c", "launch.c"];
 
 fn run(cmd: &mut Command) {
     let status = cmd.status().expect("a build tool is missing");
@@ -50,7 +50,7 @@ fn main() {
     for file in SOURCES {
         println!("cargo:rerun-if-changed={}", port.join(file).display());
     }
-    for file in ["policy.h", "draw.h", "desk_io.h"] {
+    for file in ["policy.h", "draw.h", "desk_io.h", "launch.h"] {
         println!("cargo:rerun-if-changed={}", port.join(file).display());
     }
     println!(

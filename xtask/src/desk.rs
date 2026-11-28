@@ -347,6 +347,8 @@ const SIGTERM: &str = "desk: SIGTERM to gamma after ";
 /// What the manager says of the memory it has (the line it prints when it is
 /// ready and when it ends).
 const MEMORY: &str = "desk: memory ";
+/// The address space the manager gives a program it starts (6 MiB).
+const SPAWN_LIMIT: u64 = 6 << 20;
 
 /// How long a step may take (the run under -icount is slow).
 const WITHIN: Duration = Duration::from_secs(240);
@@ -378,7 +380,12 @@ fn drag(qmp: &mut Qmp, from: (u32, u32), to: (u32, u32)) -> Result<(), String> {
 /// after the action that is the list. A line that is another list (a stage on
 /// the way) is passed.
 fn expect_state(run: &mut Run, what: &str, want: &str) -> Result<(), String> {
-    run.expect_line(what, |l| l == want, WITHIN).map(|_| ())
+    let line = run.expect_line(what, |l| l == want || said_failure(l), WITHIN)?;
+    if line == want {
+        Ok(())
+    } else {
+        Err(format!("while waiting for {what}: the run said {line:?}"))
+    }
 }
 
 /// The milliseconds the manager says it waited before it sent SIGTERM.
@@ -548,6 +555,18 @@ fn desk_verdict(lines: &[String]) -> Result<(), String> {
     }
     if let Some(bad) = lines.iter().find(|l| said_failure(l)) {
         return Err(format!("the run said {bad:?}"));
+    }
+    // The manager limits the address space of the programs it starts, and the limit
+    // reaches them.
+    let limited = lines
+        .iter()
+        .filter(|l| l.starts_with("desk-client ") && l.contains(": up, address space limit "))
+        .filter(|l| l.ends_with(&format!(" {SPAWN_LIMIT}")))
+        .count();
+    if limited != 3 {
+        return Err(format!(
+            "{limited} clients came up under the limit {SPAWN_LIMIT}, 3 expected"
+        ));
     }
     if count(MEMORY) == 0 {
         return Err("the manager said nothing of its memory".to_owned());
@@ -843,7 +862,12 @@ mod tests {
     fn desk_run() -> Vec<String> {
         let mut lines: Vec<String> = ["alpha", "beta", "gamma"]
             .iter()
-            .map(|n| format!("{STARTED}{n}"))
+            .flat_map(|n| {
+                [
+                    format!("{STARTED}{n}"),
+                    format!("desk-client {n}: up, address space limit {SPAWN_LIMIT}"),
+                ]
+            })
             .collect();
         lines.extend([
             READY.to_owned(),
@@ -880,6 +904,13 @@ mod tests {
         let mut lines = desk_run();
         lines.push("init: desk ended: exit code 1; restarts in 100 ms".to_owned());
         assert!(desk_verdict(&lines).unwrap_err().contains("exit code 1"));
+        let mut lines = desk_run();
+        lines.retain(|l| !l.contains("beta: up"));
+        assert!(
+            desk_verdict(&lines)
+                .unwrap_err()
+                .contains("2 clients came up")
+        );
         let mut lines = desk_run();
         lines.retain(|l| !l.starts_with(MEMORY));
         assert!(desk_verdict(&lines).unwrap_err().contains("memory"));
