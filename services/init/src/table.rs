@@ -85,6 +85,21 @@ pub fn first_args(table: &[Record], name: &str) -> &'static [u8] {
         &[]
     }
 }
+/// The roots the services of `table` register with the process service (`ROOT_SERVICES`), as a
+/// mask by root number: init gives it to the process service in the line `roots=` of its own
+/// arguments, and TakeRoot for a root outside it answers ABSENT at once.
+pub fn roots_mask(table: &[Record]) -> u32 {
+    let mut mask = 0;
+    for (service, mark) in ROOT_SERVICES {
+        if table.iter().any(|record| record.name == *service)
+            && let Some(root) = proto_process::root_of(proto_process::NOTARY | mark)
+        {
+            mask |= 1 << root;
+        }
+    }
+    mask
+}
+
 pub const CLOCK_SERVICE: &str = "clock";
 pub const PIPE_SERVICE: &str = "pipe";
 /// The network service's name.
@@ -676,7 +691,7 @@ pub struct Wait {
 }
 
 /// The waits of one record at most.
-pub const WAITS_MAX: usize = 2;
+pub const WAITS_MAX: usize = 3;
 /// The longest deadline of a wait, in milliseconds.
 pub const WAIT_MAX_MS: u32 = 60_000;
 
@@ -1437,7 +1452,13 @@ fn check_record(r: &Record) -> Result<(), TableError<'static>> {
             });
         }
     }
-    let own = r.args.len() + 8 * r.dma.len();
+    // The process service has the line of the roots before its own arguments (`roots_mask`).
+    let roots_line = if r.name == PROCESS_SERVICE {
+        proto_init::ROOTS_LINE_MAX
+    } else {
+        0
+    };
+    let own = r.args.len() + 8 * r.dma.len() + roots_line;
     if own > OWN_ARGS_MAX {
         return Err(TableError::Args { record, len: own });
     }
@@ -4819,6 +4840,35 @@ mod tests {
     /// The layer service is a voucher whose notary session carries the mark of its root, a native
     /// client of the data file service and a client of the RAM file service's boot profile, and
     /// no other service gets the mark of its root.
+    /// The line of the roots follows the table: a root is listed when the service that registers
+    /// it is in the table, so a table with no `layerd` has no layer root and TakeRoot for it
+    /// answers ABSENT. The line fits the own arguments of the process service in every table.
+    #[test]
+    fn the_roots_line_lists_the_services_of_the_table() {
+        use proto_process::{ROOT_LAYER, ROOT_PIPES};
+        let mut layered = 0;
+        for table in all_tables() {
+            let mask = roots_mask(table);
+            for (service, mark) in ROOT_SERVICES {
+                let root = proto_process::root_of(proto_process::NOTARY | mark).unwrap();
+                let has = table.iter().any(|record| record.name == *service);
+                assert_eq!(mask & (1 << root) != 0, has, "{service}");
+            }
+            let has_layer = table.iter().any(|record| record.name == LAYER_SERVICE);
+            assert_eq!(mask & (1 << ROOT_LAYER) != 0, has_layer);
+            layered += usize::from(has_layer);
+            assert_eq!(
+                mask & (1 << ROOT_PIPES) != 0,
+                table.iter().any(|record| record.name == PIPE_SERVICE)
+            );
+            let mut line = [0; proto_init::ROOTS_LINE_MAX];
+            let n = proto_init::write_roots(mask, &mut line);
+            assert_eq!(proto_init::roots_mask(&line[..n]), Some(mask));
+        }
+        assert!(layered > 0);
+        assert!(roots_mask(&[]) == 0);
+    }
+
     #[test]
     fn the_layer_service_is_a_voucher_with_its_own_root_and_a_native_client() {
         use proto_process::{LAYER, NOTARY, ROOT_LAYER, root_of};
