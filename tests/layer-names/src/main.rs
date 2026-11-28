@@ -605,27 +605,30 @@ extern "C" fn main(
     );
     // A name of the lower set is copied up before it is written (the answer to the write is
     // COPYING with a ticket, and WAIT says how the copy ended); a program is never copied, so the
-    // copy of one ends with a read-only file system. A lower name does not move, and the volume has
-    // no hard links. The program is the probe's own file, which no later check needs to be written.
+    // copy of one ends with a read-only file system (a rename of a lower file is a copy up as well,
+    // so the rename of the program takes the same way, and a lower directory does not move). The
+    // volume has no hard links. The program is the probe's own file, which no later check needs to be
+    // written.
     {
         let name = "the lower set is copied up before it is written";
-        let ticket_of = |op: Option<n::ChangeOp>, flags: u32, path: &[u8]| -> Option<u64> {
-            let mut w = Writer::new();
-            match op {
-                None => n::write_open(flags, path, &mut w).ok()?,
-                Some(op) => n::Change {
-                    op,
-                    a: 0o755,
-                    b: 0,
-                    first: path,
-                    second: b"",
+        let ticket_of =
+            |op: Option<n::ChangeOp>, flags: u32, path: &[u8], second: &[u8]| -> Option<u64> {
+                let mut w = Writer::new();
+                match op {
+                    None => n::write_open(flags, path, &mut w).ok()?,
+                    Some(op) => n::Change {
+                        op,
+                        a: 0o755,
+                        b: 0,
+                        first: path,
+                        second,
+                    }
+                    .write(&mut w)
+                    .ok()?,
                 }
-                .write(&mut w)
-                .ok()?,
-            }
-            let a = call(&names, w.as_bytes(), rt::handle::Outgoing::new())?;
-            n::read_copying(a.all())?.ok()
-        };
+                let a = call(&names, w.as_bytes(), rt::handle::Outgoing::new())?;
+                n::read_copying(a.all())?.ok()
+            };
         // WAIT for a copy, asked again while it goes on: the status that ended it.
         let ended = |ticket: u64| -> Option<u32> {
             for _ in 0..3000 {
@@ -641,9 +644,15 @@ extern "C" fn main(
             None
         };
         let program = b"/bin/layer-names";
-        let t1 = ticket_of(None, proto_fs::WRITE_ONLY, program);
-        let t2 = ticket_of(None, proto_fs::WRITE_ONLY | proto_fs::CREATE, program);
-        let t3 = ticket_of(Some(n::ChangeOp::Chmod), 0, program);
+        let t1 = ticket_of(None, proto_fs::WRITE_ONLY, program, b"");
+        let t2 = ticket_of(None, proto_fs::WRITE_ONLY | proto_fs::CREATE, program, b"");
+        let t3 = ticket_of(Some(n::ChangeOp::Chmod), 0, program, b"");
+        let t4 = ticket_of(
+            Some(n::ChangeOp::Rename),
+            0,
+            program,
+            b"/bin/layer-names-moved",
+        );
         let change = |op: n::ChangeOp, first: &[u8], second: &[u8]| {
             let mut w = Writer::new();
             let request = n::Change {
@@ -656,13 +665,13 @@ extern "C" fn main(
             let _ = request.write(&mut w);
             call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status())
         };
-        let rename = change(n::ChangeOp::Rename, b"/lower/keep", b"/lower/moved");
+        let rename = change(n::ChangeOp::Rename, b"/lower", b"/lower-moved");
         let link = change(n::ChangeOp::Link, b"/lower/keep", b"/lower/hard");
-        let (Some(t1), Some(t2), Some(t3)) = (t1, t2, t3) else {
+        let (Some(t1), Some(t2), Some(t3), Some(t4)) = (t1, t2, t3, t4) else {
             t.fail(name, format_args!("a write of the program was not COPYING"));
             return 1;
         };
-        let (e1, e2, e3) = (ended(t1), ended(t2), ended(t3));
+        let (e1, e2, e3, e4) = (ended(t1), ended(t2), ended(t3), ended(t4));
         // A ticket the service never gave is a copy that is over; one that is over keeps its answer.
         let never = ended(0x7777_0001);
         let again = ended(t1);
@@ -675,6 +684,7 @@ extern "C" fn main(
         if e1 == erofs
             && e2 == erofs
             && e3 == erofs
+            && e4 == erofs
             && never == Some(0)
             && again == erofs
             && still
@@ -686,7 +696,7 @@ extern "C" fn main(
             t.fail(
                 name,
                 format_args!(
-                    "ended {e1:?} {e2:?} {e3:?}, never {never:?}, again {again:?}, rename {rename:?}, link {link:?}, still lower {still}"
+                    "ended {e1:?} {e2:?} {e3:?} {e4:?}, never {never:?}, again {again:?}, rename {rename:?}, link {link:?}, still lower {still}"
                 ),
             );
         }

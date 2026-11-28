@@ -23,6 +23,14 @@ phase-reread = []
 # second boot on the same disk that reads the copies.
 phase-copy = []
 phase-copyreread = []
+# The phases of the probes of part B of the copy up: names that change during a copy, a volume too
+# small for a copy (and the boot after it), and the cut of the power with its verification
+# (`cargo xtask layer-posix copy race|full`, `cargo xtask layer-cut copy`).
+phase-copyrace = []
+phase-copyfull = []
+phase-copyfullreread = []
+phase-cut = []
+phase-cutverify = []
 
 [[bin]]
 name = "layer-posix-probe"
