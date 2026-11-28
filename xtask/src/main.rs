@@ -61,6 +61,7 @@ mod data_image;
 mod data_posix;
 mod data_probe;
 mod deqp;
+mod desk;
 mod disasm;
 mod display_probe;
 mod doom;
@@ -2637,6 +2638,7 @@ commands:
   wfc-probe run the scene demo on OpenWF Composition (<WF/wfc.h>) in QEMU with the compositor: two scenes of three elements (a stretch, quarter turns, a flip, the filters none and faster, a global alpha and a mask) over the windows of two producers, and a third scene of the window of the first revision shown straight, committed in turn 100 times and each composed on request, QEMU's screenshot compared with the CRC of the host's reference (tools/wfc-ref), then the scene changed 100 times on an active context with every screenshot one of the two and both of them among the shots; then scene D (the bilinear filter: two stretches, a flip, a quarter turn) committed once, its screenshot compared and its frame time printed; the counters of the service (no frame failed, bands grow, scene C a frame shown straight) and the device's trace; then the steps of the compositor and the driver under -icount
   wfd-probe run the display demo on OpenWF Display (<WF/wfd.h>) in QEMU with the display driver alone: 100 frames bound to the primary pipeline in turn, each compared with the guest's CRC, the host's own and QEMU's screenshot, and the cursor moved 100 times (the device's trace); then the driver's steps under -icount
   posix-window run the C probe of the window library (<stafeto/window.h>) in QEMU: a window with two buffers, the bits that free them, events, fork, a signal and close, the frames compared with QEMU's screenshot
+  desk-probe --api run the C probe of the manager's calls (<stafeto/manager.h>) in QEMU over the compositor with a keyboard (transport 15) and a tablet (transport 6): the manager subscribes, sees a client's window and gives it the focus, reads its title by INFO, frames it with a window of its own tied by LINK, moves the pair, resizes the client by CONFIGURE and hears RESIZED, hides and shows the pair, asks the client to close; the child of the manager is refused with EPERM; a key and a tablet click sent from QEMU reach the window with the focus
   display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
   layer-probe [steps] attach and detach layers of the RAM file service in QEMU; steps
             measures the steps of the layer calls under -icount
@@ -3084,6 +3086,7 @@ fn main() {
         Some("layer-posix") => layer_posix::command(&args[1..], &qemu::VIRT),
         Some("layer-cut") => layer_posix::cut(&args[1..], &qemu::VIRT),
         Some("posix-window") => posix_window::probe(&qemu::VIRT),
+        Some("desk-probe") => desk::command(&args[1..], &qemu::VIRT),
         Some("wfc-probe") => wfc::command(&args[1..], &qemu::VIRT),
         Some("wfd-probe") => wfd::probe(&qemu::VIRT),
         Some("display-probe") => display_probe::probe(&qemu::VIRT),
@@ -11496,6 +11499,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("vi-dialog", vi_dialog::vi_dialog),
         // The window library of C programs against QEMU's screenshots.
         job("posix-window", || posix_window::probe(&qemu::VIRT)),
+        // The manager's calls of the C library over a compositor with a keyboard
+        // and a tablet on transports of their own, a key and a click from QEMU.
+        job("desk-probe --api", || desk::api(&qemu::VIRT)),
         // OpenWF Display over the driver alone: the frames against QEMU's
         // screenshot, the scanout and cursor trace, the driver's steps.
         job("wfd-probe", || wfd::probe(&qemu::VIRT)),
@@ -15266,6 +15272,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "posix-window-probe",
         "--package",
+        "posix-manager-probe",
+        "--package",
         "wfd-demo",
         "--package",
         "wfc-demo",
@@ -18089,6 +18097,7 @@ mod entropy_in_images_tests {
                 Box::leak(crate::layer_posix::plain_ash_programs().into_boxed_slice()),
             ),
             ("posix_window::PROGRAMS", &crate::posix_window::PROGRAMS),
+            ("desk::PROGRAMS", &crate::desk::PROGRAMS),
             ("cxx_probe::PROGRAMS", &crate::cxx_probe::PROGRAMS),
             ("gles_pbuffer::PROGRAMS", &crate::gles_pbuffer::PROGRAMS),
             ("deqp::PROGRAMS", &crate::deqp::PROGRAMS),

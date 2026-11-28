@@ -27,6 +27,38 @@ pub const fn label(sequence: u32, slot: usize) -> u64 {
     TAG << 32 | ((sequence & SEQUENCE_MAX) as u64) << 4 | slot as u64
 }
 
+/// The slot number of the manager's label: no window has it (`slot_of` gives
+/// None for it), so the copy of the channel that carries the manager's ring
+/// never mixes with a window's.
+pub const MANAGER_SLOT: usize = 15;
+
+/// The bit of the mask of `stafeto_windows_wait` that says the manager's ring
+/// holds events (`STAFETO_MANAGER_EVENTS`). It is above the windows' bits.
+pub const MANAGER_BIT: u32 = 1 << 30;
+const _: () = assert!(MANAGER_BIT > 1 << (WINDOWS_MAX - 1) && MANAGER_BIT < 1 << 31);
+
+/// The label of the copy number `sequence` hands the service for the manager's
+/// ring.
+pub const fn manager_label(sequence: u32) -> u64 {
+    TAG << 32 | ((sequence & SEQUENCE_MAX) as u64) << 4 | MANAGER_SLOT as u64
+}
+
+/// Whether `label` is a label of the manager's ring.
+pub const fn is_manager_label(label: u64) -> bool {
+    label >> 32 == TAG && (label & 0xf) as usize == MANAGER_SLOT
+}
+
+/// The mask a wait across the windows returns when the manager's ring has
+/// something (`pending`) or the service that holds the subscription went
+/// (`gone`): the windows' mask with `MANAGER_BIT` added.
+pub const fn with_manager(mask: u32, pending: bool, gone: bool) -> u32 {
+    if pending || gone {
+        mask | MANAGER_BIT
+    } else {
+        mask
+    }
+}
+
 /// The window a label names; None for a label that is none of the library's.
 pub const fn slot_of(label: u64) -> Option<usize> {
     let slot = (label & 0xf) as usize;
@@ -125,6 +157,30 @@ mod tests {
         assert_eq!(slot_of(0x5749_0000_0000 | 8), None);
         assert_eq!(slot_of(0x5748_0000_0000), None);
         assert_eq!(slot_of(1 << 63 | label(0, 1)), None);
+    }
+
+    #[test]
+    fn the_managers_label_names_no_window_and_no_window_label_is_the_managers() {
+        for sequence in [0, 1, 77, SEQUENCE_MAX] {
+            let managers = manager_label(sequence);
+            assert!(is_manager_label(managers));
+            assert_eq!(slot_of(managers), None);
+            for slot in 0..WINDOWS_MAX {
+                assert!(!is_manager_label(label(sequence, slot)));
+            }
+        }
+        assert!(!is_manager_label(0));
+        assert!(!is_manager_label(0x5748_0000_000f));
+        assert_ne!(manager_label(1), manager_label(2));
+    }
+
+    #[test]
+    fn the_managers_bit_joins_the_mask_and_stays_positive() {
+        assert_eq!(with_manager(0b101, false, false), 0b101);
+        assert_eq!(with_manager(0b101, true, false), 0b101 | MANAGER_BIT);
+        assert_eq!(with_manager(0, false, true), MANAGER_BIT);
+        assert!(MANAGER_BIT as i32 > 0);
+        assert_eq!(MANAGER_BIT & 0xff, 0);
     }
 
     #[test]

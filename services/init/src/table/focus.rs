@@ -26,35 +26,54 @@ pub const LINE: u32 = 48 + 13;
 /// `Status` of a virtio-mmio transport (Virtio 1.2, 4.2.2).
 const MMIO_STATUS: u64 = 0x70;
 
+/// The record of the tablet's driver on the transport at `$transport` (a
+/// constant of 0x200 bytes a transport from 0xa000000) and its line: the
+/// keyboard's program and record on that transport.
+macro_rules! pointer_on {
+    ($transport:expr, $line:expr) => {
+        Record {
+            name: "pointer",
+            windows: &[Window {
+                name: "mmio",
+                base: $transport & !(PAGE - 1),
+                len: PAGE,
+                duplicate: false,
+                at: super::At::Fixed,
+            }],
+            bindings: &[Binding {
+                name: "irq",
+                line: $line,
+                edge: false,
+                of: None,
+            }],
+            args: &$transport.to_le_bytes(),
+            quiesce: &[Write {
+                window: "mmio",
+                offset: ($transport & (PAGE - 1)) + MMIO_STATUS,
+                bits: 32,
+                value: 0,
+                settled: 0xFFFF_FFFF,
+                only_if: None,
+                confirm: None,
+            }],
+            ..input::INPUT
+        }
+    };
+}
+
 /// The input driver of the tablet: the keyboard's program and record on
 /// another transport.
-pub const POINTER: Record = Record {
-    name: "pointer",
-    windows: &[Window {
-        name: "mmio",
-        base: TRANSPORT & !(PAGE - 1),
-        len: PAGE,
-        duplicate: false,
-        at: super::At::Fixed,
-    }],
-    bindings: &[Binding {
-        name: "irq",
-        line: LINE,
-        edge: false,
-        of: None,
-    }],
-    args: &TRANSPORT.to_le_bytes(),
-    quiesce: &[Write {
-        window: "mmio",
-        offset: (TRANSPORT & (PAGE - 1)) + MMIO_STATUS,
-        bits: 32,
-        value: 0,
-        settled: 0xFFFF_FFFF,
-        only_if: None,
-        confirm: None,
-    }],
-    ..input::INPUT
-};
+pub const POINTER: Record = pointer_on!(TRANSPORT, LINE);
+
+/// The virtio-mmio transport of the tablet in the desk image (`desk::TABLE`)
+/// and its line: transport 6 at 0xa000c00 on the page 0xa000000, which no
+/// record of that image holds (it has no network card), so the keyboard
+/// (transport 15, page 0xa001000) and the tablet both have a page to map.
+pub const DESK_TRANSPORT: u64 = 0x0a00_0c00;
+pub const DESK_LINE: u32 = 48 + 6;
+
+/// The tablet's driver of the desk image.
+pub const DESK_POINTER: Record = pointer_on!(DESK_TRANSPORT, DESK_LINE);
 
 /// The compositor with the pointer's driver as an input service of its own.
 pub const COMPOSITOR: Record = Record {

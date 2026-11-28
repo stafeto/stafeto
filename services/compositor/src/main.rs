@@ -2749,9 +2749,8 @@ impl Compositor {
         let id = self.scene.place_of(a).unwrap_or(usize::MAX);
         let result = match op {
             manage::SUBSCRIBE => {
-                if !compositor::subscribe_allowed(self.holder(), scene)
-                    || (scene && self.manager.is_some() && self.manager_label != r.label())
-                {
+                let same = self.manager.is_some() && self.manager_label == r.label();
+                if !compositor::subscribe_allowed(self.holder(), scene, same) {
                     return Answer::Status(proto_comp::code(proto_comp::BUSY));
                 }
                 let Ok(notify) = r.handles.take::<Channel>(0) else {
@@ -2964,6 +2963,12 @@ impl Service<1> for Compositor {
         let gpu = Gpu::from_number(method);
         let comp = Comp::from_number(method);
         if is_manager(label) {
+            // A manager that is a process of POSIX (`desk`) starts programs: each
+            // gets a clone of the session (CLONE, which `posix_spawn` asks), an
+            // ordinary context's session with no mark of the manager's.
+            if gpu == Some(Gpu::Clone) {
+                return self.clone_session(r);
+            }
             return self.manager_request(method, r);
         }
         if is_scene(label) {

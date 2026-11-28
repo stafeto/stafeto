@@ -37,6 +37,12 @@ class LeakedNames(unittest.TestCase):
             MODULE.leaked_names({"stafeto_windows_wait", "stafeto_window_resize", "malloc"}),
             ["stafeto_window_resize", "stafeto_windows_wait"])
 
+    def test_the_managers_calls_are_found(self):
+        self.assertEqual(
+            MODULE.leaked_names({"stafeto_manager_subscribe", "stafeto_manager_link",
+                                 "stafeto_window_id", "malloc"}),
+            ["stafeto_manager_link", "stafeto_manager_subscribe", "stafeto_window_id"])
+
     def test_the_functions_of_openwf_are_found(self):
         names = {"wfdCreateDevice", "wfdStafetoStream", "wfcCreateContext", "wfcCompose", "write"}
         self.assertEqual(

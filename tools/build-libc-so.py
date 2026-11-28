@@ -66,8 +66,8 @@ TOOLCHAIN = "nightly-2026-05-24"
 # The build of the measurement of the packet path (STAFETO_TRACE=1) adds the time stamps of
 # the layer and the points of the stack's glue (`cargo xtask net-trace`).
 TRACE = bool(os.environ.get("STAFETO_TRACE"))
-# The names of `<stafeto/window.h>`, which libc.so never exports.
-WINDOW_NAMES = re.compile(r"stafeto_(windows?|screen)_")
+# The names of `<stafeto/window.h>` and `<stafeto/manager.h>`, which libc.so never exports.
+WINDOW_NAMES = re.compile(r"stafeto_(windows?|screen|manager)_")
 # The functions of OpenWF Display and Composition (`<WF/wfd.h>`, `<WF/wfc.h>`, the features
 # `wfd` and `wfc` of posix-crt), which libc.so never exports either.
 OPENWF_NAMES = re.compile(r"wf[cd][A-Z]")

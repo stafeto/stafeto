@@ -150,8 +150,16 @@ pub const COMP_MANAGER_MARK: u64 = 1 << 60;
 pub const COMP_INPUT_MARK: u64 = 1 << 59;
 pub const COMP_SCENE_MARK: u64 = 1 << 54;
 /// The window manager of the images that have one, and the probe that stands
-/// in for it.
-pub const COMP_MANAGERS: &[&str] = &["wm", "focus-wm", "top-wm"];
+/// in for it. `desk` is the manager of the desk image (`table::desk`).
+pub const COMP_MANAGERS: &[&str] = &["wm", "focus-wm", "top-wm", "desk"];
+/// The managers that may be processes of POSIX, by the name of their record:
+/// `desk` alone. Like a scene's holder, a POSIX manager has its session made
+/// here, by init, as a CONNECT of the record's program asks it, so the mark
+/// needs nothing of the process service. The sessions the manager gives its
+/// children (`posix_spawn`) are clones, which carry no mark (the compositor's
+/// CLONE), and `exec` moves the session with its mark to the new image, so the
+/// window layer refuses `exec` (EPERM) in a process that subscribed as the manager.
+pub const COMP_POSIX_MANAGERS: &[&str] = &["desk"];
 /// The programs that inject events as a device would: the probes only.
 pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject", "lvgl-inject", "frame-load"];
 
@@ -165,7 +173,9 @@ pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject", "lvgl-inject"
 pub const COMP_SCENES: &[&str] = &["comp-probe-s", "wfc-demo"];
 
 /// The mark of the compositor's session that `client` gets by asking for
-/// `service`: the scene's, the manager's, the input's, or none.
+/// `service`: the scene's, the manager's, the input's, or none. A record of
+/// POSIX has the scene's mark by `COMP_SCENES` and the manager's by
+/// `COMP_POSIX_MANAGERS` alone; no process of POSIX injects events.
 pub fn comp_mark(client: &Record, service: &[u8]) -> Option<u64> {
     if service != b"gpu" {
         return None;
@@ -174,7 +184,9 @@ pub fn comp_mark(client: &Record, service: &[u8]) -> Option<u64> {
         return Some(COMP_SCENE_MARK);
     }
     if client.is_posix() {
-        return None;
+        return COMP_POSIX_MANAGERS
+            .contains(&client.name)
+            .then_some(COMP_MANAGER_MARK);
     }
     if COMP_MANAGERS.contains(&client.name) {
         Some(COMP_MANAGER_MARK)
@@ -1581,6 +1593,7 @@ pub mod bench;
 pub mod ceiling;
 pub mod comp;
 pub mod cycle;
+pub mod desk;
 pub mod doom;
 pub mod entropy;
 pub mod focus;
@@ -1698,6 +1711,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-layer-posix") as usize
     + cfg!(feature = "table-layer-ash") as usize
     + cfg!(feature = "table-posix-window") as usize
+    + cfg!(feature = "table-desk") as usize
     + cfg!(feature = "table-wfc") as usize
     + cfg!(feature = "table-wfc-steps") as usize
     + cfg!(feature = "table-wfd") as usize
@@ -1819,6 +1833,7 @@ const _: () = assert!(
     feature = "table-layer-posix",
     feature = "table-layer-ash",
     feature = "table-posix-window",
+    feature = "table-desk",
     feature = "table-wfc",
     feature = "table-wfc-steps",
     feature = "table-wfd",
@@ -2051,6 +2066,8 @@ pub const TABLE: &[Record] = ramfs::LAYER_POSIX_TABLE;
 pub const TABLE: &[Record] = ramfs::LAYER_ASH_TABLE;
 #[cfg(feature = "table-posix-window")]
 pub const TABLE: &[Record] = window::TABLE;
+#[cfg(feature = "table-desk")]
+pub const TABLE: &[Record] = desk::TABLE;
 #[cfg(feature = "table-wfc")]
 pub const TABLE: &[Record] = wfc::TABLE;
 #[cfg(feature = "table-wfc-steps")]
@@ -2100,6 +2117,7 @@ pub const ALL_TABLES: &[&[Record]] = &[
     focus::TABLE,
     focus::WM_TABLE,
     focus::TOP_TABLE,
+    desk::TABLE,
     input::TABLE,
     entropy::TABLE,
     entropy::VZ_TABLE,
@@ -4342,6 +4360,67 @@ mod tests {
         }
     }
 
+    /// The manager's mark goes to a record of POSIX that `COMP_POSIX_MANAGERS`
+    /// names (`desk`) and to no other: a POSIX record called as another manager or
+    /// as an injector gets none, and the injectors stay native.
+    #[test]
+    fn the_manager_mark_goes_to_the_named_posix_manager_only() {
+        let desk = desk::TABLE.iter().find(|r| r.name == "desk").unwrap();
+        assert_eq!(COMP_POSIX_MANAGERS, ["desk"]);
+        assert!(
+            COMP_POSIX_MANAGERS
+                .iter()
+                .all(|n| COMP_MANAGERS.contains(n))
+        );
+        assert!(desk.is_posix());
+        assert_eq!(comp_mark(desk, b"gpu"), Some(COMP_MANAGER_MARK));
+        assert_eq!(comp_mark(desk, b"clock"), None);
+        let posix = |name: &'static str| Record {
+            name,
+            connects: &["gpu", PROCESS_SERVICE],
+            ..*desk
+        };
+        assert!(posix("p").is_posix());
+        for name in [
+            "wm",
+            "focus-wm",
+            "top-wm",
+            "wm-old",
+            "posix-app",
+            "focus-inject",
+            "wm-inject",
+            "lvgl-inject",
+            "frame-load",
+            "desk2",
+        ] {
+            assert_eq!(comp_mark(&posix(name), b"gpu"), None, "{name}");
+        }
+        // The names the table gives the manager's mark are all the table's.
+        for name in COMP_MANAGERS {
+            assert!(
+                [focus::TABLE, focus::WM_TABLE, focus::TOP_TABLE, desk::TABLE]
+                    .iter()
+                    .any(|t| t.iter().any(|r| r.name == *name)),
+                "{name}"
+            );
+        }
+    }
+
+    /// A record named `desk` (the one that gets the manager's mark as a process
+    /// of POSIX) is in the desk image alone.
+    #[test]
+    fn a_record_named_desk_is_in_the_desk_image_alone() {
+        for table in all_tables() {
+            let has = table.iter().any(|r| r.name == "desk");
+            assert_eq!(
+                has,
+                std::ptr::eq(table, desk::TABLE),
+                "{:?}",
+                table.first().map(|r| r.name)
+            );
+        }
+    }
+
     /// The games image is the shell's dialog with the launcher's quota of
     /// 3 072 pages and a pool of four and a half such quotas, and the
     /// input and display services, which the launcher (and so the shell and
@@ -4483,6 +4562,7 @@ mod tests {
             ramfs::DATA_POSIX_TABLE,
             lvgl::TABLE,
             window::TABLE,
+            desk::TABLE,
             wfc::TABLE,
             wfc::STEPS_TABLE,
             gles::PBUFFER_TABLE,
@@ -4514,6 +4594,7 @@ mod tests {
                     "posix-display",
                     "posix-data",
                     "posix-window",
+                    "posix-manager",
                     "wfd-demo",
                     "wfc-demo",
                     "display-run",

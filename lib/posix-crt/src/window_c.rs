@@ -7,9 +7,11 @@
 //! libc.so is built without it. Each is the layer's call
 //! (`posix_abi::window`) with the errno set as C expects: 0, a count or
 //! the window's number, or -1 with errno. The layouts of the structures are
-//! `comp_client::layout`, which holds the same assertions as the header.
+//! `comp_client::layout`, which holds the same assertions as the header. The
+//! manager's calls (`<stafeto/manager.h>`) are at the end of the file.
 
 use comp_client::layout::{self, Rect, Screen, Window, WindowEvent};
+use comp_client::manager::{ManagerInfo, ManagerWindow};
 use comp_client::table;
 use core::ffi::{c_char, c_int};
 use posix_abi::constants::EINVAL;
@@ -297,6 +299,149 @@ pub unsafe extern "C" fn stafeto_window_capacity(win: c_int, w: *mut u32, h: *mu
                     h.write(cap_h);
                 }
             }
+            0
+        }
+        Err(errno) => fail(errno),
+    }
+}
+
+// ---------------------------------------------------------------- the manager
+
+/// Subscribes the process to the manager's ring of events.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_manager_subscribe() -> c_int {
+    match window::subscribe() {
+        Ok(()) => 0,
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Takes up to `max` events of the manager's ring without waiting: the count.
+///
+/// # Safety
+/// `e` is null or points to room for `max` events, `flags` is null or points
+/// to a writable `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_manager_events(
+    e: *mut WindowEvent,
+    max: c_int,
+    flags: *mut u32,
+) -> c_int {
+    if e.is_null() || max <= 0 {
+        return fail(EINVAL);
+    }
+    // SAFETY: the caller gives room for `max` events.
+    let out = unsafe { core::slice::from_raw_parts_mut(e, max as usize) };
+    match window::manager_events(out) {
+        Ok((count, lost)) => {
+            if !flags.is_null() {
+                // SAFETY: the caller's pointer, checked for null.
+                unsafe { flags.write(lost) };
+            }
+            count as c_int
+        }
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Lists the windows, the lowest in the order of depth first: the count.
+///
+/// # Safety
+/// `w` is null or points to room for `max` records.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_manager_list(w: *mut ManagerWindow, max: c_int) -> c_int {
+    if w.is_null() || max <= 0 {
+        return fail(EINVAL);
+    }
+    // SAFETY: the caller gives room for `max` records.
+    let out = unsafe { core::slice::from_raw_parts_mut(w, max as usize) };
+    match window::manager_list(out) {
+        Ok(count) => count as c_int,
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Describes window `id` in `*out`.
+///
+/// # Safety
+/// `out` is null or points to a writable `struct stafeto_manager_info`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_manager_info(id: u32, out: *mut ManagerInfo) -> c_int {
+    if out.is_null() {
+        return fail(EINVAL);
+    }
+    match window::manager_info(id) {
+        Ok(described) => {
+            // SAFETY: the caller's pointer, checked for null.
+            unsafe { out.write(described) };
+            0
+        }
+        Err(errno) => fail(errno),
+    }
+}
+
+fn done(result: Result<(), i32>) -> c_int {
+    match result {
+        Ok(()) => 0,
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Moves window `id` to (`x`, `y`).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_manager_move(id: u32, x: u32, y: u32) -> c_int {
+    done(window::move_to(id, x, y))
+}
+
+/// Raises window `id` to the top.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_manager_raise(id: u32) -> c_int {
+    done(window::raise(id))
+}
+
+/// Gives window `id` the keyboard's focus.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_manager_focus(id: u32) -> c_int {
+    done(window::focus(id))
+}
+
+/// Shows (`shown` not 0) or hides window `id`.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_manager_visible(id: u32, shown: c_int) -> c_int {
+    done(window::visible(id, shown != 0))
+}
+
+/// Asks window `id` for a size and states.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_manager_configure(id: u32, w: u32, h: u32, states: u32) -> c_int {
+    done(window::configure(id, w, h, states))
+}
+
+/// Asks window `id` to close itself.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_manager_close(id: u32) -> c_int {
+    done(window::manager_close(id))
+}
+
+/// Ties window `follower` (one of the manager's own) to window `leader`.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_manager_link(leader: u32, follower: u32) -> c_int {
+    done(window::link(leader, follower))
+}
+
+/// The service's number of the process's open window `win`.
+///
+/// # Safety
+/// `id` is null or points to a writable `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_window_id(win: c_int, id: *mut u32) -> c_int {
+    if id.is_null() {
+        return fail(EINVAL);
+    }
+    match window::window_id(win) {
+        Ok(number) => {
+            // SAFETY: the caller's pointer, checked for null.
+            unsafe { id.write(number) };
             0
         }
         Err(errno) => fail(errno),
