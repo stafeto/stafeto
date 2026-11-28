@@ -42,9 +42,12 @@ use crate::{
 /// programs, the display driver, the input driver (one program, a record for
 /// each of the keyboard and the tablet) and the compositor, with `features` on
 /// the three that count their steps.
-const fn common(steps: &'static [&'static str]) -> [ImageProgram; 9] {
+const fn common(
+    table: &'static [&'static str],
+    steps: &'static [&'static str],
+) -> [ImageProgram; 9] {
     [
-        ("init", "init", INIT_STACK_SIZE, &["table-desk"]),
+        ("init", "init", INIT_STACK_SIZE, table),
         ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
         (
             "posix-process-service",
@@ -94,7 +97,7 @@ const DESK_STACK_SIZE: u32 = 256 * 1024;
 /// The image of the C probe of the manager's calls (`desk-probe --api`): the
 /// probe runs as the record `desk` under that name.
 pub const API_PROGRAMS: [ImageProgram; 12] = {
-    let c = common(&[]);
+    let c = common(&["table-desk"], &[]);
     [
         c[0],
         c[1],
@@ -111,8 +114,12 @@ pub const API_PROGRAMS: [ImageProgram; 12] = {
     ]
 };
 
-const fn desk_programs(steps: &'static [&'static str]) -> [ImageProgram; 13] {
-    let c = common(steps);
+const fn desk_programs(
+    table: &'static [&'static str],
+    steps: &'static [&'static str],
+    client: &'static str,
+) -> [ImageProgram; 13] {
+    let c = common(table, steps);
     [
         c[0],
         c[1],
@@ -124,18 +131,23 @@ const fn desk_programs(steps: &'static [&'static str]) -> [ImageProgram; 13] {
         c[7],
         c[8],
         ("desk", "desk", DESK_STACK_SIZE, &[]),
-        ("desk-client", "desk-client", POSIX_STACK_SIZE, &[]),
+        (client, "desk-client", POSIX_STACK_SIZE, &[]),
         ENTROPY[0],
         ENTROPY[1],
     ]
 }
 
 /// The image of the desk: the manager and the clients of the probe it starts.
-pub const PROGRAMS: [ImageProgram; 13] = desk_programs(&[]);
+pub const PROGRAMS: [ImageProgram; 13] = desk_programs(&["table-desk"], &[], "desk-client");
 
 /// The same under -icount: the display driver, the input driver and the
 /// compositor count their steps.
-pub const STEPS_PROGRAMS: [ImageProgram; 13] = desk_programs(&["steps"]);
+pub const STEPS_PROGRAMS: [ImageProgram; 13] =
+    desk_programs(&["table-desk"], &["steps"], "desk-client");
+
+/// The images with six clients of 400 by 300 (`many`) and with eight windows of clients (`sixteen`).
+const MANY_PROGRAMS: [ImageProgram; 13] = desk_programs(&["table-desk-many"], &[], "dc");
+const SIXTEEN_PROGRAMS: [ImageProgram; 13] = desk_programs(&["table-desk-sixteen"], &[], "dc");
 
 /// The lines of the probe, each a check that passed and each said once.
 const LINES: [&str; 12] = [
@@ -676,12 +688,121 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     Ok(())
 }
 
-/// `cargo xtask desk-probe [--api]`.
+/// The windows of a list `desk: state ...`: its entries.
+fn state_entries(line: &str) -> Option<Vec<&str>> {
+    let rest = line.strip_prefix("desk: state ")?;
+    Some(rest.split("; ").collect())
+}
+
+/// What a run with many clients must show: the list of `clients` clients of 400 by 300 (each
+/// `c1`, `c2`...), `frames` frames and the panel, in a line, once the manager has framed all
+/// it can; and the frames it could not make said so.
+fn many_verdict(lines: &[String], clients: usize, frames: usize) -> Result<usize, String> {
+    let refused = lines
+        .iter()
+        .filter(|l| l.starts_with("desk: no frame for a window"))
+        .count();
+    if refused != clients - frames {
+        return Err(format!(
+            "{refused} windows without a frame, {} expected",
+            clients - frames
+        ));
+    }
+    if let Some(bad) = lines
+        .iter()
+        .find(|l| said_failure(l) && !l.starts_with("desk: no frame for a window"))
+    {
+        return Err(format!("the run said {bad:?}"));
+    }
+    let wanted = clients + frames + 1;
+    let seen = lines
+        .iter()
+        .filter_map(|l| state_entries(l))
+        .map(|e| e.len())
+        .max()
+        .unwrap_or(0);
+    if seen != wanted {
+        return Err(format!(
+            "the longest list had {seen} windows, {wanted} expected"
+        ));
+    }
+    Ok(wanted)
+}
+
+/// A run of the desk that starts `clients` clients of 400 by 300 and waits for the list with
+/// all of them: the panel, the frames the manager's share holds and the clients.
+fn many_run(
+    machine: &qemu::Machine,
+    kernel: &std::path::Path,
+    image: &std::path::Path,
+    more: &[&str],
+    clients: usize,
+    frames: usize,
+) -> Result<Vec<String>, String> {
+    let scratch = Scratch::new()?;
+    let cmd = desk_command(machine, image, kernel, &scratch, more);
+    let mut run = Run::start(cmd, Input::Null)?;
+    let wanted = clients + frames + 1;
+    let driven = run
+        .expect_line(
+            "the list of every window",
+            |l| state_entries(l).is_some_and(|e| e.len() == wanted) || failure(l).is_some(),
+            WITHIN,
+        )
+        .and_then(|line| match failure(&line) {
+            Some(failed) => Err(failed),
+            None => Ok(()),
+        });
+    let outcome = run.stop();
+    driven?;
+    many_verdict(&outcome.lines, clients, frames)?;
+    Ok(outcome.lines)
+}
+
+/// `cargo xtask desk-probe many`: the manager's panel, six frames of 408 by 328 and six
+/// clients of 400 by 300, 13 windows, all made (each buffer of a client is one mapping of the
+/// compositor, however large); `desk-probe sixteen`: eight clients, the sixteen windows of
+/// the service, the eighth frame refused by the manager's share of eight.
+fn many(machine: &qemu::Machine, sixteen: bool) -> Result<(), String> {
+    crate::relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let (clients, frames, name) = if sixteen {
+        (8, 7, "sixteen")
+    } else {
+        (6, 6, "many")
+    };
+    let programs = if sixteen {
+        &SIXTEEN_PROGRAMS
+    } else {
+        &MANY_PROGRAMS
+    };
+    let image = build_boot_image(
+        if sixteen {
+            "boot-desk-sixteen.img"
+        } else {
+            "boot-desk-many.img"
+        },
+        programs,
+        BOOT_PROFILE,
+    )?;
+    let lines = many_run(machine, &kernel.image, &image, &[], clients, frames)
+        .map_err(|e| format!("desk-probe {name} on {}: {e}", machine.name))?;
+    let windows = many_verdict(&lines, clients, frames)?;
+    println!(
+        "desk-probe {name} on {}: the manager framed {frames} of {clients} clients of 400 by 300 and the list had all {windows} windows: ok",
+        machine.name
+    );
+    Ok(())
+}
+
+/// `cargo xtask desk-probe [--api | many | sixteen]`.
 pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
     match args {
         [] => probe(machine),
         [flag] if flag == "--api" => api(machine),
-        _ => Err("desk-probe [--api]".to_owned()),
+        [mode] if mode == "many" => many(machine, false),
+        [mode] if mode == "sixteen" => many(machine, true),
+        _ => Err("desk-probe [--api | many | sixteen]".to_owned()),
     }
 }
 

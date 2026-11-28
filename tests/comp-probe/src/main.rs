@@ -53,10 +53,10 @@
 use abi::{Access, Error, MESSAGE_MAX, Rights, Source};
 use core::cell::Cell;
 use proto_comp::{
-    ACTIVE, ASK_COMMITTED, ASK_COMPOSED, Attach, BILINEAR, BUSY, COMMITTED_BIT, COMPOSED_BIT,
-    Create, Description, Element, FORMAT_A8, FORMAT_ARGB8888, FORMAT_XRGB8888, INVALID, MIRROR,
-    Method, NEAREST, NO_WINDOW, NOT_ALLOWED, Post, Rect, SceneCommit, TRANSPARENCY_ALPHA,
-    TRANSPARENCY_MASK, TRANSPARENCY_SOURCE, UNSUPPORTED, code, manage, meaning,
+    ACTIVE, ASK_COMMITTED, ASK_COMPOSED, Attach, BILINEAR, BUFFER_MAX, BUSY, COMMITTED_BIT,
+    COMPOSED_BIT, Create, Description, Element, FORMAT_A8, FORMAT_ARGB8888, FORMAT_XRGB8888,
+    INVALID, MIRROR, Method, NEAREST, NO_WINDOW, NOT_ALLOWED, Post, Rect, SceneCommit,
+    TRANSPARENCY_ALPHA, TRANSPARENCY_MASK, TRANSPARENCY_SOURCE, UNSUPPORTED, code, manage, meaning,
 };
 use proto_gpu::{HEIGHT, STRIDE, WIDTH};
 use proto_init::ServiceArgs;
@@ -78,6 +78,8 @@ const SNAPSHOT_NS: u64 = if cfg!(feature = "quick") {
 } else {
     2_500_000_000
 };
+/// The windows the first client makes before its own (`many`: sixteen, twice).
+const MANY_CREATED: u32 = 32;
 const RETRY_NS: u64 = 5_000_000;
 const WAIT_NS: u64 = 60_000_000_000;
 
@@ -653,6 +655,77 @@ impl Probe<'_> {
         plain(window, w.as_bytes())
     }
 
+    /// Sixteen windows over four contexts, each with three buffers of the most the service
+    /// takes (256 pages): every ATTACH is OK (a buffer takes one mapping entry of the service,
+    /// not one for each piece of 32 pages), the windows are posted and shown, a seventeenth
+    /// is refused, and once they have gone, sixteen are made again over the same places.
+    fn many(&self, display: &Handle<Channel>) -> Result<(), &'static str> {
+        const WINDOWS: usize = 16;
+        const PER_CONTEXT: usize = 4;
+        let contexts = [
+            self.display()?,
+            self.display()?,
+            self.display()?,
+            self.display()?,
+            self.display()?,
+        ];
+        let len = BUFFER_MAX;
+        let mut objects: [[Option<Handle<Memory>>; 3]; WINDOWS] =
+            [const { [const { None }; 3] }; WINDOWS];
+        for window in objects.iter_mut() {
+            for object in window.iter_mut() {
+                *object = Some(sys::mem_create(len).map_err(say("mem_create of a buffer"))?);
+            }
+        }
+        let place = |k: usize| Rect {
+            x: (k % 4) as u32 * 160,
+            y: (k / 4) as u32 * 100,
+            w: 160,
+            h: 100,
+        };
+        for round in 0..2 {
+            let mut sessions: [Option<Handle<Channel>>; WINDOWS] = [const { None }; WINDOWS];
+            for k in 0..WINDOWS {
+                let (session, _) = self
+                    .create(&contexts[k / PER_CONTEXT], place(k), FORMAT_XRGB8888)
+                    .map_err(say("WINDOW_CREATE of one of sixteen"))?;
+                self.attach(&session, 640, FORMAT_XRGB8888, &objects[k])
+                    .map_err(say("ATTACH of three large buffers"))?;
+                sessions[k] = Some(session);
+            }
+            if round == 0 {
+                let seventeenth = self.create(&contexts[4], place(0), FORMAT_XRGB8888);
+                if seventeenth.err() != Some(Fail::Status(proto_gpu::LIMIT)) {
+                    return Err("the seventeenth window was not refused");
+                }
+            }
+            let before = self.describe(display).map_err(say("DESCRIBE"))?;
+            for session in sessions.iter().flatten() {
+                self.post(session, 0, &[])
+                    .map_err(say("POST of one of sixteen"))?;
+                self.settled(display)?;
+            }
+            let shown = self.settled(display)?;
+            if shown.open != WINDOWS as u32 || shown.frames <= before.frames {
+                return Err("sixteen windows were not shown");
+            }
+            drop(sessions);
+            let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+            while self.settled(display)?.open != 0 {
+                if time::ticks_to_ns(time::now()) > end {
+                    return Err("the sixteen windows never went");
+                }
+                self.sleep(RETRY_NS);
+            }
+        }
+        // The notices of the buffers that came free are no part of the checks after this.
+        self.bits.set(0);
+        rt::println!(
+            "comp-probe: sixteen windows of three large buffers are attached and shown, again after they went, the seventeenth is refused"
+        );
+        Ok(())
+    }
+
     fn windows(self) -> Result<(), &'static str> {
         let display = self.display()?;
         let d = self.describe_when_ready(&display)?;
@@ -660,6 +733,7 @@ impl Probe<'_> {
             return Err("DESCRIBE does not say a free 640 by 400 screen");
         }
         rt::println!("comp-probe: the screen is 640x400, no window yet");
+        self.many(&display)?;
         // The refusals of WINDOW_CREATE.
         let outside = Rect { x: 400, ..FIRST };
         if self.create(&display, outside, FORMAT_XRGB8888).err()
@@ -715,7 +789,7 @@ impl Probe<'_> {
             }
         }
         let before = self.describe(&display).map_err(say("DESCRIBE"))?;
-        if before.open != 1 || before.created != 1 {
+        if before.open != 1 || before.created != MANY_CREATED + 1 {
             return Err("DESCRIBE does not count the window");
         }
         self.post(&window, 0, &[]).map_err(say("POST"))?;
@@ -881,7 +955,7 @@ impl Probe<'_> {
             return Err("the fifth window of a context was not refused");
         }
         let d = self.describe(&display).map_err(say("DESCRIBE"))?;
-        if d.open != 4 || d.created != 5 {
+        if d.open != 4 || d.created != MANY_CREATED + 5 {
             return Err("DESCRIBE does not count four windows");
         }
         rt::println!("comp-probe: a context has four windows at most");
@@ -1425,7 +1499,7 @@ impl Probe<'_> {
         let end = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
         loop {
             let d = self.describe_when_ready(&display)?;
-            if d.created >= 1 && d.open == 0 && d.busy == 0 {
+            if d.created >= MANY_CREATED + 5 && d.open == 0 && d.busy == 0 {
                 break;
             }
             if time::ticks_to_ns(time::now()) > end {

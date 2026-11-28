@@ -51,6 +51,7 @@
 
 use abi::{Access, Error, MESSAGE_MAX, Rights, Source};
 use compositor::frame::{self, Fire, Pacer, Wake};
+use compositor::mapping::{self, CHUNK, Pick, Wait};
 use compositor::prep::{self, Pass, Reads, Table};
 use compositor::{
     Band, Format, FrameKind, MAX_WINDOWS, Refusal, SCREEN, Scene, ScreenAsk, ScreenPhase,
@@ -110,10 +111,6 @@ const _: () = assert!(POOL_AT + POOL_LEN + PAGE <= CURSOR_AT);
 const PAGE: usize = 4096;
 /// The pages of the driver's frame buffer.
 const BUFFER_PAGES: usize = BUFFER_BYTES as usize / PAGE;
-/// The pages one step of the service maps or unmaps at most: a page costs
-/// the kernel about 200 ticks of a mapping and 80 of an unmapping, and a
-/// step stays under 16 500 (xtask).
-const CHUNK: usize = 32;
 /// The tries and the pause of the first OPEN of the driver.
 const OPEN_TRIES: u32 = 150;
 const OPEN_PAUSE_NS: u64 = 5_000_000;
@@ -159,6 +156,8 @@ const ARM: u64 = 8;
 /// The worker has let go of what it held, or drew something: the free of buffers
 /// that waited for it, the unmapping of windows, the images it published.
 const PREP: u64 = 16;
+/// The mapper thread did its order (`rt::mapper`).
+const MAPPED: u64 = 32;
 /// The events one READ of an input service asks for.
 const READ_MAX: u32 = 32;
 /// The codes of a start that failed, and of the driver's end.
@@ -199,16 +198,19 @@ fn is_scene(label: u64) -> bool {
 
 /// What a window holds besides what the scene decides: the objects of its
 /// buffers with the pages of each that are mapped (for reading, from the
-/// start, in chunks), the channel the client is told on, the FLUSH that
-/// waits for the frame in progress and the one that waits for the next. A
-/// window that went keeps its place, `dying`, until its pages are unmapped,
-/// a chunk a step.
+/// start, one call for a buffer), the channel the client is told on, the FLUSH
+/// that waits for the frame in progress and the one that waits for the next.
+/// A window that went keeps its place, `dying`, until its buffers are unmapped
+/// and no order of the mapper thread is for it.
 struct Extra {
     notify: Option<Handle<Channel>>,
     memory: [Option<Handle<Memory>>; proto_comp::BUFFERS],
-    /// The pages each buffer has, and the pages of them mapped so far.
+    /// The pages each buffer has, and the pages of them mapped: 0 or all.
     pages: [usize; proto_comp::BUFFERS],
     mapped: [usize; proto_comp::BUFFERS],
+    /// The level of the client that attached: the mapper thread works at it for the
+    /// window's mappings and unmappings.
+    level: u8,
     dying: bool,
     wait: Option<Pending>,
     queued: Option<Pending>,
@@ -221,6 +223,7 @@ impl Extra {
             memory: [const { None }; proto_comp::BUFFERS],
             pages: [0; proto_comp::BUFFERS],
             mapped: [0; proto_comp::BUFFERS],
+            level: 1,
             dying: false,
             wait: None,
             queued: None,
@@ -238,6 +241,35 @@ struct Attaching {
     bytes: u64,
     buffer: usize,
     pending: Pending,
+}
+
+/// The order the mapper thread has: the buffer of a window it maps or unmaps.
+#[derive(Clone, Copy)]
+struct Ordered {
+    slot: usize,
+    buffer: usize,
+    unmap: bool,
+    /// The pages the order maps or unmaps: the whole buffer.
+    pages: usize,
+}
+
+/// The pages one order maps of the `left` a buffer has to map. A buffer is one order; the break
+/// maps the pieces of 32 pages the step thread used to, one entry each.
+fn order_pages(left: usize) -> usize {
+    if cfg!(feature = "break-compositor-chunk-map") {
+        left.min(CHUNK)
+    } else {
+        left
+    }
+}
+
+/// The first page of the order that unmaps the last of `mapped` pages of a buffer.
+fn order_first(mapped: usize) -> usize {
+    if cfg!(feature = "break-compositor-chunk-map") {
+        (mapped - 1) / CHUNK * CHUNK
+    } else {
+        0
+    }
 }
 
 /// The pixels of the windows' buffers, as the mappings hold them.
@@ -275,11 +307,12 @@ fn window_bytes(scene: &Scene, window: usize, buffer: u8) -> &[u8] {
             buf_at(window, buffer as usize)
         };
         // SAFETY: a buffer is taken only once it is attached, and the
-        // reply of ATTACH comes after its last chunk is mapped read-only at
-        // this address, for at least `stride` times `h` bytes; the legacy
-        // buffer is mapped from the start. The mapping stays until the
-        // window has gone and a later step unmaps it, never in the middle
-        // of a band (one thread).
+        // reply of ATTACH comes after the mapper thread's last order is done
+        // (the buffer is mapped read-only at this address in one call, for at
+        // least `stride` times `h` bytes); the legacy buffer is mapped from
+        // the start. The mapping stays until the window has gone and the
+        // mapper thread unmaps it by an order a step gave after the worker
+        // let go of the window, never in the middle of a band (one thread).
         unsafe { slice::from_raw_parts(at as *const u8, len) }
     }
 }
@@ -301,6 +334,8 @@ static IMAGES: ImagePool = ImagePool(UnsafeCell::new([0; prep::POOL_BYTES]));
 static WORKER_STACK: rt::Stack<{ 64 * 1024 }> = rt::Stack::new();
 /// The page after the main thread's message buffer is the worker's.
 const WORKER_BUFFER: usize = rt::abi::INIT_MSGBUF as usize + 4096;
+/// The mapper thread's message buffer, the page after the worker's.
+const MAPPER_BUFFER: usize = rt::abi::INIT_MSGBUF as usize + 2 * 4096;
 /// The wait channel the worker receives on, the channel it tells the service's
 /// bit through, as raw handle numbers (the handles live in the service).
 static WORKER_WAIT: AtomicU64 = AtomicU64::new(0);
@@ -470,6 +505,9 @@ struct Compositor {
     primary: Option<Pipeline>,
     cleared: Option<usize>,
     attaching: Option<Attaching>,
+    /// The thread that maps and unmaps the windows' buffers, and the order it has.
+    mapper: Option<rt::mapper::Mapper>,
+    ordered: Option<Ordered>,
     /// The context of a manager that went: its windows are destroyed one a step
     /// (`reap_one`), so that eight windows do not make one long step.
     reaping: Option<u64>,
@@ -632,6 +670,8 @@ fn main(_: u64) -> u64 {
         primary: None,
         cleared: None,
         attaching: None,
+        mapper: None,
+        ordered: None,
         reaping: None,
         pacer: Pacer::new(now_ns(), period, cap),
         timer,
@@ -645,6 +685,12 @@ fn main(_: u64) -> u64 {
     // The worker starts here, before the first request: a thread is made at no
     // step of the service.
     service.start_worker();
+    // The mapper thread of the windows' buffers starts here, too.
+    service.mapper =
+        rt::mapper::Mapper::start(&service.process, &service.notify, MAPPED, MAPPER_BUFFER).ok();
+    if service.mapper.is_none() {
+        rt::println!("compositor: no thread for the windows' buffers, ATTACH is refused");
+    }
     // The image of the pointer's picture is made here, before the first band
     // the pointer is in.
     service.raster.prepare(
@@ -1772,8 +1818,8 @@ impl Compositor {
     // ------------------------------------------------------------ the windows
 
     /// The window at place `i` goes: what it waited for is refused
-    /// (PEER_CLOSED), its buffers are unmapped a chunk a step (the place is
-    /// `dying` until then), its buffer, if it is of the first revision, is
+    /// (PEER_CLOSED), its buffers are unmapped by the mapper thread (the place is
+    /// `dying` until the last one is done), its buffer, if it is of the first revision, is
     /// cleared a step at a time (its session of keyboard focus answers
     /// REVOKED from now on), and the place on the screen is shown again.
     fn destroy(&mut self, i: usize) {
@@ -1787,11 +1833,14 @@ impl Compositor {
         extra.notify = None;
         extra.wait = None;
         extra.queued = None;
-        if extra.mapped.iter().any(|&m| m != 0) {
+        // An order in flight for the window maps a buffer the window has not recorded yet.
+        let in_flight = self.ordered.is_some_and(|o| o.slot == i);
+        if in_flight || extra.mapped.iter().any(|&m| m != 0) {
             extra.dying = true;
         } else {
             *extra = Extra::new();
         }
+        self.steer_mapper();
         if w.legacy {
             self.released += 1;
         }
@@ -1828,20 +1877,75 @@ impl Compositor {
         self.phase.has_work()
             || self.cleared.is_some()
             || matches!(self.pool, PoolState::Mapping { .. })
-            || self.attaching.is_some()
             || self.reaping.is_some()
-            || self.unmappable().is_some()
+            || self.next_order().is_some()
     }
 
-    /// A dying window whose pages are to be unmapped: the worker is not reading it.
-    fn unmappable(&self) -> Option<usize> {
-        (0..MAX_WINDOWS).find(|&i| self.extra[i].dying && !self.scene.worker_reads(i))
+    /// The jobs that wait for the mapper thread: the dying windows with buffers to unmap
+    /// (the worker is not reading them) and the ATTACH in progress, each at the level of
+    /// its client.
+    fn mapper_waits(&self, waits: &mut [Wait; MAX_WINDOWS + 1]) -> usize {
+        let mut n = 0;
+        for i in 0..MAX_WINDOWS {
+            let e = &self.extra[i];
+            let in_flight = self.ordered.is_some_and(|o| o.slot == i);
+            if e.dying
+                && !in_flight
+                && e.mapped.iter().any(|&m| m != 0)
+                && !self.scene.worker_reads(i)
+            {
+                waits[n] = Wait {
+                    slot: i,
+                    level: e.level,
+                    dying: true,
+                };
+                n += 1;
+            }
+        }
+        if let Some(job) = &self.attaching {
+            waits[n] = Wait {
+                slot: job.slot,
+                level: self.extra[job.slot].level,
+                dying: false,
+            };
+            n += 1;
+        }
+        n
     }
 
-    /// One step of the work: a piece of the legacy buffer cleared, else a
-    /// chunk of a dying window's pages unmapped, else a chunk of the
-    /// buffers an ATTACH waits for mapped. The next is due by the service's
-    /// own bit.
+    /// The order the mapper thread gets now, if it has none and a job waits.
+    fn next_order(&self) -> Option<Pick> {
+        let mapper = self.mapper.as_ref()?;
+        let mut waits = [Wait {
+            slot: 0,
+            level: 1,
+            dying: false,
+        }; MAX_WINDOWS + 1];
+        let n = self.mapper_waits(&mut waits);
+        mapping::pick(!mapper.idle(), &waits[..n])
+    }
+
+    /// While the thread works on an order, the jobs that wait for it lend their level: it
+    /// is raised to the highest of them.
+    fn steer_mapper(&self) {
+        let Some(mapper) = self.mapper.as_ref().filter(|m| !m.idle()) else {
+            return;
+        };
+        let mut waits = [Wait {
+            slot: 0,
+            level: 1,
+            dying: false,
+        }; MAX_WINDOWS + 1];
+        let n = self.mapper_waits(&mut waits);
+        if let Some(level) = mapping::waiting_level(&waits[..n]) {
+            mapper.raise(level);
+        }
+    }
+
+    /// One step of the work: a piece of the legacy buffer cleared, else the next
+    /// order of the mapper thread given (a dying window's buffer to unmap, else the
+    /// buffer an ATTACH waits for). The thread's end of an order comes by its own
+    /// bit (`mapped`), so a step that waits for it is not asked for again.
     fn work(&mut self) {
         rt::service::step_own();
         rt::service::step_detail(STEP_WORK);
@@ -1868,10 +1972,8 @@ impl Compositor {
             }
         } else if matches!(self.pool, PoolState::Mapping { .. }) {
             self.map_pool_chunk();
-        } else if let Some(i) = self.unmappable() {
-            self.unmap_chunk(i);
-        } else if self.attaching.is_some() {
-            self.map_chunk();
+        } else if let Some(pick) = self.next_order() {
+            self.give_order(pick);
         }
         if self.has_work() {
             let _ = sys::notify(&self.notify, WORK);
@@ -1890,64 +1992,160 @@ impl Compositor {
         }
     }
 
-    /// The last chunk of the pages mapped of a dying window `i`.
-    fn unmap_chunk(&mut self, i: usize) {
-        let extra = &mut self.extra[i];
-        if let Some(b) = (0..proto_comp::BUFFERS).find(|&b| extra.mapped[b] != 0) {
-            let first = (extra.mapped[b] - 1) / CHUNK * CHUNK;
-            let pages = extra.mapped[b] - first;
-            // SAFETY: the chunk is one mapping this service made at this
-            // address, of these pages; no band reads a dying window.
-            let _ = unsafe {
-                sys::mem_unmap(
-                    &self.process,
-                    buf_at(i, b) + first * PAGE,
+    /// Gives the mapper thread the order `pick` chose.
+    fn give_order(&mut self, pick: Pick) {
+        let Some(mapper) = self.mapper.as_ref() else {
+            return;
+        };
+        match pick {
+            Pick::Unmap(i) => {
+                let extra = &mut self.extra[i];
+                let Some(b) = (0..proto_comp::BUFFERS).find(|&b| extra.mapped[b] != 0) else {
+                    return;
+                };
+                let first = order_first(extra.mapped[b]);
+                let pages = extra.mapped[b] - first;
+                match mapper.unmap(
+                    extra.level,
                     (pages * PAGE) as u64,
-                )
-            };
-            extra.mapped[b] = first;
-        }
-        if extra.mapped.iter().all(|&m| m == 0) {
-            *extra = Extra::new();
+                    buf_at(i, b) + first * PAGE,
+                ) {
+                    Ok(()) => {
+                        self.ordered = Some(Ordered {
+                            slot: i,
+                            buffer: b,
+                            unmap: true,
+                            pages,
+                        });
+                        // The break gives the place back at the first order.
+                        #[cfg(feature = "break-compositor-unmap-early")]
+                        {
+                            *extra = Extra::new();
+                        }
+                    }
+                    Err(error) => {
+                        // The mapping stays in its place, which no window takes any more
+                        // than its own; the place is given back.
+                        rt::println!("compositor: a buffer cannot be given back: {error:?}");
+                        extra.mapped[b] = 0;
+                        if extra.mapped.iter().all(|&m| m == 0) {
+                            *extra = Extra::new();
+                        }
+                    }
+                }
+            }
+            Pick::Attach => {
+                let Some(job) = &self.attaching else {
+                    return;
+                };
+                let (i, b) = (job.slot, job.buffer);
+                let extra = &self.extra[i];
+                let done = extra.mapped[b];
+                let pages = order_pages(extra.pages[b] - done);
+                let (offset, size) = ((done * PAGE) as u64, (pages * PAGE) as u64);
+                let at = buf_at(i, b) + done * PAGE;
+                // The break maps in the step, as a buffer of 256 pages that no order is.
+                #[cfg(feature = "break-compositor-map-on-step")]
+                {
+                    let outcome = match &extra.memory[b] {
+                        Some(memory) => {
+                            sys::mem_map(&self.process, memory, offset, size, at, Access::Read)
+                        }
+                        None => Err(Error::BadState),
+                    };
+                    self.ordered = Some(Ordered {
+                        slot: i,
+                        buffer: b,
+                        unmap: false,
+                        pages,
+                    });
+                    self.order_done(outcome);
+                }
+                #[cfg(not(feature = "break-compositor-map-on-step"))]
+                {
+                    let ordered = match &extra.memory[b] {
+                        Some(memory) => {
+                            mapper.map(extra.level, memory, offset, size, at, Access::Read)
+                        }
+                        None => Err(Error::BadState),
+                    };
+                    match ordered {
+                        Ok(()) => {
+                            self.ordered = Some(Ordered {
+                                slot: i,
+                                buffer: b,
+                                unmap: false,
+                                pages,
+                            })
+                        }
+                        Err(error) => self.attach_failed(i, error),
+                    }
+                }
+            }
         }
     }
 
-    /// A chunk of the buffer the ATTACH in progress is at; the last chunk
-    /// of the last buffer ends it.
-    fn map_chunk(&mut self) {
-        let Some(job) = &self.attaching else {
+    /// The ATTACH of window `i` ends with the status of `error`, and the window goes.
+    fn attach_failed(&mut self, i: usize, error: Error) {
+        rt::println!("compositor: a buffer could not be mapped: {error:?}");
+        if let Some(job) = self.attaching.take() {
+            let _ = job.pending.answer(
+                &proto_wire::reply(mapping::attach_status(error)),
+                Outgoing::new(),
+            );
+        }
+        self.destroy(i);
+    }
+
+    /// The mapper thread did its order: a buffer is mapped or unmapped. The last buffer of
+    /// the ATTACH in progress ends it; the last unmapping of a window that went gives its
+    /// place back.
+    fn mapped(&mut self) {
+        let Some(outcome) = self.mapper.as_ref().and_then(rt::mapper::Mapper::take) else {
             return;
         };
-        let (i, b) = (job.slot, job.buffer);
+        self.order_done(outcome);
+    }
+
+    /// The order the thread had ended with `outcome`.
+    fn order_done(&mut self, outcome: Result<(), Error>) {
+        let Some(done) = self.ordered.take() else {
+            return;
+        };
+        let (i, b) = (done.slot, done.buffer);
         let extra = &mut self.extra[i];
-        let done = extra.mapped[b];
-        let pages = CHUNK.min(extra.pages[b] - done);
-        let mapped = match &extra.memory[b] {
-            Some(memory) => sys::mem_map(
-                &self.process,
-                memory,
-                (done * PAGE) as u64,
-                (pages * PAGE) as u64,
-                buf_at(i, b) + done * PAGE,
-                Access::Read,
-            ),
-            None => Err(Error::BadState),
-        };
-        if let Err(error) = mapped {
-            rt::println!("compositor: a buffer could not be mapped: {error:?}");
-            if let Some(job) = self.attaching.take() {
-                let _ = job.pending.answer(
-                    &proto_wire::reply(proto_comp::code(proto_comp::INVALID)),
-                    Outgoing::new(),
-                );
+        if done.unmap {
+            if let Err(error) = outcome {
+                rt::println!("compositor: a buffer was not unmapped: {error:?}");
             }
-            self.destroy(i);
-            return;
+            extra.mapped[b] -= done.pages.min(extra.mapped[b]);
+        } else if let Err(error) = outcome {
+            if extra.dying {
+                // The window went while its buffer was being mapped.
+                if extra.mapped.iter().all(|&m| m == 0) {
+                    *extra = Extra::new();
+                }
+            } else {
+                self.attach_failed(i, error);
+            }
+        } else {
+            extra.mapped[b] += done.pages;
+            if !extra.dying && extra.mapped[b] == extra.pages[b] {
+                self.attach_next();
+            }
         }
-        extra.mapped[b] = done + pages;
-        if extra.mapped[b] < extra.pages[b] {
-            return;
+        let extra = &mut self.extra[i];
+        if extra.dying && extra.mapped.iter().all(|&m| m == 0) {
+            *extra = Extra::new();
         }
+        if self.has_work() {
+            let _ = sys::notify(&self.notify, WORK);
+        }
+    }
+
+    /// A buffer of the ATTACH in progress is mapped: the next one is ordered by the next step,
+    /// the last one ends the ATTACH with its reply.
+    fn attach_next(&mut self) {
         let Some(job) = self.attaching.as_mut() else {
             return;
         };
@@ -2295,10 +2493,13 @@ impl Compositor {
         if self.attaching.is_some() {
             return Answer::Status(proto_comp::code(proto_comp::BUSY));
         }
+        if self.mapper.is_none() {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        }
         let need = attach.bytes(w.rect.h);
         // The objects are looked at here, in this step; they are mapped a
-        // chunk of pages a step, and the reply waits for the last. All of an
-        // object is mapped: what it holds beyond the window's lines is the
+        // buffer at a time by the mapper thread, and the reply waits for the
+        // last. All of an object is mapped: what it holds beyond the window's lines is the
         // capacity the window can be resized to.
         let mut memory: [Option<Handle<Memory>>; proto_comp::BUFFERS] = [const { None }; 3];
         let mut pages = [0; proto_comp::BUFFERS];
@@ -2321,6 +2522,7 @@ impl Compositor {
         let extra = &mut self.extra[i];
         extra.memory = memory;
         extra.pages = pages;
+        extra.level = r.level().clamp(1, prep::LEVEL_MAX);
         self.attaching = Some(Attaching {
             slot: i,
             count: attach.count as u8,
@@ -2329,6 +2531,7 @@ impl Compositor {
             buffer: 0,
             pending,
         });
+        self.steer_mapper();
         let _ = sys::notify(&self.notify, WORK);
         Answer::Deferred
     }
@@ -3099,6 +3302,9 @@ impl Service<1> for Compositor {
         }
         if matches!(n.source, Source::Unlabeled) && n.bits & PREP != 0 {
             self.prep_done();
+        }
+        if matches!(n.source, Source::Unlabeled) && n.bits & MAPPED != 0 {
+            self.mapped();
         }
         match n.source {
             Source::Session if n.label & !GENERATION == KEYS => self.read_device(Which::Keys),
