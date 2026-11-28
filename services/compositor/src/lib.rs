@@ -61,9 +61,9 @@ use proto_comp::{
 use proto_gpu::{HEIGHT, LayerRow, STRIDE, WIDTH};
 
 /// The windows at once, and the windows of one context.
-pub const MAX_WINDOWS: usize = 8;
-// The places a mask of `u8` names (`Scene::create`).
-const _: () = assert!(MAX_WINDOWS <= 8);
+pub const MAX_WINDOWS: usize = 16;
+// The places a mask of `u16` names (`Scene::create`).
+const _: () = assert!(MAX_WINDOWS <= 16);
 pub const PER_CONTEXT: usize = 4;
 /// The most lines of one band of a frame (`Scene::tile` makes a band
 /// shorter where its layers cost more). A copy band over the whole width
@@ -816,7 +816,7 @@ impl Default for Ring {
 /// windows by place (bit `i`) and the manager.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Delivered {
-    pub windows: u8,
+    pub windows: u16,
     pub manager: bool,
 }
 
@@ -927,7 +927,7 @@ struct Stage {
     /// What the last taking gave back: the buffer of each window, and the
     /// windows of the first revision whose FLUSH is answered.
     given: [Option<u8>; MAX_WINDOWS],
-    answered: u8,
+    answered: u16,
 }
 
 impl Stage {
@@ -954,7 +954,7 @@ pub struct GivenBack {
     /// window no element shows had as its current one before it posted.
     pub freed: [Option<u8>; MAX_WINDOWS],
     /// The windows of the first revision whose FLUSH has its answer, by place.
-    pub answered: u8,
+    pub answered: u16,
 }
 
 /// The bits a scene session's channel is told by (`Scene::scene_bits`).
@@ -1290,7 +1290,7 @@ impl Scene {
         ctx: u64,
         rect: Rect,
         legacy: bool,
-        taken: u8,
+        taken: u16,
     ) -> Result<usize, Refusal> {
         if !rect.within(WIDTH, HEIGHT) {
             return Err(Refusal::Invalid);
@@ -2320,7 +2320,7 @@ impl Scene {
             }
         }
         let d = clipped.bounds()?;
-        let mut first = 0u8;
+        let mut first = 0u16;
         for (i, w) in self.windows.iter_mut().enumerate() {
             let Some(w) = w else {
                 continue;
@@ -2543,12 +2543,13 @@ impl Scene {
     /// estimate counts every window that touches the damage, the ones under a
     /// covering window too, so it never falls short.
     pub fn tile(&self, damage: Rect) -> (u32, u32) {
-        let passes = self.working().map(|def| self.passes(def, damage));
+        let passes = self.layer_groups(damage);
         self.tile_with(damage, passes.as_ref())
     }
 
-    /// `tile` with the groups of the frame's layers (`passes`) already made: they
-    /// are the working scene's over `damage`, or none for no scene.
+    /// `tile` with the groups of the frame's layers (`layer_groups`) already
+    /// made: they are the working scene's over `damage`, those of the windows
+    /// when more than WINDOW_GROUPS_ABOVE show over it, or none.
     pub fn tile_with(&self, damage: Rect, passes: Option<&Passes>) -> (u32, u32) {
         let touches = |r: Rect| {
             r.x < damage.x + damage.w
@@ -2713,7 +2714,107 @@ impl Scene {
         }
         plan
     }
+
+    /// The groups of the layers of a frame over `damage`: the working scene's
+    /// (`passes`), or, with no scene, the shown windows' (`window_passes`) when
+    /// more than WINDOW_GROUPS_ABOVE of them touch the damage; None otherwise.
+    pub fn layer_groups(&self, damage: Rect) -> Option<Passes> {
+        match self.working() {
+            Some(def) => Some(self.passes(def, damage)),
+            None => self.window_passes(damage),
+        }
+    }
+
+    /// The groups of the shown windows over `damage` when no scene is working
+    /// and more than WINDOW_GROUPS_ABOVE of the windows touch it (up to that many
+    /// the windows are one band's layers, `tile_with`). The windows go in the
+    /// order of depth by the rule of `passes`: the topmost opaque window that
+    /// covers the damage whole is the base, the windows under it are not drawn,
+    /// and when no opaque window covers the damage the black is group 0; each
+    /// window that touches the damage is a layer (a copy of an XRGB8888 window, a
+    /// laying over of an ARGB8888 one, and the term of a layer) that joins the
+    /// open group while the group's calls stay within GROUP_CALLS; the pointer's
+    /// picture, when the frame draws it, is the last group. A step pays
+    /// ELEMENT_TERM for every shown window (`Passes::elements`). The groups name
+    /// the windows by place (`Passes::group_of`), so a window that moves in the
+    /// order of depth while the place is walked stays in its group.
+    pub fn window_passes(&self, damage: Rect) -> Option<Passes> {
+        let touches = |r: Rect| {
+            r.x < damage.x + damage.w
+                && damage.x < r.x + r.w
+                && r.y < damage.y + damage.h
+                && damage.y < r.y + r.h
+        };
+        // The shown windows that touch the damage, counted before the windows are
+        // put in order: up to WINDOW_GROUPS_ABOVE they are one band's layers.
+        let over = self
+            .windows
+            .iter()
+            .flatten()
+            .filter(|w| Scene::shown(w) && touches(w.rect))
+            .count();
+        if over <= WINDOW_GROUPS_ABOVE {
+            return None;
+        }
+        let (order, n) = self.order();
+        let mut plan = Passes::EMPTY;
+        plan.windows = true;
+        plan.elements = n as u32;
+        let base = order[..n].iter().rposition(|&k| {
+            self.windows[usize::from(k)]
+                .is_some_and(|w| w.format == Format::Xrgb && covers_rect(w.rect, damage))
+        });
+        if base.is_none() {
+            plan.groups = 1;
+            plan.black = true;
+            plan.cost[0] = GroupCost::of(FILL, 0, damage);
+        }
+        let mut open: Option<usize> = None;
+        for &k in &order[base.unwrap_or(0)..n] {
+            let Some(w) = self.windows[usize::from(k)] else {
+                continue;
+            };
+            if !touches(w.rect) {
+                continue;
+            }
+            let price = if w.format == Format::Argb {
+                OVER
+            } else {
+                OPAQUE
+            };
+            let at = match open {
+                Some(g) if plan.cost[g].calls + price.call + LAYER <= GROUP_CALLS => g,
+                _ => {
+                    plan.groups += 1;
+                    plan.groups - 1
+                }
+            };
+            open = Some(at);
+            plan.group[usize::from(k)] = at as u8;
+            plan.members[at] |= 1 << k;
+            plan.placed[usize::from(k)] = w.rect;
+            plan.cost[at].add(price, LAYER, intersect(w.rect, damage));
+        }
+        if let Some(c) = self
+            .drawn_pointer()
+            .map(Scene::cursor_rect)
+            .filter(|&c| touches(c))
+        {
+            plan.pointer = plan.groups as u8;
+            plan.cost[plan.groups] = GroupCost::of(OVER, LAYER, intersect(c, damage));
+            plan.groups += 1;
+        }
+        Some(plan)
+    }
 }
+
+/// The most windows over a damage that make one band's layers; more are drawn in
+/// groups (`Scene::window_passes`).
+pub const WINDOW_GROUPS_ABOVE: usize = 8;
+
+// The groups name windows by place in the arrays of the elements' groups, and
+// the black and the pointer's picture add two groups.
+const _: () = assert!(MAX_WINDOWS <= MAX_ELEMENTS);
 
 /// The calls of a group of layers (ticks): what a step may spend on its calls
 /// and the terms of its layers before the rows and the points, half of the
@@ -2808,20 +2909,30 @@ impl GroupCost {
     }
 }
 
-/// The groups of layers of a frame (`Scene::passes`): the group of each element
-/// of the working scene and of the pointer's picture, and what each group costs
-/// by the model.
+/// The groups of layers of a frame (`Scene::passes`, `Scene::window_passes`): the
+/// group of each element of the working scene (or of each window by place, with
+/// no scene) and of the pointer's picture, and what each group costs by the
+/// model.
 #[derive(Clone, Copy, Debug)]
 pub struct Passes {
     group: [u8; MAX_ELEMENTS],
     pointer: u8,
     /// Whether group 0 is the black over the damage.
     black: bool,
+    /// Whether the layers are the shown windows (`group` is by place) and not the
+    /// elements of a scene.
+    windows: bool,
+    /// For the groups of windows: the rectangle each window had when the groups
+    /// were made, by place. The costs of the groups were charged on these
+    /// widths, so a step draws a window on its planned rectangle cut to its
+    /// current one (a window that moved meanwhile is repaired by the next frame,
+    /// its move damaged the old place and the new).
+    placed: [Rect; MAX_ELEMENTS],
     pub groups: usize,
     pub cost: [GroupCost; MAX_ELEMENTS + 2],
     /// The elements of the scene: each is a term of every step (`ELEMENT_TERM`).
     pub elements: u32,
-    /// The elements of each group, a bit each.
+    /// The elements of each group, a bit each (the places of the windows).
     members: [u16; MAX_ELEMENTS + 2],
     /// The groups that are one element drawn in two steps for each band (the
     /// product of its mask and alpha, then the element).
@@ -2833,6 +2944,13 @@ impl Passes {
         group: [NO_GROUP; MAX_ELEMENTS],
         pointer: NO_GROUP,
         black: false,
+        windows: false,
+        placed: [Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        }; MAX_ELEMENTS],
         groups: 0,
         cost: [GroupCost::EMPTY; MAX_ELEMENTS + 2],
         elements: 0,
@@ -2849,7 +2967,8 @@ impl Passes {
         band_size_of(calls, c)
     }
 
-    /// The group of element `k` of the scene, if it draws over the damage.
+    /// The group of element `k` of the scene (of the window at place `k` for
+    /// the groups of windows), if it draws over the damage.
     pub fn group_of(&self, k: usize) -> Option<usize> {
         Some(usize::from(self.group[k])).filter(|&g| g != usize::from(NO_GROUP))
     }
@@ -2864,7 +2983,7 @@ impl Passes {
         self.two_step[g]
     }
 
-    /// The elements in group `g`.
+    /// The elements (the windows) in group `g`.
     pub fn members_of(&self, g: usize) -> usize {
         self.members[g].count_ones() as usize
     }
@@ -3515,12 +3634,13 @@ pub fn compose(
 }
 
 /// The groups of the layers of a frame over `damage` (`Scene::passes` of the
-/// working scene), None with no scene. The caller of a place makes them once
+/// working scene, or `Scene::window_passes` with no scene), None when the
+/// windows are one band's layers. The caller of a place makes them once
 /// and gives them to every `compose_planned` of the place: the place walks one
 /// set of groups however the windows change in the middle of it (a window
 /// that goes draws nothing in its group; `at.pass` keeps its meaning).
 pub fn plan(scene: &Scene, damage: Rect) -> Option<Passes> {
-    scene.working().map(|def| scene.passes(def, damage))
+    scene.layer_groups(damage)
 }
 
 /// `compose` with the groups of the place made by `plan` (None with no scene).
@@ -3791,6 +3911,97 @@ pub fn compose_sized(
     compose_with(scene, damage, at, size, passes.as_ref(), fb, src, raster)
 }
 
+/// The window at place `k` laid on the band `band` of the frame: the part of
+/// its current buffer the band holds, nothing when it has none.
+fn draw_window(
+    scene: &Scene,
+    k: u8,
+    band: Rect,
+    fb: &mut [u8],
+    src: &impl Source,
+    raster: &mut impl Raster,
+) {
+    let Some(w) = scene.window(k as usize).copied() else {
+        return;
+    };
+    let Some(b) = w.current else {
+        return;
+    };
+    let (wx0, wx1) = (
+        band.x.max(w.rect.x),
+        (band.x + band.w).min(w.rect.x + w.rect.w),
+    );
+    let (wy0, wy1) = (
+        band.y.max(w.rect.y),
+        (band.y + band.h).min(w.rect.y + w.rect.h),
+    );
+    if wx0 >= wx1 || wy0 >= wy1 {
+        return;
+    }
+    raster.blit(
+        fb,
+        src.pixels(k as usize, b),
+        w.stride,
+        w.format,
+        (w.rect.w, w.rect.h),
+        (wx0 - w.rect.x, wy0 - w.rect.y),
+        (wx0, wy0),
+        (wx1 - wx0, wy1 - wy0),
+        w.format == Format::Argb,
+        image_of(k as usize, b),
+    );
+}
+
+/// The step of the band `band` of group `pass` of the groups of windows
+/// (`Scene::window_passes`). The black group fills the band. In a group
+/// of windows the topmost opaque window of the group that covers the band whole
+/// by its planned rectangle is its base, and the windows of the group above it lie over it in the order of
+/// depth. The pointer's group draws no window (`compose_with` draws the picture).
+fn compose_windows(
+    scene: &Scene,
+    passes: &Passes,
+    pass: usize,
+    band: Rect,
+    fb: &mut [u8],
+    src: &impl Source,
+    raster: &mut impl Raster,
+) {
+    if passes.is_black(pass) {
+        raster.black(fb, band);
+        return;
+    }
+    let (order, n) = scene.order();
+    // The planned rectangle of a window of this group that touches the band, cut
+    // to the band: what the group's price was charged for.
+    let part = |k: u8| {
+        if passes.group_of(usize::from(k)) != Some(pass) {
+            return None;
+        }
+        let r = passes.placed[usize::from(k)];
+        let touches = r.x < band.x + band.w
+            && band.x < r.x + r.w
+            && r.y < band.y + band.h
+            && band.y < r.y + r.h;
+        touches.then(|| intersect(r, band))
+    };
+    let covers = |k: u8| {
+        scene
+            .window(k as usize)
+            .is_some_and(|w| w.format == Format::Xrgb)
+            && passes.placed[usize::from(k)].x <= band.x
+            && passes.placed[usize::from(k)].y <= band.y
+            && passes.placed[usize::from(k)].x + passes.placed[usize::from(k)].w >= band.x + band.w
+            && passes.placed[usize::from(k)].y + passes.placed[usize::from(k)].h >= band.y + band.h
+            && part(k).is_some()
+    };
+    let base = order[..n].iter().rposition(|&k| covers(k)).unwrap_or(0);
+    for &k in &order[base..n] {
+        if let Some(cut) = part(k) {
+            draw_window(scene, k, cut, fb, src, raster);
+        }
+    }
+}
+
 /// `compose_sized` with the groups of the layers (`Scene::passes`) of the working
 /// scene over `damage` made by the caller (None with no scene).
 #[allow(clippy::too_many_arguments)]
@@ -3814,7 +4025,8 @@ fn compose_with(
     // The rectangle this band walks: the group's under a scene, the damage
     // otherwise.
     let groups = match (scene.working(), passes) {
-        (Some(def), Some(plan)) => Some((def, plan)),
+        (_, Some(plan)) if plan.windows => Some((None, plan)),
+        (Some(def), Some(plan)) => Some((Some(def), plan)),
         _ => None,
     };
     let walk = match groups {
@@ -3842,7 +4054,12 @@ fn compose_with(
     let mut pointer_now = true;
     let mut product = Product::None;
     if let Some((def, passes)) = groups {
-        product = compose_elements(scene, def, passes, group, phase, band, fb, src, raster);
+        match def {
+            Some(def) => {
+                product = compose_elements(scene, def, passes, group, phase, band, fb, src, raster);
+            }
+            None => compose_windows(scene, passes, group, band, fb, src, raster),
+        }
         // The pointer's picture is the last group, drawn in the steps of it.
         pointer_now = passes.pointer_group() == Some(group);
     } else {
@@ -3859,40 +4076,10 @@ fn compose_with(
             })
         });
         if base.is_none() {
-            raster.black(
-                fb,
-                Rect {
-                    x: x0,
-                    y: y0,
-                    w: x1 - x0,
-                    h: y1 - y0,
-                },
-            );
+            raster.black(fb, band);
         }
         for &k in &order[base.unwrap_or(0)..n] {
-            let Some(w) = window(k) else {
-                continue;
-            };
-            let Some(b) = w.current else {
-                continue;
-            };
-            let (wx0, wx1) = (x0.max(w.rect.x), x1.min(w.rect.x + w.rect.w));
-            let (wy0, wy1) = (y0.max(w.rect.y), y1.min(w.rect.y + w.rect.h));
-            if wx0 >= wx1 || wy0 >= wy1 {
-                continue;
-            }
-            raster.blit(
-                fb,
-                src.pixels(k as usize, b),
-                w.stride,
-                w.format,
-                (w.rect.w, w.rect.h),
-                (wx0 - w.rect.x, wy0 - w.rect.y),
-                (wx0, wy0),
-                (wx1 - wx0, wy1 - wy0),
-                w.format == Format::Argb,
-                image_of(k as usize, b),
-            );
+            draw_window(scene, k, band, fb, src, raster);
         }
     }
     if let Some(p) = scene.drawn_pointer().filter(|_| pointer_now) {
@@ -4093,13 +4280,17 @@ mod tests {
             s.create(9, 7, rect(0, 0, 10, 10), false, 0),
             Err(Refusal::Limit)
         );
-        // Another context has its own share, until the table is full.
-        for k in 0..(MAX_WINDOWS - PER_CONTEXT) as u64 {
-            s.create(100 + k, 8, rect(0, 0, 10, 10), false, 0).unwrap();
+        // Other contexts have their own shares, until the table is full.
+        for ctx in 8..(8 + (MAX_WINDOWS / PER_CONTEXT - 1) as u64) {
+            for k in 0..PER_CONTEXT as u64 {
+                s.create(100 * ctx + k, ctx, rect(0, 0, 10, 10), false, 0)
+                    .unwrap();
+            }
         }
         assert_eq!(
-            s.create(200, 9, rect(0, 0, 10, 10), false, 0),
-            Err(Refusal::Limit)
+            s.create(200, 99, rect(0, 0, 10, 10), false, 0),
+            Err(Refusal::Limit),
+            "the 17th window"
         );
         assert_eq!(s.open(), MAX_WINDOWS as u32);
         assert_eq!(s.created(), MAX_WINDOWS as u32);
@@ -4115,12 +4306,64 @@ mod tests {
         let b = s.create(2, 1, rect(0, 0, 8, 8), false, 0b1).unwrap();
         assert_eq!(b, 1);
         assert_eq!(s.create(3, 1, rect(0, 0, 8, 8), false, 0b11).unwrap(), 2);
-        let all = u8::MAX;
+        let all = u16::MAX;
         assert_eq!(
             s.create(4, 2, rect(0, 0, 8, 8), false, all),
             Err(Refusal::Limit)
         );
         assert_eq!(s.create(5, 2, rect(0, 0, 8, 8), false, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn sixteen_windows_from_four_contexts_fill_the_places_and_a_dying_high_place_is_skipped() {
+        let mut s = Scene::new();
+        for k in 0..MAX_WINDOWS {
+            let ctx = (k % 4) as u64 + 1;
+            let i = s.create(k as u64, ctx, rect(0, 0, 8, 8), false, 0).unwrap();
+            assert_eq!(i, k, "the places are given in turn");
+        }
+        // The fifth window of a context is Limit, and so is the 17th window.
+        assert_eq!(
+            s.create(50, 1, rect(0, 0, 8, 8), false, 0),
+            Err(Refusal::Limit)
+        );
+        assert_eq!(
+            s.create(51, 5, rect(0, 0, 8, 8), false, 0),
+            Err(Refusal::Limit)
+        );
+        // Places 9 and 15 go; 9 is still dying (its bit is `taken`), 15 is free.
+        s.destroy(9);
+        s.destroy(15);
+        let b = s.create(60, 2, rect(0, 0, 8, 8), false, 1 << 9).unwrap();
+        assert_eq!(b, 15, "place 9 is skipped while it is taken");
+        let id = s.window(b).unwrap().id;
+        assert_eq!(proto_comp::id_place(id), 15);
+        assert_eq!(s.create(61, 4, rect(0, 0, 8, 8), false, 0).unwrap(), 9);
+        let id = s.window(9).unwrap().id;
+        assert_eq!(proto_comp::id_place(id), 9);
+        assert_eq!(proto_comp::id_generation(id), 2);
+    }
+
+    #[test]
+    fn the_generation_wraps_at_place_15() {
+        let mut s = Scene::new();
+        for k in 0..MAX_WINDOWS {
+            s.create(
+                k as u64,
+                1 + (k / PER_CONTEXT) as u64,
+                rect(0, 0, 8, 8),
+                false,
+                0,
+            )
+            .unwrap();
+        }
+        s.destroy(15);
+        s.made[15] = proto_comp::ID_GENERATION_MAX;
+        let i = s.create(99, 4, rect(0, 0, 8, 8), false, 0).unwrap();
+        assert_eq!(i, 15);
+        let id = s.window(i).unwrap().id;
+        assert_eq!(proto_comp::id_place(id), 15);
+        assert_eq!(proto_comp::id_generation(id), 1);
     }
 
     #[test]
@@ -4995,6 +5238,8 @@ mod tests {
         calls: u32,
         /// Hundredths of a tick.
         centi: u32,
+        /// The layers laid (the copies and the layings over, the pointer's too).
+        layers: u32,
     }
 
     impl Cost {
@@ -5024,6 +5269,7 @@ mod tests {
         ) {
             let p = if over { OVER } else { OPAQUE };
             self.calls += p.call;
+            self.layers += 1;
             self.centi += p.row * area.1 + p.point * area.0 * area.1;
         }
 
@@ -5437,7 +5683,7 @@ mod tests {
     fn eight_translucent_windows_make_bands_within_the_band_ticks() {
         let mut s = Scene::new();
         let mut src = flat(&[]);
-        for k in 0..MAX_WINDOWS {
+        for k in 0..8 {
             let i = s
                 .create(k as u64 + 1, 1 + (k / PER_CONTEXT) as u64, SCREEN, false, 0)
                 .unwrap();
@@ -5453,6 +5699,261 @@ mod tests {
             worst <= BAND_TICKS,
             "a band of {worst} ticks by the model, {bands} bands"
         );
+    }
+
+    /// Sixteen windows over the whole screen, from four contexts, ARGB8888 when
+    /// `argb(k)`, each of the value `value(k)` in every byte, posted and shown:
+    /// the scene, the sources and the damage.
+    fn sixteen(
+        argb: impl Fn(usize) -> bool,
+        rect_of: impl Fn(usize) -> Rect,
+        value: impl Fn(usize) -> u8,
+    ) -> (Scene, Flat, Rect) {
+        let mut s = Scene::new();
+        let mut src = flat(&[]);
+        for k in 0..MAX_WINDOWS {
+            let r = rect_of(k);
+            let i = s
+                .create(k as u64 + 1, 1 + (k / PER_CONTEXT) as u64, r, false, 0)
+                .unwrap();
+            if argb(k) {
+                s.set_format(i, Format::Argb);
+            }
+            s.attach(i, 1, r.w * 4).unwrap();
+            src.0[i * BUFFERS] = vec![value(k); (r.w * 4 * r.h) as usize];
+            s.post(i, 0, &[]).unwrap();
+        }
+        let d = s.begin().unwrap();
+        s.end(true);
+        (s, src, d)
+    }
+
+    /// The bands of the frame over `d` by the model, each with the terms a
+    /// step pays beyond its operations (the layers, the term of every shown
+    /// window, the step and the fixed term of a band): the greatest, and the count.
+    fn worst_step(s: &Scene, d: Rect, src: &impl Source) -> (u32, u32) {
+        let plan = plan(s, d);
+        let shown = s.order().1 as u32;
+        let mut fb = screen();
+        let mut at = Band {
+            row: d.y,
+            col: 0,
+            pass: 0,
+        };
+        let (mut worst, mut bands) = (0, 0);
+        while at.row < d.y + d.h {
+            let mut cost = Cost::default();
+            at = compose_planned(s, d, at, plan.as_ref(), &mut fb, src, &mut cost);
+            let terms = LAYER * cost.layers + ELEMENT_TERM * shown + SCENE_STEP + BAND_FIXED;
+            worst = worst.max(cost.calls + cost.ticks() + terms);
+            bands += 1;
+        }
+        (worst, bands)
+    }
+
+    #[test]
+    fn sixteen_translucent_windows_are_drawn_in_groups_each_within_the_band_ticks() {
+        let (s, src, d) = sixteen(|_| true, |_| SCREEN, |_| 0x10);
+        assert_eq!(s.open(), 16);
+        let plan = plan(&s, d).expect("more than eight layers make groups");
+        // The black is group 0, the windows follow, in groups of calls within
+        // GROUP_CALLS each (one layer alone may pass it, none here does).
+        assert!(plan.is_black(0));
+        assert!(plan.groups >= 3, "{} groups", plan.groups);
+        let mut layers = 0;
+        for g in 1..plan.groups {
+            assert!(plan.cost[g].calls <= GROUP_CALLS, "group {g}");
+            layers += plan.members_of(g);
+        }
+        assert_eq!(layers, 16);
+        // Without groups the calls of 16 layers alone pass the band.
+        const { assert!(16 * (OVER.call + LAYER) > BAND_TICKS) };
+        let (worst, bands) = worst_step(&s, d, &src);
+        assert!(
+            worst <= BAND_TICKS,
+            "a band of {worst} ticks by the model, {bands} bands"
+        );
+        // The size the frame's bound uses is that of the smallest group.
+        let (w, rows) = s.tile(d);
+        assert!(w >= 1 && rows >= 1);
+    }
+
+    #[test]
+    fn a_window_that_moves_in_the_middle_of_a_place_keeps_the_band_within_the_ticks() {
+        let mut s = Scene::new();
+        let mut src = flat(&[]);
+        let d = rect(0, 0, 200, 100);
+        // One layer over the whole damage and eight of 200 by 100 that lie mostly
+        // beyond its right edge, so the plan charges them on 10 points a line.
+        let mut places = Vec::new();
+        for k in 0..9 {
+            let r = if k == 0 {
+                rect(0, 0, 200, 100)
+            } else {
+                rect(190, 0, 200, 100)
+            };
+            let i = s
+                .create(k as u64 + 1, 1 + (k / PER_CONTEXT) as u64, r, false, 0)
+                .unwrap();
+            s.set_format(i, Format::Argb);
+            s.attach(i, 1, r.w * 4).unwrap();
+            src.0[i * BUFFERS] = vec![0x10; (r.w * 4 * r.h) as usize];
+            s.post(i, 0, &[]).unwrap();
+            places.push(i);
+        }
+        s.begin().unwrap();
+        s.end(true);
+        let plan = plan(&s, d).expect("nine windows make groups");
+        let steady = |s: &Scene| {
+            let mut fb = screen();
+            let mut at = Band {
+                row: d.y,
+                col: 0,
+                pass: 0,
+            };
+            let mut worst = 0;
+            while at.row < d.y + d.h {
+                let mut cost = Cost::default();
+                at = compose_planned(s, d, at, Some(&plan), &mut fb, &src, &mut cost);
+                let terms = LAYER * cost.layers + ELEMENT_TERM * 9 + SCENE_STEP + BAND_FIXED;
+                worst = worst.max(cost.calls + cost.ticks() + terms);
+            }
+            worst
+        };
+        assert!(steady(&s) <= BAND_TICKS);
+        // The eight move to the left edge in the middle of the place: the plan is
+        // the same, and a band is still within the ticks.
+        for &i in &places[1..] {
+            s.move_to(i, 0, 0).unwrap();
+        }
+        let worst = steady(&s);
+        assert!(
+            worst <= BAND_TICKS,
+            "a band of {worst} ticks after the move"
+        );
+    }
+
+    #[test]
+    fn eight_windows_over_a_damage_make_no_groups_and_the_nine_do() {
+        let mut s = Scene::new();
+        let mut src = flat(&[]);
+        let mut place = Vec::new();
+        for k in 0..9 {
+            let i = s
+                .create(k as u64 + 1, 1 + (k / PER_CONTEXT) as u64, SCREEN, false, 0)
+                .unwrap();
+            s.set_format(i, Format::Argb);
+            s.attach(i, 1, 2560).unwrap();
+            src.0[i * BUFFERS] = vec![0x10; 2560 * 400];
+            place.push(i);
+            if k < 8 {
+                s.post(i, 0, &[]).unwrap();
+            }
+        }
+        s.begin().unwrap();
+        s.end(true);
+        assert!(s.window_passes(SCREEN).is_none(), "eight windows");
+        assert!(plan(&s, SCREEN).is_none());
+        // The tile of the eight is the one band of their layers (as before).
+        let one = s.tile(SCREEN);
+        s.post(place[8], 0, &[]).unwrap();
+        s.begin().unwrap();
+        s.end(true);
+        assert!(s.window_passes(SCREEN).is_some(), "nine windows");
+        // A damage that only one window touches stays one band's layers.
+        let (s2, _, _) = sixteen(|_| true, |k| rect(10 + 40 * k as u32, 10, 30, 30), |_| 0x10);
+        assert!(s2.window_passes(rect(10, 10, 30, 30)).is_none());
+        assert!(one.1 >= 1);
+    }
+
+    #[test]
+    fn the_windows_under_an_opaque_cover_are_in_no_group() {
+        let mut s = Scene::new();
+        let mut src = flat(&[]);
+        let mut places = Vec::new();
+        for k in 0..12 {
+            let i = s
+                .create(k as u64 + 1, 1 + (k / PER_CONTEXT) as u64, SCREEN, false, 0)
+                .unwrap();
+            if k != 5 {
+                s.set_format(i, Format::Argb);
+            }
+            s.attach(i, 1, 2560).unwrap();
+            src.0[i * BUFFERS] = vec![0x10 + k as u8; 2560 * 400];
+            s.post(i, 0, &[]).unwrap();
+            places.push(i);
+        }
+        s.begin().unwrap();
+        s.end(true);
+        let plan = plan(&s, SCREEN).unwrap();
+        assert!(!plan.is_black(0), "an opaque window covers the damage");
+        for &i in &places[..5] {
+            assert_eq!(plan.group_of(i), None, "window {i} is under the cover");
+        }
+        for &i in &places[5..] {
+            assert!(plan.group_of(i).is_some(), "window {i} is drawn");
+        }
+        // Nothing under the cover is read: its buffers are empty in `src`.
+        let mut fb = screen();
+        let mut under = src;
+        for &i in &places[..5] {
+            under.0[i * BUFFERS].clear();
+        }
+        let n = draw(&s, SCREEN, &mut fb, &under);
+        assert!(n >= 1);
+    }
+
+    /// The frame over `d` in one step of every band, the windows' layers of one
+    /// band each (the picture the groups must make).
+    fn one_step(s: &Scene, d: Rect, src: &impl Source) -> Vec<u8> {
+        let mut fb = screen();
+        let mut at = Band {
+            row: d.y,
+            col: 0,
+            pass: 0,
+        };
+        while at.row < d.y + d.h {
+            at = compose_with(s, d, at, (640, 16), None, &mut fb, src, &mut Plain);
+        }
+        fb
+    }
+
+    #[test]
+    fn the_groups_of_sixteen_overlapping_windows_draw_the_picture_of_one_step() {
+        let (mut s, src, d) = sixteen(
+            |k| k % 3 != 0,
+            |k| {
+                rect(
+                    20 + 30 * (k as u32 % 8),
+                    10 + 40 * (k as u32 / 8) + 9 * (k as u32 % 5),
+                    260 + 7 * k as u32,
+                    170,
+                )
+            },
+            |k| 0x15 + 0x0B * k as u8,
+        );
+        s.pointer_to(300, 120);
+        let whole = SCREEN;
+        let plan = plan(&s, whole).expect("groups");
+        assert!(plan.groups >= 3);
+        assert!(plan.pointer_group() == Some(plan.groups - 1));
+        let one = one_step(&s, whole, &src);
+        let mut grouped = screen();
+        let n = draw(&s, whole, &mut grouped, &src);
+        assert!(n > 1);
+        assert!(
+            grouped == one,
+            "the groups drew another picture than one step"
+        );
+        // Something was drawn: not the 0xEE of the empty target.
+        assert!(grouped.iter().any(|&b| b != 0xEE));
+        // A damage that cuts through them, too.
+        let cut = rect(100, 60, 333, 120);
+        let one = one_step(&s, cut, &src);
+        let mut grouped = screen();
+        draw(&s, cut, &mut grouped, &src);
+        assert!(grouped == one, "the cut damage differs");
+        let _ = d;
     }
 
     #[test]
@@ -6104,7 +6605,7 @@ mod tests {
         let mut src = flat(&[]);
         // Eight windows, opaque and with an alpha in turn, staggered over
         // one another, two contexts of four.
-        for k in 0..MAX_WINDOWS {
+        for k in 0..8 {
             let r = rect(100 + 7 * k as u32, 100 + 5 * k as u32, 300, 200);
             let i = s
                 .create(k as u64 + 1, 1 + (k / PER_CONTEXT) as u64, r, false, 0)
@@ -6754,6 +7255,35 @@ mod tests {
         assert!(s.damaged());
         s.begin();
         assert_eq!(s.given_back().answered, 1 << a);
+    }
+
+    #[test]
+    fn the_masks_of_delivered_rings_and_answered_flushes_carry_the_places_8_to_15() {
+        let mut s = Scene::new();
+        // Nine windows take the places 0 to 8; the window of the first revision
+        // takes place 9 and a window of the second revision place 10.
+        for k in 0..9 {
+            let r = rect(0, 0, 8, 8);
+            s.create(k as u64, 1 + (k / PER_CONTEXT) as u64, r, false, 0)
+                .unwrap();
+        }
+        let a = s.create(100, 4, SCREEN, true, 0).unwrap();
+        let b = make(&mut s, 101, 5, rect(0, 0, 100, 50), 1);
+        assert_eq!((a, b), (9, 10));
+        s.flush(a, SCREEN).unwrap();
+        s.scene_commit(&commit(ACTIVE, 0, &[element(b, 0, 0, 100, 50)]))
+            .unwrap();
+        s.flush(a, SCREEN).unwrap();
+        s.post(b, 0, &[]).unwrap();
+        s.begin().unwrap();
+        let given = s.given_back();
+        assert_eq!(given.answered, 1 << 9, "the FLUSH of place 9 is answered");
+        // A ring told at a place above 7.
+        let c = make(&mut s, 102, 5, rect(10, 10, 20, 20), 1);
+        assert_eq!(c, 11);
+        s.delivered();
+        s.tell(c, Event::new(FOCUS_IN, 0, 0));
+        assert_eq!(s.delivered().windows, 1 << 11);
     }
 
     #[test]

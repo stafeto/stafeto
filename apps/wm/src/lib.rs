@@ -167,6 +167,21 @@ mod tests {
     }
 
     #[test]
+    fn a_list_of_sixteen_records_is_walked_whole() {
+        // The ids of 16 windows made at the places 0 to 15 (the place in 4 bits).
+        let id = |k: u32| proto_comp::window_id(k, 2);
+        let list = |focus: u32| -> Vec<WindowRecord> {
+            (0..16)
+                .map(|k| win(id(k), SHOWN | if k == focus { FOCUSED } else { 0 }))
+                .collect()
+        };
+        assert_eq!(next_focus(&list(14), true), Some(id(15)));
+        assert_eq!(next_focus(&list(15), true), Some(id(0)));
+        assert_eq!(next_focus(&list(0), false), Some(id(15)));
+        assert_eq!(next_focus(&list(9), false), Some(id(8)));
+    }
+
+    #[test]
     fn a_new_window_gets_the_focus() {
         let mut c = Chords::new();
         assert_eq!(

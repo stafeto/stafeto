@@ -54,6 +54,8 @@ const MAP_AT: usize = 0x20_0000_0000;
 const MAP_STEP: usize = 0x100_0000;
 /// The retry period for a service that is being set up, and the longest wait.
 const RETRY_NS: u64 = 5_000_000;
+/// The longest `retire` waits for the service to have a window gone.
+const RETIRE_NS: u64 = 1_000_000_000;
 /// The lateness of a wake-up at a phase start that fails the run.
 const WAKE_LATE_NS: u64 = 100_000_000;
 /// The counters of a phase start this long after its start and are read this
@@ -401,6 +403,7 @@ impl Env<'_> {
     }
 
     fn post(window: &Handle<Channel>, buffer: u32, rect: paint::Rect) -> Result<(), Fail> {
+        let buffer_number = buffer;
         let rect = Rect {
             x: rect.x,
             y: rect.y,
@@ -415,7 +418,10 @@ impl Env<'_> {
         let mut buffer = [0; MESSAGE_MAX];
         match reply.bytes(&mut buffer).get(..4) {
             Some(b) if u32::from_le_bytes([b[0], b[1], b[2], b[3]]) == 0 => Ok(()),
-            _ => Err("POST was refused"),
+            other => {
+                rt::println!("frame-load: POST of buffer {buffer_number} said {other:?}");
+                Err("POST was refused")
+            }
         }
     }
 
@@ -441,7 +447,10 @@ impl Env<'_> {
         {
             Some(0) => Ok(true),
             Some(code) if code == proto_comp::code(proto_comp::BUSY).code() => Ok(false),
-            _ => Err("POST was refused"),
+            other => {
+                rt::println!("frame-load: POST said {other:?}");
+                Err("POST was refused")
+            }
         }
     }
 
@@ -462,6 +471,28 @@ impl Env<'_> {
             *slot = Some(memory);
         }
         Ok(made.map(|m| m.expect("every buffer was made")))
+    }
+
+    /// The window `open` goes, and the service is given the time to have it gone
+    /// before the next window is made: what the service sends on this channel
+    /// for the old window (the bit of a buffer that came back) is then read and
+    /// dropped here, so that it is not taken for a buffer of the next window.
+    fn retire(&self, display: &Handle<Channel>, open: &mut Option<(Scene, Handle<Channel>)>) {
+        let Some(old) = open.take() else {
+            return;
+        };
+        let before = Self::describe(display).map(|d| d.open).ok();
+        drop(old);
+        if let Some(before) = before {
+            let end = now() + RETIRE_NS;
+            while now() < end && Self::describe(display).is_ok_and(|d| d.open >= before) {
+                self.sleep_until(now() + RETRY_NS);
+            }
+        }
+        while let Ok(Waited::Got(got)) = self.waiter.receive_until(&self.channel, now()) {
+            self.keep(&got);
+        }
+        self.bits.set(0);
     }
 
     /// The phase of the overload: eight windows in one place, each posted whole
@@ -564,19 +595,18 @@ impl Env<'_> {
             self.sleep_until(self.schedule.start_of(phase));
             self.woke_in_time("draw", phase)?;
             if scene == Scene::O {
-                drop(open.take());
+                self.retire(&display, &mut open);
                 self.overload(&display, &small, phase)?;
                 continue;
             }
             let Some(rect) = paint::window_of(scene) else {
                 // No window in this scene: the one of the phase before goes.
-                open = None;
+                self.retire(&display, &mut open);
                 continue;
             };
             if open.as_ref().map(|(s, _)| *s) != Some(scene) {
                 // The window of the scene before closes first.
-                drop(open.take());
-                self.bits.set(0);
+                self.retire(&display, &mut open);
                 free = 0b11;
                 open = Some((scene, self.window(&display, rect, &objects)?));
             }

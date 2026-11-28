@@ -40,7 +40,7 @@ use wm::{Chords, Command, next_focus};
 rt::entry!(main);
 
 /// The windows the compositor has at most (services/compositor MAX_WINDOWS).
-const MAX_WINDOWS: usize = 8;
+const MAX_WINDOWS: usize = 16;
 /// The pause between two tries of the compositor's screen, and how long the
 /// manager waits for it.
 const RETRY_NS: u64 = 20_000_000;

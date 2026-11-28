@@ -94,13 +94,19 @@ const PROBE_WM: Record = Record {
     ..comp::PROBE
 };
 
-/// The many windows (role `n`, in the run under -icount): seven windows over
-/// the first client's, in two contexts, for the bound on the bands. Its quota
-/// is the seven buffers of 30 pages and the stack.
+/// The many windows (role `n`): in the run under -icount fifteen windows over
+/// the first client's, in four contexts (sixteen windows in all), for the bound
+/// on the bands; in the run with the monitor sixteen windows over one another
+/// when the clients are gone, for the screenshot. Its quota is the sixteen
+/// buffers of 30 pages at most (480 pages) with the stack and the program, and
+/// its handles are the sixteen windows with their buffers, the three clones and
+/// its own.
 const PROBE_MANY: Record = Record {
     name: "focus-many",
     program: "focus-probe",
     args: b"n",
+    quota: 800 * PAGE,
+    handle_limit: 64,
     ..comp::PROBE
 };
 
