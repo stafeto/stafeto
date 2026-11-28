@@ -1178,7 +1178,14 @@ pub(crate) fn layer_time() -> bool {
 /// SPCR and no entropy service.
 fn aws_programs() -> &'static [ImageProgram] {
     static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
+    LIST.get_or_init(|| aws_program_list(layered_root(), layer_time()))
+}
+
+/// The list of `aws_programs` for the layered root (`layered`: the layer service and init's feature
+/// `layered-root`) and the measurement of it (`timed`: the program `layer-time`). The choice is a
+/// parameter so that a test can hold both lists in one process.
+fn aws_program_list(layered: bool, timed: bool) -> Vec<ImageProgram> {
+    {
         let packages =
             packages::of_image("boot-aws.img").unwrap_or_else(|e| panic!("the image of EC2: {e}"));
         let mut programs = SHELL_SERVICES.to_vec();
@@ -1186,7 +1193,7 @@ fn aws_programs() -> &'static [ImageProgram] {
             "init",
             "init",
             INIT_STACK_SIZE,
-            if layered_root() {
+            if layered {
                 &["table-aws", "layered-root"]
             } else {
                 &["table-aws"]
@@ -1207,10 +1214,10 @@ fn aws_programs() -> &'static [ImageProgram] {
         // data file service and the host key service.
         programs.push(("nvme-blk", "nvme-blk", blk_probe::BLK_STACK_SIZE, &[]));
         programs.push(("datafsd", "datafsd", 32 * 1024, &[]));
-        if layered_root() {
+        if layered {
             programs.push(("layerd", "layerd", LAYERD_STACK_SIZE, &[]));
         }
-        if layer_time() {
+        if layered && timed {
             programs.push(("layer-time", "layer-time", POSIX_STACK_SIZE, &[]));
         }
         programs.push(("datakey", "datakey", 128 * 1024, &[]));
@@ -1220,18 +1227,19 @@ fn aws_programs() -> &'static [ImageProgram] {
         // The network service with the ENA of the instance (init's record `net`).
         // `STAFETO_ENA_BREAK` builds the one that holds the head of the event
         // queue on purpose (`aws image --ena-break-aenq`).
-        let break_aenq: &'static [&'static str] =
-            match std::env::var("STAFETO_ENA_BREAK").as_deref() {
-                Ok("exit") => &["ena-break-exit"],
-                Ok("1") => &["ena-break-aenq"],
-                Ok(other) => panic!(
-                    "STAFETO_ENA_BREAK={other:?}: the values are \"1\" (the event head is held) and \"exit\" (the service exits once)"
-                ),
-                Err(_) => &[],
-            };
+        let break_aenq: &'static [&'static str] = match std::env::var("STAFETO_ENA_BREAK")
+            .as_deref()
+        {
+            Ok("exit") => &["ena-break-exit"],
+            Ok("1") => &["ena-break-aenq"],
+            Ok(other) => panic!(
+                "STAFETO_ENA_BREAK={other:?}: the values are \"1\" (the event head is held) and \"exit\" (the service exits once)"
+            ),
+            Err(_) => &[],
+        };
         programs.push(("netd", "netd", net::NETD_STACK_SIZE, break_aenq));
         programs
-    })
+    }
 }
 
 /// The boot image of the shell on EC2.
@@ -15441,6 +15449,57 @@ fn ci_lints() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_layered_image_of_ec2_has_the_layer_service_its_table_and_the_measurement() {
+        let plain = super::aws_program_list(false, false);
+        assert!(plain.iter().all(|p| p.0 != "layerd" && p.0 != "layer-time"));
+        assert_eq!(plain[0].3, ["table-aws"]);
+        let layered = super::aws_program_list(true, true);
+        // Init is built with the table of EC2 and the layered root, which picks the table with the
+        // layer service after the data file service (`init::table::aws::TABLE_LAYERED`).
+        assert_eq!(layered[0].0, "init");
+        assert_eq!(layered[0].3, ["table-aws", "layered-root"]);
+        let at = |n: &str| layered.iter().position(|p| p.0 == n);
+        let (datafs, layerd, datakey) = (at("datafsd"), at("layerd"), at("datakey"));
+        assert!(
+            datafs < layerd && layerd < datakey,
+            "{datafs:?} {layerd:?} {datakey:?}"
+        );
+        assert!(at("layer-time").is_some());
+        // The files of the measurement name programs the list has, and the boot script runs the
+        // script that starts the program.
+        let files = super::rootfs::layer_time_files();
+        for f in &files {
+            if let Some(super::rootfs::Source::Elf(program)) = f.source {
+                assert!(at(program).is_some(), "{} names {program}", f.path);
+            }
+        }
+        for path in [
+            "/bin/layer-time",
+            "/etc/rc.d/layer-time",
+            "/usr/share/layer-time/small",
+            "/usr/share/layer-time/medium",
+            "/usr/share/layer-time/big",
+            "/usr/share/layer-time/trunc",
+        ] {
+            assert!(files.iter().any(|f| f.path == path), "{path}");
+        }
+        let rc = include_str!("../../tools/rc/rc");
+        let list = rc.lines().find(|l| l.starts_with("for name in ")).unwrap();
+        assert!(
+            list.split_whitespace()
+                .any(|w| w.trim_end_matches(';') == "layer-time")
+        );
+        let script = include_str!("../../tools/rc/layer-time");
+        assert!(script.contains("/bin/layer-time"));
+        // The layer service of the EC2 table has a program to start.
+        assert!(
+            layered
+                .iter()
+                .any(|p| p.0 == "layerd" && p.1 == "layerd" && p.2 == super::LAYERD_STACK_SIZE)
+        );
+    }
+
     /// A build script of programs sees a fixed `SOURCE_DATE_EPOCH` (also
     /// over a value the caller has set) and `PYTHONHASHSEED=0`; the
     /// environment of xtask is not touched.
