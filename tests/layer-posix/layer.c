@@ -659,16 +659,17 @@ static int writes_to_the_lower_set_are_refused(void) {
     LP_CHECK(FAILS(truncate("/bin/layer-posix", 0), EROFS));
     /* A directory is not opened for writing. */
     LP_CHECK(FAILS(open("/plain", O_WRONLY), EISDIR));
-    /* A lower name is not renamed (EXDEV), and the volume has no hard links. */
-    LP_CHECK(FAILS(rename("/etc/layer-lower", "/etc/renamed"), EXDEV));
+    /* A lower directory is not renamed (EXDEV), a lower program is EROFS, a lower file is copied up
+     * and renamed (the copy phase), a name does not leave the root, and the volume has no hard links. */
+    LP_CHECK(FAILS(rename("/plain", "/plain-renamed"), EXDEV));
     LP_CHECK(FAILS(rename("/etc/layer-lower", "/tmp/renamed"), EXDEV));
-    LP_CHECK(FAILS(rename("/bin/layer-posix", "/bin/renamed"), EXDEV));
+    LP_CHECK(FAILS(rename("/bin/layer-posix", "/bin/renamed"), EROFS));
     LP_CHECK(FAILS(link("/etc/layer-lower", "/etc/hard"), EMLINK));
     /* A path against a description of a lower directory is refused as well. */
     int lower = open("/plain", O_RDONLY | O_DIRECTORY);
     LP_CHECK(lower >= 0);
     LP_CHECK(FAILS(openat(lower, "../bin/layer-posix", O_WRONLY), EROFS));
-    LP_CHECK(FAILS(renameat(lower, "a", lower, "a2"), EXDEV));
+    LP_CHECK(FAILS(renameat(lower, "../bin/layer-posix", lower, "../bin/layer-posix-renamed"), EROFS));
     close(lower);
     /* Nothing was written below the layers. */
     LP_CHECK(has_bytes("/etc/layer-lower", "lower of etc\n") && has_bytes("/plain/a", "a\n"));
@@ -1094,7 +1095,7 @@ static int renames(void) {
     LP_CHECK(FAILS(stat("/etc/layer-lower", &st), ENOENT) && has_bytes("/etc/w-ll", "recreated\n"));
     LP_CHECK(listed("/etc", "layer-lower", 0) && listed("/etc", "w-ll", 1));
     /* What it refuses. */
-    LP_CHECK(FAILS(rename("/lowpriv/f", "/lowpriv/f2"), EXDEV) && FAILS(rename("/lower", "/lower2"), EXDEV));
+    LP_CHECK(FAILS(rename("/lowpriv", "/lowpriv2"), EXDEV) && FAILS(rename("/lower", "/lower2"), EXDEV));
     LP_CHECK(FAILS(rename("/etc/w-over", "/tmp/w-over"), EXDEV) && FAILS(rename("/tmp", "/etc/w-tmp-dir"), EXDEV));
     LP_CHECK(FAILS(rename("/etc/never", "/etc/x"), ENOENT));
     LP_CHECK(FAILS(rename("/etc/w-d2", "/etc/w-d2/sub/x"), EINVAL));
@@ -1651,6 +1652,9 @@ static int a_lower_program_is_never_copied_and_still_runs(void) {
     LP_CHECK(FAILS(chmod("/bin/layer-posix", 0644), EROFS));
     LP_CHECK(FAILS(chown("/bin/layer-posix", 1, 1), EROFS));
     LP_CHECK(FAILS(truncate("/bin/layer-posix", 0), EROFS));
+    /* A rename of it is EROFS too (an EXDEV would make `mv` copy it and unlink it). */
+    LP_CHECK(FAILS(rename("/bin/layer-posix", "/bin/layer-posix-moved"), EROFS));
+    LP_CHECK(FAILS(stat("/bin/layer-posix-moved", &st), ENOENT));
     LP_CHECK(stat("/bin/layer-posix", &st) == 0 && st.st_dev == LAYERED_DEVICE && st.st_size > 4096);
     LP_CHECK((st.st_mode & 07777) == 0755);
     pid_t pid = 0;
@@ -1725,6 +1729,38 @@ static int two_writers_of_one_file_make_one_copy(void) {
     LP_CHECK(fd >= 0 && pread(fd, tail, 13, (off_t)TWO_BYTES) == 13 && close(fd) == 0);
     tail[13] = 0;
     LP_CHECK(strcmp(tail, "child\nparent\n") == 0 || strcmp(tail, "parent\nchild\n") == 0);
+    return 0;
+}
+
+/* A file and a link of the lower set are copied up and renamed: the old name is gone, the new one
+ * has the number, owner, mode and bytes of the old, a directory and a program are EXDEV. */
+static int lower_names_are_renamed(void) {
+    struct stat before, after, lbefore;
+    char text[16];
+    LP_CHECK(stat("/copyup/rn-file", &before) == 0 && has_bytes("/copyup/rn-file", "rename me\n"));
+    LP_CHECK((before.st_mode & 07777) == 0640 && before.st_uid == 1000 && before.st_gid == 100);
+    LP_CHECK(lstat("/copyup/rn-link", &lbefore) == 0 && S_ISLNK(lbefore.st_mode));
+    LP_CHECK(rename("/copyup/rn-file", "/copyup/rn-file2") == 0);
+    LP_CHECK(FAILS(stat("/copyup/rn-file", &after), ENOENT));
+    LP_CHECK(FAILS(open("/copyup/rn-file", O_RDONLY), ENOENT));
+    LP_CHECK(stat("/copyup/rn-file2", &after) == 0 && same_attributes(&before, &after));
+    LP_CHECK(same_times(&before, &after) && has_bytes("/copyup/rn-file2", "rename me\n"));
+    LP_CHECK(listed("/copyup", "rn-file", 0) && listed("/copyup", "rn-file2", 1));
+    /* The link goes the same way. */
+    LP_CHECK(rename("/copyup/rn-link", "/copyup/rn-link2") == 0);
+    LP_CHECK(FAILS(lstat("/copyup/rn-link", &after), ENOENT));
+    LP_CHECK(lstat("/copyup/rn-link2", &after) == 0 && S_ISLNK(after.st_mode) && after.st_ino == lbefore.st_ino);
+    LP_CHECK(readlink("/copyup/rn-link2", text, sizeof text) == 7 && memcmp(text, "rn-file", 7) == 0);
+    LP_CHECK(listed("/copyup", "rn-link", 0) && listed("/copyup", "rn-link2", 1));
+    /* Out of the lower directory into the layer's, over a name the layer deleted. */
+    LP_CHECK(rename("/copyup/rn-move", "/etc/layer-hidden") == 0 && has_bytes("/etc/layer-hidden", "move me\n"));
+    LP_CHECK(FAILS(stat("/copyup/rn-move", &after), ENOENT));
+    /* A lower directory is EXDEV and a lower program is EROFS (it is never copied, and `mv` must not
+     * copy and unlink it), and nothing changes for them. */
+    LP_CHECK(FAILS(rename("/copyup/dir", "/copyup/dir-renamed"), EXDEV));
+    LP_CHECK(FAILS(rename("/bin/layer-posix", "/bin/layer-posix-renamed"), EROFS));
+    LP_CHECK(stat("/copyup/dir", &after) == 0 && stat("/bin/layer-posix", &after) == 0);
+    LP_CHECK(FAILS(stat("/bin/layer-posix-renamed", &after), ENOENT));
     return 0;
 }
 
@@ -1836,6 +1872,7 @@ static int copy_first(void) {
     run_check("a signal during the wait of a copy is EINTR without SA_RESTART", signal_without_restart);
     run_check("a signal during the wait of a copy goes on with SA_RESTART", signal_with_restart);
     run_check("the numbers of the copies are kept", the_numbers_are_kept);
+    run_check("a lower file and a lower link are renamed after their copy with a mark on the old name", lower_names_are_renamed);
     if (failures != 0) {
         printf("layer-posix: %d checks failed\n", failures);
         return 20;
@@ -1875,6 +1912,13 @@ static int the_copies_are_kept(void) {
     LP_CHECK(is_the_big_file("/copyup/big1") && is_the_big_file("/copyup/big2"));
     /* The directory of the layer shows its lower name still. */
     LP_CHECK(has_bytes("/copyup/dir/in", "inside\n"));
+    /* The renamed lower names are renamed still, with the old names marked deleted. */
+    char link[16];
+    LP_CHECK(FAILS(stat("/copyup/rn-file", &st), ENOENT) && has_bytes("/copyup/rn-file2", "rename me\n"));
+    LP_CHECK(FAILS(lstat("/copyup/rn-link", &st), ENOENT) && lstat("/copyup/rn-link2", &st) == 0);
+    LP_CHECK(readlink("/copyup/rn-link2", link, sizeof link) == 7);
+    LP_CHECK(FAILS(stat("/copyup/rn-move", &st), ENOENT) && has_bytes("/etc/layer-hidden", "move me\n"));
+    LP_CHECK(listed("/copyup", "rn-file", 0) && listed("/copyup", "rn-file2", 1) && listed("/copyup", "rn-link", 0));
     /* A file that is already the layer's is written without a copy. */
     int fd = open("/copyup/append", O_WRONLY | O_APPEND);
     LP_CHECK(fd >= 0 && write(fd, "again\n", 6) == 6 && close(fd) == 0);
@@ -1889,6 +1933,353 @@ static int copyreread_first(void) {
         return 20;
     }
     printf("layer-posix: copy reread checks passed\n");
+    return 0;
+}
+
+/* ---- the race phase: names that change while a copy goes on (the role "copyrace"), a volume too
+ * small for a copy (the roles "copyfull" and "copyfullreread"), and the cut of the power in the
+ * middle of a copy (the roles "cut" and "cutverify", `cargo xtask layer-cut copy`) ---- */
+
+#define RACE_BYTES (3UL << 20)
+#define SMALL_BYTES (1UL << 20)
+#define FULL_BYTES (20UL << 20)
+#define CUT_BYTES (200UL << 10)
+#define FILES_MORE 14
+
+/* Whether the file at `path` is `len` bytes of the pattern, after `skip` bytes at the start that the
+ * probe wrote itself. */
+static int has_pattern(const char *path, size_t len, size_t skip) {
+    static unsigned char buf[65536];
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size != (off_t)len) return 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    size_t at = 0;
+    int ok = 1;
+    while (ok && at < len) {
+        ssize_t got = read(fd, buf, sizeof buf);
+        if (got <= 0) {
+            ok = 0;
+            break;
+        }
+        for (ssize_t i = 0; i < got; i++) {
+            if ((size_t)(at + (size_t)i) >= skip && buf[i] != BIG_BYTE(at + (size_t)i)) {
+                ok = 0;
+                break;
+            }
+        }
+        at += (size_t)got;
+    }
+    close(fd);
+    return ok && at == len;
+}
+
+/* A child that renames `from` to `to` and ends with 0 when it did, 1 for ENOENT, 2 otherwise. */
+static pid_t rename_child(const char *from, const char *to, unsigned delay_ms) {
+    pid_t pid = fork();
+    if (pid != 0) return pid;
+    if (delay_ms != 0) {
+        struct timespec nap = {0, (long)delay_ms * 1000000L};
+        nanosleep(&nap, NULL);
+    }
+    if (rename(from, to) == 0) _exit(0);
+    _exit(errno == ENOENT ? 1 : 2);
+}
+
+static void nap_ms(long ms) {
+    struct timespec nap = {ms / 1000, (ms % 1000) * 1000000L};
+    nanosleep(&nap, NULL);
+}
+
+static long mono_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long)(now.tv_sec * 1000 + now.tv_nsec / 1000000);
+}
+
+/* A child that renames `from` to `to`, tells the parent through `fds` the time it begins (a long
+ * word) and the time the rename returned, and ends as `rename_child` does. The parent acts between
+ * the two times, so the copy that the rename waits for is running when it does: the rename that
+ * returned before the parent acted would show the race was missed. */
+static pid_t timed_rename_child(const char *from, const char *to, int fds[2]) {
+    if (pipe(fds) != 0) return -1;
+    pid_t pid = fork();
+    if (pid != 0) return pid;
+    long begin = mono_ms();
+    if (write(fds[1], &begin, sizeof begin) != (ssize_t)sizeof begin) _exit(3);
+    int done = rename(from, to);
+    int err = errno;
+    long end = mono_ms();
+    if (write(fds[1], &end, sizeof end) != (ssize_t)sizeof end) _exit(3);
+    if (done == 0) _exit(0);
+    _exit(err == ENOENT ? 1 : 2);
+}
+
+/* Waits until the child has begun its rename (the request is at the service a moment later), then
+ * runs `act`; true when the rename was still waiting for its copy as `act` ended. */
+static int act_during_the_wait(int fds[2], int (*act)(void), int *acted) {
+    long begin = 0, end = 0;
+    if (read(fds[0], &begin, sizeof begin) != (ssize_t)sizeof begin) return 0;
+    nap_ms(30);
+    *acted = act();
+    long at = mono_ms();
+    if (read(fds[0], &end, sizeof end) != (ssize_t)sizeof end) return 0;
+    printf("layer-posix: the rename began at %ld ms, the change was made at %ld, the rename returned at %ld\n", begin, at, end);
+    return end > at;
+}
+
+static int unlink_rc_a(void) {
+    return unlink("/race/rc-a") == 0;
+}
+
+static int a_name_deleted_during_the_copy_of_a_rename_stays_deleted(void) {
+    struct stat st;
+    int fds[2], acted = 0;
+    pid_t child = timed_rename_child("/race/rc-a", "/race/rc-a2", fds);
+    LP_CHECK(child > 0);
+    int waiting = act_during_the_wait(fds, unlink_rc_a, &acted);
+    /* The rename that waited for the copy asks again and finds no name. */
+    int code = wait_ok(child);
+    LP_CHECK(acted && waiting);
+    LP_CHECK(code == 1);
+    LP_CHECK(FAILS(stat("/race/rc-a", &st), ENOENT) && FAILS(stat("/race/rc-a2", &st), ENOENT));
+    LP_CHECK(listed("/race", "rc-a", 0) && listed("/race", "rc-a2", 0));
+    return 0;
+}
+
+static int unlink_and_make_rc_b(void) {
+    return unlink("/race/rc-b") == 0 && put_file("/race/rc-b", "mine\n", 0644) == 0;
+}
+
+static int a_name_made_during_the_copy_of_a_rename_is_the_one_that_moves(void) {
+    struct stat st;
+    int fds[2], acted = 0;
+    pid_t child = timed_rename_child("/race/rc-b", "/race/rc-b2", fds);
+    LP_CHECK(child > 0);
+    int waiting = act_during_the_wait(fds, unlink_and_make_rc_b, &acted);
+    int code = wait_ok(child);
+    LP_CHECK(acted && waiting);
+    LP_CHECK(code == 0);
+    LP_CHECK(has_bytes("/race/rc-b2", "mine\n") && FAILS(stat("/race/rc-b", &st), ENOENT));
+    LP_CHECK(listed("/race", "rc-b", 0) && listed("/race", "rc-b2", 1));
+    return 0;
+}
+
+static int two_renames_of_one_file_make_one_move(void) {
+    struct stat st;
+    pid_t one = rename_child("/race/rc-c", "/race/rc-c1", 0);
+    pid_t two = rename_child("/race/rc-c", "/race/rc-c2", 0);
+    LP_CHECK(one > 0 && two > 0);
+    int a = wait_ok(one), b = wait_ok(two);
+    LP_CHECK((a == 0 && b == 1) || (a == 1 && b == 0));
+    int first = stat("/race/rc-c1", &st) == 0, second = stat("/race/rc-c2", &st) == 0;
+    LP_CHECK(first + second == 1);
+    LP_CHECK(has_pattern(first ? "/race/rc-c1" : "/race/rc-c2", RACE_BYTES, 0));
+    LP_CHECK(FAILS(stat("/race/rc-c", &st), ENOENT) && listed("/race", "rc-c", 0));
+    return 0;
+}
+
+struct more_task {
+    char path[32];
+    int result;
+};
+
+static void *more_writer(void *arg) {
+    struct more_task *task = arg;
+    int fd = open(task->path, O_WRONLY);
+    task->result = fd >= 0 && pwrite(fd, "HEAD", 4, 0) == 4 && close(fd) == 0 ? 0 : 1;
+    return NULL;
+}
+
+/* Fourteen threads open fourteen files for writing at once: twelve copies fit the table, the others
+ * are told STARTING and ask again until a place is free. */
+static int more_files_than_places_for_copies_are_all_copied(void) {
+    static struct more_task tasks[FILES_MORE];
+    pthread_t threads[FILES_MORE];
+    pthread_attr_t attr;
+    LP_CHECK(pthread_attr_init(&attr) == 0 && pthread_attr_setstacksize(&attr, 64 * 1024) == 0);
+    for (int i = 0; i < FILES_MORE; i++) {
+        snprintf(tasks[i].path, sizeof tasks[i].path, "/race/f%02d", i);
+        tasks[i].result = -1;
+        LP_CHECK(pthread_create(&threads[i], &attr, more_writer, &tasks[i]) == 0);
+    }
+    int bad = 0;
+    for (int i = 0; i < FILES_MORE; i++) {
+        LP_CHECK(pthread_join(threads[i], NULL) == 0);
+        if (tasks[i].result != 0) bad++;
+    }
+    LP_CHECK(bad == 0);
+    for (int i = 0; i < FILES_MORE; i++) {
+        if (!has_pattern(tasks[i].path, SMALL_BYTES, 4)) printf("layer-posix: %s is not the lower file\n", tasks[i].path);
+        LP_CHECK(has_pattern(tasks[i].path, SMALL_BYTES, 4));
+    }
+    return 0;
+}
+
+static int race_first(void) {
+    if (lp_session() != 0) {
+        printf("layer-posix: the program started with a session\n");
+        failures++;
+    }
+    run_check("a name deleted during the copy of a rename stays deleted", a_name_deleted_during_the_copy_of_a_rename_stays_deleted);
+    run_check("a name made during the copy of a rename is the one that moves", a_name_made_during_the_copy_of_a_rename_is_the_one_that_moves);
+    run_check("two renames of one file make one move", two_renames_of_one_file_make_one_move);
+    run_check("more files than places for copies are all copied", more_files_than_places_for_copies_are_all_copied);
+    if (failures != 0) {
+        printf("layer-posix: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("layer-posix: copy race checks passed\n");
+    return 0;
+}
+
+/* The volume holds 16 MiB and the lower file 20 MiB: the copy runs out of space. Every waiter is told
+ * ENOSPC, the lower file reads on, and nothing is left of the copy. */
+static int a_copy_without_space_is_enospc_for_every_waiter(void) {
+    pid_t child = fork();
+    LP_CHECK(child >= 0);
+    if (child == 0) {
+        int fd = open("/full/big", O_WRONLY);
+        _exit(fd == -1 && errno == ENOSPC ? 0 : 1);
+    }
+    int fd = open("/full/big", O_WRONLY);
+    int err = errno;
+    if (fd >= 0 || err != ENOSPC) printf("layer-posix: the open gave %d, errno %d\n", fd, err);
+    LP_CHECK(fd == -1 && err == ENOSPC);
+    LP_CHECK(wait_ok(child) == 0);
+    /* A rename waits for the same copy and gets the same answer. */
+    LP_CHECK(FAILS(rename("/full/big", "/full/big2"), ENOSPC));
+    return 0;
+}
+
+static int the_lower_file_is_whole_after_a_copy_without_space(void) {
+    struct stat st;
+    LP_CHECK(stat("/full/big", &st) == 0 && st.st_size == (off_t)FULL_BYTES);
+    LP_CHECK(has_pattern("/full/big", FULL_BYTES, 0));
+    LP_CHECK(FAILS(stat("/full/big2", &st), ENOENT) && listed("/full", "big", 1) && listed("/full", "big2", 0));
+    /* The reaper removes what the copy left in work/: a file of 64 KiB can be made on the volume
+     * again (the statvfs of the data file service lags behind the removal, so the space is tried). */
+    static char block[65536];
+    int made = 0;
+    for (long waited = 0; waited < 30000 && !made; waited += 100) {
+        int fd = open("/data/space-probe", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd >= 0) {
+            made = write(fd, block, sizeof block) == (ssize_t)sizeof block && fsync(fd) == 0;
+            close(fd);
+            unlink("/data/space-probe");
+        }
+        if (!made) nap_ms(100);
+    }
+    LP_CHECK(made);
+    return 0;
+}
+
+static int full_first(void) {
+    run_check("a copy without space is ENOSPC for every waiter and for a rename", a_copy_without_space_is_enospc_for_every_waiter);
+    run_check("the lower file is whole after a copy without space", the_lower_file_is_whole_after_a_copy_without_space);
+    if (failures != 0) {
+        printf("layer-posix: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("layer-posix: copy full checks passed\n");
+    return 0;
+}
+
+static int the_lower_file_is_whole_and_the_copy_is_tried_again(void) {
+    struct stat st;
+    LP_CHECK(stat("/full/big", &st) == 0 && has_pattern("/full/big", FULL_BYTES, 0));
+    LP_CHECK(FAILS(open("/full/big", O_WRONLY), ENOSPC));
+    LP_CHECK(has_pattern("/full/big", FULL_BYTES, 0));
+    return 0;
+}
+
+static int fullreread_first(void) {
+    run_check("the lower file is whole and the copy is tried again", the_lower_file_is_whole_and_the_copy_is_tried_again);
+    if (failures != 0) {
+        printf("layer-posix: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("layer-posix: copy full reread checks passed\n");
+    return 0;
+}
+
+/* The cut: a copy up (open for writing) of /cutup/a and the rename of /cutup/b. The service built
+ * for `layer-cut` stops at its point and the host kills the machine; the probe after it finds the
+ * names as one of the two states a cut allows. */
+static int cut_first(void) {
+    struct stat st;
+    if (put_file("/cutup/seed", "seed\n", 0644) != 0 || stat("/cutup/seed", &st) != 0) {
+        printf("layer-posix: the seed was not made\n");
+        return 20;
+    }
+    printf("layer-posix: cut begins\n");
+    fflush(stdout);
+    int fd = open("/cutup/a", O_WRONLY);
+    if (fd < 0 || close(fd) != 0) {
+        printf("layer-posix: the open of /cutup/a ended with errno %d\n", errno);
+        return 20;
+    }
+    printf("layer-posix: cut copy up done\n");
+    fflush(stdout);
+    if (rename("/cutup/b", "/cutup/b2") != 0) {
+        printf("layer-posix: the rename of /cutup/b ended with errno %d\n", errno);
+        return 20;
+    }
+    printf("layer-posix: cut rename done\n");
+    return 0;
+}
+
+static int cut_attributes(const char *path, mode_t mode, uid_t uid, gid_t gid) {
+    struct stat st;
+    return stat(path, &st) == 0 && (st.st_mode & 07777) == mode && st.st_uid == uid && st.st_gid == gid &&
+           st.st_dev == LAYERED_DEVICE;
+}
+
+static int the_copied_file_is_whole_with_the_lower_attributes(void) {
+    LP_CHECK(has_bytes("/cutup/seed", "seed\n"));
+    LP_CHECK(has_pattern("/cutup/a", CUT_BYTES, 0));
+    LP_CHECK(cut_attributes("/cutup/a", 0640, 1000, 100));
+    LP_CHECK(listed("/cutup", "a", 1));
+    return 0;
+}
+
+static int the_renamed_file_has_the_old_name_or_the_new_never_both_and_never_torn(void) {
+    struct stat st;
+    int old = stat("/cutup/b", &st) == 0;
+    int moved = stat("/cutup/b2", &st) == 0;
+    printf("layer-posix: cut found the old name %d, the new name %d\n", old, moved);
+    LP_CHECK(old + moved == 1);
+    const char *path = old ? "/cutup/b" : "/cutup/b2";
+    LP_CHECK(has_pattern(path, CUT_BYTES, 0));
+    LP_CHECK(cut_attributes(path, 0600, 1001, 101));
+    LP_CHECK(listed("/cutup", "b", old) && listed("/cutup", "b2", moved));
+    return 0;
+}
+
+static int the_rename_that_was_cut_goes_through_when_it_is_asked_again(void) {
+    struct stat st;
+    if (stat("/cutup/b", &st) == 0) {
+        LP_CHECK(rename("/cutup/b", "/cutup/b2") == 0);
+    } else {
+        LP_CHECK(FAILS(rename("/cutup/b", "/cutup/b2"), ENOENT));
+    }
+    LP_CHECK(FAILS(stat("/cutup/b", &st), ENOENT) && has_pattern("/cutup/b2", CUT_BYTES, 0));
+    LP_CHECK(cut_attributes("/cutup/b2", 0600, 1001, 101));
+    LP_CHECK(listed("/cutup", "b", 0) && listed("/cutup", "b2", 1));
+    int fd = open("/cutup/a", O_WRONLY);
+    LP_CHECK(fd >= 0 && close(fd) == 0 && has_pattern("/cutup/a", CUT_BYTES, 0));
+    return 0;
+}
+
+static int cutverify_first(void) {
+    run_check("the copied file is whole with the lower attributes", the_copied_file_is_whole_with_the_lower_attributes);
+    run_check("the renamed file has the old name or the new, never both and never torn", the_renamed_file_has_the_old_name_or_the_new_never_both_and_never_torn);
+    run_check("the rename that was cut goes through when it is asked again", the_rename_that_was_cut_goes_through_when_it_is_asked_again);
+    if (failures != 0) {
+        printf("layer-posix: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("layer-posix: cut verify checks passed\n");
     return 0;
 }
 
@@ -1921,5 +2312,10 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "reread") == 0) return reread_first();
     if (argc > 1 && strcmp(argv[1], "copy") == 0) return copy_first();
     if (argc > 1 && strcmp(argv[1], "copyreread") == 0) return copyreread_first();
+    if (argc > 1 && strcmp(argv[1], "copyrace") == 0) return race_first();
+    if (argc > 1 && strcmp(argv[1], "copyfull") == 0) return full_first();
+    if (argc > 1 && strcmp(argv[1], "copyfullreread") == 0) return fullreread_first();
+    if (argc > 1 && strcmp(argv[1], "cut") == 0) return cut_first();
+    if (argc > 1 && strcmp(argv[1], "cutverify") == 0) return cutverify_first();
     return launcher();
 }
