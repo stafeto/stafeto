@@ -278,7 +278,17 @@ pub fn ash(machine: &qemu::Machine) -> Result<(), String> {
     crate::relibc()?;
     crate::busybox_build()?;
     let kernel = build(Variant::Normal)?;
-    let image = write_boot_image_files(ASH_IMAGE, &ash_programs(), BOOT_PROFILE, &[], Vec::new())?;
+    // The shell's own program is a file of the lower set too: the write the script makes to it is
+    // refused (a program is never copied up), where a write to a data file would be copied.
+    let program = crate::rootfs::RootFile {
+        path: "/bin/busybox-probe",
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        source: Some(crate::rootfs::Source::Elf("busybox-probe")),
+    };
+    let image =
+        write_boot_image_files(ASH_IMAGE, &ash_programs(), BOOT_PROFILE, &[], vec![program])?;
     let disk =
         Disk(std::env::temp_dir().join(format!("stafeto-layer-ash-{}.img", std::process::id())));
     crate::data_image::make_layer_posix_volume(&disk.0, DISK_BYTES)?;
@@ -1083,7 +1093,7 @@ mod tests {
             "a",
             "a",
             "tmp-bytes",
-            "ash: can't create /etc/layer-lower: Read-only file system",
+            "ash: can't create /bin/busybox-probe: Read-only file system",
             "write-refused",
         ] {
             lines.push(l.to_owned());

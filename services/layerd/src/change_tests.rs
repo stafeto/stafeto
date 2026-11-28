@@ -2689,6 +2689,35 @@ fn a_directory_the_service_makes_has_a_number_of_the_counter_not_of_the_volume()
 }
 
 #[test]
+fn directories_and_files_share_one_counter_that_is_written_back_when_its_block_is_used_up() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let mut seen = std::collections::BTreeSet::new();
+    // More names than one block of the counter: the block is written back in the middle, by the
+    // step of a directory as it is by the step of a file.
+    for k in 0..300 {
+        let path = format!("/etc/n{k}");
+        if k % 2 == 0 {
+            mkdir(&mut core, 0, &path, 0o755).unwrap();
+        } else {
+            let (_, pass) = open(&mut core, 0, creating(f::WRITE_ONLY, 0o644), &path).unwrap();
+            assert!(pass.is_some());
+        }
+        let ino = node(&core, &format!("/.layers/00{path}")).unwrap().ino;
+        assert!(ino & UPPER_INO_TAG != 0 && ino & (1 << 63) == 0, "{ino:#x}");
+        assert!(seen.insert(ino), "{ino:#x} twice");
+    }
+    // The counter on the volume is past the numbers given, so a start again takes up after them.
+    let text = node(&core, "/.layers/COMPOSITION").unwrap().data.clone();
+    let text = String::from_utf8(text).unwrap();
+    let line = text.lines().find(|l| l.starts_with("ino ")).unwrap();
+    let written: u64 = line[4..].trim().parse().unwrap();
+    assert!(written > 300, "{line}");
+    assert_eq!(core.volume.calls_of("mkdir"), 0);
+}
+
+#[test]
 fn a_cut_open_makes_an_empty_copy_with_the_attributes_of_the_lower_file() {
     let mut world = World::new();
     let mut core = world.core(volume());

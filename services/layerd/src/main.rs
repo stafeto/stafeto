@@ -883,8 +883,12 @@ impl Layerd {
         self.note_copies("queued");
         if sent {
             let _ = sys::notify(&self.kick, 1);
+            // The deliberate break `break-layerd-copy-in-loop`: the copy is made here, in this step.
             #[cfg(feature = "break-layerd-copy-in-loop")]
-            worker::inline();
+            {
+                worker::inline();
+                self.copies_ended();
+            }
         }
     }
 
