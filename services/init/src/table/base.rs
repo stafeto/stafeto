@@ -45,6 +45,14 @@ const LAUNCHER_CONNECTS: &[&str] = &[
 /// after 30 s`).
 pub const PKGD_READY_MS: u32 = 30_000;
 
+/// How long the launcher of the layered root waits for the layer service to say READY, and how
+/// long init watches its start (spec 5, section 4): the time the index of the live layer takes to
+/// build. The formula of the plan (3 times the measured time from the READY of the data service to
+/// that of the layer service, within 30 s and `WAIT_MAX_MS`) gives the cap, 60 s, because the
+/// measurement on EC2 was 293 s for a volume of 8,192 names. Temporary: the values come from the
+/// formula again when the fast build of the index (issue 657) lands and the measurement is repeated.
+pub const LAYERD_READY_MS: u32 = 60_000;
+
 /// The launcher of the games table with the network service too, under the
 /// larger of the two quotas of a command.
 pub const LAUNCHER: Record = Record {

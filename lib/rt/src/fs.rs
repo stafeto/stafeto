@@ -637,6 +637,17 @@ impl Files {
         }
     }
 
+    /// GUARD: the file service of a layered root switches its write guard on
+    /// (`Method::Guard`, the boot profile only). One way; a repeat is answered the same.
+    pub fn guard(&self) -> Result<(), Status> {
+        let request = Method::Guard.header().bytes();
+        let reply = sys::send(&self.channel, &request).map_err(Status::Kernel)?;
+        match Status::from_code(Self::reply_code(&reply)?) {
+            Status::Ok => Ok(()),
+            status => Err(status),
+        }
+    }
+
     /// Canonical exact cleanup preserves a replacement at the same numeric fd.
     pub fn close_exact(&self, held: PreparedOpen) -> Result<CloseOutcome, Status> {
         let mut w = Writer::new();

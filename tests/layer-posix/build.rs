@@ -50,6 +50,8 @@ fn main() {
     // The probes of the races, of the full volume and of the cut (`cargo xtask layer-posix copy
     // race|full`, `cargo xtask layer-cut copy`).
     for (feature, name) in [
+        ("CARGO_FEATURE_PHASE_SCRIPT", "script"),
+        ("CARGO_FEATURE_PHASE_BARE", "bare"),
         ("CARGO_FEATURE_PHASE_COPYRACE", "copyrace"),
         ("CARGO_FEATURE_PHASE_COPYFULL", "copyfull"),
         ("CARGO_FEATURE_PHASE_COPYFULLREREAD", "copyfullreread"),

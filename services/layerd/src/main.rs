@@ -379,7 +379,7 @@ fn main(_: u64) -> u64 {
         index,
         scan,
         workers,
-        data::Data { session },
+        data::Data::new(session),
         lower::Ram::new(files),
         epoch,
     );
@@ -421,6 +421,10 @@ fn main(_: u64) -> u64 {
         sessions: [const { None }; SESSIONS],
         ready: false,
         report: None,
+        longest_step: 0,
+        longest_method: 0,
+        tail: TAIL_NONE,
+        guard_tries: 0,
     };
     // The loop is this thread: it works under its budget from here on, and a budget the kernel
     // refuses is a start error, since the thread would run without a limit.
@@ -507,8 +511,8 @@ struct Layerd {
     changes: &'static mut [Change; JOBS + 1],
     /// The commit job (the last of `changes`) has a copy to make visible.
     commit: bool,
-    /// The kick of the worker thread.
-    kick: Handle<Channel>,
+    /// The kick of the worker thread (None with no data volume: the thread does not start).
+    kick: Option<Handle<Channel>>,
     /// The counters of the copies at the last line the service printed.
     copy_seen: (u32, u32, u32, u32),
     /// The notifications of the programs that wait for a copy (WAIT with a handle).
@@ -523,7 +527,25 @@ struct Layerd {
     ready: bool,
     /// What the line of the build says, kept from the step that ended it to the next one.
     report: Option<BuildReport>,
+    /// The longest step of the build by the clock (ticks), and the method of the longest call it
+    /// made to the data file service (0 for a step that made none).
+    longest_step: u64,
+    longest_method: u16,
+    /// Which of the steps after READY is next (`TAIL_*`).
+    tail: u8,
+    /// The refusals of GUARD so far.
+    guard_tries: u8,
 }
+
+/// The refusals of GUARD after which the instance ends, and its exit code.
+const GUARD_TRIES: u8 = 20;
+const GUARD_REFUSED: u64 = 7;
+
+const TAIL_NONE: u8 = 0;
+const TAIL_GUARD: u8 = 1;
+const TAIL_REPORT: u8 = 2;
+const TAIL_CALLS: u8 = 3;
+const TAIL_STARTING: u8 = 4;
 
 /// The numbers of the methods the service takes: LIST, STATUS and the methods of proto_layer that
 /// name a layer (NOT_FOUND), SESSION, and the names but WAIT.
@@ -575,6 +597,10 @@ impl Layerd {
         let Ok(brought) = r.handles.take::<Channel>(0) else {
             return Answer::Status(Status::Kernel(abi::Error::WrongType));
         };
+        // No data volume: the root is the RAM file service's alone, and a program is told so.
+        if self.core.passes_all() {
+            return st(l::NO_STORE);
+        }
         if !self.notary.ready(&self.parent, &self.process) {
             return st(layerd::starting::code(layerd::starting::Cause::Notary));
         }
@@ -955,8 +981,8 @@ impl Layerd {
             sent = true;
         }
         self.note_copies("queued");
-        if sent {
-            let _ = sys::notify(&self.kick, 1);
+        if sent && let Some(kick) = &self.kick {
+            let _ = sys::notify(kick, 1);
             // The deliberate break `break-layerd-copy-in-loop`: the copy is made here, in this step.
             #[cfg(feature = "break-layerd-copy-in-loop")]
             {
@@ -1589,20 +1615,80 @@ impl Service<0> for Layerd {
         if notice.label != LABEL_STEP {
             return;
         }
-        if let Some(r) = self.report.take() {
-            rt::println!(
-                "layerd: index of {} names and {} deletions built in {} ms, {} steps, {} overruns, READY at {} ms of uptime",
-                r.added,
-                r.deleted,
-                r.ms,
-                r.steps,
-                r.overruns,
-                r.up
-            );
-            starting_line(true);
-            return;
+        // The end of the build takes steps of its own, one thing in each: the call to the RAM file
+        // service that switches its write guard on, then each line (a line of the console is a few
+        // thousand ticks, and a step stays under the gate of 0.9 B).
+        match self.tail {
+            TAIL_GUARD => {
+                // The root is decided by the names now: the write guard of the RAM file service
+                // goes on before READY, so the launcher starts nothing while a write can pass the
+                // layers. A refusal is tried again in the next step, and the instance ends after
+                // `GUARD_TRIES` of them (init starts the next one).
+                match self.core.guard_lower() {
+                    Ok(_) => {
+                        rt::println!("layerd: write guard of the root on");
+                        if let Err(why) = rt::service::ready(&self.parent) {
+                            rt::println!("layerd: READY refused: {why:?}");
+                        }
+                        self.tail = TAIL_REPORT;
+                    }
+                    Err(why) => {
+                        self.guard_tries += 1;
+                        rt::println!("layerd: GUARD refused: {why:?}");
+                        if self.guard_tries >= GUARD_TRIES {
+                            sys::process_exit(GUARD_REFUSED);
+                        }
+                    }
+                }
+                let _ = sys::notify(&self.step, 1);
+                return;
+            }
+            TAIL_REPORT => {
+                if let Some(r) = self.report.take() {
+                    rt::println!(
+                        "layerd: index of {} names and {} deletions built in {} ms, {} steps, {} overruns, READY at {} ms of uptime",
+                        r.added,
+                        r.deleted,
+                        r.ms,
+                        r.steps,
+                        r.overruns,
+                        r.up
+                    );
+                }
+                self.tail = TAIL_CALLS;
+                let _ = sys::notify(&self.step, 1);
+                return;
+            }
+            TAIL_CALLS => {
+                let (calls, waited) = self.core.volume.stats.totals();
+                rt::println!(
+                    "layerd: build made {calls} calls to the data file service and waited {} ms for them, the longest step took {} us ({})",
+                    rt::time::ticks_to_ns(waited) / 1_000_000,
+                    rt::time::ticks_to_ns(self.longest_step) / 1000,
+                    data::method_name(self.longest_method)
+                );
+                self.tail = TAIL_STARTING;
+                let _ = sys::notify(&self.step, 1);
+                return;
+            }
+            TAIL_STARTING => {
+                starting_line(true);
+                self.tail = TAIL_NONE;
+                return;
+            }
+            _ => {}
         }
-        if self.core.build_step() {
+        let started = rt::time::now();
+        self.core.volume.stats.begin_step();
+        let finished = self.core.build_step();
+        if !self.ready {
+            let took = rt::time::now().saturating_sub(started);
+            if took > self.longest_step {
+                self.longest_step = took;
+                self.longest_method = self.core.volume.stats.step_method();
+            }
+        }
+        if finished {
             if !self.ready {
                 self.ready = true;
                 let (added, deleted) = self.core.index.counts();
@@ -1621,7 +1707,14 @@ impl Service<0> for Layerd {
                             up,
                         });
                     }
-                    other => rt::println!("layerd: not serving: {other:?}"),
+                    other => {
+                        rt::println!("layerd: not serving: {other:?}");
+                        if other == State::NoStore {
+                            rt::println!(
+                                "layerd: no data volume: the root is memory-only, writes to it go to the RAM file service and will not persist"
+                            );
+                        }
+                    }
                 }
                 let (names, marks) = self.core.left_out();
                 if names + marks != 0 {
@@ -1635,11 +1728,12 @@ impl Service<0> for Layerd {
                         self.core.skipped()
                     );
                 }
-                if let Err(why) = rt::service::ready(&self.parent) {
-                    rt::println!("layerd: READY refused: {why:?}");
-                }
                 if self.report.is_some() {
+                    // READY comes with the guard (`TAIL_GUARD`).
+                    self.tail = TAIL_GUARD;
                     let _ = sys::notify(&self.step, 1);
+                } else if let Err(why) = rt::service::ready(&self.parent) {
+                    rt::println!("layerd: READY refused: {why:?}");
                 }
             }
         } else {

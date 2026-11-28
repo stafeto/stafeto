@@ -39,6 +39,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -535,6 +536,25 @@ static int real_and_effective_access(void) {
         _exit(0);
     }
     DATA_CHECK(wait_ok(pid) == 0);
+    return 0;
+}
+
+/* This program is built with the layer client (the feature `layer`, as every program is), and the
+ * image has no layer service: the process service answers TakeRoot for its root with ABSENT, so the
+ * first path of the root goes to the RAM service at once. It is the first path of this process: the
+ * check runs first. With the answer UNREGISTERED the layer waits five seconds for a root that never
+ * comes and then fails the call (the break `break-process-absent-wait`). */
+static int no_layer_service_is_not_waited_for(void) {
+    struct timespec begin, end;
+    struct stat st;
+    DATA_CHECK(clock_gettime(CLOCK_MONOTONIC, &begin) == 0);
+    int found = stat("/bin/posix-data", &st);
+    DATA_CHECK(clock_gettime(CLOCK_MONOTONIC, &end) == 0);
+    long ms = (end.tv_sec - begin.tv_sec) * 1000 + (end.tv_nsec - begin.tv_nsec) / 1000000;
+    DATA_CHECK(found == 0 && S_ISREG(st.st_mode));
+    DATA_CHECK(ms < 1000);
+    /* The second path takes the same way, and the device is the RAM service's own. */
+    DATA_CHECK(stat("/bin", &st) == 0 && S_ISDIR(st.st_mode));
     return 0;
 }
 
@@ -3295,6 +3315,7 @@ static int first(void) {
         printf("posix-data: the probe is not user 0\n");
         return 20;
     }
+    run_check("no layer service is not waited for", no_layer_service_is_not_waited_for);
     run_check("read pub whole", read_whole);
     run_check("pread", read_by_pread);
     run_check("lseek", seeking);

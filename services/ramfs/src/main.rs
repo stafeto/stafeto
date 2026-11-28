@@ -3240,6 +3240,23 @@ impl Service<0> for Fs {
                     Err(code) => status(code),
                 }
             }
+            Some(Method::Guard) => {
+                if body.finish().is_err() || !r.handles.is_empty() {
+                    return Answer::Status(Status::BadSize);
+                }
+                // The session authenticates first; only the layer service's boot profile (init's
+                // mark GUARDER) may switch the guard on, and only a layered root.
+                if let Err(code) = self.authenticate(&mut s.data, r.label()) {
+                    return status(code);
+                }
+                if !matches!(s.data.binding, Binding::Boot)
+                    || !proto_fs::may_guard(r.label())
+                    || !self.ram.storage.state.set_guarded()
+                {
+                    return status(proto_fs::PERMISSION);
+                }
+                Answer::Status(Status::Ok)
+            }
             Some(Method::Write) => {
                 if let Err(code) = self.authenticate(&mut s.data, r.label()) {
                     return status(code);

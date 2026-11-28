@@ -1402,7 +1402,7 @@ pub const LAYER_NAMES_TABLE: &[Record] = &[
         quota: PROCS_QUOTA,
         waits: &[super::Wait {
             service: "layerd",
-            deadline_ms: 30_000,
+            deadline_ms: super::base::LAYERD_READY_MS,
         }],
         ..POSIX
     },
@@ -1435,7 +1435,7 @@ pub const LAYER_POSIX_TABLE: &[Record] = &[
         quota: PROCS_QUOTA,
         waits: &[super::Wait {
             service: "layerd",
-            deadline_ms: 30_000,
+            deadline_ms: super::base::LAYERD_READY_MS,
         }],
         ..POSIX
     },
@@ -1461,7 +1461,7 @@ pub const LAYER_ASH_TABLE: &[Record] = &[
         connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
         waits: &[super::Wait {
             service: "layerd",
-            deadline_ms: 30_000,
+            deadline_ms: super::base::LAYERD_READY_MS,
         }],
         ..BUSYBOX_TABLE[3]
     },

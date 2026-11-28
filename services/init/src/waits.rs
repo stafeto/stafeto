@@ -251,6 +251,45 @@ mod tests {
         }
     }
 
+    /// A record that names three services (the launcher of the layered root: `layerd`, `datakey`
+    /// and `pkgd`) starts after the READY of all three, in any order, under the longest deadline.
+    #[test]
+    fn three_services_start_the_record_after_all_are_ready() {
+        const WAIT_THREE: &[Wait] = &[
+            Wait {
+                service: "layerd",
+                deadline_ms: 60_000,
+            },
+            Wait {
+                service: "datakey",
+                deadline_ms: 30_000,
+            },
+            Wait {
+                service: "pkgd",
+                deadline_ms: 30_000,
+            },
+        ];
+        let names = ["layerd", "datakey", "pkgd"];
+        for order in [[0, 1, 2], [2, 1, 0], [1, 0, 2], [1, 2, 0]] {
+            let mut gate = open(WAIT_THREE, 0);
+            assert_eq!(gate.deadline(), 60_000 * MS);
+            assert_eq!(gate.ready(names[order[0]]), Step::Hold);
+            assert_eq!(gate.ready(names[order[1]]), Step::Hold);
+            assert_eq!(gate.ready(names[order[2]]), Step::Start(Release::Ready));
+        }
+        // The one that is last decides the line when the deadline passes.
+        let mut gate = open(WAIT_THREE, 0);
+        assert_eq!(gate.ready("pkgd"), Step::Hold);
+        assert_eq!(gate.ready("datakey"), Step::Hold);
+        assert_eq!(
+            gate.expired(60_000 * MS),
+            Step::Start(Release::Late {
+                service: "layerd",
+                deadline_ms: 60_000
+            })
+        );
+    }
+
     /// The deadline starts the record, naming the service that is not
     /// ready; an expiry before it is stale.
     #[test]
@@ -410,6 +449,24 @@ mod tests {
                 deadline_ms: 1000,
             },
         ];
+        const FOUR: &[Wait] = &[
+            Wait {
+                service: "pkgd",
+                deadline_ms: 1000,
+            },
+            Wait {
+                service: "blk",
+                deadline_ms: 1000,
+            },
+            Wait {
+                service: "ramfs",
+                deadline_ms: 1000,
+            },
+            Wait {
+                service: "clock",
+                deadline_ms: 1000,
+            },
+        ];
         let base = table::pkg::STORE_PROBE_TABLE;
         let with = |name: &str, waits: &'static [Wait]| -> Vec<Record> {
             base.iter()
@@ -427,9 +484,10 @@ mod tests {
         };
         assert!(table::check(&with("store-probe", NONE)).is_ok());
         assert!(table::check(&with("store-probe", FINE)).is_ok());
+        assert!(table::check(&with("store-probe", THREE)).is_ok());
         // A wait for the record itself, a chain (the service waits), an
         // unknown record, a client, a deadline of 0 and one past the limit,
-        // the same service twice and a third wait.
+        // the same service twice and a fourth wait (three are the most).
         assert!(refused(with("pkgd", FINE)));
         let mut chain = with("store-probe", FINE);
         for r in &mut chain {
@@ -438,7 +496,7 @@ mod tests {
             }
         }
         assert!(refused(chain));
-        for waits in [GONE, CLIENT, ZERO, LONG, TWICE, THREE] {
+        for waits in [GONE, CLIENT, ZERO, LONG, TWICE, FOUR] {
             assert!(refused(with("store-probe", waits)), "{waits:?}");
         }
         assert!(table::check(table::base::BASE_TABLE).is_ok());

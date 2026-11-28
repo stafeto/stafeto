@@ -126,6 +126,8 @@ pub struct Core<'a, V: Volume, L: Lower> {
     clearing: Option<usize>,
     /// The build left names out for the buckets: the root is served read-only.
     pub partial: bool,
+    /// The write guard of the lower set's service has been asked for (`guard_lower`).
+    guard_sent: bool,
     /// `/.layers/NN`, the live layer's directory.
     live: [u8; 16],
     live_len: usize,
@@ -323,6 +325,7 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
             reseeds: 0,
             clearing: None,
             partial: false,
+            guard_sent: false,
             live: *b"/.layers/00\0\0\0\0\0",
             live_len: 11,
             table: Table::new(epoch),
@@ -335,6 +338,30 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
 
     pub fn epoch(&self) -> u16 {
         self.table.epoch()
+    }
+
+    /// There is no data volume (the data file service said NOT_READY): the root has no layers to
+    /// merge and is the RAM file service's alone, writes included (design 2.1, point 5). The
+    /// service answers every SESSION with NO_STORE, so a program sends its paths to the file service
+    /// itself (`posix_abi::layer`), and asks no guard of it.
+    pub fn passes_all(&self) -> bool {
+        self.state == State::NoStore
+    }
+
+    /// Asks the lower set's service for its write guard, once, when the index is built and the
+    /// root is served (`State::Ready`): from then on the layer service is the only way to write a
+    /// name of the root. Without a volume (`passes_all`) and while the build goes on nothing is
+    /// asked. True when the guard is on after the call. An error leaves it unasked; the caller
+    /// (`main.rs`) asks again in a later step and ends the instance after a number of refusals.
+    pub fn guard_lower(&mut self) -> R<bool> {
+        if self.state != State::Ready {
+            return Ok(false);
+        }
+        if !self.guard_sent {
+            self.lower.guard()?;
+            self.guard_sent = true;
+        }
+        Ok(true)
     }
 
     pub fn descriptions(&self) -> usize {

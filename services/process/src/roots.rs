@@ -9,7 +9,7 @@
 //! replaces the old.
 
 use proto_process::{
-    PERMISSION, ROOT_DATA, ROOT_LAYER, ROOT_TERMINAL, ROOTS, UNREGISTERED, root_of,
+    ABSENT, PERMISSION, ROOT_DATA, ROOT_LAYER, ROOT_TERMINAL, ROOTS, UNREGISTERED, root_of,
 };
 
 /// What a Register through a notary session asks, by the label and the
@@ -58,13 +58,23 @@ pub const TAKEN_RIGHTS: abi::Rights = abi::Rights::SEND.union(abi::Rights::TRANS
 /// The registered roots, by root.
 pub struct Roots<H> {
     held: [Option<H>; ROOTS],
+    /// The roots the table of init registers, as a mask by root number (the line `roots=` of the
+    /// own arguments), or None when init gave no line: no root is then known to be absent.
+    listed: Option<u32>,
 }
 
 impl<H> Roots<H> {
     pub const fn new() -> Self {
         Self {
             held: [const { None }; ROOTS],
+            listed: None,
         }
+    }
+
+    /// Records which roots the table of init registers: TakeRoot for any other root answers ABSENT
+    /// (no service of the table will ever send it).
+    pub fn list(&mut self, mask: u32) {
+        self.listed = Some(mask);
     }
 
     /// Keeps `root` for the service of `which`; the one it replaces (the
@@ -73,11 +83,18 @@ impl<H> Roots<H> {
         self.held.get_mut(which as usize)?.replace(root)
     }
 
-    /// The root TakeRoot gives for `which`: PERMISSION for any root but `ROOT_DATA` and `ROOT_LAYER`, UNREGISTERED
-    /// when the service sent none.
+    /// The root TakeRoot gives for `which`: PERMISSION for any root but `ROOT_DATA` and `ROOT_LAYER`, ABSENT when the
+    /// table does not list its service, UNREGISTERED when the service sent none yet.
     pub fn taken(&self, which: u32) -> Result<&H, u32> {
         if !takeable(which) {
             return Err(PERMISSION);
+        }
+        if self.listed.is_some_and(|mask| mask & (1 << which) == 0) {
+            return Err(if cfg!(feature = "break-process-absent-wait") {
+                UNREGISTERED
+            } else {
+                ABSENT
+            });
         }
         self.get(which).ok_or(UNREGISTERED)
     }
@@ -173,6 +190,24 @@ mod tests {
         assert_eq!(empty.taken(ROOT_DATA), Err(UNREGISTERED));
         assert_eq!(empty.taken(ROOT_LAYER), Err(UNREGISTERED));
         assert!(takeable(ROOT_DATA) && takeable(ROOT_LAYER) && !takeable(ROOT_DATA + 1));
+    }
+
+    /// A root the table does not list answers ABSENT at once, listed or not registered yet
+    /// UNREGISTERED, and a root that is registered answers its handle whatever the list says of
+    /// the others. (The planted fault: ABSENT given as UNREGISTERED, which makes a client without
+    /// the service wait for it.)
+    #[test]
+    fn a_root_the_table_does_not_list_is_absent() {
+        let mut roots = Roots::<u32>::new();
+        roots.list(1 << ROOT_DATA);
+        assert_eq!(roots.taken(ROOT_LAYER), Err(ABSENT));
+        assert_eq!(roots.taken(ROOT_DATA), Err(UNREGISTERED));
+        roots.register(ROOT_DATA, 7);
+        assert_eq!(roots.taken(ROOT_DATA), Ok(&7));
+        // The roots the loaders take are no TakeRoot's, listed or not.
+        assert_eq!(roots.taken(proto_process::ROOT_PKG), Err(PERMISSION));
+        roots.list(1 << ROOT_LAYER | 1 << ROOT_DATA);
+        assert_eq!(roots.taken(ROOT_LAYER), Err(UNREGISTERED));
     }
 
     /// The copy TakeRoot puts in its reply can travel: a handle in a message has TRANSFER. (The

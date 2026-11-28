@@ -16,6 +16,10 @@ pub const DEVICE: u64 = n::DEVICE;
 /// The code of `proto_layer` that says the service builds its index: ask again. The POSIX layer
 /// does not depend on `proto_layer`; the layer service's tests keep the two equal.
 pub const STARTING: u32 = 1318;
+/// The code of `proto_layer` that says the service has no data volume: SESSION answers it, and the
+/// program sends every path of the root to the file service itself. Kept equal to the service's by
+/// a test, as `STARTING` is.
+pub const NO_STORE: u32 = 1309;
 
 /// Linux's errno numbers, which relibc uses.
 pub mod errno {
@@ -574,6 +578,7 @@ mod tests {
     #[test]
     fn the_codes_the_client_keeps_are_the_services() {
         assert_eq!(STARTING, proto_layer::STARTING);
+        assert_eq!(NO_STORE, proto_layer::NO_STORE);
     }
 
     #[test]

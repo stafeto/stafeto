@@ -576,14 +576,16 @@ static int exec_keeps_the_description(void) {
 static int programs_of_the_layers(void) {
     pid_t pid = 0;
     char *argv[] = {"layer-posix", "exit0", NULL};
-    /* A program the layer deletes is not there, and a program of the layer of the user is no program. */
+    /* A program the layer deletes is not there, and a file of the layer of the user is no program:
+     * one with the execute bit that is no script and no ELF file is ENOEXEC, so that a shell runs it
+     * itself (an ELF file of a layer is EACCES, see the script phase). */
     LP_CHECK(posix_spawn(&pid, "/bin/layer-posix-gone", NULL, NULL, argv, environ) == ENOENT);
-    LP_CHECK(posix_spawn(&pid, "/bin/layer-upper-prog", NULL, NULL, argv, environ) == EACCES);
+    LP_CHECK(posix_spawn(&pid, "/bin/layer-upper-prog", NULL, NULL, argv, environ) == ENOEXEC);
     LP_CHECK(posix_spawn(&pid, "/bin/never-was", NULL, NULL, argv, environ) == ENOENT);
     LP_CHECK(posix_spawn(&pid, "/bin/layer-posix", NULL, NULL, argv, environ) == 0);
     LP_CHECK(wait_ok(pid) == 0);
     LP_CHECK(FAILS(execv("/bin/layer-posix-gone", argv), ENOENT));
-    LP_CHECK(FAILS(execv("/bin/layer-upper-prog", argv), EACCES));
+    LP_CHECK(FAILS(execv("/bin/layer-upper-prog", argv), ENOEXEC));
     LP_CHECK(FAILS(execv("/etc/layer-lower", argv), EACCES));
     return 0;
 }
@@ -2286,6 +2288,176 @@ static int cutverify_first(void) {
 /* The program init starts has no code in its map to copy, so it cannot fork (the layer answers
  * ENOSYS); a program the loader starts can. The first role is therefore a launcher: it starts the
  * program from /bin with posix_spawn and passes on how it ended. */
+/* ---- the scripts of a layer of the user (the roles "script" and "script-run") ----
+ *
+ * A name of a layer of the user is no program (EACCES), but a script that starts with `#!` runs
+ * through its interpreter: execve and posix_spawn read the line through the layered root, check the
+ * right to execute the file, and run the interpreter with its argument, the path of the script and
+ * the arguments of the call. The interpreter here is this program (a program of the lower set) in
+ * the role "script-run", which checks its own arguments. The path of the interpreter goes through the
+ * same check as any program's: a name the layer deletes is ENOENT, a name of the layer is EACCES. */
+
+#define SCRIPT_BODY "#!/bin/layer-posix script-run\nthe rest of the script is not read\n"
+
+/* The role of the interpreter: argv is the interpreter's name, its argument, the path of the script
+ * and the arguments the caller gave. */
+static int script_run(int argc, char **argv) {
+    if (argc != 5) return 31;
+    if (strcmp(argv[0], "/bin/layer-posix") != 0) return 32;
+    if (strcmp(argv[1], "script-run") != 0) return 33;
+    if (strcmp(argv[2], "/scripts/hello") != 0) return 34;
+    if (strcmp(argv[3], "one") != 0 || strcmp(argv[4], "two") != 0) return 35;
+    return 0;
+}
+
+/* Makes the file `path` of the layer with `text` and the mode `mode`. */
+static int make_script(const char *path, const char *text, mode_t mode) {
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, mode);
+    if (fd < 0) return -1;
+    size_t length = strlen(text);
+    if (write(fd, text, length) != (ssize_t)length) {
+        close(fd);
+        return -1;
+    }
+    if (close(fd) != 0 || chmod(path, mode) != 0) return -1;
+    return 0;
+}
+
+static int a_script_of_the_layer_runs_through_its_interpreter(void) {
+    LP_CHECK(mkdir("/scripts", 0755) == 0);
+    LP_CHECK(make_script("/scripts/hello", SCRIPT_BODY, 0755) == 0);
+    char *argv[] = {"hello", "one", "two", NULL};
+    pid_t pid = 0;
+    LP_CHECK(posix_spawn(&pid, "/scripts/hello", NULL, NULL, argv, environ) == 0);
+    LP_CHECK(wait_ok(pid) == 0);
+    pid = fork();
+    LP_CHECK(pid >= 0);
+    if (pid == 0) {
+        execv("/scripts/hello", argv);
+        _exit(40 + (errno & 15));
+    }
+    LP_CHECK(wait_ok(pid) == 0);
+    return 0;
+}
+
+static int a_script_with_no_execute_bit_is_refused(void) {
+    LP_CHECK(make_script("/scripts/plain", SCRIPT_BODY, 0644) == 0);
+    char *argv[] = {"plain", "one", "two", NULL};
+    pid_t pid = 0;
+    LP_CHECK(posix_spawn(&pid, "/scripts/plain", NULL, NULL, argv, environ) == EACCES);
+    LP_CHECK(FAILS(execv("/scripts/plain", argv), EACCES));
+    /* A file with the execute bit that starts with no `#!` is ENOEXEC (a shell then runs it itself),
+     * and one that starts with an ELF header is EACCES: no program runs from a layer of the user. */
+    LP_CHECK(make_script("/scripts/data", "not a script\n", 0755) == 0);
+    LP_CHECK(posix_spawn(&pid, "/scripts/data", NULL, NULL, argv, environ) == ENOEXEC);
+    LP_CHECK(FAILS(execv("/scripts/data", argv), ENOEXEC));
+    LP_CHECK(make_script("/scripts/elf", "\x7f" "ELF and nothing more\n", 0755) == 0);
+    LP_CHECK(posix_spawn(&pid, "/scripts/elf", NULL, NULL, argv, environ) == EACCES);
+    LP_CHECK(FAILS(execv("/scripts/elf", argv), EACCES));
+    return 0;
+}
+
+static int an_interpreter_the_layer_deletes_is_not_found(void) {
+    /* /bin/layer-posix-gone is a file of the lower set that the layer deletes. */
+    LP_CHECK(make_script("/scripts/gone", "#!/bin/layer-posix-gone\n", 0755) == 0);
+    char *argv[] = {"gone", NULL};
+    pid_t pid = 0;
+    LP_CHECK(posix_spawn(&pid, "/scripts/gone", NULL, NULL, argv, environ) == ENOENT);
+    LP_CHECK(FAILS(execv("/scripts/gone", argv), ENOENT));
+    return 0;
+}
+
+static int an_interpreter_of_the_layer_is_refused(void) {
+    /* The interpreter is a script of the layer: no program runs from a layer of the user. */
+    LP_CHECK(make_script("/scripts/nested", "#!/scripts/hello\n", 0755) == 0);
+    char *argv[] = {"nested", NULL};
+    pid_t pid = 0;
+    LP_CHECK(posix_spawn(&pid, "/scripts/nested", NULL, NULL, argv, environ) == EACCES);
+    LP_CHECK(FAILS(execv("/scripts/nested", argv), EACCES));
+    return 0;
+}
+
+/* The role of the interpreter of the set-ID script: a script's set-ID bits are ignored, so the
+ * program runs with the identity of the caller (1001), not the owner's (1000). */
+static int script_euid(void) {
+    if (geteuid() != 1001 || getuid() != 1001 || getegid() != 100) return 51;
+    return 0;
+}
+
+static int a_set_id_script_runs_with_the_callers_identity(void) {
+    LP_CHECK(make_script("/scripts/suid", "#!/bin/layer-posix script-euid\n", 0755) == 0);
+    LP_CHECK(chown("/scripts/suid", 1000, 100) == 0 && chmod("/scripts/suid", 04755) == 0);
+    struct stat st;
+    LP_CHECK(stat("/scripts/suid", &st) == 0 && (st.st_mode & 07777) == 04755 && st.st_uid == 1000);
+    pid_t pid = fork();
+    LP_CHECK(pid >= 0);
+    if (pid == 0) {
+        if (setgid(100) != 0 || setuid(1001) != 0) _exit(2);
+        char *argv[] = {"suid", NULL};
+        execv("/scripts/suid", argv);
+        _exit(40 + (errno & 15));
+    }
+    LP_CHECK(wait_ok(pid) == 0);
+    return 0;
+}
+
+static int script_first(void) {
+    run_check("a script of the layer runs through its interpreter",
+              a_script_of_the_layer_runs_through_its_interpreter);
+    run_check("a script with no execute bit is refused", a_script_with_no_execute_bit_is_refused);
+    run_check("an interpreter the layer deletes is not found", an_interpreter_the_layer_deletes_is_not_found);
+    run_check("an interpreter of the layer is refused", an_interpreter_of_the_layer_is_refused);
+    run_check("a set-ID script runs with the caller's identity", a_set_id_script_runs_with_the_callers_identity);
+    if (failures != 0) {
+        printf("layer-posix: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("layer-posix: script checks passed\n");
+    return 0;
+}
+
+/* ---- a machine with no data volume (the role "bare") ----
+ *
+ * The data file service has no disk, so the layer service answers every SESSION with NO_STORE and
+ * the root is the RAM file service's alone: a write goes to memory (the guard of the file service
+ * was never asked for), and nothing says the root is layered. */
+
+static int the_root_is_the_file_services_alone(void) {
+    struct stat st;
+    LP_CHECK(stat("/bin/layer-posix", &st) == 0 && S_ISREG(st.st_mode));
+    LP_CHECK(st.st_dev != LAYERED_DEVICE);
+    LP_CHECK(stat("/etc/layer-lower", &st) == 0 && st.st_dev != LAYERED_DEVICE);
+    /* The layer the volume would have had is not there. */
+    LP_CHECK(FAILS(stat("/etc/layer-own", &st), ENOENT));
+    return 0;
+}
+
+static int a_write_to_the_root_goes_to_memory(void) {
+    struct stat st;
+    char text[8];
+    int fd = open("/etc/bare-new", O_CREAT | O_RDWR, 0644);
+    LP_CHECK(fd >= 0 && write(fd, "memory", 6) == 6 && close(fd) == 0);
+    LP_CHECK(read_file("/etc/bare-new", text, sizeof text) == 6 && memcmp(text, "memory", 6) == 0);
+    LP_CHECK(mkdir("/bare-dir", 0755) == 0 && rename("/etc/bare-new", "/bare-dir/moved") == 0);
+    LP_CHECK(stat("/bare-dir/moved", &st) == 0 && st.st_size == 6 && st.st_dev != LAYERED_DEVICE);
+    /* The files of the image are the file service's own, immutable: a write is its refusal, and
+     * nothing is copied up. */
+    LP_CHECK(FAILS(open("/etc/layer-lower", O_WRONLY), EROFS));
+    LP_CHECK(unlink("/bare-dir/moved") == 0 && rmdir("/bare-dir") == 0);
+    return 0;
+}
+
+static int bare_first(void) {
+    run_check("the root is the file service's alone", the_root_is_the_file_services_alone);
+    run_check("a write to the root goes to memory", a_write_to_the_root_goes_to_memory);
+    if (failures != 0) {
+        printf("layer-posix: %d checks failed\n", failures);
+        return 20;
+    }
+    printf("layer-posix: bare checks passed\n");
+    return 0;
+}
+
 static int launcher(void) {
     char *argv[] = {"layer-posix", LAYER_POSIX_MODE, NULL};
     pid_t pid = 0;
@@ -2307,7 +2479,11 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "forged") == 0) return forged_role();
     if (argc > 1 && strcmp(argv[1], "setid") == 0) return setid_role();
     if (argc > 2 && strcmp(argv[1], "genuine") == 0) return genuine_role(argv);
+    if (argc > 1 && strcmp(argv[1], "script-euid") == 0) return script_euid();
+    if (argc > 1 && strcmp(argv[1], "script-run") == 0) return script_run(argc, argv);
     if (argc > 1 && strcmp(argv[1], "run") == 0) return first();
+    if (argc > 1 && strcmp(argv[1], "script") == 0) return script_first();
+    if (argc > 1 && strcmp(argv[1], "bare") == 0) return bare_first();
     if (argc > 1 && strcmp(argv[1], "write") == 0) return write_first();
     if (argc > 1 && strcmp(argv[1], "reread") == 0) return reread_first();
     if (argc > 1 && strcmp(argv[1], "copy") == 0) return copy_first();
