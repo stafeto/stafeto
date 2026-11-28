@@ -43,6 +43,17 @@ const RAM_TAG: &str = "2";
 /// The kind of the RAM file service that counts READ_AT_FD_INTO (the statistics count every method
 /// from 64 on in the kind 63): the reads of the copy up of 12 KiB each.
 const RAM_READ_KIND: usize = 63;
+/// The kind of the RAM file service that counts RESOLVE_START.
+const RAM_RESOLVE_KIND: usize = 21;
+/// The longest wait of the loop in a call that is a notification step (kind 63 of the layer service)
+/// without the copy, in ticks (`layer-steps nocopy`, 28 November): what the same run with the copy
+/// may exceed by one part of the copy and `WAIT_MARGIN`.
+const NOCOPY_WAIT_63: u64 = 6_500_235;
+const WAIT_MARGIN: u64 = 1_000_000;
+/// The longest job of the copy in the data file service, a part or an FSYNC, in microseconds.
+const COPY_JOB_MAX_US: u64 = 100_000;
+/// Ticks of the counter in a microsecond (62.5 MHz).
+const TICKS_PER_US: u64 = 125 / 2;
 
 /// The checks of the probe in scale mode, in the order it runs them.
 pub const CHECKS: [&str; 16] = [
@@ -237,14 +248,15 @@ pub fn gate(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
 
 /// The reads of the copy in the RAM file service (kind 63, the step of READ_AT_FD_INTO of 12 KiB):
 /// none over B, at most 0.9 B and seen at all, so that the copy of the lower file of 64 MiB was made
-/// through them. The longest of the kind, in ticks. The other kinds of the service are judged by the
-/// probes of the service itself (the start of the resolve of a path of 253 components, which this
-/// run now measures, is one of them).
+/// through them. The longest of the kind, in ticks. Every other kind of the service is judged against B
+/// too (the Change family among them) but the kind 21, ResolveStart: the start of the resolve of a path
+/// of 253 components is 23,139 ticks there, over B, with the copy and without it (`RAM_RESOLVE_KIND`;
+/// a matter of the probes of the RAM file service, told by both runs).
 pub fn ram_gate(lines: &[String]) -> Result<u64, String> {
     crate::step_line::within_b(
         lines,
         RAM_TAG,
-        crate::step_line::Kinds::Only(&[RAM_READ_KIND]),
+        crate::step_line::Kinds::Except(&[RAM_RESOLVE_KIND]),
     )?;
     let rows = crate::step_line::longest(lines, RAM_TAG);
     let reads = rows
@@ -301,6 +313,41 @@ pub fn longest_job_us(lines: &[String], method: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// The longest step of the RAM file service of `kind`, in ticks (0 when it told none).
+pub fn ram_row(lines: &[String], kind: usize) -> u64 {
+    crate::step_line::longest(lines, RAM_TAG)
+        .iter()
+        .find(|r| r.0 == kind)
+        .map_or(0, |r| r.1)
+}
+
+/// The gate of the copy: the longest part and FSYNC job of the data file service at most
+/// `COPY_JOB_MAX_US`, and the longest wait of the loop in a call of kind 63 at most the wait without
+/// the copy and one part more (`WAIT_MARGIN` besides). The part and the wait, in ticks.
+pub fn copy_gate(lines: &[String]) -> Result<(u64, u64), String> {
+    let part = longest_job_us(lines, "PwriteFrom");
+    let fsync = longest_job_us(lines, "Fsync");
+    if part == 0 {
+        return Err("layer-steps: the data file service told no part of the copy".into());
+    }
+    for (what, us) in [("part", part), ("FSYNC", fsync)] {
+        if us > COPY_JOB_MAX_US {
+            return Err(format!(
+                "layer-steps: the longest {what} of the copy took {us} us, over {COPY_JOB_MAX_US}"
+            ));
+        }
+    }
+    let wait = waits(lines).iter().find(|w| w.0 == 63).map_or(0, |w| w.1);
+    let bound = NOCOPY_WAIT_63 + part * TICKS_PER_US + WAIT_MARGIN;
+    if wait > bound {
+        return Err(format!(
+            "layer-steps: the loop waited {wait} ticks in a call of kind 63, over {bound} (the wait without the copy {NOCOPY_WAIT_63}, one part {} ticks, a margin {WAIT_MARGIN})",
+            part * TICKS_PER_US
+        ));
+    }
+    Ok((part * TICKS_PER_US, wait))
+}
+
 /// The line the service says when its index is built: the names, the marks and the steps it took.
 fn index_line(lines: &[String]) -> Result<(u32, u32, u32), String> {
     let line = lines
@@ -333,12 +380,16 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     }
     let rows = gate(&output.lines)?;
     let read = ram_gate(&output.lines)?;
+    let (part_ticks, wait63) = copy_gate(&output.lines)?;
     println!(
-        "layer-steps: longest wait of the loop in a call (kind, ticks) {:?}; longest job of the data file service: a part {} us, an FSYNC {} us, a CHOWN {} us",
+        "layer-steps: longest wait of the loop in a call (kind, ticks) {:?} (kind 63 {wait63}, one part {part_ticks} ticks); longest job of the data file service: a part {} us, an FSYNC {} us, a CHOWN {} us, a Rename {} us, an Unlink {} us; ResolveStart of the RAM file service {} ticks",
         waits(&output.lines),
         longest_job_us(&output.lines, "PwriteFrom"),
         longest_job_us(&output.lines, "Fsync"),
-        longest_job_us(&output.lines, "Chown")
+        longest_job_us(&output.lines, "Chown"),
+        longest_job_us(&output.lines, "Rename"),
+        longest_job_us(&output.lines, "Unlink"),
+        ram_row(&output.lines, RAM_RESOLVE_KIND)
     );
     println!(
         "layer-steps on {}: {names} names built in {steps} steps, a file at 247 components, a path of 253, a merged listing of {} names, a lower file of 64 MiB copied up meanwhile (a read of the copy in the RAM file service {read} ticks); steps of the layer service (kind, ticks, detail) {rows:?}, none over 0.9 B ({}) in {seconds} s: ok",
@@ -398,12 +449,15 @@ pub fn nocopy(machine: &qemu::Machine) -> Result<(), String> {
     )?;
     let rows = gate(&output.lines)?;
     println!(
-        "layer-steps nocopy on {}: steps of the layer service {rows:?}; longest wait of the loop in a call (kind, ticks) {:?}; longest job of the data file service: a part {} us, an FSYNC {} us, a CHOWN {} us, in {seconds} s",
+        "layer-steps nocopy on {}: steps of the layer service {rows:?}; longest wait of the loop in a call (kind, ticks) {:?}; longest job of the data file service: a part {} us, an FSYNC {} us, a CHOWN {} us, a Rename {} us, an Unlink {} us; ResolveStart of the RAM file service {} ticks, in {seconds} s",
         machine.name,
         waits(&output.lines),
         longest_job_us(&output.lines, "PwriteFrom"),
         longest_job_us(&output.lines, "Fsync"),
-        longest_job_us(&output.lines, "Chown")
+        longest_job_us(&output.lines, "Chown"),
+        longest_job_us(&output.lines, "Rename"),
+        longest_job_us(&output.lines, "Unlink"),
+        ram_row(&output.lines, RAM_RESOLVE_KIND)
     );
     Ok(())
 }
@@ -449,12 +503,46 @@ mod tests {
         assert!(ram_gate(&[step(63, 21_000)]).is_err());
         // A step of another kind of the service is no read of the copy.
         assert_eq!(ram_gate(&[step(63, 14_000), step(21, 23_000)]), Ok(14_000));
+        // Any other kind over B is caught: the Change family among them.
+        assert!(ram_gate(&[step(63, 14_000), step(44, 21_000)]).is_err());
+        assert_eq!(ram_row(&[step(21, 23_000)], 21), 23_000);
         assert!(
             ram_gate(&[step(64, 5_000)])
                 .unwrap_err()
                 .contains("no read")
         );
         assert!(ram_gate(&[]).is_err());
+    }
+
+    #[test]
+    fn the_copy_is_gated_by_its_jobs_and_by_the_wait_it_adds_to_the_loop() {
+        let lines = |part: u64, fsync: u64, wait: u64| -> Vec<String> {
+            vec![
+                format!("datafs: job PwriteFrom longest {part} us"),
+                format!("datafs: job Fsync longest {fsync} us"),
+                format!("service wait: {STEP_TAG} kind 63 {wait} ticks of {wait}"),
+            ]
+        };
+        // One part (32 ms) over the wait without the copy, inside the margin.
+        let ok = lines(32_000, 14_000, NOCOPY_WAIT_63 + 2_000_000);
+        assert_eq!(
+            copy_gate(&ok),
+            Ok((32_000 * TICKS_PER_US, NOCOPY_WAIT_63 + 2_000_000))
+        );
+        assert!(
+            copy_gate(&lines(120_000, 1, 1))
+                .unwrap_err()
+                .contains("part")
+        );
+        assert!(
+            copy_gate(&lines(1_000, 120_000, 1))
+                .unwrap_err()
+                .contains("FSYNC")
+        );
+        // Three parts more than without the copy.
+        let over = lines(32_000, 14_000, NOCOPY_WAIT_63 + 6_000_000);
+        assert!(copy_gate(&over).unwrap_err().contains("kind 63"));
+        assert!(copy_gate(&[]).is_err());
     }
 
     #[test]

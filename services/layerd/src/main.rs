@@ -27,7 +27,8 @@
 //! (`layerd::copy`) and answers COPYING with the ticket; the bytes are copied by the worker thread
 //! (`worker`) with sessions of its own, so no step of the loop holds a copy. The loop's calls to the data
 //! file service wait for at most one job of the copy ahead of them (that service has one worker thread of
-//! synchronous calls: a part of 64 KiB, an FSYNC or one attribute call). WAIT is answered at once
+//! synchronous calls: a part of 64 KiB, an FSYNC or one attribute call) and one tail step, besides the
+//! jobs of other clients ahead of them and their own job. WAIT is answered at once
 //! (COPYING while the copy goes on) and keeps the notification the request brings; when the worker
 //! has ended a copy the loop walks the name again under the lock and either makes the copy visible
 //! (the rename into the layer and the index entry in one step) or hands it to the reaper, and
@@ -1313,15 +1314,12 @@ impl Layerd {
                             let Ok(handle) = r.handles.take::<Channel>(0) else {
                                 return Answer::Status(Status::Kernel(abi::Error::WrongType));
                             };
-                            match self.waiters.add(label, ticket, handle) {
-                                copy::Added::New => {}
-                                // The session waited for the ticket already (another thread of the
-                                // program, or the same one after a signal): the old notification is
-                                // told, so that its thread asks again, and the new one is kept.
-                                copy::Added::Replaced(old) => {
-                                    let _ = sys::notify(&old, 1);
-                                }
-                                copy::Added::Full(_) => return st(l::STARTING),
+                            // Up to `PER_OWNER` notifications of a session are kept, for one ticket or
+                            // several (another thread of the program, or the same one after a
+                            // signal); none is told before its copy ends. A session over its share
+                            // is told STARTING, and its program backs off.
+                            if let copy::Added::Full(_) = self.waiters.add(label, ticket, handle) {
+                                return st(l::STARTING);
                             }
                         }
                         match n::write_copying(ticket, r.reply()) {

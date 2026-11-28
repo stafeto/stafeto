@@ -24,7 +24,7 @@
 //! | ACCESS (82) | a session | `bits` u32, `flags` u32 (`ACCESS_REAL`), the path | none |
 //! | READLINK (83) | a session | the path | the target, to the end of the message |
 //! | CHANGE (84) | a session | the `Change` request (below) | none; COPYING with a ticket |
-//! | WAIT (85) | a session | `ticket` u64, and optionally one handle: a copy of the caller's channel (NOTIFY, labelled with the ticket) | none when the copy is over, the failure of the copy, or COPYING and the ticket while it goes on |
+//! | WAIT (85) | a session | `ticket` u64, and optionally one handle: a copy of the caller's channel (NOTIFY, labelled with the ticket and bit 62) | none when the copy is over, the failure of the copy, or COPYING and the ticket while it goes on |
 //!
 //! The root channel takes SESSION and VERIFY_SESSION and nothing else, a session never takes them
 //! (the status `INVALID_ARGUMENT`), and the root of the service also takes the SESSION of
@@ -85,7 +85,7 @@
 //! `READ_ONLY_FILESYSTEM` for a program, which is never copied, or an I/O error), or `COPYING` and
 //! the ticket while it goes on. The kernel gives no end to the wait of a thread for the reply of a
 //! request a service has taken, so a wait that a signal may end is the caller's `receive` on its own
-//! channel: a WAIT that brings a copy of that channel (NOTIFY, labelled with the ticket) has it kept
+//! channel: a WAIT that brings a copy of that channel (NOTIFY, labelled with the ticket and bit 62) has it kept
 //! by the service, which notifies bit 0 on it when the copy ends and drops it; the caller asks WAIT
 //! again then. A WAIT with no handle only asks. The service holds 16 such notifications at most
 //! (`STARTING` for the next).

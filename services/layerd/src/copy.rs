@@ -7,7 +7,8 @@
 //! holds a copy (the bound of its step is 0.9 B). The loop does wait for the data file service, as
 //! it always did: that service has one worker thread of synchronous calls, so a call of the loop
 //! waits for at most one job of the copy that is ahead of it (a part of 64 KiB, an FSYNC or one
-//! attribute call), and the wait is no work of the step:
+//! attribute call) and one tail step of the data file service (docs/data.md), besides the jobs of
+//! other clients ahead of it and its own job; the wait is no work of the step:
 //!
 //! - `Table` (the loop): the places of the copies with their tickets (the place and the
 //!   generation), the queue of the files that wait for one of the `ACTIVE` copies in work, and the
@@ -180,7 +181,7 @@ pub const fn ticket_parts(ticket: u64) -> (u8, u32) {
 /// `ticket_parts`, and the notification kept under a value no copy ever ends).
 pub const fn ticket_valid(ticket: u64) -> bool {
     let (place, generation) = ticket_parts(ticket);
-    generation != 0 && ticket_of(place, generation) == ticket
+    (place as usize) < PLACES && generation != 0 && ticket_of(place, generation) == ticket
 }
 
 /// What a worker says of a copy that ended.
@@ -383,8 +384,9 @@ impl Table {
 
 /// The waiters of the copies: `N` places for what the service gives each when its copy ends (the
 /// notification a program's WAIT brought), each kept under the session that asked (`owner`) and the
-/// ticket. A session has at most `PER_OWNER` places; a new WAIT of a session for a ticket it waits
-/// for replaces the old one, which is given back so the service can tell it to look again.
+/// ticket. A session has at most `PER_OWNER` places, for one ticket or for several (two threads of a
+/// program, or one thread after a signal, wait for one copy); a waiter is never replaced, and none is
+/// told before its copy ends, so no notification bounces between threads.
 pub struct Waiters<P, const N: usize> {
     held: [Option<(u64, u64, P)>; N],
 }
@@ -397,9 +399,8 @@ pub const PER_OWNER: usize = 4;
 pub enum Added<P> {
     /// A place was taken.
     New,
-    /// The session's earlier waiter for the ticket was replaced; here it is.
-    Replaced(P),
-    /// No place: the table is full or the session holds `PER_OWNER`; the waiter comes back.
+    /// No place: the table is full or the session holds `PER_OWNER`; the waiter comes back and the
+    /// program is told to ask again later (STARTING).
     Full(P),
 }
 
@@ -418,16 +419,6 @@ impl<P, const N: usize> Waiters<P, N> {
 
     /// Holds `waiter` of the session `owner` for `ticket`.
     pub fn add(&mut self, owner: u64, ticket: u64, waiter: P) -> Added<P> {
-        if let Some(place) = self.held.iter_mut().find(|h| {
-            h.as_ref()
-                .is_some_and(|(o, t, _)| *o == owner && *t == ticket)
-        }) {
-            let old = place.replace((owner, ticket, waiter));
-            return match old {
-                Some((_, _, old)) => Added::Replaced(old),
-                None => Added::New,
-            };
-        }
         let mine = self
             .held
             .iter()
@@ -848,33 +839,36 @@ mod tests {
     }
 
     #[test]
-    fn waiters_are_kept_by_session_and_ticket_and_a_new_one_replaces_the_old() {
+    fn two_waits_of_one_session_for_one_ticket_are_both_kept_and_told_when_the_copy_ends() {
         let mut w: Waiters<u32, WAITERS> = Waiters::new();
-        // Four sessions take four places each: the table is full for the fifth.
-        for k in 0..WAITERS as u32 {
-            assert_eq!(
-                w.add(u64::from(k / PER_OWNER as u32), u64::from(k), k),
-                Added::New
-            );
+        // Two threads of one session wait for one copy: both are kept, none replaces the other.
+        assert_eq!(w.add(1, 7, 10), Added::New);
+        assert_eq!(w.add(1, 7, 11), Added::New);
+        assert_eq!(w.len(), 2);
+        // Nothing is told while the copy goes on (the service tells by `take` when it ends).
+        assert_eq!(w.len(), 2);
+        let mut told = std::vec::Vec::new();
+        while let Some(x) = w.take(7) {
+            told.push(x);
         }
-        assert_eq!(w.add(9, 1, 99), Added::Full(99));
-        assert_eq!(w.len(), WAITERS);
-        // The same session for the same ticket replaces its waiter, and the table stays as full.
-        assert_eq!(w.add(0, 2, 77), Added::Replaced(2));
-        assert_eq!(w.len(), WAITERS);
-        assert_eq!(w.take(2), Some(77));
-        // A session that holds its share is refused before the table is full.
-        let mut w: Waiters<u32, WAITERS> = Waiters::new();
-        for k in 0..PER_OWNER as u32 {
-            assert_eq!(w.add(1, u64::from(k), k), Added::New);
-        }
-        assert_eq!(w.add(1, 50, 5), Added::Full(5));
-        assert_eq!(w.add(2, 50, 5), Added::New);
-        // Waiters of a ticket come out one at a time, and a session that ended takes its own away.
-        assert_eq!(w.take(50), Some(5));
-        assert_eq!(w.take(50), None);
-        w.drop_owner(1);
+        told.sort_unstable();
+        assert_eq!(told, [10, 11]);
         assert!(w.is_empty());
+        // A session holds `PER_OWNER` and no more, for one ticket or several; others are not held back.
+        for k in 0..PER_OWNER as u32 {
+            assert_eq!(w.add(1, u64::from(k % 2), k), Added::New);
+        }
+        assert_eq!(w.add(1, 0, 99), Added::Full(99));
+        assert_eq!(w.add(2, 0, 5), Added::New);
+        // Four sessions of four fill the table.
+        let mut full: Waiters<u32, WAITERS> = Waiters::new();
+        for k in 0..WAITERS as u32 {
+            assert_eq!(full.add(u64::from(k / PER_OWNER as u32), 1, k), Added::New);
+        }
+        assert_eq!(full.add(9, 1, 0), Added::Full(0));
+        // A session that ended takes its own away.
+        w.drop_owner(1);
+        assert_eq!(w.len(), 1);
     }
 
     #[test]
@@ -885,7 +879,9 @@ mod tests {
         assert!(!ticket_valid(t | 1 << 63));
         assert!(!ticket_valid(0));
         assert!(!ticket_valid(3));
-        assert!(ticket_valid(ticket_of(255, u32::MAX)));
+        assert!(ticket_valid(ticket_of(PLACES as u8 - 1, u32::MAX)));
+        // A place the table does not have is no ticket either.
+        assert!(!ticket_valid(ticket_of(PLACES as u8, 1)) && !ticket_valid(ticket_of(255, 1)));
         // The table would find the forged value Pending, the reason the service refuses it first.
         let mut table = Table::new();
         let real = table.reserve(b"/a", Kind::Whole, stat(1)).unwrap();

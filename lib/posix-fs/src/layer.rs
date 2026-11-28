@@ -137,12 +137,20 @@ pub fn copying_ticket(reply: &[u8]) -> Option<Result<u64, i32>> {
     n::read_copying(reply).map(|ticket| ticket.map_err(|_| errno::EIO))
 }
 
-/// The label of the copy of its channel that a thread brings to WAIT: the ticket. A tag in the high
-/// bits (62 and 63 were tried, as `wait.rs` tags its own labels) kept the notification from the
-/// thread's receive in the probe, so the label stays the ticket (at most 40 bits); a notification
-/// of another long operation with the same number only makes the wait ask WAIT again.
+/// The tag of the label of the copy of its channel that a thread brings to WAIT: bit 62, a namespace
+/// of the tickets (at most 40 bits) that no other labelled copy of a channel uses (`wait.rs` has bit
+/// 63, the fast sockets 1 << 62 | 0xfa57 << 32 and 0xfa58, the data window 0x5749_4e44_0000 and on).
+pub const WAIT_TAG: u64 = 1 << 62;
+
+/// The label of that copy: the ticket with the tag. The label the thread sends and the one its
+/// receive matches are this one (`waits_for`).
 pub const fn wait_label(ticket: u64) -> u64 {
-    ticket
+    WAIT_TAG | ticket
+}
+
+/// Whether a notification labelled `label` is the one of the copy `ticket`.
+pub const fn waits_for(label: u64, ticket: u64) -> bool {
+    label == wait_label(ticket)
 }
 
 /// The errno of a copy that failed, which the answer to WAIT carries as a status of the layer
@@ -746,8 +754,27 @@ mod tests {
     }
 
     #[test]
-    fn the_label_of_a_wait_is_the_ticket() {
-        assert_eq!(wait_label(0x0102), 0x0102);
+    fn the_label_a_wait_sends_is_the_label_its_receive_matches() {
+        let ticket = u64::from(u32::MAX) << 8 | 11;
+        let sent = wait_label(ticket);
+        assert!(waits_for(sent, ticket));
+        assert!(
+            !waits_for(ticket, ticket),
+            "the plain ticket is no label of a wait"
+        );
+        assert!(!waits_for(sent, ticket + 1));
+        // The tag is bit 62 alone, and no ticket reaches it.
+        assert_eq!(sent & !ticket, WAIT_TAG);
+        assert_eq!(ticket & WAIT_TAG, 0);
+        // The labels of the other copies of a channel are other labels.
+        for other in [
+            1u64 << 63 | 5,
+            1 << 62 | 0xfa57 << 32,
+            0xfa58,
+            0x5749_4e44_0000,
+        ] {
+            assert!(!waits_for(other, ticket) || other == sent);
+        }
     }
 
     #[test]

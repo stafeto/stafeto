@@ -474,7 +474,7 @@ fn call_with(request: &[u8], take: bool) -> Result<Got, i32> {
 /// WAIT for the copy `ticket` names. The service answers WAIT at once, as the kernel gives no end to
 /// the wait of a thread for the reply of a request a service has taken (a signal would stay pending
 /// until the reply): 0 when the copy is over, the failure of the copy, or COPYING while it goes on.
-/// The first WAIT brings a copy of the thread's own channel labelled with the ticket (NOTIFY), which
+/// The first WAIT brings a copy of the thread's own channel labelled with the ticket and bit 62 (NOTIFY), which
 /// the service keeps and notifies when the copy ends; the thread waits in `receive` on its channel,
 /// as a long operation does (`long`), and a signal that ends the receive ends the call with EINTR
 /// unless every handler that ran had SA_RESTART (a thread cancelled in a point of cancellation ends
@@ -506,7 +506,7 @@ fn wait_copy(ticket: u64) -> Result<(), i32> {
             let Ok(labelled) = rt::sys::handle_label(
                 &channel,
                 rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER,
-                ticket,
+                wait,
                 level,
             ) else {
                 return Err(EIO);
@@ -579,7 +579,7 @@ fn wait_copy(ticket: u64) -> Result<(), i32> {
                     label,
                     bits,
                     ..
-                }) if label == wait && bits & 1 != 0 => {
+                }) if pure::waits_for(label, ticket) && bits & 1 != 0 => {
                     // The service told once and dropped its copy: the next WAIT brings a new one.
                     armed = false;
                     break 'notified;
