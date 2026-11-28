@@ -31,6 +31,14 @@
 //! by its own rule. Nothing there depends on the screenshot, so the run is
 //! the same on every machine.
 //!
+//! A fourth image (`top_probe`) has the top-window protocol: a client whose window
+//! can be resized to the whole screen and a manager that frames it with a window
+//! of its own, links the two, moves the pair, asks for a size, and asks the client
+//! to close. The screenshots after the link, after the move (while the client has
+//! said its new size and not posted it), after the new size and after the close
+//! are compared with the guest's CRC-32; a run under -icount judges the steps of
+//! the new methods.
+//!
 //! A third run, under -icount, measures the steps of the compositor, of the
 //! display driver and of the tablet's driver: every step stays under 0.9 of
 //! term B, and a band of a frame and a step of the drivers' own under
@@ -139,6 +147,90 @@ pub const WM_STEPS_PROGRAMS: [ImageProgram; 6] = [
     ),
     ("wm", "wm", CHILD_STACK_SIZE, &[]),
     ("focus-probe", "focus-probe", CHILD_STACK_SIZE, &[]),
+];
+
+/// The image of the top-window probe: the display driver, the compositor, the
+/// client and the manager (no input service).
+pub const TOP_PROGRAMS: [ImageProgram; 4] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-focus-top"]),
+    (
+        "virtio-gpu",
+        "virtio-gpu",
+        crate::gpu_probe::GPU_STACK_SIZE,
+        &[],
+    ),
+    ("compositor", "compositor", comp_probe::COMP_STACK_SIZE, &[]),
+    ("focus-probe", "focus-probe", CHILD_STACK_SIZE, &[]),
+];
+
+/// The same under -icount: the compositor counts its steps, the clients do not
+/// wait for the monitor.
+pub const TOP_STEPS_PROGRAMS: [ImageProgram; 4] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-focus-top"]),
+    (
+        "virtio-gpu",
+        "virtio-gpu",
+        crate::gpu_probe::GPU_STACK_SIZE,
+        &[],
+    ),
+    (
+        "compositor",
+        "compositor",
+        comp_probe::COMP_STACK_SIZE,
+        &["steps"],
+    ),
+    ("focus-probe", "focus-probe", CHILD_STACK_SIZE, &["quick"]),
+];
+
+/// The screens of the top-window run, after each step the guest announces.
+const TOP_LINKED: &str = "focus-probe: top linked crc ";
+const TOP_PENDING: &str = "focus-probe: top pending crc ";
+const TOP_RESIZED: &str = "focus-probe: top resized crc ";
+const TOP_CLOSED: &str = "focus-probe: top closed crc ";
+/// The programs of the top-window image end in this order of their names.
+const TOP_ENDED: [&str; 2] = [
+    "init: top-client ended: exit code 0, not restarted",
+    "init: top-wm ended: exit code 0, not restarted",
+];
+
+/// The lines the top-window run has, and how many times each.
+const TOP_CHECKS: [(&str, usize); 9] = [
+    (
+        "focus-probe: top client window is up and its refusals are exact",
+        1,
+    ),
+    (
+        "focus-probe: top manager has the client's texts and capacity",
+        1,
+    ),
+    (
+        "focus-probe: top frame is linked directly under the client",
+        1,
+    ),
+    (
+        "focus-probe: top client was asked for a size and answered",
+        1,
+    ),
+    ("focus-probe: top client posted the new size", 1),
+    ("focus-probe: top client was asked to close", 1),
+    ("focus-probe: ok", 2),
+    (comp_probe::READY, 1),
+    (gpu_probe::READY, 1),
+];
+
+/// The kinds of the compositor's steps the top-window run must have: the
+/// requests of the window and of the manager, the two new methods among them
+/// (SET_TEXT 28, SIZE 29), and the compositor's own.
+const TOP_COMP_KINDS: [(usize, &str); 9] = [
+    (17, "Describe"),
+    (18, "WindowCreate"),
+    (19, "Attach"),
+    (20, "Post"),
+    (21, "Events"),
+    (22, "Manage"),
+    (28, "SetText"),
+    (29, "Size"),
+    (65, "a band of a frame and the end of a frame"),
 ];
 
 /// Where the injected pointer moves first (the guest's CLICK) and where the
@@ -413,6 +505,37 @@ fn many_band_text(lines: &[String]) -> String {
     }
 }
 
+/// Judges the lines of the top-window run: the services started and were ready
+/// once, every check passed, and no program said it failed.
+pub fn top_verdict(lines: &[String]) -> Result<(), String> {
+    let count = |marker: &str| lines.iter().filter(|l| l.as_str() == marker).count();
+    if let Some(failed) = lines.iter().find(|l| l.starts_with("focus-probe: failed")) {
+        return Err(failed.clone());
+    }
+    for (marker, wanted) in TOP_CHECKS {
+        if count(marker) != wanted {
+            let found: Vec<_> = lines
+                .iter()
+                .filter(|l| {
+                    l.starts_with("virtio-gpu: ")
+                        || l.starts_with("compositor: ")
+                        || l.starts_with("focus-probe: ")
+                })
+                .collect();
+            return Err(format!(
+                "{} lines {marker:?}, {wanted} expected; the programs said {found:?}",
+                count(marker)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The steps of the compositor in the top-window run.
+pub fn top_steps_verdict(lines: &[String]) -> Result<comp_probe::Rows, String> {
+    rows_of(lines, comp_probe::COMP_TAG, "compositor", &TOP_COMP_KINDS)
+}
+
 /// The steps of the compositor in the window manager's run.
 pub fn wm_steps_verdict(lines: &[String]) -> Result<comp_probe::Rows, String> {
     rows_of(lines, comp_probe::COMP_TAG, "compositor", &WM_COMP_KINDS)
@@ -610,6 +733,94 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
     Ok(())
 }
 
+/// Follows the top-window run: the screenshots against the guest's CRC-lines, then
+/// the end of the two programs.
+fn drive_top(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
+    const WITHIN: Duration = Duration::from_secs(120);
+    let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
+    for prefix in [TOP_LINKED, TOP_PENDING, TOP_RESIZED, TOP_CLOSED] {
+        let line = run.expect_line(prefix, |l| l.contains(prefix), WITHIN)?;
+        gpu_probe::compare(&mut monitor, &scratch.picture(), &line, prefix)?;
+    }
+    for ended in TOP_ENDED {
+        run.expect_seen(ended, WITHIN)?;
+    }
+    Ok(())
+}
+
+/// The top-window protocol's run. Without `counted` it has a monitor: the
+/// screenshots after the link, the move that leaves the client's size where it
+/// was, the new size and the close are the guest's CRC. With `counted` it is under
+/// -icount with the compositor counting its steps, which must include SET_TEXT,
+/// SIZE and the manager's operations, and every one stays under the bound.
+fn top_probe(machine: &qemu::Machine, counted: bool) -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    if !counted {
+        let image = build_boot_image("boot-focus-top.img", &TOP_PROGRAMS, BOOT_PROFILE)?;
+        let scratch = Scratch::new()?;
+        let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+        cmd.args(["-display", "none", "-serial", "stdio", "-monitor"]);
+        cmd.arg(format!(
+            "unix:{},server=on,wait=off",
+            scratch.socket().display()
+        ));
+        cmd.args(qemu::GPU);
+        let mut run = Run::start(cmd, Input::Null)?;
+        let driven = drive_top(&mut run, &scratch);
+        let outcome = run.stop();
+        driven.map_err(|e| format!("focus-probe (top window) on {}: {e}", machine.name))?;
+        top_verdict(&outcome.lines)
+            .map_err(|e| format!("focus-probe (top window) on {}: {e}", machine.name))?;
+        println!(
+            "focus-probe on {}: the screen matched the guest's frames after the link of a frame to a window, after the move of the pair while the window had said its new size and not posted it, after the new size (the window's and its frame's, taken from the buffers that carried them) and after the close the manager asked for",
+            machine.name
+        );
+        return Ok(());
+    }
+    let image = build_boot_image(
+        "boot-focus-top-steps.img",
+        &TOP_STEPS_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    cmd.args(qemu::GPU);
+    cmd.args(qemu::ICOUNT);
+    let output = run_until(
+        cmd,
+        crate::BOOT_TIMEOUT * 4,
+        Some("init: top-wm ended: "),
+        &kernel.elf,
+    )?;
+    qemu::expect_stopped_on(&output, TOP_ENDED[1])?;
+    qemu::expect_marker(&output, TOP_ENDED[0])?;
+    top_verdict(&output.lines)
+        .map_err(|e| format!("focus-probe (top window) on {}: {e}", machine.name))?;
+    let rows = top_steps_verdict(&output.lines)
+        .map_err(|e| format!("focus-probe (top window) on {}: {e}", machine.name))?;
+    crate::check_waits(&output.lines, &[comp_probe::COMP_TAG], "focus-probe")?;
+    let text: Vec<String> = rows
+        .iter()
+        .map(|(kind, ticks, _)| format!("kind {kind} {ticks}"))
+        .collect();
+    println!(
+        "focus-probe on {}: the longest steps of the compositor in the top-window run under -icount, ticks (0.9 of term B {}): {}",
+        machine.name,
+        gpu_probe::STEP_MAX,
+        text.join(", ")
+    );
+    Ok(())
+}
+
+/// `cargo xtask focus-probe top`: the runs of the top-window image alone.
+pub fn top(machine: &qemu::Machine) -> Result<(), String> {
+    top_probe(machine, false)?;
+    if !machine.is_hvf() {
+        top_probe(machine, true)?;
+    }
+    Ok(())
+}
+
 /// `cargo xtask focus-probe`: the probe on `machine`, the screenshots of the
 /// monitor against the guest's CRC and the tablet's click, and, on QEMU's own
 /// emulation, the steps of the services under -icount.
@@ -651,9 +862,11 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
         machine.name
     );
     wm_probe(machine, false)?;
+    top_probe(machine, false)?;
     if !machine.is_hvf() {
         steps(machine)?;
         wm_probe(machine, true)?;
+        top_probe(machine, true)?;
     }
     Ok(())
 }
@@ -908,6 +1121,47 @@ mod tests {
         );
         lines.push(row(3, gpu_probe::STEP_MAX + 1));
         assert!(wm_steps_verdict(&lines).unwrap_err().contains("term B"));
+    }
+
+    fn good_top_run() -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        for (marker, n) in TOP_CHECKS {
+            for _ in 0..n {
+                lines.push(marker.to_owned());
+            }
+        }
+        lines
+    }
+
+    #[test]
+    fn the_top_window_run_with_every_check_passes_and_names_a_missing_or_failed_one() {
+        assert_eq!(top_verdict(&good_top_run()), Ok(()));
+        let mut lines = good_top_run();
+        lines.retain(|l| !l.contains("posted the new size"));
+        assert!(
+            top_verdict(&lines)
+                .unwrap_err()
+                .contains("posted the new size")
+        );
+        let mut lines = good_top_run();
+        lines.push("focus-probe: failed: a bad size was not refused with INVALID".to_owned());
+        assert!(top_verdict(&lines).unwrap_err().contains("bad size"));
+    }
+
+    #[test]
+    fn the_top_window_steps_need_the_new_methods_and_stay_under_the_bound() {
+        let row = |kind: usize, ticks: u64| {
+            format!("service step: 17 kind {kind} {ticks} ticks detail 0")
+        };
+        let mut lines: Vec<String> = TOP_COMP_KINDS.iter().map(|&(k, _)| row(k, 100)).collect();
+        assert!(top_steps_verdict(&lines).is_ok());
+        for (kind, name) in [(28, "SetText"), (29, "Size")] {
+            let mut without = lines.clone();
+            without.retain(|l| !l.contains(&format!("kind {kind} ")));
+            assert!(top_steps_verdict(&without).unwrap_err().contains(name));
+        }
+        lines.push(row(29, gpu_probe::STEP_MAX + 1));
+        assert!(top_steps_verdict(&lines).unwrap_err().contains("term B"));
     }
 
     fn cursor(update: bool, (x, y): (u32, u32), res: u32) -> qemu::GpuTrace {

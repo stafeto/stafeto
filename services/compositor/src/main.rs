@@ -62,9 +62,9 @@ use core::slice;
 use core::sync::atomic::{AtomicU64, Ordering};
 use proto_comp::{
     Attach, BUFFER_MAX, COMMITTED_BIT, COMPOSED_BIT, Create, Description, EVENTS_BIT, Event,
-    FOCUSED, INPUT_MARK, MANAGER_MARK, MAX_EVENTS, Method as Comp, Post, RESET, Rect, SCENE_MARK,
-    SHOWN, STATS_WINDOWS, SetBody, StatsReply, WindowRecord, WindowStats, manage,
-    read_scene_compose, read_stats_request,
+    FOCUSED, INPUT_MARK, MANAGER_MARK, MAX_EVENTS, Method as Comp, NO_WINDOW, Post, RESET, Rect,
+    SCENE_MARK, SHOWN, STATS_WINDOWS, SetBody, SetText, Size, StatsReply, WindowRecord,
+    WindowStats, manage, read_scene_compose, read_stats_request,
 };
 use proto_gpu::{
     BUFFER_BYTES, BUSY, CLEARING, FORMATS_ARGB8888, FORMATS_XRGB8888, FRAME_FAILED, FRAME_SHOWN,
@@ -234,6 +234,8 @@ struct Attaching {
     slot: usize,
     count: u8,
     stride: u32,
+    /// The bytes the smallest of the buffers holds: the window's capacity.
+    bytes: u64,
     buffer: usize,
     pending: Pending,
 }
@@ -264,9 +266,9 @@ const STEP_ARM: u64 = 6000;
 /// The windows' buffers, as the mappings hold them.
 fn window_bytes(scene: &Scene, window: usize, buffer: u8) -> &[u8] {
     {
-        let len = scene
-            .window(window)
-            .map_or(0, |w| w.stride as usize * w.rect.h as usize);
+        let len = scene.window(window).map_or(0, |w| {
+            w.stride as usize * scene.buffer_lines(window) as usize
+        });
         let at = if scene.window(window).is_some_and(|w| w.legacy) {
             POOL_AT
         } else {
@@ -468,6 +470,9 @@ struct Compositor {
     primary: Option<Pipeline>,
     cleared: Option<usize>,
     attaching: Option<Attaching>,
+    /// The context of a manager that went: its windows are destroyed one a step
+    /// (`reap_one`), so that eight windows do not make one long step.
+    reaping: Option<u64>,
     /// The clock of the frame: when a frame is taken, the periods, the counters.
     pacer: Pacer,
     /// The timer of the frame, made through a copy of the channel with a label
@@ -627,6 +632,7 @@ fn main(_: u64) -> u64 {
         primary: None,
         cleared: None,
         attaching: None,
+        reaping: None,
         pacer: Pacer::new(now_ns(), period, cap),
         timer,
         _timer_view: timer_view,
@@ -1823,6 +1829,7 @@ impl Compositor {
             || self.cleared.is_some()
             || matches!(self.pool, PoolState::Mapping { .. })
             || self.attaching.is_some()
+            || self.reaping.is_some()
             || self.unmappable().is_some()
     }
 
@@ -1841,6 +1848,8 @@ impl Compositor {
         self.regrant();
         if self.phase.has_work() {
             self.open_step();
+        } else if self.reaping.is_some() {
+            self.reap_one();
         } else if let Some(done) = self.cleared {
             let len = CLEARED.min(POOL_LEN - done);
             // SAFETY: the service's own read and write mapping of the
@@ -1866,6 +1875,18 @@ impl Compositor {
         }
         if self.has_work() {
             let _ = sys::notify(&self.notify, WORK);
+        }
+    }
+
+    /// One window of the manager that went is destroyed; the last one ends the
+    /// reaping.
+    fn reap_one(&mut self) {
+        let Some(label) = self.reaping else {
+            return;
+        };
+        match (0..MAX_WINDOWS).find(|&i| self.scene.window(i).is_some_and(|w| w.ctx == label)) {
+            Some(i) => self.destroy(i),
+            None => self.reaping = None,
         }
     }
 
@@ -1937,7 +1958,10 @@ impl Compositor {
         let Some(job) = self.attaching.take() else {
             return;
         };
-        let status = match self.scene.attach(job.slot, job.count, job.stride) {
+        let status = match self
+            .scene
+            .attach_sized(job.slot, job.count, job.stride, job.bytes)
+        {
             Ok(()) => Status::Ok,
             Err(refusal) => Compositor::refusal(refusal),
         };
@@ -2220,7 +2244,11 @@ impl Compositor {
             h: create.h,
         };
         let taken = self.taken();
-        let i = match self.scene.create(label, r.label(), rect, false, taken) {
+        let manager = is_manager(r.label());
+        let i = match self
+            .scene
+            .create_as(label, r.label(), rect, false, taken, manager)
+        {
             Ok(i) => i,
             Err(refusal) => return Answer::Status(Compositor::refusal(refusal)),
         };
@@ -2269,18 +2297,22 @@ impl Compositor {
         }
         let need = attach.bytes(w.rect.h);
         // The objects are looked at here, in this step; they are mapped a
-        // chunk of pages a step, and the reply waits for the last.
+        // chunk of pages a step, and the reply waits for the last. All of an
+        // object is mapped: what it holds beyond the window's lines is the
+        // capacity the window can be resized to.
         let mut memory: [Option<Handle<Memory>>; proto_comp::BUFFERS] = [const { None }; 3];
         let mut pages = [0; proto_comp::BUFFERS];
+        let mut held = u64::MAX;
         for b in 0..attach.count as usize {
             let Ok(object) = r.handles.take::<Memory>(b) else {
                 return Answer::Status(proto_comp::code(proto_comp::INVALID));
             };
-            match sys::memory_info(&object) {
-                Ok(info) if info.size >= need && info.size <= BUFFER_MAX => {}
+            let size = match sys::memory_info(&object) {
+                Ok(info) if info.size >= need && info.size <= BUFFER_MAX => info.size,
                 _ => return Answer::Status(proto_comp::code(proto_comp::INVALID)),
-            }
-            pages[b] = (need as usize).div_ceil(PAGE);
+            };
+            held = held.min(size);
+            pages[b] = (size as usize).div_ceil(PAGE);
             memory[b] = Some(object);
         }
         let Some(pending) = r.defer() else {
@@ -2293,6 +2325,7 @@ impl Compositor {
             slot: i,
             count: attach.count as u8,
             stride: attach.stride,
+            bytes: held,
             buffer: 0,
             pending,
         });
@@ -2333,11 +2366,12 @@ impl Compositor {
                 if let Some(w) = self.scene.window(i).copied() {
                     let pixels = Pixels(&self.scene);
                     let src = pixels.pixels(i, buffer);
+                    // The size the buffer will have when a frame takes it.
                     self.raster.prepare(
                         src,
                         w.stride,
                         w.format,
-                        (w.rect.w, w.rect.h),
+                        self.scene.posted_size(i),
                         compositor::image_of(i, buffer),
                     );
                 }
@@ -2384,6 +2418,38 @@ impl Compositor {
             Answer::Status(Status::Ok)
         } else {
             Answer::Status(proto_comp::code(proto_comp::INVALID))
+        }
+    }
+
+    /// SET_TEXT of window `i`: its title or the kind of its application.
+    fn set_text(&mut self, i: usize, r: &mut Request<'_>) -> Answer {
+        let text = match SetText::read(r.body()) {
+            Ok(text) => text,
+            Err(status) => return Answer::Status(status),
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let told = self.scene.set_text(i, text.which, text.text());
+        self.deliver();
+        match told {
+            Ok(()) => Answer::Status(Status::Ok),
+            Err(refusal) => Answer::Status(Compositor::refusal(refusal)),
+        }
+    }
+
+    /// SIZE of window `i`: the size of its next POST.
+    fn size(&mut self, i: usize, r: &mut Request<'_>) -> Answer {
+        let size = match Size::read(r.body()) {
+            Ok(size) => size,
+            Err(status) => return Answer::Status(status),
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        match self.scene.set_size(i, size.w, size.h, size.serial) {
+            Ok(()) => Answer::Status(Status::Ok),
+            Err(refusal) => Answer::Status(Compositor::refusal(refusal)),
         }
     }
 
@@ -2656,6 +2722,9 @@ impl Compositor {
             Some(Comp::Manage) => self.manage(r),
             Some(Comp::Describe) => self.describe(r),
             Some(Comp::Stats) => self.stats(r, Scope::All),
+            // The session of the manager is a context too: its windows are its
+            // panel and the frames of the windows it manages.
+            Some(Comp::WindowCreate) => self.window_create(r),
             _ => Compositor::not_allowed(Comp::from_number(method).is_some()),
         }
     }
@@ -2695,15 +2764,39 @@ impl Compositor {
                 Ok(())
             }
             manage::LIST => return self.list(r),
+            manage::INFO => return self.info(id, r),
             manage::MOVE => self.scene.move_to(id, b, c),
             manage::RAISE => self.scene.raise(id),
             manage::FOCUS => self.scene.focus_on(id),
+            manage::CONFIGURE => {
+                let (w, h) = manage::unsize(b);
+                self.scene.configure(id, w, h, c)
+            }
+            manage::CLOSE => self.scene.close_request(id),
+            manage::LINK if b == NO_WINDOW => self.scene.link(id, None),
+            manage::LINK => match self.scene.place_of(b) {
+                Some(follower) => self.scene.link(id, Some(follower)),
+                None => Err(Refusal::Invalid),
+            },
             _ => self.scene.set_visible(id, b != 0),
         };
+        // `kick` tells the rings that got CONFIGURE or CLOSE_REQUEST.
         self.kick();
         match result {
             Ok(()) => Answer::Status(Status::Ok),
             Err(refusal) => Answer::Status(Compositor::refusal(refusal)),
+        }
+    }
+
+    /// INFO: the flags, the capacity and the texts of the window at place `id`
+    /// (`usize::MAX` for an id that names none).
+    fn info(&mut self, id: usize, r: &mut Request<'_>) -> Answer {
+        let Some(info) = self.scene.info(id) else {
+            return Answer::Status(proto_comp::code(proto_comp::INVALID));
+        };
+        match info.write(r.reply()) {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(status) => Answer::Status(status),
         }
     }
 
@@ -2849,6 +2942,8 @@ const METHODS: &[u16] = &[
     Comp::Stats.number(),
     Comp::SceneCommit.number(),
     Comp::SceneCompose.number(),
+    Comp::SetText.number(),
+    Comp::Size.number(),
 ];
 
 /// Which windows a STATS shows its session.
@@ -2907,6 +3002,8 @@ impl Service<1> for Compositor {
                 (_, Some(Comp::Post)) => self.post(i, r),
                 (_, Some(Comp::Events)) => self.events_of_window(i, r),
                 (_, Some(Comp::Set)) => self.set(i, r),
+                (_, Some(Comp::SetText)) => self.set_text(i, r),
+                (_, Some(Comp::Size)) => self.size(i, r),
                 (_, Some(Comp::Stats)) => self.stats(r, Scope::Window(i)),
                 _ => Compositor::not_allowed(comp.is_some()),
             };
@@ -2946,7 +3043,20 @@ impl Service<1> for Compositor {
                 self.manager_scene = false;
                 self.scene.set_manager(false);
             }
+            // The windows of the manager's session go with it (a scene's go
+            // below): the windows they framed stay where they are.
             if !is_scene(label) {
+                // A manager that went before the last one's windows were all
+                // destroyed finishes them now (rare); the new one goes a step
+                // a window.
+                if let Some(old) = self.reaping.replace(label) {
+                    for i in 0..MAX_WINDOWS {
+                        if self.scene.window(i).is_some_and(|w| w.ctx == old) {
+                            self.destroy(i);
+                        }
+                    }
+                }
+                let _ = sys::notify(&self.notify, WORK);
                 return;
             }
             // The holder of the scene went: the windows show as they did

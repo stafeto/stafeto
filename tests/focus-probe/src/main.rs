@@ -44,6 +44,22 @@
 //!   manager, a key to the window that kept the focus, and a key to the other
 //!   once the first has ended), and tells when the manager is gone.
 //!
+//! The image of the top-window protocol (`focus::TOP_TABLE`, the third image of
+//! xtask's focus-probe) has two roles:
+//!
+//! - `t`, a client with a window of 200 by 150 whose buffers hold the whole screen
+//!   (so it can be resized): it sets its title and its application's kind, checks
+//!   the refusals of SIZE and of SET_TEXT, answers a CONFIGURE with a SIZE and,
+//!   when it is asked, with the POST that carries the new size, and ends on
+//!   CLOSE_REQUEST.
+//! - `w`, a manager: it reads the client's texts and capacity (INFO), makes a
+//!   frame of its own window, links it to the client (LINK), moves the pair while
+//!   the client has said its new size but not posted it, asks for the size
+//!   (CONFIGURE), resizes the frame when RESIZED comes, and closes the client
+//!   (CLOSE). It prints the CRC-32 of the screen after the link, after the move,
+//!   after the new size and after the close, which xtask compares with QEMU's
+//!   screenshot.
+//!
 //! Each check prints its line, and the last of a role says `focus-probe: ok`;
 //! xtask reads them.
 
@@ -151,6 +167,8 @@ fn main(_: u64) -> u64 {
         b"p" => probe.wm_new(),
         b"o" => probe.wm_old(),
         b"j" => probe.wm_input(),
+        b"t" => probe.top_client(),
+        b"w" => probe.top_manager(),
         _ => Err("an unknown role"),
     };
     match result {
@@ -1435,6 +1453,509 @@ impl Probe<'_> {
         self.until(&display, "the first client never went", |n| n.open == 1)?;
         self.key(&display, KEY_F)?;
         rt::println!("focus-probe: the keys are injected");
+        Ok(())
+    }
+}
+
+// ------------------------------------------------------------ the top window
+
+/// The client's window, the size it is asked for, and the place the pair is moved to.
+const TOP_AT: Rect = Rect {
+    x: 100,
+    y: 100,
+    w: 200,
+    h: 150,
+};
+const TOP_SIZE: (u32, u32) = (300, 200);
+const TOP_MOVE: (u32, u32) = (150, 120);
+/// The frame is wider than the client by an edge on each side and taller by a
+/// title above and an edge below.
+const EDGE: u32 = 4;
+const TITLE_H: u32 = 24;
+/// The bytes of a buffer that holds the whole screen: the capacity of a
+/// window that can be resized to it.
+const SCREEN_BYTES: u64 = WIDTH as u64 * HEIGHT as u64 * 4;
+
+/// The point (x, y) of the client's window of `w` by `h` points.
+fn top_point(x: u32, y: u32, w: u32, h: u32) -> u32 {
+    let r = x * 255 / (w - 1);
+    let g = y * 255 / (h - 1);
+    r << 16 | g << 8 | ((x ^ y) & 0xFF)
+}
+
+/// The point (x, y) of the manager's frame of `w` by `h` points: a title, an
+/// edge and a dark middle (the client lies over it).
+fn frame_point(x: u32, y: u32, w: u32, h: u32) -> u32 {
+    if y < TITLE_H {
+        0x30_30_90 | (x * 255 / (w - 1)) << 8
+    } else if x < EDGE || x >= w - EDGE || y >= h - EDGE {
+        0x20_20_60 | (y * 255 / (h - 1))
+    } else {
+        0x10_10_10
+    }
+}
+
+/// What the screen shows of the frame and the client, `(rectangle, is the
+/// frame)` bottom first, over the black: the rectangles' sizes are the sizes
+/// the pictures were made for.
+fn top_crc(layers: &[(Rect, bool)]) -> u32 {
+    let mut crc = Crc(0xFFFF_FFFF);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let mut point = 0;
+            for &(r, frame) in layers {
+                if x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h {
+                    let (lx, ly) = (x - r.x, y - r.y);
+                    point = if frame {
+                        frame_point(lx, ly, r.w, r.h)
+                    } else {
+                        top_point(lx, ly, r.w, r.h)
+                    };
+                }
+            }
+            crc.point(point);
+        }
+    }
+    !crc.0
+}
+
+/// A picture of `w` by `h` points at `at`, in buffers of the screen's width.
+fn paint(at: usize, w: u32, h: u32, point: impl Fn(u32, u32) -> u32) {
+    for y in 0..h {
+        for x in 0..w {
+            // SAFETY: `buffers` mapped this object for writing at this address,
+            // for the whole screen; the probe is the only user, in one thread.
+            unsafe {
+                (at as *mut u32)
+                    .add((y * WIDTH + x) as usize)
+                    .write(point(x, y))
+            };
+        }
+    }
+}
+
+impl Probe<'_> {
+    /// SET_TEXT of a window.
+    fn text(&self, window: &Handle<Channel>, which: u32, text: &str) -> Result<(), Fail> {
+        let mut w = Writer::new();
+        proto_comp::SetText::new(which, text)
+            .and_then(|t| t.write(&mut w))
+            .map_err(Fail::Status)?;
+        plain(window, w.as_bytes())
+    }
+
+    /// A SET_TEXT whose bytes are `bytes` as they are, whatever they are.
+    fn text_raw(&self, window: &Handle<Channel>, which: u32, bytes: &[u8]) -> Result<(), Fail> {
+        let mut w = Writer::new();
+        Method::SetText
+            .header()
+            .write(&mut w)
+            .map_err(Fail::Status)?;
+        w.u32(which).map_err(Fail::Status)?;
+        w.u32(bytes.len() as u32).map_err(Fail::Status)?;
+        w.bytes(bytes).map_err(Fail::Status)?;
+        plain(window, w.as_bytes())
+    }
+
+    /// SIZE of a window.
+    fn size(&self, window: &Handle<Channel>, w: u32, h: u32, serial: u32) -> Result<(), Fail> {
+        let mut out = Writer::new();
+        proto_comp::Size { w, h, serial }
+            .write(&mut out)
+            .map_err(Fail::Status)?;
+        plain(window, out.as_bytes())
+    }
+
+    /// Whether `result` is the refusal `code`.
+    fn refused(result: Result<(), Fail>, code: u32) -> bool {
+        result == Err(Fail::Status(proto_comp::code(code)))
+    }
+
+    /// MANAGE `op` with `a`, `b`, `c`.
+    fn manage(
+        &self,
+        display: &Handle<Channel>,
+        op: u32,
+        a: u32,
+        b: u32,
+        c: u32,
+    ) -> Result<(), Fail> {
+        let mut w = Writer::new();
+        proto_comp::write_manage(op, a, b, c, &mut w).map_err(Fail::Status)?;
+        plain(display, w.as_bytes())
+    }
+
+    /// INFO of the window `id`.
+    fn info(&self, display: &Handle<Channel>, id: u32) -> Result<proto_comp::Info, Fail> {
+        let mut w = Writer::new();
+        proto_comp::write_manage(manage::INFO, id, 0, 0, &mut w).map_err(Fail::Status)?;
+        let reply = sys::send(display, w.as_bytes()).map_err(Fail::Kernel)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_comp::Info::read(reply.bytes(&mut buffer)).map_err(Fail::Status)
+    }
+
+    /// The record of LIST for the window `id`.
+    fn listed(&self, display: &Handle<Channel>, id: u32) -> Result<WindowRecord, &'static str> {
+        let mut w = Writer::new();
+        proto_comp::write_manage(manage::LIST, 0, 0, 0, &mut w).map_err(say("MANAGE's bytes"))?;
+        let reply = sys::send(display, w.as_bytes()).map_err(say("LIST"))?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let mut found = None;
+        proto_comp::read_list(reply.bytes(&mut buffer), |r| {
+            if r.id == id {
+                found = Some(r);
+            }
+        })
+        .map_err(say("LIST's reply"))?;
+        found.ok_or("a window is not in LIST")
+    }
+
+    /// The screen has settled: no frame is being made and the count of frames
+    /// stood still over a pause.
+    fn settled(&self, display: &Handle<Channel>) -> Result<(), &'static str> {
+        let mut frames = None;
+        loop {
+            let d = self.until(display, "the screen never settled", |_| true)?;
+            if frames == Some(d.frames) {
+                return Ok(());
+            }
+            frames = Some(d.frames);
+            self.sleep(200_000_000);
+        }
+    }
+
+    /// The client of the top-window image: a window that can be resized to the
+    /// whole screen, which answers CONFIGURE and CLOSE_REQUEST.
+    fn top_client(self) -> Result<(), &'static str> {
+        let display = self.display()?;
+        self.describe_when_ready(&display)?;
+        self.until(&display, "the manager never subscribed", |d| {
+            d.flags & HAS_MANAGER != 0
+        })?;
+        let (window, _) = self
+            .create_as(&display, TOP_AT, FORMAT_XRGB8888)
+            .map_err(say("WINDOW_CREATE"))?;
+        self.text(&window, proto_comp::TEXT_TITLE, "Top")
+            .map_err(say("SET_TEXT"))?;
+        self.text(&window, proto_comp::TEXT_APP, "probe")
+            .map_err(say("SET_TEXT"))?;
+        // A text that is not UTF-8, a zero in a text, an unknown text: refused.
+        let bad = [
+            (proto_comp::TEXT_TITLE, &[0xC3, 0x28][..]),
+            (proto_comp::TEXT_TITLE, &[b'a', 0][..]),
+            (3, &b"a"[..]),
+        ];
+        for (which, bytes) in bad {
+            if !Self::refused(self.text_raw(&window, which, bytes), proto_comp::INVALID) {
+                return Err("a bad text was not refused with INVALID");
+            }
+        }
+        // No size before the buffers.
+        if !Self::refused(self.size(&window, 100, 100, 0), proto_comp::NOT_ALLOWED) {
+            return Err("SIZE before ATTACH was not refused with NOT_ALLOWED");
+        }
+        let (objects, at) = self.buffers(2, SCREEN_BYTES)?;
+        self.attach_as(&window, WIDTH * 4, &objects[..2], FORMAT_XRGB8888)
+            .map_err(say("ATTACH"))?;
+        // The size is refused past what the buffers hold (a width of 641, a
+        // height of 401), past the screen at the window's place (600 wide at
+        // x 100), when it is empty, and with the serial of no CONFIGURE.
+        for (w, h, serial) in [
+            (641, 100, 0),
+            (100, 401, 0),
+            (600, 100, 0),
+            (0, 10, 0),
+            (10, 0, 0),
+            (200, 150, 9),
+        ] {
+            if !Self::refused(self.size(&window, w, h, serial), proto_comp::INVALID) {
+                rt::println!("focus-probe: SIZE {w} {h} {serial} was not refused");
+                return Err("a bad size was not refused with INVALID");
+            }
+        }
+        paint(at[0], TOP_AT.w, TOP_AT.h, |x, y| {
+            top_point(x, y, TOP_AT.w, TOP_AT.h)
+        });
+        self.post(&window, 0, &[]).map_err(say("POST"))?;
+        rt::println!("focus-probe: top client window is up and its refusals are exact");
+        let mut stage = 0;
+        let mut serial = 0;
+        self.watch(&window, |e| {
+            match (stage, e.kind) {
+                (0, proto_comp::CONFIGURE) => {
+                    if (e.x, e.y) != (TOP_SIZE.0 as i32, TOP_SIZE.1 as i32)
+                        || e.code != proto_comp::STATE_RESIZING as u16
+                        || e.value <= 0
+                    {
+                        rt::println!("focus-probe: top client: the CONFIGURE is {e:?}");
+                        return Err("the first CONFIGURE is not the one asked");
+                    }
+                    serial = e.value as u32;
+                    // The answer: the size, and the picture of that size, which
+                    // waits in the second buffer for the second CONFIGURE.
+                    self.size(&window, TOP_SIZE.0, TOP_SIZE.1, serial)
+                        .map_err(say("SIZE"))?;
+                    paint(at[1], TOP_SIZE.0, TOP_SIZE.1, |x, y| {
+                        top_point(x, y, TOP_SIZE.0, TOP_SIZE.1)
+                    });
+                    // The manager hears of it by the title.
+                    self.text(&window, proto_comp::TEXT_TITLE, "sized")
+                        .map_err(say("SET_TEXT"))?;
+                    rt::println!("focus-probe: top client was asked for a size and answered");
+                    stage = 1;
+                }
+                (1, proto_comp::CONFIGURE) => {
+                    if (e.x, e.y) != (0, 0) || e.value as u32 <= serial {
+                        return Err("the second CONFIGURE is not a later choice of the client");
+                    }
+                    self.post(
+                        &window,
+                        1,
+                        &[Rect {
+                            x: 0,
+                            y: 0,
+                            w: TOP_SIZE.0,
+                            h: TOP_SIZE.1,
+                        }],
+                    )
+                    .map_err(say("POST"))?;
+                    rt::println!("focus-probe: top client posted the new size");
+                    stage = 2;
+                }
+                (2, proto_comp::CLOSE_REQUEST) => {
+                    rt::println!("focus-probe: top client was asked to close");
+                    return Ok(true);
+                }
+                _ => {}
+            }
+            Ok(false)
+        })
+    }
+
+    /// The manager of the top-window image.
+    fn top_manager(self) -> Result<(), &'static str> {
+        let display = self.display()?;
+        self.describe_when_ready(&display)?;
+        let notify = sys::handle_duplicate(&self.channel, Rights::NOTIFY | Rights::TRANSFER)
+            .map_err(say("duplicate"))?;
+        let mut w = Writer::new();
+        proto_comp::write_manage(manage::SUBSCRIBE, 0, 0, 0, &mut w)
+            .map_err(say("MANAGE's bytes"))?;
+        match call_with(&display, w.as_bytes(), [notify.erase()].into())
+            .map_err(say("SUBSCRIBE"))?
+        {
+            (Status::Ok, _) => {}
+            _ => return Err("SUBSCRIBE was refused"),
+        }
+        // An operation the service has not is refused.
+        if !Self::refused(
+            self.manage(&display, manage::LAST + 1, 0, 0, 0),
+            proto_comp::INVALID,
+        ) {
+            return Err("an unknown operation was not refused with INVALID");
+        }
+        // The client's making and its two texts.
+        let mut client = None;
+        let mut texts = 0;
+        self.watch(&display, |e| {
+            match e.kind {
+                CREATE => client = Some(e.value as u32),
+                proto_comp::TITLE if Some(e.value as u32) == client => texts |= e.x,
+                _ => {}
+            }
+            Ok(client.is_some() && texts == 3)
+        })?;
+        let id = client.ok_or("no window was made")?;
+        self.until(&display, "the client never showed its window", |d| {
+            d.frames >= 1
+        })?;
+        let info = self.info(&display, id).map_err(say("INFO"))?;
+        if info.title() != b"Top"
+            || info.app() != b"probe"
+            || (info.cap_w, info.cap_h) != (WIDTH, HEIGHT)
+            || info.flags != 0
+        {
+            rt::println!("focus-probe: top manager: INFO is {info:?}");
+            return Err("INFO of the client is not what it set");
+        }
+        if !Self::refused(
+            self.info(&display, 0x7fff_fff0).map(drop),
+            proto_comp::INVALID,
+        ) {
+            return Err("INFO of no window was not refused with INVALID");
+        }
+        rt::println!("focus-probe: top manager has the client's texts and capacity");
+        // The frame: a window of the manager's own, over the client until it is
+        // linked.
+        let frame_at = Rect {
+            x: TOP_AT.x - EDGE,
+            y: TOP_AT.y - TITLE_H,
+            w: TOP_AT.w + 2 * EDGE,
+            h: TOP_AT.h + TITLE_H + EDGE,
+        };
+        let (frame, fid) = self
+            .create_as(&display, frame_at, FORMAT_XRGB8888)
+            .map_err(say("WINDOW_CREATE of the frame"))?;
+        let (objects, at) = self.buffers(2, SCREEN_BYTES)?;
+        self.attach_as(&frame, WIDTH * 4, &objects[..2], FORMAT_XRGB8888)
+            .map_err(say("ATTACH of the frame"))?;
+        paint(at[0], frame_at.w, frame_at.h, |x, y| {
+            frame_point(x, y, frame_at.w, frame_at.h)
+        });
+        self.post(&frame, 0, &[])
+            .map_err(say("POST of the frame"))?;
+        self.until(&display, "the frame never showed", |d| d.frames >= 2)?;
+        if self.listed(&display, fid)?.depth < self.listed(&display, id)?.depth {
+            return Err("a window of the manager is under the client before the link");
+        }
+        self.manage(&display, manage::LINK, id, fid, 0)
+            .map_err(say("LINK"))?;
+        // Linked: the frame is directly under the client.
+        let (c, f) = (self.listed(&display, id)?, self.listed(&display, fid)?);
+        if f.depth + 1 != c.depth {
+            return Err("the frame is not directly under the client once linked");
+        }
+        let flags = |i: &proto_comp::Info| i.flags;
+        let (ic, iff) = (
+            self.info(&display, id).map_err(say("INFO"))?,
+            self.info(&display, fid).map_err(say("INFO"))?,
+        );
+        if flags(&ic) != proto_comp::INFO_LEADER
+            || flags(&iff) != proto_comp::INFO_FOLLOWER | proto_comp::INFO_MANAGER
+        {
+            return Err("INFO does not tell the link");
+        }
+        rt::println!("focus-probe: top frame is linked directly under the client");
+        self.settled(&display)?;
+        rt::println!(
+            "focus-probe: top linked crc {:08x}",
+            top_crc(&[(frame_at, true), (TOP_AT, false)])
+        );
+        self.sleep(SNAPSHOT_NS);
+        // The size: the client answers with SIZE and says so by its title. Its
+        // window is the old size until it posts, and moves with its frame.
+        self.manage(
+            &display,
+            manage::CONFIGURE,
+            id,
+            manage::size(TOP_SIZE.0, TOP_SIZE.1),
+            proto_comp::STATE_RESIZING,
+        )
+        .map_err(say("CONFIGURE"))?;
+        self.watch(&display, |e| {
+            Ok(e.kind == proto_comp::TITLE && e.value as u32 == id && e.x == 1)
+        })?;
+        self.manage(&display, manage::MOVE, id, TOP_MOVE.0, TOP_MOVE.1)
+            .map_err(say("MOVE"))?;
+        let (c, f) = (self.listed(&display, id)?, self.listed(&display, fid)?);
+        let (dx, dy) = (TOP_MOVE.0 - TOP_AT.x, TOP_MOVE.1 - TOP_AT.y);
+        if (c.x, c.y, c.w, c.h) != (TOP_MOVE.0, TOP_MOVE.1, TOP_AT.w, TOP_AT.h)
+            || (f.x, f.y, f.w, f.h) != (frame_at.x + dx, frame_at.y + dy, frame_at.w, frame_at.h)
+        {
+            rt::println!("focus-probe: top manager: the pair is {c:?} {f:?}");
+            return Err("the pair did not move together, or the size changed with SIZE");
+        }
+        // A move that takes the frame off the screen moves neither.
+        if !Self::refused(
+            self.manage(&display, manage::MOVE, id, 2, 200),
+            proto_comp::INVALID,
+        ) {
+            return Err("a move that takes the frame off the screen was not refused");
+        }
+        if (self.listed(&display, id)?.x, self.listed(&display, fid)?.x)
+            != (TOP_MOVE.0, frame_at.x + dx)
+        {
+            return Err("a refused move moved a window");
+        }
+        let moved_frame = Rect {
+            x: frame_at.x + dx,
+            y: frame_at.y + dy,
+            ..frame_at
+        };
+        let moved = Rect {
+            x: TOP_MOVE.0,
+            y: TOP_MOVE.1,
+            ..TOP_AT
+        };
+        self.settled(&display)?;
+        rt::println!(
+            "focus-probe: top pending crc {:08x}",
+            top_crc(&[(moved_frame, true), (moved, false)])
+        );
+        self.sleep(SNAPSHOT_NS);
+        // The client's choice: it posts the new size, and the frame follows.
+        self.manage(&display, manage::CONFIGURE, id, 0, 0)
+            .map_err(say("CONFIGURE"))?;
+        self.watch(&display, |e| {
+            if e.kind == proto_comp::RESIZED && e.value as u32 == id {
+                if (e.x, e.y) != (TOP_SIZE.0 as i32, TOP_SIZE.1 as i32) {
+                    return Err("RESIZED does not say the size posted");
+                }
+                return Ok(true);
+            }
+            Ok(false)
+        })?;
+        let grown = Rect {
+            w: TOP_SIZE.0 + 2 * EDGE,
+            h: TOP_SIZE.1 + TITLE_H + EDGE,
+            ..moved_frame
+        };
+        self.size(&frame, grown.w, grown.h, 0)
+            .map_err(say("SIZE of the frame"))?;
+        paint(at[1], grown.w, grown.h, |x, y| {
+            frame_point(x, y, grown.w, grown.h)
+        });
+        self.post(
+            &frame,
+            1,
+            &[Rect {
+                x: 0,
+                y: 0,
+                w: grown.w,
+                h: grown.h,
+            }],
+        )
+        .map_err(say("POST of the frame"))?;
+        self.watch(&display, |e| {
+            Ok(e.kind == proto_comp::RESIZED
+                && e.value as u32 == fid
+                && (e.x, e.y) == (grown.w as i32, grown.h as i32))
+        })?;
+        let regrown = Rect {
+            w: TOP_SIZE.0,
+            h: TOP_SIZE.1,
+            ..moved
+        };
+        self.settled(&display)?;
+        let (c, f) = (self.listed(&display, id)?, self.listed(&display, fid)?);
+        if (c.x, c.y, c.w, c.h) != (regrown.x, regrown.y, regrown.w, regrown.h)
+            || (f.x, f.y, f.w, f.h) != (grown.x, grown.y, grown.w, grown.h)
+        {
+            rt::println!("focus-probe: top manager: the pair is {c:?} {f:?}");
+            return Err("the sizes in LIST are not the sizes posted");
+        }
+        rt::println!(
+            "focus-probe: top resized crc {:08x}",
+            top_crc(&[(grown, true), (regrown, false)])
+        );
+        self.sleep(SNAPSHOT_NS);
+        // The end: the client is asked, closes itself, and its frame goes with
+        // it (hidden by the service).
+        self.manage(&display, manage::CLOSE, id, 0, 0)
+            .map_err(say("CLOSE"))?;
+        self.watch(&display, |e| {
+            Ok(e.kind == proto_comp::CLOSE && e.value as u32 == id)
+        })?;
+        self.settled(&display)?;
+        if self.listed(&display, fid)?.flags & proto_comp::SHOWN != 0 {
+            return Err("the frame is still shown after its window went");
+        }
+        let info = self.info(&display, fid).map_err(say("INFO"))?;
+        if info.flags != proto_comp::INFO_MANAGER {
+            return Err("the link did not end with the window");
+        }
+        rt::println!("focus-probe: top closed crc {:08x}", top_crc(&[]));
+        self.sleep(SNAPSHOT_NS);
         Ok(())
     }
 }
