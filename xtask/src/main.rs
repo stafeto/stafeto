@@ -2467,13 +2467,15 @@ commands:
             of the compositor and the display driver under -icount; with --hvf under HVF
   comp-late-probe run the probe of the composition service with the screen opened late, from a
             request, by the steps of the work, under -icount: the longest step of the mapping
-  focus-probe [--hvf] run the probe of focus and composition of two clients in QEMU: a window
+  focus-probe [--hvf | top] run the probe of focus and composition of two clients in QEMU: a window
             with an alpha over another, the screen after a click that raises one, after the
             manager's Super-Tab and after the second client ended, each compared with QEMU's
             screenshot by CRC-32, the keys of the window with the focus alone, a click of
             QEMU's tablet, then the window manager program with a native client and one of
             the first revision (the chord, the keys, the manager's end), and the steps of
-            the services under -icount; with --hvf under HVF
+            the services under -icount, and the top-window image (a frame linked to a
+            window, a move, a new size, a close); with --hvf under HVF, with top only the
+            top-window runs
   lvgl-probe [--hvf] run the probe of the LVGL demo in QEMU: the demo's first frame and the frame after
             the scenario of 22 injected events, each compared three ways: the CRC-32 the demo prints,
             the CRC-32 of QEMU's screenshot and the CRC-32 the reference program on the host
@@ -3011,7 +3013,8 @@ fn main() {
                 focus_probe::probe(&qemu::HVF_V3)?;
                 focus_probe::probe(&qemu::HVF_V2)
             }),
-            Some(_) => Err("focus-probe [--hvf]".to_owned()),
+            Some("top") => focus_probe::top(&qemu::VIRT),
+            Some(_) => Err("focus-probe [--hvf | top]".to_owned()),
         },
         Some("lvgl-probe") => match args.get(1).map(String::as_str) {
             None => lvgl::probe(&qemu::VIRT),

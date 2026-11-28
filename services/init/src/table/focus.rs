@@ -185,3 +185,33 @@ pub const WM_TABLE: &[Record] = &[
     WM_PROBE_OLD,
     WM_PROBE_INPUT,
 ];
+
+// ------------------------------------------------------------ the top window
+
+/// The client of the top-window image (role `t`): a window whose two buffers
+/// hold the whole screen (250 pages each), so that it can be resized to it.
+const TOP_CLIENT: Record = Record {
+    name: "top-client",
+    program: "focus-probe",
+    args: b"t",
+    quota: 800 * PAGE,
+    handle_limit: 64,
+    ..comp::PROBE
+};
+
+/// The manager of the top-window image (role `w`): the compositor's manager
+/// session (`table::COMP_MANAGERS`), with a frame of its own of two buffers that
+/// hold the whole screen.
+const TOP_WM: Record = Record {
+    name: "top-wm",
+    program: "focus-probe",
+    args: b"w",
+    quota: 800 * PAGE,
+    handle_limit: 64,
+    ..comp::PROBE
+};
+
+/// The image of the top-window protocol's probe on QEMU: the compositor with no
+/// input service, a manager that frames, links, resizes and closes, and a client
+/// that answers it.
+pub const TOP_TABLE: &[Record] = &[comp::DISPLAY, comp::PROBE_COMPOSITOR, TOP_CLIENT, TOP_WM];

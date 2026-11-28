@@ -53,6 +53,34 @@ and the header version 1 of both.
   Tab can switch the windows without the window with the focus seeing them. The
   Alt, Ctrl and Shift keys stay the windows' (Doom binds all three). The
   program `wm` (`apps/wm`, below) is the manager of the images that have one.
+- The top window (SET_TEXT 28, SIZE 29, and MANAGE INFO, CONFIGURE, CLOSE and
+  LINK, with the events CONFIGURE, CLOSE_REQUEST, TITLE and RESIZED; `VERSION`
+  stays 1, a client that knows no such event kind skips it, and the numbers 30
+  and 31 are kept for the requests of a client to its manager). A window has a
+  title and an application's kind of up to 64 bytes of UTF-8 each (SET_TEXT);
+  the manager is told by TITLE and reads them with INFO, which also gives the
+  window's capacity: the width a stride holds and the lines the smallest buffer
+  holds (ATTACH maps the whole object, so a client that wants a window it can
+  resize makes buffers of the whole screen, 250 pages each). SIZE sets the size
+  of the next POST, whose rectangles are then in that size; the window has the
+  size when a frame takes that buffer (the damage is the old rectangle with the
+  new one, and the manager is told by RESIZED); a second SIZE before the POST
+  replaces the first. A size no buffer holds, or one that takes the window off
+  the screen at its place, is INVALID, and a MOVE or a CONFIGURE that would take
+  it off is too; the window of the first revision, a mask and a window under a
+  scene have no SIZE (NOT_ALLOWED). CONFIGURE asks a window for a size and
+  states (its ring gets CONFIGURE with a serial the answer gives back in SIZE; 0
+  by 0 leaves the choice to the client) and CLOSE asks it to close
+  (CLOSE_REQUEST); the client decides. The manager's session is a context with
+  a share of 8 windows (the others have 4), and its windows that follow no
+  window lie above every other window. LINK ties a window of the manager (a
+  frame) to a window of a client: a move, a raise, a hide or a show of the
+  client is made for both in the same step of the service, the frame lying
+  directly under the client; a move that would take either off the screen moves
+  neither; a click on the frame gives the focus and the top place to the client
+  (the frame keeps the pointer's button) and a frame never has the focus; the
+  client going hides the frame and ends the link. A resize keeps the window's
+  corner: it grows or shrinks at the right and the bottom.
 - The input session (`INJECT`, INPUT_MARK, `COMP_INJECTORS`: the probes only)
   injects a key, the pointer's place on the screen or a button, which takes the
   path of the device's own event.
@@ -121,6 +149,8 @@ has at most MAX_WINDOWS (16) records, no loop is added to a step. When the manag
 ends, the compositor goes on by its own rule: the window that has the focus
 keeps it, the first window shown takes it when no manager has subscribed, a click
 moves it, and a window that goes passes it to the one on top.
+
+A manager that frames windows (the top window, "What a client sees") makes a window of its own for each frame, reads the client's texts and capacity with INFO, links the two with LINK, resizes the frame when RESIZED comes, and asks the client to close with CLOSE. `apps/wm` uses none of this; the probe `cargo xtask focus-probe top` plays both parts.
 
 ## Input
 
@@ -935,7 +965,7 @@ scene.
 
 ## Not yet
 
-A window's resize, a frame clock that follows the display's own vertical blank
+A resize by a new attach of larger buffers (a window is resized inside the capacity of the buffers it attached), the requests of a client to its manager to move or resize it, a frame clock that follows the display's own vertical blank
 (the period is the service's, and the free run is the only way without it), the
 sharing of the cap between clients, a call of pixman for the parts of windows that
 do not overlap (eight translucent windows on one place cost eight calls a band; sixteen cost four groups of

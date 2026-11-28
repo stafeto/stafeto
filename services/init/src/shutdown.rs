@@ -386,6 +386,7 @@ mod tests {
             input::TABLE,
             focus::TABLE,
             focus::WM_TABLE,
+            focus::TOP_TABLE,
             entropy::TABLE,
             entropy::VZ_TABLE,
         ] {

@@ -26,13 +26,19 @@
 //! | STATS (25) | context, window, manager, input | `flags` (u32) | status, 17 counters, 33 buckets, `count` (u32), then `count` records of 32 bytes | INVALID, NOT_ALLOWED, REVOKED |
 //! | SCENE_COMMIT (26) | scene | `flags`, `bg`, `count` (u32), then `count` records of 56 bytes | the status alone, at once | INVALID, NOT_ALLOWED, BUSY, LIMIT_REACHED |
 //! | SCENE_COMPOSE (27) | scene | `flags` (u32) | the status alone, at once | INVALID, NOT_ALLOWED, UNSUPPORTED, BUSY |
+//! | SET_TEXT (28) | window | `which` (1 the title, 2 the application's kind), `len` (u32, at most TEXT_MAX), `len` bytes of UTF-8 with no zero | the status alone | INVALID, REVOKED |
+//! | SIZE (29) | window | `w`, `h`, `serial` (u32: the number of a CONFIGURE, or 0) | the status alone | INVALID, NOT_ALLOWED, REVOKED |
+//!
+//! The numbers 30 and 31 are kept for the requests of a client to its manager
+//! (a move and a resize).
 //!
 //! The context is the `Display` session. A window is a session of its own
 //! (a label the service gives): the window goes when the last copy of its
 //! session closes or when the context's session does (the process ended),
 //! and its pixels leave the next frame. The window is `w` by `h` points of
 //! FORMAT_XRGB8888 at (`x`, `y`) of the screen, all of it inside the
-//! screen; its place and size do not change. It shows once the first POST
+//! screen; its size changes only as the top-window protocol below says, and
+//! its place by the manager. It shows once the first POST
 //! is taken into a frame; windows lie in the order they were made, the
 //! newest on top, and the one the screen has nothing of shows black.
 //!
@@ -90,6 +96,31 @@
 //! KEY_LEFTMETA and KEY_RIGHTMETA) and the keys pressed with Super held go
 //! to it alone: the window with the focus never sees them. The Alt, Ctrl and
 //! Shift keys stay the windows' (a game of the first revision binds them).
+//!
+//! The top-window protocol. A window has a title and an application's kind
+//! (SET_TEXT: up to TEXT_MAX bytes of UTF-8 each; the manager is told by TITLE
+//! and reads them with MANAGE INFO). A window of the second revision with
+//! buffers may change its size inside what its buffers hold (their capacity,
+//! which INFO tells: the width a stride holds and the lines the smallest buffer
+//! holds): SIZE says the size of the next POST, whose rectangles are then in the
+//! new size, and the window has the new size when a frame takes that buffer (the
+//! damage is the old rectangle with the new one, and the manager is told by
+//! RESIZED). The window stays inside the screen: a SIZE that would take it out
+//! is INVALID, and a MOVE or a CONFIGURE that would is too. A second SIZE before
+//! the POST replaces the first. The manager asks for a size with MANAGE
+//! CONFIGURE (the window's ring gets CONFIGURE with a `serial`, which a client
+//! that answers gives back in SIZE; a size of 0 by 0 leaves the choice to the
+//! client) and for the end of the window with MANAGE CLOSE (the window's ring
+//! gets CLOSE_REQUEST; the client decides). MANAGE LINK ties a window of the
+//! manager (the follower, its frame) to a window of a client (the leader): a
+//! move, a raise or a hide of the leader is made for both in the same step of
+//! the service, the follower lying directly under the leader; a click on the
+//! follower gives the focus and the top place to the leader, and the follower
+//! never has the focus; the leader going hides the follower and ends the link.
+//! The session of the manager is a context too, with a share of
+//! MANAGER_SHARE windows (the others have PER_CONTEXT), and its windows that
+//! are not followers lie above every other window, in the order they were
+//! raised.
 //!
 //! The input session (a label with INPUT_MARK, given by init to the probes)
 //! injects an event as if the device had made it: a KEY, a MOVE with the
@@ -290,10 +321,12 @@ pub enum Method {
     Stats = 25,
     SceneCommit = 26,
     SceneCompose = 27,
+    SetText = 28,
+    Size = 29,
 }
 
 impl Method {
-    pub const ALL: [Method; 11] = [
+    pub const ALL: [Method; 13] = [
         Method::Describe,
         Method::WindowCreate,
         Method::Attach,
@@ -305,6 +338,8 @@ impl Method {
         Method::Stats,
         Method::SceneCommit,
         Method::SceneCompose,
+        Method::SetText,
+        Method::Size,
     ];
 
     pub const fn number(self) -> u16 {
@@ -562,6 +597,23 @@ pub const FOCUS_OUT: u16 = 5;
 /// `value` its id (`window_id`), which the manager gives back in MANAGE.
 pub const CREATE: u16 = 6;
 pub const CLOSE: u16 = 7;
+/// The window's (top-window protocol): the manager asks for a size and states
+/// (`code` the states, `value` the serial the answer gives back, `x` and `y`
+/// the width and height; 0 and 0 leaves the choice to the client), and asks the
+/// window to close itself (no number). A client that knows no such kind skips it.
+pub const CONFIGURE: u16 = 8;
+pub const CLOSE_REQUEST: u16 = 9;
+/// The manager's: a window's title (`x` 1) or application's kind (`x` 2) changed
+/// (`code` is the place and `value` the id), and a window took a buffer of
+/// another size (`x` and `y` the width and height).
+pub const TITLE: u16 = 10;
+pub const RESIZED: u16 = 11;
+
+/// The states of CONFIGURE (the bits of its `code`, MANAGE CONFIGURE's `c`).
+pub const STATE_MAXIMIZED: u32 = 1;
+pub const STATE_FULLSCREEN: u32 = 2;
+pub const STATE_RESIZING: u32 = 4;
+pub const STATES: u32 = STATE_MAXIMIZED | STATE_FULLSCREEN | STATE_RESIZING;
 
 /// One event. KEY: `code` is Linux's key code, `value` 1 for pressed and 0
 /// for released. MOVE: `x` and `y` the pointer's place in the window's own
@@ -688,7 +740,27 @@ pub mod manage {
     pub const FOCUS: u32 = 4;
     /// Window `a` is shown (`b` is 1) or hidden (0).
     pub const VISIBLE: u32 = 5;
-    pub const LAST: u32 = VISIBLE;
+    /// Window `a`: the reply holds its flags, its capacity and its texts
+    /// (`Info`).
+    pub const INFO: u32 = 6;
+    /// Window `a` is asked for the size `b` (the width in the low 16 bits, the
+    /// height in the high 16) and the states `c`: its ring gets CONFIGURE.
+    pub const CONFIGURE: u32 = 7;
+    /// Window `a` is asked to close: its ring gets CLOSE_REQUEST.
+    pub const CLOSE: u32 = 8;
+    /// The window `b` of the manager follows window `a` (NO_WINDOW for `b`:
+    /// window `a` has no follower any more).
+    pub const LINK: u32 = 9;
+    pub const LAST: u32 = LINK;
+
+    /// The `b` of CONFIGURE for a width and a height.
+    pub const fn size(w: u32, h: u32) -> u32 {
+        (w & 0xffff) | (h << 16)
+    }
+    /// The width and the height of a CONFIGURE's `b`.
+    pub const fn unsize(b: u32) -> (u32, u32) {
+        (b & 0xffff, b >> 16)
+    }
 }
 
 /// MANAGE's request: the header, `op`, `a`, `b`, `c`.
@@ -1205,6 +1277,181 @@ impl SetBody {
     }
 }
 
+// ------------------------------------------------------ the top window
+
+/// The most bytes of a title or of an application's kind.
+pub const TEXT_MAX: usize = 64;
+/// SET_TEXT's `which`: the title, the application's kind.
+pub const TEXT_TITLE: u32 = 1;
+pub const TEXT_APP: u32 = 2;
+
+/// SET_TEXT's body: which text and its bytes (at most TEXT_MAX, UTF-8, no zero).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetText {
+    pub which: u32,
+    pub len: usize,
+    pub bytes: [u8; TEXT_MAX],
+}
+
+impl SetText {
+    /// A SET_TEXT of `text`; INVALID for a `which` that is none, more than
+    /// TEXT_MAX bytes or a zero byte.
+    pub fn new(which: u32, text: &str) -> Result<SetText, Status> {
+        let t = text.as_bytes();
+        if !(TEXT_TITLE..=TEXT_APP).contains(&which) || t.len() > TEXT_MAX || t.contains(&0) {
+            return Err(code(INVALID));
+        }
+        let mut bytes = [0; TEXT_MAX];
+        bytes[..t.len()].copy_from_slice(t);
+        Ok(SetText {
+            which,
+            len: t.len(),
+            bytes,
+        })
+    }
+
+    pub fn text(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        Method::SetText.header().write(w)?;
+        w.u32(self.which)?;
+        w.u32(self.len as u32)?;
+        w.bytes(self.text())
+    }
+
+    /// The body after the header: BAD_SIZE unless it is the two numbers and
+    /// `len` bytes, INVALID for a `which` that is none, a `len` past TEXT_MAX,
+    /// bytes that are not UTF-8 or hold a zero.
+    pub fn read(mut body: Reader<'_>) -> Result<SetText, Status> {
+        let which = body.u32()?;
+        let len = body.u32()? as usize;
+        if !(TEXT_TITLE..=TEXT_APP).contains(&which) || len > TEXT_MAX {
+            return Err(code(INVALID));
+        }
+        let t = body.bytes(len)?;
+        body.finish()?;
+        if t.contains(&0) || core::str::from_utf8(t).is_err() {
+            return Err(code(INVALID));
+        }
+        let mut bytes = [0; TEXT_MAX];
+        bytes[..len].copy_from_slice(t);
+        Ok(SetText { which, len, bytes })
+    }
+}
+
+/// SIZE's body: the size of the next POST, and the serial of the CONFIGURE it
+/// answers (0 for none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Size {
+    pub w: u32,
+    pub h: u32,
+    pub serial: u32,
+}
+
+impl Size {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        Method::Size.header().write(w)?;
+        w.u32(self.w)?;
+        w.u32(self.h)?;
+        w.u32(self.serial)
+    }
+
+    /// The body after the header: BAD_SIZE unless it is the three numbers.
+    pub fn read(mut body: Reader<'_>) -> Result<Size, Status> {
+        let s = Size {
+            w: body.u32()?,
+            h: body.u32()?,
+            serial: body.u32()?,
+        };
+        body.finish()?;
+        Ok(s)
+    }
+}
+
+/// INFO's `flags`: the window is of the first revision, it is ARGB8888, it has
+/// a follower, it is a follower, it is a window of the manager's session.
+pub const INFO_LEGACY: u32 = 1;
+pub const INFO_ARGB: u32 = 2;
+pub const INFO_LEADER: u32 = 4;
+pub const INFO_FOLLOWER: u32 = 8;
+pub const INFO_MANAGER: u32 = 16;
+
+/// MANAGE INFO's reply: the flags, the capacity (the most the window's size
+/// can be: 0 by 0 before ATTACH) and the two texts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Info {
+    pub flags: u32,
+    pub cap_w: u32,
+    pub cap_h: u32,
+    pub title_len: usize,
+    pub app_len: usize,
+    pub title: [u8; TEXT_MAX],
+    pub app: [u8; TEXT_MAX],
+}
+
+impl Info {
+    pub fn title(&self) -> &[u8] {
+        &self.title[..self.title_len]
+    }
+
+    pub fn app(&self) -> &[u8] {
+        &self.app[..self.app_len]
+    }
+
+    /// Status 0, `flags`, `cap_w`, `cap_h`, the two lengths, the two texts.
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(Status::Ok.code())?;
+        for n in [
+            self.flags,
+            self.cap_w,
+            self.cap_h,
+            self.title_len as u32,
+            self.app_len as u32,
+        ] {
+            w.u32(n)?;
+        }
+        w.bytes(self.title())?;
+        w.bytes(self.app())
+    }
+
+    /// The reply in `reply`: a refusal that carries nothing is its status
+    /// alone and comes back as the error; BAD_SIZE for a length past TEXT_MAX
+    /// or any size but the one the lengths say.
+    pub fn read(reply: &[u8]) -> Result<Info, Status> {
+        let mut r = Reader::new(reply);
+        let status = Status::from_code(r.u32()?);
+        if status != Status::Ok {
+            return Err(status);
+        }
+        let flags = r.u32()?;
+        let cap_w = r.u32()?;
+        let cap_h = r.u32()?;
+        let title_len = r.u32()? as usize;
+        let app_len = r.u32()? as usize;
+        if title_len > TEXT_MAX || app_len > TEXT_MAX {
+            return Err(Status::BadSize);
+        }
+        let mut info = Info {
+            flags,
+            cap_w,
+            cap_h,
+            title_len,
+            app_len,
+            title: [0; TEXT_MAX],
+            app: [0; TEXT_MAX],
+        };
+        info.title[..title_len].copy_from_slice(r.bytes(title_len)?);
+        info.app[..app_len].copy_from_slice(r.bytes(app_len)?);
+        r.finish()?;
+        Ok(info)
+    }
+}
+
+/// The most bytes of INFO's reply.
+pub const INFO_MAX: usize = 24 + 2 * TEXT_MAX;
+
 /// STATS' request: the header and the flags.
 pub fn write_stats(flags: u32, w: &mut Writer) -> Result<(), Status> {
     Method::Stats.header().write(w)?;
@@ -1466,7 +1713,12 @@ mod tests {
     #[test]
     fn the_methods_keep_their_numbers_apart_from_gpus() {
         let numbers: Vec<_> = Method::ALL.iter().map(|m| m.number()).collect();
-        assert_eq!(numbers, [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+        assert_eq!(
+            numbers,
+            [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+        );
+        assert_eq!(Method::from_number(30), None);
+        assert_eq!(Method::from_number(31), None);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header().version, proto_gpu::VERSION);
@@ -1664,6 +1916,126 @@ mod tests {
             read_manage(Reader::new(&w.as_bytes()[8..])),
             Err(code(INVALID))
         );
+    }
+
+    #[test]
+    fn the_new_operations_and_events_have_their_numbers() {
+        assert_eq!(
+            [manage::INFO, manage::CONFIGURE, manage::CLOSE, manage::LINK],
+            [6, 7, 8, 9]
+        );
+        assert_eq!(manage::LAST, 9);
+        assert_eq!([CONFIGURE, CLOSE_REQUEST, TITLE, RESIZED], [8, 9, 10, 11]);
+        assert_eq!(manage::unsize(manage::size(640, 400)), (640, 400));
+        let mut w = Writer::new();
+        write_manage(manage::LINK, 1, NO_WINDOW, 0, &mut w).unwrap();
+        assert_eq!(
+            read_manage(Reader::new(&w.as_bytes()[8..])),
+            Ok([manage::LINK, 1, NO_WINDOW, 0])
+        );
+    }
+
+    #[test]
+    fn set_text_round_trips_and_checks_which_length_utf8_and_zero() {
+        let mut w = Writer::new();
+        SetText::new(TEXT_TITLE, "Caf\u{e9} \u{442}\u{435}\u{441}\u{442}")
+            .unwrap()
+            .write(&mut w)
+            .unwrap();
+        let got = SetText::read(Reader::new(&w.as_bytes()[8..])).unwrap();
+        assert_eq!(got.which, TEXT_TITLE);
+        assert_eq!(
+            got.text(),
+            "Caf\u{e9} \u{442}\u{435}\u{441}\u{442}".as_bytes()
+        );
+        // The longest text, and one byte more.
+        let long = "x".repeat(TEXT_MAX);
+        assert!(SetText::new(TEXT_APP, &long).is_ok());
+        assert_eq!(
+            SetText::new(TEXT_APP, &format!("{long}x")),
+            Err(code(INVALID))
+        );
+        assert_eq!(SetText::new(0, "a"), Err(code(INVALID)));
+        assert_eq!(SetText::new(3, "a"), Err(code(INVALID)));
+        assert_eq!(SetText::new(1, "a\0b"), Err(code(INVALID)));
+        let body = |which: u32, len: u32, bytes: &[u8]| {
+            let mut w = Writer::new();
+            w.u32(which).unwrap();
+            w.u32(len).unwrap();
+            w.bytes(bytes).unwrap();
+            w.as_bytes().to_vec()
+        };
+        // A byte string that is not UTF-8, a zero, a length past the maximum,
+        // a body shorter or longer than its length says.
+        assert_eq!(
+            SetText::read(Reader::new(&body(1, 2, &[0xc3, 0x28]))),
+            Err(code(INVALID))
+        );
+        assert_eq!(
+            SetText::read(Reader::new(&body(1, 2, &[b'a', 0]))),
+            Err(code(INVALID))
+        );
+        assert_eq!(
+            SetText::read(Reader::new(&body(1, 65, &[b'a'; 65]))),
+            Err(code(INVALID))
+        );
+        assert_eq!(
+            SetText::read(Reader::new(&body(1, 3, b"ab"))),
+            Err(Status::BadSize)
+        );
+        assert_eq!(
+            SetText::read(Reader::new(&body(1, 1, b"ab"))),
+            Err(Status::BadSize)
+        );
+        assert_eq!(
+            SetText::read(Reader::new(&body(0, 1, b"a"))),
+            Err(code(INVALID))
+        );
+        // An empty text is allowed (it clears).
+        assert_eq!(SetText::read(Reader::new(&body(2, 0, b""))).unwrap().len, 0);
+    }
+
+    #[test]
+    fn size_round_trips_and_is_three_numbers() {
+        let mut w = Writer::new();
+        let s = Size {
+            w: 300,
+            h: 200,
+            serial: 7,
+        };
+        s.write(&mut w).unwrap();
+        assert_eq!(Size::read(Reader::new(&w.as_bytes()[8..])), Ok(s));
+        assert_eq!(
+            Size::read(Reader::new(&w.as_bytes()[8..16])),
+            Err(Status::BadSize)
+        );
+    }
+
+    #[test]
+    fn info_round_trips_with_its_texts_and_fits_a_message() {
+        let mut info = Info {
+            flags: INFO_ARGB | INFO_LEADER,
+            cap_w: 640,
+            cap_h: 400,
+            title_len: 5,
+            app_len: TEXT_MAX,
+            title: [0; TEXT_MAX],
+            app: [b'a'; TEXT_MAX],
+        };
+        info.title[..5].copy_from_slice(b"Title");
+        let mut w = Writer::new();
+        info.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), INFO_MAX - TEXT_MAX + 5);
+        assert_eq!(INFO_MAX, 152);
+        assert_eq!(Info::read(w.as_bytes()), Ok(info));
+        assert_eq!(Info::read(&w.as_bytes()[..30]), Err(Status::BadSize));
+        let mut bad = w.as_bytes().to_vec();
+        bad[16] = 65;
+        assert_eq!(Info::read(&bad), Err(Status::BadSize));
+        // A refusal is its status alone.
+        let mut w = Writer::new();
+        w.u32(INVALID).unwrap();
+        assert_eq!(Info::read(w.as_bytes()), Err(code(INVALID)));
     }
 
     #[test]

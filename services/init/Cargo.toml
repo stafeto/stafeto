@@ -159,6 +159,7 @@ table-focus = []
 # The probe of the window manager with a keyboard, a client of the first
 # revision and a native client (xtask focus-probe, its second image).
 table-focus-wm = []
+table-focus-top = []
 # The network service in the image of the shell, and the image of its probe
 # (xtask net-probe).
 table-net = []

@@ -45,6 +45,8 @@ pub mod elements;
 pub mod fit;
 pub mod frame;
 pub mod prep;
+#[cfg(test)]
+mod top_tests;
 
 /// The stack of the service in the images (`COMP_STACK_SIZE` of xtask, which a test
 /// holds to this): the steps build paints the part of it that `px::stack` scans.
@@ -55,8 +57,9 @@ mod measures;
 use damage::DamageList;
 use elements::{Def, Fault, Shape};
 use proto_comp::{
-    BUFFERS, BUTTON, CLOSE, CREATE, Element, Event, FOCUS_IN, FOCUS_OUT, KEY, MAX_ELEMENTS,
-    MAX_RECTS, MOVE, RING, Rect, SceneCommit, union,
+    BUFFERS, BUTTON, CLOSE, CLOSE_REQUEST, CONFIGURE, CREATE, Element, Event, FOCUS_IN, FOCUS_OUT,
+    KEY, MAX_ELEMENTS, MAX_RECTS, MOVE, RESIZED, RING, Rect, STATES, SceneCommit, TEXT_MAX, TITLE,
+    union,
 };
 use proto_gpu::{HEIGHT, LayerRow, STRIDE, WIDTH};
 
@@ -65,6 +68,9 @@ pub const MAX_WINDOWS: usize = 16;
 // The places a mask of `u16` names (`Scene::create`).
 const _: () = assert!(MAX_WINDOWS <= 16);
 pub const PER_CONTEXT: usize = 4;
+/// The windows the manager's session may hold: its panel and the frames of
+/// the windows it manages.
+pub const MANAGER_SHARE: usize = 8;
 /// The most lines of one band of a frame (`Scene::tile` makes a band
 /// shorter where its layers cost more). A copy band over the whole width
 /// holds nine lines at the prices below, so the limit leaves the prices to
@@ -710,6 +716,48 @@ pub struct Window {
     pub held: Option<Rect>,
 }
 
+/// What a window has of the top-window protocol (proto_comp's SET_TEXT, SIZE and
+/// MANAGE operations), kept apart from `Window` so that the bands, which copy a
+/// window a layer, copy no more than they did.
+#[derive(Clone, Copy, Debug)]
+struct Top {
+    /// The most the size can be: the width a stride holds and the lines the
+    /// smallest buffer holds (0 by 0 before ATTACH).
+    cap: (u32, u32),
+    /// The size SIZE gave for the next POST, and the size of the buffer posted
+    /// and not yet taken, which the taking makes the window's.
+    next: Option<(u32, u32)>,
+    posted: Option<(u32, u32)>,
+    /// The last serial a CONFIGURE gave the window.
+    serial: u32,
+    /// The window belongs to the manager's session.
+    mgr: bool,
+    /// The window of the manager that follows this window, and the window this
+    /// window follows (places).
+    follower: Option<u8>,
+    leader: Option<u8>,
+    title_len: u8,
+    app_len: u8,
+    title: [u8; TEXT_MAX],
+    app: [u8; TEXT_MAX],
+}
+
+impl Top {
+    const NEW: Top = Top {
+        cap: (0, 0),
+        next: None,
+        posted: None,
+        serial: 0,
+        mgr: false,
+        follower: None,
+        leader: None,
+        title_len: 0,
+        app_len: 0,
+        title: [0; TEXT_MAX],
+        app: [0; TEXT_MAX],
+    };
+}
+
 /// What the primary pipeline of the display shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Primary {
@@ -824,6 +872,7 @@ pub struct Delivered {
 /// the pointer.
 pub struct Scene {
     windows: [Option<Window>; MAX_WINDOWS],
+    tops: [Top; MAX_WINDOWS],
     rings: [Ring; MAX_WINDOWS],
     manager_ring: Ring,
     manager: bool,
@@ -1017,6 +1066,7 @@ impl Scene {
     pub const fn new() -> Scene {
         Scene {
             windows: [None; MAX_WINDOWS],
+            tops: [Top::NEW; MAX_WINDOWS],
             rings: [Ring::new(); MAX_WINDOWS],
             manager_ring: Ring::new(),
             manager: false,
@@ -1292,6 +1342,21 @@ impl Scene {
         legacy: bool,
         taken: u16,
     ) -> Result<usize, Refusal> {
+        self.create_as(label, ctx, rect, legacy, taken, false)
+    }
+
+    /// `create` for a context that is the manager's session (`manager`: its
+    /// share is MANAGER_SHARE windows and its windows that follow none lie above
+    /// all others) or any other (PER_CONTEXT).
+    pub fn create_as(
+        &mut self,
+        label: u64,
+        ctx: u64,
+        rect: Rect,
+        legacy: bool,
+        taken: u16,
+        manager: bool,
+    ) -> Result<usize, Refusal> {
         if !rect.within(WIDTH, HEIGHT) {
             return Err(Refusal::Invalid);
         }
@@ -1301,7 +1366,7 @@ impl Scene {
             .flatten()
             .filter(|w| w.ctx == ctx)
             .count();
-        if mine >= PER_CONTEXT {
+        if mine >= if manager { MANAGER_SHARE } else { PER_CONTEXT } {
             return Err(Refusal::Limit);
         }
         let place = self
@@ -1340,6 +1405,10 @@ impl Scene {
             shown_once: false,
         });
         self.rings[place].clear();
+        self.tops[place] = Top {
+            mgr: manager,
+            ..Top::NEW
+        };
         self.tell_manager(Event::new(CREATE, place as u16, id as i32));
         Ok(place)
     }
@@ -1354,6 +1423,21 @@ impl Scene {
     /// The buffers of window `i`: `count` of them with `stride`, which
     /// must hold the window's lines. Once.
     pub fn attach(&mut self, i: usize, count: u8, stride: u32) -> Result<(), Refusal> {
+        let bytes = self
+            .window(i)
+            .map_or(0, |w| u64::from(stride) * u64::from(w.rect.h));
+        self.attach_sized(i, count, stride, bytes)
+    }
+
+    /// `attach` for buffers that hold `bytes` each (the smallest of them): the
+    /// window's capacity is the width a stride holds and the lines `bytes` hold.
+    pub fn attach_sized(
+        &mut self,
+        i: usize,
+        count: u8,
+        stride: u32,
+        bytes: u64,
+    ) -> Result<(), Refusal> {
         let w = self
             .windows
             .get_mut(i)
@@ -1372,6 +1456,15 @@ impl Scene {
         }
         w.attached = count;
         w.stride = stride;
+        let lines = bytes / u64::from(stride.max(1));
+        self.tops[i].cap = (
+            if w.format == Format::A8 {
+                stride
+            } else {
+                stride / 4
+            },
+            u32::try_from(lines).unwrap_or(u32::MAX),
+        );
         Ok(())
     }
 
@@ -1728,13 +1821,35 @@ impl Scene {
             return Err(Refusal::Busy);
         }
         let wrect = w.rect;
-        let mut damage = Scene::changed(w.rect, rects)?;
+        // The rectangles are in the size the buffer will have: the one SIZE
+        // gave, or the one a buffer still waiting for its taking carries.
+        let size = self.tops[i]
+            .next
+            .or(self.tops[i].posted)
+            .unwrap_or((w.rect.w, w.rect.h));
+        let resizing = size != (w.rect.w, w.rect.h);
+        let new_rect = Rect {
+            x: w.rect.x,
+            y: w.rect.y,
+            w: size.0,
+            h: size.1,
+        };
+        let changed = Scene::changed(new_rect, rects)?;
+        // A change of size damages the old rectangle with the new one.
+        let mut damage = if resizing {
+            union(Some(w.rect), new_rect)
+        } else {
+            changed
+        };
         let mut seen = true;
         if let Some(carried) = in_scene {
             match carried {
                 Some(d) => damage = d,
                 None => seen = false,
             }
+        }
+        if let Some(n) = self.tops[i].next.take() {
+            self.tops[i].posted = Some(n);
         }
         w.bufs[buffer as usize] = Buf::Posted;
         let mut replaced = w.posted.replace(buffer);
@@ -1766,7 +1881,7 @@ impl Scene {
         }
         if in_scene.is_some() {
             self.route_damage(damage, seen);
-        } else if held.is_some() || rects.is_empty() {
+        } else if held.is_some() || rects.is_empty() || resizing {
             self.add_damage(damage);
         } else {
             // The areas of the change stay apart in the frame's damage.
@@ -1837,6 +1952,17 @@ impl Scene {
             .scene_on()
             .then(|| self.window_damage_in(i, &[], false));
         let w = self.windows.get_mut(i)?.take()?;
+        // A leader that goes hides the window that followed it and ends the
+        // link (the manager sees CLOSE of the leader); a follower that goes
+        // leaves its leader alone.
+        let top = core::mem::replace(&mut self.tops[i], Top::NEW);
+        if let Some(l) = top.leader {
+            self.tops[usize::from(l)].follower = None;
+        }
+        if let Some(f) = top.follower.map(usize::from) {
+            self.tops[f].leader = None;
+            self.set_visible_one(f, false);
+        }
         if let Some(t) = self.prep {
             t.clear_window(i);
         }
@@ -1866,25 +1992,45 @@ impl Scene {
         self.tell_manager(Event::new(CLOSE, i as u16, w.id as i32));
         if self.focus == Some(i) {
             self.focus = None;
-            if let Some(top) = self.top(None) {
+            if let Some(top) = self.focus_top(None) {
                 self.set_focus(top);
             }
         }
         Some(w)
     }
 
+    /// The place of window `i` in the order of depth: the windows of the manager
+    /// that follow none lie above all others, then the order they were raised in.
+    fn depth_key(&self, i: usize) -> u64 {
+        let t = &self.tops[i];
+        let seq = self.windows[i].map_or(0, |w| w.seq);
+        (u64::from(t.mgr && t.leader.is_none()) << 32) | u64::from(seq)
+    }
+
     /// The topmost shown window, except `except`.
     fn top(&self, except: Option<usize>) -> Option<usize> {
-        let mut best: Option<(u32, usize)> = None;
+        self.topmost(except, false)
+    }
+
+    /// The topmost shown window that may have the focus (a follower never does),
+    /// except `except`.
+    fn focus_top(&self, except: Option<usize>) -> Option<usize> {
+        self.topmost(except, true)
+    }
+
+    fn topmost(&self, except: Option<usize>, focusable: bool) -> Option<usize> {
+        let mut best: Option<(u64, usize)> = None;
         for (i, w) in self.windows.iter().enumerate() {
             let Some(w) = w else {
                 continue;
             };
-            if Some(i) == except || !Scene::shown(w) {
+            if Some(i) == except || !Scene::shown(w) || (focusable && self.tops[i].leader.is_some())
+            {
                 continue;
             }
-            if best.is_none_or(|(seq, _)| w.seq > seq) {
-                best = Some((w.seq, i));
+            let key = self.depth_key(i);
+            if best.is_none_or(|(k, _)| key > k) {
+                best = Some((key, i));
             }
         }
         best.map(|(_, i)| i)
@@ -2030,7 +2176,7 @@ impl Scene {
 
     /// The topmost shown window that covers the point.
     pub fn hit(&self, x: i32, y: i32) -> Option<usize> {
-        let mut best: Option<(u32, usize)> = None;
+        let mut best: Option<(u64, usize)> = None;
         for (i, w) in self.windows.iter().enumerate() {
             let Some(w) = w else {
                 continue;
@@ -2040,8 +2186,11 @@ impl Scene {
                 && y >= r.y as i32
                 && x < (r.x + r.w) as i32
                 && y < (r.y + r.h) as i32;
-            if inside && Scene::shown(w) && best.is_none_or(|(seq, _)| w.seq > seq) {
-                best = Some((w.seq, i));
+            if inside && Scene::shown(w) {
+                let key = self.depth_key(i);
+                if best.is_none_or(|(k, _)| key > k) {
+                    best = Some((key, i));
+                }
             }
         }
         best.map(|(_, i)| i)
@@ -2110,8 +2259,12 @@ impl Scene {
         let target = if pressed {
             let hit = self.hit(at.0, at.1);
             if let Some(i) = hit {
-                self.set_focus(i);
-                let _ = self.raise(i);
+                // A click on a follower is a click on its leader's frame: the
+                // leader has the focus and the top place with it, and the
+                // button stays held by the follower.
+                let lead = self.tops[i].leader.map_or(i, usize::from);
+                self.set_focus(lead);
+                let _ = self.raise(lead);
                 self.held = Some(i);
             }
             hit
@@ -2146,62 +2299,131 @@ impl Scene {
 
     // ------------------------------------------------------------ the manager
 
-    /// Window `i` goes to the top. Invalid for a window that is none.
+    /// Window `i` goes to the top. Invalid for a window that is none. The
+    /// window that follows a window goes with it and lies directly under it, so
+    /// raising a follower raises its leader.
     pub fn raise(&mut self, i: usize) -> Result<(), Refusal> {
-        let rect = self.window(i).ok_or(Refusal::Invalid)?.rect;
+        self.window(i).ok_or(Refusal::Invalid)?;
+        let i = self.tops[i].leader.map_or(i, usize::from);
+        let follower = self.tops[i].follower.map(usize::from);
         let top = self.windows.iter().flatten().map(|w| w.seq).max();
-        if top == self.window(i).map(|w| w.seq) {
+        let mine = self.window(i).map(|w| w.seq);
+        let under = follower.is_none_or(|f| {
+            self.window(f)
+                .zip(mine)
+                .is_some_and(|(w, m)| w.seq.wrapping_add(1) == m)
+        });
+        if top == mine && under {
             return Ok(());
         }
-        self.seq = self.seq.wrapping_add(1);
-        let seq = self.seq;
-        if let Some(Some(w)) = self.windows.get_mut(i) {
-            w.seq = seq;
-            if Scene::shown(w) {
-                self.add_damage(rect);
+        for k in [follower, Some(i)].into_iter().flatten() {
+            self.seq = self.seq.wrapping_add(1);
+            let seq = self.seq;
+            let mut damaged = None;
+            if let Some(Some(w)) = self.windows.get_mut(k) {
+                w.seq = seq;
+                if Scene::shown(w) {
+                    damaged = Some(w.rect);
+                }
+            }
+            if let Some(r) = damaged {
+                self.add_damage(r);
             }
         }
         Ok(())
     }
 
-    /// Window `i` has the focus and the top place.
+    /// Window `i` has the focus and the top place (a follower's leader has
+    /// them: a follower never has the focus).
     pub fn focus_on(&mut self, i: usize) -> Result<(), Refusal> {
         if self.window(i).is_none() {
             return Err(Refusal::Invalid);
         }
+        let i = self.tops[i].leader.map_or(i, usize::from);
         self.set_focus(i);
         self.raise(i)
     }
 
+    /// The size window `i` may have to be reckoned with when it moves: its own,
+    /// or the greater of the sizes a SIZE and a POST that waits for its taking
+    /// gave.
+    fn reach(&self, i: usize) -> (u32, u32) {
+        let (mut w, mut h) = self.window(i).map_or((0, 0), |w| (w.rect.w, w.rect.h));
+        for (nw, nh) in [self.tops[i].next, self.tops[i].posted]
+            .into_iter()
+            .flatten()
+        {
+            w = w.max(nw);
+            h = h.max(nh);
+        }
+        (w, h)
+    }
+
+    /// The rectangle window `i` would take at (`x`, `y`) with every size it may
+    /// have by the next frame, when all of it is on the screen.
+    fn placed(&self, i: usize, x: i64, y: i64) -> Option<Rect> {
+        let (w, h) = self.reach(i);
+        let (x, y) = (u32::try_from(x).ok()?, u32::try_from(y).ok()?);
+        let r = Rect { x, y, w, h };
+        r.within(WIDTH, HEIGHT).then_some(r)
+    }
+
     /// Window `i` moves to (`x`, `y`): all of it stays on the screen. A
-    /// window of the first revision does not move.
+    /// window of the first revision does not move. The window that follows it
+    /// moves by the same step, in the same call; when either would leave the
+    /// screen nothing moves.
     pub fn move_to(&mut self, i: usize, x: u32, y: u32) -> Result<(), Refusal> {
         let w = self.window(i).ok_or(Refusal::Invalid)?;
         if w.legacy {
             return Err(Refusal::NotAllowed);
         }
-        let to = Rect { x, y, ..w.rect };
-        if !to.within(WIDTH, HEIGHT) {
-            return Err(Refusal::Invalid);
+        let from = w.rect;
+        let to = self
+            .placed(i, i64::from(x), i64::from(y))
+            .ok_or(Refusal::Invalid)?;
+        let mut moves = [Some((i, from, to)), None];
+        if let Some(f) = self.tops[i].follower.map(usize::from)
+            && let Some(fw) = self.window(f)
+        {
+            let at = (
+                i64::from(fw.rect.x) + i64::from(x) - i64::from(from.x),
+                i64::from(fw.rect.y) + i64::from(y) - i64::from(from.y),
+            );
+            let fto = self.placed(f, at.0, at.1).ok_or(Refusal::Invalid)?;
+            moves[1] = Some((f, fw.rect, fto));
         }
-        let was = w.rect;
-        let shown = Scene::shown(w);
-        if let Some(Some(w)) = self.windows.get_mut(i) {
-            w.rect = to;
-        }
-        if shown {
-            self.add_damage(was);
-            self.add_damage(to);
+        for (k, was, to) in moves.into_iter().flatten() {
+            let shown = self.window(k).is_some_and(Scene::shown);
+            if let Some(Some(w)) = self.windows.get_mut(k) {
+                w.rect.x = to.x;
+                w.rect.y = to.y;
+            }
+            if shown {
+                self.add_damage(was);
+                self.add_damage(to);
+            }
         }
         Ok(())
     }
 
-    /// Window `i` is shown or hidden. A hidden window has no focus: it
-    /// passes to the window on top.
+    /// Window `i` is shown or hidden, and the window that follows it with it. A
+    /// hidden window has no focus: it passes to the window on top.
     pub fn set_visible(&mut self, i: usize, visible: bool) -> Result<(), Refusal> {
-        let w = self.window(i).ok_or(Refusal::Invalid)?;
+        self.window(i).ok_or(Refusal::Invalid)?;
+        let follower = self.tops[i].follower.map(usize::from);
+        self.set_visible_one(i, visible);
+        if let Some(f) = follower {
+            self.set_visible_one(f, visible);
+        }
+        Ok(())
+    }
+
+    fn set_visible_one(&mut self, i: usize, visible: bool) {
+        let Some(w) = self.window(i) else {
+            return;
+        };
         if w.visible == visible {
-            return Ok(());
+            return;
         }
         let rect = w.rect;
         let had = w.current.is_some();
@@ -2216,11 +2438,10 @@ impl Scene {
         }
         if !visible
             && self.focus == Some(i)
-            && let Some(top) = self.top(Some(i))
+            && let Some(top) = self.focus_top(Some(i))
         {
             self.set_focus(top);
         }
-        Ok(())
     }
 
     /// The windows in the order of depth, lowest first: the place, and the
@@ -2230,10 +2451,10 @@ impl Scene {
         let mut n = 0;
         for (i, w) in self.windows.iter().enumerate() {
             if w.is_some() {
-                // Insertion by `seq`: the oldest first.
-                let seq = |k: u8| self.windows[k as usize].map_or(0, |w| w.seq);
+                // Insertion by depth: the lowest first.
+                let key = |k: u8| self.depth_key(usize::from(k));
                 let mut p = n;
-                while p > 0 && seq(at[p - 1]) > seq(i as u8) {
+                while p > 0 && key(at[p - 1]) > key(i as u8) {
                     at[p] = at[p - 1];
                     p -= 1;
                 }
@@ -2242,6 +2463,182 @@ impl Scene {
             }
         }
         (at, n)
+    }
+
+    // ------------------------------------------------------ the top window
+
+    /// SIZE: window `i` has `w` by `h` points from the buffer its next POST
+    /// posts (`serial` is the CONFIGURE the client answers, or 0). Invalid for a
+    /// size no buffer holds, one that takes the window off the screen at its
+    /// place, or a serial that no CONFIGURE gave; NotAllowed for a window of the
+    /// first revision, a mask, a window without buffers, or while a scene
+    /// shows the windows.
+    pub fn set_size(&mut self, i: usize, w: u32, h: u32, serial: u32) -> Result<(), Refusal> {
+        let win = self.window(i).ok_or(Refusal::Invalid)?;
+        if win.legacy || win.format == Format::A8 || win.attached == 0 || self.scene_on() {
+            return Err(Refusal::NotAllowed);
+        }
+        let cap = self.tops[i].cap;
+        let place = Rect {
+            x: win.rect.x,
+            y: win.rect.y,
+            w,
+            h,
+        };
+        if w == 0
+            || h == 0
+            || w > cap.0
+            || h > cap.1
+            || serial > self.tops[i].serial
+            || !place.within(WIDTH, HEIGHT)
+        {
+            return Err(Refusal::Invalid);
+        }
+        self.tops[i].next = Some((w, h));
+        Ok(())
+    }
+
+    /// The size of the buffer window `i` posted last and the frame has not
+    /// taken, or the size of the window.
+    pub fn posted_size(&self, i: usize) -> (u32, u32) {
+        let own = self.window(i).map_or((0, 0), |w| (w.rect.w, w.rect.h));
+        self.tops[i].next.or(self.tops[i].posted).unwrap_or(own)
+    }
+
+    /// The lines the buffers of window `i` hold at the least (the window's own
+    /// height before ATTACH, and for the first revision).
+    pub fn buffer_lines(&self, i: usize) -> u32 {
+        let own = self.window(i).map_or(0, |w| w.rect.h);
+        self.tops[i].cap.1.max(own)
+    }
+
+    /// SET_TEXT: the title (`which` 1) or the application's kind (2) of window
+    /// `i`; the manager is told when it changed. Invalid for a `which` that is
+    /// none or more than TEXT_MAX bytes.
+    pub fn set_text(&mut self, i: usize, which: u32, text: &[u8]) -> Result<(), Refusal> {
+        let id = self.window(i).ok_or(Refusal::Invalid)?.id;
+        if text.len() > TEXT_MAX {
+            return Err(Refusal::Invalid);
+        }
+        let top = &mut self.tops[i];
+        let (bytes, len) = match which {
+            proto_comp::TEXT_TITLE => (&mut top.title, &mut top.title_len),
+            proto_comp::TEXT_APP => (&mut top.app, &mut top.app_len),
+            _ => return Err(Refusal::Invalid),
+        };
+        let same = &bytes[..usize::from(*len)] == text;
+        bytes[..text.len()].copy_from_slice(text);
+        *len = text.len() as u8;
+        if !same {
+            self.tell_manager(Event::at(TITLE, i as u16, id as i32, which as i32, 0));
+        }
+        Ok(())
+    }
+
+    /// INFO: the flags, the capacity and the texts of window `i`.
+    pub fn info(&self, i: usize) -> Option<proto_comp::Info> {
+        let w = self.window(i)?;
+        let t = &self.tops[i];
+        let mut flags = 0;
+        if w.legacy {
+            flags |= proto_comp::INFO_LEGACY;
+        }
+        if w.format == Format::Argb {
+            flags |= proto_comp::INFO_ARGB;
+        }
+        if t.follower.is_some() {
+            flags |= proto_comp::INFO_LEADER;
+        }
+        if t.leader.is_some() {
+            flags |= proto_comp::INFO_FOLLOWER;
+        }
+        if t.mgr {
+            flags |= proto_comp::INFO_MANAGER;
+        }
+        Some(proto_comp::Info {
+            flags,
+            cap_w: t.cap.0,
+            cap_h: t.cap.1,
+            title_len: usize::from(t.title_len),
+            app_len: usize::from(t.app_len),
+            title: t.title,
+            app: t.app,
+        })
+    }
+
+    /// CONFIGURE: window `i` is asked for `w` by `h` points (0 by 0: its own
+    /// choice) and the states `states`; its ring gets CONFIGURE with a serial
+    /// the answer gives back in SIZE. Invalid for a size over the screen, one
+    /// side 0 or a state that is none; NotAllowed for a window that has no ring
+    /// of events for it (the first revision, a mask).
+    pub fn configure(&mut self, i: usize, w: u32, h: u32, states: u32) -> Result<(), Refusal> {
+        let win = self.window(i).ok_or(Refusal::Invalid)?;
+        if win.legacy || win.format == Format::A8 {
+            return Err(Refusal::NotAllowed);
+        }
+        if states & !STATES != 0 || w > WIDTH || h > HEIGHT || (w == 0) != (h == 0) {
+            return Err(Refusal::Invalid);
+        }
+        self.tops[i].serial = self.tops[i].serial.wrapping_add(1).max(1);
+        let serial = self.tops[i].serial;
+        self.tell(
+            i,
+            Event::at(CONFIGURE, states as u16, serial as i32, w as i32, h as i32),
+        );
+        Ok(())
+    }
+
+    /// CLOSE: window `i`'s ring gets CLOSE_REQUEST; the client decides.
+    pub fn close_request(&mut self, i: usize) -> Result<(), Refusal> {
+        let win = self.window(i).ok_or(Refusal::Invalid)?;
+        if win.legacy {
+            return Err(Refusal::NotAllowed);
+        }
+        self.tell(i, Event::new(CLOSE_REQUEST, 0, 0));
+        Ok(())
+    }
+
+    /// LINK: the window `follower` of the manager follows window `leader` (None:
+    /// `leader` has no follower any more). Moving, raising, hiding and showing the
+    /// leader do the same for the follower in one step; the two are raised
+    /// together now. Invalid when the follower is no window of the manager's
+    /// session, the leader is one, either is in a link already, or they are one.
+    pub fn link(&mut self, leader: usize, follower: Option<usize>) -> Result<(), Refusal> {
+        self.window(leader).ok_or(Refusal::Invalid)?;
+        let Some(f) = follower else {
+            if let Some(old) = self.tops[leader].follower.take() {
+                let old = usize::from(old);
+                self.tops[old].leader = None;
+                // The window that followed lies above all others again.
+                if let Some(w) = self.window(old).filter(|w| Scene::shown(w)) {
+                    let r = w.rect;
+                    self.add_damage(r);
+                }
+            }
+            return Ok(());
+        };
+        self.window(f).ok_or(Refusal::Invalid)?;
+        let (lt, ft) = (&self.tops[leader], &self.tops[f]);
+        if leader == f
+            || !ft.mgr
+            || lt.mgr
+            || lt.follower.is_some()
+            || lt.leader.is_some()
+            || ft.leader.is_some()
+            || ft.follower.is_some()
+        {
+            return Err(Refusal::Invalid);
+        }
+        self.tops[leader].follower = Some(f as u8);
+        self.tops[f].leader = Some(leader as u8);
+        // The pair lies together at the top, the follower directly under.
+        if self.focus == Some(f) {
+            self.focus = None;
+            if let Some(top) = self.focus_top(None) {
+                self.set_focus(top);
+            }
+        }
+        self.raise(leader)
     }
 
     // ------------------------------------------------------------ the frame
@@ -2321,6 +2718,7 @@ impl Scene {
         }
         let d = clipped.bounds()?;
         let mut first = 0u16;
+        let mut resized = 0u16;
         for (i, w) in self.windows.iter_mut().enumerate() {
             let Some(w) = w else {
                 continue;
@@ -2348,6 +2746,16 @@ impl Scene {
             } else {
                 w.retired = w.current.replace(b);
                 w.bufs[b as usize] = Buf::Taken;
+                // The buffer carries the size SIZE gave: the window has it
+                // from this frame.
+                if let Some((nw, nh)) = self.tops[i].posted.take()
+                    && (nw, nh) != (w.rect.w, w.rect.h)
+                {
+                    w.rect.w = nw;
+                    w.rect.h = nh;
+                    self.told[i] = 0;
+                    resized |= 1 << i;
+                }
                 if k == u64::MAX {
                     w.pace.count_taken();
                 } else {
@@ -2358,6 +2766,20 @@ impl Scene {
             // A mask gets neither the focus nor the top place.
             if !core::mem::replace(&mut w.shown_once, true) && w.format != Format::A8 {
                 first |= 1 << i;
+            }
+        }
+        for i in 0..MAX_WINDOWS {
+            if resized & (1 << i) != 0
+                && let Some(w) = self.windows[i]
+            {
+                let e = Event::at(
+                    RESIZED,
+                    i as u16,
+                    w.id as i32,
+                    w.rect.w as i32,
+                    w.rect.h as i32,
+                );
+                self.tell_manager(e);
             }
         }
         // With a manager the window's making was told to it (CREATE), and it
