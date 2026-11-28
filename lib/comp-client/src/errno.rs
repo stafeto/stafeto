@@ -7,6 +7,7 @@
 use abi::Error;
 use proto_wire::Status;
 
+pub const EPERM: i32 = 1;
 pub const EINTR: i32 = 4;
 pub const EIO: i32 = 5;
 pub const EBADF: i32 = 9;

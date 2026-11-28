@@ -253,7 +253,7 @@ the C functions (`window_c.rs`), `posix-abi` with the same feature the calls
 `libc.so` is built without the feature and the header lies outside the libc
 sysroot, so the series 0.5 of the ABI is as it was, and `tools/build-libc-so.py`
 refuses a build of `libc.so` that defines a name of the library
-(`stafeto_window_*`, `stafeto_windows_*`, `stafeto_screen_*`). A program that uses windows is a
+(`stafeto_window_*`, `stafeto_windows_*`, `stafeto_screen_*`, `stafeto_manager_*`). A program that uses windows is a
 statically linked one (`tests/posix-window` is the model); a later series
 moves the library into `libc.so` and gives the window's channel to `poll`.
 
@@ -282,8 +282,9 @@ moves the library into `libc.so` and gives the window's channel to `poll`.
   closed window's copy (CLIENT_GONE) from marking the window that took its
   number later. `stafeto_windows_wait(timeout, bits[8])` waits for bits of any
   window: it returns the mask of the windows that have some and fills `bits`
-  (a window the service took away has `STAFETO_WINDOW_GONE`; bit 30 of the mask
-  is kept for the manager's ring). `stafeto_window_wait(win, ...)` keeps its
+  (a window the service took away has `STAFETO_WINDOW_GONE`; bit 30 of the mask,
+  `STAFETO_MANAGER_EVENTS`, says the manager's ring has events, see "The manager's
+  calls in C"). `stafeto_window_wait(win, ...)` keeps its
   meaning; the bits it does not take stay in their windows' accounts. The
   header says a program skips the events of a kind it does not know.
 - A window made with `STAFETO_WINDOW_RESIZABLE` has buffers of the whole
@@ -356,6 +357,66 @@ five rectangles, three windows of one process shown together and the new size
 of one of them have the CRC-32 the program computed, and the bits of each
 window, the wait across windows, the title, the events, fork, a signal, close
 and exec are checked by the program.
+
+## The manager's calls in C
+
+`<stafeto/manager.h>` (`lib/posix-crt/window/stafeto/manager.h`, in the same static
+library as `<stafeto/window.h>`, the same crates: `window_c.rs`, `posix-abi`'s
+`window/manager.rs`, `comp-client`'s `manager.rs` for the layouts and the refusals)
+gives a C program the manager's side of the protocol: `stafeto_manager_subscribe`,
+`_events` (the manager's ring: CREATE, CLOSE, TITLE, RESIZED and the keys the service
+keeps from the windows), `_list` (up to 16 records), `_info` (flags, capacity, title and
+kind of program as C strings), `_move`, `_raise`, `_focus`, `_visible`, `_configure`,
+`_close`, `_link`, and `stafeto_window_id` for the number the service gave the process's own
+window (so a manager tells its own windows from the others in LIST and CREATE). Each call
+is one request on the process's session with the service and so one step of the service;
+nothing loops in the library.
+
+- Who is a manager is init's table. The mark goes to the clients `table::COMP_MANAGERS`
+  names; for a record of POSIX only the names of `COMP_POSIX_MANAGERS` (`desk`), the way a
+  scene's holder gets its mark (`COMP_SCENES`), with the session made by init as the
+  program's CONNECT asks it. Every other session answers the manager's calls with
+  NOT_ALLOWED, which the library gives as EPERM. A child the manager starts with
+  `posix_spawn` gets a clone of the session (CLONE, which the service now answers on the
+  manager's session too): an ordinary context's session with no mark, so the child's
+  `stafeto_manager_subscribe` is EPERM. `exec` moves a session with its mark to the new
+  image, so a manager never calls it (`desk` does not).
+- The subscription is one more labelled copy of the process's shared channel
+  (`comp_client::table::manager_label`, slot 15, which names no window). The channel now
+  lives as long as a window is open or the manager is subscribed. The service sends the
+  copy EVENTS_BIT when its ring has events, and `stafeto_windows_wait` returns it as bit 30
+  of the mask (once for each time the bit came; a service that went is reported until the
+  process ends, and the manager's calls then give ENODEV). A manager with no window of its
+  own may call `stafeto_windows_wait`. The ring is read with `stafeto_manager_events`
+  until a call returns fewer events than asked, as a window's ring is. One thread at a time
+  takes the ring's events (EBUSY for the second). `fork` leaves the child without the
+  subscription, as it leaves it without windows.
+- With a manager subscribed the service gives a new window neither the focus nor the top
+  place: the manager decides, and the CREATE for every window already there comes after the
+  subscription, so a manager that starts late learns of them from its ring.
+- The refusals the header lists: EPERM (no mark, at the subscription; later a window of the
+  first revision or a mask that cannot be moved, configured or asked to close, or a scene's
+  holder that has the service; `exec` in a subscribed process too), EBADF (a call before the subscription), EBUSY (a second
+  subscription, in the process or in another session while that one is alive, so a restarting
+  manager retries until the old session has gone), EINVAL (an id that names no window, a
+  move or LINK the service refuses), ENODEV (the service ended). An id of a window that went
+  is a race the manager expects and goes on from.
+
+`cargo xtask desk-probe --api` runs the C probe of these calls (`tests/posix-manager`) in
+the image of the desk (`table::desk`, `boot-desk.img`): the services of the POSIX
+programs, the display driver, the keyboard's driver (transport 15), the tablet's driver
+(transport 6) and the compositor with both, and the record `desk`, a process of POSIX at
+level 22 under the ceiling 23, which runs the probe until the manager of the desk takes its
+place. The keyboard and the tablet each map a page of their own (0xa001000 and 0xa000000):
+the transports 13 and 15 of the other images share one page, which a table gives to a
+single record, so no image had both devices before. The probe subscribes, starts its own
+file as a client, gives the client's window the focus, reads its title by INFO, frames it
+with a window of its own tied by LINK, moves the pair (and sees a move that would put the
+frame off the screen refused with nothing moved), asks for a size and hears RESIZED, hides
+and shows the pair, and asks the client to close; the child's own subscription is EPERM.
+The host then presses a key with QEMU's monitor and moves and clicks the tablet through
+QMP at a point the probe prints: the window with the focus gets them from the two devices,
+which the client says by changing its title.
 
 ## Limits accepted in stage G1
 

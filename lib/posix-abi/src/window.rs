@@ -36,6 +36,12 @@
 //!   of the capacity of the whole screen (capped at `BUFFER_MAX`), and
 //!   `resize` changes its size inside the capacity.
 //!
+//! A process the init table gives the manager's mark (the program `desk`) is
+//! also the window manager: `manager` holds its calls (`<stafeto/manager.h>`).
+//! Its subscription is one more labelled copy of the shared channel, whose
+//! label (`table::manager_label`) names no window; the service's bit for the
+//! manager's ring is the bit 30 of the mask `wait_all` returns.
+//!
 //! A forked child has no windows: the state is reset in `after_fork`, and
 //! the handles above are the parent's alone (the layer carries only its
 //! own session records into a child). `exec` closes every window as it
@@ -60,6 +66,12 @@ use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use proto_comp::{Attach, Create, Description, Method, Post, SetText, Size};
+
+mod manager;
+pub use manager::{
+    close as manager_close, configure, events as manager_events, focus, info as manager_info, link,
+    list as manager_list, move_to, raise, subscribe, visible, window_id,
+};
 use proto_wire::{Status, Writer};
 use rt::abi::{Error, MESSAGE_MAX, Rights, Source};
 use rt::handle::{Channel, Handle, Memory, Outgoing, Timer};
@@ -114,6 +126,9 @@ struct Win {
     label: AtomicU64,
     /// The window's session (a raw handle, 0 for none).
     session: AtomicU64,
+    /// The service's number of the window (`proto_comp::window_id`), which the
+    /// manager's events and MANAGE name it by; 0 when there is no window.
+    id: AtomicU32,
     /// What the window is: width, height, stride, format, buffers.
     shape: [AtomicU32; 5],
     /// The capacity: the most width and height `resize` takes.
@@ -139,6 +154,7 @@ impl Win {
             generation: AtomicU32::new(0),
             label: AtomicU64::new(0),
             session: AtomicU64::new(0),
+            id: AtomicU32::new(0),
             shape: [const { AtomicU32::new(0) }; 5],
             cap: [const { AtomicU32::new(0) }; 2],
             pixels: [const { AtomicU64::new(0) }; layout::BUFFERS_MAX],
@@ -173,6 +189,12 @@ static LOCK: AtomicBool = AtomicBool::new(false);
 static WAITING: AtomicBool = AtomicBool::new(false);
 /// The failure of an unmap was told once.
 static UNMAP_TOLD: AtomicBool = AtomicBool::new(false);
+/// The label of the copy of the channel the service holds for the manager's
+/// ring (0 before `subscribe`), whether its bit came since a wait took it, and
+/// whether the service's copy went.
+static MANAGER_LABEL: AtomicU64 = AtomicU64::new(0);
+static MANAGER_PENDING: AtomicBool = AtomicBool::new(false);
+static MANAGER_GONE: AtomicBool = AtomicBool::new(false);
 
 fn level() -> u8 {
     (threads::own_block().base_level.load(Ordering::Relaxed) as u8).max(1)
@@ -326,6 +348,18 @@ fn lock() -> Flag {
     }
 }
 
+/// The shared channel and its timer, made with the first window (or the
+/// manager's subscription, whichever comes first). Called under `LOCK`.
+fn ensure_channel() -> Result<(), i32> {
+    if CHANNEL.load(Ordering::Acquire) == 0 {
+        let own = sys::channel_create_wait(level()).map_err(memory_errno)?;
+        let timer = sys::timer_create(&own, level()).map_err(memory_errno)?;
+        CHANNEL.store(own.into_raw().0, Ordering::Release);
+        TIMER.store(timer.into_raw().0, Ordering::Release);
+    }
+    Ok(())
+}
+
 fn open_window(
     win: &'static Win,
     slot: usize,
@@ -383,12 +417,7 @@ fn open_window(
     win.taking.store(false, Ordering::Release);
 
     // The shared channel and its timer, made with the first window.
-    if CHANNEL.load(Ordering::Acquire) == 0 {
-        let own = sys::channel_create_wait(level()).map_err(memory_errno)?;
-        let timer = sys::timer_create(&own, level()).map_err(memory_errno)?;
-        CHANNEL.store(own.into_raw().0, Ordering::Release);
-        TIMER.store(timer.into_raw().0, Ordering::Release);
-    }
+    ensure_channel()?;
 
     // The buffers: the process keeps each object mapped, and a spare handle
     // of it that ATTACH copies from (a busy service asks for the copies
@@ -449,6 +478,13 @@ fn open_window(
     };
     let made = reply.handles.take::<Channel>(0).map_err(|_| EIO)?;
     win.session.store(made.into_raw().0, Ordering::Release);
+    // The reply is the status and the window's number.
+    let mut buffer = [0; MESSAGE_MAX];
+    let id = match reply.bytes(&mut buffer).get(4..8) {
+        Some(w) => u32::from_le_bytes([w[0], w[1], w[2], w[3]]),
+        None => return Err(EIO),
+    };
+    win.id.store(id, Ordering::Release);
 
     // ATTACH with copies of the objects, MAP_READ and TRANSFER alone.
     let attach = Attach {
@@ -515,9 +551,16 @@ fn opened(win: i32) -> Result<&'static Win, i32> {
     Ok(w)
 }
 
+/// The process subscribed as the window manager (`exec` is refused then).
+pub(crate) fn manager_subscribed() -> bool {
+    MANAGER_LABEL.load(Ordering::Acquire) != 0
+}
+
 /// Some window is open.
 fn any_open() -> Result<(), i32> {
-    if WINS.iter().any(|w| w.state.load(Ordering::Acquire) == OPEN) {
+    if MANAGER_LABEL.load(Ordering::Acquire) != 0
+        || WINS.iter().any(|w| w.state.load(Ordering::Acquire) == OPEN)
+    {
         Ok(())
     } else {
         Err(EBADF)
@@ -561,6 +604,24 @@ const WAKE: u64 = 1 << 32;
 /// expiries, the wake and anything else are passed over. Whether service
 /// bits came.
 fn absorb(got: &Received) -> bool {
+    if let Received::Notification {
+        source: Source::Session,
+        label,
+        bits,
+        ..
+    } = got
+        && table::is_manager_label(*label)
+        && MANAGER_LABEL.load(Ordering::Acquire) == *label
+    {
+        if bits & rt::abi::CLIENT_GONE != 0 {
+            MANAGER_GONE.store(true, Ordering::Release);
+        }
+        if bits & proto_comp::EVENTS_BIT != 0 {
+            MANAGER_PENDING.store(true, Ordering::Release);
+            return true;
+        }
+        return false;
+    }
     if let Received::Notification {
         source: Source::Session,
         label,
@@ -833,7 +894,14 @@ fn reached(goal: Goal, out: &mut [u32; WINDOWS_MAX]) -> Option<u32> {
                 }),
                 out,
             );
-            Some(mask)
+            // The manager's ring is one more thing a wait across the windows
+            // tells of, once for each time its bit came; a service that went
+            // is told until the process ends.
+            let pending = MANAGER_LABEL.load(Ordering::Acquire) != 0
+                && MANAGER_PENDING.swap(false, Ordering::AcqRel);
+            let gone =
+                MANAGER_LABEL.load(Ordering::Acquire) != 0 && MANAGER_GONE.load(Ordering::Acquire);
+            Some(table::with_manager(mask, pending, gone))
         }
     };
     got.filter(|&bits| bits != 0)
@@ -1097,13 +1165,15 @@ fn release_window(w: &Win) {
     }
     w.account.store(0, Ordering::Release);
     w.label.store(0, Ordering::Release);
+    w.id.store(0, Ordering::Release);
 }
 
 /// The timer and the channel close, when no window is open or being made.
 fn drop_channel_if_unused() {
-    if WINS
-        .iter()
-        .any(|w| w.state.load(Ordering::Acquire) != CLOSED)
+    if MANAGER_LABEL.load(Ordering::Acquire) != 0
+        || WINS
+            .iter()
+            .any(|w| w.state.load(Ordering::Acquire) != CLOSED)
     {
         return;
     }
@@ -1151,11 +1221,16 @@ pub fn close(win: i32) -> Result<(), i32> {
 /// # Safety
 /// The child's only thread, before anything else of the layer runs.
 pub unsafe fn after_fork() {
-    for cell in [&CHANNEL, &TIMER] {
+    for cell in [&CHANNEL, &TIMER, &MANAGER_LABEL] {
         cell.store(0, Ordering::Release);
     }
+    for flag in [&MANAGER_PENDING, &MANAGER_GONE] {
+        flag.store(false, Ordering::Release);
+    }
+    manager::after_fork();
     for w in &WINS {
         w.session.store(0, Ordering::Release);
+        w.id.store(0, Ordering::Release);
         w.account.store(0, Ordering::Release);
         w.label.store(0, Ordering::Release);
         for cell in &w.pixels {
@@ -1180,5 +1255,8 @@ pub(crate) fn release_for_exec() {
             release_window(w);
         }
     }
+    MANAGER_LABEL.store(0, Ordering::Release);
+    MANAGER_PENDING.store(false, Ordering::Release);
+    MANAGER_GONE.store(false, Ordering::Release);
     drop_channel_if_unused();
 }
