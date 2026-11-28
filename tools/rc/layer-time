@@ -1,0 +1,9 @@
+# /etc/rc.d/layer-time: the measurement of the layered root (`cargo xtask aws image --layered`). The
+# image has the program and the lower files it copies up; the boot script runs this file last. The
+# program is a fresh process of the shell: its first path of the root takes the root and a session of
+# the layer service, and it prints one line for each measurement and `layer-time: done`.
+if [ ! -x /bin/layer-time ]; then
+    echo "layer-time: no program in this image"
+    exit 0
+fi
+/bin/layer-time

@@ -27,6 +27,7 @@ pub mod lookup;
 pub mod names;
 pub mod reaper;
 pub mod scan;
+pub mod starting;
 pub mod volume;
 
 #[cfg(test)]

@@ -31,13 +31,19 @@ pub struct Listed {
     pub cursor: u64,
 }
 
-/// The slots of the index one request looks at in the first stage: 384 slots cost about 5,400
-/// ticks under `-icount` (14 for a slot, measured), and the entries of a reply (up to 46 of the
-/// message's 1 KiB) about 9,000 more: under 0.9 B with the rest of the step.
+/// The entries of the list of a directory one request looks at in the first stage (a mark of
+/// deletion is looked at and dropped inside the walk): under `-icount` each costs about 57 ticks
+/// (`cargo xtask layer-steps`, a directory of 2,000 marks: 384 of them took 22,000); the names of a
+/// reply (up to 46 of the message's 1 KiB) cost about 9,000 more, so 96 keep a request under 0.9 B
+/// with the rest of the step. The count is of looks, whatever the memory does: on hardware the
+/// walk of a list jumps across the table (the entries of a directory lie where their hashes put
+/// them, 40 bytes each in 640 KiB), so a look can miss the cache where `-icount` counts an
+/// instruction; the number is a bound on the work, and the time of a request on a machine is for
+/// the measurement on it to say.
 pub const SLOTS_PER_READDIR: usize = if cfg!(feature = "break-layerd-slots") {
     4096
 } else {
-    384
+    96
 };
 
 /// The entries of the lower set one request reads, kept, dropped or replayed (never more than
@@ -121,7 +127,9 @@ pub fn read_dir<L: Lower>(
         }
         let mut budget = SLOTS_PER_READDIR;
         let key = index.dir_key(dir);
-        while room(reply) {
+        // A name is taken while it fits: the room is asked for the name at hand, so a reply is
+        // full of short names (46 of six bytes in the message's 1 KiB).
+        while reply.len() + ENTRY_HEAD < abi::MESSAGE_MAX {
             let from = (position.at - 2) as usize;
             let found = match key {
                 Some(key) => index.next_child_of(key, from, &mut budget),
@@ -134,20 +142,30 @@ pub fn read_dir<L: Lower>(
                     break;
                 }
                 NextChild::Continue(next) => {
-                    // The slots this request may look at are used up: the next one goes on.
+                    // The entries this request may look at are used up: the next one goes on.
                     position.at = next as u32 + 2;
                     break;
                 }
                 NextChild::Found(next, id) => {
-                    position.at = next as u32 + 2;
-                    let Some(e) = index.entry(id) else { continue };
+                    let Some(e) = index.entry(id) else {
+                        position.at = next as u32 + 2;
+                        continue;
+                    };
                     let kind = match e.kind {
-                        Kind::Whiteout | Kind::Empty | Kind::Gone => continue,
+                        Kind::Whiteout | Kind::Empty | Kind::Gone => {
+                            position.at = next as u32 + 2;
+                            continue;
+                        }
                         Kind::Dir => DIRECTORY,
                         Kind::File => REGULAR,
                         Kind::Link => SYMLINK,
                     };
                     let name = index.name(id).unwrap_or(&[]);
+                    if reply.len() + ENTRY_HEAD + name.len() > abi::MESSAGE_MAX {
+                        // It does not fit: the next request starts with it.
+                        break;
+                    }
+                    position.at = next as u32 + 2;
                     reply
                         .push(&DirEntry {
                             ino: e.number,
@@ -179,7 +197,9 @@ pub fn read_dir<L: Lower>(
         // library of the C programs does so for STARTING); a reply with `more` and no entry is
         // for the steps that make progress.
         if *resolving >= LISTINGS_RESOLVING || mine >= LISTINGS_PER_SESSION {
-            return Err(Status::Unknown(proto_layer::STARTING));
+            return Err(Status::Unknown(crate::starting::code(
+                crate::starting::Cause::Listing,
+            )));
         }
         let mut path = [0u8; 512];
         let n = index.path_of(dir, &mut path).ok_or(Status::BadSize)?;
@@ -196,9 +216,9 @@ pub fn read_dir<L: Lower>(
                 Ok(listed(position, false))
             }
             // The session has no path job free: busy.
-            Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES)) => {
-                Err(Status::Unknown(proto_layer::STARTING))
-            }
+            Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES)) => Err(Status::Unknown(
+                crate::starting::code(crate::starting::Cause::Listing),
+            )),
             Err(e) => Err(e),
         };
     }

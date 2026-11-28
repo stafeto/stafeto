@@ -97,6 +97,7 @@ mod layer_posix;
 mod layer_probe;
 mod layer_restart;
 mod layer_steps;
+mod layer_time;
 mod linux_guest;
 mod log_quiet;
 mod lvgl;
@@ -1162,6 +1163,14 @@ pub(crate) fn layered_root() -> bool {
     std::env::var("STAFETO_LAYERED_ROOT").as_deref() == Ok("1")
 }
 
+/// Whether the image of the shell on EC2 and its QEMU twin carry the measurement of the layered root
+/// (`cargo xtask aws image --layered`): the program `layer-time`, the lower files it copies up
+/// (`rootfs::layer_time_files`) and the script `/etc/rc.d/layer-time` that runs it from the boot
+/// script once the layer service is ready (the launcher waits for it). It needs `layered_root`.
+pub(crate) fn layer_time() -> bool {
+    layered_root() && std::env::var("STAFETO_LAYER_TIME").as_deref() == Ok("1")
+}
+
 /// The programs of the shell on EC2 (init's table `table-aws`): the shell
 /// image's services and BusyBox, with init's table for the 16550 of the
 /// SPCR and no entropy service.
@@ -1198,6 +1207,9 @@ fn aws_programs() -> &'static [ImageProgram] {
         programs.push(("datafsd", "datafsd", 32 * 1024, &[]));
         if layered_root() {
             programs.push(("layerd", "layerd", LAYERD_STACK_SIZE, &[]));
+        }
+        if layer_time() {
+            programs.push(("layer-time", "layer-time", POSIX_STACK_SIZE, &[]));
         }
         programs.push(("datakey", "datakey", 128 * 1024, &[]));
         // The service of the power button (init's record `power`): the PL061 pin the EC2
@@ -2617,6 +2629,7 @@ commands:
             `httpd -f -p 80 -h /www &` fetches the page of the image
   efi [EFI|EFI_EL2] boot the system through the EFI loader under edk2 from a GPT disk with an ESP and compare
             the kernel's boot report with the same machine started with -kernel
+  layer-time build the image of the try-out with the layered root and the measurement (the program layer-time), boot it on QEMU's EFI machine with the volume of the steps probe (8,192 names) and print the measurement: the build of the index, the first path of a fresh process, the copy up of lower files of 1 KiB, 1 MiB and 16 MiB and of an open that truncates; the local twin of `aws image --layered` and `aws boot --end layer-time: done`
   efi-time  boot an image with the clock service through the loader under edk2 and check that the loader writes the
             firmware's time into boot-time and the clock service starts there (within 120 s of the host)
   efi-vz    boot the disk of the EFI loader on Apple VZ (VZEFIBootLoader) to the shell
@@ -3053,6 +3066,7 @@ fn main() {
         Some("net-wget") => net_wget::command(&args[1..]),
         Some("net-ec2-key") => net_ec2_key::command(&args[1..]),
         Some("net-try") => net_try::command(&args[1..]),
+        Some("layer-time") => layer_time::command(&args[1..]),
         Some("net-ec2-key-imds") => net_ec2_key::imds_command(&args[1..]),
         Some("net-tls") => net_tls::command(&args[1..]),
         Some("probe-ca") => probe_ca::command(&args[1..]),
@@ -15211,7 +15225,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "layer-names",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/calibrate,compositor/irq-trace,compositor/late-open,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash,layerd/steps,layerd/probe-restart,layerd/break-layerd-whiteout,layerd/break-layerd-search,layerd/break-layerd-no-mark,layerd/break-layerd-sticky,layerd/break-layerd-one-step,layerd/break-layerd-change-one-step,layerd/break-layerd-slots,layerd/break-layerd-epoch,layerd/break-layerd-copy-counter-ino,layerd/break-layerd-copy-attrs,layerd/break-layerd-copy-in-loop,layerd/break-layerd-copy-elf,layerd/break-layerd-copy-recheck,datafsd/probe-restart,datafsd/break-datafs-layers-visible",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/calibrate,compositor/irq-trace,compositor/late-open,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash,layerd/steps,layerd/probe-restart,layerd/break-layerd-whiteout,layerd/break-layerd-search,layerd/break-layerd-no-mark,layerd/break-layerd-sticky,layerd/break-layerd-one-step,layerd/break-layerd-change-one-step,layerd/break-layerd-slots,layerd/break-layerd-compact-one-step,layerd/break-layerd-chain-unlink,layerd/break-layerd-epoch,layerd/break-layerd-copy-counter-ino,layerd/break-layerd-copy-attrs,layerd/break-layerd-copy-in-loop,layerd/break-layerd-copy-elf,layerd/break-layerd-copy-recheck,datafsd/probe-restart,datafsd/break-datafs-layers-visible",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -15269,6 +15283,8 @@ fn ci_lints() -> Result<(), String> {
         "posix-data-probe",
         "--package",
         "layer-posix-probe",
+        "--package",
+        "layer-time",
         "--package",
         "posix-window-probe",
         "--package",

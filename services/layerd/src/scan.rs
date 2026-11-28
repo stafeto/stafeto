@@ -80,7 +80,7 @@ pub enum Progress {
 }
 
 /// The entries of a batch one step takes into the index.
-pub const ENTRIES_PER_STEP: usize = 16;
+pub const ENTRIES_PER_STEP: usize = 12;
 
 pub struct Scan {
     queue: [u32; SLOTS],
