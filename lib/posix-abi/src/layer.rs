@@ -204,8 +204,9 @@ pub fn session() -> Option<rt::abi::Handle> {
 #[allow(non_upper_case_globals)]
 pub static stafeto_layer_client: u8 = 1;
 
-/// The image has no layer service (the process service answered ABSENT, or no root came for the
-/// whole wait of UNREGISTERED): no path of this process goes to the service again. A program built
+/// The image or the machine has no layer service (the process service answered ABSENT, or the service
+/// answered NO_STORE): no path of this process goes to the service again. A root that is only late
+/// (UNREGISTERED) does not set it. A program built
 /// with the layer in an image without `layerd` learns it at its first path, with no wait.
 static NEVER: AtomicBool = AtomicBool::new(false);
 
@@ -335,8 +336,10 @@ static TAKE: posix_sync::LayerLock = posix_sync::LayerLock::new();
 const BUSY_TRIES: u32 = 60_000;
 
 /// The same for a process service that has no root of the layer service yet (UNREGISTERED): the
-/// service registers its root before it builds its index, so a root that does not come in five
-/// seconds is not coming (the service is marked broken).
+/// service registers its root before it builds its index. A root that does not come in five
+/// seconds fails the call with EIO and nothing more: the service may be late or restarting, and a
+/// process that took it for absent would write past the layers for the rest of its life. Only
+/// ABSENT and NO_STORE (an image or a machine that has no layers) end the use of the service.
 const NO_ROOT_TRIES: u32 = 5000;
 
 /// Waits a millisecond with a timed sleep that is no point of cancellation, as `data` does.
@@ -397,8 +400,7 @@ fn take() -> Result<rt::abi::Handle, Taking> {
                 return Err(Taking::Absent);
             }
             Attempt::NoRoot => {
-                why!("no root of the layer service after the tries: none in this image");
-                NEVER.store(true, Ordering::Release);
+                why!("no root of the layer service after the tries");
                 return Err(Taking::Errno(EIO));
             }
             Attempt::Retry => {

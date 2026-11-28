@@ -471,6 +471,15 @@ pub const fn is_boot_profile(label: u64) -> bool {
     label & (OWN | LOADERS) == 0 && label & BOOT_PROFILE != 0
 }
 
+/// The mark init adds to the boot profile of the layer service alone (`LAYER_SERVICE`): only that
+/// session may send GUARD. Bit 59, below the marks above it.
+pub const GUARDER: u64 = 1 << 59;
+
+/// Whether `label` is the boot profile of the layer service, the one session that may send GUARD.
+pub const fn may_guard(label: u64) -> bool {
+    is_boot_profile(label) && label & GUARDER != 0
+}
+
 /// The mark of the label of the session of the loaders: bit 62 with bit
 /// 63 clear, which init gives only to the process service's session with
 /// the RAM file service.
@@ -646,7 +655,7 @@ pub enum Method {
     /// client may keep a copy of the bytes of an immutable file for as long as it holds the
     /// description. No handles; one step of the service, O(1) in the description.
     SnapshotFd = 69,
-    /// No body, no handles; only a session of the boot profile (the layer service). The write
+    /// No body, no handles; only the boot profile of the layer service (`may_guard`). The write
     /// guard of a layered root goes on: from now a session of a POSIX process cannot write a name
     /// outside the pass-through names (`names::PASS_THROUGH`, READ_ONLY_FILESYSTEM). The switch is
     /// one way: a repeat changes nothing and nothing switches it off. PERMISSION for any other
@@ -820,6 +829,15 @@ mod tests {
 
     /// GUARD has a number of its own, past the layer service's methods 70 to 85 (the two numberings
     /// share a channel type in the tables of the probes).
+    #[test]
+    fn only_the_boot_profile_of_the_layer_service_may_guard() {
+        assert!(may_guard(BOOT_PROFILE | GUARDER | 3));
+        assert!(!may_guard(BOOT_PROFILE | 3));
+        assert!(!may_guard(GUARDER | 3));
+        assert!(!may_guard(OWN | BOOT_PROFILE | GUARDER));
+        assert!(!is_layers(BOOT_PROFILE | GUARDER | 3) && !is_layers(GUARDER));
+    }
+
     #[test]
     fn guard_is_listed_apart_from_the_names_of_the_layer_service() {
         assert_eq!(Method::from_number(86), Some(Method::Guard));

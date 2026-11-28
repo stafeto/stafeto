@@ -684,11 +684,12 @@ const PASSED_BARE: &str = "layer-posix: bare checks passed";
 
 /// The checks of the scripts of a layer of the user (`cargo xtask layer-posix script`), in the order
 /// the probe runs them.
-pub const SCRIPT_CHECKS: [&str; 4] = [
+pub const SCRIPT_CHECKS: [&str; 5] = [
     "a script of the layer runs through its interpreter",
     "a script with no execute bit is refused",
     "an interpreter the layer deletes is not found",
     "an interpreter of the layer is refused",
+    "a set-ID script runs with the caller's identity",
 ];
 
 /// The checks of a machine with no data volume (`cargo xtask layer-posix boot`).

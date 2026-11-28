@@ -424,6 +424,7 @@ fn main(_: u64) -> u64 {
         longest_step: 0,
         longest_method: 0,
         tail: TAIL_NONE,
+        guard_tries: 0,
     };
     // The loop is this thread: it works under its budget from here on, and a budget the kernel
     // refuses is a start error, since the thread would run without a limit.
@@ -532,7 +533,13 @@ struct Layerd {
     longest_method: u16,
     /// Which of the steps after READY is next (`TAIL_*`).
     tail: u8,
+    /// The refusals of GUARD so far.
+    guard_tries: u8,
 }
+
+/// The refusals of GUARD after which the instance ends, and its exit code.
+const GUARD_TRIES: u8 = 20;
+const GUARD_REFUSED: u64 = 7;
 
 const TAIL_NONE: u8 = 0;
 const TAIL_GUARD: u8 = 1;
@@ -1614,14 +1621,25 @@ impl Service<0> for Layerd {
         match self.tail {
             TAIL_GUARD => {
                 // The root is decided by the names now: the write guard of the RAM file service
-                // goes on (a machine with no data volume passes every path to that service and
-                // asks none).
+                // goes on before READY, so the launcher starts nothing while a write can pass the
+                // layers. A refusal is tried again in the next step, and the instance ends after
+                // `GUARD_TRIES` of them (init starts the next one).
                 match self.core.guard_lower() {
-                    Ok(true) => rt::println!("layerd: write guard of the root on"),
-                    Ok(false) => {}
-                    Err(why) => rt::println!("layerd: GUARD refused: {why:?}"),
+                    Ok(_) => {
+                        rt::println!("layerd: write guard of the root on");
+                        if let Err(why) = rt::service::ready(&self.parent) {
+                            rt::println!("layerd: READY refused: {why:?}");
+                        }
+                        self.tail = TAIL_REPORT;
+                    }
+                    Err(why) => {
+                        self.guard_tries += 1;
+                        rt::println!("layerd: GUARD refused: {why:?}");
+                        if self.guard_tries >= GUARD_TRIES {
+                            sys::process_exit(GUARD_REFUSED);
+                        }
+                    }
                 }
-                self.tail = TAIL_REPORT;
                 let _ = sys::notify(&self.step, 1);
                 return;
             }
@@ -1689,7 +1707,14 @@ impl Service<0> for Layerd {
                             up,
                         });
                     }
-                    other => rt::println!("layerd: not serving: {other:?}"),
+                    other => {
+                        rt::println!("layerd: not serving: {other:?}");
+                        if other == State::NoStore {
+                            rt::println!(
+                                "layerd: no data volume: the root is memory-only, writes to it go to the RAM file service and will not persist"
+                            );
+                        }
+                    }
                 }
                 let (names, marks) = self.core.left_out();
                 if names + marks != 0 {
@@ -1703,12 +1728,12 @@ impl Service<0> for Layerd {
                         self.core.skipped()
                     );
                 }
-                if let Err(why) = rt::service::ready(&self.parent) {
-                    rt::println!("layerd: READY refused: {why:?}");
-                }
                 if self.report.is_some() {
+                    // READY comes with the guard (`TAIL_GUARD`).
                     self.tail = TAIL_GUARD;
                     let _ = sys::notify(&self.step, 1);
+                } else if let Err(why) = rt::service::ready(&self.parent) {
+                    rt::println!("layerd: READY refused: {why:?}");
                 }
             }
         } else {

@@ -25,20 +25,28 @@ impl Line {
     }
 }
 
-/// The line of a script in `head`, the first bytes of the file. None for a file that does not
-/// start with `#!`, a first line with no end in `head` (too long: ENOEXEC as on Linux, which cuts
-/// it) and a line with no interpreter. The interpreter ends at a blank or a tab; what follows it,
-/// with the blanks at both ends cut, is one argument.
+/// The line of a script in `head`, the first bytes of the file. None (the caller answers ENOEXEC)
+/// for a file that does not start with `#!`, a line with no interpreter, and a line whose
+/// interpreter is cut: `head` is `HEAD` bytes long, has no newline, and the interpreter's path runs
+/// to its end. The end of the file ends the line like a newline (a `head` shorter than `HEAD`
+/// is the whole file), and a cut argument is the argument as far as it goes (as Linux since 5.0).
+/// The interpreter ends at a blank or a tab; what follows it, with the blanks at both ends cut, is
+/// one argument. The carriage return counts as a blank (lenient: Linux has it in the path).
 pub fn parse(head: &[u8]) -> Option<Line> {
     let rest = head.strip_prefix(b"#!")?;
-    let end = rest.iter().position(|&b| b == b'\n')?;
-    let line = &rest[..end];
+    let (line, cut) = match rest.iter().position(|&b| b == b'\n') {
+        Some(end) => (&rest[..end], false),
+        None => (rest, head.len() >= HEAD),
+    };
     let blank = |b: &u8| matches!(*b, b' ' | b'\t' | b'\r');
     let start = line.iter().position(|b| !blank(b))?;
     let stop = line[start..]
         .iter()
         .position(blank)
         .map_or(line.len(), |at| start + at);
+    if cut && stop == line.len() {
+        return None;
+    }
     let from = line[stop..]
         .iter()
         .position(|b| !blank(b))
@@ -64,8 +72,8 @@ mod tests {
         parse(text).map(|l| (l.interpreter(text), l.argument(text)))
     }
 
-    /// The Linux rule: the interpreter ends at a blank, the rest of the line is one argument with
-    /// the blanks at its ends cut, and a line that is no `#!` line or has no end is no script.
+    /// The interpreter ends at a blank, the rest of the line is one argument with the blanks at its
+    /// ends cut, the end of the file ends the line, and a line that is no `#!` line is no script.
     #[test]
     fn the_line_has_an_interpreter_and_one_argument() {
         assert_eq!(line(b"#!/bin/sh\necho\n"), Some((&b"/bin/sh"[..], None)));
@@ -78,12 +86,38 @@ mod tests {
             line(b"#!\t/bin/awk  -f  x y \t\r\nBEGIN\n"),
             Some((&b"/bin/awk"[..], Some(&b"-f  x y"[..])))
         );
-        assert_eq!(line(b"#!/bin/sh"), None, "a line with no end in the head");
+        assert_eq!(
+            line(b"#!/bin/sh"),
+            Some((&b"/bin/sh"[..], None)),
+            "the file's end ends the line"
+        );
+        assert_eq!(
+            line(b"#!/bin/sh -x"),
+            Some((&b"/bin/sh"[..], Some(&b"-x"[..])))
+        );
         assert_eq!(line(b"#!\n"), None);
         assert_eq!(line(b"#! \t\n"), None);
         assert_eq!(line(b"# !/bin/sh\n"), None);
         assert_eq!(line(b"\x7fELF"), None);
         assert_eq!(line(b""), None);
         assert_eq!(line(b"#"), None);
+    }
+
+    /// A first line as long as the head has no end in it: a cut interpreter fails, a cut argument is
+    /// the argument as far as it goes.
+    #[test]
+    fn a_line_cut_by_the_head_fails_in_the_interpreter_and_goes_on_in_the_argument() {
+        let mut path = b"#!/".to_vec();
+        path.resize(HEAD, b'a');
+        assert_eq!(parse(&path), None);
+        let mut argument = b"#!/bin/sh ".to_vec();
+        argument.resize(HEAD, b'x');
+        let l = parse(&argument).expect("a cut argument");
+        assert_eq!(l.interpreter(&argument), b"/bin/sh");
+        assert_eq!(l.argument(&argument).map(<[u8]>::len), Some(HEAD - 10));
+        // The same bytes with a newline at the end of the head are a whole line.
+        let mut whole = path.clone();
+        *whole.last_mut().unwrap() = b'\n';
+        assert!(parse(&whole).is_some());
     }
 }

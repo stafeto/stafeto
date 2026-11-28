@@ -14,7 +14,7 @@
 //! is opened by the loader at its canonical path. The loader takes `libc.so` and the other
 //! libraries of a dynamic program from the lower set alone, whatever the layers hold.
 
-use crate::constants::{ENOENT, O_CLOEXEC, O_RDONLY};
+use crate::constants::{O_CLOEXEC, O_RDONLY};
 
 pub use posix_fs::script::{HEAD, Line, parse};
 
@@ -35,9 +35,11 @@ impl Script {
     }
 }
 
-/// The script at `path` (an absolute path of a layer of the user, `abs` for the layer service),
-/// when the caller may execute it and it starts with `#!`. EACCES for a file that is no script or
-/// that the caller may not execute, the errno of the open and the read otherwise.
+/// The script at `abs` (a name of a layer of the user), when the caller may execute it and it starts
+/// with `#!`. EACCES for a file the caller may not execute and for an ELF file (no program runs
+/// from a layer of the user); ENOEXEC for any other file with the execute bit that is no script
+/// (a shell's fallback then runs it), and for a line that has no interpreter or a cut one; the
+/// errno of the layer, the open and the read otherwise (EINTR and EIO stay what they are).
 pub fn read(abs: &crate::layer::Abs) -> Result<Script, i32> {
     crate::layer::may_run_script(abs)?;
     let fd = crate::open(abs.bytes(), O_RDONLY | O_CLOEXEC)?;
@@ -57,10 +59,9 @@ pub fn read(abs: &crate::layer::Abs) -> Result<Script, i32> {
     };
     let _ = crate::close(fd);
     got?;
-    let line = parse(&head[..length]).ok_or(crate::constants::EACCES)?;
-    // A name the layers made vanish between the check and the open is not found.
-    if line.interpreter(&head[..length]).is_empty() {
-        return Err(ENOENT);
+    if head[..length].starts_with(b"\x7fELF") {
+        return Err(crate::constants::EACCES);
     }
+    let line = parse(&head[..length]).ok_or(crate::constants::ENOEXEC)?;
     Ok(Script { head, length, line })
 }

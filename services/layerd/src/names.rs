@@ -351,8 +351,8 @@ impl<'a, V: Volume, L: Lower> Core<'a, V, L> {
     /// Asks the lower set's service for its write guard, once, when the index is built and the
     /// root is served (`State::Ready`): from then on the layer service is the only way to write a
     /// name of the root. Without a volume (`passes_all`) and while the build goes on nothing is
-    /// asked. True when the guard is on after the call. An error leaves it unasked, so that the
-    /// next call tries again.
+    /// asked. True when the guard is on after the call. An error leaves it unasked; the caller
+    /// (`main.rs`) asks again in a later step and ends the instance after a number of refusals.
     pub fn guard_lower(&mut self) -> R<bool> {
         if self.state != State::Ready {
             return Ok(false);

@@ -1479,11 +1479,11 @@ fn a_root_entry_named_as_the_mount_is_a_conflict_only_when_the_mount_is_set() {
     ));
 }
 
-/// The package service attaches and detaches the layers of a layered root whose write guard is on:
-/// its session is the layer session (`LayerStart`, `LayerStep`), which the guard of the walks of
-/// POSIX sessions does not look at, so an installation, a removal and an upgrade of a package
-/// work, and the file of a package that a user's layer shadows is the lower set's to update. A walk
-/// of a POSIX session that would write the same directory is refused all the while.
+/// With the write guard on, the storage still attaches, replaces and detaches a layer (the calls
+/// `LayerStart` and `LayerStep` make, which no walk of a POSIX session guards), the new bytes show
+/// after the replacement and the name is gone after the detach, and a guarded walk that would create
+/// a name in the same directory is refused at each point. It does not run the layer session, the
+/// package service, a user's layer or an image.
 #[test]
 fn a_package_installs_upgrades_and_goes_under_the_write_guard() {
     let mut ram = ram();

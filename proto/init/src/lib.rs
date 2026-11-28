@@ -1205,7 +1205,10 @@ fn parse_line(line: &[u8]) -> Option<GrantLine> {
 /// its table; `Grants::parse` leaves it out.
 pub const ROOTS_PREFIX: &[u8] = b"roots=";
 /// The longest line `write_roots` writes: the prefix, seven numbers, six commas and the newline.
-pub const ROOTS_LINE_MAX: usize = ROOTS_PREFIX.len() + 7 + 6 + 1;
+pub const ROOTS_LINE_MAX: usize =
+    ROOTS_PREFIX.len() + proto_process::ROOTS + (proto_process::ROOTS - 1) + 1;
+// One digit for each root, so a root number is below 10.
+const _: () = assert!(proto_process::ROOTS <= 10);
 
 /// Writes the line of the roots in `mask` (bit n for root n, below 10) into `out`, and returns its
 /// length. An empty mask writes the line with no number, which lists no root.
@@ -1213,7 +1216,7 @@ pub fn write_roots(mask: u32, out: &mut [u8; ROOTS_LINE_MAX]) -> usize {
     out[..ROOTS_PREFIX.len()].copy_from_slice(ROOTS_PREFIX);
     let mut at = ROOTS_PREFIX.len();
     let mut first = true;
-    for root in 0..7u8 {
+    for root in 0..proto_process::ROOTS as u8 {
         if mask & (1 << root) != 0 {
             if !first {
                 out[at] = b',';

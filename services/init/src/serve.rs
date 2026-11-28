@@ -2151,7 +2151,13 @@ impl Init {
             && !client.is_posix()
         {
             Grant {
-                mark: proto_fs::BOOT_PROFILE,
+                // The layer service's session may also send GUARD.
+                mark: proto_fs::BOOT_PROFILE
+                    | if client.name == table::LAYER_SERVICE {
+                        proto_fs::GUARDER
+                    } else {
+                        0
+                    },
                 duplicate: false,
             }
         } else if let Some(mark) = table::data_mark(client, name.as_bytes()) {

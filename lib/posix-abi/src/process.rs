@@ -1584,6 +1584,8 @@ pub fn spawn_search<'s, 'a>(
     }
     // A path of the layered root goes through the layer service first: the layers that delete the
     // name make it ENOENT, and a name of a layer of the user is never run.
+    // `posix_spawnp` (`search` set) is left out of the scripts of a layer of the user: its PATH search
+    // takes lower programs alone. `execvp` of the C library searches by `execve`, which runs them.
     // The loader gets the path the service approved. A name of a layer of the user that is a script
     // runs through its interpreter, as for `exec`.
     let checked = match crate::layer::route(crate::names::AT_FDCWD, file)? {
@@ -1610,7 +1612,7 @@ fn spawn_refused<'s, 'a>(
     attributes: SpawnAttributes,
     actions: impl Iterator<Item = FileAction<'a>>,
 ) -> Result<i32, i32> {
-    match script_of(file) {
+    match script_of(file)? {
         Some(script) => spawn_script(file, &script, argv, envp, attributes, actions),
         None => Err(crate::constants::EACCES),
     }
@@ -1887,7 +1889,7 @@ fn exec_refused<'s>(
     envp: impl Iterator<Item = &'s [u8]> + Clone,
     umask: u32,
 ) -> Result<core::convert::Infallible, i32> {
-    match script_of(path) {
+    match script_of(path)? {
         Some(script) => exec_script(path, &script, argv, envp, umask),
         None => Err(crate::constants::EACCES),
     }
@@ -1898,12 +1900,14 @@ fn exec_refused<'s>(
 /// interpreter's path is checked the same way every program's is (ENOENT when the layers delete
 /// it, EACCES when it lies in a layer of the user), by the `exec` that runs it.
 #[inline(never)]
-fn script_of(path: &[u8]) -> Option<crate::script::Script> {
+fn script_of(path: &[u8]) -> Result<Option<crate::script::Script>, i32> {
     use crate::layer::Runnable;
-    let abs = crate::layer::route(crate::names::AT_FDCWD, path).ok()??;
-    match crate::layer::runnable(&abs) {
-        Ok(Runnable::Layer) => crate::script::read(&abs).ok(),
-        _ => None,
+    let Some(abs) = crate::layer::route(crate::names::AT_FDCWD, path)? else {
+        return Ok(None);
+    };
+    match crate::layer::runnable(&abs)? {
+        Runnable::Layer => crate::script::read(&abs).map(Some),
+        Runnable::Lower(_) => Ok(None),
     }
 }
 

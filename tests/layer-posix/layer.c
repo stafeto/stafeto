@@ -576,14 +576,16 @@ static int exec_keeps_the_description(void) {
 static int programs_of_the_layers(void) {
     pid_t pid = 0;
     char *argv[] = {"layer-posix", "exit0", NULL};
-    /* A program the layer deletes is not there, and a program of the layer of the user is no program. */
+    /* A program the layer deletes is not there, and a file of the layer of the user is no program:
+     * one with the execute bit that is no script and no ELF file is ENOEXEC, so that a shell runs it
+     * itself (an ELF file of a layer is EACCES, see the script phase). */
     LP_CHECK(posix_spawn(&pid, "/bin/layer-posix-gone", NULL, NULL, argv, environ) == ENOENT);
-    LP_CHECK(posix_spawn(&pid, "/bin/layer-upper-prog", NULL, NULL, argv, environ) == EACCES);
+    LP_CHECK(posix_spawn(&pid, "/bin/layer-upper-prog", NULL, NULL, argv, environ) == ENOEXEC);
     LP_CHECK(posix_spawn(&pid, "/bin/never-was", NULL, NULL, argv, environ) == ENOENT);
     LP_CHECK(posix_spawn(&pid, "/bin/layer-posix", NULL, NULL, argv, environ) == 0);
     LP_CHECK(wait_ok(pid) == 0);
     LP_CHECK(FAILS(execv("/bin/layer-posix-gone", argv), ENOENT));
-    LP_CHECK(FAILS(execv("/bin/layer-upper-prog", argv), EACCES));
+    LP_CHECK(FAILS(execv("/bin/layer-upper-prog", argv), ENOEXEC));
     LP_CHECK(FAILS(execv("/etc/layer-lower", argv), EACCES));
     return 0;
 }
@@ -2344,10 +2346,14 @@ static int a_script_with_no_execute_bit_is_refused(void) {
     pid_t pid = 0;
     LP_CHECK(posix_spawn(&pid, "/scripts/plain", NULL, NULL, argv, environ) == EACCES);
     LP_CHECK(FAILS(execv("/scripts/plain", argv), EACCES));
-    /* A file that starts with no `#!` is no program of the layer either. */
+    /* A file with the execute bit that starts with no `#!` is ENOEXEC (a shell then runs it itself),
+     * and one that starts with an ELF header is EACCES: no program runs from a layer of the user. */
     LP_CHECK(make_script("/scripts/data", "not a script\n", 0755) == 0);
-    LP_CHECK(posix_spawn(&pid, "/scripts/data", NULL, NULL, argv, environ) == EACCES);
-    LP_CHECK(FAILS(execv("/scripts/data", argv), EACCES));
+    LP_CHECK(posix_spawn(&pid, "/scripts/data", NULL, NULL, argv, environ) == ENOEXEC);
+    LP_CHECK(FAILS(execv("/scripts/data", argv), ENOEXEC));
+    LP_CHECK(make_script("/scripts/elf", "\x7f" "ELF and nothing more\n", 0755) == 0);
+    LP_CHECK(posix_spawn(&pid, "/scripts/elf", NULL, NULL, argv, environ) == EACCES);
+    LP_CHECK(FAILS(execv("/scripts/elf", argv), EACCES));
     return 0;
 }
 
@@ -2371,12 +2377,37 @@ static int an_interpreter_of_the_layer_is_refused(void) {
     return 0;
 }
 
+/* The role of the interpreter of the set-ID script: a script's set-ID bits are ignored, so the
+ * program runs with the identity of the caller (1001), not the owner's (1000). */
+static int script_euid(void) {
+    if (geteuid() != 1001 || getuid() != 1001 || getegid() != 100) return 51;
+    return 0;
+}
+
+static int a_set_id_script_runs_with_the_callers_identity(void) {
+    LP_CHECK(make_script("/scripts/suid", "#!/bin/layer-posix script-euid\n", 0755) == 0);
+    LP_CHECK(chown("/scripts/suid", 1000, 100) == 0 && chmod("/scripts/suid", 04755) == 0);
+    struct stat st;
+    LP_CHECK(stat("/scripts/suid", &st) == 0 && (st.st_mode & 07777) == 04755 && st.st_uid == 1000);
+    pid_t pid = fork();
+    LP_CHECK(pid >= 0);
+    if (pid == 0) {
+        if (setgid(100) != 0 || setuid(1001) != 0) _exit(2);
+        char *argv[] = {"suid", NULL};
+        execv("/scripts/suid", argv);
+        _exit(40 + (errno & 15));
+    }
+    LP_CHECK(wait_ok(pid) == 0);
+    return 0;
+}
+
 static int script_first(void) {
     run_check("a script of the layer runs through its interpreter",
               a_script_of_the_layer_runs_through_its_interpreter);
     run_check("a script with no execute bit is refused", a_script_with_no_execute_bit_is_refused);
     run_check("an interpreter the layer deletes is not found", an_interpreter_the_layer_deletes_is_not_found);
     run_check("an interpreter of the layer is refused", an_interpreter_of_the_layer_is_refused);
+    run_check("a set-ID script runs with the caller's identity", a_set_id_script_runs_with_the_callers_identity);
     if (failures != 0) {
         printf("layer-posix: %d checks failed\n", failures);
         return 20;
@@ -2448,6 +2479,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "forged") == 0) return forged_role();
     if (argc > 1 && strcmp(argv[1], "setid") == 0) return setid_role();
     if (argc > 2 && strcmp(argv[1], "genuine") == 0) return genuine_role(argv);
+    if (argc > 1 && strcmp(argv[1], "script-euid") == 0) return script_euid();
     if (argc > 1 && strcmp(argv[1], "script-run") == 0) return script_run(argc, argv);
     if (argc > 1 && strcmp(argv[1], "run") == 0) return first();
     if (argc > 1 && strcmp(argv[1], "script") == 0) return script_first();
