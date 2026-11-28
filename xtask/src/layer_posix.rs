@@ -252,6 +252,10 @@ pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
         None => probe(machine),
         Some("breaks") if args.len() == 1 => breaks(machine),
         Some("ash") if args.len() == 1 => ash(machine),
+        Some("script") if args.len() == 1 => script(machine),
+        Some("script") if args.len() == 2 && args[1] == "breaks" => script_breaks(machine),
+        Some("boot") if args.len() == 1 => boot_check(machine),
+        Some("boot") if args.len() == 2 && args[1] == "breaks" => boot_breaks(machine),
         Some("write") if args.len() == 1 => write(machine),
         Some("write") if args.len() == 2 && args[1] == "breaks" => write_breaks(machine),
         Some("copy") if args.len() == 1 => copy(machine),
@@ -259,7 +263,7 @@ pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
         Some("copy") if args.len() == 2 && args[1] == "race" => copy_race(machine),
         Some("copy") if args.len() == 2 && args[1] == "full" => copy_full(machine),
         Some(other) => Err(format!(
-            "layer-posix [breaks | ash | write [breaks] | copy [breaks | race | full]]: unknown argument {other}"
+            "layer-posix [breaks | ash | script [breaks] | boot [breaks] | write [breaks] | copy [breaks | race | full]]: unknown argument {other}"
         )),
     }
 }
@@ -476,6 +480,20 @@ fn boot_until(
     env: &[(&str, &str)],
     stop: &str,
 ) -> Result<(qemu::Outcome, u64), String> {
+    boot_machine(machine, with, Some(disk), extra, limit, env, stop)
+}
+
+/// `boot_until` on a machine that may have no disk at all (`disk` None): the data file service finds
+/// no volume then.
+fn boot_machine(
+    machine: &qemu::Machine,
+    with: Build,
+    disk: Option<&Disk>,
+    extra: Vec<crate::rootfs::RootFile>,
+    limit: std::time::Duration,
+    env: &[(&str, &str)],
+    stop: &str,
+) -> Result<(qemu::Outcome, u64), String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
     let image = {
@@ -490,7 +508,10 @@ fn boot_until(
         own
     };
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
-    cmd.args(qemu::HEADLESS).args(qemu::store(&disk.0, None));
+    cmd.args(qemu::HEADLESS);
+    if let Some(disk) = disk {
+        cmd.args(qemu::store(&disk.0, None));
+    }
     let started = std::time::Instant::now();
     let output = run_until(cmd, limit, Some(stop), &kernel.elf);
     // The image is this run's alone.
@@ -523,6 +544,39 @@ fn registered(lines: &[String]) -> Result<(), String> {
     ))
 }
 
+/// The layer service has asked the RAM file service for its write guard once its index was built
+/// (`layerd: write guard of the root on`, after the line that says the build began and before the
+/// probe's first line), and the file service accepted it.
+fn guarded(lines: &[String]) -> Result<(), String> {
+    let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
+    let (Some(guard), Some(begun)) = (
+        at("layerd: write guard of the root on"),
+        at("building the index"),
+    ) else {
+        return Err(format!(
+            "the layer service did not say that the write guard is on after its index was built: {:?}",
+            lines
+                .iter()
+                .filter(|l| l.contains("layerd:"))
+                .collect::<Vec<_>>()
+        ));
+    };
+    if guard < begun {
+        return Err("the write guard was on before the index began to build".to_owned());
+    }
+    if lines
+        .iter()
+        .position(|l| l.contains(PREFIX))
+        .is_some_and(|probe| probe < guard)
+    {
+        return Err("the probe started before the write guard was on".to_owned());
+    }
+    if lines.iter().any(|l| l.contains("layerd: GUARD refused")) {
+        return Err("the RAM file service refused GUARD".to_owned());
+    }
+    Ok(())
+}
+
 /// Each check has exactly one line `ok`, in the order of `CHECKS`; no line says a check failed; the
 /// line of the end comes once, after every check.
 pub fn read_lines(lines: &[String]) -> Result<(), String> {
@@ -532,6 +586,7 @@ pub fn read_lines(lines: &[String]) -> Result<(), String> {
 /// `read_lines` for the checks `checks` and the line of the end `passed`.
 fn read_checks(lines: &[String], checks: &[&str], passed: &str) -> Result<(), String> {
     registered(lines)?;
+    guarded(lines)?;
     let mine = mine(lines);
     if let Some(bad) = mine
         .iter()
@@ -628,6 +683,190 @@ pub fn breaks(machine: &qemu::Machine) -> Result<(), String> {
         }
         println!("layer-posix breaks: {feature} is caught by {check:?} (in {seconds} s)");
     }
+    Ok(())
+}
+
+const PASSED_SCRIPT: &str = "layer-posix: script checks passed";
+const PASSED_BARE: &str = "layer-posix: bare checks passed";
+
+/// The checks of the scripts of a layer of the user (`cargo xtask layer-posix script`), in the order
+/// the probe runs them.
+pub const SCRIPT_CHECKS: [&str; 4] = [
+    "a script of the layer runs through its interpreter",
+    "a script with no execute bit is refused",
+    "an interpreter the layer deletes is not found",
+    "an interpreter of the layer is refused",
+];
+
+/// The checks of a machine with no data volume (`cargo xtask layer-posix boot`).
+pub const BARE_CHECKS: [&str; 2] = [
+    "the root is the file service's alone",
+    "a write to the root goes to memory",
+];
+
+/// The deliberate breaks of the scripts and the check each fails: the interpreter's path is not
+/// checked by the layer service (a name the layer deletes is found by the loader).
+pub const SCRIPT_BREAKS: [(&str, &str); 1] = [(
+    "break-layer-script",
+    "an interpreter the layer deletes is not found",
+)];
+
+const SCRIPT_PROBE: &[&str] = &["phase-script"];
+const BARE_PROBE: &[&str] = &["phase-bare"];
+
+/// `layer-posix script`: a script in a layer of the user runs through its interpreter, with the
+/// interpreter's path checked as any program's.
+pub fn script(machine: &qemu::Machine) -> Result<(), String> {
+    let (output, seconds) = boot(
+        machine,
+        Build {
+            probe: SCRIPT_PROBE,
+            ..Build::default()
+        },
+    )?;
+    read_checks(&output.lines, &SCRIPT_CHECKS, PASSED_SCRIPT)?;
+    qemu::expect_stopped_on(
+        &output,
+        "init: layer-posix ended: exit code 0, not restarted",
+    )?;
+    println!(
+        "layer-posix script on {}: {} checks of the scripts of a layer of the user in {seconds} s: ok",
+        machine.name,
+        SCRIPT_CHECKS.len()
+    );
+    Ok(())
+}
+
+/// Each break of the scripts, one boot each: the probe must fail and name the check the break is for.
+pub fn script_breaks(machine: &qemu::Machine) -> Result<(), String> {
+    for (feature, check) in SCRIPT_BREAKS {
+        let probe: &'static [&'static str] =
+            Box::leak(vec!["phase-script", feature].into_boxed_slice());
+        let (output, seconds) = boot(
+            machine,
+            Build {
+                probe,
+                ..Build::default()
+            },
+        )?;
+        let mine = mine(&output.lines);
+        if mine.iter().any(|l| *l == &PASSED_SCRIPT[PREFIX.len()..]) {
+            return Err(format!(
+                "layer-posix script breaks: {feature} did not fail the probe"
+            ));
+        }
+        let failed: Vec<&&str> = mine.iter().filter(|l| l.contains(" FAILED")).collect();
+        let wanted = format!("{check} FAILED");
+        if !failed.iter().any(|l| l.starts_with(&wanted)) {
+            return Err(format!(
+                "layer-posix script breaks: {feature} did not fail {check:?}; the checks that failed: {failed:?}"
+            ));
+        }
+        println!("layer-posix script breaks: {feature} is caught by {check:?} (in {seconds} s)");
+    }
+    Ok(())
+}
+
+/// One boot of the probe `bare` on a machine with no disk: the data file service finds no volume.
+fn bare_boot(machine: &qemu::Machine, build: Build) -> Result<(qemu::Outcome, u64), String> {
+    boot_machine(machine, build, None, Vec::new(), LIMIT, &[], ENDS)
+}
+
+/// What a machine with no data volume says: the data file service has no disk, the layer service
+/// does not serve and asks no guard of the RAM file service, and its root is registered all the same
+/// (the launcher waits for its READY).
+fn read_bare(lines: &[String]) -> Result<(), String> {
+    let said = |needle: &str| lines.iter().any(|l| l.contains(needle));
+    for needle in ["datafs: no disk", "layerd: not serving: NoStore"] {
+        if !said(needle) {
+            return Err(format!(
+                "a machine with no volume did not say {needle:?}: {:?}",
+                lines
+                    .iter()
+                    .filter(|l| l.contains("datafs:") || l.contains("layerd:"))
+                    .collect::<Vec<_>>()
+            ));
+        }
+    }
+    if said("layerd: write guard of the root on") {
+        return Err(
+            "the layer service asked for the write guard on a machine with no volume".into(),
+        );
+    }
+    let mut passed = lines.to_vec();
+    // The check of the lines of the probe alone: registered, and no failures.
+    registered(&passed)?;
+    passed.retain(|l| l.contains(PREFIX));
+    let mine = mine(&passed);
+    if let Some(bad) = mine
+        .iter()
+        .find(|l| l.contains("FAILED") || l.contains("check failed"))
+    {
+        return Err(format!("layer-posix: {bad}"));
+    }
+    let oks: Vec<&str> = mine.iter().filter_map(|l| l.strip_suffix(" ok")).collect();
+    if oks != BARE_CHECKS || !mine.iter().any(|l| *l == &PASSED_BARE[PREFIX.len()..]) {
+        return Err(format!(
+            "the checks of a machine with no volume came out as {oks:?} and {mine:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// `layer-posix boot`: a machine with a volume has the write guard on after READY (the probe of the
+/// plain run reads it), and a machine with no volume has none and writes to memory.
+pub fn boot_check(machine: &qemu::Machine) -> Result<(), String> {
+    let (with, with_seconds) = boot(machine, Build::default())?;
+    read_lines(&with.lines)?;
+    qemu::expect_stopped_on(&with, "init: layer-posix ended: exit code 0, not restarted")?;
+    let (bare, bare_seconds) = bare_boot(
+        machine,
+        Build {
+            probe: BARE_PROBE,
+            ..Build::default()
+        },
+    )?;
+    read_bare(&bare.lines)?;
+    qemu::expect_stopped_on(&bare, "init: layer-posix ended: exit code 0, not restarted")?;
+    println!(
+        "layer-posix boot on {}: the write guard is on after READY with a volume ({with_seconds} s), and with no volume the root writes to memory with no guard ({bare_seconds} s): ok",
+        machine.name
+    );
+    Ok(())
+}
+
+/// The break of the guard: the RAM file service guards from its start, so a machine with no volume
+/// cannot write. The probe of that machine must fail the check of the write.
+pub const BOOT_BREAK: (&str, &str) = (
+    "break-ramfs-guard-early",
+    "a write to the root goes to memory",
+);
+
+pub fn boot_breaks(machine: &qemu::Machine) -> Result<(), String> {
+    let (feature, check) = BOOT_BREAK;
+    let ramfs: &'static [&'static str] = Box::leak(vec![feature].into_boxed_slice());
+    let (output, seconds) = bare_boot(
+        machine,
+        Build {
+            probe: BARE_PROBE,
+            ramfs,
+            ..Build::default()
+        },
+    )?;
+    let mine = mine(&output.lines);
+    if mine.iter().any(|l| *l == &PASSED_BARE[PREFIX.len()..]) {
+        return Err(format!(
+            "layer-posix boot breaks: {feature} did not fail the probe"
+        ));
+    }
+    let failed: Vec<&&str> = mine.iter().filter(|l| l.contains(" FAILED")).collect();
+    let wanted = format!("{check} FAILED");
+    if !failed.iter().any(|l| l.starts_with(&wanted)) {
+        return Err(format!(
+            "layer-posix boot breaks: {feature} did not fail {check:?}; the checks that failed: {failed:?}"
+        ));
+    }
+    println!("layer-posix boot breaks: {feature} is caught by {check:?} (in {seconds} s)");
     Ok(())
 }
 
@@ -1527,7 +1766,11 @@ mod tests {
     use super::*;
 
     fn lines(names: &[&str]) -> Vec<String> {
-        let mut v = vec!["layerd: root registered with the process service".to_owned()];
+        let mut v = vec![
+            "layerd: root registered with the process service".to_owned(),
+            "layerd: live layer 00, building the index".to_owned(),
+            "layerd: write guard of the root on".to_owned(),
+        ];
         v.extend(names.iter().map(|n| format!("{PREFIX}{n}")));
         v
     }
@@ -1537,6 +1780,71 @@ mod tests {
         names.push(PASSED[PREFIX.len()..].to_owned());
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         lines(&refs)
+    }
+
+    /// The layer service must say its write guard is on, after it began to build and before the
+    /// probe speaks, and no refusal of GUARD may be on the console. (The planted fault: a run with
+    /// no guard line passes.)
+    #[test]
+    fn the_write_guard_line_is_required_in_its_place() {
+        let without = |drop: &str| -> Vec<String> {
+            all_ok().into_iter().filter(|l| !l.contains(drop)).collect()
+        };
+        assert!(read_lines(&without("write guard")).is_err());
+        let mut late = without("write guard");
+        late.push("layerd: write guard of the root on".to_owned());
+        assert!(
+            read_lines(&late).is_err(),
+            "the guard after the probe's lines"
+        );
+        let mut early = all_ok();
+        let guard = early.remove(2);
+        early.insert(0, guard);
+        assert!(
+            read_lines(&early).is_err(),
+            "the guard before the build began"
+        );
+        let mut refused = all_ok();
+        refused.insert(3, "layerd: GUARD refused: Unknown(501)".to_owned());
+        assert!(read_lines(&refused).is_err());
+    }
+
+    fn bare(names: &[&str]) -> Vec<String> {
+        let mut v = vec![
+            "datafs: no disk: no data volume on this machine".to_owned(),
+            "layerd: root registered with the process service".to_owned(),
+            "layerd: not serving: NoStore".to_owned(),
+        ];
+        v.extend(names.iter().map(|n| format!("{PREFIX}{n}")));
+        v
+    }
+
+    fn bare_ok() -> Vec<String> {
+        let mut names: Vec<String> = BARE_CHECKS.iter().map(|c| format!("{c} ok")).collect();
+        names.push(PASSED_BARE[PREFIX.len()..].to_owned());
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        bare(&refs)
+    }
+
+    /// A machine with no volume says the data service has no disk and the layer service does not
+    /// serve, asks no guard, and its probe passes with every check once.
+    #[test]
+    fn a_machine_with_no_volume_has_no_guard_and_passes_its_checks() {
+        assert_eq!(read_bare(&bare_ok()), Ok(()));
+        let mut guarded = bare_ok();
+        guarded.push("layerd: write guard of the root on".to_owned());
+        assert!(read_bare(&guarded).is_err());
+        let no_disk: Vec<String> = bare_ok().into_iter().skip(1).collect();
+        assert!(read_bare(&no_disk).is_err());
+        let mut failed = bare_ok();
+        failed.insert(
+            3,
+            format!("{PREFIX}a write to the root goes to memory FAILED"),
+        );
+        assert!(read_bare(&failed).is_err());
+        let mut short = bare_ok();
+        short.remove(3);
+        assert!(read_bare(&short).is_err());
     }
 
     #[test]
@@ -1673,6 +1981,8 @@ mod tests {
             .chain(&FULL_CHECKS)
             .chain(&FULL_REREAD_CHECKS)
             .chain(&CUT_CHECKS)
+            .chain(&SCRIPT_CHECKS)
+            .chain(&BARE_CHECKS)
         {
             let quoted = format!("run_check(\"{check}\"");
             assert_eq!(source.matches(&quoted).count(), 1, "{check}");
@@ -1688,7 +1998,13 @@ mod tests {
                 + FULL_CHECKS.len()
                 + FULL_REREAD_CHECKS.len()
                 + CUT_CHECKS.len()
+                + SCRIPT_CHECKS.len()
+                + BARE_CHECKS.len()
         );
+        for (feature, check) in SCRIPT_BREAKS {
+            assert!(SCRIPT_CHECKS.contains(&check), "{feature}");
+        }
+        assert!(BARE_CHECKS.contains(&BOOT_BREAK.1));
         // The breaks of the copy probe name checks of its phase.
         for (feature, checks) in COPY_BREAKS {
             assert!(

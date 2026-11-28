@@ -92,6 +92,7 @@ mod input_probe;
 mod jobs;
 mod kernel_size;
 mod keys;
+mod layer_client;
 mod layer_names;
 mod layer_posix;
 mod layer_probe;
@@ -1153,12 +1154,12 @@ pub(crate) fn aws_qemu_programs() -> &'static [ImageProgram] {
 }
 
 /// Whether the shell images are built with the layer service: `STAFETO_LAYERED_ROOT=1` gives init
-/// its feature `layered-root` (the tables with `layerd` and the launcher that waits for it), adds the
-/// program `layerd` and builds `libc.so` with the feature `layer` (`tools/build-libc-so.py`). Off
-/// until the layered root is complete (step C4 of the layered file system): the packaged static
-/// programs (BusyBox, Dropbear, nginx and the rest) take the feature `layer` of `posix-crt` the same
-/// way, and none of them has it yet, so a layered image of today serves their paths from the file
-/// service alone.
+/// its feature `layered-root` (the tables with `layerd` and the launcher that waits for it) and adds
+/// the program `layerd`. Off by default until the index of a large layer builds fast (issue 657).
+/// `libc.so` and the packaged programs are built with the feature `layer` of `posix-crt` whatever the
+/// image (`tools/layer-features.txt`): in an image with no layer service their first path learns it
+/// at once (ABSENT of the process service). An image that has the layer service checks that every
+/// POSIX program has the mark of the layer client (`layer_client::check`).
 pub(crate) fn layered_root() -> bool {
     std::env::var("STAFETO_LAYERED_ROOT").as_deref() == Ok("1")
 }
@@ -2641,12 +2642,12 @@ commands:
   posix-random-net-two the same with two stack instances of the network service on two CPUs: a socket homed on the second instance survives
   posix-random-net-two-steps the same under -icount, the steps of both instances
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
-  layer-posix run the C probe of the POSIX layer on the layered root (open, read, stat, readdir, chdir, openat, fork, spawn and exec of the descriptions of the layer service, the rights of another user, EROFS for writes to the lower set, the session in the slot of a set-ID program) over the layer service on a volume made offline, in QEMU; with the argument breaks: the probe built with each deliberate break of the layer (no path routed to the service, no session for a child, no session check in the loader), which it must catch; with the argument ash: BusyBox's ash on the layered root (`ls -la /etc` and reads of names of the layers); with the argument write: the changes of names on the layer (create, write, mkdir, unlink and rmdir of lower names as marks of deletion, an opaque directory, rename, symbolic links, the rights of another user, a sticky directory) and a second boot on the same disk that must see the same names; with write breaks: the same with each deliberate break of the layer service (no mark of deletion on the volume, no sticky check), which it must catch; with the argument copy: the copy up of a lower file on its first write (the number, owner, mode and times kept, an empty copy for `O_TRUNC`, a lower directory and a lower link, a program that is never copied, two writers and one copy, a signal during the wait of a copy of 16 MiB: EINTR without SA_RESTART, success with it) and a second boot on the same disk that sees the copies and finds `work/` empty; with copy breaks: the same with each deliberate break of the copy (numbers of the counter, no attributes, a program copied, a rename that leaves the old name unmarked), which it must catch; with copy race: names deleted and made during the copy of a rename, two renames of one file, fourteen files for the twelve places of the table of copies; with copy full: a copy of a file of 20 MiB on a volume of 16 MiB (ENOSPC for every waiter, the lower file whole, work/ empty on the next boot)
+  layer-posix run the C probe of the POSIX layer on the layered root (open, read, stat, readdir, chdir, openat, fork, spawn and exec of the descriptions of the layer service, the rights of another user, EROFS for writes to the lower set, the session in the slot of a set-ID program) over the layer service on a volume made offline, in QEMU; with the argument breaks: the probe built with each deliberate break of the layer (no path routed to the service, no session for a child, no session check in the loader), which it must catch; with the argument ash: BusyBox's ash on the layered root (`ls -la /etc` and reads of names of the layers); with the argument script: a script that starts with `#!` in a layer of the user runs through its interpreter (exec and spawn, the interpreter checked as every program is; with script breaks: an interpreter not checked, which the probe must catch); with the argument boot: the write guard of the RAM file service is on after READY of the layer service, and a machine with no data volume has the root in memory with no guard (with boot breaks: the guard on from the start, which must fail the write); with the argument write: the changes of names on the layer (create, write, mkdir, unlink and rmdir of lower names as marks of deletion, an opaque directory, rename, symbolic links, the rights of another user, a sticky directory) and a second boot on the same disk that must see the same names; with write breaks: the same with each deliberate break of the layer service (no mark of deletion on the volume, no sticky check), which it must catch; with the argument copy: the copy up of a lower file on its first write (the number, owner, mode and times kept, an empty copy for `O_TRUNC`, a lower directory and a lower link, a program that is never copied, two writers and one copy, a signal during the wait of a copy of 16 MiB: EINTR without SA_RESTART, success with it) and a second boot on the same disk that sees the copies and finds `work/` empty; with copy breaks: the same with each deliberate break of the copy (numbers of the counter, no attributes, a program copied, a rename that leaves the old name unmarked), which it must catch; with copy race: names deleted and made during the copy of a rename, two renames of one file, fourteen files for the twelve places of the table of copies; with copy full: a copy of a file of 20 MiB on a volume of 16 MiB (ENOSPC for every waiter, the lower file whole, work/ empty on the next boot)
   layer-steps run the steps of the layer service at the scale of its limits under -icount on one CPU (a volume of 8,192 names in the live layer: a chain of 246 directories with a file at its end, a path of 253 components, a merged listing of 1,024 names): the probe passes and no step of the service is over 0.9 B, while a lower file of 64 MiB is copied up meanwhile (the reads of the copy in the RAM file service are under the gate too); with the argument breaks: the service that walks the whole layer in one step, and the one that copies in its own step, which the gate must fail
   layer-cut copy [N] the power cut during a copy up and between the steps of the rename of a lower file: the layer service built with the feature probe-cut stops at each of six points (the file in work/ made, its first cell written, the file whole and closed, the copy renamed into the layer, the old name of the rename marked, the volume with the new name) and the machine is killed on the line; the same disk is started again and a probe must find the copied file whole with the lower attributes, the renamed file under the old name or the new and never both and never torn, the cut rename done again, and work/ cleared at the start (held where the cut left a file in it); with the argument breaks: the layer service that makes the copy at its final name, which the probe after a cut in the middle of the copy must catch
   layer-restart run the probe of the restarts of the layer service and the data file service (the layer service ends on an OPEN of /.die and after the data file service ended, both come back: the old session is dead, a description of the old instance answers STALE, a file the data file service holds is read on, a new session lists and reads as before); with the argument breaks: the layer service whose instances all carry one epoch, which the probe must fail
   layer-names-probe run the probe of the names of the layered root (a POSIX program of the root that speaks to the layer service directly: TakeRoot, SESSION, redirects of lower names, the pass of a file of the layer and its bytes, merged listings, marks of deletion, an opaque directory, the numbers of stat, EACCES for another user and EROFS) over a volume made offline, in QEMU; with the argument breaks: the same against the layer service built with each deliberate break, which it must catch; with the argument steps: under -icount on one CPU with the steps of the service told
-  data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU; with an argument: write, cap, full, restart, throughput, fast (64 MiB through the window against the bounds of the plan), atomic (atomicity, lease, signals, fork, restart of the large calls), steps (the service's steps and the CPU time of its parts under -icount, on one CPU and on two), atomic-break FEATURE (the atomic probe on a service with a deliberate break, which it must catch)
+  data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU; with an argument: write, cap, full, restart, throughput, fast (64 MiB through the window against the bounds of the plan), atomic (atomicity, lease, signals, fork, restart of the large calls), steps (the service's steps and the CPU time of its parts under -icount, on one CPU and on two), atomic-break FEATURE (the atomic probe on a service with a deliberate break, which it must catch), absent-break (the read probe on a process service that answers UNREGISTERED where it should say ABSENT: the first path of the root waits for a layer service the image does not have, which the probe must catch)
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
   wfc-probe run the scene demo on OpenWF Composition (<WF/wfc.h>) in QEMU with the compositor: two scenes of three elements (a stretch, quarter turns, a flip, the filters none and faster, a global alpha and a mask) over the windows of two producers, and a third scene of the window of the first revision shown straight, committed in turn 100 times and each composed on request, QEMU's screenshot compared with the CRC of the host's reference (tools/wfc-ref), then the scene changed 100 times on an active context with every screenshot one of the two and both of them among the shots; then scene D (the bilinear filter: two stretches, a flip, a quarter turn) committed once, its screenshot compared and its frame time printed; the counters of the service (no frame failed, bands grow, scene C a frame shown straight) and the device's trace; then the steps of the compositor and the driver under -icount
   wfd-probe run the display demo on OpenWF Display (<WF/wfd.h>) in QEMU with the display driver alone: 100 frames bound to the primary pipeline in turn, each compared with the guest's CRC, the host's own and QEMU's screenshot, and the cursor moved 100 times (the device's trace); then the driver's steps under -icount
@@ -4031,6 +4032,14 @@ fn write_boot_image_files(
     }
     let target = target_dir();
     let mut sources = Vec::new();
+    // An image with the layer service sends the paths of every POSIX program of it through that
+    // service: each such program has the layer client (`layer_client`), and so has `libc.so`.
+    let layered = programs.iter().any(|p| p.1 == "layerd");
+    let relibc = if layered {
+        relibc_packages(&root())?
+    } else {
+        Vec::new()
+    };
     {
         let _building = BUILD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         run_cmd(&mut cmd)?;
@@ -4051,6 +4060,13 @@ fn write_boot_image_files(
             } else {
                 cargo_output(&target, PROGRAM_TARGET, profile, package)
             };
+            if layered && relibc.iter().any(|r| r == package) {
+                if is_dynamic(features) {
+                    layer_client::check(&target.join("libc-so").join("libc.so"), true)?;
+                } else {
+                    layer_client::check(&built, false)?;
+                }
+            }
             let elf = image_elf(&target, name, package);
             let why = |e: String| format!("{}: {e}", elf.display());
             if let Some(dir) = elf.parent() {
@@ -11511,6 +11527,22 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             layer_posix::cut(&["breaks".to_owned()], &qemu::VIRT)
         }),
         job("layer-posix ash", || layer_posix::ash(&qemu::VIRT)),
+        // A script of a layer of the user runs through its interpreter (the interpreter checked as
+        // every program is), and the machine with no data volume has the root in memory and the
+        // write guard of the RAM file service is on only once the layer service is ready.
+        job("layer-posix script", || layer_posix::script(&qemu::VIRT)),
+        job("layer-posix script breaks", || {
+            layer_posix::script_breaks(&qemu::VIRT)
+        }),
+        job("layer-posix boot", || layer_posix::boot_check(&qemu::VIRT)),
+        job("layer-posix boot breaks", || {
+            layer_posix::boot_breaks(&qemu::VIRT)
+        }),
+        // No layer service in the image: the process service says ABSENT, and the program does not
+        // wait for a root that never comes.
+        job("data-posix absent-break", || {
+            data_posix::absent_break(&qemu::VIRT)
+        }),
         job("vi-dialog", vi_dialog::vi_dialog),
         // The window library of C programs against QEMU's screenshots.
         job("posix-window", || posix_window::probe(&qemu::VIRT)),

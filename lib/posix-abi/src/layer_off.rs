@@ -88,6 +88,19 @@ pub fn check_exec(_abs: &Abs) -> Result<Abs, i32> {
     Err(EIO)
 }
 
+pub enum Runnable {
+    Lower(Abs),
+    Layer,
+}
+
+pub fn runnable(_abs: &Abs) -> Result<Runnable, i32> {
+    Err(EIO)
+}
+
+pub fn may_run_script(_abs: &Abs) -> Result<(), i32> {
+    Err(EIO)
+}
+
 pub fn described(_dirfd: c_int) -> Result<Option<Abs>, i32> {
     Ok(None)
 }
