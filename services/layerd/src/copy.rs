@@ -3,8 +3,11 @@
 
 //! The copy up of lower files (the layered file system, step C4 part A): the table of the copies
 //! the loop keeps, and the copier the worker thread runs. A change that has to write a file of the
-//! lower set copies it into the layer first. The bytes move outside the loop, so the loop never
-//! waits for a disk (the bound of its step is 0.9 B):
+//! lower set copies it into the layer first. The bytes move outside the loop, so no step of the loop
+//! holds a copy (the bound of its step is 0.9 B). The loop does wait for the data file service, as
+//! it always did: that service has one worker thread of synchronous calls, so a call of the loop
+//! waits for at most one job of the copy that is ahead of it (a part of 64 KiB, an FSYNC or one
+//! attribute call), and the wait is no work of the step:
 //!
 //! - `Table` (the loop): the places of the copies with their tickets (the place and the
 //!   generation), the queue of the files that wait for one of the `ACTIVE` copies in work, and the
@@ -170,6 +173,14 @@ pub const fn ticket_of(place: u8, generation: u32) -> u64 {
 /// The place and the generation a ticket names.
 pub const fn ticket_parts(ticket: u64) -> (u8, u32) {
     (ticket as u8, (ticket >> 8) as u32)
+}
+
+/// Whether `ticket` is one the table gave: a place and a generation of at most 32 bits, and nothing
+/// above them. A WAIT with another value is INVALID_ARGUMENT (the bits above would be dropped by
+/// `ticket_parts`, and the notification kept under a value no copy ever ends).
+pub const fn ticket_valid(ticket: u64) -> bool {
+    let (place, generation) = ticket_parts(ticket);
+    generation != 0 && ticket_of(place, generation) == ticket
 }
 
 /// What a worker says of a copy that ended.
@@ -370,10 +381,26 @@ impl Table {
     }
 }
 
-/// The waiters of a ticket: `N` places for what the service gives each when its copy ends (the
-/// notification a program's WAIT brought).
+/// The waiters of the copies: `N` places for what the service gives each when its copy ends (the
+/// notification a program's WAIT brought), each kept under the session that asked (`owner`) and the
+/// ticket. A session has at most `PER_OWNER` places; a new WAIT of a session for a ticket it waits
+/// for replaces the old one, which is given back so the service can tell it to look again.
 pub struct Waiters<P, const N: usize> {
-    held: [Option<(u64, P)>; N],
+    held: [Option<(u64, u64, P)>; N],
+}
+
+/// The places of one session.
+pub const PER_OWNER: usize = 4;
+
+/// What `Waiters::add` did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Added<P> {
+    /// A place was taken.
+    New,
+    /// The session's earlier waiter for the ticket was replaced; here it is.
+    Replaced(P),
+    /// No place: the table is full or the session holds `PER_OWNER`; the waiter comes back.
+    Full(P),
 }
 
 impl<P, const N: usize> Default for Waiters<P, N> {
@@ -389,32 +416,52 @@ impl<P, const N: usize> Waiters<P, N> {
         }
     }
 
-    /// Holds `reply` for `ticket`; it comes back when there is no place.
-    pub fn add(&mut self, ticket: u64, reply: P) -> Result<(), P> {
+    /// Holds `waiter` of the session `owner` for `ticket`.
+    pub fn add(&mut self, owner: u64, ticket: u64, waiter: P) -> Added<P> {
+        if let Some(place) = self.held.iter_mut().find(|h| {
+            h.as_ref()
+                .is_some_and(|(o, t, _)| *o == owner && *t == ticket)
+        }) {
+            let old = place.replace((owner, ticket, waiter));
+            return match old {
+                Some((_, _, old)) => Added::Replaced(old),
+                None => Added::New,
+            };
+        }
+        let mine = self
+            .held
+            .iter()
+            .flatten()
+            .filter(|(o, _, _)| *o == owner)
+            .count();
+        if mine >= PER_OWNER {
+            return Added::Full(waiter);
+        }
         match self.held.iter_mut().find(|h| h.is_none()) {
             Some(place) => {
-                *place = Some((ticket, reply));
-                Ok(())
+                *place = Some((owner, ticket, waiter));
+                Added::New
             }
-            None => Err(reply),
+            None => Added::Full(waiter),
         }
     }
 
-    /// One reply held for `ticket`.
+    /// One waiter held for `ticket`.
     pub fn take(&mut self, ticket: u64) -> Option<P> {
         let place = self
             .held
             .iter_mut()
-            .find(|h| h.as_ref().is_some_and(|(t, _)| *t == ticket))?;
-        place.take().map(|(_, p)| p)
+            .find(|h| h.as_ref().is_some_and(|(_, t, _)| *t == ticket))?;
+        place.take().map(|(_, _, p)| p)
     }
 
-    /// One reply, whatever its ticket (the service ends).
-    pub fn take_any(&mut self) -> Option<P> {
-        self.held
-            .iter_mut()
-            .find_map(|h| h.take())
-            .map(|(_, reply)| reply)
+    /// The waiters of the session `owner` go (it ended): they are of no use.
+    pub fn drop_owner(&mut self, owner: u64) {
+        for place in &mut self.held {
+            if place.as_ref().is_some_and(|(o, _, _)| *o == owner) {
+                *place = None;
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -545,6 +592,37 @@ impl Copier {
         }
     }
 
+    /// One cell: the reads of the lower file into it (the first `have` bytes are there already, and
+    /// `eof` says the file ended inside them) and one write of it.
+    fn cells<B: Bulk>(run: &mut Run, bulk: &mut B, have: usize, eof: bool) -> Result<(), u32> {
+        let (Some(fd), Some(h)) = (run.lower, run.work) else {
+            return Err(proto_layer::IO);
+        };
+        let mut filled = have;
+        let mut ended = eof;
+        while filled < CELL && !ended {
+            let want = PIECE.min(CELL - filled);
+            let got = bulk
+                .read_lower(fd, run.offset + filled as u64, filled, want)
+                .map_err(code_of)?;
+            filled += got;
+            // A read that is short is the end of the file (the service reads what one state of the
+            // file holds), and the next place would be no whole page.
+            ended = got < want;
+        }
+        if filled > 0 {
+            let wrote = bulk.write_cell(h, run.offset, filled).map_err(code_of)?;
+            if wrote != filled {
+                return Err(proto_fs::NO_SPACE);
+            }
+            run.offset += filled as u64;
+        }
+        if filled < CELL {
+            run.phase = Phase::Finish;
+        }
+        Ok(())
+    }
+
     /// One unit; true when the copy is done.
     fn unit<B: Bulk>(run: &mut Run, bulk: &mut B) -> Result<bool, u32> {
         let fail = |s: Status| code_of(s);
@@ -576,42 +654,16 @@ impl Copier {
                 let h = bulk.open_work(&work[..wl], 0o600, ino).map_err(fail)?;
                 run.work = Some(h);
                 run.made = true;
-                run.phase = if run.order.kind == Kind::Empty {
-                    Phase::Finish
-                } else {
-                    Phase::Cells
-                };
-                Ok(false)
-            }
-            Phase::Cells => {
-                let (Some(fd), Some(h)) = (run.lower, run.work) else {
-                    return Err(proto_layer::IO);
-                };
-                let mut filled = 0;
-                while filled < CELL {
-                    let want = PIECE.min(CELL - filled);
-                    let got = bulk
-                        .read_lower(fd, run.offset + filled as u64, filled, want)
-                        .map_err(fail)?;
-                    filled += got;
-                    // A read that is short is the end of the file (the service reads what one
-                    // state of the file holds), and the next place would not be a whole page.
-                    if got < want {
-                        break;
-                    }
-                }
-                if filled > 0 {
-                    let wrote = bulk.write_cell(h, run.offset, filled).map_err(fail)?;
-                    if wrote != filled {
-                        return Err(proto_fs::NO_SPACE);
-                    }
-                    run.offset += filled as u64;
-                }
-                if filled < CELL {
+                if run.order.kind == Kind::Empty {
                     run.phase = Phase::Finish;
+                    return Ok(false);
                 }
-                Ok(false)
+                // The first cell goes on from the piece the check read, which is in the cell
+                // still: no second read of it.
+                run.phase = Phase::Cells;
+                Self::cells(run, bulk, got, got < PIECE).map(|()| false)
             }
+            Phase::Cells => Self::cells(run, bulk, 0, false).map(|()| false),
             Phase::Finish => {
                 let (Some(fd), Some(h)) = (run.lower, run.work) else {
                     return Err(proto_layer::IO);
@@ -796,25 +848,49 @@ mod tests {
     }
 
     #[test]
-    fn sixteen_waiters_are_held_and_the_seventeenth_is_given_back() {
+    fn waiters_are_kept_by_session_and_ticket_and_a_new_one_replaces_the_old() {
         let mut w: Waiters<u32, WAITERS> = Waiters::new();
+        // Four sessions take four places each: the table is full for the fifth.
         for k in 0..WAITERS as u32 {
-            w.add(u64::from(k % 3), k).unwrap();
+            assert_eq!(
+                w.add(u64::from(k / PER_OWNER as u32), u64::from(k), k),
+                Added::New
+            );
         }
-        assert_eq!(w.add(1, 99), Err(99));
+        assert_eq!(w.add(9, 1, 99), Added::Full(99));
         assert_eq!(w.len(), WAITERS);
-        let mut of_zero = std::vec::Vec::new();
-        while let Some(k) = w.take(0) {
-            of_zero.push(k);
+        // The same session for the same ticket replaces its waiter, and the table stays as full.
+        assert_eq!(w.add(0, 2, 77), Added::Replaced(2));
+        assert_eq!(w.len(), WAITERS);
+        assert_eq!(w.take(2), Some(77));
+        // A session that holds its share is refused before the table is full.
+        let mut w: Waiters<u32, WAITERS> = Waiters::new();
+        for k in 0..PER_OWNER as u32 {
+            assert_eq!(w.add(1, u64::from(k), k), Added::New);
         }
-        of_zero.sort_unstable();
-        assert_eq!(of_zero, [0, 3, 6, 9, 12, 15]);
-        assert!(w.add(1, 99).is_ok());
-        let mut rest = 0;
-        while w.take_any().is_some() {
-            rest += 1;
-        }
-        assert_eq!((rest, w.is_empty()), (11, true));
+        assert_eq!(w.add(1, 50, 5), Added::Full(5));
+        assert_eq!(w.add(2, 50, 5), Added::New);
+        // Waiters of a ticket come out one at a time, and a session that ended takes its own away.
+        assert_eq!(w.take(50), Some(5));
+        assert_eq!(w.take(50), None);
+        w.drop_owner(1);
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn a_ticket_with_a_bit_above_its_place_and_generation_is_no_ticket() {
+        let t = ticket_of(3, 12);
+        assert!(ticket_valid(t));
+        assert!(!ticket_valid(t | 1 << 40));
+        assert!(!ticket_valid(t | 1 << 63));
+        assert!(!ticket_valid(0));
+        assert!(!ticket_valid(3));
+        assert!(ticket_valid(ticket_of(255, u32::MAX)));
+        // The table would find the forged value Pending, the reason the service refuses it first.
+        let mut table = Table::new();
+        let real = table.reserve(b"/a", Kind::Whole, stat(1)).unwrap();
+        assert_eq!(table.wait(real | 1 << 40), Wait::Pending);
+        assert!(!ticket_valid(real | 1 << 40) && ticket_valid(real));
     }
 
     #[test]
@@ -900,8 +976,9 @@ mod tests {
                 made: true
             }
         );
-        // The head, three cells (the third is the short one: the end), the finish.
-        assert_eq!(turns, 1 + 3 + 1);
+        // The head with the first cell (the check read its first piece, which stays), two more cells
+        // (the last is the short one: the end), the finish.
+        assert_eq!(turns, 1 + 2 + 1);
         assert_eq!(
             b.writes,
             [(0, 65_536), (65_536, 65_536), (131_072, 150_000 - 131_072)]
@@ -910,7 +987,9 @@ mod tests {
         // KiB and one of 4 KiB); the head read the first piece once more.
         assert!(b.reads.iter().all(|&(_, n)| n <= PIECE));
         assert_eq!(b.reads[0], (0, PIECE));
-        assert_eq!(b.reads[1..7].iter().map(|r| r.1).sum::<usize>(), CELL);
+        // The first cell is that piece and five reads more (no second read of the piece).
+        assert_eq!(b.reads[..6].iter().map(|r| r.1).sum::<usize>(), CELL);
+        assert_eq!(b.reads[1].0, PIECE as u64);
         let (work, wl) = o.work();
         let node = &b.volume.nodes[&work[..wl]];
         assert_eq!(node.data, data);

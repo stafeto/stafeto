@@ -50,6 +50,16 @@ use proto_fs::names::{self as n, Change, ChangeOp, OpenAnswer, UPPER_INO_TAG};
 use proto_fs::{MAX_PATH, Redirect};
 use proto_wire::{Reader, Status, Writer};
 
+/// What `Core::commit_start` did.
+pub enum CommitStart {
+    /// No copy waits for a commit.
+    None,
+    /// The commit job has a copy.
+    Job,
+    /// The copy of this ticket is over at once, failed.
+    Failed(u64),
+}
+
 /// What a step of a change job came to.
 #[allow(clippy::large_enum_variant)]
 pub enum ChangeStep<P> {
@@ -388,6 +398,12 @@ pub struct ChangeJob<V: Volume, L: Lower> {
     /// set a copy of one keeps, and the read of the text of a link of the lower set.
     csub: u8,
     ens_ino: u64,
+    /// The times (access, modification) of the lower directory a copy of one keeps: of the
+    /// directory `stage_ensure` is making, of the leaf of an attribute operation, and the ones
+    /// `dir_step` gives the directory it makes (None for a new directory).
+    ens_times: (i64, i64),
+    leaf_times: (i64, i64),
+    dir_times: Option<(i64, i64)>,
     lprobe: Option<L::Link>,
     /// What a commit job did with its copy: made it visible, or dropped it (the file in `work/`
     /// is the reaper's); and the code the waiters get when the copy could not be made visible.
@@ -486,6 +502,9 @@ impl<V: Volume, L: Lower> ChangeJob<V, L> {
             commit_of: None,
             csub: 0,
             ens_ino: 0,
+            ens_times: (0, 0),
+            leaf_times: (0, 0),
+            dir_times: None,
             lprobe: None,
             copy_visible: false,
             dropped: false,
@@ -1373,7 +1392,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 Ok(None)
             }
             Phase::LeafA => {
-                let (up, leaf) = (job.a.parent.as_ref().and_then(|p| p.up), job.a.leaf);
+                let leaf = job.a.leaf;
                 let ino = self
                     .copies
                     .facts(place, generation)
@@ -1381,12 +1400,9 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 let same = matches!(leaf, Some(Leaf::Lower(ls)) if ls.ino == ino && ls.kind == 2);
                 // The deliberate break `break-layerd-copy-recheck`: the copy is made visible whatever
                 // the walk found at the name.
-                let (up, same) = if cfg!(feature = "break-layerd-copy-recheck") {
-                    (up.or(Some(0)), true)
-                } else {
-                    (up, same)
-                };
-                if up.is_some() && same {
+                let same = same || cfg!(feature = "break-layerd-copy-recheck");
+                // The directories of the path the layer does not hold are made with the copy.
+                if same {
                     job.push(Stage::Ensure { b: false });
                     job.push(Stage::CopyIn);
                 } else {
@@ -2296,11 +2312,13 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     ) -> F<Option<Done<V::Pass>>> {
         let attr = lower_attr(&ls);
         let trailing = job.a.parts.trailing;
+        self.number_kept(&ls)?;
         match ls.kind {
             1 => {
                 let mut plan = Self::attr_plan(c, job, 0, Kind::Dir, &attr, ls.ino)?;
                 plan.fresh = true;
                 job.attr = plan;
+                job.leaf_times = (ls.atime, ls.mtime);
                 job.committed = true;
                 job.push(Stage::Ensure { b: false });
                 job.push(Stage::Dir {
@@ -2411,6 +2429,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         // The names the layer would make must fit the volume.
         let mut vp = [0u8; 512];
         self.leg_vpath(&job.a, job.a.parts.len, false, &mut vp)?;
+        self.number_kept(&ls)?;
         let found = self.copies.find(&job.a.plain[..job.a.parts.len]);
         if let Some(ticket) = found {
             job.ticket = ticket;
@@ -2421,11 +2440,23 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             }
             job.copy_kind = kind;
             job.copy_stat = ls;
-            job.push(Stage::Ensure { b: false });
+            // The directories of the path are not made here: the commit makes them with the copy,
+            // so a copy that is refused (a program) leaves no directory in the layer.
             job.push(Stage::CopyReserve);
         }
         Self::begin_commit(job);
         Ok(None)
+    }
+
+    /// The number of a lower name is kept by its copy, so it must be one the layer's own numbers
+    /// (bit 62) and the numbers of the volume's paths (bit 63) cannot be: a lower number with either
+    /// bit set is INVALID_ARGUMENT, before anything is made. (A number kept can still equal that of
+    /// another lower file after an image or package change: a matter for a later part.)
+    fn number_kept(&self, ls: &LowerStat) -> F<()> {
+        if ls.ino & (proto_data::INO_NUMBERED | proto_data::INO_PATH) != 0 {
+            return fail(proto_fs::INVALID_ARGUMENT);
+        }
+        Ok(())
     }
 }
 
@@ -2433,32 +2464,39 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
     // ------------------------------------------------------------------ the copies the worker ended
 
     /// The next copy the worker ended becomes the work of the commit job `job` (with the place
-    /// `id` of the lock): false when none waits.
-    pub fn commit_start(&mut self, job: &mut ChangeJob<V, L>, id: u8) -> bool {
+    /// `id` of the lock). A copy whose job cannot start is over at once with an I/O error and its
+    /// file goes to the reaper: its ticket is given back, for the waiters to be told.
+    pub fn commit_start(&mut self, job: &mut ChangeJob<V, L>, id: u8) -> CommitStart {
         let Some((place, generation)) = self.copies.finished() else {
-            return false;
+            return CommitStart::None;
         };
         let mut path = [0u8; crate::copy::PATH];
-        let len = match self.copies.facts(place, generation) {
-            Some((p, _, _, _)) => {
+        let (len, made) = match self.copies.facts(place, generation) {
+            Some((p, _, _, made)) => {
                 path[..p.len()].copy_from_slice(p);
-                p.len()
+                (p.len(), made)
             }
-            None => return false,
+            None => return CommitStart::None,
         };
         if job
             .start_commit(id, place, generation, &path[..len])
             .is_err()
         {
+            if made {
+                let (work, wl) = crate::copy::work_path(place, generation);
+                let _ = self.work.push(&work[..wl], false, 0);
+            }
             self.copies.over(place, generation, proto_layer::IO, true);
-            return false;
+            return CommitStart::Failed(crate::copy::ticket_of(place, generation));
         }
-        true
+        CommitStart::Job
     }
 
     /// The commit job is over, whatever it came to: the copy is made visible or it is not, and a
-    /// file in `work/` that nobody took is the reaper's. The waiters are answered from the table.
-    pub fn commit_done(&mut self, job: &mut ChangeJob<V, L>) {
+    /// file in `work/` that nobody took is the reaper's. `failed` is the code of the job's own
+    /// failure, which the waiters get when the worker had none. The waiters are answered from the
+    /// table.
+    pub fn commit_done(&mut self, job: &mut ChangeJob<V, L>, failed: Option<u32>) {
         let Some((place, generation)) = job.commit_of.take() else {
             return;
         };
@@ -2469,7 +2507,10 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             let (work, wl) = crate::copy::work_path(place, generation);
             let _ = self.work.push(&work[..wl], false, 0);
         }
-        let code = if worker != 0 { worker } else { job.copy_code };
+        let code = [worker, job.copy_code, failed.unwrap_or(0)]
+            .into_iter()
+            .find(|&c| c != 0)
+            .unwrap_or(0);
         self.copies.over(place, generation, code, !job.copy_visible);
     }
 
@@ -2567,6 +2608,7 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                     let leg = job.leg(b);
                     (leg.parts.leaf_at, leg.parts.len)
                 };
+                job.dir_times = lower.map(|_| job.leaf_times);
                 match self.dir_step(job, b, parent, (at, len), len, (created, lower), opaque)? {
                     Some(_) => Ok(Flow::CallDone),
                     None => Ok(Flow::Call),
@@ -2698,11 +2740,14 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
                 mode: ls.mode & 0o7777,
             };
             // The directory of the layer keeps the number of the lower one.
+            self.number_kept(&ls)?;
             job.ens_ino = ls.ino;
+            job.ens_times = (ls.atime, ls.mtime);
             job.sub = 2;
             return Ok(Flow::Call);
         }
         let (cur, created, lower) = (job.ens_cur, job.ens_created, job.ens_ino);
+        job.dir_times = Some(job.ens_times);
         match self.dir_step(job, b, cur, (pos, end), end, (created, Some(lower)), false)? {
             Some(id) => {
                 job.ens_cur = id;
@@ -2805,6 +2850,16 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
             5 => {
                 let (work, wl) = Self::work_path_of(job.work);
                 if let Err(e) = self.volume.chmod(&work[..wl], mode) {
+                    return Err(self.scrub_fail(job, true, e));
+                }
+                job.dsub = if job.dir_times.is_some() { 9 } else { 6 };
+                Ok(None)
+            }
+            // The times of the lower directory a copy of one keeps.
+            9 => {
+                let (work, wl) = Self::work_path_of(job.work);
+                let (atime, mtime) = job.dir_times.unwrap_or((d::UTIME_OMIT, d::UTIME_OMIT));
+                if let Err(e) = self.volume.utimens(&work[..wl], atime, mtime) {
                     return Err(self.scrub_fail(job, true, e));
                 }
                 job.dsub = 6;

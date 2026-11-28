@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The worker thread of the layer service (the layered file system, step C4 part A): the bytes of
-//! the copies up. The loop never waits for a disk, so a lower file is copied here, at the level 30
+//! the copies up. No step of the loop may hold a copy, so a lower file is copied here, at the level 30
 //! with no budget, on the CPUs of the service (`GENERAL_CPUS`), as the worker thread of the data file
 //! service is. The thread has sessions of its own: with the data file service (the label `SERVICE`)
 //! and with the RAM file service (the boot profile), and one window of `WINDOW_BYTES`, given to the

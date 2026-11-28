@@ -487,9 +487,11 @@ fn wait_copy(ticket: u64) -> Result<(), i32> {
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
     let level = block.base_level.load(Ordering::Relaxed) as u8;
+    let wait = pure::wait_label(ticket);
     let mut bound = false;
-    let mut reborn = false;
-    let mut tries = 0;
+    // The pause before a WAIT is asked again of a service with no place, growing to 16 ms: the
+    // answer to WAIT is the service's own and has no end of its own, the copy being as long as it is.
+    let mut pause_ns = 1_000_000i64;
     // The service holds a notification of this thread for the ticket.
     let mut armed = false;
     let mut handled = block.handled.load(Ordering::SeqCst);
@@ -525,13 +527,9 @@ fn wait_copy(ticket: u64) -> Result<(), i32> {
             Err(Error::PeerClosed) => {
                 why!("the session closed during a WAIT: the service went");
                 forget(session);
-                // The new instance knows no ticket and answers 0: the request goes again.
-                if !reborn {
-                    reborn = true;
-                    armed = false;
-                    continue;
-                }
-                return Err(EIO);
+                // The tickets of the new instance start again and could match another copy, so the
+                // request that said COPYING goes again (the caller sends it) with no WAIT.
+                return Ok(());
             }
             Err(error) => {
                 why!("WAIT not sent to the session: {error:?}");
@@ -551,12 +549,11 @@ fn wait_copy(ticket: u64) -> Result<(), i32> {
                 continue;
             }
             pure::Waited::Bind => return Err(EIO),
-            pure::Waited::Pause if tries < BUSY_TRIES => {
-                tries += 1;
-                pause()?;
+            pure::Waited::Pause => {
+                crate::threads::sleep::pause(pause_ns)?;
+                pause_ns = (pause_ns * 2).min(16_000_000);
                 continue;
             }
-            pure::Waited::Pause => return Err(EIO),
             pure::Waited::Failed(errno) => return Err(errno),
         }
         // The copy goes on: wait for the service's notification. An entry that came before the
@@ -582,7 +579,7 @@ fn wait_copy(ticket: u64) -> Result<(), i32> {
                     label,
                     bits,
                     ..
-                }) if label == ticket && bits & 1 != 0 => {
+                }) if label == wait && bits & 1 != 0 => {
                     // The service told once and dropped its copy: the next WAIT brings a new one.
                     armed = false;
                     break 'notified;

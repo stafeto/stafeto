@@ -25,7 +25,9 @@
 //! The copy up (step C4 part A). A request that writes a file of the lower set is a change job that
 //! makes the directories of the path in the layer, takes a place in the table of copies
 //! (`layerd::copy`) and answers COPYING with the ticket; the bytes are copied by the worker thread
-//! (`worker`) with sessions of its own, so the loop never waits for a disk. WAIT is answered at once
+//! (`worker`) with sessions of its own, so no step of the loop holds a copy. The loop's calls to the data
+//! file service wait for at most one job of the copy ahead of them (that service has one worker thread of
+//! synchronous calls: a part of 64 KiB, an FSYNC or one attribute call). WAIT is answered at once
 //! (COPYING while the copy goes on) and keeps the notification the request brings; when the worker
 //! has ended a copy the loop walks the name again under the lock and either makes the copy visible
 //! (the rename into the layer and the index entry in one step) or hands it to the reaper, and
@@ -42,7 +44,7 @@ mod worker;
 use abi::Rights;
 use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Release};
-use layerd::changejob::{ChangeJob, ChangeStep};
+use layerd::changejob::{ChangeJob, ChangeStep, CommitStart};
 use layerd::copy::{self, Waiters};
 use layerd::identity::{Binding, Vouched, vouched_from};
 use layerd::index::Index;
@@ -895,6 +897,9 @@ impl Layerd {
     /// The counters of the copies, a line when one of them moved: the probes read it (a read open
     /// makes no copy, two writers of one file make one).
     fn note_copies(&mut self, what: &str) {
+        if !cfg!(feature = "probe-copies") {
+            return;
+        }
         let t = &self.core.copies;
         let seen = (t.reserved, t.committed, t.dropped, t.failed);
         if seen == self.copy_seen {
@@ -925,9 +930,25 @@ impl Layerd {
         if self.commit {
             return;
         }
-        if self.core.commit_start(&mut self.changes[JOBS], JOBS as u8) {
-            self.commit = true;
-            let _ = sys::notify(&self.walk_step, 1);
+        match self.core.commit_start(&mut self.changes[JOBS], JOBS as u8) {
+            CommitStart::None => {}
+            CommitStart::Job => {
+                self.commit = true;
+                let _ = sys::notify(&self.walk_step, 1);
+            }
+            // The copy is over at once, failed: its waiters are told as for any copy that ends.
+            CommitStart::Failed(ticket) => {
+                self.note_copies("over");
+                self.tell_waiters(ticket);
+                self.next_commit();
+            }
+        }
+    }
+
+    /// The programs that wait for the copy are told, and ask WAIT once more for how it ended.
+    fn tell_waiters(&mut self, ticket: u64) {
+        while let Some(notify) = self.waiters.take(ticket) {
+            let _ = sys::notify(&notify, 1);
         }
     }
 
@@ -943,19 +964,27 @@ impl Layerd {
         let mut w = proto_wire::Writer::new();
         match self.core.change_step(&c, &mut self.changes[JOBS], &mut w) {
             ChangeStep::Wait | ChangeStep::More => {}
-            ChangeStep::Done(_) => {
+            ChangeStep::Done(result) => {
                 let of = self.changes[JOBS].commit_of();
-                self.core.commit_done(&mut self.changes[JOBS]);
+                // A failure the waiters must hear (the volume is full, an I/O error); a name that
+                // changed meanwhile is no failure of the copy: the program asks again.
+                let failed = match result {
+                    Ok(_) => None,
+                    Err(Status::Unknown(
+                        proto_fs::NO_ENTRY
+                        | proto_fs::NOT_DIRECTORY
+                        | proto_fs::ALREADY_EXISTS
+                        | proto_fs::ACCESS_DENIED,
+                    )) => None,
+                    Err(Status::Unknown(code)) => Some(code),
+                    Err(_) => Some(proto_layer::IO),
+                };
+                self.core.commit_done(&mut self.changes[JOBS], failed);
                 self.commit = false;
                 // The line goes before the answers, so a program that has its answer has it too.
                 self.note_copies("over");
                 if let Some((place, generation)) = of {
-                    // The programs that wait for the copy are told, and ask WAIT once more for how
-                    // it ended.
-                    let ticket = copy::ticket_of(place, generation);
-                    while let Some(notify) = self.waiters.take(ticket) {
-                        let _ = sys::notify(&notify, 1);
-                    }
+                    self.tell_waiters(copy::ticket_of(place, generation));
                 }
                 self.next_commit();
                 self.pump();
@@ -1265,6 +1294,12 @@ impl Layerd {
                 if r.handles.len() > 1 {
                     return bad;
                 }
+                // A ticket the table never gave (a bit above its place and generation) is refused:
+                // the table would read it as another ticket, and the notification kept for it would
+                // never be told.
+                if !copy::ticket_valid(ticket) {
+                    return st(proto_fs::INVALID_ARGUMENT);
+                }
                 // WAIT is answered at once: 0 or the failure when the copy is over, COPYING while it
                 // goes on. The kernel gives no end to the wait of a thread for the reply of a request
                 // that a service has taken, so a wait that a signal may end is the program's `receive`
@@ -1275,14 +1310,18 @@ impl Layerd {
                     copy::Wait::Over(code) => st(code),
                     copy::Wait::Pending => {
                         if r.handles.len() == 1 {
-                            if self.waiters.len() >= copy::WAITERS {
-                                return st(l::STARTING);
-                            }
                             let Ok(handle) = r.handles.take::<Channel>(0) else {
                                 return Answer::Status(Status::Kernel(abi::Error::WrongType));
                             };
-                            if self.waiters.add(ticket, handle).is_err() {
-                                return st(l::STARTING);
+                            match self.waiters.add(label, ticket, handle) {
+                                copy::Added::New => {}
+                                // The session waited for the ticket already (another thread of the
+                                // program, or the same one after a signal): the old notification is
+                                // told, so that its thread asks again, and the new one is kept.
+                                copy::Added::Replaced(old) => {
+                                    let _ = sys::notify(&old, 1);
+                                }
+                                copy::Added::Full(_) => return st(l::STARTING),
                             }
                         }
                         match n::write_copying(ticket, r.reply()) {
@@ -1456,6 +1495,7 @@ impl Service<0> for Layerd {
         #[cfg(feature = "steps")]
         serve_line();
         self.core.gone(label);
+        self.waiters.drop_owner(label);
         if let Some(place) = self.slot_of(label) {
             self.sessions[place] = None;
         }

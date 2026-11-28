@@ -106,7 +106,9 @@ fn lower() -> FakeLower {
         .attr("/usr/share", 0o755, 3, 4)
         .dir("/usr/share/doc", 207)
         .file("/usr/share/doc/readme", 208)
-        .bytes("/usr/share/doc/readme", b"read me");
+        .bytes("/usr/share/doc/readme", b"read me")
+        .file("/usr/share/doc/elf", 209)
+        .bytes("/usr/share/doc/elf", b"\x7fELF here");
     let long = "a".repeat(250);
     l.dir(&format!("/{long}"), 90);
     l
@@ -2576,7 +2578,10 @@ fn commit_all(core: &mut C<'_>) {
         who: &root,
     };
     let mut job = ChangeJob::<FakeVolume, FakeLower>::new();
-    while core.commit_start(&mut job, 8) {
+    while matches!(
+        core.commit_start(&mut job, 8),
+        crate::changejob::CommitStart::Job
+    ) {
         let mut w = Writer::new();
         let mut counts = Vec::new();
         for _ in 0..10_000 {
@@ -2594,7 +2599,7 @@ fn commit_all(core: &mut C<'_>) {
         }
         // The commit job is a change job like the others: a call in a step.
         assert_one_call_a_step("commit", &counts, false);
-        core.commit_done(&mut job);
+        core.commit_done(&mut job, None);
     }
 }
 
@@ -2640,13 +2645,17 @@ fn a_lower_file_opened_for_writing_is_copied_with_its_number_owner_mode_and_time
 }
 
 #[test]
-fn the_directories_of_the_path_are_made_with_the_numbers_and_attributes_of_the_lower_ones() {
+fn the_directories_of_the_path_are_made_with_the_copy_with_the_numbers_attributes_and_times_of_the_lower_ones()
+ {
     let mut world = World::new();
     let mut core = world.core(volume());
     ready(&mut core);
     let (reply, _) = open(&mut core, 0, f::WRITE_ONLY, "/usr/share/doc/readme").unwrap();
     copying(&reply);
-    // The directories are made at once (under the lock), the file waits for the worker.
+    // The reserve makes no directory: the commit does, with the copy, so a copy that is refused
+    // leaves none.
+    assert!(node(&core, "/.layers/00/usr").is_none());
+    settle(&mut core);
     for (path, ino) in [
         ("/.layers/00/usr", 205),
         ("/.layers/00/usr/share", 206),
@@ -2654,11 +2663,10 @@ fn the_directories_of_the_path_are_made_with_the_numbers_and_attributes_of_the_l
     ] {
         let dir = node(&core, path).unwrap();
         assert!(dir.dir, "{path}");
-        assert_eq!(dir.ino, ino, "{path}");
+        assert_eq!((dir.ino, dir.times), (ino, (4_000, 5_000)), "{path}");
     }
     let share = node(&core, "/.layers/00/usr/share").unwrap();
     assert_eq!((share.uid, share.gid, share.mode), (3, 4, 0o755));
-    settle(&mut core);
     assert_eq!(
         node(&core, "/.layers/00/usr/share/doc/readme")
             .unwrap()
@@ -2815,6 +2823,36 @@ fn a_program_of_the_lower_set_is_never_copied_up() {
 }
 
 #[test]
+fn a_program_that_is_refused_leaves_no_directory_in_the_layer() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    let (reply, _) = open(&mut core, 0, f::WRITE_ONLY, "/usr/share/doc/elf").unwrap();
+    let ticket = copying(&reply);
+    settle(&mut core);
+    assert_eq!(core.copy_wait(ticket), Wait::Over(f::READ_ONLY_FILESYSTEM));
+    assert!(node(&core, "/.layers/00/usr").is_none());
+    assert!(core.volume.children(b"/.layers/work").is_empty());
+}
+
+#[test]
+fn a_lower_number_with_bit_62_or_63_is_refused_before_anything_is_made() {
+    let mut world = World::new();
+    let mut core = world.core(volume());
+    ready(&mut core);
+    core.lower.file("/etc/oddnum", UPPER_INO_TAG | 5);
+    core.lower.file("/etc/oddnum2", 1 << 63 | 5);
+    for path in ["/etc/oddnum", "/etc/oddnum2"] {
+        assert_eq!(
+            open(&mut core, 0, f::WRITE_ONLY, path).err(),
+            Some(st(f::INVALID_ARGUMENT)),
+            "{path}"
+        );
+    }
+    assert_eq!(core.copies.reserved, 0);
+}
+
+#[test]
 fn a_name_deleted_during_the_copy_stays_deleted_and_the_copy_goes_to_the_reaper() {
     let mut world = World::new();
     let mut core = world.core(volume());
@@ -2927,7 +2965,7 @@ fn a_lower_directory_is_copied_without_content_for_chmod_chown_and_utimensat() {
         assert!(dir.dir);
         assert_eq!(dir.ino, 30, "{op:?}");
         match op {
-            ChangeOp::Chmod => assert_eq!(dir.mode, 0o700),
+            ChangeOp::Chmod => assert_eq!((dir.mode, dir.times), (0o700, (4_000, 5_000))),
             ChangeOp::Chown => assert_eq!(dir.uid, 5),
             _ => assert_eq!(dir.times.0, 77),
         }

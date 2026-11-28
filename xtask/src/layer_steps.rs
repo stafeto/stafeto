@@ -75,6 +75,9 @@ pub const BREAKS: [(&str, bool); 4] = [
     ("break-layerd-copy-in-loop", false),
 ];
 
+/// The check that makes the copy.
+const COPY_CHECK: &str = "a lower file of 64 MiB is copied up while the checks run";
+
 /// The bytes of the lower file the probe writes: the byte at i is (i % 251) | 1 (`scale.rs`).
 const BIG_BYTES: usize = 64 << 20;
 
@@ -129,7 +132,9 @@ fn lower_files() -> Vec<crate::rootfs::RootFile> {
 }
 
 fn programs(layerd: &'static [&'static str]) -> Vec<ImageProgram> {
-    let mut list = layer_names::programs(layerd, &[]);
+    // The data file service tells its jobs too: the longest of each method is the most a call of
+    // the loop waits behind it.
+    let mut list = layer_names::programs(layerd, &["steps"]);
     // The RAM file service tells its steps too: the reads of the copy are among them.
     let at = list
         .iter()
@@ -149,13 +154,25 @@ fn boot(
     machine: &qemu::Machine,
     features: &'static [&'static str],
 ) -> Result<(qemu::Outcome, u64), String> {
+    boot_with(machine, features, true)
+}
+
+/// `boot`, with the copy of the lower file of 64 MiB or without it.
+fn boot_with(
+    machine: &qemu::Machine,
+    features: &'static [&'static str],
+    copy: bool,
+) -> Result<(qemu::Outcome, u64), String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
     let image = write_boot_image_files(
         IMAGE,
         &programs(features),
         BOOT_PROFILE,
-        &[("STAFETO_LAYER_NAMES_MODE", "scale")],
+        &[
+            ("STAFETO_LAYER_NAMES_MODE", "scale"),
+            ("STAFETO_LAYER_NAMES_COPY", if copy { "1" } else { "0" }),
+        ],
         lower_files(),
     )?;
     let disk = layer_names::Disk(
@@ -172,6 +189,10 @@ fn boot(
 
 /// Each check has one line `ok`, in the order of `CHECKS`, and the end comes once, after them all.
 pub fn read_lines(lines: &[String]) -> Result<(), String> {
+    read_checks(lines, true)
+}
+
+fn read_checks(lines: &[String], copy: bool) -> Result<(), String> {
     layer_names::registered(lines)?;
     let mine = layer_names::mine(lines);
     if let Some(bad) = mine
@@ -181,9 +202,14 @@ pub fn read_lines(lines: &[String]) -> Result<(), String> {
         return Err(format!("layer-steps: {bad}"));
     }
     let oks: Vec<&str> = mine.iter().filter_map(|l| l.strip_suffix(" ok")).collect();
-    if oks != CHECKS {
+    let due: Vec<&str> = CHECKS
+        .iter()
+        .copied()
+        .filter(|c| copy || *c != COPY_CHECK)
+        .collect();
+    if oks != due {
         return Err(format!(
-            "the checks that said ok are {oks:?}, {CHECKS:?} were due"
+            "the checks that said ok are {oks:?}, {due:?} were due"
         ));
     }
     if !mine.contains(&PASSED) {
@@ -231,6 +257,44 @@ pub fn ram_gate(lines: &[String]) -> Result<u64, String> {
     Ok(reads.1)
 }
 
+/// The longest wait of the loop in a call of another service, by kind of step: the lines
+/// `service wait: 18 kind K W ticks of A`, W the wait, in ticks.
+pub fn waits(lines: &[String]) -> Vec<(usize, u64)> {
+    let key = format!("service wait: {STEP_TAG} kind ");
+    let mut out: Vec<(usize, u64)> = Vec::new();
+    for line in lines {
+        let Some(at) = line.find(&key) else { continue };
+        let mut words = line[at + key.len()..].split_whitespace();
+        let (Some(kind), Some(wait)) = (
+            words.next().and_then(|w| w.parse::<usize>().ok()),
+            words.next().and_then(|w| w.parse::<u64>().ok()),
+        ) else {
+            continue;
+        };
+        match out.iter_mut().find(|(k, _)| *k == kind) {
+            Some(old) => old.1 = old.1.max(wait),
+            None => out.push((kind, wait)),
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// The longest job of the data file service for `method` (`datafs: job <method> longest N us`), in
+/// microseconds: with `PwriteFrom`, the part of 64 KiB the copy writes, the most a call of the loop
+/// waits behind a job of the copy; 0 when the service told none.
+pub fn longest_job_us(lines: &[String], method: &str) -> u64 {
+    let key = format!("datafs: job {method} longest ");
+    lines
+        .iter()
+        .filter_map(|l| {
+            let at = l.find(&key)?;
+            l[at + key.len()..].split_whitespace().next()?.parse().ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// The line the service says when its index is built: the names, the marks and the steps it took.
 fn index_line(lines: &[String]) -> Result<(u32, u32, u32), String> {
     let line = lines
@@ -263,6 +327,13 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     }
     let rows = gate(&output.lines)?;
     let read = ram_gate(&output.lines)?;
+    println!(
+        "layer-steps: longest wait of the loop in a call (kind, ticks) {:?}; longest job of the data file service: a part {} us, an FSYNC {} us, a CHOWN {} us",
+        waits(&output.lines),
+        longest_job_us(&output.lines, "PwriteFrom"),
+        longest_job_us(&output.lines, "Fsync"),
+        longest_job_us(&output.lines, "Chown")
+    );
     println!(
         "layer-steps on {}: {names} names built in {steps} steps, a file at 247 components, a path of 253, a merged listing of {} names, a lower file of 64 MiB copied up meanwhile (a read of the copy in the RAM file service {read} ticks); steps of the layer service (kind, ticks, detail) {rows:?}, none over 0.9 B ({}) in {seconds} s: ok",
         machine.name,
@@ -310,11 +381,35 @@ pub fn breaks(machine: &qemu::Machine) -> Result<(), String> {
     Ok(())
 }
 
+/// The probe without the copy (`layer-steps nocopy`): the waits of the loop and the jobs of the
+/// data file service to compare with the run with the copy.
+pub fn nocopy(machine: &qemu::Machine) -> Result<(), String> {
+    let (output, seconds) = boot_with(machine, &["steps"], false)?;
+    read_checks(&output.lines, false)?;
+    qemu::expect_stopped_on(
+        &output,
+        "init: layer-names ended: exit code 0, not restarted",
+    )?;
+    let rows = gate(&output.lines)?;
+    println!(
+        "layer-steps nocopy on {}: steps of the layer service {rows:?}; longest wait of the loop in a call (kind, ticks) {:?}; longest job of the data file service: a part {} us, an FSYNC {} us, a CHOWN {} us, in {seconds} s",
+        machine.name,
+        waits(&output.lines),
+        longest_job_us(&output.lines, "PwriteFrom"),
+        longest_job_us(&output.lines, "Fsync"),
+        longest_job_us(&output.lines, "Chown")
+    );
+    Ok(())
+}
+
 pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
     match args.first().map(String::as_str) {
         None => probe(machine),
+        Some("nocopy") if args.len() == 1 => nocopy(machine),
         Some("breaks") if args.len() == 1 => breaks(machine),
-        Some(other) => Err(format!("layer-steps [breaks]: unknown argument {other}")),
+        Some(other) => Err(format!(
+            "layer-steps [breaks | nocopy]: unknown argument {other}"
+        )),
     }
 }
 
@@ -352,6 +447,26 @@ mod tests {
                 .contains("no read")
         );
         assert!(ram_gate(&[]).is_err());
+    }
+
+    #[test]
+    fn the_waits_and_the_jobs_of_the_data_service_are_read() {
+        let lines: Vec<String> = [
+            "service wait: 18 kind 64 52667483 ticks of 52676623",
+            "service wait: 18 kind 64 100 ticks of 200",
+            "service wait: 18 kind 63 7 ticks of 9",
+            "service wait: 2 kind 64 99999999 ticks of 99999999",
+            "datafs: job PwriteFrom longest 1200 us",
+            "datafs: job PwriteFrom longest 3400 us",
+            "datafs: job Fsync longest 50 us",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(waits(&lines), [(63, 7), (64, 52_667_483)]);
+        assert_eq!(longest_job_us(&lines, "PwriteFrom"), 3400);
+        assert_eq!(longest_job_us(&lines, "Fsync"), 50);
+        assert_eq!(longest_job_us(&lines, "Chown"), 0);
     }
 
     #[test]

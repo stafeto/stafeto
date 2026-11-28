@@ -677,7 +677,7 @@ const PASSED_COPY_REREAD: &str = "layer-posix: copy reread checks passed";
 
 /// The checks of the copy phase (`cargo xtask layer-posix copy`): a lower file is copied up when it
 /// is written, in the order the probe runs them.
-pub const COPY_CHECKS: [&str; 12] = [
+pub const COPY_CHECKS: [&str; 13] = [
     "a lower file that is written is copied up",
     "the copy keeps the owner, the mode, the times and the number",
     "a cut open makes an empty copy with the lower attributes",
@@ -686,6 +686,7 @@ pub const COPY_CHECKS: [&str; 12] = [
     "lchown of a lower link copies the link",
     "a lower program is never copied up and still runs",
     "a read open copies nothing",
+    "a user without write rights is refused and nothing is copied",
     "two writers of one file make one copy",
     "a signal during the wait of a copy is EINTR without SA_RESTART",
     "a signal during the wait of a copy goes on with SA_RESTART",
@@ -722,6 +723,8 @@ const COPIES_MADE_VISIBLE: u32 = 10;
 const COPIES_FAILED: u32 = 5;
 
 const COPY_PROBE: &[&str] = &["phase-copy"];
+/// The layer service of the copy probe tells the counters of its copies.
+const COPY_LAYERD: &[&str] = &["probe-copies"];
 const COPY_REREAD_PROBE: &[&str] = &["phase-copyreread"];
 
 /// The size of the disk of the copy probe: the data partition holds the copies (35 MiB of files
@@ -893,6 +896,12 @@ pub fn read_copy_counts(lines: &[String]) -> Result<(), String> {
             "a read open changed the copies of the service: {begin:?} before, {end:?} after"
         ));
     }
+    let (begin, end) = (counts("deny-begin")?, counts("deny-end")?);
+    if begin != end {
+        return Err(format!(
+            "a user without the right to write made a copy: {begin:?} before, {end:?} after"
+        ));
+    }
     let (begin, end) = (counts("two-begin")?, counts("two-end")?);
     if end[0] != begin[0] + 1 {
         return Err(format!(
@@ -935,6 +944,7 @@ pub fn copy(machine: &qemu::Machine) -> Result<(), String> {
         machine,
         Build {
             probe: COPY_PROBE,
+            layerd: COPY_LAYERD,
             ..Build::default()
         },
         &disk,
@@ -952,6 +962,7 @@ pub fn copy(machine: &qemu::Machine) -> Result<(), String> {
         machine,
         Build {
             probe: COPY_REREAD_PROBE,
+            layerd: COPY_LAYERD,
             ..Build::default()
         },
         &disk,
@@ -986,7 +997,8 @@ fn copy_disk() -> Result<Disk, String> {
 /// for.
 pub fn copy_breaks(machine: &qemu::Machine) -> Result<(), String> {
     for (feature, checks) in COPY_BREAKS {
-        let layerd: &'static [&'static str] = Box::leak(vec![feature].into_boxed_slice());
+        let layerd: &'static [&'static str] =
+            Box::leak(vec!["probe-copies", feature].into_boxed_slice());
         let disk = copy_disk()?;
         let (output, seconds) = boot_with(
             machine,
@@ -1184,6 +1196,8 @@ mod tests {
             mark("read-begin"),
             line("over", [read[0], 2, 0, 0]),
             mark("read-end"),
+            mark("deny-begin"),
+            mark("deny-end"),
             line("queued", [two[0], 2, 0, 0]),
             mark("two-begin"),
             line("queued", [two[1], 2, 0, 0]),

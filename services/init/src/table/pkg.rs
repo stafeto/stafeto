@@ -574,8 +574,10 @@ pub const LAYERD: Record = Record {
     // session, `SESSIONS` of the program), one pass or one Vouch copy in flight, and about 24 of its
     // own (the channels, the notification of the steps, the sessions with the two file services and
     // the notary, the page of the generations, the console, the timers of the heartbeat and of the
-    // registrar) and 8 of the worker thread (its two sessions, the window, the channel it waits on
-    // with the kick, the notification it gives and the thread): 226, and a limit of 256.
+    // registrar), 8 of the worker thread (its two sessions, the window, the channel it waits on
+    // with the kick, the notification it gives and the thread) and the 16 copies of channels of
+    // programs that wait for a copy (WAIT with a handle, kept until the copy ends): 242, and a
+    // limit of 256.
     handle_limit: 256,
     restart: Restart::Always,
     console: true,

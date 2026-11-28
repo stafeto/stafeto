@@ -137,6 +137,14 @@ pub fn copying_ticket(reply: &[u8]) -> Option<Result<u64, i32>> {
     n::read_copying(reply).map(|ticket| ticket.map_err(|_| errno::EIO))
 }
 
+/// The label of the copy of its channel that a thread brings to WAIT: the ticket. A tag in the high
+/// bits (62 and 63 were tried, as `wait.rs` tags its own labels) kept the notification from the
+/// thread's receive in the probe, so the label stays the ticket (at most 40 bits); a notification
+/// of another long operation with the same number only makes the wait ask WAIT again.
+pub const fn wait_label(ticket: u64) -> u64 {
+    ticket
+}
+
 /// The errno of a copy that failed, which the answer to WAIT carries as a status of the layer
 /// service: a full volume is ENOSPC and a volume that cannot be written (or a program, which is
 /// never copied up) is EROFS; any other failure is EIO.
@@ -735,6 +743,11 @@ mod tests {
             Ok(n::NameMethod::Wait.header())
         );
         assert_eq!(n::read_wait(r), Ok(77));
+    }
+
+    #[test]
+    fn the_label_of_a_wait_is_the_ticket() {
+        assert_eq!(wait_label(0x0102), 0x0102);
     }
 
     #[test]

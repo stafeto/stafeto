@@ -1678,6 +1678,25 @@ static int a_read_open_copies_nothing(void) {
     return 0;
 }
 
+/* User 1000 has no write right on /copyup/read (0644 of root): the open, the truncate and the chmod
+ * are refused by the rights of the lower attributes, before a byte is copied. */
+static int user_without_write_rights_body(void) {
+    if (!FAILS(open("/copyup/read", O_WRONLY), EACCES)) return 2;
+    if (!FAILS(open("/copyup/read", O_RDWR | O_TRUNC), EACCES)) return 3;
+    if (!FAILS(truncate("/copyup/read", 0), EACCES)) return 4;
+    if (!FAILS(chmod("/copyup/read", 0666), EPERM)) return 5;
+    return 0;
+}
+
+static int a_user_without_write_rights_copies_nothing(void) {
+    struct stat st;
+    printf("layer-posix: marker deny-begin\n");
+    LP_CHECK(as_user(user_without_write_rights_body) == 0);
+    printf("layer-posix: marker deny-end\n");
+    LP_CHECK(stat("/copyup/read", &st) == 0 && (st.st_mode & 07777) == 0644 && st.st_size == 10);
+    return 0;
+}
+
 static int two_writers_of_one_file_make_one_copy(void) {
     int gate[2];
     LP_CHECK(pipe(gate) == 0);
@@ -1717,13 +1736,16 @@ static void on_alarm(int sig) {
 
 /* The first byte of the file and a byte after its middle are the lower file's. */
 static int is_the_big_file(const char *path) {
-    unsigned char b[2];
+    unsigned char b[6];
     struct stat st;
     if (stat(path, &st) != 0 || st.st_size != (off_t)BIG_BYTES) return 0;
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
-    int ok = pread(fd, b, 1, 0) == 1 && b[0] == BIG_BYTE(0) &&
-             pread(fd, b + 1, 1, (off_t)(BIG_BYTES / 2 + 5)) == 1 && b[1] == BIG_BYTE(BIG_BYTES / 2 + 5);
+    /* The four bytes the probe wrote at the start, then the lower file's bytes. */
+    int ok = pread(fd, b, 6, 0) == 6 && memcmp(b, "HEAD", 4) == 0 && b[4] == BIG_BYTE(4) &&
+             b[5] == BIG_BYTE(5) &&
+             pread(fd, b, 1, (off_t)(BIG_BYTES / 2 + 5)) == 1 && b[0] == BIG_BYTE(BIG_BYTES / 2 + 5) &&
+             pread(fd, b, 1, (off_t)(BIG_BYTES - 1)) == 1 && b[0] == BIG_BYTE(BIG_BYTES - 1);
     close(fd);
     return ok;
 }
@@ -1751,7 +1773,7 @@ static int a_signal_during_the_wait(const char *path, int restart) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     LP_CHECK(timer_settime(clock_timer, 0, &timer, NULL) == 0);
-    int fd = open(path, O_WRONLY | O_APPEND);
+    int fd = open(path, O_WRONLY);
     int err = errno;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     printf("layer-posix: the open of the file of 16 MiB took %ld ms\n", (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
@@ -1763,10 +1785,12 @@ static int a_signal_during_the_wait(const char *path, int restart) {
     } else {
         if (fd >= 0 || err != EINTR) printf("layer-posix: the open gave %d, errno %d\n", fd, err);
         LP_CHECK(fd == -1 && err == EINTR && alarmed == 1);
-        fd = open(path, O_WRONLY | O_APPEND);
+        fd = open(path, O_WRONLY);
         LP_CHECK(fd >= 0);
     }
-    /* The file is not written: its size is past the limit of a program's writes (SIGXFSZ). */
+    /* The file is written at its start only: its size is past the limit of a program's writes
+     * (SIGXFSZ for a write that grows it). The write is read back by `is_the_big_file`. */
+    LP_CHECK(pwrite(fd, "HEAD", 4, 0) == 4);
     LP_CHECK(close(fd) == 0);
     LP_CHECK(is_the_big_file(path));
     return 0;
@@ -1807,6 +1831,7 @@ static int copy_first(void) {
     run_check("lchown of a lower link copies the link", lchown_of_a_lower_link);
     run_check("a lower program is never copied up and still runs", a_lower_program_is_never_copied_and_still_runs);
     run_check("a read open copies nothing", a_read_open_copies_nothing);
+    run_check("a user without write rights is refused and nothing is copied", a_user_without_write_rights_copies_nothing);
     run_check("two writers of one file make one copy", two_writers_of_one_file_make_one_copy);
     run_check("a signal during the wait of a copy is EINTR without SA_RESTART", signal_without_restart);
     run_check("a signal during the wait of a copy goes on with SA_RESTART", signal_with_restart);

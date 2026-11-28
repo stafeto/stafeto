@@ -32,6 +32,10 @@ bench = false
 [features]
 steps = ["rt/step-stats"]
 probe-restart = []
+# `probe-copies`: a line of the counters of the copies up (`layerd: copies queued|over: N reserved,
+# ...`) whenever one moves, which `cargo xtask layer-posix copy` reads (a read open makes no copy,
+# two writers of one file make one).
+probe-copies = []
 # `break-layerd-epoch`: every instance carries the one epoch, so a handle of an earlier instance is
 # no stranger (`cargo xtask layer-restart breaks`).
 break-layerd-epoch = []

@@ -39,7 +39,13 @@ const LOW_DEPTH: u32 = 32;
 /// `/mk2` the rename went over; the marks of `/marks` and of `/mk2` are gone.
 /// The lower file of 64 MiB the probe writes while it measures: its copy makes `/lowbig` and
 /// `/lowbig/big` names of the layer (`xtask::layer_steps`).
-const COPIED_NAMES: u32 = 2;
+/// A build with `STAFETO_LAYER_NAMES_COPY=0` leaves the copy out (`cargo xtask layer-steps nocopy`:
+/// the waits of the loop without it, to compare with the waits with it).
+const COPY: bool = match option_env!("STAFETO_LAYER_NAMES_COPY") {
+    Some(v) => !(v.len() == 1 && v.as_bytes()[0] == b'0'),
+    None => true,
+};
+const COPIED_NAMES: u32 = if COPY { 2 } else { 0 };
 const NAMES_AFTER: u32 = NAMES + LOW_DEPTH + 2 - 1 + COPIED_NAMES;
 const BIG: &str = "/lowbig/big";
 const BIG_BYTES: u64 = 64 << 20;
@@ -209,7 +215,7 @@ pub fn run() -> i32 {
         },
     );
     // The copy of a lower file of 64 MiB goes on while the checks that follow are made.
-    let ticket = begin_copy(&names);
+    let ticket = if COPY { begin_copy(&names) } else { Ok(0) };
     if ticket.is_err() {
         say(format_args!(
             "a lower file of 64 MiB is written: no COPYING"
@@ -281,6 +287,7 @@ pub fn run() -> i32 {
     // is the layer's, whole.
     let name = "a lower file of 64 MiB is copied up while the checks run";
     match ticket {
+        Ok(_) if !COPY => {}
         Ok(ticket) => match wait_copy(&names, ticket) {
             0 => t.check(name, big_copy_is_there(&data, &names)),
             status => t.fail(
