@@ -76,6 +76,8 @@ struct datafs {
     uint32_t mc_hits;
     uint32_t mc_misses;
     uint32_t mc_off;
+    // The metadata pair of the directory the last datafs_path_attrs named, or NO_BLOCK.
+    uint32_t walk_pair[2];
     uint8_t mc_data[MCACHE_BLOCKS][BLOCK];
 };
 
@@ -704,6 +706,37 @@ int datafs_stat(struct datafs *d, void *ctx, const char *path, uint8_t *type, ui
     return 0;
 }
 
+// Whether the last datafs_path_attrs named a directory, and then its metadata pair in out[0] and
+// out[1] (1), or 0.
+int datafs_walked_pair(const struct datafs *d, uint32_t *out)
+{
+    if (d->walk_pair[0] == NO_BLOCK) {
+        return 0;
+    }
+    out[0] = d->walk_pair[0];
+    out[1] = d->walk_pair[1];
+    return 1;
+}
+
+// The directory whose metadata pair is `pair0` and `pair1` (from datafs_walked_pair), opened with no
+// walk of its path: the slot, or a negative error.
+int datafs_opendir_pair(struct datafs *d, void *ctx, uint32_t pair0, uint32_t pair1)
+{
+    d->ctx = ctx;
+    lfs_block_t pair[2] = {pair0, pair1};
+    for (int i = 0; i < DATAFS_DIRS; i++) {
+        if (!d->dir_used[i]) {
+            int err = lfs_dir_open_pair(&d->lfs, &d->dir[i], pair);
+            if (err < 0) {
+                return err;
+            }
+            d->dir_used[i] = 1;
+            return i;
+        }
+    }
+    return LFS_ERR_NOMEM;
+}
+
 int datafs_opendir(struct datafs *d, void *ctx, const char *path)
 {
     d->ctx = ctx;
@@ -874,7 +907,10 @@ int datafs_path_attrs(struct datafs *d, void *ctx, const char *path, uint8_t *ty
     lfs_size_t filled = 0;
     memset(&info, 0, sizeof(info));
     d->ctx = ctx;
-    int err = lfs_path_attrs(&d->lfs, path, &info, attr, out, buffer, each, capacity, &filled);
+    d->walk_pair[0] = NO_BLOCK;
+    d->walk_pair[1] = NO_BLOCK;
+    int err = lfs_path_attrs(&d->lfs, path, &info, attr, out, buffer, each, capacity, &filled,
+                             d->walk_pair);
     *count = filled;
     if (err < 0) {
         return err;

@@ -73,6 +73,8 @@ unsafe extern "C" {
         name: *mut u8,
     ) -> c_int;
     fn datafs_opendir(d: *mut c_void, ctx: *mut c_void, path: *const c_char) -> c_int;
+    fn datafs_walked_pair(d: *const c_void, out: *mut u32) -> c_int;
+    fn datafs_opendir_pair(d: *mut c_void, ctx: *mut c_void, pair0: u32, pair1: u32) -> c_int;
     fn datafs_closedir(d: *mut c_void, ctx: *mut c_void, slot: c_int) -> c_int;
     fn datafs_readdir(
         d: *mut c_void,
@@ -758,6 +760,23 @@ impl<'a, D: Device> Fs<'a, D> {
         check(slot).map(|slot| Dir(slot as u8))
     }
 
+    /// The metadata pair of the directory that the last `path_attrs` named (None when it named
+    /// something else or failed), for `opendir_pair`.
+    pub fn walked_pair(&self) -> Option<DirPair> {
+        let mut out = [0u32; 2];
+        // SAFETY: the state is the one `Fs::new` set up, and `out` has room for two words.
+        let named = unsafe { datafs_walked_pair(self.state.0.as_ptr().cast(), out.as_mut_ptr()) };
+        (named != 0).then_some(DirPair(out))
+    }
+
+    /// `opendir` of the directory a walk just named (`walked_pair`), with no walk of its path:
+    /// nothing may have been written since the walk.
+    pub fn opendir_pair(&mut self, pair: DirPair) -> Res<Dir> {
+        // SAFETY: as above.
+        let slot = self.call(|d, ctx| unsafe { datafs_opendir_pair(d, ctx, pair.0[0], pair.0[1]) });
+        check(slot).map(|slot| Dir(slot as u8))
+    }
+
     pub fn closedir(&mut self, dir: Dir) -> Res<()> {
         // SAFETY: as above.
         check(self.call(|d, ctx| unsafe { datafs_closedir(d, ctx, c_int::from(dir.0)) })).map(drop)
@@ -1147,6 +1166,10 @@ impl<D: Device> Fs<'_, D> {
         }
     }
 }
+
+/// The blocks of the metadata pair of a directory (`Fs::walked_pair`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirPair([u32; 2]);
 
 /// One entry of a path as `Fs::path_attrs` gives it: its kind and the size of its attribute.
 #[repr(C)]

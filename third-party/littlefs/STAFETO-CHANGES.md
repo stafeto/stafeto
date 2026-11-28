@@ -242,6 +242,14 @@ The data service keeps the metadata blocks it reads in a cache of its own, in th
 - `lfs_bd_read_data` is `lfs_bd_read` with the field set around the call. Seven reads of the release call it, where the release calls `lfs_bd_read`: the reads of the skip list and the bytes of a file (`lfs_ctz_find`, `lfs_ctz_find_hinted`, `lfs_file_flushedread`), the copy of a block when a list is extended or a block is moved (`lfs_ctz_extend` twice, `lfs_file_relocate`) and the walk of a list (`lfs_ctz_traverse`). Every other read (the fetch of a pair, the get of a tag, the commit) is for metadata.
 - Nothing changes on the disk and no read or write of the device is added or dropped: the field only describes the read being made. A device that ignores it behaves as the release does.
 
+## A change to the open of a directory: by its pair, with no second walk
+
+The data service looks a path up (`lfs_path_attrs`, one walk with the attributes of every entry) and then, for an open of a directory, opened the path again (`lfs_dir_open` walks it a second time, about 3 reads for each component). The change gives the second step the pair the first found.
+
+- `lfs_path_attrs` has one more argument at its end, `lfs_block_t *last` (NULL is allowed): when the path names a directory it receives the two blocks of that directory's metadata pair (`lfs->root` for the root, else the structure tag of its entry in the pair that holds it, read with `lfs_dir_get` from the pair the walk already fetched). It is untouched for a file and for a failed walk, so a caller sets it to a block that no pair has before the call.
+- `lfs_dir_open_pair(lfs, dir, pair)` in `lfs.h` and `lfs.c` is the tail of `lfs_dir_open_`: it fetches the pair, sets the iterator up and adds the directory to the list of open ones. A caller that passes a pair of an earlier walk must not have written to the volume since (a rename or a removal could have moved the directory).
+- Nothing changes on the disk. `lib/datafs/src/tests_entry_attr.rs` (`a_directory_named_by_a_walk_opens_by_its_pair_for_a_few_reads`) lists the same entries by the pair and by the path and counts the reads (at most 4 against over 100 at depth 100).
+
 ## A known defect of the release that the service works around
 
 With `inline_max = -1` (no inlined files) littlefs 2.11.3, with or without this change, loses a write at the start or in the middle of an existing inline file (a file that an earlier configuration kept inside the pair of its directory): moving the file out (`lfs_file_outline`, `lfs_file_relocate`) copies only the bytes before the write position, flushing the rest then fails, and the close answers `LFS_ERR_CORRUPT`; the write is lost and the old bytes stay. Appending, `O_TRUNC` and truncating down work. The service moves every inline file out before a write can meet this: open for writing, seek to the end and write no byte (one commit, the whole file moves), by the conversion job after the mount and, for a file the job has not reached, at the first open of the path for writing or truncation. The test that reproduces the defect is `without_the_move_out_a_write_in_the_middle_of_an_old_inline_file_is_lost` in `lib/datafs/src/tests_perm.rs`: it fails when a release stops losing the write, and then the move-out can go. The release's own message about it is not sent yet.
@@ -259,8 +267,8 @@ f2fbde533670560434bd9f5a547174cc7c5a4670a02c47b4bd85180dced8b2ec  lfs_util.c
 0cb4ff1daf5fdc1359c6a6ee3116092f08fc100c9d58b1b77ab17bfd801f856d  LICENSE.md
 6dd74dfc58ac93589f8e002bb73c0830a59206912cfe8c951c07eb2bd5fccad0  SPEC.md
 2a8b3459d74b9fa8bdd947738522c46331739405b1fc3d70f057f636a1dea768  DESIGN.md
-19ebd429072a0c3837d36e532235c7a34cce5f2b1ee30a64b73e9cc1619a6be5  lfs.c (with the change)
-0de254fa10368186ace6d2f9e652099041c0c942a96047bcbc814daacd1bd095  lfs.h (with the change)
+26aed6ad93c95c80611f0e0a241c825016ac5614ecb7602a431bf6fefddbba3d  lfs.c (with the change)
+ac82120fa439892a414b730915b433e41425f35d84960990fa0609a1521d61cf  lfs.h (with the change)
 ```
 
 `tools/check-littlefs.py` (run by `cargo xtask ci` as "littlefs sources") fails when a file of the

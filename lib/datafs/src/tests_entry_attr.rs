@@ -766,3 +766,58 @@ fn a_walk_into_a_directory_split_over_many_pairs_gives_the_attribute_of_the_entr
         }
     }
 }
+
+/// A walk that names a directory gives its pair, and the directory opens from it with no walk of
+/// the path: the same entries as `opendir`, and the reads of the open are a few where the walk of
+/// a deep path is hundreds.
+#[test]
+fn a_directory_named_by_a_walk_opens_by_its_pair_for_a_few_reads() {
+    let depth = 100;
+    let (fs, path) = chain(depth);
+    // A file in the directory and one in its parent, so the listing has something to compare.
+    let mut fs = restarted(fs);
+    for name in ["x", "y"] {
+        let f = fs
+            .open(
+                format!("{path}/{name}").as_bytes(),
+                Open::WRITE.with(Open::CREATE),
+            )
+            .unwrap();
+        fs.close(f).unwrap();
+    }
+    let listing = |fs: &mut Vol, dir| {
+        let mut names = Vec::new();
+        while let Some(e) = fs.readdir(dir).unwrap() {
+            names.push(e.name().to_vec());
+        }
+        names
+    };
+    let mut fs = restarted(fs);
+    let walked = walk(&mut fs, &path, depth + 1);
+    assert!(walked.1.is_ok());
+    let pair = fs.walked_pair().expect("a directory has a pair");
+    let at = reads(&mut fs);
+    let dir = fs.opendir_pair(pair).unwrap();
+    let by_pair = reads(&mut fs) - at;
+    let by_pair_names = listing(&mut fs, dir);
+    fs.closedir(dir).unwrap();
+    assert!(by_pair <= 4, "{by_pair} reads to open by the pair");
+    let mut fs = restarted(fs);
+    let at = reads(&mut fs);
+    let dir = fs.opendir(path.as_bytes()).unwrap();
+    let by_path = reads(&mut fs) - at;
+    let by_path_names = listing(&mut fs, dir);
+    fs.closedir(dir).unwrap();
+    assert!(by_path > 100, "{by_path} reads by the path");
+    assert_eq!(by_pair_names, by_path_names);
+    assert_eq!(by_pair_names.len(), 4, "`.`, `..`, x and y");
+    // A walk of a file, or of a missing name, names no directory.
+    let file = format!("{path}/x");
+    let _ = walk(&mut fs, &file, depth + 2);
+    assert_eq!(fs.walked_pair(), None);
+    let _ = walk(&mut fs, "/missing", 4);
+    assert_eq!(fs.walked_pair(), None);
+    // The root names its own pair.
+    let _ = walk(&mut fs, "/", 4);
+    assert!(fs.walked_pair().is_some());
+}

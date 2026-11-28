@@ -2140,7 +2140,13 @@ impl Server {
                     description.searched = true;
                     description.object = di as u8;
                 } else {
-                    let slot = match fs.opendir(path) {
+                    // The walk of the lookup named the directory's pair: it is opened with no
+                    // second walk of the path (nothing was written since).
+                    let opened = match fs.walked_pair() {
+                        Some(pair) => fs.opendir_pair(pair),
+                        None => fs.opendir(path),
+                    };
+                    let slot = match opened {
                         Ok(dir) => dir.0,
                         Err(Error::NoMemory) => return Err(p::code(p::TABLE_FULL)),
                         Err(e) => return Err(status_of(e)),
