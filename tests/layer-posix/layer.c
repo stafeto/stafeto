@@ -1491,7 +1491,7 @@ static int write_first(void) {
     run_check("hard links, reserved names and long paths", reserved_names_and_limits);
     run_check("the rights of another user on the layer", rights_of_another_user_on_the_layer);
     run_check("a sticky directory is kept", a_sticky_directory_is_kept);
-    run_check("the lower set is not written", the_lower_set_is_not_written);
+    run_check("a program of the lower set is not written", the_lower_set_is_not_written);
     run_check("changes against descriptions", changes_against_descriptions);
     if (failures != 0) {
         printf("layer-posix: %d checks failed\n", failures);

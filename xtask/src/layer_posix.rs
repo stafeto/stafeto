@@ -131,7 +131,7 @@ pub const WRITE_CHECKS: [&str; 13] = [
     "hard links, reserved names and long paths",
     "the rights of another user on the layer",
     "a sticky directory is kept",
-    "the lower set is not written",
+    "a program of the lower set is not written",
     "changes against descriptions",
 ];
 
