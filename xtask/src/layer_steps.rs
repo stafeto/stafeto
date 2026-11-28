@@ -50,10 +50,19 @@ const RAM_RESOLVE_KIND: usize = 21;
 /// may exceed by one part of the copy and `WAIT_MARGIN`.
 const NOCOPY_WAIT_63: u64 = 6_500_235;
 const WAIT_MARGIN: u64 = 1_000_000;
-/// The longest job of the copy in the data file service, a part or an FSYNC, in microseconds.
-const COPY_JOB_MAX_US: u64 = 100_000;
-/// Ticks of the counter in a microsecond (62.5 MHz).
-const TICKS_PER_US: u64 = 125 / 2;
+/// The longest part of the copy in the data file service (a PWRITE_FROM of 64 KiB), in
+/// microseconds: about 31 ms on the Mac and on the GitHub runners (28 November), since littlefs
+/// writes the part to the host's page cache with no flush, and the part is what the wait gate below
+/// adds to the loop. The FSYNC at the end of the copy is told only: it is the flush of 64 MiB
+/// through virtio-blk to the host disk (12 to 13 ms on the Mac, 199 to 221 ms on the runners in
+/// `layer-steps` and in `data-steps`), while the worker's own stretches in it stay under 1 ms, so a
+/// bound on it would judge the runner's disk; its effect on the loop is the wait of kind 63.
+const COPY_PART_MAX_US: u64 = 100_000;
+
+/// Ticks of the counter for `us` microseconds (62.5 MHz).
+fn ticks_of(us: u64) -> u64 {
+    us * 125 / 2
+}
 
 /// The checks of the probe in scale mode, in the order it runs them.
 pub const CHECKS: [&str; 16] = [
@@ -321,31 +330,28 @@ pub fn ram_row(lines: &[String], kind: usize) -> u64 {
         .map_or(0, |r| r.1)
 }
 
-/// The gate of the copy: the longest part and FSYNC job of the data file service at most
-/// `COPY_JOB_MAX_US`, and the longest wait of the loop in a call of kind 63 at most the wait without
-/// the copy and one part more (`WAIT_MARGIN` besides). The part and the wait, in ticks.
+/// The gate of the copy: the longest part of the data file service at most `COPY_PART_MAX_US`,
+/// and the longest wait of the loop in a call of kind 63 at most the wait without the copy and one
+/// part more (`WAIT_MARGIN` besides). The part and the wait, in ticks.
 pub fn copy_gate(lines: &[String]) -> Result<(u64, u64), String> {
     let part = longest_job_us(lines, "PwriteFrom");
-    let fsync = longest_job_us(lines, "Fsync");
     if part == 0 {
         return Err("layer-steps: the data file service told no part of the copy".into());
     }
-    for (what, us) in [("part", part), ("FSYNC", fsync)] {
-        if us > COPY_JOB_MAX_US {
-            return Err(format!(
-                "layer-steps: the longest {what} of the copy took {us} us, over {COPY_JOB_MAX_US}"
-            ));
-        }
+    if part > COPY_PART_MAX_US {
+        return Err(format!(
+            "layer-steps: the longest part of the copy took {part} us, over {COPY_PART_MAX_US}"
+        ));
     }
     let wait = waits(lines).iter().find(|w| w.0 == 63).map_or(0, |w| w.1);
-    let bound = NOCOPY_WAIT_63 + part * TICKS_PER_US + WAIT_MARGIN;
+    let bound = NOCOPY_WAIT_63 + ticks_of(part) + WAIT_MARGIN;
     if wait > bound {
         return Err(format!(
             "layer-steps: the loop waited {wait} ticks in a call of kind 63, over {bound} (the wait without the copy {NOCOPY_WAIT_63}, one part {} ticks, a margin {WAIT_MARGIN})",
-            part * TICKS_PER_US
+            ticks_of(part)
         ));
     }
-    Ok((part * TICKS_PER_US, wait))
+    Ok((ticks_of(part), wait))
 }
 
 /// The line the service says when its index is built: the names, the marks and the steps it took.
@@ -527,18 +533,15 @@ mod tests {
         let ok = lines(32_000, 14_000, NOCOPY_WAIT_63 + 2_000_000);
         assert_eq!(
             copy_gate(&ok),
-            Ok((32_000 * TICKS_PER_US, NOCOPY_WAIT_63 + 2_000_000))
+            Ok((ticks_of(32_000), NOCOPY_WAIT_63 + 2_000_000))
         );
         assert!(
             copy_gate(&lines(120_000, 1, 1))
                 .unwrap_err()
                 .contains("part")
         );
-        assert!(
-            copy_gate(&lines(1_000, 120_000, 1))
-                .unwrap_err()
-                .contains("FSYNC")
-        );
+        // The FSYNC is the host's flush and is told only: one of 220 ms passes.
+        assert!(copy_gate(&lines(32_000, 220_000, NOCOPY_WAIT_63)).is_ok());
         // Three parts more than without the copy.
         let over = lines(32_000, 14_000, NOCOPY_WAIT_63 + 6_000_000);
         assert!(copy_gate(&over).unwrap_err().contains("kind 63"));
