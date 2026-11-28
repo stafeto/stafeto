@@ -217,6 +217,27 @@ impl Storage {
     }
 }
 
+#[cfg(any(test, feature = "model"))]
+extern crate std;
+
+#[cfg(any(test, feature = "model"))]
+impl Storage {
+    /// A volume's memory on the heap, made in place (a `Storage` is large, and a host test thread
+    /// has a small stack): for the tests and the host tools.
+    pub fn boxed() -> std::boxed::Box<Storage> {
+        let layout = core::alloc::Layout::new::<Storage>();
+        // SAFETY: the layout is that of `Storage`, whose every bit pattern is valid (a zeroed
+        // array), and the box owns the block the global allocator made for that layout.
+        unsafe {
+            let at = std::alloc::alloc_zeroed(layout).cast::<Storage>();
+            if at.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            std::boxed::Box::from_raw(at)
+        }
+    }
+}
+
 impl Default for Storage {
     fn default() -> Self {
         Self::new()

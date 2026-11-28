@@ -18,7 +18,7 @@ break-stamps-split = []
 frame-load = { path = "../tests/frame-load" }
 abi = { path = "../lib/abi" }
 console-line = { path = "../lib/console-line" }
-datafs = { path = "../lib/datafs" }
+datafs = { path = "../lib/datafs", features = ["model"] }
 rawframe = { path = "../lib/rawframe" }
 bootimg = { path = "../lib/bootimg", features = ["write"] }
 # The records of the network service, whose quota `netd-quota` checks.
@@ -34,6 +34,10 @@ fscommon = "0.1.1"
 firmware-tree = { path = "../boot/firmware-tree" }
 kcore = { path = "../kcore" }
 netd = { path = "../services/netd" }
+# The build of the index of the layer service over the data service in memory (layer_reads.rs).
+layerd = { path = "../services/layerd" }
+proto-data = { path = "../proto/data" }
+proto-wire = { path = "../proto/wire" }
 pkgd = { path = "../services/pkgd", features = ["host"] }
 pkgfmt = { path = "../lib/pkgfmt", features = ["write"] }
 proto-pkg = { path = "../proto/pkg", features = ["alloc"] }
@@ -46,7 +50,6 @@ virtio-pci = { path = "../lib/virtio-pci" }
 
 [dev-dependencies]
 entries = { path = "../lib/entries" }
-proto-wire = { path = "../proto/wire" }
 posix-fd = { path = "../lib/posix-fd" }
 posix-types = { path = "../lib/posix-types" }
 proto-fs = { path = "../proto/fs" }
