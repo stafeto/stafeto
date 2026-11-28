@@ -616,7 +616,7 @@ extern "C" fn work(_: u64) -> ! {
     if !clock.attach(&view::<Channel>(PARENT), &process) {
         rt::println!("datafs: no clock service, the times of files are the count since boot");
     }
-    mount_work(&mut volume, &mut clock, began);
+    mount_work(&mut volume, &mut clock);
     tell_pairs();
     if let Some(fs) = volume.as_mut() {
         // The time from the connection to the disk service to READY: the mount of littlefs and the
@@ -647,7 +647,7 @@ fn open_volume(disk: Disk) -> Option<Volume> {
     // SAFETY: the storage is the worker's alone, and lives for the life of the process.
     let storage = unsafe { &mut *STORAGE.get() };
     match volume::open(disk, storage, seed) {
-        Ok((mut fs, did, part)) => {
+        Ok((fs, did, part)) => {
             // No count of the blocks in use here: that is a walk of the whole volume, which the
             // worker makes after READY, once its queue has been quiet (`idle_walk`).
             let how = match did {
@@ -659,10 +659,9 @@ fn open_volume(disk: Disk) -> Option<Volume> {
                 }
             };
             rt::println!(
-                "datafs: {how}, {} blocks, partition at sector {}, {} reads",
+                "datafs: {how}, {} blocks, partition at sector {}",
                 fs.blocks(),
-                part.first,
-                fs.device().device.reads
+                part.first
             );
             Some(fs)
         }
@@ -700,7 +699,7 @@ fn say_foreign(found: &Found) {
 /// with nothing remembered of directories. Without a volume the epoch is the clock's. A conversion
 /// of the volume of the first release is a few commits (three entries); READY waits for them, and
 /// no request has been taken yet.
-fn mount_work(volume: &mut Option<Volume>, clock: &mut Clock, began: u64) {
+fn mount_work(volume: &mut Option<Volume>, clock: &mut Clock) {
     // SAFETY: the server is the worker's alone and lives for the life of the process.
     let server: &mut Server = unsafe { &mut *SERVER.get() };
     let mut epoch = (rt::time::now() >> 4) as u32;
@@ -709,14 +708,6 @@ fn mount_work(volume: &mut Option<Volume>, clock: &mut Clock, began: u64) {
         server.set_now(clock.now_ns());
         // The directory of the orphans is made after READY (see `Server::start_work`).
         let start = server.start_work(fs);
-        // How far the mount work got and at what cost, for a machine whose disk is slow to read
-        // (a volume made from a snapshot reads each block from the snapshot the first time): a
-        // boot that stops here shows the stage and the count of reads of the device.
-        let ms = rt::time::ticks_to_ns(rt::time::now()).saturating_sub(began) / 1_000_000;
-        rt::println!(
-            "datafs: mount work done after {ms} ms, {} reads",
-            fs.device().device.reads
-        );
         match start.recovered {
             Ok(done) if done.removed + done.restored + done.failed == 0 => {}
             Ok(done) => rt::println!(

@@ -573,11 +573,6 @@ impl Env<'_> {
             }
             step += 1;
         }
-        // The windows go when the sessions drop on return. Holding them to the
-        // phase boundary puts the frame that removes them after the counters
-        // are read, as in every other scene, so where the last overload frame
-        // ends against the read does not decide what is counted.
-        self.sleep_until(end);
         rt::println!(
             "frame-load: draw {} posts {posts} busy {busy}",
             phase.name()
