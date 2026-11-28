@@ -2009,6 +2009,16 @@ impl<V: Volume, L: Lower> Core<'_, V, L> {
         let Some(dst) = job.rn.dst else {
             return fail(proto_fs::NO_ENTRY);
         };
+        // Two names of one lower file (hard links, one number): the rename is a success that does
+        // nothing (XSH rename).
+        if let (true, Some(src), Leaf::Lower(target)) = (job.rn.lower_src, job.rn.src_lower, dst)
+            && src.ino == target.ino
+        {
+            job.nstages = 0;
+            job.pc = 0;
+            job.phase = Phase::Commit;
+            return Ok(None);
+        }
         let src_is_dir = job.rn.src_kind == Kind::Dir;
         let (dst_is_dir, dst_up, dst_lower_dir) = dst_facts(dst);
         if job.rn.dst_attr.is_some() {

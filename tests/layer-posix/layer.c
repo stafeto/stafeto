@@ -659,17 +659,17 @@ static int writes_to_the_lower_set_are_refused(void) {
     LP_CHECK(FAILS(truncate("/bin/layer-posix", 0), EROFS));
     /* A directory is not opened for writing. */
     LP_CHECK(FAILS(open("/plain", O_WRONLY), EISDIR));
-    /* A lower directory is not renamed (EXDEV), a lower file is copied up and renamed (the copy
-     * phase), a name does not leave the root, and the volume has no hard links. */
+    /* A lower directory is not renamed (EXDEV), a lower program is EROFS, a lower file is copied up
+     * and renamed (the copy phase), a name does not leave the root, and the volume has no hard links. */
     LP_CHECK(FAILS(rename("/plain", "/plain-renamed"), EXDEV));
     LP_CHECK(FAILS(rename("/etc/layer-lower", "/tmp/renamed"), EXDEV));
-    LP_CHECK(FAILS(rename("/bin/layer-posix", "/bin/renamed"), EXDEV));
+    LP_CHECK(FAILS(rename("/bin/layer-posix", "/bin/renamed"), EROFS));
     LP_CHECK(FAILS(link("/etc/layer-lower", "/etc/hard"), EMLINK));
     /* A path against a description of a lower directory is refused as well. */
     int lower = open("/plain", O_RDONLY | O_DIRECTORY);
     LP_CHECK(lower >= 0);
     LP_CHECK(FAILS(openat(lower, "../bin/layer-posix", O_WRONLY), EROFS));
-    LP_CHECK(FAILS(renameat(lower, "../bin/layer-posix", lower, "../bin/layer-posix-renamed"), EXDEV));
+    LP_CHECK(FAILS(renameat(lower, "../bin/layer-posix", lower, "../bin/layer-posix-renamed"), EROFS));
     close(lower);
     /* Nothing was written below the layers. */
     LP_CHECK(has_bytes("/etc/layer-lower", "lower of etc\n") && has_bytes("/plain/a", "a\n"));
@@ -1652,6 +1652,9 @@ static int a_lower_program_is_never_copied_and_still_runs(void) {
     LP_CHECK(FAILS(chmod("/bin/layer-posix", 0644), EROFS));
     LP_CHECK(FAILS(chown("/bin/layer-posix", 1, 1), EROFS));
     LP_CHECK(FAILS(truncate("/bin/layer-posix", 0), EROFS));
+    /* A rename of it is EROFS too (an EXDEV would make `mv` copy it and unlink it). */
+    LP_CHECK(FAILS(rename("/bin/layer-posix", "/bin/layer-posix-moved"), EROFS));
+    LP_CHECK(FAILS(stat("/bin/layer-posix-moved", &st), ENOENT));
     LP_CHECK(stat("/bin/layer-posix", &st) == 0 && st.st_dev == LAYERED_DEVICE && st.st_size > 4096);
     LP_CHECK((st.st_mode & 07777) == 0755);
     pid_t pid = 0;
@@ -1752,9 +1755,10 @@ static int lower_names_are_renamed(void) {
     /* Out of the lower directory into the layer's, over a name the layer deleted. */
     LP_CHECK(rename("/copyup/rn-move", "/etc/layer-hidden") == 0 && has_bytes("/etc/layer-hidden", "move me\n"));
     LP_CHECK(FAILS(stat("/copyup/rn-move", &after), ENOENT));
-    /* A lower directory and a lower program are EXDEV, and nothing changes for them. */
+    /* A lower directory is EXDEV and a lower program is EROFS (it is never copied, and `mv` must not
+     * copy and unlink it), and nothing changes for them. */
     LP_CHECK(FAILS(rename("/copyup/dir", "/copyup/dir-renamed"), EXDEV));
-    LP_CHECK(FAILS(rename("/bin/layer-posix", "/bin/layer-posix-renamed"), EXDEV));
+    LP_CHECK(FAILS(rename("/bin/layer-posix", "/bin/layer-posix-renamed"), EROFS));
     LP_CHECK(stat("/copyup/dir", &after) == 0 && stat("/bin/layer-posix", &after) == 0);
     LP_CHECK(FAILS(stat("/bin/layer-posix-renamed", &after), ENOENT));
     return 0;
@@ -1987,27 +1991,75 @@ static void nap_ms(long ms) {
     nanosleep(&nap, NULL);
 }
 
+static long mono_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long)(now.tv_sec * 1000 + now.tv_nsec / 1000000);
+}
+
+/* A child that renames `from` to `to`, tells the parent through `fds` the time it begins (a long
+ * word) and the time the rename returned, and ends as `rename_child` does. The parent acts between
+ * the two times, so the copy that the rename waits for is running when it does: the rename that
+ * returned before the parent acted would show the race was missed. */
+static pid_t timed_rename_child(const char *from, const char *to, int fds[2]) {
+    if (pipe(fds) != 0) return -1;
+    pid_t pid = fork();
+    if (pid != 0) return pid;
+    long begin = mono_ms();
+    if (write(fds[1], &begin, sizeof begin) != (ssize_t)sizeof begin) _exit(3);
+    int done = rename(from, to);
+    int err = errno;
+    long end = mono_ms();
+    if (write(fds[1], &end, sizeof end) != (ssize_t)sizeof end) _exit(3);
+    if (done == 0) _exit(0);
+    _exit(err == ENOENT ? 1 : 2);
+}
+
+/* Waits until the child has begun its rename (the request is at the service a moment later), then
+ * runs `act`; true when the rename was still waiting for its copy as `act` ended. */
+static int act_during_the_wait(int fds[2], int (*act)(void), int *acted) {
+    long begin = 0, end = 0;
+    if (read(fds[0], &begin, sizeof begin) != (ssize_t)sizeof begin) return 0;
+    nap_ms(30);
+    *acted = act();
+    long at = mono_ms();
+    if (read(fds[0], &end, sizeof end) != (ssize_t)sizeof end) return 0;
+    printf("layer-posix: the rename began at %ld ms, the change was made at %ld, the rename returned at %ld\n", begin, at, end);
+    return end > at;
+}
+
+static int unlink_rc_a(void) {
+    return unlink("/race/rc-a") == 0;
+}
+
 static int a_name_deleted_during_the_copy_of_a_rename_stays_deleted(void) {
     struct stat st;
-    pid_t child = rename_child("/race/rc-a", "/race/rc-a2", 0);
+    int fds[2], acted = 0;
+    pid_t child = timed_rename_child("/race/rc-a", "/race/rc-a2", fds);
     LP_CHECK(child > 0);
-    nap_ms(150);
-    LP_CHECK(unlink("/race/rc-a") == 0);
+    int waiting = act_during_the_wait(fds, unlink_rc_a, &acted);
     /* The rename that waited for the copy asks again and finds no name. */
-    LP_CHECK(wait_ok(child) == 1);
+    int code = wait_ok(child);
+    LP_CHECK(acted && waiting);
+    LP_CHECK(code == 1);
     LP_CHECK(FAILS(stat("/race/rc-a", &st), ENOENT) && FAILS(stat("/race/rc-a2", &st), ENOENT));
     LP_CHECK(listed("/race", "rc-a", 0) && listed("/race", "rc-a2", 0));
     return 0;
 }
 
+static int unlink_and_make_rc_b(void) {
+    return unlink("/race/rc-b") == 0 && put_file("/race/rc-b", "mine\n", 0644) == 0;
+}
+
 static int a_name_made_during_the_copy_of_a_rename_is_the_one_that_moves(void) {
     struct stat st;
-    pid_t child = rename_child("/race/rc-b", "/race/rc-b2", 0);
+    int fds[2], acted = 0;
+    pid_t child = timed_rename_child("/race/rc-b", "/race/rc-b2", fds);
     LP_CHECK(child > 0);
-    nap_ms(150);
-    LP_CHECK(unlink("/race/rc-b") == 0);
-    LP_CHECK(put_file("/race/rc-b", "mine\n", 0644) == 0);
-    LP_CHECK(wait_ok(child) == 0);
+    int waiting = act_during_the_wait(fds, unlink_and_make_rc_b, &acted);
+    int code = wait_ok(child);
+    LP_CHECK(acted && waiting);
+    LP_CHECK(code == 0);
     LP_CHECK(has_bytes("/race/rc-b2", "mine\n") && FAILS(stat("/race/rc-b", &st), ENOENT));
     LP_CHECK(listed("/race", "rc-b", 0) && listed("/race", "rc-b2", 1));
     return 0;
@@ -2105,8 +2157,20 @@ static int the_lower_file_is_whole_after_a_copy_without_space(void) {
     LP_CHECK(stat("/full/big", &st) == 0 && st.st_size == (off_t)FULL_BYTES);
     LP_CHECK(has_pattern("/full/big", FULL_BYTES, 0));
     LP_CHECK(FAILS(stat("/full/big2", &st), ENOENT) && listed("/full", "big", 1) && listed("/full", "big2", 0));
-    /* Let the reaper remove what the copy left in work/ before the machine stops. */
-    nap_ms(2000);
+    /* The reaper removes what the copy left in work/: a file of 64 KiB can be made on the volume
+     * again (the statvfs of the data file service lags behind the removal, so the space is tried). */
+    static char block[65536];
+    int made = 0;
+    for (long waited = 0; waited < 30000 && !made; waited += 100) {
+        int fd = open("/data/space-probe", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd >= 0) {
+            made = write(fd, block, sizeof block) == (ssize_t)sizeof block && fsync(fd) == 0;
+            close(fd);
+            unlink("/data/space-probe");
+        }
+        if (!made) nap_ms(100);
+    }
+    LP_CHECK(made);
     return 0;
 }
 

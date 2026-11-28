@@ -404,11 +404,15 @@ pub fn read_ash(lines: &[String]) -> Result<(), String> {
         ));
     }
     let after = &got[..want];
-    if !got[after.len()..].iter().any(|l| l == "write-refused") {
-        return Err(format!(
-            "the shell wrote below the layers: {:?}",
-            &got[after.len()..]
-        ));
+    // The write and the `mv` of the program are refused, and the program is there.
+    let mut rest = got[after.len()..].iter();
+    for wanted in ["write-refused", "mv-refused", "moved-none", "program-kept"] {
+        if !rest.any(|l| l == wanted) {
+            return Err(format!(
+                "the shell did not say {wanted:?} after the listing: {:?}",
+                &got[after.len()..]
+            ));
+        }
     }
     Ok(())
 }
@@ -738,11 +742,11 @@ pub const COPY_BREAKS: [(&str, &[&str]); 4] = [
 ];
 
 /// The copies of the whole run: the files of the checks that copy (nine of the probe, the two of two
-/// signals and the two files of the renames), and the five writes and the rename of a program that
-/// begin a copy the worker refuses. The link of a rename is copied in the job: no copy of the table.
-const COPIES_RESERVED: u32 = 18;
+/// signals and the two files of the renames), and the five writes and the two renames of a program
+/// that begin a copy the worker refuses. The link of a rename is copied in the job: no copy of the table.
+const COPIES_RESERVED: u32 = 19;
 const COPIES_MADE_VISIBLE: u32 = 12;
-const COPIES_FAILED: u32 = 6;
+const COPIES_FAILED: u32 = 7;
 
 const COPY_PROBE: &[&str] = &["phase-copy"];
 /// The layer service of the copy probe tells the counters of its copies.
@@ -1269,16 +1273,36 @@ pub fn copy_full(machine: &qemu::Machine) -> Result<(), String> {
     Ok(())
 }
 
-/// The points of the cut, and whether the cut leaves a file in `work/` (the points before the
-/// rename of the copy into the layer do).
-pub const CUT_POINTS: [(u8, &str, bool); 6] = [
-    (1, "the file in work/ is made, no byte in it", true),
-    (2, "the first cell of the file in work/ is written", true),
-    (3, "the file in work/ is whole and closed", true),
-    (4, "the copy is renamed into the layer", false),
-    (5, "the old name of the rename is marked", false),
-    (6, "the volume has the new name of the rename", false),
+/// The points of the cut: the number, what has happened, whether the cut leaves a file in `work/` (the
+/// points before the rename of the copy into the layer do), and whether the rename of `/cutup/b` is
+/// done (the name found after the cut is the new one). Points 1 to 4 fire in the open of `/cutup/a`,
+/// before the probe has begun the rename, so `/cutup/b` has its old name there; point 5 leaves the
+/// copy under the old name (its mark is written, the move is not), and point 6 the new name.
+pub const CUT_POINTS: [(u8, &str, bool, bool); 6] = [
+    (1, "the file in work/ is made, no byte in it", true, false),
+    (
+        2,
+        "the first cell of the file in work/ is written",
+        true,
+        false,
+    ),
+    (3, "the file in work/ is whole and closed", true, false),
+    (4, "the copy is renamed into the layer", false, false),
+    (5, "the old name of the rename is marked", false, false),
+    (6, "the volume has the new name of the rename", false, true),
 ];
+
+/// The names the probe found after a cut, from its line `cut found the old name N, the new name M`.
+pub fn cut_found(lines: &[String]) -> Result<(bool, bool), String> {
+    lines
+        .iter()
+        .find_map(|l| {
+            let rest = l.split_once("cut found the old name ")?.1;
+            let (old, new) = rest.split_once(", the new name ")?;
+            Some((old.trim() == "1", new.trim() == "1"))
+        })
+        .ok_or_else(|| "the probe did not say which names it found".to_owned())
+}
 
 /// How many names `work/` held at the start of a boot, from the line of the layer service.
 pub fn work_held(lines: &[String]) -> Result<usize, String> {
@@ -1303,7 +1327,13 @@ pub fn work_held(lines: &[String]) -> Result<usize, String> {
 
 /// One point of the cut: the service stops at the point and the machine is killed, then the same disk
 /// is started again with the verification.
-fn cut_point(machine: &qemu::Machine, point: u8, what: &str, leaves: bool) -> Result<(), String> {
+fn cut_point(
+    machine: &qemu::Machine,
+    point: u8,
+    what: &str,
+    leaves: bool,
+    moved: bool,
+) -> Result<(), String> {
     let disk = small_disk(&format!("cut{point}"), CUT_DISK_BYTES)?;
     let at = point.to_string();
     let marker = format!("layerd: cut point {point}");
@@ -1344,6 +1374,13 @@ fn cut_point(machine: &qemu::Machine, point: u8, what: &str, leaves: bool) -> Re
     .map_err(|e| format!("layer-cut {point}: {e}"))?;
     read_checks(&verify.lines, &CUT_CHECKS, PASSED_CUT)
         .map_err(|e| format!("layer-cut {point} ({what}): {e}"))?;
+    let found = cut_found(&verify.lines)?;
+    if found != (!moved, moved) {
+        return Err(format!(
+            "layer-cut {point} ({what}): the probe found (old name, new name) {found:?}, {:?} were due",
+            (!moved, moved)
+        ));
+    }
     let held = work_held(&verify.lines)?;
     if (held > 0) != leaves {
         return Err(format!(
@@ -1366,8 +1403,8 @@ fn cut_point(machine: &qemu::Machine, point: u8, what: &str, leaves: bool) -> Re
 pub fn cut_command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
     match args {
         [what] if what == "copy" => {
-            for (point, what, leaves) in CUT_POINTS {
-                cut_point(machine, point, what, leaves)?;
+            for (point, what, leaves, moved) in CUT_POINTS {
+                cut_point(machine, point, what, leaves, moved)?;
             }
             Ok(())
         }
@@ -1375,12 +1412,12 @@ pub fn cut_command(args: &[String], machine: &qemu::Machine) -> Result<(), Strin
             let point: u8 = point
                 .parse()
                 .map_err(|_| format!("layer-cut copy: {point} is not a point"))?;
-            let (_, what, leaves) = CUT_POINTS
+            let (_, what, leaves, moved) = CUT_POINTS
                 .iter()
                 .copied()
-                .find(|(p, _, _)| *p == point)
+                .find(|(p, _, _, _)| *p == point)
                 .ok_or_else(|| format!("layer-cut copy: no point {point}"))?;
-            cut_point(machine, point, what, leaves)
+            cut_point(machine, point, what, leaves, moved)
         }
         _ => Err("layer-cut copy [point 1 to 6]".to_owned()),
     }
@@ -1532,6 +1569,9 @@ mod tests {
             "tmp-bytes",
             "ash: can't create /bin/busybox-probe: Read-only file system",
             "write-refused",
+            "mv-refused",
+            "moved-none",
+            "program-kept",
         ] {
             lines.push(l.to_owned());
         }
@@ -1613,6 +1653,11 @@ mod tests {
         let points: Vec<u8> = CUT_POINTS.iter().map(|p| p.0).collect();
         assert_eq!(points, [1, 2, 3, 4, 5, 6]);
         assert!(CUT_POINTS.iter().filter(|p| p.2).count() == 3);
+        assert_eq!(CUT_POINTS.iter().filter(|p| p.3).count(), 1);
+        assert_eq!(
+            cut_found(&["layer-posix: cut found the old name 0, the new name 1".to_owned()]),
+            Ok((false, true))
+        );
         assert!(CUT_BREAK.0.starts_with("break-layerd-copy-"));
         // The breaks of the write probe name a check of its phase.
         for (feature, reread, check) in WRITE_BREAKS {

@@ -272,7 +272,11 @@ impl Table {
         let at = self.take_place()?;
         self.seq += 1;
         let p = &mut self.places[at];
-        p.generation = p.generation.wrapping_add(1).max(1);
+        // The generation `u32::MAX` is the one of `DONE_TICKET`: no copy has it.
+        p.generation = match p.generation.wrapping_add(1) {
+            0 | u32::MAX => 1,
+            g => g,
+        };
         p.state = State::Queued;
         p.kind = kind;
         p.path[..path.len()].copy_from_slice(path);
@@ -738,6 +742,18 @@ mod tests {
         assert_eq!(&name[..n], b"/.layers/work/c3-12");
         let (name, n) = work_path(0, 1);
         assert_eq!(&name[..n], b"/.layers/work/c0-1");
+    }
+
+    #[test]
+    fn no_copy_has_the_generation_of_the_ticket_that_is_over() {
+        let mut t = Table::new();
+        for place in &mut t.places {
+            place.generation = u32::MAX - 1;
+        }
+        let ticket = t.reserve(b"/etc/motd", Kind::Whole, stat(1)).unwrap();
+        assert_ne!(ticket_parts(ticket).1, u32::MAX);
+        assert_ne!(ticket, DONE_TICKET);
+        assert_eq!(t.wait(DONE_TICKET), Wait::Over(0));
     }
 
     #[test]
