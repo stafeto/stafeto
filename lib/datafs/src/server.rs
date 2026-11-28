@@ -259,6 +259,11 @@ struct Pass {
 #[derive(Clone, Copy)]
 struct Pending {
     ino: u64,
+    /// The mode, owner and group of the entry, read with it (READDIR sends only its number and
+    /// kind, not these three).
+    mode: u32,
+    uid: u32,
+    gid: u32,
     kind: Kind,
     name: [u8; crate::NAME_MAX],
     len: usize,
@@ -865,7 +870,7 @@ impl Server {
         closed
     }
 
-    fn node_at(&self, path: &[u8]) -> Option<usize> {
+    pub(super) fn node_at(&self, path: &[u8]) -> Option<usize> {
         self.nodes
             .iter()
             .position(|n| n.used && !n.orphan && n.path.get() == path)
@@ -1345,7 +1350,16 @@ impl Server {
             Method::Readdir => {
                 let di = self.find(si, r.u32()?)?;
                 r.finish()?;
-                self.do_readdir(fs, di, native, w)
+                self.do_readdir(fs, di, native, false, w)
+            }
+            Method::ReaddirAttr => {
+                // Only a native client lists with the attributes: the layered file service.
+                if !p::is_service(owner) {
+                    return Err(p::code(p::PERMISSION));
+                }
+                let di = self.find(si, r.u32()?)?;
+                r.finish()?;
+                self.do_readdir(fs, di, native, true, w)
             }
             Method::Rewind => {
                 let di = self.find(si, r.u32()?)?;
@@ -2024,7 +2038,7 @@ impl Server {
 
     /// What the attribute of the file of node `ni` will say once its pending writes are folded in:
     /// the time of the last write as `mtime` and `ctime`, the set-ID bits cleared (see `write_times`).
-    fn overlay_pending(&self, ni: usize, attr: &mut Attr) {
+    pub(super) fn overlay_pending(&self, ni: usize, attr: &mut Attr) {
         let n = &self.nodes[ni];
         if n.wrote {
             attr.mtime = n.wrote_at;
@@ -2127,7 +2141,13 @@ impl Server {
                     description.searched = true;
                     description.object = di as u8;
                 } else {
-                    let slot = match fs.opendir(path) {
+                    // The walk of the lookup named the directory's pair: it is opened with no
+                    // second walk of the path (nothing was written since, in this request).
+                    let opened = match found.pair {
+                        Some(pair) => fs.opendir_pair(pair),
+                        None => fs.opendir(path),
+                    };
+                    let slot = match opened {
                         Ok(dir) => dir.0,
                         Err(Error::NoMemory) => return Err(p::code(p::TABLE_FULL)),
                         Err(e) => return Err(status_of(e)),

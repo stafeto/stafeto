@@ -5,7 +5,7 @@
 
 use crate::volume::{Bulk, CELL, Lower, LowerStat, R, Visit, Volume};
 use proto_data as d;
-use proto_wire::Status;
+use proto_wire::{Status, Writer};
 use std::collections::BTreeMap;
 use std::string::String;
 use std::vec::Vec;
@@ -420,6 +420,47 @@ impl Volume for FakeVolume {
         }
         self.handles.get_mut(&handle).unwrap().1 = end;
         Ok(end < all.len())
+    }
+
+    fn read_dir_attr_raw(
+        &mut self,
+        handle: u32,
+        out: &mut [u8; crate::volume::BATCH_BYTES],
+    ) -> R<(usize, bool)> {
+        self.check("read_dir")?;
+        let batch = self.batch;
+        let (path, pos) = self
+            .handles
+            .get(&handle)
+            .cloned()
+            .ok_or(st(d::BAD_HANDLE))?;
+        // The position counts the children (there is no `.` and `..` to pass).
+        let all = self.children(&path);
+        let end = (pos + batch).min(all.len());
+        let mut len = 0;
+        for (name, n) in &all[pos..end] {
+            let kind = if n.dir {
+                d::KIND_DIRECTORY
+            } else {
+                d::KIND_FILE
+            };
+            let mut batch = d::DirBatch::new();
+            assert!(batch.push_attr(&d::DirAttrEntry {
+                ino: n.ino,
+                kind,
+                mode: n.mode,
+                uid: n.uid,
+                gid: n.gid,
+                name,
+            }));
+            let mut w = Writer::new();
+            batch.write(false, &mut w).unwrap();
+            let bytes = &w.as_bytes()[4..];
+            out[len..len + bytes.len()].copy_from_slice(bytes);
+            len += bytes.len();
+        }
+        self.handles.get_mut(&handle).unwrap().1 = end;
+        Ok((len, end < all.len()))
     }
 
     fn export(&mut self, handle: u32) -> R<Vec<u8>> {

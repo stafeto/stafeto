@@ -25,7 +25,7 @@ type Vol = Fs<'static, MemDevice>;
 const BLOCK_DATA: u64 = 4096 - 8;
 
 fn attach(device: MemDevice) -> Vol {
-    let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+    let state: &'static mut Storage = Box::leak(Storage::boxed());
     Fs::new(device, state).unwrap()
 }
 

@@ -125,6 +125,19 @@ static int lfs_bd_read(lfs_t *lfs,
     return 0;
 }
 
+// A read of the blocks of a file's data (the skip list, the bytes, the copy of a block): the
+// device is told the block holds file data, which the metadata block cache of the service does
+// not keep (lfs_t.data_read, read by the device's read function).
+static int lfs_bd_read_data(lfs_t *lfs,
+        const lfs_cache_t *pcache, lfs_cache_t *rcache, lfs_size_t hint,
+        lfs_block_t block, lfs_off_t off,
+        void *buffer, lfs_size_t size) {
+    lfs->data_read = 1;
+    int err = lfs_bd_read(lfs, pcache, rcache, hint, block, off, buffer, size);
+    lfs->data_read = 0;
+    return err;
+}
+
 static int lfs_bd_cmp(lfs_t *lfs,
         const lfs_cache_t *pcache, lfs_cache_t *rcache, lfs_size_t hint,
         lfs_block_t block, lfs_off_t off,
@@ -2865,6 +2878,28 @@ static int lfs_dir_open_(lfs_t *lfs, lfs_dir_t *dir, const char *path) {
     return 0;
 }
 
+// stafeto: the tail of lfs_dir_open_ for a directory whose metadata pair is known (the one
+// lfs_path_attrs gave for its path), so the path is not walked again.
+static int lfs_dir_open_pair_(lfs_t *lfs, lfs_dir_t *dir, const lfs_block_t pair[2]) {
+    // fetch first pair
+    int err = lfs_dir_fetch(lfs, &dir->m, pair);
+    if (err) {
+        return err;
+    }
+
+    // setup entry
+    dir->head[0] = dir->m.pair[0];
+    dir->head[1] = dir->m.pair[1];
+    dir->id = 0;
+    dir->pos = 0;
+
+    // add to list of mdirs
+    dir->type = LFS_TYPE_DIR;
+    lfs_mlist_append(lfs, (struct lfs_mlist *)dir);
+
+    return 0;
+}
+
 static int lfs_dir_close_(lfs_t *lfs, lfs_dir_t *dir) {
     // remove from list of mdirs
     lfs_mlist_remove(lfs, (struct lfs_mlist *)dir);
@@ -3031,7 +3066,7 @@ static int lfs_ctz_find(lfs_t *lfs,
                 lfs_npw2(current-target+1) - 1,
                 lfs_ctz(current));
 
-        int err = lfs_bd_read(lfs,
+        int err = lfs_bd_read_data(lfs,
                 pcache, rcache, sizeof(head),
                 head, 4*skip, &head, sizeof(head));
         head = lfs_fromle32(head);
@@ -3128,7 +3163,7 @@ static int lfs_ctz_find_hinted(lfs_t *lfs, lfs_file_t *file,
                 lfs_npw2(current-target+1) - 1,
                 lfs_ctz(current));
 
-        int err = lfs_bd_read(lfs,
+        int err = lfs_bd_read_data(lfs,
                 NULL, &file->cache, sizeof(head),
                 head, 4*skip, &head, sizeof(head));
         head = lfs_fromle32(head);
@@ -3181,7 +3216,7 @@ static int lfs_ctz_extend(lfs_t *lfs,
             if (noff != lfs->cfg->block_size) {
                 for (lfs_off_t i = 0; i < noff; i++) {
                     uint8_t data;
-                    err = lfs_bd_read(lfs,
+                    err = lfs_bd_read_data(lfs,
                             NULL, rcache, noff-i,
                             head, i, &data, 1);
                     if (err) {
@@ -3221,7 +3256,7 @@ static int lfs_ctz_extend(lfs_t *lfs,
                 }
 
                 if (i != skips-1) {
-                    err = lfs_bd_read(lfs,
+                    err = lfs_bd_read_data(lfs,
                             NULL, rcache, sizeof(nhead),
                             nhead, 4*i, &nhead, sizeof(nhead));
                     nhead = lfs_fromle32(nhead);
@@ -3267,7 +3302,7 @@ static int lfs_ctz_traverse(lfs_t *lfs,
 
         lfs_block_t heads[2];
         int count = 2 - (index & 1);
-        err = lfs_bd_read(lfs,
+        err = lfs_bd_read_data(lfs,
                 pcache, rcache, count*sizeof(head),
                 head, 0, &heads, count*sizeof(head));
         heads[0] = lfs_fromle32(heads[0]);
@@ -3527,7 +3562,7 @@ static int lfs_file_relocate(lfs_t *lfs, lfs_file_t *file) {
                     return err;
                 }
             } else {
-                err = lfs_bd_read(lfs,
+                err = lfs_bd_read_data(lfs,
                         &file->cache, &lfs->rcache, file->off-i,
                         file->block, i, &data, 1);
                 if (err) {
@@ -3832,7 +3867,7 @@ static lfs_ssize_t lfs_file_flushedread(lfs_t *lfs, lfs_file_t *file,
                 return err;
             }
         } else {
-            int err = lfs_bd_read(lfs,
+            int err = lfs_bd_read_data(lfs,
                     NULL, &file->cache, lfs->cfg->block_size,
                     file->block, file->off, data, diff);
             if (err) {
@@ -4247,7 +4282,7 @@ static int lfs_stat_attr_(lfs_t *lfs, const char *path, struct lfs_info *info,
 // middle of the path): the entries that were found before the failure are there.
 static int lfs_path_attrs_(lfs_t *lfs, const char *path, struct lfs_info *info,
         uint8_t type, struct lfs_path_attr *out, void *buffer, lfs_size_t size,
-        lfs_size_t capacity, lfs_size_t *count) {
+        lfs_size_t capacity, lfs_size_t *count, lfs_block_t *last) {
     struct lfs_path_walk walk = {
         .type = type,
         .out = out,
@@ -4268,6 +4303,21 @@ static int lfs_path_attrs_(lfs_t *lfs, const char *path, struct lfs_info *info,
     if (strchr(path, '/') != NULL
             && lfs_tag_type3(tag) != LFS_TYPE_DIR) {
         return LFS_ERR_NOTDIR;
+    }
+
+    // the metadata pair of the directory the path names, from the pair that holds its entry
+    if (last && lfs_tag_type3(tag) == LFS_TYPE_DIR) {
+        if (lfs_tag_id(tag) == 0x3ff) {
+            last[0] = lfs->root[0];
+            last[1] = lfs->root[1];
+        } else {
+            lfs_stag_t res = lfs_dir_get(lfs, &cwd, LFS_MKTAG(0x700, 0x3ff, 0),
+                    LFS_MKTAG(LFS_TYPE_STRUCT, lfs_tag_id(tag), 8), last);
+            if (res < 0) {
+                return (int)res;
+            }
+            lfs_pair_fromle32(last);
+        }
     }
 
     return lfs_dir_getinfo(lfs, &cwd, lfs_tag_id(tag), info);
@@ -6749,18 +6799,18 @@ int lfs_stat_attr(lfs_t *lfs, const char *path, struct lfs_info *info,
 
 int lfs_path_attrs(lfs_t *lfs, const char *path, struct lfs_info *info,
         uint8_t type, struct lfs_path_attr *out, void *buffer, lfs_size_t size,
-        lfs_size_t capacity, lfs_size_t *count) {
+        lfs_size_t capacity, lfs_size_t *count, lfs_block_t *last) {
     int err = LFS_LOCK(lfs->cfg);
     if (err) {
         return err;
     }
     LFS_TRACE("lfs_path_attrs(%p, \"%s\", %p, %"PRIu8", %p, %p, %"PRIu32", "
-                "%"PRIu32", %p)",
+                "%"PRIu32", %p, %p)",
             (void*)lfs, path, (void*)info, type, (void*)out, buffer, size,
-            capacity, (void*)count);
+            capacity, (void*)count, (void*)last);
 
     err = lfs_path_attrs_(lfs, path, info, type, out, buffer, size,
-            capacity, count);
+            capacity, count, last);
 
     LFS_TRACE("lfs_path_attrs -> %d", err);
     LFS_UNLOCK(lfs->cfg);
@@ -7065,6 +7115,22 @@ int lfs_dir_open(lfs_t *lfs, lfs_dir_t *dir, const char *path) {
     err = lfs_dir_open_(lfs, dir, path);
 
     LFS_TRACE("lfs_dir_open -> %d", err);
+    LFS_UNLOCK(lfs->cfg);
+    return err;
+}
+
+int lfs_dir_open_pair(lfs_t *lfs, lfs_dir_t *dir, const lfs_block_t pair[2]) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_dir_open_pair(%p, %p, {0x%"PRIx32", 0x%"PRIx32"})",
+            (void*)lfs, (void*)dir, pair[0], pair[1]);
+    LFS_ASSERT(!lfs_mlist_isopen(lfs->mlist, (struct lfs_mlist*)dir));
+
+    err = lfs_dir_open_pair_(lfs, dir, pair);
+
+    LFS_TRACE("lfs_dir_open_pair -> %d", err);
     LFS_UNLOCK(lfs->cfg);
     return err;
 }

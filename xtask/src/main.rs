@@ -96,6 +96,7 @@ mod layer_client;
 mod layer_names;
 mod layer_posix;
 mod layer_probe;
+mod layer_reads;
 mod layer_restart;
 mod layer_steps;
 mod layer_time;
@@ -2653,6 +2654,7 @@ commands:
   posix-random-net-two-steps the same under -icount, the steps of both instances
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
   layer-posix run the C probe of the POSIX layer on the layered root (open, read, stat, readdir, chdir, openat, fork, spawn and exec of the descriptions of the layer service, the rights of another user, EROFS for writes to the lower set, the session in the slot of a set-ID program) over the layer service on a volume made offline, in QEMU; with the argument breaks: the probe built with each deliberate break of the layer (no path routed to the service, no session for a child, no session check in the loader), which it must catch; with the argument ash: BusyBox's ash on the layered root (`ls -la /etc` and reads of names of the layers); with the argument script: a script that starts with `#!` in a layer of the user runs through its interpreter (exec and spawn, the interpreter checked as every program is; with script breaks: an interpreter not checked, which the probe must catch); with the argument boot: the write guard of the RAM file service is on after READY of the layer service, and a machine with no data volume has the root in memory with no guard (with boot breaks: the guard on from the start, which must fail the write); with the argument write: the changes of names on the layer (create, write, mkdir, unlink and rmdir of lower names as marks of deletion, an opaque directory, rename, symbolic links, the rights of another user, a sticky directory) and a second boot on the same disk that must see the same names; with write breaks: the same with each deliberate break of the layer service (no mark of deletion on the volume, no sticky check), which it must catch; with the argument copy: the copy up of a lower file on its first write (the number, owner, mode and times kept, an empty copy for `O_TRUNC`, a lower directory and a lower link, a program that is never copied, two writers and one copy, a signal during the wait of a copy of 16 MiB: EINTR without SA_RESTART, success with it) and a second boot on the same disk that sees the copies and finds `work/` empty; with copy breaks: the same with each deliberate break of the copy (numbers of the counter, no attributes, a program copied, a rename that leaves the old name unmarked), which it must catch; with copy race: names deleted and made during the copy of a rename, two renames of one file, fourteen files for the twelve places of the table of copies; with copy full: a copy of a file of 20 MiB on a volume of 16 MiB (ENOSPC for every waiter, the lower file whole, work/ empty on the next boot)
+  layer-reads the reads of the device the build of the layer index takes on the volume of the scale probe, in memory (the host cost of a build; the gate is 5,000)
   layer-steps run the steps of the layer service at the scale of its limits under -icount on one CPU (a volume of 8,192 names in the live layer: a chain of 246 directories with a file at its end, a path of 253 components, a merged listing of 1,024 names): the probe passes and no step of the service is over 0.9 B, while a lower file of 64 MiB is copied up meanwhile (the reads of the copy in the RAM file service are under the gate too); with the argument breaks: the service that walks the whole layer in one step, and the one that copies in its own step, which the gate must fail
   layer-cut copy [N] the power cut during a copy up and between the steps of the rename of a lower file: the layer service built with the feature probe-cut stops at each of six points (the file in work/ made, its first cell written, the file whole and closed, the copy renamed into the layer, the old name of the rename marked, the volume with the new name) and the machine is killed on the line; the same disk is started again and a probe must find the copied file whole with the lower attributes, the renamed file under the old name or the new and never both and never torn, the cut rename done again, and work/ cleared at the start (held where the cut left a file in it); with the argument breaks: the layer service that makes the copy at its final name, which the probe after a cut in the middle of the copy must catch
   layer-restart run the probe of the restarts of the layer service and the data file service (the layer service ends on an OPEN of /.die and after the data file service ended, both come back: the old session is dead, a description of the old instance answers STALE, a file the data file service holds is read on, a new session lists and reads as before); with the argument breaks: the layer service whose instances all carry one epoch, which the probe must fail
@@ -3109,6 +3111,7 @@ fn main() {
         Some("data-posix") => data_posix::command(&args[1..], &qemu::VIRT),
         Some("layer-names-probe") => layer_names::command(&args[1..], &qemu::VIRT),
         Some("layer-steps") => layer_steps::command(&args[1..], &qemu::VIRT),
+        Some("layer-reads") => layer_reads::command(&args[1..]),
         Some("layer-restart") => layer_restart::command(&args[1..], &qemu::VIRT),
         Some("layer-posix") => layer_posix::command(&args[1..], &qemu::VIRT),
         Some("layer-cut") => layer_posix::cut(&args[1..], &qemu::VIRT),
@@ -3395,7 +3398,7 @@ const NVME_BREAKS: [&str; 10] = [
 /// The deliberate breaks of the data volume (`cargo xtask datafs-breaks`): each is a feature of
 /// `lib/datafs` that does one wrong thing, and its host tests (a cut of the power at every sector of a
 /// workload, the table of a new volume, the protocol) pass without it and fail with it.
-const DATAFS_BREAKS: [&str; 16] = [
+const DATAFS_BREAKS: [&str; 17] = [
     "break-datafs-sync",
     "break-datafs-consistent",
     "break-datafs-busy",
@@ -3412,6 +3415,7 @@ const DATAFS_BREAKS: [&str; 16] = [
     "break-datafs-layers-visible",
     "break-datafs-tail-whole",
     "break-datafs-numbered-any",
+    "break-datafs-cache-stale",
 ];
 
 /// The breaks to run: every one of `DATAFS_BREAKS`, or only the ones `named` (each must be one of

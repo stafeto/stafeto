@@ -14,8 +14,11 @@ pub const PATH_MAX: usize = 511;
 /// A larger volume would walk the tree on every STATFS and every wrap of the allocator, so
 /// `volume::open` refuses it.
 pub const BLOCKS_MAX: u64 = 1 << 20;
+/// The blocks of the cache of metadata blocks (`csrc/glue.c`: 128 sets of 4 ways), each of 4 KiB.
+pub const CACHE_BLOCKS: usize = 512;
 /// The bytes of memory a volume uses at most (`Storage`); the C structure is checked against it.
-pub const STORAGE_BYTES: usize = (56 + 68 + 128 + 48) * 1024;
+/// The cache of metadata blocks is 2 MiB of it (the statics of the service grow by 512 pages).
+pub const STORAGE_BYTES: usize = (56 + 68 + 128 + 48) * 1024 + CACHE_BLOCKS * 4096 + 8 * 1024;
 
 unsafe extern "C" {
     fn datafs_state_size() -> usize;
@@ -70,6 +73,7 @@ unsafe extern "C" {
         name: *mut u8,
     ) -> c_int;
     fn datafs_opendir(d: *mut c_void, ctx: *mut c_void, path: *const c_char) -> c_int;
+    fn datafs_opendir_pair(d: *mut c_void, ctx: *mut c_void, pair0: u32, pair1: u32) -> c_int;
     fn datafs_closedir(d: *mut c_void, ctx: *mut c_void, slot: c_int) -> c_int;
     fn datafs_readdir(
         d: *mut c_void,
@@ -115,6 +119,8 @@ unsafe extern "C" {
     fn datafs_set_block_cycles(d: *mut c_void, cycles: i32);
     fn datafs_set_ctz_hints(d: *mut c_void, hints: u32);
     fn datafs_set_trust_prog(d: *mut c_void, on: u32);
+    fn datafs_set_cache(d: *mut c_void, on: u32);
+    fn datafs_cache_stats(d: *const c_void, out: *mut u32);
     fn datafs_erases(d: *const c_void) -> u32;
     fn datafs_open_attr(
         d: *mut c_void,
@@ -186,6 +192,20 @@ unsafe extern "C" fn datafs_rs_prog(
     }
 }
 
+/// The stop and yield points of a walk for a read the cache answered (`Device::checkpoint`).
+///
+/// # Safety
+/// As `datafs_rs_read`.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn datafs_rs_check(ctx: Ctx) -> c_int {
+    // SAFETY: as above.
+    let device = unsafe { &mut *(ctx as *mut &mut dyn Device) };
+    match device.checkpoint() {
+        Ok(()) => 0,
+        Err(_) => Error::Io.code(),
+    }
+}
+
 /// # Safety
 /// As `datafs_rs_read`.
 #[unsafe(no_mangle)]
@@ -214,6 +234,27 @@ pub struct Storage([u8; STORAGE_BYTES]);
 impl Storage {
     pub const fn new() -> Self {
         Self([0; STORAGE_BYTES])
+    }
+}
+
+#[cfg(any(test, feature = "model"))]
+extern crate std;
+
+#[cfg(any(test, feature = "model"))]
+impl Storage {
+    /// A volume's memory on the heap, made in place (a `Storage` is large, and a host test thread
+    /// has a small stack): for the tests and the host tools.
+    pub fn boxed() -> std::boxed::Box<Storage> {
+        let layout = core::alloc::Layout::new::<Storage>();
+        // SAFETY: the layout is that of `Storage`, whose every bit pattern is valid (a zeroed
+        // array), and the box owns the block the global allocator made for that layout.
+        unsafe {
+            let at = std::alloc::alloc_zeroed(layout).cast::<Storage>();
+            if at.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            std::boxed::Box::from_raw(at)
+        }
     }
 }
 
@@ -732,6 +773,15 @@ impl<'a, D: Device> Fs<'a, D> {
         check(slot).map(|slot| Dir(slot as u8))
     }
 
+    /// `opendir` of the directory a walk just named (the pair `path_attrs_pair` gave), with no walk
+    /// of its path: nothing may have been written to the volume since the walk, so the pair is used
+    /// in the call that got it and kept nowhere.
+    pub fn opendir_pair(&mut self, pair: DirPair) -> Res<Dir> {
+        // SAFETY: as above.
+        let slot = self.call(|d, ctx| unsafe { datafs_opendir_pair(d, ctx, pair.0[0], pair.0[1]) });
+        check(slot).map(|slot| Dir(slot as u8))
+    }
+
     pub fn closedir(&mut self, dir: Dir) -> Res<()> {
         // SAFETY: as above.
         check(self.call(|d, ctx| unsafe { datafs_closedir(d, ctx, c_int::from(dir.0)) })).map(drop)
@@ -895,6 +945,21 @@ impl<D: Device> Fs<'_, D> {
         unsafe { datafs_set_trust_prog(self.state.0.as_mut_ptr().cast(), on) };
     }
 
+    /// The cache of metadata blocks on (the service's setting, from the setup) or off, for the
+    /// measurements and the tests that compare the two.
+    pub fn set_cache(&mut self, on: bool) {
+        // SAFETY: as `set_orphan_table`.
+        unsafe { datafs_set_cache(self.state.0.as_mut_ptr().cast(), u32::from(on)) };
+    }
+
+    /// The reads the cache of metadata blocks answered and the blocks it loaded since the setup.
+    pub fn cache_stats(&self) -> (u32, u32) {
+        let mut out = [0u32; 2];
+        // SAFETY: the state is the one `Fs::new` set up, and `out` has room for two words.
+        unsafe { datafs_cache_stats(self.state.0.as_ptr().cast(), out.as_mut_ptr()) };
+        (out[0], out[1])
+    }
+
     /// A table of the repair of orphans of `cells` cells (0 is none), before the next mount.
     pub fn set_orphan_cells(&mut self, cells: u32) {
         // SAFETY: as `set_orphan_table`.
@@ -956,6 +1021,7 @@ unsafe extern "C" {
         each: u32,
         capacity: u32,
         count: *mut u32,
+        pair: *mut u32,
     ) -> c_int;
     fn datafs_stat_attr(
         d: *mut c_void,
@@ -1072,10 +1138,25 @@ impl<D: Device> Fs<'_, D> {
         bytes: &mut [u8],
         each: usize,
     ) -> (usize, Res<Info>) {
+        let (count, info, _) = self.path_attrs_pair(path, attr, entries, bytes, each);
+        (count, info)
+    }
+
+    /// `path_attrs`, and the metadata pair of the directory the path names (None for a file and
+    /// for a failed walk), for `opendir_pair`.
+    pub fn path_attrs_pair(
+        &mut self,
+        path: &[u8],
+        attr: u8,
+        entries: &mut [PathEntry],
+        bytes: &mut [u8],
+        each: usize,
+    ) -> (usize, Res<Info>, Option<DirPair>) {
         let path = match CPath::new(path) {
             Ok(path) => path,
-            Err(e) => return (0, Err(e)),
+            Err(e) => return (0, Err(e), None),
         };
+        let mut pair = [u32::MAX; 2];
         let capacity = entries
             .len()
             .min(bytes.len().checked_div(each).unwrap_or(usize::MAX));
@@ -1097,15 +1178,24 @@ impl<D: Device> Fs<'_, D> {
                 u32::try_from(each).unwrap_or(u32::MAX),
                 u32::try_from(capacity).unwrap_or(u32::MAX),
                 &mut count,
+                pair.as_mut_ptr(),
             )
         });
         let count = count as usize;
         match check(status).and_then(|_| kind_of(kind)) {
-            Ok(kind) => (count, Ok(Info { kind, size })),
-            Err(e) => (count, Err(e)),
+            Ok(kind) => (
+                count,
+                Ok(Info { kind, size }),
+                (pair[0] != u32::MAX).then_some(DirPair(pair)),
+            ),
+            Err(e) => (count, Err(e), None),
         }
     }
 }
+
+/// The blocks of the metadata pair of a directory (`Fs::path_attrs_pair`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirPair([u32; 2]);
 
 /// One entry of a path as `Fs::path_attrs` gives it: its kind and the size of its attribute.
 #[repr(C)]

@@ -62,7 +62,7 @@ impl Rig {
 
     /// A rig on a formatted volume with the mount work not run and no hidden directory.
     pub fn new_unmade() -> Rig {
-        let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+        let state: &'static mut Storage = Box::leak(Storage::boxed());
         let mut fs = Fs::new(MemDevice::new(SECTORS), state).unwrap();
         fs.format().unwrap();
         fs.mount().unwrap();
@@ -74,7 +74,7 @@ impl Rig {
 
     /// A rig on `device` whose conversion job has not run: the mount work only read the mark.
     pub fn unconverted(device: MemDevice) -> Rig {
-        let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+        let state: &'static mut Storage = Box::leak(Storage::boxed());
         let mut fs = Fs::new(device, state).unwrap();
         fs.mount().unwrap();
         let mut server = Server::new();
@@ -90,7 +90,7 @@ impl Rig {
     }
 
     pub fn on(device: MemDevice) -> Rig {
-        let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+        let state: &'static mut Storage = Box::leak(Storage::boxed());
         let mut fs = Fs::new(device, state).unwrap();
         if fs.mount().is_err() {
             fs.format().unwrap();
@@ -1155,7 +1155,7 @@ fn where_tells_the_path_of_a_description_and_no_entry_for_an_unlinked_file() {
 #[test]
 fn a_volume_of_version_2_gets_its_attributes_at_the_first_mount_and_the_mark_then() {
     // The volume as the 0.5 service left it: /ssh and /ssh/host_key with no attribute.
-    let mut state = Storage::new();
+    let mut state = Storage::boxed();
     let mut fs = Fs::new(MemDevice::new(SECTORS), &mut state).unwrap();
     fs.format().unwrap();
     fs.mount().unwrap();
@@ -1225,7 +1225,7 @@ fn a_volume_of_version_2_gets_its_attributes_at_the_first_mount_and_the_mark_the
 
 #[test]
 fn a_volume_whose_format_is_above_this_one_is_refused_and_left_alone() {
-    let mut state = Storage::new();
+    let mut state = Storage::boxed();
     let mut fs = Fs::new(MemDevice::new(SECTORS), &mut state).unwrap();
     fs.format().unwrap();
     fs.mount().unwrap();
@@ -1980,6 +1980,17 @@ fn a_cold_stat_at_depth_200_costs_about_three_reads_a_level_and_depth_253_is_acc
 
 #[test]
 fn a_read_that_fails_in_a_listing_loses_no_entry_and_repeats_none() {
+    failing_reads_in_a_listing(false);
+}
+
+/// The same with the cache of metadata blocks on: a failed read of the device is no block of the
+/// cache, and the reads the cache answers are not points of failure.
+#[test]
+fn a_read_that_fails_in_a_listing_with_the_cache_on_loses_no_entry_and_repeats_none() {
+    failing_reads_in_a_listing(true);
+}
+
+fn failing_reads_in_a_listing(cache: bool) {
     let mut rig = Rig::new();
     rig.mkdir(ROOT, b"/d", 0o755).unwrap();
     let mut want: Vec<String> = vec![".".into(), "..".into()];
@@ -1991,9 +2002,13 @@ fn a_read_that_fails_in_a_listing_loses_no_entry_and_repeats_none() {
     rig.fs.unmount().unwrap();
     let device = rig.fs.into_device();
     let mut tried = 0;
-    for k in 0..40 {
+    // With the cache a listing reads the device a few times only: the points are the first reads.
+    for k in 0..if cache { 6 } else { 40 } {
         let mut rig = Rig::on(device.clone());
         let dir = rig.open(ROOT, b"/d", p::DIRECTORY | p::READ, 0).unwrap();
+        // Off: the point counts the reads of the device, none answered by the cache. On: the cache
+        // is empty when the listing starts, so the first reads are the points.
+        rig.fs.set_cache(cache);
         rig.fs.device().fail_read_after(Some(k));
         let (mut got, mut errors) = (Vec::new(), 0);
         loop {
@@ -2711,7 +2726,7 @@ fn a_write_at_the_start_or_in_the_middle_of_an_old_inline_file_after_the_mount_w
 #[test]
 fn the_conversion_job_moves_the_inline_files_once_and_marks_the_volume() {
     use crate::attr::{ATTR_FORMAT_TYPE, VOLUME_FORMAT};
-    let mut state = Storage::new();
+    let mut state = Storage::boxed();
     let mut fs = Fs::new(part_a_volume(), &mut state).unwrap();
     fs.mount().unwrap();
     let mut server = Server::new();
@@ -2739,7 +2754,7 @@ fn without_the_move_out_a_write_in_the_middle_of_an_old_inline_file_is_lost() {
     // What the mount work protects against (littlefs 2.11.3 with inline data off): the write fails at
     // close with CORRUPT and the old data stays. If this test fails, littlefs no longer loses the
     // write and the move-out is not needed for it.
-    let mut state = Storage::new();
+    let mut state = Storage::boxed();
     let mut fs = Fs::new(part_a_volume(), &mut state).unwrap();
     fs.mount().unwrap();
     let f = fs.open(b"/ssh/host_key", crate::Open::READ_WRITE).unwrap();
@@ -2755,7 +2770,7 @@ fn without_the_move_out_a_write_in_the_middle_of_an_old_inline_file_is_lost() {
 fn a_move_out_that_is_skipped_leaves_the_write_lost_which_the_test_of_the_mount_work_sees() {
     // The planted fault: mount work with no move-out (the mark set, nothing moved) loses the write.
     use crate::attr::{ATTR_FORMAT_TYPE, VOLUME_FORMAT};
-    let mut state = Storage::new();
+    let mut state = Storage::boxed();
     let mut fs = Fs::new(part_a_volume(), &mut state).unwrap();
     fs.mount().unwrap();
     fs.setattr(b"/", ATTR_FORMAT_TYPE, &VOLUME_FORMAT.to_le_bytes())
@@ -3049,7 +3064,7 @@ fn ready_does_not_wait_for_the_job_and_a_request_is_served_between_its_steps() {
 /// A volume made offline as the fill probe makes it: files of 1 MiB and small ones, no hidden
 /// directory of the orphans, no mark and no attribute.
 fn volume_full_of_files() -> (MemDevice, u64) {
-    let mut state = Storage::new();
+    let mut state = Storage::boxed();
     let mut fs = Fs::new(MemDevice::new(131_072), &mut state).unwrap();
     fs.format().unwrap();
     fs.mount().unwrap();
@@ -3091,7 +3106,7 @@ const READY_READS_MAX: u64 = 1_500;
 fn the_work_before_ready_does_not_traverse_the_files_of_a_volume_full_of_them() {
     let (device, used) = volume_full_of_files();
     assert!(used > 7_000, "{used} blocks used");
-    let mut state = Storage::new();
+    let mut state = Storage::boxed();
     let mut fs = Fs::new(device.clone(), &mut state).unwrap();
     fs.mount().unwrap();
     let reads = fs.device().reads;
@@ -3106,7 +3121,7 @@ fn the_work_before_ready_does_not_traverse_the_files_of_a_volume_full_of_them() 
     );
     // The same volume with the hidden directory made at the mount (the earlier order): the first
     // allocation scans the window, a traversal of every file's blocks.
-    let mut state = Storage::new();
+    let mut state = Storage::boxed();
     let mut fs = Fs::new(device, &mut state).unwrap();
     fs.mount().unwrap();
     let reads = fs.device().reads;
@@ -3120,7 +3135,7 @@ fn the_work_before_ready_does_not_traverse_the_files_of_a_volume_full_of_them() 
         "{before} reads: the test cannot tell the order apart"
     );
     // After READY the directory is made by its own job.
-    let mut state = Storage::new();
+    let mut state = Storage::boxed();
     let mut fs = Fs::new(MemDevice::new(131_072), &mut state).unwrap();
     fs.format().unwrap();
     fs.mount().unwrap();

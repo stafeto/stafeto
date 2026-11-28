@@ -48,6 +48,13 @@ pub trait Volume {
     /// One batch of the entries of the directory description `handle`, `.` and `..` included;
     /// whether more follow.
     fn read_dir(&mut self, handle: u32, visit: Visit<'_>) -> R<bool>;
+    /// One batch of the entries of the directory description `handle` with their attributes and
+    /// without `.` and `..` (READDIR_ATTR), as the bytes of the reply after its `more` word (for
+    /// each entry the number u64, the kind u32, the length of the name u32, the mode, owner and
+    /// group u32 and the name: `proto_data::dir_attr_entry` reads them) copied to `out`; the length
+    /// and whether more follow. The build of the index reads a batch in one step and takes its
+    /// entries in others.
+    fn read_dir_attr_raw(&mut self, handle: u32, out: &mut [u8; BATCH_BYTES]) -> R<(usize, bool)>;
     /// The pass of the description `handle`.
     fn export(&mut self, handle: u32) -> R<Self::Pass>;
     /// One batch of the entries of the directory description `handle` as the bytes of the reply

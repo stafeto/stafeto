@@ -144,7 +144,7 @@ mod tests {
     }
 
     fn rig() -> (Server, Fs<'static, MemDevice>) {
-        let state: &'static mut Storage = Box::leak(Box::new(Storage::new()));
+        let state: &'static mut Storage = Box::leak(Storage::boxed());
         let mut fs = Fs::new(MemDevice::new(4096), state).unwrap();
         fs.format().unwrap();
         fs.mount().unwrap();

@@ -521,6 +521,10 @@ typedef struct lfs {
     lfs_size_t attr_max;
     lfs_size_t inline_max;
 
+    // Set while a read is for the data of a file, clear for metadata: the read function of
+    // the configuration may keep metadata blocks only (a change of stafeto).
+    uint8_t data_read;
+
 #ifdef LFS_MIGRATE
     struct lfs1 *lfs1;
 #endif
@@ -606,10 +610,12 @@ struct lfs_path_attr {
 // Returns 0, or a negative error code: LFS_ERR_NOENT for a missing entry and LFS_ERR_NOTDIR
 // for a file in the middle of the path, with *count counting the entries that were found
 // before it (the root and the directories above the missing name), and LFS_ERR_NAMETOOLONG
-// for a path with more entries than capacity (*count is capacity then).
+// for a path with more entries than capacity (*count is capacity then). When the path names a
+// directory and last is not NULL, last receives the blocks of its metadata pair, which
+// lfs_dir_open_pair opens with no walk of the path.
 int lfs_path_attrs(lfs_t *lfs, const char *path, struct lfs_info *info,
         uint8_t type, struct lfs_path_attr *out, void *buffer, lfs_size_t size,
-        lfs_size_t capacity, lfs_size_t *count);
+        lfs_size_t capacity, lfs_size_t *count, lfs_block_t *last);
 
 // Find info about a file or directory and one of its custom attributes
 //
@@ -778,6 +784,13 @@ int lfs_mkdir(lfs_t *lfs, const char *path);
 // Once open a directory can be used with read to iterate over files.
 // Returns a negative error code on failure.
 int lfs_dir_open(lfs_t *lfs, lfs_dir_t *dir, const char *path);
+
+// Open a directory by the blocks of its metadata pair
+//
+// stafeto: the open of lfs_dir_open without the walk of a path, for a pair that
+// lfs_path_attrs gave a moment ago (nothing may have been written since).
+// Returns a negative error code on failure.
+int lfs_dir_open_pair(lfs_t *lfs, lfs_dir_t *dir, const lfs_block_t pair[2]);
 
 // Close a directory
 //

@@ -298,6 +298,19 @@ impl Volume for Data {
         Ok((rest.len(), more))
     }
 
+    fn read_dir_attr_raw(&mut self, handle: u32, out: &mut [u8; BATCH_BYTES]) -> R<(usize, bool)> {
+        let buf = self.call(|w| p::handle_call(Method::ReaddirAttr, handle, w))?;
+        let mut r = p::reply(&buf.bytes[..buf.len])?;
+        let more = match r.u32()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Status::BadSize),
+        };
+        let rest = r.bytes(r.left())?;
+        out[..rest.len()].copy_from_slice(rest);
+        Ok((rest.len(), more))
+    }
+
     fn export(&mut self, handle: u32) -> R<Self::Pass> {
         let (mut reply, _) = self.exchange(|w| p::handle_call(Method::Export, handle, w))?;
         reply.handles.take_any(0).map_err(|_| Status::BadSize)

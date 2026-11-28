@@ -55,7 +55,7 @@ fn written(fs: &mut Fs<'_, MemDevice>, name: &[u8], data: &[u8]) -> crate::fs::F
 #[test]
 fn littlefs_loses_the_blocks_of_an_unlinked_open_file() {
     for (len, kept) in [(10usize, true), (300, true), (5000, false), (40000, false)] {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut fs = mounted(&mut state);
         let data = bytes(len, 1);
         let f = written(&mut fs, b"/a", &data);
@@ -78,7 +78,7 @@ fn littlefs_loses_the_blocks_of_an_unlinked_open_file() {
 /// A file replaced by a rename is in the same case.
 #[test]
 fn littlefs_loses_the_blocks_of_an_open_file_that_a_rename_replaces() {
-    let mut state = Storage::new();
+    let mut state = Storage::boxed();
     let mut fs = mounted(&mut state);
     let data = bytes(40000, 1);
     let f = written(&mut fs, b"/a", &data);
@@ -95,7 +95,7 @@ fn littlefs_loses_the_blocks_of_an_open_file_that_a_rename_replaces() {
 /// rename is not committed by the sync, which still returns success.
 #[test]
 fn littlefs_detaches_an_open_file_that_is_renamed() {
-    let mut state = Storage::new();
+    let mut state = Storage::boxed();
     let mut fs = mounted(&mut state);
     let data = bytes(40000, 1);
     let f = written(&mut fs, b"/c", &data);
@@ -111,7 +111,7 @@ fn littlefs_detaches_an_open_file_that_is_renamed() {
 /// other's bytes, which is why the service shares one open file among the descriptions of a path.
 #[test]
 fn littlefs_gives_two_opens_of_one_name_no_common_view() {
-    let mut state = Storage::new();
+    let mut state = Storage::boxed();
     let mut fs = mounted(&mut state);
     let one = fs.open(b"/t", Open::READ_WRITE.with(Open::CREATE)).unwrap();
     let two = fs.open(b"/t", Open::READ_WRITE).unwrap();
@@ -263,7 +263,7 @@ mod served {
 
     #[test]
     fn each_description_has_its_position_and_the_file_is_shared() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let a = t.open(1, b"/f", RW);
         let b = t.open(1, b"/f", p::READ);
@@ -303,7 +303,7 @@ mod served {
 
     #[test]
     fn pread_and_pwrite_leave_the_position_alone() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let f = t.open(1, b"/f", RW);
         t.write(1, f, b"0123456789");
@@ -329,7 +329,7 @@ mod served {
 
     #[test]
     fn append_writes_go_to_the_end_whoever_wrote_last() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let a = t.open(1, b"/log", p::WRITE | p::CREATE | p::APPEND);
         let b = t.open(2, b"/log", p::WRITE | p::READ | p::APPEND);
@@ -367,7 +367,7 @@ mod served {
 
     #[test]
     fn an_unlinked_open_file_stays_until_its_last_description_closes() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let data = bytes(40000, 9);
         let f = t.open(1, b"/big", RW);
@@ -420,7 +420,7 @@ mod served {
 
     #[test]
     fn an_open_file_can_be_renamed_and_written_after() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let data = bytes(40000, 5);
         let f = t.open(1, b"/c", RW);
@@ -445,7 +445,7 @@ mod served {
 
     #[test]
     fn a_rename_over_an_open_file_leaves_the_old_one_to_its_readers() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let old = bytes(30000, 1);
         let f = t.open(1, b"/target", RW);
@@ -466,7 +466,7 @@ mod served {
 
     #[test]
     fn what_a_cut_leaves_under_the_orphans_goes_at_the_next_mount() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let before = t.fs.used_blocks().unwrap();
         let f = t.open(1, b"/big", RW);
@@ -478,7 +478,7 @@ mod served {
         t.fs.device().flush().unwrap();
         let mut device = core::mem::replace(t.fs.device(), MemDevice::new(16));
         device.power_cycle(Survive::None);
-        let mut state2 = Storage::new();
+        let mut state2 = Storage::boxed();
         let mut fs = Fs::new(device, &mut state2).unwrap();
         fs.mount().unwrap();
         assert!(
@@ -501,7 +501,7 @@ mod served {
 
     #[test]
     fn a_clone_shares_the_descriptions_and_their_positions() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let (parent, child, other) = (1u64, 100u64, 2u64);
         let f = t.open(parent, b"/f", RW);
@@ -550,7 +550,7 @@ mod served {
 
     #[test]
     fn a_session_holds_a_bounded_number_of_descriptions() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let mut held = Vec::new();
         for i in 0..crate::server::HELD_MAX {
@@ -582,7 +582,7 @@ mod served {
 
     #[test]
     fn a_process_tree_has_limits_and_a_full_table_is_another_code() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         // Clones of one client are limited; a clone with nothing to hold is refused.
         let f = t.open(1, b"/f", RW);
@@ -639,7 +639,7 @@ mod served {
 
     #[test]
     fn the_open_files_of_the_service_are_a_table_that_fills_for_everyone() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         // Two clients take every open file of the volume (FILES), by distinct names.
         for i in 0..crate::FILES {
@@ -665,7 +665,7 @@ mod served {
 
     #[test]
     fn the_table_of_sessions_is_one_for_all_and_answers_table_full() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         for label in 1..=server::SESSIONS as u64 {
             assert!(t.call(label, 0, p::statfs).is_ok());
@@ -677,7 +677,7 @@ mod served {
 
     #[test]
     fn a_pass_gives_a_description_to_whoever_adopts_it_once() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let f = t.open(1, b"/f", RW);
         t.write(1, f, b"abcdef");
@@ -708,7 +708,7 @@ mod served {
 
     #[test]
     fn an_unspent_pass_gives_its_reference_up_when_its_last_copy_goes() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let f = t.open(1, b"/f", RW);
         t.call(1, 900, |w| p::handle_call(p::Method::Export, f, w))
@@ -740,7 +740,7 @@ mod served {
 
     #[test]
     fn a_handle_of_an_earlier_instance_is_stale_and_other_bad_handles_are_not() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let f = t.open(1, b"/f", RW);
         assert_eq!(f >> 16, 7);
@@ -775,7 +775,7 @@ mod served {
 
     #[test]
     fn a_request_of_version_one_is_refused() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let mut w = Writer::new();
         proto_wire::Header::new(p::Method::Statfs.number(), 1)
@@ -792,7 +792,7 @@ mod served {
     /// precedes the move fails first, and the node is as it was.
     #[test]
     fn a_move_that_cannot_sync_leaves_the_open_file_as_it_was() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let f = t.open(1, b"/a", RW);
         t.fill(1, f, &bytes(8192, 4));
@@ -831,7 +831,7 @@ mod served {
     /// is free; the last close removes the orphan.
     #[test]
     fn a_failed_reopen_after_a_move_leaves_the_names_right() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         server::ensure_orphans(&mut t.fs).unwrap();
         let f = t.open(1, b"/a", RW);
@@ -854,7 +854,7 @@ mod served {
 
     #[test]
     fn a_rename_over_an_open_file_that_fails_puts_the_old_file_back() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let target = t.open(1, b"/t", RW);
         t.write(1, target, b"old");
@@ -883,7 +883,7 @@ mod served {
 
     #[test]
     fn the_epoch_of_each_mount_differs_and_makes_an_old_handle_stale() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let one = server::bump_epoch(&mut t.fs).unwrap();
         let two = server::bump_epoch(&mut t.fs).unwrap();
@@ -891,7 +891,7 @@ mod served {
         // It is in the volume: a mount of the same medium goes on from there.
         let mut device = core::mem::replace(t.fs.device(), MemDevice::new(16));
         device.power_cycle(Survive::All);
-        let mut state2 = Storage::new();
+        let mut state2 = Storage::boxed();
         let mut fs = Fs::new(device, &mut state2).unwrap();
         fs.mount().unwrap();
         assert_eq!(server::bump_epoch(&mut fs), Ok(3));
@@ -917,7 +917,7 @@ mod served {
 
     #[test]
     fn a_pass_is_kept_by_an_adopter_at_its_limit_and_adopted_later() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let f = t.open(1, b"/f", RW);
         t.call(1, 900, |w| p::handle_call(p::Method::Export, f, w))
@@ -947,7 +947,7 @@ mod served {
 
     #[test]
     fn close_all_closes_shared_files_and_orphans_once_each() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         let a1 = t.open(1, b"/f", RW);
         let _a2 = t.open(2, b"/f", RW);
@@ -977,7 +977,7 @@ mod served {
 
     #[test]
     fn fstat_tells_a_link_count_and_the_orphans_dir_is_made_at_mount() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         server::ensure_orphans(&mut t.fs).unwrap();
         server::ensure_orphans(&mut t.fs).unwrap();
@@ -1006,7 +1006,7 @@ mod served {
     /// not stop the recovery of the entries after it.
     #[test]
     fn the_recovery_goes_on_past_an_entry_it_cannot_remove() {
-        let mut state = Storage::new();
+        let mut state = Storage::boxed();
         let mut t = Rig::new(&mut state);
         server::ensure_orphans(&mut t.fs).unwrap();
         t.fs.mkdir(b"/.orphans/1").unwrap();

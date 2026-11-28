@@ -93,6 +93,13 @@ pub trait Device {
     /// it ended well or not. A device that serves a worker may end the reads of a walk at a stop
     /// notice; the default does nothing.
     fn walk_marks(&mut self, _on: bool) {}
+    /// Asked by the glue when a read of a walk is answered from the cache of metadata blocks, so
+    /// that a hit meets the same stop and yield points as a read of the device does
+    /// (`services/datafs` `Disk::read`): an error ends the walk with that read. The default
+    /// allows everything.
+    fn checkpoint(&mut self) -> Result<(), DeviceError> {
+        Ok(())
+    }
 }
 
 impl<D: Device + ?Sized> Device for &mut D {
@@ -114,6 +121,10 @@ impl<D: Device + ?Sized> Device for &mut D {
 
     fn walk_marks(&mut self, on: bool) {
         (**self).walk_marks(on)
+    }
+
+    fn checkpoint(&mut self) -> Result<(), DeviceError> {
+        (**self).checkpoint()
     }
 }
 
@@ -157,5 +168,9 @@ impl<D: Device> Device for Window<D> {
 
     fn walk_marks(&mut self, on: bool) {
         self.device.walk_marks(on)
+    }
+
+    fn checkpoint(&mut self) -> Result<(), DeviceError> {
+        self.device.checkpoint()
     }
 }

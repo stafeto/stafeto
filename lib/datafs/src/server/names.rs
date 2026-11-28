@@ -66,7 +66,7 @@ impl Server {
         } else {
             path.iter().filter(|&&b| b == b'/').count()
         };
-        let (count, status) = fs.path_attrs(
+        let (count, status, pair) = fs.path_attrs_pair(
             path,
             ATTR_TYPE,
             &mut self.walk.entries,
@@ -95,12 +95,14 @@ impl Server {
                 Ok(Found {
                     last: Some((info, entry)),
                     parent: parent(self),
+                    pair,
                 })
             }
             // Only the last name is missing: every ancestor was reached.
             Err(Error::NoEntry) if count == comps && comps > 0 => Ok(Found {
                 last: None,
                 parent: parent(self),
+                pair: None,
             }),
             Err(Error::NoEntry) => Err(p::code(p::NO_ENTRY)),
             Err(e) => Err(status_of(e)),
@@ -736,12 +738,15 @@ impl Server {
 
     /// READDIR: the entries of the next batch (rule of the listing): `ino`, `kind` and the name of
     /// as many as the reply holds, `.` and `..` first. An entry that did not fit waits in the
-    /// description's slot for the next call.
+    /// description's slot for the next call. With `attrs` (READDIR_ATTR) each entry also carries its
+    /// mode, owner and group, and `.` and `..` are left out: no lookup of the directory or of its
+    /// parent is made.
     pub(super) fn do_readdir<D: Device>(
         &mut self,
         fs: &mut Fs<'_, D>,
         di: usize,
         native: bool,
+        attrs: bool,
         w: &mut Writer,
     ) -> Res<()> {
         let d = self.descriptions[di];
@@ -775,23 +780,50 @@ impl Server {
                         {
                             continue;
                         }
+                        Some((entry, ..)) if attrs && matches!(entry.name(), b"." | b"..") => {
+                            continue;
+                        }
                         Some((entry, record, at)) => {
                             // The number of `.` and `..` is looked up: a failure there moves the
                             // iterator back too.
-                            let ino =
-                                match entry_ino(fs, dir.get(), entry.name(), entry.kind, &record) {
-                                    Ok(ino) => ino,
-                                    Err(e) => {
-                                        let _ = fs.seek_dir(Dir(d.object), at);
-                                        if batch.is_empty() {
-                                            return Err(e);
-                                        }
-                                        more = true;
-                                        break;
+                            let attr = match entry_attr(
+                                fs,
+                                dir.get(),
+                                entry.name(),
+                                entry.kind,
+                                &record,
+                            ) {
+                                Ok(attr) => attr,
+                                Err(e) => {
+                                    let _ = fs.seek_dir(Dir(d.object), at);
+                                    if batch.is_empty() {
+                                        return Err(e);
                                     }
-                                };
+                                    more = true;
+                                    break;
+                                }
+                            };
+                            // As STAT says it: the write time and the set-ID bits of a file that is
+                            // written and not yet folded into its record (`overlay_pending`).
+                            let mut attr = attr;
+                            if attrs && entry.kind == Kind::File {
+                                let mut path = [0u8; MAX_PATH + 1 + crate::NAME_MAX];
+                                let mut n = dir.get().len();
+                                path[..n].copy_from_slice(dir.get());
+                                if dir.get() != b"/" {
+                                    path[n] = b'/';
+                                    n += 1;
+                                }
+                                path[n..n + entry.name().len()].copy_from_slice(entry.name());
+                                if let Some(ni) = self.node_at(&path[..n + entry.name().len()]) {
+                                    self.overlay_pending(ni, &mut attr);
+                                }
+                            }
                             let mut pending = Pending {
-                                ino,
+                                ino: attr.ino,
+                                mode: attr.mode,
+                                uid: attr.uid,
+                                gid: attr.gid,
                                 kind: entry.kind,
                                 name: [0; crate::NAME_MAX],
                                 len: entry.name().len(),
@@ -802,7 +834,19 @@ impl Server {
                     },
                 },
             };
-            if !batch.push(next.ino, kind_word(next.kind), &next.name[..next.len]) {
+            let fits = if attrs {
+                batch.push_attr(&p::DirAttrEntry {
+                    ino: next.ino,
+                    kind: kind_word(next.kind),
+                    mode: next.mode,
+                    uid: next.uid,
+                    gid: next.gid,
+                    name: &next.name[..next.len],
+                })
+            } else {
+                batch.push(next.ino, kind_word(next.kind), &next.name[..next.len])
+            };
+            if !fits {
                 self.pending[slot] = Some(next);
                 more = true;
                 break;
@@ -861,22 +905,23 @@ fn listed<D: Device>(
     }
 }
 
-/// The number of the entry `name` of the directory `dir`, as STAT gives it: from the record the
+/// The record of the entry `name` of the directory `dir`, as STAT gives it: from the record the
 /// listing read with the entry. `.` and `..` carry no attribute on the volume: they take the number
-/// of the directory itself and of its parent (looked up once for each listing).
-fn entry_ino<D: Device>(
+/// of the directory itself and of its parent (looked up once for each listing), and the mode, owner
+/// and group of those directories.
+fn entry_attr<D: Device>(
     fs: &mut Fs<'_, D>,
     dir: &[u8],
     name: &[u8],
     kind: Kind,
     record: &([u8; WALK_EACH], Option<usize>),
-) -> Res<u64> {
+) -> Res<Attr> {
     if name == b"." {
-        return Ok(entry_of(fs, dir, Kind::Directory)?.attr.ino);
+        return Ok(entry_of(fs, dir, Kind::Directory)?.attr);
     }
     if name == b".." {
         let (parent, _) = split(dir);
-        return Ok(entry_of(fs, parent, Kind::Directory)?.attr.ino);
+        return Ok(entry_of(fs, parent, Kind::Directory)?.attr);
     }
     // The path is wanted only for the default of an entry with no record (a number from the path).
     let mut path = [0u8; MAX_PATH + 1 + crate::NAME_MAX];
@@ -888,9 +933,7 @@ fn entry_ino<D: Device>(
     }
     path[n..n + name.len()].copy_from_slice(name);
     let (bytes, size) = record;
-    Ok(record_of(kind, &path[..n + name.len()], *size, bytes)
-        .attr
-        .ino)
+    Ok(record_of(kind, &path[..n + name.len()], *size, bytes).attr)
 }
 
 /// The stat record of an entry.
@@ -915,6 +958,9 @@ pub(super) fn stat_record(kind: Kind, size: u32, attr: &Attr, nlink: u32) -> p::
 pub(super) struct Found {
     pub last: Option<(crate::fs::Info, Record)>,
     pub parent: Option<Record>,
+    /// The metadata pair of the last name when it is a directory: good for an open in the same
+    /// request, while nothing is written to the volume.
+    pub pair: Option<crate::fs::DirPair>,
 }
 
 /// The path of entry `i` of a walk: the root for 0, the path up to the end of component `i`.
