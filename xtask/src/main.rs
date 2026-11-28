@@ -2475,10 +2475,12 @@ commands:
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its
             steps under -icount; with --hvf under HVF
-  comp-probe [--hvf] run the probe of the composition service in QEMU: windows of a client, a
+  comp-probe [--hvf | breaks] run the probe of the composition service in QEMU: windows of a client, a
             rectangle posted alone, two windows, the screen after a process ended and a window
             of the first revision, each compared with QEMU's screenshot by CRC-32, and the steps
-            of the compositor and the display driver under -icount; with --hvf under HVF
+            of the compositor and the display driver under -icount; with --hvf under HVF;
+            with breaks, the compositor with each deliberate break of the windows'
+            mappings, which must be caught
   comp-late-probe run the probe of the composition service with the screen opened late, from a
             request, by the steps of the work, under -icount: the longest step of the mapping
   focus-probe [--hvf | top] run the probe of focus and composition of two clients in QEMU: a window
@@ -3023,7 +3025,8 @@ fn main() {
                 comp_probe::probe(&qemu::HVF_V3)?;
                 comp_probe::probe(&qemu::HVF_V2)
             }),
-            Some(_) => Err("comp-probe [--hvf]".to_owned()),
+            Some("breaks") => comp_probe::breaks(&qemu::VIRT),
+            Some(_) => Err("comp-probe [--hvf | breaks]".to_owned()),
         },
         Some("comp-late-probe") => comp_probe::late(&qemu::VIRT),
         Some("focus-probe") => match args.get(1).map(String::as_str) {
@@ -11524,6 +11527,18 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The manager `desk` itself over the same devices: frames, the panel, a
         // drag, focus, Super and Tab, the close button and SIGTERM, a restart.
         job("desk-probe", || desk::probe(&qemu::VIRT)),
+        // The manager with a panel, six frames and six clients of 400 by 300
+        // (13 windows), then with sixteen: every window made, one mapping a buffer.
+        job("desk-probe many", || {
+            desk::command(&["many".to_owned()], &qemu::VIRT)
+        }),
+        job("desk-probe sixteen", || {
+            desk::command(&["sixteen".to_owned()], &qemu::VIRT)
+        }),
+        // The same 13 windows under -icount: the band gate is a known failure.
+        job("desk-probe many steps", || {
+            desk::command(&["many".to_owned(), "steps".to_owned()], &qemu::VIRT)
+        }),
         // OpenWF Display over the driver alone: the frames against QEMU's
         // screenshot, the scanout and cursor trace, the driver's steps.
         job("wfd-probe", || wfd::probe(&qemu::VIRT)),
@@ -11546,6 +11561,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The same service when the screen opens late, from a request: the
         // frame buffer mapped in portions and the longest step of that work.
         job("comp-late-probe", || comp_probe::late(&qemu::VIRT)),
+        // The four deliberate breaks of the windows' mappings, each caught.
+        job("comp-probe breaks", || comp_probe::breaks(&qemu::VIRT)),
         // The frame time under the loads: ten phases on one boot under
         // -icount, and the waits of the compositor's steps.
         job("frame-probe", || frame_probe::probe(&[])),
@@ -15234,7 +15251,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "layer-names",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/calibrate,compositor/irq-trace,compositor/late-open,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash,layerd/steps,layerd/probe-restart,layerd/break-layerd-whiteout,layerd/break-layerd-search,layerd/break-layerd-no-mark,layerd/break-layerd-sticky,layerd/break-layerd-one-step,layerd/break-layerd-change-one-step,layerd/break-layerd-slots,layerd/break-layerd-compact-one-step,layerd/break-layerd-chain-unlink,layerd/break-layerd-epoch,layerd/break-layerd-copy-counter-ino,layerd/break-layerd-copy-attrs,layerd/break-layerd-copy-in-loop,layerd/break-layerd-copy-elf,layerd/break-layerd-copy-recheck,datafsd/probe-restart,datafsd/break-datafs-layers-visible",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/calibrate,compositor/irq-trace,compositor/late-open,compositor/break-compositor-chunk-map,compositor/break-compositor-map-on-step,compositor/break-compositor-unmap-early,compositor/break-compositor-status,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash,layerd/steps,layerd/probe-restart,layerd/break-layerd-whiteout,layerd/break-layerd-search,layerd/break-layerd-no-mark,layerd/break-layerd-sticky,layerd/break-layerd-one-step,layerd/break-layerd-change-one-step,layerd/break-layerd-slots,layerd/break-layerd-compact-one-step,layerd/break-layerd-chain-unlink,layerd/break-layerd-epoch,layerd/break-layerd-copy-counter-ino,layerd/break-layerd-copy-attrs,layerd/break-layerd-copy-in-loop,layerd/break-layerd-copy-elf,layerd/break-layerd-copy-recheck,datafsd/probe-restart,datafsd/break-datafs-layers-visible",
         "--target",
         PROGRAM_TARGET,
         "--",

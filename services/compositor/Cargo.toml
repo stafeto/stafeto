@@ -24,6 +24,11 @@ bench = false
 # request opens the screen by the steps of the work (the probe of the late opening).
 late-open = ["steps"]
 steps = ["rt/step-stats"]
+# The deliberate breaks of the windows' mappings (xtask comp-probe breaks): each must fail its probe or test.
+break-compositor-chunk-map = []
+break-compositor-map-on-step = []
+break-compositor-unmap-early = []
+break-compositor-status = []
 # `calibrate`: besides `steps`, the service measures the prices of its operations on
 # shapes of their own before its first request (`px::calibration`, seconds of the
 # CPU at its level: the images that do not read the lines leave it out).
