@@ -66,8 +66,8 @@ and the header version 1 of both.
   size when a frame takes that buffer (the damage is the old rectangle with the
   new one, and the manager is told by RESIZED); a second SIZE before the POST
   replaces the first. A size no buffer holds, or one that takes the window off
-  the screen at its place, is INVALID, and a MOVE or a CONFIGURE that would take
-  it off is too; the window of the first revision, a mask and a window under a
+  the screen at its place, is INVALID, and a MOVE that would take it off is too
+  (a CONFIGURE need only fit the screen, and SIZE takes the last serial given); the window of the first revision, a mask and a window under a
   scene have no SIZE (NOT_ALLOWED). CONFIGURE asks a window for a size and
   states (its ring gets CONFIGURE with a serial the answer gives back in SIZE; 0
   by 0 leaves the choice to the client) and CLOSE asks it to close
@@ -150,7 +150,7 @@ ends, the compositor goes on by its own rule: the window that has the focus
 keeps it, the first window shown takes it when no manager has subscribed, a click
 moves it, and a window that goes passes it to the one on top.
 
-A manager that frames windows (the top window, "What a client sees") makes a window of its own for each frame, reads the client's texts and capacity with INFO, links the two with LINK, resizes the frame when RESIZED comes, and asks the client to close with CLOSE. `apps/wm` uses none of this; the probe `cargo xtask focus-probe top` plays both parts.
+A manager that frames windows (the top window, "What a client sees") makes a window of its own for each frame, reads the client's texts and capacity with INFO, links the two with LINK, resizes the frame when RESIZED comes, and asks the client to close with CLOSE. A manager that restarts finds the windows by LIST and frames them again; the stacking order of the pairs it gets back is the order it LINKs them in (each LINK raises its pair), so it LINKs in LIST order, lowest first, to keep it. When a manager goes the service destroys its windows one in a step, and the windows it framed stay where they are. `apps/wm` uses none of this; the probe `cargo xtask focus-probe top` plays both parts.
 
 ## Input
 

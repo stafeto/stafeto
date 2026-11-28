@@ -106,11 +106,12 @@
 //! new size, and the window has the new size when a frame takes that buffer (the
 //! damage is the old rectangle with the new one, and the manager is told by
 //! RESIZED). The window stays inside the screen: a SIZE that would take it out
-//! is INVALID, and a MOVE or a CONFIGURE that would is too. A second SIZE before
+//! is INVALID, and so is a MOVE that would. A second SIZE before
 //! the POST replaces the first. The manager asks for a size with MANAGE
-//! CONFIGURE (the window's ring gets CONFIGURE with a `serial`, which a client
-//! that answers gives back in SIZE; a size of 0 by 0 leaves the choice to the
-//! client) and for the end of the window with MANAGE CLOSE (the window's ring
+//! CONFIGURE (the size need only fit the screen; the window's ring gets
+//! CONFIGURE with a `serial`, which a client that answers gives back in SIZE,
+//! and the last serial given is the only one SIZE takes; a size of 0 by 0 leaves
+//! the choice to the client) and for the end of the window with MANAGE CLOSE (the window's ring
 //! gets CLOSE_REQUEST; the client decides). MANAGE LINK ties a window of the
 //! manager (the follower, its frame) to a window of a client (the leader): a
 //! move, a raise or a hide of the leader is made for both in the same step of
@@ -604,7 +605,8 @@ pub const CLOSE: u16 = 7;
 pub const CONFIGURE: u16 = 8;
 pub const CLOSE_REQUEST: u16 = 9;
 /// The manager's: a window's title (`x` 1) or application's kind (`x` 2) changed
-/// (`code` is the place and `value` the id), and a window took a buffer of
+/// (`code` is the place and `value` the id; one TITLE of each text waits in the
+/// ring at a time, and INFO has the text as it is), and a window took a buffer of
 /// another size (`x` and `y` the width and height).
 pub const TITLE: u16 = 10;
 pub const RESIZED: u16 = 11;

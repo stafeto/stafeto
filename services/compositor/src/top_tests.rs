@@ -468,3 +468,121 @@ fn the_manager_hears_of_a_window_of_its_own_like_any() {
         [Event::new(CREATE, a as u16, s.window(a).unwrap().id as i32)]
     );
 }
+
+#[test]
+fn the_focus_falls_to_a_client_window_and_not_to_the_panel() {
+    let mut s = Scene::new();
+    let panel = big(&mut s, 1, 1, rect(0, 0, 640, 24), true);
+    let a = big(&mut s, 2, 2, rect(0, 100, 100, 100), false);
+    let b = big(&mut s, 3, 3, rect(200, 100, 100, 100), false);
+    shown(&mut s, panel);
+    shown(&mut s, a);
+    shown(&mut s, b);
+    s.focus_on(b).unwrap();
+    s.set_visible(b, false).unwrap();
+    assert_eq!(s.focus(), Some(a), "the panel is above a, the focus is a's");
+    s.destroy(a);
+    // Only the panel is left to take it.
+    assert_eq!(s.focus(), Some(panel));
+}
+
+#[test]
+fn alternating_texts_tell_the_manager_once_until_it_reads() {
+    let mut s = Scene::new();
+    s.set_manager(true);
+    let a = big(&mut s, 1, 1, rect(0, 0, 10, 10), false);
+    manager_events(&mut s);
+    for k in 0..200u32 {
+        let text = if k % 2 == 0 { "one" } else { "two" };
+        s.set_text(a, TEXT_TITLE, text.as_bytes()).unwrap();
+        s.set_text(a, TEXT_APP, text.as_bytes()).unwrap();
+    }
+    assert_eq!(manager_events(&mut s).len(), 2, "one TITLE of each text");
+    // Taken: the next change is told again.
+    s.set_text(a, TEXT_TITLE, b"three").unwrap();
+    assert_eq!(manager_events(&mut s).len(), 1);
+}
+
+#[test]
+fn only_the_last_serial_answers_a_configure() {
+    let mut s = Scene::new();
+    let a = big(&mut s, 1, 1, rect(0, 0, 10, 10), false);
+    s.configure(a, 20, 20, 0).unwrap();
+    s.configure(a, 30, 30, 0).unwrap();
+    assert_eq!(s.set_size(a, 20, 20, 1), Err(Refusal::Invalid), "older");
+    assert_eq!(s.set_size(a, 30, 30, 2), Ok(()));
+    assert_eq!(s.set_size(a, 30, 30, 0), Ok(()));
+    // The serial wraps inside the positive numbers, to 1.
+    s.tops[a].serial = i32::MAX as u32;
+    s.configure(a, 20, 20, 0).unwrap();
+    assert_eq!(events(&mut s, a).last().unwrap().value, 1);
+    assert_eq!(s.set_size(a, 20, 20, 1), Ok(()));
+}
+
+#[test]
+fn a_raise_is_among_the_windows_of_its_tier() {
+    let mut s = Scene::new();
+    let a = big(&mut s, 1, 2, rect(0, 0, 50, 50), false);
+    let b = big(&mut s, 2, 3, rect(0, 0, 50, 50), false);
+    let panel = big(&mut s, 3, 1, rect(0, 0, 50, 50), true);
+    // The panel was made last and has the greatest number, then b is raised.
+    shown(&mut s, a);
+    shown(&mut s, b);
+    s.raise(a).unwrap();
+    let (order, n) = s.by_depth();
+    assert_eq!(order[n - 2] as usize, a, "a is over b");
+    assert_eq!(order[n - 1] as usize, panel);
+    // Raising the client that has the greatest number of its tier changes
+    // nothing; raising b makes it the top of the clients.
+    s.raise(b).unwrap();
+    let (order, n) = s.by_depth();
+    assert_eq!(order[n - 2] as usize, b);
+}
+
+#[test]
+fn a_link_shows_the_frame_as_its_window_is_shown() {
+    let mut s = Scene::new();
+    let c = big(&mut s, 1, 1, rect(100, 100, 50, 50), false);
+    let f = big(&mut s, 2, 2, rect(96, 76, 58, 78), true);
+    shown(&mut s, c);
+    shown(&mut s, f);
+    s.set_visible(c, false).unwrap();
+    s.link(c, None).unwrap();
+    s.set_visible(f, true).unwrap();
+    s.link(c, Some(f)).unwrap();
+    assert!(!s.window(f).unwrap().visible, "hidden with its window");
+}
+
+#[test]
+fn a_size_that_waits_when_a_scene_starts_is_dropped() {
+    let mut s = Scene::new();
+    let a = big(&mut s, 1, 1, rect(0, 0, 100, 100), false);
+    shown(&mut s, a);
+    s.set_size(a, 150, 150, 0).unwrap();
+    let id = s.window(a).unwrap().id;
+    let element = Element {
+        source: id,
+        mask: proto_comp::NO_WINDOW,
+        sx: 0,
+        sy: 0,
+        sw: 100 << 16,
+        sh: 100 << 16,
+        dx: 0,
+        dy: 0,
+        dw: 100,
+        dh: 100,
+        orient: 0,
+        filter: 0,
+        transparency: 0,
+        alpha: 0,
+    };
+    let commit = SceneCommit::new(proto_comp::ACTIVE, 0, &[element]).unwrap();
+    s.scene_commit(&commit).unwrap();
+    s.commit_done(false).unwrap();
+    assert_eq!(s.posted_size(a), (100, 100));
+    // A POST that carries the size of an earlier SIZE (made before the scene)
+    // leaves the window as it is.
+    s.post(a, 1, &[]).unwrap();
+    s.begin();
+    assert_eq!(s.window(a).unwrap().rect, rect(0, 0, 100, 100));
+}

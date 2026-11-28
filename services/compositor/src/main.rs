@@ -470,6 +470,9 @@ struct Compositor {
     primary: Option<Pipeline>,
     cleared: Option<usize>,
     attaching: Option<Attaching>,
+    /// The context of a manager that went: its windows are destroyed one a step
+    /// (`reap_one`), so that eight windows do not make one long step.
+    reaping: Option<u64>,
     /// The clock of the frame: when a frame is taken, the periods, the counters.
     pacer: Pacer,
     /// The timer of the frame, made through a copy of the channel with a label
@@ -629,6 +632,7 @@ fn main(_: u64) -> u64 {
         primary: None,
         cleared: None,
         attaching: None,
+        reaping: None,
         pacer: Pacer::new(now_ns(), period, cap),
         timer,
         _timer_view: timer_view,
@@ -1825,6 +1829,7 @@ impl Compositor {
             || self.cleared.is_some()
             || matches!(self.pool, PoolState::Mapping { .. })
             || self.attaching.is_some()
+            || self.reaping.is_some()
             || self.unmappable().is_some()
     }
 
@@ -1843,6 +1848,8 @@ impl Compositor {
         self.regrant();
         if self.phase.has_work() {
             self.open_step();
+        } else if self.reaping.is_some() {
+            self.reap_one();
         } else if let Some(done) = self.cleared {
             let len = CLEARED.min(POOL_LEN - done);
             // SAFETY: the service's own read and write mapping of the
@@ -1868,6 +1875,18 @@ impl Compositor {
         }
         if self.has_work() {
             let _ = sys::notify(&self.notify, WORK);
+        }
+    }
+
+    /// One window of the manager that went is destroyed; the last one ends the
+    /// reaping.
+    fn reap_one(&mut self) {
+        let Some(label) = self.reaping else {
+            return;
+        };
+        match (0..MAX_WINDOWS).find(|&i| self.scene.window(i).is_some_and(|w| w.ctx == label)) {
+            Some(i) => self.destroy(i),
+            None => self.reaping = None,
         }
     }
 
@@ -3027,12 +3046,17 @@ impl Service<1> for Compositor {
             // The windows of the manager's session go with it (a scene's go
             // below): the windows they framed stay where they are.
             if !is_scene(label) {
-                for i in 0..MAX_WINDOWS {
-                    if self.scene.window(i).is_some_and(|w| w.ctx == label) {
-                        self.destroy(i);
+                // A manager that went before the last one's windows were all
+                // destroyed finishes them now (rare); the new one goes a step
+                // a window.
+                if let Some(old) = self.reaping.replace(label) {
+                    for i in 0..MAX_WINDOWS {
+                        if self.scene.window(i).is_some_and(|w| w.ctx == old) {
+                            self.destroy(i);
+                        }
                     }
                 }
-                self.kick();
+                let _ = sys::notify(&self.notify, WORK);
                 return;
             }
             // The holder of the scene went: the windows show as they did

@@ -736,6 +736,10 @@ struct Top {
     /// window follows (places).
     follower: Option<u8>,
     leader: Option<u8>,
+    /// The TITLE events (bit 1 the title, bit 2 the kind) in the manager's ring
+    /// that it has not taken: a change of a text that has its bit set tells
+    /// nothing more, so that alternating SET_TEXTs cannot fill the ring.
+    told: u8,
     title_len: u8,
     app_len: u8,
     title: [u8; TEXT_MAX],
@@ -751,6 +755,7 @@ impl Top {
         mgr: false,
         follower: None,
         leader: None,
+        told: 0,
         title_len: 0,
         app_len: 0,
         title: [0; TEXT_MAX],
@@ -2009,22 +2014,28 @@ impl Scene {
 
     /// The topmost shown window, except `except`.
     fn top(&self, except: Option<usize>) -> Option<usize> {
-        self.topmost(except, false)
+        self.topmost(except, false, false)
     }
 
-    /// The topmost shown window that may have the focus (a follower never does),
-    /// except `except`.
+    /// The topmost shown window that may have the focus, except `except`: a
+    /// window of a client when there is one (the focus does not fall to the
+    /// manager's panel), else any window that is not a follower (a follower
+    /// never has the focus).
     fn focus_top(&self, except: Option<usize>) -> Option<usize> {
-        self.topmost(except, true)
+        self.topmost(except, true, true)
+            .or_else(|| self.topmost(except, true, false))
     }
 
-    fn topmost(&self, except: Option<usize>, focusable: bool) -> Option<usize> {
+    fn topmost(&self, except: Option<usize>, focusable: bool, clients: bool) -> Option<usize> {
         let mut best: Option<(u64, usize)> = None;
         for (i, w) in self.windows.iter().enumerate() {
             let Some(w) = w else {
                 continue;
             };
-            if Some(i) == except || !Scene::shown(w) || (focusable && self.tops[i].leader.is_some())
+            if Some(i) == except
+                || !Scene::shown(w)
+                || (focusable && self.tops[i].leader.is_some())
+                || (clients && self.tops[i].mgr)
             {
                 continue;
             }
@@ -2060,6 +2071,9 @@ impl Scene {
     /// to come.
     pub fn set_manager(&mut self, on: bool) {
         self.manager = on;
+        for t in &mut self.tops {
+            t.told = 0;
+        }
         if !on {
             self.manager_ring.clear();
             self.modifier = 0;
@@ -2102,7 +2116,22 @@ impl Scene {
 
     /// EVENTS of the manager.
     pub fn take_manager_events(&mut self, out: &mut [Event]) -> (usize, bool) {
-        self.manager_ring.take(out)
+        let (n, lost) = self.manager_ring.take(out);
+        // A TITLE the manager has taken can be told again; when the ring lost
+        // events any TITLE may be one of them.
+        if lost {
+            for t in &mut self.tops {
+                t.told = 0;
+            }
+        }
+        for e in &out[..n] {
+            if e.kind == TITLE
+                && let Some(t) = self.tops.get_mut(usize::from(e.code))
+            {
+                t.told &= !(1 << (e.x - 1).clamp(0, 7));
+            }
+        }
+        (n, lost)
     }
 
     /// Window `i` has the focus: FOCUS_OUT to the window that had it,
@@ -2306,7 +2335,13 @@ impl Scene {
         self.window(i).ok_or(Refusal::Invalid)?;
         let i = self.tops[i].leader.map_or(i, usize::from);
         let follower = self.tops[i].follower.map(usize::from);
-        let top = self.windows.iter().flatten().map(|w| w.seq).max();
+        // On top of the windows of its own tier (the manager's unlinked windows
+        // lie above the others whatever their order).
+        let tier = |k: usize| self.tops[k].mgr && self.tops[k].leader.is_none();
+        let top = (0..MAX_WINDOWS)
+            .filter(|&k| tier(k) == tier(i))
+            .filter_map(|k| self.window(k).map(|w| w.seq))
+            .max();
         let mine = self.window(i).map(|w| w.seq);
         let under = follower.is_none_or(|f| {
             self.window(f)
@@ -2489,7 +2524,7 @@ impl Scene {
             || h == 0
             || w > cap.0
             || h > cap.1
-            || serial > self.tops[i].serial
+            || (serial != 0 && serial != self.tops[i].serial)
             || !place.within(WIDTH, HEIGHT)
         {
             return Err(Refusal::Invalid);
@@ -2529,7 +2564,9 @@ impl Scene {
         let same = &bytes[..usize::from(*len)] == text;
         bytes[..text.len()].copy_from_slice(text);
         *len = text.len() as u8;
-        if !same {
+        let bit = 1 << (which - 1);
+        if !same && top.told & bit == 0 {
+            top.told |= bit;
             self.tell_manager(Event::at(TITLE, i as u16, id as i32, which as i32, 0));
         }
         Ok(())
@@ -2579,7 +2616,10 @@ impl Scene {
         if states & !STATES != 0 || w > WIDTH || h > HEIGHT || (w == 0) != (h == 0) {
             return Err(Refusal::Invalid);
         }
-        self.tops[i].serial = self.tops[i].serial.wrapping_add(1).max(1);
+        // The serial is a positive i32 (the event's `value`): it wraps to 1, and
+        // SIZE accepts only the last one given.
+        let last = self.tops[i].serial;
+        self.tops[i].serial = if last >= i32::MAX as u32 { 1 } else { last + 1 };
         let serial = self.tops[i].serial;
         self.tell(
             i,
@@ -2631,6 +2671,9 @@ impl Scene {
         }
         self.tops[leader].follower = Some(f as u8);
         self.tops[f].leader = Some(leader as u8);
+        // The frame shows when its window does.
+        let visible = self.window(leader).is_some_and(|w| w.visible);
+        self.set_visible_one(f, visible);
         // The pair lies together at the top, the follower directly under.
         if self.focus == Some(f) {
             self.focus = None;
@@ -2748,7 +2791,12 @@ impl Scene {
                 w.bufs[b as usize] = Buf::Taken;
                 // The buffer carries the size SIZE gave: the window has it
                 // from this frame.
-                if let Some((nw, nh)) = self.tops[i].posted.take()
+                // Under a scene the elements name the window's own rectangle: a
+                // size that waited is dropped (SIZE is refused while a scene is
+                // on, and a commit clears the ones given before it).
+                let carried = self.tops[i].posted.take();
+                if let Some((nw, nh)) = carried
+                    && !(self.slot_working.is_some() || self.slot_pending.is_some())
                     && (nw, nh) != (w.rect.w, w.rect.h)
                 {
                     w.rect.w = nw;
@@ -3562,6 +3610,11 @@ impl Scene {
             }
             self.slot_pending = Some(k as u8);
             self.stage.committed_now |= ask;
+        }
+        // The sizes given before the scene are dropped with it (SIZE is refused
+        // while a scene is on).
+        for t in &mut self.tops {
+            t.next = None;
         }
         Ok(())
     }
