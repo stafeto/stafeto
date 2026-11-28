@@ -29,9 +29,14 @@ enum Order {
         at: usize,
         access: Access,
     },
+    /// Takes `size` bytes at `at` out of the space (nothing when `size` is 0), and closes the
+    /// handle `close` when that went well (`abi::Handle::INVALID`: none). The close is the
+    /// last reference of an object whose other holders are gone, so its teardown is queued
+    /// at the level the order works at.
     Unmap {
         size: u64,
         at: usize,
+        close: crate::abi::Handle,
     },
 }
 
@@ -140,7 +145,37 @@ impl Mapper {
 
     /// Takes `size` bytes at `at` out of the space, working at `level`.
     pub fn unmap(&self, level: u8, size: u64, at: usize) -> Result<(), Error> {
-        self.give(level, Order::Unmap { size, at })
+        self.give(
+            level,
+            Order::Unmap {
+                size,
+                at,
+                close: crate::abi::Handle::INVALID,
+            },
+        )
+    }
+
+    /// `unmap`, and once the range is out the thread closes `memory` (nothing is unmapped
+    /// when `size` is 0): when the handle is the last reference of the object, the kernel
+    /// takes it apart at `level`, behind the threads above it, and not at the level of the
+    /// caller. After an outcome of Ok the handle is closed and its owner must not close it
+    /// again (`Handle::into_raw`); after an error it is open. The caller keeps `memory` until
+    /// the outcome is taken.
+    pub fn unmap_close(
+        &self,
+        level: u8,
+        size: u64,
+        at: usize,
+        memory: &Handle<Memory>,
+    ) -> Result<(), Error> {
+        self.give(
+            level,
+            Order::Unmap {
+                size,
+                at,
+                close: memory.raw(),
+            },
+        )
     }
 
     /// Raises the level of the order in the cell to `level` when it is higher than the
@@ -213,9 +248,19 @@ extern "C" fn work(_: u64) -> ! {
                 let memory = Handle::<Memory>::borrowed(crate::abi::Handle(memory));
                 sys::mem_map(&process, &memory, offset, size, at, access)
             }
-            // SAFETY: the range is one that no slice of the service reaches any more (the
-            // caller's promise when it gave the order).
-            Order::Unmap { size, at } => unsafe { sys::mem_unmap(&process, at, size) },
+            Order::Unmap { size, at, close } => {
+                let outcome = if size == 0 {
+                    Ok(())
+                } else {
+                    // SAFETY: the range is one that no slice of the service reaches any more
+                    // (the caller's promise when it gave the order).
+                    unsafe { sys::mem_unmap(&process, at, size) }
+                };
+                if outcome.is_ok() && close != crate::abi::Handle::INVALID {
+                    drop(Handle::<Memory>::from_raw(close));
+                }
+                outcome
+            }
         };
         // SAFETY: still GIVEN: the cell is the thread's until the store.
         unsafe { *CELL.outcome.get() = Some(outcome) };

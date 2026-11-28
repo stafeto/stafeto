@@ -239,6 +239,14 @@ impl Extra {
 }
 
 impl Extra {
+    /// Whether the place still holds a buffer: a mapping, or the handle of its object. The
+    /// mapper thread lets go of both (`rt::mapper`), at the level of the client, so that the
+    /// teardown of the object (hundreds of pages) is queued there and not at the level of
+    /// this service.
+    fn holds(&self) -> bool {
+        self.mapped.iter().any(|&m| m != 0) || self.memory.iter().any(Option::is_some)
+    }
+
     /// An unmapping failed (the order was not given, or the kernel refused it). The mapping
     /// may still be in the place's range, so the place is not given back: it is asked again
     /// at the next step, and after `UNMAP_TRIES` failures in a row the place is lost, never
@@ -290,7 +298,9 @@ fn order_pages(left: usize) -> usize {
 
 /// The first page of the order that unmaps the last of `mapped` pages of a buffer.
 fn order_first(mapped: usize) -> usize {
-    if cfg!(feature = "break-compositor-chunk-map") {
+    if mapped == 0 {
+        0
+    } else if cfg!(feature = "break-compositor-chunk-map") {
         (mapped - 1) / CHUNK * CHUNK
     } else {
         0
@@ -1860,7 +1870,7 @@ impl Compositor {
         extra.queued = None;
         // An order in flight for the window maps a buffer the window has not recorded yet.
         let in_flight = self.ordered.is_some_and(|o| o.slot == i);
-        if in_flight || extra.mapped.iter().any(|&m| m != 0) {
+        if in_flight || extra.holds() {
             extra.dying = true;
         } else {
             *extra = Extra::new();
@@ -1914,12 +1924,7 @@ impl Compositor {
         for i in 0..MAX_WINDOWS {
             let e = &self.extra[i];
             let in_flight = self.ordered.is_some_and(|o| o.slot == i);
-            if e.dying
-                && !e.lost
-                && !in_flight
-                && e.mapped.iter().any(|&m| m != 0)
-                && !self.scene.worker_reads(i)
-            {
+            if e.dying && !e.lost && !in_flight && e.holds() && !self.scene.worker_reads(i) {
                 waits[n] = Wait {
                     slot: i,
                     level: e.level,
@@ -2026,16 +2031,27 @@ impl Compositor {
         match pick {
             Pick::Unmap(i) => {
                 let extra = &mut self.extra[i];
-                let Some(b) = (0..proto_comp::BUFFERS).find(|&b| extra.mapped[b] != 0) else {
+                // A buffer with a mapping first; then a buffer whose object was not mapped
+                // (the order that closes its handle takes nothing out).
+                let Some(b) = (0..proto_comp::BUFFERS)
+                    .find(|&b| extra.mapped[b] != 0)
+                    .or_else(|| (0..proto_comp::BUFFERS).find(|&b| extra.memory[b].is_some()))
+                else {
                     return;
                 };
                 let first = order_first(extra.mapped[b]);
                 let pages = extra.mapped[b] - first;
-                match mapper.unmap(
-                    extra.level,
-                    (pages * PAGE) as u64,
-                    buf_at(i, b) + first * PAGE,
-                ) {
+                let at = buf_at(i, b) + first * PAGE;
+                // The order that takes the buffer's last pages out closes the handle of its
+                // object in the thread, at the client's level: the object's teardown is
+                // queued there (a handle closed here would queue it at this service's).
+                let sent = match &extra.memory[b] {
+                    Some(memory) if first == 0 => {
+                        mapper.unmap_close(extra.level, (pages * PAGE) as u64, at, memory)
+                    }
+                    _ => mapper.unmap(extra.level, (pages * PAGE) as u64, at),
+                };
+                match sent {
                     Ok(()) => {
                         self.ordered = Some(Ordered {
                             slot: i,
@@ -2137,16 +2153,20 @@ impl Compositor {
                 Ok(()) => {
                     extra.tries = 0;
                     extra.mapped[b] -= done.pages.min(extra.mapped[b]);
+                    // The order that took the last pages out closed the handle too.
+                    if extra.mapped[b] == 0
+                        && let Some(closed) = extra.memory[b].take()
+                    {
+                        let _ = closed.into_raw();
+                    }
                 }
                 // The mapping may remain: the place stays dying and the next step asks again.
                 Err(error) => extra.unmap_failed(error),
             }
         } else if let Err(error) = outcome {
             if extra.dying {
-                // The window went while its buffer was being mapped.
-                if extra.mapped.iter().all(|&m| m == 0) {
-                    *extra = Extra::new();
-                }
+                // The window went while its buffer was being mapped: the place is given back
+                // below once the thread let go of what it holds.
             } else {
                 self.attach_failed(i, error);
             }
@@ -2157,7 +2177,7 @@ impl Compositor {
             }
         }
         let extra = &mut self.extra[i];
-        if extra.dying && extra.mapped.iter().all(|&m| m == 0) {
+        if extra.dying && !extra.holds() {
             *extra = Extra::new();
         }
     }
