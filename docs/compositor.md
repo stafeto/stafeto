@@ -436,11 +436,38 @@ of the measures) there is no cap and no period.
 ## Steps
 
 Every step of the compositor stays under 16 500 ticks. A page costs the kernel
-about 200 ticks to map and 80 to unmap, so ATTACH looks at its objects in the
-step of the request and maps them a chunk of 32 pages a step, and its reply
-comes after the last chunk; a window that went keeps its place, with its
-pages, until its chunks are unmapped one step at a time. A buffer is a
-megabyte at most.
+about 200 ticks to map and 80 to unmap, so a step never maps a buffer of a window.
+ATTACH looks at its objects in the step of the request and gives each buffer, one
+after the other, to the mapper thread (`rt::mapper`, the thread ramfs uses for its
+layers): one `mem_map` call for the whole buffer, made at the level of the client
+that attached (at most 31), which the kernel splits into portions of 16 pages with
+points of preemption. The thread tells the service with the bit MAPPED of its own
+channel, and the reply of ATTACH comes after the last buffer. A window that went
+keeps its place, with its buffers, until the thread has unmapped each of them by one
+call; the place is free after the last unmapping is done, never before. A window that
+goes while the thread maps one of its buffers is marked dying, and the mapping that
+comes is unmapped like the others. While the thread works on an order, the jobs that
+wait for it lend their level: it is raised to the highest of them. The step that gives
+an order is short, and the service asks for no step of the work while the thread has an
+order, so the thread is not starved by the service on one CPU. A buffer is a megabyte
+at most.
+
+The thread does one order at a time, so an ATTACH waits behind the orders ahead of it:
+at worst the unmappings of 16 windows with 3 buffers each (48 calls, a megabyte apiece,
+the windows that went first), then its own buffers one after the other. A client that
+needs a bound on ATTACH waits for the reply for that long.
+
+### The budget of mapping entries
+
+The kernel gives a process 128 mapping entries (`abi::MAX_MAPPINGS`), and a `mem_map`
+call takes one entry however many pages it maps. A buffer therefore takes one entry,
+so 16 windows with 3 buffers take 48. The service's own mappings (the frame buffer and
+the pool in pieces of 32 pages, the cursor's picture, the segments of its image and its
+stack, and a margin of 11 that holds the message buffers of its three threads) are `OWN_MAPPINGS` of
+`compositor::mapping`, and a constant assertion holds the sum under the table. A buffer
+the kernel refuses to map ends the ATTACH with the status of the kernel's error
+(`attach_status`): LIMIT_REACHED when the table of entries is full, NO_MEMORY when the
+tables of the mapping cannot be paid for, INVALID for the rest; the window goes.
 
 ## Opening the screen
 

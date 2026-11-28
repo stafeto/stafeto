@@ -112,18 +112,20 @@ pub const COMPOSITOR_KEYS_FREE: Record = Record {
     ..COMPOSITOR_KEYS
 };
 
-/// The probe (role `w`): a window of its own with two buffers, a pattern,
-/// then another buffer; it ends holding the window. The quota is the
-/// buffers it makes (four objects of 63 pages, a small one and a second
-/// window's 10) and its stack.
+/// The probe (role `w`): sixteen windows of three buffers of 256 pages (48 MiB),
+/// twice, then a window of its own with two buffers, a pattern, then another
+/// buffer; it ends holding the window. The quota is those objects and the
+/// buffers it makes after them (four objects of 63 pages, a small one and a second
+/// window's 10) and its stack; the handles are the 16 sessions, their 48 objects
+/// and the contexts.
 pub const PROBE: Record = Record {
     name: "comp-probe",
     program: "comp-probe",
     kind: Kind::Client,
     priority: 30,
     ceiling: 30,
-    quota: 640 * PAGE,
-    handle_limit: 48,
+    quota: 12_800 * PAGE,
+    handle_limit: 128,
     restart: Restart::Never,
     console: true,
     log: false,
@@ -151,6 +153,8 @@ pub const PROBE: Record = Record {
 const PROBE_B: Record = Record {
     name: "comp-probe-b",
     args: b"l",
+    quota: 640 * PAGE,
+    handle_limit: 48,
     ..PROBE
 };
 
@@ -159,6 +163,8 @@ const PROBE_B: Record = Record {
 const PROBE_C: Record = Record {
     name: "comp-probe-c",
     args: b"x",
+    quota: 640 * PAGE,
+    handle_limit: 48,
     ..PROBE
 };
 
@@ -168,6 +174,8 @@ const PROBE_C: Record = Record {
 const PROBE_S: Record = Record {
     name: "comp-probe-s",
     args: b"s",
+    quota: 640 * PAGE,
+    handle_limit: 48,
     ..PROBE
 };
 

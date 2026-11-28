@@ -6,13 +6,14 @@
  * title and an application id, a pattern of its colour, and the answers a
  * client gives the manager.
  *
- *   desk-client NAME X Y W H RRGGBB [stubborn] [resizable]
+ *   desk-client NAME X Y W H RRGGBB [stubborn] [resizable] [x]
  *
  * NAME is the window's title and application id, (X, Y) its place, W by H its
  * size and RRGGBB its colour in hexadecimal. A CLOSE_REQUEST closes the window
  * and ends the program with code 0; with `stubborn` the request is ignored,
  * so the manager's SIGTERM ends the program. With `resizable` the window has
- * buffers for the whole screen and answers a CONFIGURE with the size asked.
+ * buffers for the whole screen and answers a CONFIGURE with the size asked. With `x` the
+ * program has a second window of the same place and size, drawn once.
  */
 #include <errno.h>
 #include <stdint.h>
@@ -50,14 +51,15 @@ static int draw(int win, unsigned *current, uint32_t w, uint32_t h, uint32_t col
 
 int main(int argc, char **argv)
 {
-    int stubborn = 0, resizable = 0;
+    int stubborn = 0, resizable = 0, extra = 0;
     if (argc < 7) {
-        fprintf(stderr, "usage: desk-client NAME X Y W H RRGGBB [stubborn] [resizable]\n");
+        fprintf(stderr, "usage: desk-client NAME X Y W H RRGGBB [stubborn] [resizable] [x]\n");
         return 2;
     }
     for (int i = 7; i < argc; i++) {
         stubborn |= strcmp(argv[i], "stubborn") == 0;
         resizable |= strcmp(argv[i], "resizable") == 0;
+        extra |= strcmp(argv[i], "x") == 0;
     }
     const char *name = argv[1];
     int x = atoi(argv[2]), y = atoi(argv[3]);
@@ -75,6 +77,17 @@ int main(int argc, char **argv)
         draw(number, &current, w, h, colour) != 0) {
         printf("desk-client %s: cannot set up the window: errno %d\n", name, errno);
         return 1;
+    }
+    if (extra) {
+        struct stafeto_window second;
+        int other = stafeto_window_open(x, y, (int)w, (int)h, STAFETO_WINDOW_XRGB8888, 2, 0, &second);
+        unsigned drawn = 1;
+        if (other < 0 || stafeto_window_set_title(other, "second") != 0 ||
+            stafeto_window_set_app_id(other, "second") != 0 ||
+            draw(other, &drawn, w, h, colour) != 0) {
+            printf("desk-client %s: cannot open the second window: errno %d\n", name, errno);
+            return 1;
+        }
     }
     struct rlimit limit;
     if (getrlimit(RLIMIT_AS, &limit) != 0) {

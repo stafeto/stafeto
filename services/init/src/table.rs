@@ -1733,6 +1733,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-layer-ash") as usize
     + cfg!(feature = "table-posix-window") as usize
     + cfg!(feature = "table-desk") as usize
+    + cfg!(feature = "table-desk-many") as usize
+    + cfg!(feature = "table-desk-sixteen") as usize
     + cfg!(feature = "table-wfc") as usize
     + cfg!(feature = "table-wfc-steps") as usize
     + cfg!(feature = "table-wfd") as usize
@@ -1855,6 +1857,8 @@ const _: () = assert!(
     feature = "table-layer-ash",
     feature = "table-posix-window",
     feature = "table-desk",
+    feature = "table-desk-many",
+    feature = "table-desk-sixteen",
     feature = "table-wfc",
     feature = "table-wfc-steps",
     feature = "table-wfd",
@@ -2089,6 +2093,10 @@ pub const TABLE: &[Record] = ramfs::LAYER_ASH_TABLE;
 pub const TABLE: &[Record] = window::TABLE;
 #[cfg(feature = "table-desk")]
 pub const TABLE: &[Record] = desk::TABLE;
+#[cfg(feature = "table-desk-many")]
+pub const TABLE: &[Record] = desk::MANY_TABLE;
+#[cfg(feature = "table-desk-sixteen")]
+pub const TABLE: &[Record] = desk::SIXTEEN_TABLE;
 #[cfg(feature = "table-wfc")]
 pub const TABLE: &[Record] = wfc::TABLE;
 #[cfg(feature = "table-wfc-steps")]
@@ -2139,6 +2147,8 @@ pub const ALL_TABLES: &[&[Record]] = &[
     focus::WM_TABLE,
     focus::TOP_TABLE,
     desk::TABLE,
+    desk::MANY_TABLE,
+    desk::SIXTEEN_TABLE,
     input::TABLE,
     entropy::TABLE,
     entropy::VZ_TABLE,
@@ -4435,7 +4445,9 @@ mod tests {
             let has = table.iter().any(|r| r.name == "desk");
             assert_eq!(
                 has,
-                std::ptr::eq(table, desk::TABLE),
+                [desk::TABLE, desk::MANY_TABLE, desk::SIXTEEN_TABLE]
+                    .iter()
+                    .any(|t| std::ptr::eq(table, *t)),
                 "{:?}",
                 table.first().map(|r| r.name)
             );
