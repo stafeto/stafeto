@@ -181,7 +181,7 @@ const KEPT: Rights = Rights::MAP_READ
 /// `after_fork` keeps room for this many.
 pub(crate) const SOURCE_PIECES: usize = 2;
 /// The buffers of the windows of a process: eight windows of three buffers.
-const WINDOW_PIECES: usize = 24;
+pub(crate) const WINDOW_PIECES: usize = 24;
 
 /// Runs `f` on the heap and the map under the heap's lock.
 pub(crate) fn heap<R>(f: impl FnOnce(&mut State) -> R) -> R {

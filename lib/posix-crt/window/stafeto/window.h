@@ -203,7 +203,8 @@ int stafeto_screen_describe(struct stafeto_screen *s);
  * All of them are free. The
  * window shows once the first post is taken into a frame. With one buffer
  * the window shows one picture: its buffer never comes back. A program that
- * draws again uses two or three. Returns the window's number (0), or -1
+ * draws again uses two or three. Returns the window's number (the lowest free
+ * one, from 0), or -1
  * with errno:
  *   ENODEV  as stafeto_screen_describe;
  *   EBUSY   the service is busy with another client's buffers and stayed so
@@ -309,11 +310,14 @@ int stafeto_window_wait(int win, uint64_t timeout_ns, uint32_t *bits);
  * the bits that came for window k since the last call that took them (each
  * bit is returned by one call of this function or of stafeto_window_wait),
  * 0 for a window with none or none open. A window the service took away has
- * STAFETO_WINDOW_GONE in its word, and keeps it until the window is closed.
+ * STAFETO_WINDOW_GONE in its word, and keeps it until the window is closed (a
+ * program closes such a window). A window closed in another thread ends a wait
+ * on that window with EBADF.
  * The buffer bits are applied to the masks of stafeto_window_free_buffers
  * before the call returns. Returns the mask of the windows that have bits
- * (bit k for window k; bit 31 is kept for the manager's events, which this
- * revision does not return), or -1 with errno:
+ * (bit k for window k; bit 30 is kept for the manager's events, which this
+ * revision does not return; the result is never negative, and only -1 is a
+ * failure), or -1 with errno:
  *   ETIMEDOUT  no bit came in time;
  *   EINTR      a signal with a handler ran during the wait;
  *   EBADF      the process has no window;
@@ -373,7 +377,8 @@ int stafeto_window_set_app_id(int win, const char *app_id);
  * a window made with STAFETO_WINDOW_RESIZABLE the screen's size (less when
  * a buffer of 1 MiB does not hold the screen); for another window the width
  * of its line and the lines the pages of its buffers hold (a little over its
- * height). 0, or -1 with errno EBADF when win is not an open window. w and h
+ * height); 0 and 0 for a mask (STAFETO_WINDOW_A8). 0, or -1 with errno EBADF
+ * when win is not an open window. w and h
  * may be null. No call to the service. */
 int stafeto_window_capacity(int win, uint32_t *w, uint32_t *h);
 
@@ -385,8 +390,12 @@ int stafeto_window_capacity(int win, uint32_t *w, uint32_t *h);
  * rectangles of the next post are in the new size, and so is the size
  * stafeto_window_info gives (the stride stays). 0, or -1 with errno:
  *   EBADF   win is not an open window;
- *   EINVAL  w or h is 0 or past the capacity, or the service refused the
- *           size (the window would reach outside the screen);
+ *   EINVAL  w or h is 0 or past the capacity, the window is a mask
+ *           (STAFETO_WINDOW_A8), or the service refused the size (the
+ *           window would reach outside the screen, or serial is not that of
+ *           the last CONFIGURE the service gave);
+ *   EPERM   the service does not let this window change size (a scene shows
+ *           the windows);
  *   ENODEV  the service ended or took the window away;
  *   EIO     the service answered in a way the layer does not know. */
 int stafeto_window_resize(int win, uint32_t w, uint32_t h, uint32_t serial);

@@ -268,6 +268,12 @@ moves the library into `libc.so` and gives the window's channel to `poll`.
   TRANSFER) and ATTACH with a copy of each buffer (MAP_READ and TRANSFER). A
   failure at any step closes what was made, so a failed open leaves nothing.
   `struct stafeto_window` is the same 48 bytes as before.
+- The quota a program with windows needs: for each window, its buffers times
+  `ceil(stride * lines / 4096)` pages, in the program's record of the init
+  table and in the POSIX service's record that pays for it (a resizable XRGB8888
+  window of 640 by 400 is 250 pages a buffer; `table::window` shows the sums).
+  `BUFFER_MAX` of 1 MiB limits a `STAFETO_WINDOW_RESIZABLE` window on a larger
+  screen: at 1920 points wide it holds 136 lines, which is its capacity.
 - One channel serves all the windows. The service holds a copy for each
   window, labelled by `comp_client::table::label` (a tag, a sequence number
   that grows with every copy handed out, and the window's number), and a
@@ -276,7 +282,7 @@ moves the library into `libc.so` and gives the window's channel to `poll`.
   closed window's copy (CLIENT_GONE) from marking the window that took its
   number later. `stafeto_windows_wait(timeout, bits[8])` waits for bits of any
   window: it returns the mask of the windows that have some and fills `bits`
-  (a window the service took away has `STAFETO_WINDOW_GONE`; bit 31 of the mask
+  (a window the service took away has `STAFETO_WINDOW_GONE`; bit 30 of the mask
   is kept for the manager's ring). `stafeto_window_wait(win, ...)` keeps its
   meaning; the bits it does not take stay in their windows' accounts. The
   header says a program skips the events of a kind it does not know.

@@ -30,7 +30,7 @@ pub const fn label(sequence: u32, slot: usize) -> u64 {
 /// The window a label names; None for a label that is none of the library's.
 pub const fn slot_of(label: u64) -> Option<usize> {
     let slot = (label & 0xf) as usize;
-    if label >> 32 != TAG || label >> 4 & 0xfff_ffff > SEQUENCE_MAX as u64 || slot >= WINDOWS_MAX {
+    if label >> 32 != TAG || slot >= WINDOWS_MAX {
         None
     } else {
         Some(slot)

@@ -12,8 +12,11 @@ use super::ramfs::{PIPE, POSIX, POSIX_ABI_TABLE, PROCS_QUOTA, RAM_FIFO_CLOCKED};
 use super::{Record, comp, entropy};
 use crate::PAGE;
 
-/// The pages of the buffers of a resizable window of the whole screen (two of
-/// 250 pages) and of the other windows the probe has open with it.
+/// The pages of the window buffers the probe has open at once. The rule: for
+/// each window, the buffers times ceil(stride times lines / 4096) pages; a
+/// resizable XRGB8888 window of 640 by 400 is 250 pages a buffer (two buffers,
+/// 500) and the small windows of the probe add about 40. Both the probe's
+/// record and the POSIX service's record carry it.
 const WINDOW_PAGES: u64 = 540;
 
 pub const TABLE: &[Record] = &[

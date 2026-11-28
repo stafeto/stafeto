@@ -20,6 +20,7 @@
  */
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -285,6 +286,7 @@ static int setup_and_refusals(struct stafeto_window *w) {
 }
 
 static int several_windows(void);
+static int waiting_threads(void);
 static int exec_role(void);
 
 static int run_role(void) {
@@ -420,6 +422,7 @@ static int run_role(void) {
     CHECK(stafeto_window_close(0) == 0);
     printf("posix-window: close ends the window, and a new one opens\n");
     CHECK(several_windows() == 0);
+    CHECK(waiting_threads() == 0);
     return exec_role();
 }
 
@@ -673,6 +676,87 @@ static int several_windows(void) {
     CHECK(stafeto_window_close(2) == 0);
     errno = 0;
     CHECK(stafeto_windows_wait(0, bits) == -1 && errno == EBADF);
+    return 0;
+}
+
+/* ---- threads that wait while windows open and close ---- */
+
+static volatile uint32_t seen_bits[STAFETO_WINDOWS_MAX];
+static volatile int stop_waiter;
+static volatile int closed_rc, closed_errno;
+static volatile long closed_after_ms;
+
+static long now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* Waits across the windows and keeps every bit it is told of. */
+static void *waiter(void *arg) {
+    uint32_t bits[STAFETO_WINDOWS_MAX];
+    (void)arg;
+    while (!stop_waiter) {
+        int mask = stafeto_windows_wait(SECOND / 5, bits);
+        if (mask > 0) {
+            for (int k = 0; k < STAFETO_WINDOWS_MAX; k++) seen_bits[k] |= bits[k];
+        } else if (errno != ETIMEDOUT) {
+            struct timespec pause = {0, 10000000};
+            nanosleep(&pause, NULL);
+        }
+    }
+    return NULL;
+}
+
+/* Waits on one window for a long time; the window is closed under it. */
+static void *closed_under(void *arg) {
+    uint32_t bits = 0;
+    long start = now_ms();
+    (void)arg;
+    errno = 0;
+    closed_rc = stafeto_window_wait(1, 20 * SECOND, &bits);
+    closed_errno = errno;
+    closed_after_ms = now_ms() - start;
+    return NULL;
+}
+
+static int waiting_threads(void) {
+    struct stafeto_window a, b;
+    pthread_t t;
+    /* A window opens, and posts, while another thread waits across the
+     * windows: its bits (the events and the freed buffer) reach that wait. */
+    CHECK(stafeto_window_open(20, 20, 60, 40, STAFETO_WINDOW_XRGB8888, 1, 0, &a) == 0);
+    CHECK(pthread_create(&t, NULL, waiter, NULL) == 0);
+    {
+        struct timespec pause = {0, 300000000};
+        nanosleep(&pause, NULL);
+    }
+    CHECK(stafeto_window_open(300, 100, 50, 50, STAFETO_WINDOW_XRGB8888, 2, 0, &b) == 1);
+    fill(&b, 0, 50, 50, 0x00A0A0A0u);
+    fill(&b, 1, 50, 50, 0x0050A050u);
+    CHECK(stafeto_window_post(1, 0, NULL, 0) == 0);
+    CHECK(stafeto_window_post(1, 1, NULL, 0) == 0);
+    for (int i = 0; i < 100; i++) {
+        struct timespec pause = {0, 100000000};
+        if ((seen_bits[1] & STAFETO_WINDOW_BUFFER(0)) && (seen_bits[1] & STAFETO_WINDOW_EVENTS))
+            break;
+        nanosleep(&pause, NULL);
+    }
+    stop_waiter = 1;
+    CHECK(pthread_join(t, NULL) == 0);
+    CHECK(seen_bits[1] & STAFETO_WINDOW_BUFFER(0));
+    CHECK(seen_bits[1] & STAFETO_WINDOW_EVENTS);
+    /* A window closed while a thread waits on it ends that wait with EBADF. */
+    CHECK(pthread_create(&t, NULL, closed_under, NULL) == 0);
+    {
+        struct timespec pause = {0, 500000000};
+        nanosleep(&pause, NULL);
+    }
+    CHECK(stafeto_window_close(1) == 0);
+    CHECK(pthread_join(t, NULL) == 0);
+    CHECK(closed_rc == -1 && closed_errno == EBADF && closed_after_ms < 10000);
+    CHECK(stafeto_window_close(0) == 0);
+    printf("posix-window: a window opens and posts while another thread waits, and a close ends a wait on it\n");
     return 0;
 }
 

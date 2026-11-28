@@ -71,6 +71,7 @@ const _: () = {
     assert!(errno::EAGAIN == EAGAIN && errno::ENOMEM == ENOMEM && errno::EBUSY == EBUSY);
     assert!(errno::ENODEV == ENODEV && errno::EINVAL == EINVAL && errno::ETIMEDOUT == ETIMEDOUT);
     assert!(WINDOWS_MAX <= 16);
+    assert!(WINDOWS_MAX * layout::BUFFERS_MAX == crate::allocation::WINDOW_PIECES);
 };
 
 const CLOSED: u32 = 0;
@@ -408,6 +409,13 @@ fn open_window(
         pixels[k] = at;
     }
 
+    // The account exists before the service can notify: a bit that comes
+    // while another thread waits (the labelled copy is live from WINDOW_CREATE)
+    // finds it, and nothing is dropped. A window still opening is not reported
+    // by a wait across the windows (only OPEN windows are).
+    win.account
+        .store(Buffers::new(buffers as usize).raw(), Ordering::Release);
+
     // WINDOW_CREATE with a copy of the channel that may notify and be
     // handed on.
     let mut tries = 0;
@@ -482,8 +490,6 @@ fn open_window(
     win.cap[1].store(cap_h, Ordering::Release);
     // SAFETY: no thread but this one knows the window yet (`taking` is clear).
     unsafe { *win.stash.0.get() = Taker::new() };
-    win.account
-        .store(Buffers::new(buffers as usize).raw(), Ordering::Release);
     let generation = GENERATION.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
     win.generation.store(generation, Ordering::Release);
     Ok(Window {
@@ -635,6 +641,9 @@ pub fn info(win: i32) -> Result<Window, i32> {
 /// `stafeto_window_capacity`: the most width and height `resize` takes.
 pub fn capacity(win: i32) -> Result<(u32, u32), i32> {
     let w = opened(win)?;
+    if w.shape(3) == layout::A8 {
+        return Ok((0, 0));
+    }
     Ok((
         w.cap[0].load(Ordering::Acquire),
         w.cap[1].load(Ordering::Acquire),
@@ -735,6 +744,10 @@ pub fn set_text(win: i32, which: u32, text: &[u8]) -> Result<(), i32> {
 pub fn resize(win: i32, width: u32, height: u32, serial: u32) -> Result<(), i32> {
     let w = opened(win)?;
     alive(w)?;
+    // A mask has no size of its own to change.
+    if w.shape(3) == layout::A8 {
+        return Err(EINVAL);
+    }
     let cap = (
         w.cap[0].load(Ordering::Acquire),
         w.cap[1].load(Ordering::Acquire),
@@ -756,6 +769,7 @@ pub fn resize(win: i32, width: u32, height: u32, serial: u32) -> Result<(), i32>
             w.shape[1].store(height, Ordering::Release);
             Ok(())
         }
+        status if status == proto_comp::code(proto_comp::NOT_ALLOWED) => Err(EPERM),
         status => Err(refusal(w, status)),
     }
 }
@@ -904,6 +918,7 @@ fn wait_for(timeout_ns: u64, goal: Goal, out: &mut [u32; WINDOWS_MAX]) -> Result
     let own = channel();
     let timer = Handle::<Timer>::borrowed(rt::abi::Handle(TIMER.load(Ordering::Acquire)));
     let block = threads::own_block();
+    let epoch = goal.epoch();
     // No limit (UINT64_MAX): no timer is set, the receive waits for a bit.
     let unlimited = timeout_ns == u64::MAX;
     loop {
@@ -920,6 +935,11 @@ fn wait_for(timeout_ns: u64, goal: Goal, out: &mut [u32; WINDOWS_MAX]) -> Result
                 }
                 Err(_) => return Err(channel_errno(goal)),
             }
+        }
+        // A window closed meanwhile (by another thread) ends the wait.
+        goal.open()?;
+        if goal.epoch() != epoch {
+            return Err(EBADF);
         }
         goal.alive()?;
         if let Some(bits) = reached(goal, out) {
@@ -1115,6 +1135,11 @@ pub fn close(win: i32) -> Result<(), i32> {
     }
     release_window(w);
     w.state.store(CLOSED, Ordering::Release);
+    // A thread that waits on the window (or on all of them) looks again and
+    // finds it gone.
+    if WAITING.load(Ordering::Acquire) {
+        let _ = sys::notify(&channel(), WAKE);
+    }
     drop_channel_if_unused();
     Ok(())
 }

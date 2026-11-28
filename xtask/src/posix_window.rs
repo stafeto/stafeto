@@ -75,7 +75,7 @@ const SHOTS: [&str; 5] = [
 ];
 
 /// The lines of the probe, each a check that passed.
-const LINES: [&str; 13] = [
+const LINES: [&str; 14] = [
     "posix-window: the screen is described, no window yet, and bad arguments leave nothing",
     "posix-window: a window of 200 by 100 with two zeroed buffers, a second window is number 1, info repeats open",
     "posix-window: post refuses a wrong buffer, window or rectangle, and a buffer that is out",
@@ -88,6 +88,7 @@ const LINES: [&str; 13] = [
     "posix-window: the bits of each window go to that window, and a wait across windows tells which",
     "posix-window: title and application id go to the service, which refuses what is not UTF-8",
     "posix-window: a window is resized inside its capacity and shows the new size with the next post",
+    "posix-window: a window opens and posts while another thread waits, and a close ends a wait on it",
     "posix-window: exec closes every window of the old image",
 ];
 
