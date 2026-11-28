@@ -224,7 +224,8 @@ pub const STEPS_CHECKS: [&str; 6] = [
 ];
 
 /// The checks of the read role.
-pub const READ_CHECKS: [&str; 31] = [
+pub const READ_CHECKS: [&str; 32] = [
+    "no layer service is not waited for",
     "read pub whole",
     "pread",
     "lseek",
@@ -441,6 +442,7 @@ pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
         Some("steps-icount") if args.len() == 1 => steps_icount(machine),
         Some("steps-budget") if args.len() == 1 => steps_budget(machine),
         Some("atomic-break") if args.len() == 2 => atomic_break(&args[1], machine),
+        Some("absent-break") if args.len() == 1 => absent_break(machine),
         Some("crash") => crash(&args[1..], machine),
         Some(other) => Err(format!(
             "data-posix [write|cap|full]: unknown argument {other}"
@@ -466,13 +468,23 @@ fn programs_of(mode: Mode, breaks: &[&'static str]) -> Vec<ImageProgram> {
         _ => &PROGRAMS,
     };
     let mut programs = base.to_vec();
-    if !breaks.is_empty() {
+    // A break of the process service (`break-process-...`) goes to it, the others to the data
+    // service.
+    for (program, own) in [("datafsd", false), ("posix-process-service", true)] {
+        let mine: Vec<&'static str> = breaks
+            .iter()
+            .copied()
+            .filter(|b| b.starts_with("break-process-") == own)
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
         let at = programs
             .iter()
-            .position(|p| p.0 == "datafsd")
-            .expect("the image has the data service");
+            .position(|p| p.0 == program)
+            .expect("the image has the service");
         let mut features: Vec<&'static str> = programs[at].3.to_vec();
-        features.extend_from_slice(breaks);
+        features.extend_from_slice(&mine);
         programs[at].3 = Box::leak(features.into_boxed_slice());
     }
     programs
@@ -594,6 +606,35 @@ pub fn steps_budget(machine: &qemu::Machine) -> Result<(), String> {
             icount: false,
         },
     )
+}
+
+/// `cargo xtask data-posix absent-break`: the read probe on a process service that answers
+/// UNREGISTERED where it should say ABSENT (`break-process-absent-wait`): the first path of the root
+/// waits five seconds for a layer service the image does not have, and the check of the probe that
+/// times it fails.
+pub fn absent_break(machine: &qemu::Machine) -> Result<(), String> {
+    let feature = "break-process-absent-wait";
+    let check = READ_CHECKS[0];
+    let (output, seconds) = boot_with(Mode::Read, machine, Boot::default(), &[feature], None)?;
+    let said = |needle: &str| output.lines.iter().any(|l| l.contains(needle));
+    // The launcher's own first path waits five seconds and fails, so the probe may never start;
+    // or it starts, and its first check fails. A run that passes is a break that is not caught.
+    let failed = said(&format!("{PREFIX}{check} FAILED"));
+    let no_start = said("posix-data: the launcher could not start");
+    if said("posix-data: read checks passed") || !(failed || no_start) {
+        return Err(format!(
+            "data-posix absent-break: {feature} did not fail the probe (first check {check:?}, launcher not started: {no_start})"
+        ));
+    }
+    println!(
+        "data-posix absent-break: {feature} is caught ({}) in {seconds} s",
+        if failed {
+            format!("by {check:?}")
+        } else {
+            "the first path of the launcher waits five seconds and fails".to_owned()
+        }
+    );
+    Ok(())
 }
 
 /// The deliberate breaks of the service that `data-atomic` must catch, and the check each fails.

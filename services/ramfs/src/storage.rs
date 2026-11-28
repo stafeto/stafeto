@@ -508,9 +508,14 @@ pub struct State {
     /// and the bytes. A walk that reaches it ends in a redirect. Length 0 is no mount.
     mount_len: u8,
     mount: [u8; MOUNT_MAX],
-    /// The image's root is layered (init's `layered` argument): the writes of a POSIX session
-    /// outside the pass-through names are refused (`Resolve::guard_layered`).
+    /// The image's root is layered (init's `layered` argument): the links and the `..` of a POSIX
+    /// session's walk are the layer service's to expand (`Resolve::bounce_layered`), and, once
+    /// `guarded` says so, its writes outside the pass-through names are refused
+    /// (`Resolve::guard_layered`).
     layered: bool,
+    /// The write guard is on (GUARD of the layer service, after its READY): only then does a
+    /// walk of a POSIX session refuse the writes outside the pass-through names. Zero at the start.
+    guarded: bool,
     pending: [Option<Reservation>; PREPARATIONS],
     preparation_used: u16,
     reclaim_queue: [u16; INODES],
@@ -565,6 +570,7 @@ impl State {
             mount_len: 0,
             mount: [0; MOUNT_MAX],
             layered: false,
+            guarded: false,
             pending: [None; PREPARATIONS],
             preparation_used: 0,
             reclaim_queue: [0; INODES],
@@ -617,6 +623,18 @@ impl State {
 
     pub fn layered(&self) -> bool {
         self.layered
+    }
+
+    /// Switches the write guard on, for good (GUARD). False when the root is not layered.
+    pub fn set_guarded(&mut self) -> bool {
+        self.guarded |= self.layered;
+        self.layered
+    }
+
+    /// The write guard is on: the root is layered and the layer service said GUARD (or the break
+    /// `break-ramfs-guard-early` has it on from the start).
+    pub fn guarded(&self) -> bool {
+        self.layered && (self.guarded || cfg!(feature = "break-ramfs-guard-early"))
     }
 
     /// The name of the mount, when there is one.

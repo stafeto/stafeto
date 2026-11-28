@@ -14,8 +14,13 @@
 //!   A path against a descriptor of any other service is not this layer's.
 //! * The session comes when it is first needed: TakeRoot asks the process service for the root of
 //!   the service, SESSION with a copy of the process's identity session gives a session that is
-//!   bound to the process. While the service has no root (UNREGISTERED), or says STARTING (it builds
-//!   its index), the layer asks again every millisecond for a few seconds, then answers EIO. A
+//!   bound to the process. While the service has no root yet (UNREGISTERED) the layer asks again every
+//!   millisecond for five seconds, and while it says STARTING (it builds its index) for a minute
+//!   (`BUSY_TRIES`, temporary until the fast build of the index), then answers EIO. A root the
+//!   table of init does not have (ABSENT: an image with no layer service) is remembered at the
+//!   first path with no wait, and no path of the process goes to the service after it. A service
+//!   with no data volume answers SESSION with NO_STORE and is treated the same way: the paths of
+//!   the root go to the file service, which then writes to memory. A
 //!   session that arrived in the slot Layer (a fork, a spawn or an exec) is unbound or has lapsed:
 //!   the first call that needs an identity answers AUTHENTICATING, and the layer sends BIND with a
 //!   copy of the identity session and asks once more.
@@ -189,15 +194,28 @@ pub fn session() -> Option<rt::abi::Handle> {
     }
 }
 
-/// The process service had no root of the layer service for the whole wait: the image has none, and
-/// no path of this process goes to the service again (a program built with the layer in an image
-/// without `layerd` waits once).
+/// The mark of a build with the layer client: the symbol a program of the layered image has (a
+/// static program in its own symbols, a dynamic one in `libc.so`, which exports it), so that
+/// `cargo xtask` checks every POSIX binary of the image with `llvm-nm` and finds none built without
+/// the feature. `route` reads it, which keeps the object that defines it in every program that
+/// asks the layer for a path.
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+pub static stafeto_layer_client: u8 = 1;
+
+/// The image or the machine has no layer service (the process service answered ABSENT, or the service
+/// answered NO_STORE): no path of this process goes to the service again. A root that is only late
+/// (UNREGISTERED) does not set it. A program built
+/// with the layer in an image without `layerd` learns it at its first path, with no wait.
 static NEVER: AtomicBool = AtomicBool::new(false);
 
 /// Why a try to take the session did not end it.
 enum Attempt {
     /// The process service has no root (UNREGISTERED) yet.
     NoRoot,
+    /// The table of init has no layer service (ABSENT): none will come.
+    Absent,
     /// Not yet: the service is busy or starting.
     Retry,
     /// The errno of the failure.
@@ -223,6 +241,10 @@ fn take_root() -> Result<Handle<Channel>, Attempt> {
         Ok(proto_process::UNREGISTERED) => {
             why!("TakeRoot: UNREGISTERED, no root yet");
             Err(Attempt::NoRoot)
+        }
+        Ok(proto_process::ABSENT) => {
+            why!("TakeRoot: ABSENT, no layer service in this image");
+            Err(Attempt::Absent)
         }
         other => {
             why!("TakeRoot refused: {other:?}");
@@ -287,6 +309,11 @@ fn take_session(root: &Handle<Channel>) -> Result<Handle<Channel>, Attempt> {
             Attempt::Failed(EIO)
         }),
         Ok(status) if is_busy(status) => Err(Attempt::Retry),
+        // The service has no data volume: the root is the file service's alone, writes included.
+        Ok(pure::NO_STORE) => {
+            why!("SESSION: NO_STORE, the root has no layers in this image");
+            Err(Attempt::Absent)
+        }
         Ok(status) => {
             why!("SESSION refused with status {status}");
             Err(Attempt::Failed(errno_of(status)))
@@ -306,7 +333,14 @@ static TAKE: posix_sync::LayerLock = posix_sync::LayerLock::new();
 /// a few microseconds of a CPU under the 50 microseconds in 10 ms of the loop's budget, so the
 /// arena of 256 KiB takes under a second at the worst (names of one byte) and about 0.3 s with
 /// names of 100 bytes: the window covers it five times over.
-const BUSY_TRIES: u32 = 5000;
+const BUSY_TRIES: u32 = 60_000;
+
+/// The same for a process service that has no root of the layer service yet (UNREGISTERED): the
+/// service registers its root before it builds its index. A root that does not come in five
+/// seconds fails the call with EIO and nothing more: the service may be late or restarting, and a
+/// process that took it for absent would write past the layers for the rest of its life. Only
+/// ABSENT and NO_STORE (an image or a machine that has no layers) end the use of the service.
+const NO_ROOT_TRIES: u32 = 5000;
 
 /// Waits a millisecond with a timed sleep that is no point of cancellation, as `data` does.
 fn pause() -> Result<(), i32> {
@@ -315,7 +349,25 @@ fn pause() -> Result<(), i32> {
 
 /// The session of the process: the one it has, or one taken now.
 fn ensure() -> Result<rt::abi::Handle, i32> {
+    take().map_err(|failed| match failed {
+        Taking::Absent => EIO,
+        Taking::Errno(errno) => errno,
+    })
+}
+
+/// Why the session could not be taken.
+enum Taking {
+    /// The image has no layer service: no path goes to it any more (`NEVER` is set).
+    Absent,
+    Errno(i32),
+}
+
+/// The session, taken now when the process has none: the body of `ensure`, which tells ABSENT
+/// apart from the failures (`route` learns it before the first call).
+#[inline(never)]
+fn take() -> Result<rt::abi::Handle, Taking> {
     let mut tries = 0;
+    let mut no_root = 0;
     loop {
         if let Some(session) = session() {
             return Ok(session);
@@ -335,20 +387,27 @@ fn ensure() -> Result<rt::abi::Handle, i32> {
             }
         };
         match attempt {
-            Attempt::Retry | Attempt::NoRoot if tries < BUSY_TRIES => {
+            Attempt::Retry if tries < BUSY_TRIES => {
                 tries += 1;
-                pause()?;
+                pause().map_err(Taking::Errno)?;
+            }
+            Attempt::NoRoot if no_root < NO_ROOT_TRIES => {
+                no_root += 1;
+                pause().map_err(Taking::Errno)?;
+            }
+            Attempt::Absent => {
+                NEVER.store(true, Ordering::Release);
+                return Err(Taking::Absent);
             }
             Attempt::NoRoot => {
-                why!("no root of the layer service after the tries: none in this image");
-                NEVER.store(true, Ordering::Release);
-                return Err(EIO);
+                why!("no root of the layer service after the tries");
+                return Err(Taking::Errno(EIO));
             }
             Attempt::Retry => {
                 why!("no session after the tries");
-                return Err(EIO);
+                return Err(Taking::Errno(EIO));
             }
-            Attempt::Failed(errno) => return Err(errno),
+            Attempt::Failed(errno) => return Err(Taking::Errno(errno)),
         }
     }
 }
@@ -683,6 +742,26 @@ fn base_path(dirfd: c_int) -> Result<Option<pure::DirPath>, i32> {
 /// `dirfd` when that is a description of the service or a directory of the file service outside
 /// the pass-through names. None for any other path, in a build with no layer service too.
 pub fn route(dirfd: c_int, path: &[u8]) -> Result<Option<Abs>, i32> {
+    core::hint::black_box(&stafeto_layer_client);
+    let Some(abs) = belonging(dirfd, path)? else {
+        return Ok(None);
+    };
+    // The first path of a process takes its session now, so that an image with no layer service
+    // (ABSENT) sends the path on to the file service at once, with no wait and no failed call.
+    // The buffers of the walk above are gone by now: the main stack of a program is 64 KiB.
+    if session().is_none() {
+        match take() {
+            Ok(_) => {}
+            Err(Taking::Absent) => return Ok(None),
+            Err(Taking::Errno(errno)) => return Err(errno),
+        }
+    }
+    Ok(Some(abs))
+}
+
+/// The path as a path of the layered root, when it belongs there (`route` before the session).
+#[inline(never)]
+fn belonging(dirfd: c_int, path: &[u8]) -> Result<Option<Abs>, i32> {
     // The break: no path goes to the layer service, and the file service answers them all as it
     // would in an image with no layers (`cargo xtask layer-posix breaks`).
     if cfg!(feature = "break-layer-route") || NEVER.load(Ordering::Acquire) {
@@ -1053,20 +1132,54 @@ fn plain(abs: &Abs, out: &mut [u8; WIDE]) -> Result<usize, i32> {
 /// path); a name of a layer of the user is never run (EACCES, as for `/data`); a name the layers
 /// delete or never had is ENOENT, and a directory of the path that is closed is EACCES.
 pub fn check_exec(abs: &Abs) -> Result<Abs, i32> {
+    match runnable(abs)? {
+        Runnable::Lower(canonical) => Ok(canonical),
+        Runnable::Layer => Err(EACCES),
+    }
+}
+
+/// What the layers say of a program at a path. The path lives on the stack of the one call.
+#[allow(clippy::large_enum_variant)]
+pub enum Runnable {
+    /// A name of the lower set: the loader opens this canonical path.
+    Lower(Abs),
+    /// A name of a layer of the user: no program runs from there, but a script that starts with
+    /// `#!` does, through its interpreter (`crate::script`).
+    Layer,
+}
+
+/// `check_exec` that says whether a name lies in a layer of the user or in the lower set, and refuses neither.
+pub fn runnable(abs: &Abs) -> Result<Runnable, i32> {
     run(abs, true, |at| {
         match ask(at, |a, w| {
             n::write_stat(0, a.bytes(), w).map_err(write_failed)
         })? {
-            Answered::Done(_) => Err(EACCES.into()),
+            Answered::Done(_) => Ok(Runnable::Layer),
             Answered::Redirect {
                 target: proto_fs::REDIRECT_RAM,
                 path,
             } => {
                 let mut canonical = [0u8; WIDE];
                 let len = crate::names::realpath_ram(path.bytes(), &mut canonical).map_err(ram)?;
-                Abs::from(&canonical[..len], false).ok_or(Next::Errno(ENAMETOOLONG))
+                Abs::from(&canonical[..len], false)
+                    .map(Runnable::Lower)
+                    .ok_or(Next::Errno(ENAMETOOLONG))
             }
             Answered::Redirect { .. } => Err(EACCES.into()),
+        }
+    })
+}
+
+/// Whether the caller (the effective identifiers) may execute the regular file of a layer of the
+/// user at `abs` as a script: the service answers ACCESS for the execute bit, and the name must be a
+/// regular file (a directory has search, which is no run).
+pub fn may_run_script(abs: &Abs) -> Result<(), i32> {
+    run(abs, true, |at| {
+        match ask(at, |a, w| {
+            n::write_access(1, 0, a.bytes(), w).map_err(write_failed)
+        })? {
+            Answered::Done(_) if stat(at, true)?.kind == 2 => Ok(()),
+            _ => Err(EACCES.into()),
         }
     })
 }

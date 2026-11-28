@@ -2632,6 +2632,22 @@ fn a_layered_root_refuses_the_writes_outside_the_pass_through_names() {
         .write(tmp_link, ROOT_ACCOUNT, 0, b"/etc/passwd")
         .unwrap();
     r.storage.state.set_layered(true);
+    // Until GUARD the layered service refuses nothing: a machine with no data volume writes to the
+    // memory of the service. The guard is one way.
+    assert!(!r.storage.state.guarded());
+    let before = guarded_walk(
+        &mut r,
+        b"/etc/new",
+        Intent::Open {
+            flags: CREATE | READ_WRITE,
+        },
+        true,
+        false,
+    );
+    assert!(matches!(before, Ok(Progress::Missing(_))), "{before:?}");
+    assert!(r.storage.state.set_guarded());
+    assert!(r.storage.state.set_guarded(), "a repeat changes nothing");
+    assert!(r.storage.state.guarded());
     let refused = Err(proto_fs::READ_ONLY_FILESYSTEM);
     let open = |flags| Intent::Open { flags };
     let found = |p: Result<Progress, u32>| matches!(p, Ok(Progress::Found(_)));

@@ -158,6 +158,12 @@ pub trait Lower {
     fn stat_poll(&mut self, probe: &mut Self::Probe) -> R<Option<LowerStat>>;
     /// Gives a stat that is not answered back.
     fn stat_cancel(&mut self, probe: Self::Probe);
+    /// Switches on the write guard of the lower set's service (GUARD): from now a POSIX session
+    /// cannot write a name of the root outside the pass-through names, so every write goes through
+    /// this service. One way, and a repeat changes nothing.
+    fn guard(&mut self) -> R<()> {
+        Ok(())
+    }
 }
 
 /// The bytes of a copy of a lower file, moved by the worker thread of the service: its own sessions

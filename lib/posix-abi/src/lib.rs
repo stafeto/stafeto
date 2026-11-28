@@ -77,6 +77,7 @@ pub mod random;
 pub mod relibc;
 pub mod resources;
 pub mod sched;
+pub mod script;
 pub mod shared;
 pub mod shares;
 pub mod signals;

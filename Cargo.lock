@@ -1467,6 +1467,7 @@ name = "proto-init"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "proto-process",
  "proto-wire",
 ]
 

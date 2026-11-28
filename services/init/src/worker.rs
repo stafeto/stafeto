@@ -442,8 +442,14 @@ fn start_data(record: &Record, cpus: u8, spawned: &mut Spawned) -> Result<Kept, 
         kept[i] = Some(object);
     }
     // The RAM file service has no DMA: its extra arguments are the mount of the data volume.
-    let first = match table::first_args(table::TABLE, record.name) {
+    // The process service has the line of the roots its table registers (`table::roots_mask`).
+    let mut roots = [0; proto_init::ROOTS_LINE_MAX];
+    let first = match table::first_args(table::table(), record.name) {
         mount if !mount.is_empty() && record.dma.is_empty() => mount,
+        _ if record.name == PROCESS_SERVICE => {
+            let len = proto_init::write_roots(table::roots_mask(table::table()), &mut roots);
+            &roots[..len]
+        }
         _ => &own[..8 * record.dma.len()],
     };
     set_args(record, &mut spawned.giver, first)?;

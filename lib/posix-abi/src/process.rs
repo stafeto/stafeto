@@ -1574,7 +1574,7 @@ pub fn spawn_search<'s, 'a>(
     attributes: SpawnAttributes,
     actions: impl Iterator<Item = FileAction<'a>>,
 ) -> Result<i32, i32> {
-    use crate::constants::{EINVAL, ENOENT};
+    use crate::constants::ENOENT;
     if file.is_empty() {
         return Err(ENOENT);
     }
@@ -1584,12 +1584,51 @@ pub fn spawn_search<'s, 'a>(
     }
     // A path of the layered root goes through the layer service first: the layers that delete the
     // name make it ENOENT, and a name of a layer of the user is never run.
-    // The loader gets the path the service approved.
+    // `posix_spawnp` (`search` set) is left out of the scripts of a layer of the user: its PATH search
+    // takes lower programs alone. `execvp` of the C library searches by `execve`, which runs them.
+    // The loader gets the path the service approved. A name of a layer of the user that is a script
+    // runs through its interpreter, as for `exec`.
     let checked = match crate::layer::route(crate::names::AT_FDCWD, file)? {
-        Some(abs) if search.is_none() => Some(crate::layer::check_exec(&abs)?),
+        Some(abs) if search.is_none() => match crate::layer::check_exec(&abs) {
+            Err(crate::constants::EACCES) => {
+                return spawn_refused(file, argv, envp, attributes, actions);
+            }
+            other => Some(other?),
+        },
         _ => None,
     };
     let file = checked.as_ref().map_or(file, |abs| abs.bytes());
+    spawn_approved(file, search, argv, envp, attributes, actions)
+}
+
+/// `spawn_search` of a path that was refused with EACCES: a script of a layer of the user is
+/// spawned through its interpreter, anything else stays refused. Apart from `spawn_search` so that
+/// the script is not in its frame.
+#[inline(never)]
+fn spawn_refused<'s, 'a>(
+    file: &[u8],
+    argv: impl Iterator<Item = &'s [u8]> + Clone,
+    envp: impl Iterator<Item = &'s [u8]> + Clone,
+    attributes: SpawnAttributes,
+    actions: impl Iterator<Item = FileAction<'a>>,
+) -> Result<i32, i32> {
+    match script_of(file)? {
+        Some(script) => spawn_script(file, &script, argv, envp, attributes, actions),
+        None => Err(crate::constants::EACCES),
+    }
+}
+
+/// `spawn_search` once the path of the program is the one the layer service approved.
+#[inline(never)]
+fn spawn_approved<'s, 'a>(
+    file: &[u8],
+    search: Option<&[u8]>,
+    argv: impl Iterator<Item = &'s [u8]> + Clone,
+    envp: impl Iterator<Item = &'s [u8]> + Clone,
+    attributes: SpawnAttributes,
+    actions: impl Iterator<Item = FileAction<'a>>,
+) -> Result<i32, i32> {
+    use crate::constants::EINVAL;
     let pgroup = attributes.pgroup;
     if pgroup > i32::MAX as u32 || attributes.flags & !proto_process::SPAWN_FLAGS != 0 {
         return Err(EINVAL);
@@ -1615,6 +1654,38 @@ pub fn spawn_search<'s, 'a>(
         });
     shadow.finish();
     spawned
+}
+
+/// `spawn_file` of the interpreter of `script`, the path of the script and the caller's own
+/// arguments after the interpreter's name (as `exec_script` does).
+#[inline(never)]
+fn spawn_script<'s, 'a>(
+    path: &[u8],
+    script: &crate::script::Script,
+    argv: impl Iterator<Item = &'s [u8]> + Clone,
+    envp: impl Iterator<Item = &'s [u8]> + Clone,
+    attributes: SpawnAttributes,
+    actions: impl Iterator<Item = FileAction<'a>>,
+) -> Result<i32, i32> {
+    let interpreter = script.interpreter();
+    let arguments = core::iter::once(interpreter)
+        .chain(script.argument())
+        .chain(core::iter::once(path))
+        .chain(argv.skip(1).map(|argument| -> &[u8] { argument }));
+    let environment = envp.map(|variable| -> &[u8] { variable });
+    // The interpreter is a program like any other: none runs from the data volume or from a layer
+    // of the user, and the path the loader opens is the lower set's canonical one.
+    if crate::data::route(crate::names::AT_FDCWD, interpreter)?.is_some() {
+        return Err(crate::constants::EACCES);
+    }
+    let approved = match crate::layer::route(crate::names::AT_FDCWD, interpreter)? {
+        // The break: the loader is given the interpreter's path as it stands.
+        Some(_) if cfg!(feature = "break-layer-script") => None,
+        Some(abs) => Some(crate::layer::check_exec(&abs)?),
+        None => None,
+    };
+    let file = approved.as_ref().map_or(interpreter, |abs| abs.bytes());
+    spawn_approved(file, None, arguments, environment, attributes, actions)
 }
 
 /// X_OK of faccessat.
@@ -1798,7 +1869,67 @@ pub fn exec<'s>(
     envp: impl Iterator<Item = &'s [u8]> + Clone,
     umask: u32,
 ) -> Result<core::convert::Infallible, i32> {
-    exec_selected(ExecSource::Path(path), argv, envp, umask)
+    let refused = exec_selected(ExecSource::Path(path), argv.clone(), envp.clone(), umask);
+    // A name of a layer of the user is no program (EACCES), but a script that starts with `#!`
+    // runs through its interpreter (`crate::script`). The check is made after the refusal, so that
+    // a program costs no more than before and the frame of `exec_selected` is as it was (the main
+    // stack of a program is 64 KiB).
+    match refused {
+        Err(crate::constants::EACCES) => exec_refused(path, argv, envp, umask),
+        other => other,
+    }
+}
+
+/// `exec` of a path that was refused with EACCES: a script of a layer of the user runs, anything
+/// else stays refused. Apart from `exec` so that its frame (the script) is not in `exec`'s.
+#[inline(never)]
+fn exec_refused<'s>(
+    path: &[u8],
+    argv: impl Iterator<Item = &'s [u8]> + Clone,
+    envp: impl Iterator<Item = &'s [u8]> + Clone,
+    umask: u32,
+) -> Result<core::convert::Infallible, i32> {
+    match script_of(path)? {
+        Some(script) => exec_script(path, &script, argv, envp, umask),
+        None => Err(crate::constants::EACCES),
+    }
+}
+
+/// The script a refused `exec` of `path` is, when the path is a name of a layer of the user that
+/// starts with `#!` and the caller may execute it; None leaves the refusal as it was. The
+/// interpreter's path is checked the same way every program's is (ENOENT when the layers delete
+/// it, EACCES when it lies in a layer of the user), by the `exec` that runs it.
+#[inline(never)]
+fn script_of(path: &[u8]) -> Result<Option<crate::script::Script>, i32> {
+    use crate::layer::Runnable;
+    let Some(abs) = crate::layer::route(crate::names::AT_FDCWD, path)? else {
+        return Ok(None);
+    };
+    match crate::layer::runnable(&abs)? {
+        Runnable::Layer => crate::script::read(&abs).map(Some),
+        Runnable::Lower(_) => Ok(None),
+    }
+}
+
+/// Runs the interpreter of `script`: its argument, the path of the script and the caller's
+/// arguments after its own `argv[0]` follow the interpreter's name.
+#[inline(never)]
+fn exec_script<'s>(
+    path: &[u8],
+    script: &crate::script::Script,
+    argv: impl Iterator<Item = &'s [u8]> + Clone,
+    envp: impl Iterator<Item = &'s [u8]> + Clone,
+    umask: u32,
+) -> Result<core::convert::Infallible, i32> {
+    let interpreter = script.interpreter();
+    let arguments = core::iter::once(interpreter)
+        .chain(script.argument())
+        .chain(core::iter::once(path))
+        .chain(argv.skip(1).map(|argument| -> &[u8] { argument }));
+    // The strings of the script's line live in this frame: the environment's borrow shortens to
+    // match.
+    let environment = envp.map(|variable| -> &[u8] { variable });
+    exec_selected(ExecSource::Path(interpreter), arguments, environment, umask)
 }
 
 /// Execute the exact retained description; current offset and open mode are ignored.
@@ -1818,6 +1949,7 @@ enum ExecSource<'a> {
     Descriptor(u32),
 }
 
+#[inline(never)]
 fn exec_selected<'s>(
     source: ExecSource<'_>,
     argv: impl Iterator<Item = &'s [u8]> + Clone,
