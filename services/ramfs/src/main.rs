@@ -537,6 +537,7 @@ fn main(_: u64) -> u64 {
         #[cfg(feature = "layer-probe")]
         refuse_unmap: false,
         layer_pending: None,
+        layer_memory: None,
         layer_channels: [const { None }; LAYERS_MAX],
         layer_sizes: [0; LAYERS_MAX],
         layer_levels: [1; LAYERS_MAX],
@@ -723,6 +724,8 @@ struct Fs {
     refuse_unmap: bool,
     /// The reply to the LayerStart of an attach, which waits for the mapping.
     layer_pending: Option<Pending>,
+    /// The object the thread is mapping, kept until its outcome is taken.
+    layer_memory: Option<Handle<Memory>>,
     /// For each layer record: the channel to tell its client of the release, the size of the
     /// mapping and the level the client named.
     layer_channels: [Option<Handle<Channel>>; LAYERS_MAX],
@@ -2116,7 +2119,7 @@ impl Fs {
             return status(proto_fs::BUSY);
         };
         let level = start.level as u8;
-        if let Err(error) = mapper.map(level, memory, size, mapper::window(index)) {
+        if let Err(error) = mapper.map(level, &memory, size, mapper::window(index)) {
             self.ram.storage.layer_unmapped(index);
             let _ = pending.answer(&proto_wire::reply(Status::Kernel(error)), Outgoing::new());
             return Answer::Deferred;
@@ -2124,6 +2127,7 @@ impl Fs {
         self.mapping = Mapping::Attaching(index);
         self.ram.storage.layer_set_session(label);
         self.layer_pending = Some(pending);
+        self.layer_memory = Some(memory);
         self.layer_channels[index] = Some(channel);
         self.layer_sizes[index] = size;
         self.layer_levels[index] = level;
@@ -2138,6 +2142,8 @@ impl Fs {
         let Some(outcome) = mapper.take() else {
             return;
         };
+        // The mapping holds the object; the handle goes.
+        self.layer_memory = None;
         #[cfg(feature = "layer-probe")]
         let outcome = if matches!(self.mapping, Mapping::Releasing(_))
             && core::mem::take(&mut self.refuse_unmap)

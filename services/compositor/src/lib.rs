@@ -44,6 +44,7 @@ mod element_tests;
 pub mod elements;
 pub mod fit;
 pub mod frame;
+pub mod mapping;
 pub mod prep;
 #[cfg(test)]
 mod top_tests;

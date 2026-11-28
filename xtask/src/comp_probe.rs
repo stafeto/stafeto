@@ -108,8 +108,12 @@ const S_ENDS: &str = "init: comp-probe-s ended: ";
 
 /// The lines each client prints once per check that passed, and how many
 /// times a run has each.
-const CHECKS: [(&str, usize); 34] = [
+const CHECKS: [(&str, usize); 35] = [
     ("comp-probe: the screen is 640x400, no window yet", 1),
+    (
+        "comp-probe: sixteen windows of three large buffers are attached and shown, again after they went, the seventeenth is refused",
+        1,
+    ),
     (
         "comp-probe: windows outside the screen or of another format are refused",
         1,
@@ -1452,6 +1456,101 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     if !machine.is_hvf() {
         steps(machine)?;
     }
+    Ok(())
+}
+
+/// The image of the run under -icount with one deliberate break of the windows' mappings in
+/// the compositor.
+const fn break_programs(feature: &'static [&'static str]) -> [ImageProgram; 4] {
+    [
+        ("init", "init", INIT_STACK_SIZE, &["table-comp"]),
+        (
+            "virtio-gpu",
+            "virtio-gpu",
+            gpu_probe::GPU_STACK_SIZE,
+            &["steps"],
+        ),
+        ("compositor", "compositor", COMP_STACK_SIZE, feature),
+        ("comp-probe", "comp-probe", PROBE_STACK_SIZE, &["quick"]),
+    ]
+}
+
+const CHUNK_MAP_PROGRAMS: [ImageProgram; 4] =
+    break_programs(&["steps", "break-compositor-chunk-map"]);
+const MAP_ON_STEP_PROGRAMS: [ImageProgram; 4] =
+    break_programs(&["steps", "break-compositor-map-on-step"]);
+const UNMAP_EARLY_PROGRAMS: [ImageProgram; 4] =
+    break_programs(&["steps", "break-compositor-unmap-early"]);
+
+/// `cargo xtask comp-probe breaks`: the compositor that maps a buffer in pieces of 32 pages
+/// (the sixteen windows run out of mapping entries: the probe fails), the one that maps a
+/// buffer in a step of its own (the steps are over the gate), the one that gives a window's
+/// place back at its first unmapping (the windows made again fail to map), and the one whose
+/// ATTACH says INVALID for a full table (the host test of `attach_status` fails). Each must be
+/// caught.
+pub fn breaks(machine: &qemu::Machine) -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    let run = |name: &'static str,
+               programs: &'static [ImageProgram],
+               stop: &str|
+     -> Result<qemu::Outcome, String> {
+        let image = build_boot_image(name, programs, BOOT_PROFILE)?;
+        let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+        cmd.args(qemu::HEADLESS);
+        cmd.args(qemu::GPU);
+        cmd.args(qemu::ICOUNT);
+        run_until(cmd, crate::BOOT_TIMEOUT * 4, Some(stop), &kernel.elf)
+    };
+    for (name, programs, what) in [
+        (
+            "boot-comp-break-chunk.img",
+            &CHUNK_MAP_PROGRAMS[..],
+            "the compositor that maps in pieces of 32 pages",
+        ),
+        (
+            "boot-comp-break-early.img",
+            &UNMAP_EARLY_PROGRAMS[..],
+            "the compositor that gives a place back at its first unmapping",
+        ),
+    ] {
+        let output = run(name, programs, "comp-probe: failed")?;
+        match output
+            .lines
+            .iter()
+            .find(|l| l.starts_with("comp-probe: failed"))
+        {
+            Some(failed) => println!("comp-probe breaks: {what} was caught: {failed}"),
+            None => return Err(format!("{what}: the probe did not fail")),
+        }
+    }
+    let output = run("boot-comp-break-step.img", &MAP_ON_STEP_PROGRAMS, S_ENDS)?;
+    match steps_verdict(&output.lines) {
+        Err(e) => println!(
+            "comp-probe breaks: the compositor that maps a buffer in a step was caught: {e}"
+        ),
+        Ok(_) => return Err("the compositor that maps in a step passed the gates".to_owned()),
+    }
+    let status = std::process::Command::new("cargo")
+        .current_dir(crate::root())
+        .args([
+            "test",
+            "-p",
+            "compositor",
+            "--lib",
+            "--features",
+            "break-compositor-status",
+            "mapping::",
+        ])
+        .output()
+        .map_err(|e| format!("cargo test: {e}"))?;
+    if status.status.success() {
+        return Err(
+            "the status that says INVALID for a full table passed its host test".to_owned(),
+        );
+    }
+    println!(
+        "comp-probe breaks: the status that says INVALID for a full table failed the host test of attach_status"
+    );
     Ok(())
 }
 

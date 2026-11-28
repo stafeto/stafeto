@@ -2942,6 +2942,27 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        // The desk with many clients: the client's file has a short name, for the own
+        // arguments of the manager's record hold 240 bytes.
+        "boot-desk-many.img" | "boot-desk-many-steps.img" | "boot-desk-sixteen.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/desk", 0o755, ROOT, "desk"),
+                file("/bin/dc", 0o755, ROOT, "dc"),
+                dir("/usr"),
+                dir("/usr/share"),
+                dir("/usr/share/fonts"),
+                of(
+                    "/usr/share/fonts/LiberationSans-Regular.ttf",
+                    0o644,
+                    ROOT,
+                    Source::Bytes("LiberationSans-Regular.ttf", lvgl_font()),
+                ),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
         // The cube starts its own file once: the copy that draws can fork.
         "boot-gles-window.img" => {
             let mut files = vec![
