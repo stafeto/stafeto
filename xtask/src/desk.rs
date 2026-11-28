@@ -802,7 +802,7 @@ fn many(machine: &qemu::Machine, sixteen: bool) -> Result<(), String> {
 /// with the mappings; the issue for it is named here when it is opened (the coordinator sets
 /// the number). Until it is fixed, `many steps` passes with the gate over and prints the
 /// numbers; a gate that passes is told, so that the mark can go.
-const BAND_ISSUE: &str = "the issue for the band of 13 stacked windows (number to be set)";
+const BAND_ISSUE: &str = "stafeto#660 (the band of 13 stacked windows)";
 
 /// `cargo xtask desk-probe many steps`: the run of `many` under -icount, the compositor's steps
 /// judged by the gates. A step over a gate is the known failure of `BAND_ISSUE` and does not
