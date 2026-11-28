@@ -19,14 +19,14 @@ pub const CHUNK: usize = 32;
 const PAGE: usize = 4096;
 
 /// The mapping entries the service itself holds: the frame buffer and the pool in pieces of
-/// `CHUNK` pages, the cursor's picture, the segments of the image and its stack, the message
-/// buffers of the three threads, and a margin.
+/// `CHUNK` pages, the cursor's picture, the segments of the image and its stack, and a margin
+/// of 11 (the message buffers of the three threads take at most 3 of it).
 pub const OWN_MAPPINGS: usize = (BUFFER_BYTES as usize / PAGE).div_ceil(CHUNK)
     + (SCREEN_BYTES as usize / PAGE).div_ceil(CHUNK)
     + 1
     + (3 + 1)
-    + 3
-    + 8;
+    + MARGIN;
+const MARGIN: usize = 11;
 
 // A window's buffers take one entry each: all the windows with all their buffers and the
 // service's own fit the kernel's table.
@@ -110,8 +110,8 @@ mod tests {
     #[test]
     fn the_budget_holds_the_windows_and_the_service() {
         assert!(MAX_WINDOWS * BUFFERS + OWN_MAPPINGS <= abi::MAX_MAPPINGS as usize);
-        // The frame buffer's 8 and the pool's 8, the cursor, the image, the buffers, a margin.
-        assert_eq!(OWN_MAPPINGS, 8 + 8 + 1 + 4 + 3 + 8);
+        // The frame buffer's 8 and the pool's 8, the cursor, the image, the margin.
+        assert_eq!(OWN_MAPPINGS, 8 + 8 + 1 + 4 + MARGIN);
     }
 
     #[test]

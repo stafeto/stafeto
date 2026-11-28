@@ -13,7 +13,7 @@ use crate::handle::{Channel, Handle, Memory, Process, Thread};
 use crate::{Stack, sys};
 use core::cell::{Cell as Level, UnsafeCell};
 use core::mem::ManuallyDrop;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 const STACK_SIZE: usize = 16 * 1024;
 
@@ -56,6 +56,8 @@ static CELL: Slot = Slot {
 /// The raw handles the thread uses: the service's process, the thread's channel, the handle
 /// it tells through. The bits it tells with.
 static HANDLES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// The thread, the cell and the handles are one set for the process: a second start is refused.
+static STARTED: AtomicBool = AtomicBool::new(false);
 static BITS: AtomicU64 = AtomicU64::new(0);
 const PROCESS: usize = 0;
 const WAKE: usize = 1;
@@ -85,6 +87,9 @@ impl Mapper {
         bits: u64,
         buffer: usize,
     ) -> Result<Mapper, Error> {
+        if STARTED.swap(true, Ordering::AcqRel) {
+            return Err(Error::BadState);
+        }
         let wake = sys::channel_create(1)?;
         BITS.store(bits, Ordering::Relaxed);
         for (i, raw) in [

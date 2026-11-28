@@ -2944,7 +2944,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         }
         // The desk with many clients: the client's file has a short name, for the own
         // arguments of the manager's record hold 240 bytes.
-        "boot-desk-many.img" | "boot-desk-sixteen.img" => {
+        "boot-desk-many.img" | "boot-desk-many-steps.img" | "boot-desk-sixteen.img" => {
             let mut files = vec![
                 dir("/bin"),
                 file("/bin/desk", 0o755, ROOT, "desk"),

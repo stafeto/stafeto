@@ -341,11 +341,15 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("posix-window", 25),
     ("desk-probe --api", 30),
     ("desk-probe", 60),
+    ("desk-probe many", 60),
+    ("desk-probe many steps", 90),
+    ("desk-probe sixteen", 60),
     ("wfd-probe", 40),
     ("wfc-probe", 202),
     ("display-probe", 25),
     ("lvgl-probe", 74),
     ("comp-late-probe", 25),
+    ("comp-probe breaks", 75),
     ("frame-probe", 73),
 ];
 const DEFAULT_WEIGHT: u32 = 20;

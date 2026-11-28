@@ -211,6 +211,11 @@ struct Extra {
     /// The level of the client that attached: the mapper thread works at it for the
     /// window's mappings and unmappings.
     level: u8,
+    /// The unmappings of a dying window that failed in a row, and whether it gave up: a
+    /// window whose mapping cannot be taken out keeps its place for good (`taken`), for the
+    /// mapping is still in the place's range.
+    tries: u8,
+    lost: bool,
     dying: bool,
     wait: Option<Pending>,
     queued: Option<Pending>,
@@ -224,12 +229,32 @@ impl Extra {
             pages: [0; proto_comp::BUFFERS],
             mapped: [0; proto_comp::BUFFERS],
             level: 1,
+            tries: 0,
+            lost: false,
             dying: false,
             wait: None,
             queued: None,
         }
     }
 }
+
+impl Extra {
+    /// An unmapping failed (the order was not given, or the kernel refused it). The mapping
+    /// may still be in the place's range, so the place is not given back: it is asked again
+    /// at the next step, and after `UNMAP_TRIES` failures in a row the place is lost, never
+    /// taken by a window again.
+    fn unmap_failed(&mut self, error: Error) {
+        self.tries += 1;
+        rt::println!("compositor: a buffer was not unmapped: {error:?}");
+        if self.tries >= UNMAP_TRIES && !self.lost {
+            self.lost = true;
+            rt::println!("compositor: a place is lost, its mapping stays");
+        }
+    }
+}
+
+/// The failures of an unmapping in a row after which its place is given up.
+const UNMAP_TRIES: u8 = 3;
 
 /// An ATTACH whose buffers are being mapped: window `slot` gets `count`
 /// buffers of `stride`, the reply waits for the last chunk.
@@ -1890,6 +1915,7 @@ impl Compositor {
             let e = &self.extra[i];
             let in_flight = self.ordered.is_some_and(|o| o.slot == i);
             if e.dying
+                && !e.lost
                 && !in_flight
                 && e.mapped.iter().any(|&m| m != 0)
                 && !self.scene.worker_reads(i)
@@ -2023,15 +2049,7 @@ impl Compositor {
                             *extra = Extra::new();
                         }
                     }
-                    Err(error) => {
-                        // The mapping stays in its place, which no window takes any more
-                        // than its own; the place is given back.
-                        rt::println!("compositor: a buffer cannot be given back: {error:?}");
-                        extra.mapped[b] = 0;
-                        if extra.mapped.iter().all(|&m| m == 0) {
-                            *extra = Extra::new();
-                        }
-                    }
+                    Err(error) => extra.unmap_failed(error),
                 }
             }
             Pick::Attach => {
@@ -2115,10 +2133,14 @@ impl Compositor {
         let (i, b) = (done.slot, done.buffer);
         let extra = &mut self.extra[i];
         if done.unmap {
-            if let Err(error) = outcome {
-                rt::println!("compositor: a buffer was not unmapped: {error:?}");
+            match outcome {
+                Ok(()) => {
+                    extra.tries = 0;
+                    extra.mapped[b] -= done.pages.min(extra.mapped[b]);
+                }
+                // The mapping may remain: the place stays dying and the next step asks again.
+                Err(error) => extra.unmap_failed(error),
             }
-            extra.mapped[b] -= done.pages.min(extra.mapped[b]);
         } else if let Err(error) = outcome {
             if extra.dying {
                 // The window went while its buffer was being mapped.
@@ -2137,9 +2159,6 @@ impl Compositor {
         let extra = &mut self.extra[i];
         if extra.dying && extra.mapped.iter().all(|&m| m == 0) {
             *extra = Extra::new();
-        }
-        if self.has_work() {
-            let _ = sys::notify(&self.notify, WORK);
         }
     }
 
@@ -2795,7 +2814,7 @@ impl Compositor {
         }
         // The worker lets go or goes idle: its level follows the work that is left.
         self.steer_worker(0);
-        if self.extra.iter().any(|e| e.dying) {
+        if self.extra.iter().any(|e| e.dying && !e.lost) {
             let _ = sys::notify(&self.notify, WORK);
         }
     }
@@ -3305,6 +3324,11 @@ impl Service<1> for Compositor {
         }
         if matches!(n.source, Source::Unlabeled) && n.bits & MAPPED != 0 {
             self.mapped();
+            // The next order is one piece of work for a step of its own: a notice that
+            // brings the work's bit leaves it to that step.
+            if n.bits & WORK == 0 && self.has_work() {
+                let _ = sys::notify(&self.notify, WORK);
+            }
         }
         match n.source {
             Source::Session if n.label & !GENERATION == KEYS => self.read_device(Which::Keys),

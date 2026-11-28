@@ -11523,6 +11523,18 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The manager `desk` itself over the same devices: frames, the panel, a
         // drag, focus, Super and Tab, the close button and SIGTERM, a restart.
         job("desk-probe", || desk::probe(&qemu::VIRT)),
+        // The manager with a panel, six frames and six clients of 400 by 300
+        // (13 windows), then with sixteen: every window made, one mapping a buffer.
+        job("desk-probe many", || {
+            desk::command(&["many".to_owned()], &qemu::VIRT)
+        }),
+        job("desk-probe sixteen", || {
+            desk::command(&["sixteen".to_owned()], &qemu::VIRT)
+        }),
+        // The same 13 windows under -icount: the band gate is a known failure.
+        job("desk-probe many steps", || {
+            desk::command(&["many".to_owned(), "steps".to_owned()], &qemu::VIRT)
+        }),
         // OpenWF Display over the driver alone: the frames against QEMU's
         // screenshot, the scanout and cursor trace, the driver's steps.
         job("wfd-probe", || wfd::probe(&qemu::VIRT)),
@@ -11545,6 +11557,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The same service when the screen opens late, from a request: the
         // frame buffer mapped in portions and the longest step of that work.
         job("comp-late-probe", || comp_probe::late(&qemu::VIRT)),
+        // The four deliberate breaks of the windows' mappings, each caught.
+        job("comp-probe breaks", || comp_probe::breaks(&qemu::VIRT)),
         // The frame time under the loads: ten phases on one boot under
         // -icount, and the waits of the compositor's steps.
         job("frame-probe", || frame_probe::probe(&[])),

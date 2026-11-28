@@ -452,13 +452,18 @@ an order is short, and the service asks for no step of the work while the thread
 order, so the thread is not starved by the service on one CPU. A buffer is a megabyte
 at most.
 
+The thread does one order at a time, so an ATTACH waits behind the orders ahead of it:
+at worst the unmappings of 16 windows with 3 buffers each (48 calls, a megabyte apiece,
+the windows that went first), then its own buffers one after the other. A client that
+needs a bound on ATTACH waits for the reply for that long.
+
 ### The budget of mapping entries
 
 The kernel gives a process 128 mapping entries (`abi::MAX_MAPPINGS`), and a `mem_map`
 call takes one entry however many pages it maps. A buffer therefore takes one entry,
 so 16 windows with 3 buffers take 48. The service's own mappings (the frame buffer and
 the pool in pieces of 32 pages, the cursor's picture, the segments of its image and its
-stack, the message buffers of its three threads, and a margin) are `OWN_MAPPINGS` of
+stack, and a margin of 11 that holds the message buffers of its three threads) are `OWN_MAPPINGS` of
 `compositor::mapping`, and a constant assertion holds the sum under the table. A buffer
 the kernel refuses to map ends the ATTACH with the status of the kernel's error
 (`attach_status`): LIMIT_REACHED when the table of entries is full, NO_MEMORY when the

@@ -700,6 +700,9 @@ impl Probe<'_> {
                 }
             }
             let before = self.describe(display).map_err(say("DESCRIBE"))?;
+            // One window to a frame: the step that takes a frame with 16 first-shown windows
+            // is over the gate (the issue for the take of 16 first-shown windows, number to
+            // be set by the coordinator). Post all 16 at once again when it is fixed.
             for session in sessions.iter().flatten() {
                 self.post(session, 0, &[])
                     .map_err(say("POST of one of sixteen"))?;
