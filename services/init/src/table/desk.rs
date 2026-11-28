@@ -106,6 +106,73 @@ pub const TABLE: &[Record] = &[
     entropy::ENTROPY,
 ];
 
+/// The arguments of the manager of the run with a panel, six frames of 408 by 328 points and six
+/// clients of 400 by 300: 13 windows (the panel and the frames are the manager's, seven of the
+/// eight places it has). The names are short and the program is `/bin/dc` (the image's copy of
+/// the client), for the own arguments of a record hold 240 bytes at most.
+pub const MANY_ARGS: &[u8] = b"desk\0--trace\0\
+--spawn\0a,/bin/dc,a,4,26,400,300,A0\0\
+--spawn\0b,/bin/dc,b,4,26,400,300,B0\0\
+--spawn\0c,/bin/dc,c,4,26,400,300,C0\0\
+--spawn\0d,/bin/dc,d,4,26,400,300,D0\0\
+--spawn\0e,/bin/dc,e,4,26,400,300,E0\0\
+--spawn\0f,/bin/dc,f,4,26,400,300,F0\0";
+
+/// The same with a second window (`x`) for two of the clients: eight windows of clients, the
+/// manager's panel and seven frames (its eight places), sixteen windows, the eighth frame
+/// refused.
+pub const SIXTEEN_ARGS: &[u8] = b"desk\0--trace\0\
+--spawn\0a,/bin/dc,a,4,26,400,300,A0\0\
+--spawn\0b,/bin/dc,b,4,26,400,300,B0\0\
+--spawn\0c,/bin/dc,c,4,26,400,300,C0\0\
+--spawn\0d,/bin/dc,d,4,26,400,300,D0\0\
+--spawn\0e,/bin/dc,e,4,26,400,300,E0,x\0\
+--spawn\0f,/bin/dc,f,4,26,400,300,F0,x\0";
+
+const _: () = assert!(MANY_ARGS.len() <= 240 && SIXTEEN_ARGS.len() <= 240);
+
+/// The table of the run with six clients of 400 by 300 (xtask desk-probe many).
+pub const MANY_TABLE: &[Record] = &[
+    RAM_FIFO_CLOCKED,
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 6 * QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    comp::DISPLAY,
+    input::INPUT,
+    focus::DESK_POINTER,
+    COMPOSITOR,
+    Record {
+        args: MANY_ARGS,
+        ..DESK
+    },
+    entropy::RNG,
+    entropy::ENTROPY,
+];
+
+/// The table of the run with eight windows of clients of 400 by 300 (xtask desk-probe sixteen).
+pub const SIXTEEN_TABLE: &[Record] = &[
+    RAM_FIFO_CLOCKED,
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 6 * QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    comp::DISPLAY,
+    input::INPUT,
+    focus::DESK_POINTER,
+    COMPOSITOR,
+    Record {
+        args: SIXTEEN_ARGS,
+        ..DESK
+    },
+    entropy::RNG,
+    entropy::ENTROPY,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

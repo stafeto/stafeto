@@ -28,6 +28,7 @@ pub mod dma;
 pub mod fs;
 pub mod handle;
 pub mod loader;
+pub mod mapper;
 pub mod mmio;
 pub mod msgbuf;
 pub mod pipe;
