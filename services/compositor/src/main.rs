@@ -2964,6 +2964,12 @@ impl Service<1> for Compositor {
         let gpu = Gpu::from_number(method);
         let comp = Comp::from_number(method);
         if is_manager(label) {
+            // A manager that is a process of POSIX (`desk`) starts programs: each
+            // gets a clone of the session (CLONE, which `posix_spawn` asks), an
+            // ordinary context's session with no mark of the manager's.
+            if gpu == Some(Gpu::Clone) {
+                return self.clone_session(r);
+            }
             return self.manager_request(method, r);
         }
         if is_scene(label) {
