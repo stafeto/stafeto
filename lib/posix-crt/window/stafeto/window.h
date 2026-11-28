@@ -315,12 +315,12 @@ int stafeto_window_wait(int win, uint64_t timeout_ns, uint32_t *bits);
  * on that window with EBADF.
  * The buffer bits are applied to the masks of stafeto_window_free_buffers
  * before the call returns. Returns the mask of the windows that have bits
- * (bit k for window k; bit 30 is kept for the manager's events, which this
- * revision does not return; the result is never negative, and only -1 is a
- * failure), or -1 with errno:
+ * (bit k for window k; bit 30, STAFETO_MANAGER_EVENTS of <stafeto/manager.h>,
+ * says the manager's ring of a process that subscribed has events; the result
+ * is never negative, and only -1 is a failure), or -1 with errno:
  *   ETIMEDOUT  no bit came in time;
  *   EINTR      a signal with a handler ran during the wait;
- *   EBADF      the process has no window;
+ *   EBADF      the process has no window and no manager's subscription;
  *   EBUSY      another thread of the process is waiting for bits (in this
  *              function or in stafeto_window_wait);
  *   EIO        the kernel refused the wait. */

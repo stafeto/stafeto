@@ -3489,9 +3489,16 @@ pub const fn scene_allowed(holder: Holder) -> bool {
     !matches!(holder, Holder::Manager)
 }
 
-/// Whether the scene session's SUBSCRIBE is taken: not while a manager has.
-pub const fn subscribe_allowed(holder: Holder, caller_scene: bool) -> bool {
-    !(caller_scene && matches!(holder, Holder::Manager))
+/// Whether a SUBSCRIBE is taken: the scene session's not while a manager has
+/// subscribed, and no session's while another session holds the subscription
+/// (`same_session`: the holder is the caller itself). The holder's session
+/// ending frees it, so a manager that restarts is told BUSY until the old one
+/// has gone.
+pub const fn subscribe_allowed(holder: Holder, caller_scene: bool, same_session: bool) -> bool {
+    if caller_scene && matches!(holder, Holder::Manager) {
+        return false;
+    }
+    matches!(holder, Holder::Unsubscribed) || same_session
 }
 
 /// Whether a MANAGE of a session is taken: the scene session's always; a
@@ -7686,9 +7693,17 @@ mod tests {
         // A manager that holds the subscription goes on while there is no scene.
         assert!(manage_allowed(Manager, false, false));
         // The scene session's own subscription is refused while the manager has.
-        assert!(!subscribe_allowed(Manager, true));
-        assert!(subscribe_allowed(Manager, false));
-        assert!(subscribe_allowed(Unsubscribed, true));
+        assert!(!subscribe_allowed(Manager, true, false));
+        assert!(!subscribe_allowed(Manager, true, true));
+        assert!(subscribe_allowed(Unsubscribed, true, false));
+        assert!(subscribe_allowed(Unsubscribed, false, false));
+        // A second manager's session is refused while the first holds the
+        // subscription, and the holder itself may subscribe again.
+        assert!(!subscribe_allowed(Manager, false, false));
+        assert!(subscribe_allowed(Manager, false, true));
+        assert!(!subscribe_allowed(Holds, true, false));
+        assert!(subscribe_allowed(Holds, true, true));
+        assert!(!subscribe_allowed(Holds, false, false));
     }
 
     #[test]

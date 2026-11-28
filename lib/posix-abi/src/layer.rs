@@ -41,7 +41,8 @@
 //!   `receive` on its own channel for as long as the file is big, and a signal ends the wait as it
 //!   ends a long operation: EINTR unless the handler has SA_RESTART, and the copy goes on either way)
 //!   and then sends the same request again. A copy that fails is ENOSPC, EROFS (a program is never
-//!   copied) or EIO.
+//!   copied) or EIO; a `rename` waits on after a signal handler. A `rename` of a file or a link of the lower set takes the
+//!   same way: the copy first, then the move with a mark on the old name.
 //!   The directory part of a path of a change is canonical: a link of a layer of the user in it is a
 //!   redirect that routes by the path (followed here), and a link of the lower set is answered with a
 //!   redirect to the RAM file service for the path: the directory part is made canonical here
@@ -434,6 +435,13 @@ fn call(request: &[u8]) -> Result<Got, i32> {
 /// `call`; with `take` false a process with no session fails with EIO at once and takes none (the
 /// close of a description needs none).
 fn call_with(request: &[u8], take: bool) -> Result<Got, i32> {
+    call_full(request, take, true)
+}
+
+/// `call_with` that says whether the wait for a copy up may end with EINTR (a signal handler
+/// without SA_RESTART, a cancelled thread): a `rename` waits on, since `mv` and the editors that
+/// rename a file do not ask again.
+fn call_full(request: &[u8], take: bool, interruptible: bool) -> Result<Got, i32> {
     let mut bound = false;
     let mut reborn = false;
     let mut tries = 0;
@@ -485,7 +493,7 @@ fn call_with(request: &[u8], take: bool) -> Result<Got, i32> {
         if status == proto_fs::COPYING && take {
             match pure::copying_ticket(raw.bytes()) {
                 Some(Ok(ticket)) => {
-                    wait_copy(ticket)?;
+                    wait_copy(ticket, interruptible)?;
                     continue;
                 }
                 _ => return Err(EIO),
@@ -515,7 +523,7 @@ fn call_with(request: &[u8], take: bool) -> Result<Got, i32> {
 /// it too): the copy goes on in the service and the next request for the file finds it. After the
 /// notification, and after a handler, WAIT is asked again: the answer is the outcome, and a
 /// handler's own wait may have taken the notification.
-fn wait_copy(ticket: u64) -> Result<(), i32> {
+fn wait_copy(ticket: u64, interruptible: bool) -> Result<(), i32> {
     let block = crate::threads::own_block();
     let _outer = crate::long::OuterRestart::enter(&block.flags);
     let channel =
@@ -553,7 +561,7 @@ fn wait_copy(ticket: u64) -> Result<(), i32> {
             // The kernel ends only a send that no service has taken: it goes again unless a
             // handler that ends the call ran.
             Err(Error::Interrupted) => {
-                if crate::long::ending(&block.flags, true) {
+                if interruptible && crate::long::ending(&block.flags, true) {
                     return Err(EINTR);
                 }
                 continue;
@@ -595,7 +603,7 @@ fn wait_copy(ticket: u64) -> Result<(), i32> {
         // receive return.
         'notified: loop {
             let guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
-            if crate::long::ending(&block.flags, true) {
+            if interruptible && crate::long::ending(&block.flags, true) {
                 drop(guard);
                 return Err(EINTR);
             }
@@ -622,14 +630,15 @@ fn wait_copy(ticket: u64) -> Result<(), i32> {
                     source: rt::abi::Source::Unlabeled,
                     bits,
                     ..
-                }) if bits & posix_sync::bit::CANCEL != 0
+                }) if interruptible
+                    && bits & posix_sync::bit::CANCEL != 0
                     && crate::threads::cancel::requested() =>
                 {
                     return Err(EINTR);
                 }
                 Ok(_) => {}
                 Err(Error::Interrupted) => {
-                    if crate::long::ending(&block.flags, true) {
+                    if interruptible && crate::long::ending(&block.flags, true) {
                         return Err(EINTR);
                     }
                     // Every handler that ran had SA_RESTART: wait on.
@@ -1145,7 +1154,7 @@ fn change(
         }
         .write(&mut w)
         .map_err(write_failed)?;
-        let got = call(w.as_bytes())?;
+        let got = call_full(w.as_bytes(), true, op != n::ChangeOp::Rename)?;
         let redirect = match proto_fs::Redirect::read_reply(got.raw.bytes()) {
             None => return Ok(Changed::Done),
             Some(Ok(redirect)) => redirect,
@@ -1205,8 +1214,12 @@ pub fn symlink(target: &[u8], abs: &Abs) -> Result<Changed, i32> {
     change(n::ChangeOp::Symlink, 0, 0, abs, None, Some(target))
 }
 
-/// `rename` of a path of the root to another one: a name of the lower set and a name that a link
-/// leads out of the root are EXDEV.
+/// `rename` of a path of the root to another one. A file or a link of the lower set is copied up
+/// and then moved. A lower program is never copied: the rename answers EROFS, so `mv` fails and
+/// leaves the program alone (an EXDEV would make `mv` copy the program and unlink it, which hides a
+/// program that runs and leaves a copy that does not). A directory of the lower set and a name that
+/// a link leads out of the root are EXDEV. The wait for the copy goes on after a signal handler:
+/// `rename` does not end with EINTR.
 pub fn rename(from: &Abs, to: &Abs) -> Result<(), i32> {
     match change(n::ChangeOp::Rename, 0, 0, from, Some(to), None)? {
         Changed::Done => Ok(()),

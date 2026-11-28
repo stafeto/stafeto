@@ -1091,6 +1091,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-manager-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "posix-map"
 version = "0.1.0"
 dependencies = [

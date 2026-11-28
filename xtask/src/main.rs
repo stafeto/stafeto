@@ -61,6 +61,7 @@ mod data_image;
 mod data_posix;
 mod data_probe;
 mod deqp;
+mod desk;
 mod disasm;
 mod display_probe;
 mod doom;
@@ -2640,8 +2641,9 @@ commands:
   posix-random-net-two the same with two stack instances of the network service on two CPUs: a socket homed on the second instance survives
   posix-random-net-two-steps the same under -icount, the steps of both instances
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
-  layer-posix run the C probe of the POSIX layer on the layered root (open, read, stat, readdir, chdir, openat, fork, spawn and exec of the descriptions of the layer service, the rights of another user, EROFS for writes to the lower set, the session in the slot of a set-ID program) over the layer service on a volume made offline, in QEMU; with the argument breaks: the probe built with each deliberate break of the layer (no path routed to the service, no session for a child, no session check in the loader), which it must catch; with the argument ash: BusyBox's ash on the layered root (`ls -la /etc` and reads of names of the layers); with the argument write: the changes of names on the layer (create, write, mkdir, unlink and rmdir of lower names as marks of deletion, an opaque directory, rename, symbolic links, the rights of another user, a sticky directory) and a second boot on the same disk that must see the same names; with write breaks: the same with each deliberate break of the layer service (no mark of deletion on the volume, no sticky check), which it must catch; with the argument copy: the copy up of a lower file on its first write (the number, owner, mode and times kept, an empty copy for `O_TRUNC`, a lower directory and a lower link, a program that is never copied, two writers and one copy, a signal during the wait of a copy of 16 MiB: EINTR without SA_RESTART, success with it) and a second boot on the same disk that sees the copies and finds `work/` empty; with copy breaks: the same with each deliberate break of the copy (numbers of the counter, no attributes, a program copied), which it must catch
+  layer-posix run the C probe of the POSIX layer on the layered root (open, read, stat, readdir, chdir, openat, fork, spawn and exec of the descriptions of the layer service, the rights of another user, EROFS for writes to the lower set, the session in the slot of a set-ID program) over the layer service on a volume made offline, in QEMU; with the argument breaks: the probe built with each deliberate break of the layer (no path routed to the service, no session for a child, no session check in the loader), which it must catch; with the argument ash: BusyBox's ash on the layered root (`ls -la /etc` and reads of names of the layers); with the argument write: the changes of names on the layer (create, write, mkdir, unlink and rmdir of lower names as marks of deletion, an opaque directory, rename, symbolic links, the rights of another user, a sticky directory) and a second boot on the same disk that must see the same names; with write breaks: the same with each deliberate break of the layer service (no mark of deletion on the volume, no sticky check), which it must catch; with the argument copy: the copy up of a lower file on its first write (the number, owner, mode and times kept, an empty copy for `O_TRUNC`, a lower directory and a lower link, a program that is never copied, two writers and one copy, a signal during the wait of a copy of 16 MiB: EINTR without SA_RESTART, success with it) and a second boot on the same disk that sees the copies and finds `work/` empty; with copy breaks: the same with each deliberate break of the copy (numbers of the counter, no attributes, a program copied, a rename that leaves the old name unmarked), which it must catch; with copy race: names deleted and made during the copy of a rename, two renames of one file, fourteen files for the twelve places of the table of copies; with copy full: a copy of a file of 20 MiB on a volume of 16 MiB (ENOSPC for every waiter, the lower file whole, work/ empty on the next boot)
   layer-steps run the steps of the layer service at the scale of its limits under -icount on one CPU (a volume of 8,192 names in the live layer: a chain of 246 directories with a file at its end, a path of 253 components, a merged listing of 1,024 names): the probe passes and no step of the service is over 0.9 B, while a lower file of 64 MiB is copied up meanwhile (the reads of the copy in the RAM file service are under the gate too); with the argument breaks: the service that walks the whole layer in one step, and the one that copies in its own step, which the gate must fail
+  layer-cut copy [N] the power cut during a copy up and between the steps of the rename of a lower file: the layer service built with the feature probe-cut stops at each of six points (the file in work/ made, its first cell written, the file whole and closed, the copy renamed into the layer, the old name of the rename marked, the volume with the new name) and the machine is killed on the line; the same disk is started again and a probe must find the copied file whole with the lower attributes, the renamed file under the old name or the new and never both and never torn, the cut rename done again, and work/ cleared at the start (held where the cut left a file in it); with the argument breaks: the layer service that makes the copy at its final name, which the probe after a cut in the middle of the copy must catch
   layer-restart run the probe of the restarts of the layer service and the data file service (the layer service ends on an OPEN of /.die and after the data file service ended, both come back: the old session is dead, a description of the old instance answers STALE, a file the data file service holds is read on, a new session lists and reads as before); with the argument breaks: the layer service whose instances all carry one epoch, which the probe must fail
   layer-names-probe run the probe of the names of the layered root (a POSIX program of the root that speaks to the layer service directly: TakeRoot, SESSION, redirects of lower names, the pass of a file of the layer and its bytes, merged listings, marks of deletion, an opaque directory, the numbers of stat, EACCES for another user and EROFS) over a volume made offline, in QEMU; with the argument breaks: the same against the layer service built with each deliberate break, which it must catch; with the argument steps: under -icount on one CPU with the steps of the service told
   data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU; with an argument: write, cap, full, restart, throughput, fast (64 MiB through the window against the bounds of the plan), atomic (atomicity, lease, signals, fork, restart of the large calls), steps (the service's steps and the CPU time of its parts under -icount, on one CPU and on two), atomic-break FEATURE (the atomic probe on a service with a deliberate break, which it must catch)
@@ -2649,6 +2651,7 @@ commands:
   wfc-probe run the scene demo on OpenWF Composition (<WF/wfc.h>) in QEMU with the compositor: two scenes of three elements (a stretch, quarter turns, a flip, the filters none and faster, a global alpha and a mask) over the windows of two producers, and a third scene of the window of the first revision shown straight, committed in turn 100 times and each composed on request, QEMU's screenshot compared with the CRC of the host's reference (tools/wfc-ref), then the scene changed 100 times on an active context with every screenshot one of the two and both of them among the shots; then scene D (the bilinear filter: two stretches, a flip, a quarter turn) committed once, its screenshot compared and its frame time printed; the counters of the service (no frame failed, bands grow, scene C a frame shown straight) and the device's trace; then the steps of the compositor and the driver under -icount
   wfd-probe run the display demo on OpenWF Display (<WF/wfd.h>) in QEMU with the display driver alone: 100 frames bound to the primary pipeline in turn, each compared with the guest's CRC, the host's own and QEMU's screenshot, and the cursor moved 100 times (the device's trace); then the driver's steps under -icount
   posix-window run the C probe of the window library (<stafeto/window.h>) in QEMU: a window with two buffers, the bits that free them, events, fork, a signal and close, the frames compared with QEMU's screenshot
+  desk-probe --api run the C probe of the manager's calls (<stafeto/manager.h>) in QEMU over the compositor with a keyboard (transport 15) and a tablet (transport 6): the manager subscribes, sees a client's window and gives it the focus, reads its title by INFO, frames it with a window of its own tied by LINK, moves the pair, resizes the client by CONFIGURE and hears RESIZED, hides and shows the pair, asks the client to close; the child of the manager is refused with EPERM; a key and a tablet click sent from QEMU reach the window with the focus
   display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
   layer-probe [steps] attach and detach layers of the RAM file service in QEMU; steps
             measures the steps of the layer calls under -icount
@@ -3095,7 +3098,9 @@ fn main() {
         Some("layer-steps") => layer_steps::command(&args[1..], &qemu::VIRT),
         Some("layer-restart") => layer_restart::command(&args[1..], &qemu::VIRT),
         Some("layer-posix") => layer_posix::command(&args[1..], &qemu::VIRT),
+        Some("layer-cut") => layer_posix::cut(&args[1..], &qemu::VIRT),
         Some("posix-window") => posix_window::probe(&qemu::VIRT),
+        Some("desk-probe") => desk::command(&args[1..], &qemu::VIRT),
         Some("wfc-probe") => wfc::command(&args[1..], &qemu::VIRT),
         Some("wfd-probe") => wfd::probe(&qemu::VIRT),
         Some("display-probe") => display_probe::probe(&qemu::VIRT),
@@ -11489,10 +11494,28 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("layer-posix copy breaks", || {
             layer_posix::copy_breaks(&qemu::VIRT)
         }),
+        // The names that change while a copy goes on, more files than places for copies, a copy on
+        // a volume too small for it, and the cut of the power in the middle of a copy and of a
+        // rename of a lower name.
+        job("layer-posix copy race", || {
+            layer_posix::copy_race(&qemu::VIRT)
+        }),
+        job("layer-posix copy full", || {
+            layer_posix::copy_full(&qemu::VIRT)
+        }),
+        job("layer-cut copy", || {
+            layer_posix::cut(&["copy".to_owned()], &qemu::VIRT)
+        }),
+        job("layer-cut breaks", || {
+            layer_posix::cut(&["breaks".to_owned()], &qemu::VIRT)
+        }),
         job("layer-posix ash", || layer_posix::ash(&qemu::VIRT)),
         job("vi-dialog", vi_dialog::vi_dialog),
         // The window library of C programs against QEMU's screenshots.
         job("posix-window", || posix_window::probe(&qemu::VIRT)),
+        // The manager's calls of the C library over a compositor with a keyboard
+        // and a tablet on transports of their own, a key and a click from QEMU.
+        job("desk-probe --api", || desk::api(&qemu::VIRT)),
         // OpenWF Display over the driver alone: the frames against QEMU's
         // screenshot, the scanout and cursor trace, the driver's steps.
         job("wfd-probe", || wfd::probe(&qemu::VIRT)),
@@ -15265,6 +15288,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "posix-window-probe",
         "--package",
+        "posix-manager-probe",
+        "--package",
         "wfd-demo",
         "--package",
         "wfc-demo",
@@ -18088,6 +18113,7 @@ mod entropy_in_images_tests {
                 Box::leak(crate::layer_posix::plain_ash_programs().into_boxed_slice()),
             ),
             ("posix_window::PROGRAMS", &crate::posix_window::PROGRAMS),
+            ("desk::PROGRAMS", &crate::desk::PROGRAMS),
             ("cxx_probe::PROGRAMS", &crate::cxx_probe::PROGRAMS),
             ("gles_pbuffer::PROGRAMS", &crate::gles_pbuffer::PROGRAMS),
             ("deqp::PROGRAMS", &crate::deqp::PROGRAMS),

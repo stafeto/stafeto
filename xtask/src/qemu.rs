@@ -489,6 +489,14 @@ pub const KEYBOARD: &[&str] = &["-device", "virtio-keyboard-device,bus=virtio-mm
 /// it (`-display none`).
 pub const TABLET: &[&str] = &["-device", "virtio-tablet-device,bus=virtio-mmio-bus.13"];
 
+/// The Virtio tablet of the desk image (`table::desk`): the transport 6,
+/// address 0xa000c00, INTID 54, on the page 0xa000000, which that image gives to
+/// the tablet alone (it has no network card, whose transport 7 lies on the same
+/// page), so the keyboard (transport 15) and the tablet both have a page to
+/// map. The monitor's `mouse_move` is relative: the probe uses QMP's
+/// `input-send-event`.
+pub const DESK_TABLET: &[&str] = &["-device", "virtio-tablet-device,bus=virtio-mmio-bus.6"];
+
 /// The disk of a run (services/virtio-blk): a modern virtio-blk-pci at
 /// device 1 of bus 0, where `virtio_pci::qemu::DISK` expects it, over the
 /// raw file `image`. No legacy interface and no MSI-X (`vectors=0`), so the

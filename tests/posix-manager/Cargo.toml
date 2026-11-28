@@ -1,0 +1,17 @@
+[package]
+name = "posix-manager-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The C probe of the manager's calls (<stafeto/manager.h>): subscription, events, list, info, move, link, configure, close and the refusal of a child, over the compositor with a keyboard and a tablet"
+build = "build.rs"
+
+[[bin]]
+name = "posix-manager-probe"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt", features = ["window"] }

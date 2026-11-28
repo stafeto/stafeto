@@ -1828,6 +1828,12 @@ fn exec_selected<'s>(
     if matches!(source, ExecSource::Path(path) if path.is_empty()) {
         return Err(ENOENT);
     }
+    // The session with the manager's mark moves to the new image as it is, so
+    // a process that subscribed as the manager never execs.
+    #[cfg(feature = "window")]
+    if crate::window::manager_subscribed() {
+        return Err(crate::constants::EPERM);
+    }
     if let ExecSource::Path(path) = source
         && crate::data::route(crate::names::AT_FDCWD, path)?.is_some()
     {

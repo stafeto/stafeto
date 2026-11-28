@@ -32,6 +32,18 @@ const ENDS: &str = "init: layer-posix ended: ";
 const PASSED: &str = "layer-posix: checks passed";
 const IMAGE: &str = "boot-layer-posix.img";
 
+/// The image is written under one name (the files of its lower set are the ones `rootfs::files_of`
+/// lists for the name), and the jobs of one `xtask ci` run side by side in a process, so the write is
+/// done one at a time and each run boots from a copy of its own.
+static IMAGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A number no other run of this process has.
+fn seq() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 const ASH_IMAGE: &str = "boot-layer-ash.img";
 const ASH_ENDS: &str = "init: busybox-probe ended: ";
 
@@ -244,8 +256,10 @@ pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
         Some("write") if args.len() == 2 && args[1] == "breaks" => write_breaks(machine),
         Some("copy") if args.len() == 1 => copy(machine),
         Some("copy") if args.len() == 2 && args[1] == "breaks" => copy_breaks(machine),
+        Some("copy") if args.len() == 2 && args[1] == "race" => copy_race(machine),
+        Some("copy") if args.len() == 2 && args[1] == "full" => copy_full(machine),
         Some(other) => Err(format!(
-            "layer-posix [breaks | ash | write [breaks] | copy [breaks]]: unknown argument {other}"
+            "layer-posix [breaks | ash | write [breaks] | copy [breaks | race | full]]: unknown argument {other}"
         )),
     }
 }
@@ -402,19 +416,26 @@ pub fn read_ash(lines: &[String]) -> Result<(), String> {
         ));
     }
     let after = &got[..want];
-    if !got[after.len()..].iter().any(|l| l == "write-refused") {
-        return Err(format!(
-            "the shell wrote below the layers: {:?}",
-            &got[after.len()..]
-        ));
+    // The write and the `mv` of the program are refused, and the program is there.
+    let mut rest = got[after.len()..].iter();
+    for wanted in ["write-refused", "mv-refused", "moved-none", "program-kept"] {
+        if !rest.any(|l| l == wanted) {
+            return Err(format!(
+                "the shell did not say {wanted:?} after the listing: {:?}",
+                &got[after.len()..]
+            ));
+        }
     }
     Ok(())
 }
 
 /// A disk for a run: the volume of the probe, made offline.
 fn new_disk() -> Result<Disk, String> {
-    let disk =
-        Disk(std::env::temp_dir().join(format!("stafeto-layer-posix-{}.img", std::process::id())));
+    let disk = Disk(std::env::temp_dir().join(format!(
+        "stafeto-layer-posix-{}-{}.img",
+        std::process::id(),
+        seq()
+    )));
     crate::data_image::make_layer_posix_volume(&disk.0, DISK_BYTES)?;
     Ok(disk)
 }
@@ -442,14 +463,39 @@ fn boot_with(
     extra: Vec<crate::rootfs::RootFile>,
     limit: std::time::Duration,
 ) -> Result<(qemu::Outcome, u64), String> {
+    boot_until(machine, with, disk, extra, limit, &[], ENDS)
+}
+
+/// `boot_with` for a build that takes `env` and a run that stops on the line `stop`.
+fn boot_until(
+    machine: &qemu::Machine,
+    with: Build,
+    disk: &Disk,
+    extra: Vec<crate::rootfs::RootFile>,
+    limit: std::time::Duration,
+    env: &[(&str, &str)],
+    stop: &str,
+) -> Result<(qemu::Outcome, u64), String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
-    let image = write_boot_image_files(IMAGE, &programs(with), BOOT_PROFILE, &[], extra)?;
+    let image = {
+        let _writing = IMAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let made = write_boot_image_files(IMAGE, &programs(with), BOOT_PROFILE, env, extra)?;
+        let own = made.with_file_name(format!(
+            "boot-layer-posix-run-{}-{}.img",
+            std::process::id(),
+            seq()
+        ));
+        std::fs::copy(&made, &own).map_err(|e| format!("{}: {e}", own.display()))?;
+        own
+    };
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::store(&disk.0, None));
     let started = std::time::Instant::now();
-    let output = run_until(cmd, limit, Some(ENDS), &kernel.elf)?;
-    Ok((output, started.elapsed().as_secs()))
+    let output = run_until(cmd, limit, Some(stop), &kernel.elf);
+    // The image is this run's alone.
+    let _ = std::fs::remove_file(&image);
+    Ok((output?, started.elapsed().as_secs()))
 }
 
 /// The lines of the probe, text after the prefix.
@@ -677,7 +723,7 @@ const PASSED_COPY_REREAD: &str = "layer-posix: copy reread checks passed";
 
 /// The checks of the copy phase (`cargo xtask layer-posix copy`): a lower file is copied up when it
 /// is written, in the order the probe runs them.
-pub const COPY_CHECKS: [&str; 13] = [
+pub const COPY_CHECKS: [&str; 14] = [
     "a lower file that is written is copied up",
     "the copy keeps the owner, the mode, the times and the number",
     "a cut open makes an empty copy with the lower attributes",
@@ -691,6 +737,7 @@ pub const COPY_CHECKS: [&str; 13] = [
     "a signal during the wait of a copy is EINTR without SA_RESTART",
     "a signal during the wait of a copy goes on with SA_RESTART",
     "the numbers of the copies are kept",
+    "a lower file and a lower link are renamed after their copy with a mark on the old name",
 ];
 
 /// The check of the second boot of the copy probe, on the disk the first one left.
@@ -698,7 +745,7 @@ pub const COPY_REREAD_CHECKS: [&str; 1] = ["the copies are the layer's with the 
 
 /// The breaks of the copy up the probe must catch: the feature of the layer service and the checks
 /// that must be among the failures.
-pub const COPY_BREAKS: [(&str, &[&str]); 3] = [
+pub const COPY_BREAKS: [(&str, &[&str]); 4] = [
     // The copy and the directories of its path take numbers of the counter: `st_ino` changes.
     (
         "break-layerd-copy-counter-ino",
@@ -714,13 +761,19 @@ pub const COPY_BREAKS: [(&str, &[&str]); 3] = [
         "break-layerd-copy-elf",
         &["a lower program is never copied up and still runs"],
     ),
+    // The rename of a lower file leaves the old name unmarked: the lower name shows again.
+    (
+        "break-layerd-rename-no-mark",
+        &["a lower file and a lower link are renamed after their copy with a mark on the old name"],
+    ),
 ];
 
-/// The copies of the whole run: the files of the checks that copy (nine of the probe and the two
-/// of two signals), and the five writes to a program that begin a copy the worker refuses.
-const COPIES_RESERVED: u32 = 15;
-const COPIES_MADE_VISIBLE: u32 = 10;
-const COPIES_FAILED: u32 = 5;
+/// The copies of the whole run: the files of the checks that copy (nine of the probe, the two of two
+/// signals and the two files of the renames), and the five writes and the two renames of a program
+/// that begin a copy the worker refuses. The link of a rename is copied in the job: no copy of the table.
+const COPIES_RESERVED: u32 = 19;
+const COPIES_MADE_VISIBLE: u32 = 12;
+const COPIES_FAILED: u32 = 7;
 
 const COPY_PROBE: &[&str] = &["phase-copy"];
 /// The layer service of the copy probe tells the counters of its copies.
@@ -752,7 +805,8 @@ fn big(len: usize) -> &'static [u8] {
 }
 
 /// The files of the lower set the copy probe writes (besides those of the image): the directory
-/// `/copyup`, with files of other owners and modes, a directory, a link, and files of 16 and 3 MiB.
+/// `/copyup`, with files of other owners and modes, a directory, links, files of 16 and 3 MiB, and
+/// the names the renames take.
 pub fn copy_lower_files() -> Vec<crate::rootfs::RootFile> {
     use crate::rootfs::{RootFile, Source};
     let of = |path: &'static str, mode: u32, (uid, gid): (u32, u32), source: Source| RootFile {
@@ -827,6 +881,24 @@ pub fn copy_lower_files() -> Vec<crate::rootfs::RootFile> {
             0o644,
             (0, 0),
             bytes("lp-copy-read", b"read only\n"),
+        ),
+        of(
+            "/copyup/rn-file",
+            0o640,
+            user,
+            bytes("lp-copy-rn-file", b"rename me\n"),
+        ),
+        of(
+            "/copyup/rn-link",
+            bootimg::rootfs::SYMLINK_MODE,
+            (0, 0),
+            Source::Link("rn-file"),
+        ),
+        of(
+            "/copyup/rn-move",
+            0o644,
+            (0, 0),
+            bytes("lp-copy-rn-move", b"move me\n"),
         ),
         of(
             "/copyup/trunc",
@@ -986,8 +1058,9 @@ pub fn copy(machine: &qemu::Machine) -> Result<(), String> {
 
 fn copy_disk() -> Result<Disk, String> {
     let disk = Disk(std::env::temp_dir().join(format!(
-        "stafeto-layer-posix-copy-{}.img",
-        std::process::id()
+        "stafeto-layer-posix-copy-{}-{}.img",
+        std::process::id(),
+        seq()
     )));
     crate::data_image::make_layer_posix_volume(&disk.0, COPY_DISK_BYTES)?;
     Ok(disk)
@@ -1029,6 +1102,424 @@ pub fn copy_breaks(machine: &qemu::Machine) -> Result<(), String> {
         println!("layer-posix copy breaks: {feature} is caught by {checks:?} (in {seconds} s)");
     }
     Ok(())
+}
+
+// ------------------------------------------------------------------ races, full volume and cut
+
+const PASSED_RACE: &str = "layer-posix: copy race checks passed";
+const PASSED_FULL: &str = "layer-posix: copy full checks passed";
+const PASSED_FULL_REREAD: &str = "layer-posix: copy full reread checks passed";
+const PASSED_CUT: &str = "layer-posix: cut verify checks passed";
+
+/// The checks of the race probe (`cargo xtask layer-posix copy race`): names that change while the
+/// copy of a rename goes on, in the order the probe runs them.
+pub const RACE_CHECKS: [&str; 4] = [
+    "a name deleted during the copy of a rename stays deleted",
+    "a name made during the copy of a rename is the one that moves",
+    "two renames of one file make one move",
+    "more files than places for copies are all copied",
+];
+
+/// The checks of the probe of the volume too small for a copy (`cargo xtask layer-posix copy full`),
+/// and of the boot after it.
+pub const FULL_CHECKS: [&str; 2] = [
+    "a copy without space is ENOSPC for every waiter and for a rename",
+    "the lower file is whole after a copy without space",
+];
+pub const FULL_REREAD_CHECKS: [&str; 1] = ["the lower file is whole and the copy is tried again"];
+
+/// The checks of the verification after a cut (`cargo xtask layer-cut copy`).
+pub const CUT_CHECKS: [&str; 3] = [
+    "the copied file is whole with the lower attributes",
+    "the renamed file has the old name or the new, never both and never torn",
+    "the rename that was cut goes through when it is asked again",
+];
+
+const RACE_BYTES: usize = 3 << 20;
+const SMALL_BYTES: usize = 1 << 20;
+const FULL_BYTES: usize = 20 << 20;
+const CUT_BYTES: usize = 200 << 10;
+/// The disk of the probe of the full volume: the data partition is about 16 MiB.
+const FULL_DISK_BYTES: u64 = 34 << 20;
+const RACE_DISK_BYTES: u64 = 128 << 20;
+/// The disk of the cut probe: the copies are 200 KiB.
+const CUT_DISK_BYTES: u64 = 64 << 20;
+/// The files of the race probe that more than fill the table of copies.
+const RACE_MORE: [&str; 14] = [
+    "/race/f00",
+    "/race/f01",
+    "/race/f02",
+    "/race/f03",
+    "/race/f04",
+    "/race/f05",
+    "/race/f06",
+    "/race/f07",
+    "/race/f08",
+    "/race/f09",
+    "/race/f10",
+    "/race/f11",
+    "/race/f12",
+    "/race/f13",
+];
+
+fn pattern_file(
+    path: &'static str,
+    mode: u32,
+    owner: (u32, u32),
+    name: &'static str,
+    bytes: &'static [u8],
+) -> crate::rootfs::RootFile {
+    crate::rootfs::RootFile {
+        path,
+        mode,
+        uid: owner.0,
+        gid: owner.1,
+        source: Some(crate::rootfs::Source::Bytes(name, bytes)),
+    }
+}
+
+fn directory(path: &'static str) -> crate::rootfs::RootFile {
+    crate::rootfs::RootFile {
+        path,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        source: None,
+    }
+}
+
+/// The lower files of the race probe: three of 3 MiB to rename and fourteen of 1 MiB to write.
+pub fn race_lower_files() -> Vec<crate::rootfs::RootFile> {
+    let (large, small) = (big(RACE_BYTES), big(SMALL_BYTES));
+    let mut files = vec![
+        directory("/race"),
+        pattern_file("/race/rc-a", 0o644, (0, 0), "lp-race-a", large),
+        pattern_file("/race/rc-b", 0o644, (0, 0), "lp-race-b", large),
+        pattern_file("/race/rc-c", 0o644, (0, 0), "lp-race-c", large),
+    ];
+    for path in RACE_MORE {
+        files.push(pattern_file(path, 0o644, (0, 0), "lp-race-f", small));
+    }
+    files
+}
+
+/// The lower file of the probe of the full volume: 20 MiB on a volume of 16 MiB.
+pub fn full_lower_files() -> Vec<crate::rootfs::RootFile> {
+    vec![
+        directory("/full"),
+        pattern_file("/full/big", 0o644, (0, 0), "lp-full-big", big(FULL_BYTES)),
+    ]
+}
+
+/// The lower files of the cut probe: a file to copy up and a file to rename, with owners and modes of
+/// their own.
+pub fn cut_lower_files() -> Vec<crate::rootfs::RootFile> {
+    let bytes = big(CUT_BYTES);
+    vec![
+        directory("/cutup"),
+        pattern_file("/cutup/a", 0o640, (1000, 100), "lp-cut-a", bytes),
+        pattern_file("/cutup/b", 0o600, (1001, 101), "lp-cut-b", bytes),
+    ]
+}
+
+fn small_disk(name: &str, bytes: u64) -> Result<Disk, String> {
+    let disk = Disk(std::env::temp_dir().join(format!(
+        "stafeto-layer-posix-{name}-{}-{}.img",
+        std::process::id(),
+        seq()
+    )));
+    crate::data_image::make_layer_posix_volume(&disk.0, bytes)?;
+    Ok(disk)
+}
+
+/// Names that change during the copy of a rename: a name deleted, a name made, two renames of one
+/// file, and more files than places in the table of copies.
+pub fn copy_race(machine: &qemu::Machine) -> Result<(), String> {
+    let disk = small_disk("race", RACE_DISK_BYTES)?;
+    let (output, seconds) = boot_with(
+        machine,
+        Build {
+            probe: &["phase-copyrace"],
+            ..Build::default()
+        },
+        &disk,
+        race_lower_files(),
+        COPY_LIMIT,
+    )?;
+    read_checks(&output.lines, &RACE_CHECKS, PASSED_RACE)?;
+    read_work_empty(&output.lines)?;
+    qemu::expect_stopped_on(
+        &output,
+        "init: layer-posix ended: exit code 0, not restarted",
+    )?;
+    println!(
+        "layer-posix copy race on {}: {} checks of names that change during a copy in {seconds} s: ok",
+        machine.name,
+        RACE_CHECKS.len()
+    );
+    Ok(())
+}
+
+/// A copy on a volume that is too small: ENOSPC for every waiter, the lower file whole, and a second
+/// boot that finds `work/` empty (the copy left nothing).
+pub fn copy_full(machine: &qemu::Machine) -> Result<(), String> {
+    let disk = small_disk("full", FULL_DISK_BYTES)?;
+    let (first, first_seconds) = boot_with(
+        machine,
+        Build {
+            probe: &["phase-copyfull"],
+            ..Build::default()
+        },
+        &disk,
+        full_lower_files(),
+        COPY_LIMIT,
+    )?;
+    read_checks(&first.lines, &FULL_CHECKS, PASSED_FULL)?;
+    qemu::expect_stopped_on(
+        &first,
+        "init: layer-posix ended: exit code 0, not restarted",
+    )?;
+    let (second, second_seconds) = boot_with(
+        machine,
+        Build {
+            probe: &["phase-copyfullreread"],
+            ..Build::default()
+        },
+        &disk,
+        full_lower_files(),
+        COPY_LIMIT,
+    )?;
+    read_checks(&second.lines, &FULL_REREAD_CHECKS, PASSED_FULL_REREAD)?;
+    read_work_empty(&second.lines)?;
+    qemu::expect_stopped_on(
+        &second,
+        "init: layer-posix ended: exit code 0, not restarted",
+    )?;
+    println!(
+        "layer-posix copy full on {}: ENOSPC for the waiters of a copy of 20 MiB on 16 MiB in {first_seconds} s, the lower file whole and work/ empty on a second boot in {second_seconds} s: ok",
+        machine.name
+    );
+    Ok(())
+}
+
+/// The points of the cut: the number, what has happened, whether the cut leaves a file in `work/` (the
+/// points before the rename of the copy into the layer do), and whether the rename of `/cutup/b` is
+/// done (the name found after the cut is the new one). Points 1 to 4 fire in the open of `/cutup/a`,
+/// before the probe has begun the rename, so `/cutup/b` has its old name there; point 5 leaves the
+/// copy under the old name (its mark is written, the move is not), and point 6 the new name.
+pub const CUT_POINTS: [(u8, &str, bool, bool); 6] = [
+    (1, "the file in work/ is made, no byte in it", true, false),
+    (
+        2,
+        "the first cell of the file in work/ is written",
+        true,
+        false,
+    ),
+    (3, "the file in work/ is whole and closed", true, false),
+    (4, "the copy is renamed into the layer", false, false),
+    (5, "the old name of the rename is marked", false, false),
+    (6, "the volume has the new name of the rename", false, true),
+];
+
+/// The names the probe found after a cut, from its line `cut found the old name N, the new name M`.
+pub fn cut_found(lines: &[String]) -> Result<(bool, bool), String> {
+    lines
+        .iter()
+        .find_map(|l| {
+            let rest = l.split_once("cut found the old name ")?.1;
+            let (old, new) = rest.split_once(", the new name ")?;
+            Some((old.trim() == "1", new.trim() == "1"))
+        })
+        .ok_or_else(|| "the probe did not say which names it found".to_owned())
+}
+
+/// How many names `work/` held at the start of a boot, from the line of the layer service.
+pub fn work_held(lines: &[String]) -> Result<usize, String> {
+    if lines
+        .iter()
+        .any(|l| l.contains("layerd: work/ is empty at the start"))
+    {
+        return Ok(0);
+    }
+    lines
+        .iter()
+        .find_map(|l| {
+            l.split_once("layerd: work/ held ")?
+                .1
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .ok_or_else(|| "the layer service said nothing of work/ at its start".to_owned())
+}
+
+/// One point of the cut: the service stops at the point and the machine is killed, then the same disk
+/// is started again with the verification.
+fn cut_point(
+    machine: &qemu::Machine,
+    point: u8,
+    what: &str,
+    leaves: bool,
+    moved: bool,
+) -> Result<(), String> {
+    let disk = small_disk(&format!("cut{point}"), CUT_DISK_BYTES)?;
+    let at = point.to_string();
+    let marker = format!("layerd: cut point {point}");
+    let (cut, cut_seconds) = boot_until(
+        machine,
+        Build {
+            probe: &["phase-cut"],
+            layerd: &["probe-cut"],
+            ..Build::default()
+        },
+        &disk,
+        cut_lower_files(),
+        LIMIT,
+        &[("STAFETO_LAYERD_CUT_AT", &at)],
+        &marker,
+    )?;
+    if !cut.stopped_on_marker {
+        return Err(format!(
+            "layer-cut {point}: the service never said {marker:?}: {:?}",
+            cut.lines
+                .iter()
+                .filter(|l| l.contains("layer-posix:") || l.contains("layerd:"))
+                .collect::<Vec<_>>()
+        ));
+    }
+    let (verify, verify_seconds) = boot_until(
+        machine,
+        Build {
+            probe: &["phase-cutverify"],
+            ..Build::default()
+        },
+        &disk,
+        cut_lower_files(),
+        LIMIT,
+        &[],
+        ENDS,
+    )
+    .map_err(|e| format!("layer-cut {point}: {e}"))?;
+    read_checks(&verify.lines, &CUT_CHECKS, PASSED_CUT)
+        .map_err(|e| format!("layer-cut {point} ({what}): {e}"))?;
+    let found = cut_found(&verify.lines)?;
+    if found != (!moved, moved) {
+        return Err(format!(
+            "layer-cut {point} ({what}): the probe found (old name, new name) {found:?}, {:?} were due",
+            (!moved, moved)
+        ));
+    }
+    let held = work_held(&verify.lines)?;
+    if (held > 0) != leaves {
+        return Err(format!(
+            "layer-cut {point} ({what}): work/ held {held} names at the start of the next boot, {} were due",
+            if leaves { "some" } else { "none" }
+        ));
+    }
+    qemu::expect_stopped_on(
+        &verify,
+        "init: layer-posix ended: exit code 0, not restarted",
+    )?;
+    println!(
+        "layer-cut copy {point}: cut when {what} ({cut_seconds} s), the old file or the new after it ({verify_seconds} s), work/ held {held}: ok"
+    );
+    Ok(())
+}
+
+/// `cargo xtask layer-cut copy [point]`: the power cut during a copy up and between the steps of the
+/// rename of a lower file.
+pub fn cut_command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
+    match args {
+        [what] if what == "copy" => {
+            for (point, what, leaves, moved) in CUT_POINTS {
+                cut_point(machine, point, what, leaves, moved)?;
+            }
+            Ok(())
+        }
+        [what, point] if what == "copy" => {
+            let point: u8 = point
+                .parse()
+                .map_err(|_| format!("layer-cut copy: {point} is not a point"))?;
+            let (_, what, leaves, moved) = CUT_POINTS
+                .iter()
+                .copied()
+                .find(|(p, _, _, _)| *p == point)
+                .ok_or_else(|| format!("layer-cut copy: no point {point}"))?;
+            cut_point(machine, point, what, leaves, moved)
+        }
+        _ => Err("layer-cut copy [point 1 to 6]".to_owned()),
+    }
+}
+
+/// The break of the cut probe: the worker makes the copy at its final name, so a cut leaves a partial
+/// file under the name.
+pub const CUT_BREAK: (&str, u8) = ("break-layerd-copy-rename-open", 2);
+
+/// `cargo xtask layer-cut breaks`: the break that makes the copy visible before its end must fail the
+/// verification of a cut in the middle of the copy.
+pub fn cut_breaks(machine: &qemu::Machine) -> Result<(), String> {
+    let (feature, point) = CUT_BREAK;
+    let disk = small_disk("cutbreak", CUT_DISK_BYTES)?;
+    let at = point.to_string();
+    let marker = format!("layerd: cut point {point}");
+    let layerd: &'static [&'static str] = Box::leak(vec!["probe-cut", feature].into_boxed_slice());
+    let (cut, _) = boot_until(
+        machine,
+        Build {
+            probe: &["phase-cut"],
+            layerd,
+            ..Build::default()
+        },
+        &disk,
+        cut_lower_files(),
+        LIMIT,
+        &[("STAFETO_LAYERD_CUT_AT", &at)],
+        &marker,
+    )?;
+    if !cut.stopped_on_marker {
+        return Err(format!(
+            "layer-cut breaks: {feature}: no cut at point {point}"
+        ));
+    }
+    let (verify, seconds) = boot_until(
+        machine,
+        Build {
+            probe: &["phase-cutverify"],
+            layerd,
+            ..Build::default()
+        },
+        &disk,
+        cut_lower_files(),
+        LIMIT,
+        &[],
+        ENDS,
+    )?;
+    let mine = mine(&verify.lines);
+    if mine.iter().any(|l| *l == &PASSED_CUT[PREFIX.len()..]) {
+        return Err(format!(
+            "layer-cut breaks: {feature} did not fail the verification"
+        ));
+    }
+    let wanted = format!("{} FAILED", CUT_CHECKS[0]);
+    if !mine.iter().any(|l| l.starts_with(&wanted)) {
+        return Err(format!(
+            "layer-cut breaks: {feature} did not fail {:?}; the lines: {mine:?}",
+            CUT_CHECKS[0]
+        ));
+    }
+    println!(
+        "layer-cut breaks: {feature} is caught by {:?} after a cut at point {point} (in {seconds} s)",
+        CUT_CHECKS[0]
+    );
+    Ok(())
+}
+
+pub fn cut(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("breaks") if args.len() == 1 => cut_breaks(machine),
+        _ => cut_command(args, machine),
+    }
 }
 
 #[cfg(test)]
@@ -1107,6 +1598,9 @@ mod tests {
             "tmp-bytes",
             "ash: can't create /bin/busybox-probe: Read-only file system",
             "write-refused",
+            "mv-refused",
+            "moved-none",
+            "program-kept",
         ] {
             lines.push(l.to_owned());
         }
@@ -1135,6 +1629,29 @@ mod tests {
     }
 
     #[test]
+    fn jobs_that_run_side_by_side_never_share_a_disk() {
+        // The jobs of one `xtask ci` run in threads of one process: the name of the
+        // disk of a run is its own (a shared disk made QEMU fail to get its write lock).
+        let names: Vec<(String, std::path::PathBuf)> = std::thread::scope(|scope| {
+            let runs: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let disk = new_disk().unwrap();
+                        (format!("{}", seq()), disk.0.clone())
+                    })
+                })
+                .collect();
+            runs.into_iter().map(|run| run.join().unwrap()).collect()
+        });
+        for (i, a) in names.iter().enumerate() {
+            for b in &names[i + 1..] {
+                assert_ne!(a.0, b.0);
+                assert_ne!(a.1, b.1);
+            }
+        }
+    }
+
+    #[test]
     fn every_break_names_a_check_of_the_probe() {
         for (feature, program, check) in BREAKS {
             assert!(CHECKS.contains(&check), "{feature}");
@@ -1152,6 +1669,10 @@ mod tests {
             .chain(&REREAD_CHECKS)
             .chain(&COPY_CHECKS)
             .chain(&COPY_REREAD_CHECKS)
+            .chain(&RACE_CHECKS)
+            .chain(&FULL_CHECKS)
+            .chain(&FULL_REREAD_CHECKS)
+            .chain(&CUT_CHECKS)
         {
             let quoted = format!("run_check(\"{check}\"");
             assert_eq!(source.matches(&quoted).count(), 1, "{check}");
@@ -1163,14 +1684,33 @@ mod tests {
                 + REREAD_CHECKS.len()
                 + COPY_CHECKS.len()
                 + COPY_REREAD_CHECKS.len()
+                + RACE_CHECKS.len()
+                + FULL_CHECKS.len()
+                + FULL_REREAD_CHECKS.len()
+                + CUT_CHECKS.len()
         );
         // The breaks of the copy probe name checks of its phase.
         for (feature, checks) in COPY_BREAKS {
-            assert!(feature.starts_with("break-layerd-copy-"), "{feature}");
+            assert!(
+                feature.starts_with("break-layerd-copy-")
+                    || feature.starts_with("break-layerd-rename-"),
+                "{feature}"
+            );
             for check in checks {
                 assert!(COPY_CHECKS.contains(check), "{feature}: {check}");
             }
         }
+        // The cut points are numbered as the service numbers them, and the break of the cut probe
+        // names the first check of the verification.
+        let points: Vec<u8> = CUT_POINTS.iter().map(|p| p.0).collect();
+        assert_eq!(points, [1, 2, 3, 4, 5, 6]);
+        assert!(CUT_POINTS.iter().filter(|p| p.2).count() == 3);
+        assert_eq!(CUT_POINTS.iter().filter(|p| p.3).count(), 1);
+        assert_eq!(
+            cut_found(&["layer-posix: cut found the old name 0, the new name 1".to_owned()]),
+            Ok((false, true))
+        );
+        assert!(CUT_BREAK.0.starts_with("break-layerd-copy-"));
         // The breaks of the write probe name a check of its phase.
         for (feature, reread, check) in WRITE_BREAKS {
             let checks: &[&str] = if reread {

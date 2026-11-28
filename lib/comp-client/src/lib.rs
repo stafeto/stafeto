@@ -13,6 +13,7 @@
 //! * `flag`: a flag one thread holds for a scope.
 //! * `table`: the process's windows on one channel: labels, numbers, the
 //!   capacity of a window and the report of a wait across them.
+//! * `manager`: the structures and refusals of `<stafeto/manager.h>`.
 //! * `events`: the 16 bytes of an event, both ways.
 //! * `errno`: the service's refusals and the kernel's as errno.
 
@@ -24,4 +25,5 @@ pub mod errno;
 pub mod events;
 pub mod flag;
 pub mod layout;
+pub mod manager;
 pub mod table;

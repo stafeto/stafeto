@@ -2910,6 +2910,16 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        // The desk starts the file of its program once, as the client it frames.
+        "boot-desk.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/posix-manager", 0o755, ROOT, "posix-manager"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
         // The cube starts its own file once: the copy that draws can fork.
         "boot-gles-window.img" => {
             let mut files = vec![
@@ -4053,6 +4063,7 @@ mod tests {
             "boot-layer-posix.img",
             "boot-layer-ash.img",
             "boot-posix-window.img",
+            "boot-desk.img",
             "boot-cxx-probe.img",
             "boot-gles-pbuffer.img",
             "boot-deqp.img",

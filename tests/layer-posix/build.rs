@@ -47,6 +47,19 @@ fn main() {
     if env::var_os("CARGO_FEATURE_PHASE_COPYREREAD").is_some() {
         mode = "copyreread".to_owned();
     }
+    // The probes of the races, of the full volume and of the cut (`cargo xtask layer-posix copy
+    // race|full`, `cargo xtask layer-cut copy`).
+    for (feature, name) in [
+        ("CARGO_FEATURE_PHASE_COPYRACE", "copyrace"),
+        ("CARGO_FEATURE_PHASE_COPYFULL", "copyfull"),
+        ("CARGO_FEATURE_PHASE_COPYFULLREREAD", "copyfullreread"),
+        ("CARGO_FEATURE_PHASE_CUT", "cut"),
+        ("CARGO_FEATURE_PHASE_CUTVERIFY", "cutverify"),
+    ] {
+        if env::var_os(feature).is_some() {
+            mode = name.to_owned();
+        }
+    }
     assert!(
         mode.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
         "STAFETO_LAYER_POSIX_MODE {mode:?} is a role name"
