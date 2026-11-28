@@ -603,16 +603,47 @@ extern "C" fn main(
             _ => Err(format_args!("no description")),
         },
     );
-    // The lower set is not written: a write open, a create over a lower name and the changes of a
-    // lower name are a read-only file system (or the lower name does not move), the volume has no
-    // hard links, and WAIT is no method of this part.
-    t.check("the lower set is not written", {
-        let w1 = open(&names, proto_fs::WRITE_ONLY, "/lower/keep");
-        let w2 = open(
-            &names,
-            proto_fs::WRITE_ONLY | proto_fs::CREATE,
-            "/lower/keep",
-        );
+    // A name of the lower set is copied up before it is written (the answer to the write is
+    // COPYING with a ticket, and WAIT says how the copy ended); a program is never copied, so the
+    // copy of one ends with a read-only file system. A lower name does not move, and the volume has
+    // no hard links. The program is the probe's own file, which no later check needs to be written.
+    {
+        let name = "the lower set is copied up before it is written";
+        let ticket_of = |op: Option<n::ChangeOp>, flags: u32, path: &[u8]| -> Option<u64> {
+            let mut w = Writer::new();
+            match op {
+                None => n::write_open(flags, path, &mut w).ok()?,
+                Some(op) => n::Change {
+                    op,
+                    a: 0o755,
+                    b: 0,
+                    first: path,
+                    second: b"",
+                }
+                .write(&mut w)
+                .ok()?,
+            }
+            let a = call(&names, w.as_bytes(), rt::handle::Outgoing::new())?;
+            n::read_copying(a.all())?.ok()
+        };
+        // WAIT for a copy, asked again while it goes on: the status that ended it.
+        let ended = |ticket: u64| -> Option<u32> {
+            for _ in 0..3000 {
+                let mut w = Writer::new();
+                n::write_wait(ticket, &mut w).ok()?;
+                let a = call(&names, w.as_bytes(), rt::handle::Outgoing::new())?;
+                if a.status() != proto_fs::COPYING {
+                    return Some(a.status());
+                }
+                // SAFETY: a plain call of relibc.
+                unsafe { usleep(10_000) };
+            }
+            None
+        };
+        let program = b"/bin/layer-names";
+        let t1 = ticket_of(None, proto_fs::WRITE_ONLY, program);
+        let t2 = ticket_of(None, proto_fs::WRITE_ONLY | proto_fs::CREATE, program);
+        let t3 = ticket_of(Some(n::ChangeOp::Chmod), 0, program);
         let change = |op: n::ChangeOp, first: &[u8], second: &[u8]| {
             let mut w = Writer::new();
             let request = n::Change {
@@ -625,26 +656,41 @@ extern "C" fn main(
             let _ = request.write(&mut w);
             call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status())
         };
-        let chmod = change(n::ChangeOp::Chmod, b"/lower/keep", b"");
         let rename = change(n::ChangeOp::Rename, b"/lower/keep", b"/lower/moved");
         let link = change(n::ChangeOp::Link, b"/lower/keep", b"/lower/hard");
-        let mut w = Writer::new();
-        let _ = n::write_wait(1, &mut w);
-        let wait = call(&names, w.as_bytes(), rt::handle::Outgoing::new()).map(|a| a.status());
-        if status_is(&w1, proto_fs::READ_ONLY_FILESYSTEM)
-            && status_is(&w2, proto_fs::READ_ONLY_FILESYSTEM)
-            && chmod == Some(proto_fs::READ_ONLY_FILESYSTEM)
+        let (Some(t1), Some(t2), Some(t3)) = (t1, t2, t3) else {
+            t.fail(name, format_args!("a write of the program was not COPYING"));
+            return 1;
+        };
+        let (e1, e2, e3) = (ended(t1), ended(t2), ended(t3));
+        // A ticket the service never gave is a copy that is over; one that is over keeps its answer.
+        let never = ended(0x7777_0001);
+        let again = ended(t1);
+        // The program is still the lower set's, whole.
+        let still = redirect_is(
+            &open(&names, proto_fs::READ_ONLY, "/bin/layer-names"),
+            "/bin/layer-names",
+        );
+        let erofs = Some(proto_fs::READ_ONLY_FILESYSTEM);
+        if e1 == erofs
+            && e2 == erofs
+            && e3 == erofs
+            && never == Some(0)
+            && again == erofs
+            && still
             && rename == Some(proto_fs::CROSS_DEVICE)
             && link == Some(proto_fs::TOO_MANY_LINKS)
-            && wait == Some(proto_wire::UNKNOWN_METHOD)
         {
-            Ok(())
+            t.ok(name);
         } else {
-            Err(format_args!(
-                "a lower name was written, or moved, or WAIT is served"
-            ))
+            t.fail(
+                name,
+                format_args!(
+                    "ended {e1:?} {e2:?} {e3:?}, never {never:?}, again {again:?}, rename {rename:?}, link {link:?}, still lower {still}"
+                ),
+            );
         }
-    });
+    }
     // The superuser searches /private.
     t.check(
         "the superuser searches a closed directory",

@@ -506,22 +506,22 @@ fn each_directory_of_the_layer_is_checked_for_the_right_to_search() {
 }
 
 #[test]
-fn a_write_to_a_lower_name_is_a_read_only_file_system() {
+fn a_write_to_a_lower_name_waits_for_its_copy_up() {
     let mut world = World::new();
     let mut core = world.core(volume());
     ready(&mut core);
-    // A name of the lower set (and the lower directories) is not written until the copy up.
+    // A name of the lower set is copied up before it is written: the answer is COPYING with the
+    // ticket of the copy, the same one for every request for the file while it goes on.
+    let mut ticket = None;
     for flags in [f::WRITE_ONLY, f::READ_WRITE, f::READ_ONLY | f::TRUNCATE] {
-        assert_eq!(
-            open(&mut core, 0, flags, "/bin/ls").err(),
-            Some(st(f::READ_ONLY_FILESYSTEM)),
-            "{flags}"
-        );
-        assert_eq!(
-            open(&mut core, 0, flags | f::CREATE, "/bin/ls").err(),
-            Some(st(f::READ_ONLY_FILESYSTEM)),
-            "{flags}"
-        );
+        for extra in [0, f::CREATE] {
+            let (reply, pass) = open(&mut core, 0, flags | extra, "/bin/ls").unwrap();
+            assert!(pass.is_none(), "{flags}");
+            let t = proto_fs::names::read_copying(&reply)
+                .expect("COPYING")
+                .unwrap();
+            assert_eq!(*ticket.get_or_insert(t), t, "{flags}");
+        }
     }
     // A create of a name that is there opens it for reading, EXCLUSIVE says it exists, and an
     // append with read access writes nothing.
@@ -560,16 +560,17 @@ fn a_write_to_a_lower_name_is_a_read_only_file_system() {
         OpenAnswer::read(&reply),
         Ok(OpenAnswer::Redirect(_))
     ));
-    // The attributes of a lower name are not changed either.
+    // The attributes of a lower name are changed on its copy: the same ticket for the file.
     for (op, a) in [
         (n::ChangeOp::Chmod, 0o600),
         (n::ChangeOp::Chown, 1000),
         (n::ChangeOp::Truncate, 0),
         (n::ChangeOp::Utimens, 5),
     ] {
+        let reply = change(&mut core, 0, op, a, 0, "/bin/ls", "").unwrap();
         assert_eq!(
-            change(&mut core, 0, op, a, 0, "/bin/ls", "").err(),
-            Some(st(f::READ_ONLY_FILESYSTEM)),
+            n::read_copying(&reply).unwrap().unwrap(),
+            ticket.unwrap(),
             "{op:?}"
         );
     }

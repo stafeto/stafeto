@@ -227,7 +227,7 @@ cat a
 cd /
 echo tmp-bytes > /tmp/f
 cat /tmp/f
-echo write > /etc/layer-lower || echo write-refused
+echo write > /bin/busybox-probe || echo write-refused
 exit 0";
 
 /// The probe's C main: the applet and its arguments of the build's

@@ -2627,8 +2627,8 @@ commands:
   posix-random-net-two the same with two stack instances of the network service on two CPUs: a socket homed on the second instance survives
   posix-random-net-two-steps the same under -icount, the steps of both instances
   posix-random-net-steps the same under -icount with the network service's steps counted: VerifySession against the margin
-  layer-posix run the C probe of the POSIX layer on the layered root (open, read, stat, readdir, chdir, openat, fork, spawn and exec of the descriptions of the layer service, the rights of another user, EROFS for writes to the lower set, the session in the slot of a set-ID program) over the layer service on a volume made offline, in QEMU; with the argument breaks: the probe built with each deliberate break of the layer (no path routed to the service, no session for a child, no session check in the loader), which it must catch; with the argument ash: BusyBox's ash on the layered root (`ls -la /etc` and reads of names of the layers); with the argument write: the changes of names on the layer (create, write, mkdir, unlink and rmdir of lower names as marks of deletion, an opaque directory, rename, symbolic links, the rights of another user, a sticky directory) and a second boot on the same disk that must see the same names; with write breaks: the same with each deliberate break of the layer service (no mark of deletion on the volume, no sticky check), which it must catch
-  layer-steps run the steps of the layer service at the scale of its limits under -icount on one CPU (a volume of 8,192 names in the live layer: a chain of 246 directories with a file at its end, a path of 253 components, a merged listing of 1,024 names): the probe passes and no step of the service is over 0.9 B; with the argument breaks: the service that walks the whole layer in one step, which the gate must fail
+  layer-posix run the C probe of the POSIX layer on the layered root (open, read, stat, readdir, chdir, openat, fork, spawn and exec of the descriptions of the layer service, the rights of another user, EROFS for writes to the lower set, the session in the slot of a set-ID program) over the layer service on a volume made offline, in QEMU; with the argument breaks: the probe built with each deliberate break of the layer (no path routed to the service, no session for a child, no session check in the loader), which it must catch; with the argument ash: BusyBox's ash on the layered root (`ls -la /etc` and reads of names of the layers); with the argument write: the changes of names on the layer (create, write, mkdir, unlink and rmdir of lower names as marks of deletion, an opaque directory, rename, symbolic links, the rights of another user, a sticky directory) and a second boot on the same disk that must see the same names; with write breaks: the same with each deliberate break of the layer service (no mark of deletion on the volume, no sticky check), which it must catch; with the argument copy: the copy up of a lower file on its first write (the number, owner, mode and times kept, an empty copy for `O_TRUNC`, a lower directory and a lower link, a program that is never copied, two writers and one copy, a signal during the wait of a copy of 16 MiB: EINTR without SA_RESTART, success with it) and a second boot on the same disk that sees the copies and finds `work/` empty; with copy breaks: the same with each deliberate break of the copy (numbers of the counter, no attributes, a program copied), which it must catch
+  layer-steps run the steps of the layer service at the scale of its limits under -icount on one CPU (a volume of 8,192 names in the live layer: a chain of 246 directories with a file at its end, a path of 253 components, a merged listing of 1,024 names): the probe passes and no step of the service is over 0.9 B, while a lower file of 64 MiB is copied up meanwhile (the reads of the copy in the RAM file service are under the gate too); with the argument breaks: the service that walks the whole layer in one step, and the one that copies in its own step, which the gate must fail
   layer-restart run the probe of the restarts of the layer service and the data file service (the layer service ends on an OPEN of /.die and after the data file service ended, both come back: the old session is dead, a description of the old instance answers STALE, a file the data file service holds is read on, a new session lists and reads as before); with the argument breaks: the layer service whose instances all carry one epoch, which the probe must fail
   layer-names-probe run the probe of the names of the layered root (a POSIX program of the root that speaks to the layer service directly: TakeRoot, SESSION, redirects of lower names, the pass of a file of the layer and its bytes, merged listings, marks of deletion, an opaque directory, the numbers of stat, EACCES for another user and EROFS) over a volume made offline, in QEMU; with the argument breaks: the same against the layer service built with each deliberate break, which it must catch; with the argument steps: under -icount on one CPU with the steps of the service told
   data-posix run the C probe of the reading paths of /data in the POSIX layer (open, read, stat, readdir, chdir, fork, spawn and exec, permissions) over the data file service on a volume made offline, in QEMU; with an argument: write, cap, full, restart, throughput, fast (64 MiB through the window against the bounds of the plan), atomic (atomicity, lease, signals, fork, restart of the large calls), steps (the service's steps and the CPU time of its parts under -icount, on one CPU and on two), atomic-break FEATURE (the atomic probe on a service with a deliberate break, which it must catch)
@@ -3363,7 +3363,7 @@ const NVME_BREAKS: [&str; 10] = [
 /// The deliberate breaks of the data volume (`cargo xtask datafs-breaks`): each is a feature of
 /// `lib/datafs` that does one wrong thing, and its host tests (a cut of the power at every sector of a
 /// workload, the table of a new volume, the protocol) pass without it and fail with it.
-const DATAFS_BREAKS: [&str; 15] = [
+const DATAFS_BREAKS: [&str; 16] = [
     "break-datafs-sync",
     "break-datafs-consistent",
     "break-datafs-busy",
@@ -3379,6 +3379,7 @@ const DATAFS_BREAKS: [&str; 15] = [
     "break-datafs-append-end",
     "break-datafs-layers-visible",
     "break-datafs-tail-whole",
+    "break-datafs-numbered-any",
 ];
 
 /// The breaks to run: every one of `DATAFS_BREAKS`, or only the ones `named` (each must be one of
@@ -7604,9 +7605,9 @@ const VOUCH_TICKS_MAX: u64 = 8_000;
 const TERM_B: u64 = 20_410;
 
 /// The stack of the main thread of the layer service: the table of its sessions (192 records with
-/// their identities), the table of its descriptions and of its jobs live in the frame of `main`,
-/// which 128 KiB no longer holds.
-pub(crate) const LAYERD_STACK_SIZE: u32 = 192 * 1024;
+/// their identities), the table of its descriptions, of its jobs and of its copies live in the
+/// frame of `main`, which 192 KiB no longer holds.
+pub(crate) const LAYERD_STACK_SIZE: u32 = 256 * 1024;
 
 /// The bound on the kernel itself: the longest row of the `B on` line of
 /// `kernel_tests` (icount build) may not pass it. The longest paths at
@@ -11466,6 +11467,14 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("layer-posix write breaks", || {
             layer_posix::write_breaks(&qemu::VIRT)
         }),
+        // The copy up of a lower file on its first write (the wait of the program for the copy, the
+        // number, owner, mode and times of the lower file kept, an empty copy for a cut, a lower
+        // directory and a lower link, a program that is never copied, two writers and one copy,
+        // a signal during the wait) and a second boot on the same disk that sees the copies.
+        job("layer-posix copy", || layer_posix::copy(&qemu::VIRT)),
+        job("layer-posix copy breaks", || {
+            layer_posix::copy_breaks(&qemu::VIRT)
+        }),
         job("layer-posix ash", || layer_posix::ash(&qemu::VIRT)),
         job("vi-dialog", vi_dialog::vi_dialog),
         // The window library of C programs against QEMU's screenshots.
@@ -15179,7 +15188,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "layer-names",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/calibrate,compositor/irq-trace,compositor/late-open,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash,layerd/steps,layerd/probe-restart,layerd/break-layerd-whiteout,layerd/break-layerd-search,layerd/break-layerd-no-mark,layerd/break-layerd-sticky,layerd/break-layerd-one-step,layerd/break-layerd-change-one-step,layerd/break-layerd-slots,layerd/break-layerd-epoch,datafsd/probe-restart,datafsd/break-datafs-layers-visible",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,compositor/steps,compositor/calibrate,compositor/irq-trace,compositor/late-open,comp-probe/quick,focus-probe/quick,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,nvme-blk/steps,nvme-blk/crash,nvme-blk/break-nvme-identity,nvme-blk/break-nvme-write-offset,pkgd/steps,pkgd/crash,pkgd/no-ready,datafsd/steps,datafsd/crash,layerd/steps,layerd/probe-restart,layerd/break-layerd-whiteout,layerd/break-layerd-search,layerd/break-layerd-no-mark,layerd/break-layerd-sticky,layerd/break-layerd-one-step,layerd/break-layerd-change-one-step,layerd/break-layerd-slots,layerd/break-layerd-epoch,layerd/break-layerd-copy-counter-ino,layerd/break-layerd-copy-attrs,layerd/break-layerd-copy-in-loop,layerd/break-layerd-copy-elf,layerd/break-layerd-copy-recheck,datafsd/probe-restart,datafsd/break-datafs-layers-visible",
         "--target",
         PROGRAM_TARGET,
         "--",

@@ -36,7 +36,12 @@
 //!   `utimensat` of a path of the root are CHANGE requests to the service (`change`); an open that
 //!   creates sends its mode (the creation mask applied) in the flags. A file opened for writing is a
 //!   pass of a writable description of the data file service, which `ADOPT` takes, so the writes are
-//!   the data file service's. A name of the lower set is EROFS until the copy up: the service says it.
+//!   the data file service's. A name of the lower set that is written is copied up first: the service
+//!   answers COPYING with a ticket, the layer sends WAIT with a notification (`wait_copy`: it waits in
+//!   `receive` on its own channel for as long as the file is big, and a signal ends the wait as it
+//!   ends a long operation: EINTR unless the handler has SA_RESTART, and the copy goes on either way)
+//!   and then sends the same request again. A copy that fails is ENOSPC, EROFS (a program is never
+//!   copied) or EIO.
 //!   The directory part of a path of a change is canonical: a link of a layer of the user in it is a
 //!   redirect that routes by the path (followed here), and a link of the lower set is answered with a
 //!   redirect to the RAM file service for the path: the directory part is made canonical here
@@ -442,6 +447,16 @@ fn call_with(request: &[u8], take: bool) -> Result<Got, i32> {
             return Ok(Got { raw, handle });
         }
         why!("call answered with status {status}");
+        // The file is copied up: the wait is the copy's, and the same request goes again.
+        if status == proto_fs::COPYING && take {
+            match pure::copying_ticket(raw.bytes()) {
+                Some(Ok(ticket)) => {
+                    wait_copy(ticket)?;
+                    continue;
+                }
+                _ => return Err(EIO),
+            }
+        }
         if status == proto_fs::AUTHENTICATING && !bound {
             bound = true;
             bind(session)?;
@@ -453,6 +468,141 @@ fn call_with(request: &[u8], take: bool) -> Result<Got, i32> {
             continue;
         }
         return Err(errno_of(status));
+    }
+}
+
+/// WAIT for the copy `ticket` names. The service answers WAIT at once, as the kernel gives no end to
+/// the wait of a thread for the reply of a request a service has taken (a signal would stay pending
+/// until the reply): 0 when the copy is over, the failure of the copy, or COPYING while it goes on.
+/// The first WAIT brings a copy of the thread's own channel labelled with the ticket and bit 62 (NOTIFY), which
+/// the service keeps and notifies when the copy ends; the thread waits in `receive` on its channel,
+/// as a long operation does (`long`), and a signal that ends the receive ends the call with EINTR
+/// unless every handler that ran had SA_RESTART (a thread cancelled in a point of cancellation ends
+/// it too): the copy goes on in the service and the next request for the file finds it. After the
+/// notification, and after a handler, WAIT is asked again: the answer is the outcome, and a
+/// handler's own wait may have taken the notification.
+fn wait_copy(ticket: u64) -> Result<(), i32> {
+    let block = crate::threads::own_block();
+    let _outer = crate::long::OuterRestart::enter(&block.flags);
+    let channel =
+        Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
+    let level = block.base_level.load(Ordering::Relaxed) as u8;
+    let wait = pure::wait_label(ticket);
+    let mut bound = false;
+    // The pause before a WAIT is asked again of a service with no place, growing to 16 ms: the
+    // answer to WAIT is the service's own and has no end of its own, the copy being as long as it is.
+    let mut pause_ns = 1_000_000i64;
+    // The service holds a notification of this thread for the ticket.
+    let mut armed = false;
+    let mut handled = block.handled.load(Ordering::SeqCst);
+    loop {
+        let session = ensure()?;
+        let service = Handle::<Channel>::borrowed(session);
+        let mut w = Writer::new();
+        n::write_wait(ticket, &mut w).map_err(|_| EIO)?;
+        let sent = if armed {
+            rt::sys::send(&service, w.as_bytes())
+        } else {
+            let Ok(labelled) = rt::sys::handle_label(
+                &channel,
+                rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER,
+                wait,
+                level,
+            ) else {
+                return Err(EIO);
+            };
+            rt::sys::send_handles(&service, w.as_bytes(), [labelled.erase()])
+                .map_err(|refused| refused.error)
+        };
+        let reply = match sent {
+            Ok(reply) => reply,
+            // The kernel ends only a send that no service has taken: it goes again unless a
+            // handler that ends the call ran.
+            Err(Error::Interrupted) => {
+                if crate::long::ending(&block.flags, true) {
+                    return Err(EINTR);
+                }
+                continue;
+            }
+            Err(Error::PeerClosed) => {
+                why!("the session closed during a WAIT: the service went");
+                forget(session);
+                // The tickets of the new instance start again and could match another copy, so the
+                // request that said COPYING goes again (the caller sends it) with no WAIT.
+                return Ok(());
+            }
+            Err(error) => {
+                why!("WAIT not sent to the session: {error:?}");
+                return Err(EIO);
+            }
+        };
+        let mut buffer = [0; MESSAGE_MAX];
+        let Ok(status) = Reader::new(reply.bytes(&mut buffer)).u32() else {
+            return Err(EIO);
+        };
+        match pure::waited(status, crate::data::busy_code()) {
+            pure::Waited::Over => return Ok(()),
+            pure::Waited::Going => armed = true,
+            pure::Waited::Bind if !bound => {
+                bound = true;
+                bind(session)?;
+                continue;
+            }
+            pure::Waited::Bind => return Err(EIO),
+            pure::Waited::Pause => {
+                crate::threads::sleep::pause(pause_ns)?;
+                pause_ns = (pause_ns * 2).min(16_000_000);
+                continue;
+            }
+            pure::Waited::Failed(errno) => return Err(errno),
+        }
+        // The copy goes on: wait for the service's notification. An entry that came before the
+        // receive ends the wait here, one that comes from here on stays pending and makes the
+        // receive return.
+        'notified: loop {
+            let guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
+            if crate::long::ending(&block.flags, true) {
+                drop(guard);
+                return Err(EINTR);
+            }
+            // A handler ran meanwhile: it may have taken the notification, so the service is asked.
+            if block.handled.load(Ordering::SeqCst) != handled {
+                handled = block.handled.load(Ordering::SeqCst);
+                drop(guard);
+                break 'notified;
+            }
+            let got = crate::fast::receive(&channel);
+            drop(guard);
+            match got {
+                Ok(rt::sys::Received::Notification {
+                    source: rt::abi::Source::Session,
+                    label,
+                    bits,
+                    ..
+                }) if pure::waits_for(label, ticket) && bits & 1 != 0 => {
+                    // The service told once and dropped its copy: the next WAIT brings a new one.
+                    armed = false;
+                    break 'notified;
+                }
+                Ok(rt::sys::Received::Notification {
+                    source: rt::abi::Source::Unlabeled,
+                    bits,
+                    ..
+                }) if bits & posix_sync::bit::CANCEL != 0
+                    && crate::threads::cancel::requested() =>
+                {
+                    return Err(EINTR);
+                }
+                Ok(_) => {}
+                Err(Error::Interrupted) => {
+                    if crate::long::ending(&block.flags, true) {
+                        return Err(EINTR);
+                    }
+                    // Every handler that ran had SA_RESTART: wait on.
+                }
+                Err(_) => return Err(EIO),
+            }
+        }
     }
 }
 

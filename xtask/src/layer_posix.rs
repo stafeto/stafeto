@@ -131,7 +131,7 @@ pub const WRITE_CHECKS: [&str; 13] = [
     "hard links, reserved names and long paths",
     "the rights of another user on the layer",
     "a sticky directory is kept",
-    "the lower set is not written",
+    "a program of the lower set is not written",
     "changes against descriptions",
 ];
 
@@ -242,8 +242,10 @@ pub fn command(args: &[String], machine: &qemu::Machine) -> Result<(), String> {
         Some("ash") if args.len() == 1 => ash(machine),
         Some("write") if args.len() == 1 => write(machine),
         Some("write") if args.len() == 2 && args[1] == "breaks" => write_breaks(machine),
+        Some("copy") if args.len() == 1 => copy(machine),
+        Some("copy") if args.len() == 2 && args[1] == "breaks" => copy_breaks(machine),
         Some(other) => Err(format!(
-            "layer-posix [breaks | ash | write [breaks]]: unknown argument {other}"
+            "layer-posix [breaks | ash | write [breaks] | copy [breaks]]: unknown argument {other}"
         )),
     }
 }
@@ -276,7 +278,17 @@ pub fn ash(machine: &qemu::Machine) -> Result<(), String> {
     crate::relibc()?;
     crate::busybox_build()?;
     let kernel = build(Variant::Normal)?;
-    let image = write_boot_image_files(ASH_IMAGE, &ash_programs(), BOOT_PROFILE, &[], Vec::new())?;
+    // The shell's own program is a file of the lower set too: the write the script makes to it is
+    // refused (a program is never copied up), where a write to a data file would be copied.
+    let program = crate::rootfs::RootFile {
+        path: "/bin/busybox-probe",
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        source: Some(crate::rootfs::Source::Elf("busybox-probe")),
+    };
+    let image =
+        write_boot_image_files(ASH_IMAGE, &ash_programs(), BOOT_PROFILE, &[], vec![program])?;
     let disk =
         Disk(std::env::temp_dir().join(format!("stafeto-layer-ash-{}.img", std::process::id())));
     crate::data_image::make_layer_posix_volume(&disk.0, DISK_BYTES)?;
@@ -419,13 +431,24 @@ fn boot_on(
     with: Build,
     disk: &Disk,
 ) -> Result<(qemu::Outcome, u64), String> {
+    boot_with(machine, with, disk, Vec::new(), LIMIT)
+}
+
+/// `boot_on` with files besides the lower set of the image and the longest the boot may take.
+fn boot_with(
+    machine: &qemu::Machine,
+    with: Build,
+    disk: &Disk,
+    extra: Vec<crate::rootfs::RootFile>,
+    limit: std::time::Duration,
+) -> Result<(qemu::Outcome, u64), String> {
     crate::relibc()?;
     let kernel = build(Variant::Normal)?;
-    let image = write_boot_image_files(IMAGE, &programs(with), BOOT_PROFILE, &[], Vec::new())?;
+    let image = write_boot_image_files(IMAGE, &programs(with), BOOT_PROFILE, &[], extra)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::store(&disk.0, None));
     let started = std::time::Instant::now();
-    let output = run_until(cmd, LIMIT, Some(ENDS), &kernel.elf)?;
+    let output = run_until(cmd, limit, Some(ENDS), &kernel.elf)?;
     Ok((output, started.elapsed().as_secs()))
 }
 
@@ -647,6 +670,367 @@ pub fn write_breaks(machine: &qemu::Machine) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------- copy
+
+const PASSED_COPY: &str = "layer-posix: copy checks passed";
+const PASSED_COPY_REREAD: &str = "layer-posix: copy reread checks passed";
+
+/// The checks of the copy phase (`cargo xtask layer-posix copy`): a lower file is copied up when it
+/// is written, in the order the probe runs them.
+pub const COPY_CHECKS: [&str; 13] = [
+    "a lower file that is written is copied up",
+    "the copy keeps the owner, the mode, the times and the number",
+    "a cut open makes an empty copy with the lower attributes",
+    "chmod, chown, utimensat and truncate of a lower file copy it up",
+    "chmod, chown and utimensat of a lower directory keep its number",
+    "lchown of a lower link copies the link",
+    "a lower program is never copied up and still runs",
+    "a read open copies nothing",
+    "a user without write rights is refused and nothing is copied",
+    "two writers of one file make one copy",
+    "a signal during the wait of a copy is EINTR without SA_RESTART",
+    "a signal during the wait of a copy goes on with SA_RESTART",
+    "the numbers of the copies are kept",
+];
+
+/// The check of the second boot of the copy probe, on the disk the first one left.
+pub const COPY_REREAD_CHECKS: [&str; 1] = ["the copies are the layer's with the numbers they had"];
+
+/// The breaks of the copy up the probe must catch: the feature of the layer service and the checks
+/// that must be among the failures.
+pub const COPY_BREAKS: [(&str, &[&str]); 3] = [
+    // The copy and the directories of its path take numbers of the counter: `st_ino` changes.
+    (
+        "break-layerd-copy-counter-ino",
+        &["a lower file that is written is copied up"],
+    ),
+    // The copy keeps the owner, mode and times the volume gave it.
+    (
+        "break-layerd-copy-attrs",
+        &["the copy keeps the owner, the mode, the times and the number"],
+    ),
+    // A program is copied like any file.
+    (
+        "break-layerd-copy-elf",
+        &["a lower program is never copied up and still runs"],
+    ),
+];
+
+/// The copies of the whole run: the files of the checks that copy (nine of the probe and the two
+/// of two signals), and the five writes to a program that begin a copy the worker refuses.
+const COPIES_RESERVED: u32 = 15;
+const COPIES_MADE_VISIBLE: u32 = 10;
+const COPIES_FAILED: u32 = 5;
+
+const COPY_PROBE: &[&str] = &["phase-copy"];
+/// The layer service of the copy probe tells the counters of its copies.
+const COPY_LAYERD: &[&str] = &["probe-copies"];
+const COPY_REREAD_PROBE: &[&str] = &["phase-copyreread"];
+
+/// The size of the disk of the copy probe: the data partition holds the copies (35 MiB of files
+/// above all) and the rest of the volume.
+const COPY_DISK_BYTES: u64 = 192 << 20;
+/// The longest a boot of the copy probe may take: 35 MiB are copied through the window of a service
+/// under emulation.
+const COPY_LIMIT: std::time::Duration = std::time::Duration::from_secs(900);
+/// The bytes of the lower files of 16 MiB and of 3 MiB (`BIG_BYTE` of the probe).
+const BIG_BYTES: usize = 16 << 20;
+const TWO_BYTES: usize = 3 << 20;
+
+/// The byte `i` of the big lower files: what the probe compares (`BIG_BYTE` of layer.c).
+fn big_byte(i: usize) -> u8 {
+    ((i.wrapping_mul(7) + (i >> 12)) | 1) as u8
+}
+
+fn big(len: usize) -> &'static [u8] {
+    Box::leak(
+        (0..len)
+            .map(big_byte)
+            .collect::<Vec<u8>>()
+            .into_boxed_slice(),
+    )
+}
+
+/// The files of the lower set the copy probe writes (besides those of the image): the directory
+/// `/copyup`, with files of other owners and modes, a directory, a link, and files of 16 and 3 MiB.
+pub fn copy_lower_files() -> Vec<crate::rootfs::RootFile> {
+    use crate::rootfs::{RootFile, Source};
+    let of = |path: &'static str, mode: u32, (uid, gid): (u32, u32), source: Source| RootFile {
+        path,
+        mode,
+        uid,
+        gid,
+        source: Some(source),
+    };
+    let bytes = |name: &'static str, text: &'static [u8]| Source::Bytes(name, text);
+    let dir = |path: &'static str, mode: u32, (uid, gid): (u32, u32)| RootFile {
+        path,
+        mode,
+        uid,
+        gid,
+        source: None,
+    };
+    let user = (1000, 100);
+    vec![
+        dir("/copyup", 0o755, (0, 0)),
+        of(
+            "/copyup/append",
+            0o640,
+            user,
+            bytes("lp-copy-append", b"lower line\n"),
+        ),
+        of(
+            "/copyup/attrs",
+            0o751,
+            (1001, 102),
+            bytes("lp-copy-attrs", b"attrs bytes\n"),
+        ),
+        of(
+            "/copyup/big1",
+            0o644,
+            (0, 0),
+            Source::Bytes("lp-copy-big1", big(BIG_BYTES)),
+        ),
+        of(
+            "/copyup/big2",
+            0o644,
+            (0, 0),
+            Source::Bytes("lp-copy-big2", big(BIG_BYTES)),
+        ),
+        of(
+            "/copyup/chmod",
+            0o644,
+            user,
+            bytes("lp-copy-chmod", b"chmod me\n"),
+        ),
+        of(
+            "/copyup/chown",
+            0o644,
+            user,
+            bytes("lp-copy-chown", b"chown me\n"),
+        ),
+        dir("/copyup/dir", 0o750, user),
+        of(
+            "/copyup/dir/in",
+            0o644,
+            (0, 0),
+            bytes("lp-copy-dir-in", b"inside\n"),
+        ),
+        of(
+            "/copyup/link",
+            bootimg::rootfs::SYMLINK_MODE,
+            (0, 0),
+            Source::Link("append"),
+        ),
+        of(
+            "/copyup/read",
+            0o644,
+            (0, 0),
+            bytes("lp-copy-read", b"read only\n"),
+        ),
+        of(
+            "/copyup/trunc",
+            0o600,
+            user,
+            bytes("lp-copy-trunc", b"to be cut\n"),
+        ),
+        of(
+            "/copyup/trunc2",
+            0o644,
+            (0, 0),
+            bytes("lp-copy-trunc2", b"truncate me\n"),
+        ),
+        of(
+            "/copyup/two",
+            0o644,
+            (0, 0),
+            Source::Bytes("lp-copy-two", big(TWO_BYTES)),
+        ),
+        of(
+            "/copyup/utime",
+            0o644,
+            (0, 0),
+            bytes("lp-copy-utime", b"utime\n"),
+        ),
+    ]
+}
+
+/// The counters of the last line of the layer service about its copies at or before `at` of the
+/// console: reserved, made visible, dropped, failed.
+fn copy_counts(lines: &[String], at: usize) -> Option<[u32; 4]> {
+    lines[..at].iter().rev().find_map(|l| {
+        let rest = l.split_once("layerd: copies ")?.1;
+        let rest = rest.split_once(": ")?.1;
+        let mut numbers = rest
+            .split(", ")
+            .map(|part| part.split_whitespace().next()?.parse().ok());
+        Some([
+            numbers.next()??,
+            numbers.next()??,
+            numbers.next()??,
+            numbers.next()??,
+        ])
+    })
+}
+
+/// The place of the line the probe says as a marker.
+fn marker(lines: &[String], name: &str) -> Result<usize, String> {
+    let wanted = format!("{PREFIX}marker {name}");
+    lines
+        .iter()
+        .position(|l| l.ends_with(&wanted))
+        .ok_or_else(|| format!("the probe said no marker {name:?}"))
+}
+
+/// What the lines of the layer service say of the copies: a read open reserves none, two writers
+/// reserve one, and the run ends with the counts the checks make; the start of each boot found
+/// `work/` empty.
+pub fn read_copy_counts(lines: &[String]) -> Result<(), String> {
+    let counts = |name: &str| -> Result<[u32; 4], String> {
+        let at = marker(lines, name)?;
+        Ok(copy_counts(lines, at).unwrap_or([0; 4]))
+    };
+    let (begin, end) = (counts("read-begin")?, counts("read-end")?);
+    if begin != end {
+        return Err(format!(
+            "a read open changed the copies of the service: {begin:?} before, {end:?} after"
+        ));
+    }
+    let (begin, end) = (counts("deny-begin")?, counts("deny-end")?);
+    if begin != end {
+        return Err(format!(
+            "a user without the right to write made a copy: {begin:?} before, {end:?} after"
+        ));
+    }
+    let (begin, end) = (counts("two-begin")?, counts("two-end")?);
+    if end[0] != begin[0] + 1 {
+        return Err(format!(
+            "two writers of one file made {} copies ({begin:?} before, {end:?} after)",
+            end[1].saturating_sub(begin[0])
+        ));
+    }
+    let last = copy_counts(lines, lines.len()).ok_or("the layer service said nothing of copies")?;
+    if last != [COPIES_RESERVED, COPIES_MADE_VISIBLE, 0, COPIES_FAILED] {
+        return Err(format!(
+            "the copies at the end are {last:?} (reserved, made visible, dropped, failed), {:?} were due",
+            [COPIES_RESERVED, COPIES_MADE_VISIBLE, 0, COPIES_FAILED]
+        ));
+    }
+    Ok(())
+}
+
+/// The start of a boot found `work/` empty.
+fn read_work_empty(lines: &[String]) -> Result<(), String> {
+    if lines
+        .iter()
+        .any(|l| l.contains("layerd: work/ is empty at the start"))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "the layer service did not find work/ empty at its start: {:?}",
+        lines
+            .iter()
+            .filter(|l| l.contains("layerd: work/"))
+            .collect::<Vec<_>>()
+    ))
+}
+
+/// The copy probe: a lower file is copied up when it is written (one boot), and a second boot on the
+/// disk reads the copies, their numbers and what they hold, and finds `work/` empty.
+pub fn copy(machine: &qemu::Machine) -> Result<(), String> {
+    let disk = copy_disk()?;
+    let (first, first_seconds) = boot_with(
+        machine,
+        Build {
+            probe: COPY_PROBE,
+            layerd: COPY_LAYERD,
+            ..Build::default()
+        },
+        &disk,
+        copy_lower_files(),
+        COPY_LIMIT,
+    )?;
+    read_checks(&first.lines, &COPY_CHECKS, PASSED_COPY)?;
+    read_work_empty(&first.lines)?;
+    read_copy_counts(&first.lines)?;
+    qemu::expect_stopped_on(
+        &first,
+        "init: layer-posix ended: exit code 0, not restarted",
+    )?;
+    let (second, second_seconds) = boot_with(
+        machine,
+        Build {
+            probe: COPY_REREAD_PROBE,
+            layerd: COPY_LAYERD,
+            ..Build::default()
+        },
+        &disk,
+        copy_lower_files(),
+        COPY_LIMIT,
+    )?;
+    read_checks(&second.lines, &COPY_REREAD_CHECKS, PASSED_COPY_REREAD)?;
+    read_work_empty(&second.lines)?;
+    qemu::expect_stopped_on(
+        &second,
+        "init: layer-posix ended: exit code 0, not restarted",
+    )?;
+    println!(
+        "layer-posix copy on {}: {} checks of the copy up in {first_seconds} s, {} check of the copies on a second boot in {second_seconds} s: ok",
+        machine.name,
+        COPY_CHECKS.len(),
+        COPY_REREAD_CHECKS.len(),
+    );
+    Ok(())
+}
+
+fn copy_disk() -> Result<Disk, String> {
+    let disk = Disk(std::env::temp_dir().join(format!(
+        "stafeto-layer-posix-copy-{}.img",
+        std::process::id()
+    )));
+    crate::data_image::make_layer_posix_volume(&disk.0, COPY_DISK_BYTES)?;
+    Ok(disk)
+}
+
+/// Each break of the copy up, one boot each: the probe must fail and name the checks the break is
+/// for.
+pub fn copy_breaks(machine: &qemu::Machine) -> Result<(), String> {
+    for (feature, checks) in COPY_BREAKS {
+        let layerd: &'static [&'static str] =
+            Box::leak(vec!["probe-copies", feature].into_boxed_slice());
+        let disk = copy_disk()?;
+        let (output, seconds) = boot_with(
+            machine,
+            Build {
+                probe: COPY_PROBE,
+                layerd,
+                ..Build::default()
+            },
+            &disk,
+            copy_lower_files(),
+            COPY_LIMIT,
+        )?;
+        let mine = mine(&output.lines);
+        if mine.iter().any(|l| *l == &PASSED_COPY[PREFIX.len()..]) {
+            return Err(format!(
+                "layer-posix copy breaks: {feature} did not fail the probe"
+            ));
+        }
+        let failed: Vec<&&str> = mine.iter().filter(|l| l.contains(" FAILED")).collect();
+        for check in checks {
+            let wanted = format!("{check} FAILED");
+            if !failed.iter().any(|l| l.starts_with(&wanted)) {
+                return Err(format!(
+                    "layer-posix copy breaks: {feature} did not fail {check:?}; the checks that failed: {failed:?}"
+                ));
+            }
+        }
+        println!("layer-posix copy breaks: {feature} is caught by {checks:?} (in {seconds} s)");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,7 +1105,7 @@ mod tests {
             "a",
             "a",
             "tmp-bytes",
-            "ash: can't create /etc/layer-lower: Read-only file system",
+            "ash: can't create /bin/busybox-probe: Read-only file system",
             "write-refused",
         ] {
             lines.push(l.to_owned());
@@ -762,14 +1146,31 @@ mod tests {
         }
         // The checks of the file are the checks of the C program, each once.
         let source = include_str!("../../tests/layer-posix/layer.c");
-        for check in CHECKS.iter().chain(&WRITE_CHECKS).chain(&REREAD_CHECKS) {
+        for check in CHECKS
+            .iter()
+            .chain(&WRITE_CHECKS)
+            .chain(&REREAD_CHECKS)
+            .chain(&COPY_CHECKS)
+            .chain(&COPY_REREAD_CHECKS)
+        {
             let quoted = format!("run_check(\"{check}\"");
             assert_eq!(source.matches(&quoted).count(), 1, "{check}");
         }
         assert_eq!(
             source.matches("run_check(\"").count(),
-            CHECKS.len() + WRITE_CHECKS.len() + REREAD_CHECKS.len()
+            CHECKS.len()
+                + WRITE_CHECKS.len()
+                + REREAD_CHECKS.len()
+                + COPY_CHECKS.len()
+                + COPY_REREAD_CHECKS.len()
         );
+        // The breaks of the copy probe name checks of its phase.
+        for (feature, checks) in COPY_BREAKS {
+            assert!(feature.starts_with("break-layerd-copy-"), "{feature}");
+            for check in checks {
+                assert!(COPY_CHECKS.contains(check), "{feature}: {check}");
+            }
+        }
         // The breaks of the write probe name a check of its phase.
         for (feature, reread, check) in WRITE_BREAKS {
             let checks: &[&str] = if reread {
@@ -780,6 +1181,78 @@ mod tests {
             assert!(checks.contains(&check), "{feature}");
             assert!(feature.starts_with("break-layerd-"));
         }
+    }
+
+    fn copy_lines(read: [u32; 2], two: [u32; 2], last: [u32; 4]) -> Vec<String> {
+        let line = |what: &str, c: [u32; 4]| {
+            format!(
+                "layerd: copies {what}: {} reserved, {} made visible, {} dropped, {} failed",
+                c[0], c[1], c[2], c[3]
+            )
+        };
+        let mark = |name: &str| format!("{PREFIX}marker {name}");
+        vec![
+            line("queued", [3, 2, 0, 0]),
+            mark("read-begin"),
+            line("over", [read[0], 2, 0, 0]),
+            mark("read-end"),
+            mark("deny-begin"),
+            mark("deny-end"),
+            line("queued", [two[0], 2, 0, 0]),
+            mark("two-begin"),
+            line("queued", [two[1], 2, 0, 0]),
+            mark("two-end"),
+            line("over", last),
+        ]
+    }
+
+    #[test]
+    fn the_counts_of_the_copies_say_a_read_made_none_and_two_writers_made_one() {
+        let last = [COPIES_RESERVED, COPIES_MADE_VISIBLE, 0, COPIES_FAILED];
+        assert_eq!(read_copy_counts(&copy_lines([3, 3], [4, 5], last)), Ok(()));
+        // A read that reserved a copy, and two writers that reserved two, fail it.
+        let err = read_copy_counts(&copy_lines([4, 0], [4, 5], last)).unwrap_err();
+        assert!(err.contains("read open"), "{err}");
+        let err = read_copy_counts(&copy_lines([3, 3], [4, 6], last)).unwrap_err();
+        assert!(err.contains("two writers"), "{err}");
+        // Two writers that made none are no better.
+        assert!(read_copy_counts(&copy_lines([3, 3], [4, 4], last)).is_err());
+        // The end of the run is the count of the checks.
+        assert!(read_copy_counts(&copy_lines([3, 3], [4, 5], [14, 10, 0, 5])).is_err());
+        assert!(read_copy_counts(&copy_lines([3, 3], [4, 5], [15, 9, 1, 5])).is_err());
+        // No marker is no proof.
+        assert!(read_copy_counts(&[]).is_err());
+    }
+
+    #[test]
+    fn the_lower_files_of_the_copy_probe_are_in_ascending_order_and_have_the_sizes_the_probe_says()
+    {
+        let files = copy_lower_files();
+        let paths: Vec<&str> = files.iter().map(|f| f.path).collect();
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(paths, sorted);
+        assert_eq!(paths.first(), Some(&"/copyup"));
+        // The file names of the sources of one image are all different and short.
+        let mut names: Vec<String> = files
+            .iter()
+            .filter_map(|f| f.source.as_ref().map(crate::rootfs::Source::file_name))
+            .collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count);
+        assert!(names.iter().all(|n| n.len() <= bootimg::NAME_MAX));
+        // The bytes of the big file are the ones layer.c compares: the first byte and one past the
+        // middle.
+        assert_eq!(big_byte(0), 1);
+        let source = include_str!("../../tests/layer-posix/layer.c");
+        assert!(source.contains("#define BIG_BYTES (16UL << 20)"));
+        assert!(source.contains("#define TWO_BYTES (3UL << 20)"));
+        assert!(source.contains("(unsigned char)(((i) * 7 + ((i) >> 12)) | 1)"));
+        assert_eq!(BIG_BYTES, 16 << 20);
+        assert_eq!(TWO_BYTES, 3 << 20);
+        assert_eq!(big_byte(4096), ((4096 * 7 + 1) | 1) as u8);
     }
 
     #[test]

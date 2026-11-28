@@ -48,7 +48,7 @@ pub const CHECKS: [&str; 23] = [
     "a dot dot in the index and after a lower name",
     "an opaque directory lists only its own names",
     "rewind fstat and close",
-    "the lower set is not written",
+    "the lower set is copied up before it is written",
     "the superuser searches a closed directory",
     "the superuser reads a closed file",
     "search denied for user 1000 on the session of before",

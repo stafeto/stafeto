@@ -602,8 +602,9 @@ fn open_numbered_gives_a_new_file_the_number_the_native_client_names() {
     for (flags, ino) in [
         (p::READ, ino),
         (p::WRITE | p::CREATE, ino),
-        (flags, 77),
+        (flags, 0),
         (flags, p::INO_NUMBERED | p::INO_PATH | 5),
+        (flags, p::INO_PATH | 5),
     ] {
         assert_eq!(
             open(&mut rig, ROOT, flags, ino, b"/m"),
@@ -616,6 +617,62 @@ fn open_numbered_gives_a_new_file_the_number_the_native_client_names() {
     let a = rig.open(ROOT, b"/a", p::WRITE | p::CREATE, 0o644).unwrap();
     rig.close(ROOT, a);
     assert!(rig.stat(ROOT, b"/a").unwrap().ino < p::INO_NUMBERED);
+}
+
+#[test]
+fn open_numbered_and_mkdir_numbered_take_the_number_of_a_lower_file() {
+    let mut rig = volume();
+    let flags = p::WRITE | p::CREATE | p::EXCLUSIVE;
+    // The numbers of the RAM file service (bits 62 and 63 clear): a place plus one, a generation.
+    let lower_file = (3u64 << 32) | 17;
+    let lower_dir = (1u64 << 32) | 4;
+    rig.call(ROOT, |w| {
+        p::open_numbered(b"/nf", flags, 0o600, lower_file, w)
+    })
+    .unwrap();
+    assert_eq!(rig.stat(ROOT, b"/nf").unwrap().ino, lower_file);
+    // A directory takes a number the same way, and `.` of its listing says it.
+    rig.call(ROOT, |w| p::mkdir_numbered(b"/nd", 0o755, lower_dir, w))
+        .unwrap();
+    let stat = rig.stat(ROOT, b"/nd").unwrap();
+    assert_eq!((stat.ino, stat.kind), (lower_dir, p::KIND_DIRECTORY));
+    // Numbers are stored and never compared: two files may carry one number, and the lease and
+    // the tail of each go by its node and its path.
+    rig.call(ROOT, |w| {
+        p::open_numbered(b"/ng", flags, 0o600, lower_file, w)
+    })
+    .unwrap();
+    rig.call(ROOT, |w| p::mkdir_numbered(b"/ne", 0o755, lower_file, w))
+        .unwrap();
+    assert_eq!(rig.stat(ROOT, b"/ng").unwrap().ino, lower_file);
+    assert_eq!(rig.stat(ROOT, b"/ne").unwrap().ino, lower_file);
+    // The counter of layerd (bit 62) is still taken, and a POSIX client is refused.
+    rig.call(ROOT, |w| {
+        p::mkdir_numbered(b"/nc", 0o755, p::INO_NUMBERED | 9, w)
+    })
+    .unwrap();
+    assert_eq!(rig.stat(ROOT, b"/nc").unwrap().ino, p::INO_NUMBERED | 9);
+    assert_eq!(
+        rig.call(OWNER, |w| p::mkdir_numbered(b"/nx", 0o755, lower_dir, w)),
+        Err(p::code(p::PERMISSION))
+    );
+    assert!(rig.stat(ROOT, b"/nx").is_err());
+    // Bad numbers and modes are INVALID, and the name is EXISTS the second time.
+    for (mode, ino) in [(0o755, 0), (0o755, p::INO_PATH | 5), (0o10000, 5)] {
+        assert_eq!(
+            rig.call(ROOT, |w| p::mkdir_numbered(b"/ny", mode, ino, w)),
+            Err(p::code(p::INVALID)),
+            "{mode:o} {ino:#x}"
+        );
+    }
+    assert_eq!(
+        rig.call(ROOT, |w| p::mkdir_numbered(b"/nd", 0o755, 5, w)),
+        Err(p::code(p::EXISTS))
+    );
+    // The counter of the volume is untouched by named numbers.
+    let a = rig.open(ROOT, b"/na", p::WRITE | p::CREATE, 0o644).unwrap();
+    rig.close(ROOT, a);
+    assert!(rig.stat(ROOT, b"/na").unwrap().ino < p::INO_NUMBERED);
 }
 
 #[test]
@@ -636,6 +693,9 @@ fn the_requests_that_need_blocks_include_the_parts_that_write_and_open_numbered(
         &mut w,
     )
     .unwrap();
+    assert!(needs_blocks(w.as_bytes()));
+    let mut w = Writer::new();
+    p::mkdir_numbered(b"/x", 0o755, p::INO_NUMBERED, &mut w).unwrap();
     assert!(needs_blocks(w.as_bytes()));
     let mut w = Writer::new();
     p::read_into(&head(1, 0, 0, 0, 0), &mut w).unwrap();

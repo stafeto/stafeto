@@ -9,7 +9,7 @@
 //! and the limits a shell and `tar` need. Version 4 adds the transfer of file bytes through a
 //! window of shared memory in parts of up to 64 KiB, held together by a lease on the file so that
 //! one `read` or `write` of any size stays atomic (see "The window" and "Parts and leases"), and
-//! OPEN_NUMBERED for a native client. Numbers 1 to 35 are those of version 3 and never change.
+//! OPEN_NUMBERED and MKDIR_NUMBERED for a native client. Numbers 1 to 35 are those of version 3 and never change.
 //! Locks of records stay out of it (ENOLCK).
 //!
 //! # Paths and descriptions
@@ -81,6 +81,7 @@
 //! | PWRITE_FROM (40) | `handle` u32, `count` u32, `offset` u64, `cell` u32, `flags` u32, `lease` u32, and with `INLINE` the bytes | as WRITE_FROM |
 //! | RELEASE (41) | `lease` u32 | none |
 //! | OPEN_NUMBERED (42) | `flags` u32, `mode` u32, `ino` u64, the path | `handle` u32, `kind` u32 |
+//! | MKDIR_NUMBERED (43) | `mode` u32, `ino` u64, the path | none |
 //!
 //! `uid` and `gid` of CHOWN and FCHOWN equal to `UID_KEEP` (u32::MAX) mean "leave as is". `atime`
 //! and `mtime` of UTIMENS and FUTIMENS take `UTIME_NOW` (the present moment, read by the service)
@@ -176,7 +177,7 @@
 //!    lapsed) answers NOT_BOUND to every request except BIND, CLOSE, CLONE, CLONE_MORE and the
 //!    requests that only read or hand on a description it holds: READ, PREAD, SEEK, FSTAT,
 //!    READDIR, REWIND, WHERE, GET_FLAGS, EXPORT, ADOPT, WINDOW, READ_INTO, PREAD_INTO and RELEASE.
-//!    WRITE, PWRITE, WRITE_FROM, PWRITE_FROM, OPEN_NUMBERED, TRUNCATE, FSYNC,
+//!    WRITE, PWRITE, WRITE_FROM, PWRITE_FROM, OPEN_NUMBERED, MKDIR_NUMBERED, TRUNCATE, FSYNC,
 //!    SET_FLAGS, FCHMOD, FCHOWN and FUTIMENS need a binding, as does every request that names a
 //!    path. A session made by CLONE inherits neither the mark nor the identity: the child binds its
 //!    own session.
@@ -417,10 +418,18 @@
 //! holds no lease.
 //!
 //! OPEN_NUMBERED is OPEN with the number of the file chosen by the caller, for a native client
-//! (label `SERVICE`) such as the layered file service; any other session is PERMISSION. `ino` has
-//! bit 62 (`INO_NUMBERED`) set and bit 63 clear, else INVALID; the flags must include CREATE and
+//! (label `SERVICE`) such as the layered file service; any other session is PERMISSION. `ino` is
+//! any number but 0 with bit 63 (`INO_PATH`, the numbers the service makes from a path) clear, else
+//! INVALID: a number with bit 62 (`INO_NUMBERED`) is one the layered file service counted, and one
+//! without it is the number of a file of the lower set, which the copy of that file keeps. The
+//! service stores the number and never looks for another file with it: its nodes, leases and tails
+//! are kept by the place of the node and by the path. The flags must include CREATE and
 //! EXCLUSIVE, else INVALID (the number goes only to a new file, and means nothing for an existing
 //! one). The reply is that of OPEN.
+//!
+//! MKDIR_NUMBERED is MKDIR with the number of the directory chosen by the caller, under the same
+//! rules as OPEN_NUMBERED for the caller (any other session is PERMISSION) and for the number. The
+//! reply is that of MKDIR.
 //!
 //! # Where the standard was checked
 //!
@@ -788,10 +797,11 @@ pub enum Method {
     PwriteFrom = 40,
     Release = 41,
     OpenNumbered = 42,
+    MkdirNumbered = 43,
 }
 
 /// The number of methods.
-pub const METHOD_COUNT: usize = 42;
+pub const METHOD_COUNT: usize = 43;
 
 impl Method {
     pub const ALL: [Method; METHOD_COUNT] = [
@@ -837,6 +847,7 @@ impl Method {
         Method::PwriteFrom,
         Method::Release,
         Method::OpenNumbered,
+        Method::MkdirNumbered,
     ];
 
     pub const fn number(self) -> u16 {
@@ -1133,6 +1144,14 @@ pub fn open_numbered(
     w.bytes(path)
 }
 
+/// MKDIR_NUMBERED.
+pub fn mkdir_numbered(path: &[u8], mode: u32, ino: u64, w: &mut Writer) -> Result<(), Status> {
+    start(Method::MkdirNumbered, w)?;
+    w.u32(mode)?;
+    w.u64(ino)?;
+    w.bytes(path)
+}
+
 // The requests, read by the service from the body after the header.
 
 /// OPEN: `(flags, mode, path)`. INVALID for flags outside `FLAGS_ALL`, a mode outside the mode
@@ -1231,9 +1250,14 @@ pub fn read_release(mut body: Reader<'_>) -> Result<u32, Status> {
     Ok(lease)
 }
 
-/// OPEN_NUMBERED: `(flags, mode, ino, path)`. INVALID for what OPEN refuses, for an `ino` without
-/// `INO_NUMBERED` or with `INO_PATH`, and for flags without both CREATE and EXCLUSIVE (the number
-/// goes to a new file only).
+/// The number of a file or directory the caller names: any but 0 with `INO_PATH` clear.
+pub const fn number_ok(ino: u64) -> bool {
+    ino != 0 && ino & INO_PATH == 0
+}
+
+/// OPEN_NUMBERED: `(flags, mode, ino, path)`. INVALID for what OPEN refuses, for an `ino` that is 0
+/// or has `INO_PATH`, and for flags without both CREATE and EXCLUSIVE (the number goes to a new
+/// file only).
 pub fn read_open_numbered<'a>(mut body: Reader<'a>) -> Result<(u32, u32, u64, &'a [u8]), Status> {
     let flags = body.u32()?;
     let mode = body.u32()?;
@@ -1245,13 +1269,25 @@ pub fn read_open_numbered<'a>(mut body: Reader<'a>) -> Result<(u32, u32, u64, &'
     if flags & READ_WRITE_BOTH == 0 && flags != DIRECTORY {
         return Err(code(INVALID));
     }
-    if ino & INO_NUMBERED == 0 || ino & INO_PATH != 0 {
+    if !number_ok(ino) {
         return Err(code(INVALID));
     }
     if flags & CREATE == 0 || flags & EXCLUSIVE == 0 {
         return Err(code(INVALID));
     }
     Ok((flags, mode, ino, path))
+}
+
+/// MKDIR_NUMBERED: `(mode, ino, path)`. INVALID for a mode outside the mode bits and for an `ino`
+/// that is 0 or has `INO_PATH`.
+pub fn read_mkdir_numbered<'a>(mut body: Reader<'a>) -> Result<(u32, u64, &'a [u8]), Status> {
+    let mode = body.u32()?;
+    let ino = body.u64()?;
+    let path = body.bytes(body.left())?;
+    if mode & !MODE_MASK != 0 || !number_ok(ino) {
+        return Err(code(INVALID));
+    }
+    Ok((mode, ino, path))
 }
 
 /// The reply to a part, after the status: `count`, `flags`, `lease`, and with an `INLINE` read the
@@ -1688,7 +1724,7 @@ mod tests {
             assert_eq!(Method::from_number(m.number()), Some(m));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(43), None);
+        assert_eq!(Method::from_number(44), None);
         for (method, number) in [
             (Method::Window, 36),
             (Method::ReadInto, 37),
@@ -1697,10 +1733,11 @@ mod tests {
             (Method::PwriteFrom, 40),
             (Method::Release, 41),
             (Method::OpenNumbered, 42),
+            (Method::MkdirNumbered, 43),
         ] {
             assert_eq!(method.number(), number);
         }
-        assert_eq!(METHOD_COUNT, 42);
+        assert_eq!(METHOD_COUNT, 43);
         for (i, a) in CODES.iter().enumerate() {
             assert!(*a > 1200 && *a < 1300, "{a}");
             assert!(!CODES[i + 1..].contains(a));
@@ -2425,7 +2462,7 @@ mod tests {
         );
         let invalid = Err(code(INVALID));
         for bad in [
-            make(new_file, 0, 41),                           // no bit 62
+            make(new_file, 0, 0),                            // no number
             make(new_file, 0, INO_NUMBERED | INO_PATH | 41), // bit 63
             make(new_file, 0, INO_PATH),                     // a number of a path
             make(WRITE | CREATE, 0o600, good),               // CREATE without EXCLUSIVE
@@ -2438,6 +2475,59 @@ mod tests {
         ] {
             assert_eq!(read_open_numbered(Reader::new(&bad)).map(|_| ()), invalid);
         }
+    }
+
+    #[test]
+    fn open_numbered_takes_the_number_of_a_lower_file_too() {
+        let make = |ino: u64| {
+            let mut w = Writer::new();
+            open_numbered(b"/n", WRITE | CREATE | EXCLUSIVE, 0o600, ino, &mut w).unwrap();
+            w.as_bytes()[HEADER_LEN..].to_vec()
+        };
+        // A number of the lower set (bits 62 and 63 clear), one with bit 62, the largest with bit 63
+        // clear.
+        for ino in [1, 41, (7 << 32) | 9, INO_NUMBERED | 41, INO_PATH - 1] {
+            assert_eq!(
+                read_open_numbered(Reader::new(&make(ino))).map(|(_, _, i, _)| i),
+                Ok(ino)
+            );
+        }
+        assert!(number_ok(5) && !number_ok(0) && !number_ok(INO_PATH | 5));
+    }
+
+    #[test]
+    fn mkdir_numbered_is_written_and_read_with_the_same_number_rules() {
+        let make = |mode: u32, ino: u64| {
+            let mut w = Writer::new();
+            mkdir_numbered(b"/d", mode, ino, &mut w).unwrap();
+            w.as_bytes().to_vec()
+        };
+        let mut want = Vec::new();
+        want.extend_from_slice(&0o755u32.to_le_bytes());
+        want.extend_from_slice(&(INO_NUMBERED | 5).to_le_bytes());
+        want.extend_from_slice(b"/d");
+        assert_eq!(
+            make(0o755, INO_NUMBERED | 5),
+            bytes_of(Method::MkdirNumbered, &want)
+        );
+        for ino in [1, (3 << 32) | 4, INO_NUMBERED | 5] {
+            let bytes = make(0o755, ino);
+            assert_eq!(
+                read_mkdir_numbered(Reader::new(&bytes[HEADER_LEN..])),
+                Ok((0o755, ino, &b"/d"[..]))
+            );
+        }
+        let invalid = Err(code(INVALID));
+        for bad in [make(0o755, 0), make(0o755, INO_PATH | 5), make(0o10000, 5)] {
+            assert_eq!(
+                read_mkdir_numbered(Reader::new(&bad[HEADER_LEN..])),
+                invalid
+            );
+        }
+        assert_eq!(
+            read_mkdir_numbered(Reader::new(&[1, 0])),
+            Err(Status::BadSize)
+        );
     }
 
     #[test]
@@ -2466,6 +2556,7 @@ mod tests {
             Method::PwriteFrom,
             Method::Release,
             Method::OpenNumbered,
+            Method::MkdirNumbered,
         ] {
             assert!(!m.is_root_method());
             assert_eq!(m.header(), Header::new(m.number(), 4));
