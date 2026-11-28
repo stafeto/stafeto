@@ -675,7 +675,8 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     let rows =
         crate::focus_probe::rows_of(&lines, comp_probe::COMP_TAG, "compositor", &DESK_COMP_KINDS)
             .map_err(|e| format!("desk-probe under -icount on {}: {e}", machine.name))?;
-    crate::check_waits(&lines, &[comp_probe::COMP_TAG], "desk-probe")?;
+    let waits = crate::frame_probe::check_waits(&lines, init::table::desk::TABLE, "desk-probe")?;
+    println!("{waits}");
     let text: Vec<String> = rows
         .iter()
         .map(|(kind, ticks, _)| format!("kind {kind} {ticks}"))
