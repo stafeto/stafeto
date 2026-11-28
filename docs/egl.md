@@ -77,6 +77,8 @@ has `EGL_PIXMAP_BIT`.
 | `EGLNativeWindowType` | `khronos_uintptr_t`: the number of a window of `<stafeto/window.h>` plus 1 |
 | `EGLNativePixmapType` | `khronos_uintptr_t`, not supported |
 
+The platform does not follow a `stafeto_window_resize` yet: the surface keeps the size the window had when it was made.
+
 The number plus 1 keeps the handle 0 for "no window": Mesa's
 `eglCreateWindowSurface` answers `EGL_BAD_NATIVE_WINDOW` for 0 before the
 platform is asked, and the window of a process is number 0. `eglplatform.h` is

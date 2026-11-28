@@ -20,6 +20,7 @@
  */
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -211,7 +212,7 @@ static int setup_and_refusals(struct stafeto_window *w) {
     errno = 0;
     CHECK(stafeto_window_open(0, 0, 10, 10, 2, 2, 0, w) == -1 && errno == EINVAL);
     errno = 0;
-    CHECK(stafeto_window_open(0, 0, 10, 10, 1, 2, 1, w) == -1 && errno == EINVAL);
+    CHECK(stafeto_window_open(0, 0, 10, 10, 1, 2, 2, w) == -1 && errno == EINVAL);
     errno = 0;
     CHECK(stafeto_window_open(500, 0, 200, 10, 1, 2, 0, w) == -1 && errno == EINVAL);
     errno = 0;
@@ -239,8 +240,19 @@ static int setup_and_refusals(struct stafeto_window *w) {
         const uint32_t *p = (const uint32_t *)w->pixels[k];
         CHECK(p[0] == 0 && p[(WIN_H * WIN_W) - 1] == 0);
     }
-    errno = 0;
-    CHECK(stafeto_window_open(WIN_X, WIN_Y, 10, 10, 1, 1, 0, w) == -1 && errno == EBUSY);
+    {
+        /* A second window is number 1 (the lowest free); closed, its number
+         * names nothing. The window 0 is as it was. */
+        struct stafeto_window other;
+        CHECK(stafeto_window_open(0, 0, 10, 10, 1, 1, 0, &other) == 1);
+        CHECK(other.width == 10 && other.generation != w->generation);
+        CHECK(stafeto_window_free_buffers(1) == STAFETO_WINDOW_BUFFER(0));
+        CHECK(stafeto_window_close(1) == 0);
+        CHECK(stafeto_window_free_buffers(1) == 0);
+        errno = 0;
+        CHECK(stafeto_window_close(1) == -1 && errno == EBADF);
+        CHECK(stafeto_window_free_buffers(0) == 3);
+    }
     {
         /* The description of the open window is the one open gave. */
         struct stafeto_window again;
@@ -252,7 +264,7 @@ static int setup_and_refusals(struct stafeto_window *w) {
         errno = 0;
         CHECK(stafeto_window_info(0, NULL) == -1 && errno == EINVAL);
     }
-    printf("posix-window: a window of 200 by 100 with two zeroed buffers, a second open is EBUSY, info repeats open\n");
+    printf("posix-window: a window of 200 by 100 with two zeroed buffers, a second window is number 1, info repeats open\n");
 
     /* Post refusals: nothing goes to the service. */
     errno = 0;
@@ -272,6 +284,10 @@ static int setup_and_refusals(struct stafeto_window *w) {
     CHECK(stafeto_window_free_buffers(0) == 3);
     return 0;
 }
+
+static int several_windows(void);
+static int waiting_threads(void);
+static int exec_role(void);
 
 static int run_role(void) {
     struct stafeto_window w;
@@ -405,6 +421,379 @@ static int run_role(void) {
     }
     CHECK(stafeto_window_close(0) == 0);
     printf("posix-window: close ends the window, and a new one opens\n");
+    CHECK(several_windows() == 0);
+    CHECK(waiting_threads() == 0);
+    return exec_role();
+}
+
+/* ---- several windows of one process ---- */
+
+struct patch {
+    int x, y, w, h;
+    uint32_t colour;
+};
+
+/* The CRC-32 of the screen the patches make over black, the later one on
+ * top (as screen_crc takes it). */
+static uint32_t patches_crc(const struct patch *p, int n) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (int y = 0; y < SCREEN_H; y++) {
+        for (int x = 0; x < SCREEN_W; x++) {
+            uint32_t c = 0;
+            for (int i = 0; i < n; i++)
+                if (x >= p[i].x && x < p[i].x + p[i].w && y >= p[i].y && y < p[i].y + p[i].h)
+                    c = p[i].colour;
+            crc = crc_byte(crc, (uint8_t)(c >> 16));
+            crc = crc_byte(crc, (uint8_t)(c >> 8));
+            crc = crc_byte(crc, (uint8_t)c);
+        }
+    }
+    return ~crc;
+}
+
+/* Fills width by height points of buffer k with one colour. */
+static void fill(const struct stafeto_window *w, unsigned k, int width, int height,
+                 uint32_t colour) {
+    uint32_t *p = (uint32_t *)w->pixels[k];
+    uint32_t words = w->stride / 4;
+    for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++) p[(uint32_t)y * words + (uint32_t)x] = colour;
+}
+
+#define BUFFER_BITS 7u
+
+/* Takes the bits that wait on every window until none does, and the
+ * events of each window, so that a later wait sees only what a step made. */
+static int settle(int count) {
+    uint32_t bits[STAFETO_WINDOWS_MAX];
+    struct stafeto_window_event ev[STAFETO_WINDOW_EVENTS_MAX];
+    struct timespec pause = {0, 300000000};
+    nanosleep(&pause, NULL);
+    for (int i = 0; i < 20; i++) {
+        if (stafeto_windows_wait(0, bits) == -1) {
+            if (errno != ETIMEDOUT) return -1;
+            break;
+        }
+    }
+    for (int k = 0; k < count; k++) {
+        if (stafeto_window_events(k, ev, STAFETO_WINDOW_EVENTS_MAX, NULL) < 0) return -1;
+    }
+    for (int i = 0; i < 20; i++) {
+        if (stafeto_windows_wait(0, bits) == -1) {
+            if (errno != ETIMEDOUT) return -1;
+            break;
+        }
+    }
+    return 0;
+}
+
+/* Waits across the windows until `want` (a window) has a buffer bit; the
+ * other windows must have none of theirs. */
+static int only_window_frees(int want, uint32_t buffer_bit) {
+    uint32_t bits[STAFETO_WINDOWS_MAX];
+    int mask = -1;
+    for (int i = 0; i < 100; i++) {
+        mask = stafeto_windows_wait(WITHIN, bits);
+        if (mask < 0) return -1;
+        if (bits[want] & buffer_bit) break;
+    }
+    if (!(bits[want] & buffer_bit) || !(mask & (1 << want))) return -2;
+    for (int k = 0; k < STAFETO_WINDOWS_MAX; k++) {
+        if (k != want && (bits[k] & BUFFER_BITS)) return -3;
+        if (bits[k] == 0 && (mask & (1 << k))) return -5;
+    }
+    return 0;
+}
+
+static int several_windows(void) {
+    struct stafeto_window a, b, c, d, spare;
+    uint32_t bits[STAFETO_WINDOWS_MAX], cw = 0, ch = 0;
+    struct stafeto_rect whole_b = {0, 0, 120, 70};
+    char long_text[70];
+
+    /* Three windows of one process: numbers 0, 1 and 2, each its own. */
+    CHECK(stafeto_window_open(20, 20, 60, 40, STAFETO_WINDOW_XRGB8888, 2, 0, &a) == 0);
+    CHECK(stafeto_window_open(200, 30, 80, 50, STAFETO_WINDOW_XRGB8888, 2,
+                              STAFETO_WINDOW_RESIZABLE, &b) == 1);
+    CHECK(stafeto_window_open(400, 200, 50, 50, STAFETO_WINDOW_XRGB8888, 1, 0, &c) == 2);
+    CHECK(a.stride == 240 && b.stride == SCREEN_W * 4 && c.stride == 200);
+    CHECK(a.generation != b.generation && b.generation != c.generation);
+    CHECK(a.pixels[0] != b.pixels[0] && b.pixels[0] != c.pixels[0]);
+    CHECK(stafeto_window_free_buffers(0) == 3 && stafeto_window_free_buffers(1) == 3);
+    CHECK(stafeto_window_free_buffers(2) == 1 && stafeto_window_free_buffers(3) == 0);
+    /* A fourth fills the service's share of a process, a fifth is refused, and
+     * a window closed gives its number back to the next one. */
+    CHECK(stafeto_window_open(10, 300, 10, 10, STAFETO_WINDOW_XRGB8888, 1, 0, &d) == 3);
+    errno = 0;
+    CHECK(stafeto_window_open(10, 320, 10, 10, STAFETO_WINDOW_XRGB8888, 1, 0, &spare) == -1 &&
+          errno == EAGAIN);
+    CHECK(stafeto_window_close(3) == 0);
+    CHECK(stafeto_window_open(10, 300, 10, 10, STAFETO_WINDOW_XRGB8888, 1, 0, &d) == 3);
+    CHECK(stafeto_window_close(3) == 0);
+    {
+        struct stafeto_window again;
+        CHECK(stafeto_window_info(1, &again) == 0 && memcmp(&again, &b, sizeof again) == 0);
+        CHECK(stafeto_window_info(2, &again) == 0 && memcmp(&again, &c, sizeof again) == 0);
+    }
+    /* The wait across the windows with no bits, and bad arguments. */
+    CHECK(settle(3) == 0);
+    errno = 0;
+    CHECK(stafeto_windows_wait(0, bits) == -1 && errno == ETIMEDOUT);
+    errno = 0;
+    CHECK(stafeto_window_wait(7, 0, NULL) == -1 && errno == EBADF);
+    errno = 0;
+    CHECK(stafeto_window_wait(-1, 0, NULL) == -1 && errno == EBADF);
+    errno = 0;
+    CHECK(stafeto_window_wait(8, 0, NULL) == -1 && errno == EBADF);
+
+    /* The three windows show together. */
+    fill(&a, 0, 60, 40, 0x00C03020u);
+    fill(&a, 1, 60, 40, 0x0020C030u);
+    fill(&b, 0, 80, 50, 0x002040C0u);
+    fill(&c, 0, 50, 50, 0x00E0E0E0u);
+    CHECK(stafeto_window_post(0, 0, NULL, 0) == 0);
+    CHECK(stafeto_window_post(1, 0, NULL, 0) == 0);
+    CHECK(stafeto_window_post(2, 0, NULL, 0) == 0);
+    for (int k = 0; k < 3; k++) CHECK(stafeto_window_shown(k, WITHIN) == 0);
+    {
+        struct patch seen[3] = {
+            {20, 20, 60, 40, 0x00C03020u},
+            {200, 30, 80, 50, 0x002040C0u},
+            {400, 200, 50, 50, 0x00E0E0E0u},
+        };
+        snapshot("several", patches_crc(seen, 3));
+    }
+    printf("posix-window: three windows of one process show together, the fifth is refused and the lowest number comes back\n");
+
+    /* A bit goes to its own window: window 0 posts again and only window 0
+     * has its buffer back, then the same for window 1. */
+    CHECK(settle(3) == 0);
+    CHECK(stafeto_window_free_buffers(0) == STAFETO_WINDOW_BUFFER(1));
+    CHECK(stafeto_window_free_buffers(1) == STAFETO_WINDOW_BUFFER(1));
+    CHECK(stafeto_window_free_buffers(2) == 0);
+    CHECK(stafeto_window_post(0, 1, NULL, 0) == 0);
+    errno = 0;
+    CHECK(stafeto_window_wait(2, 0, NULL) == -1 && errno == ETIMEDOUT);
+    CHECK(only_window_frees(0, STAFETO_WINDOW_BUFFER(0)) == 0);
+    CHECK(stafeto_window_free_buffers(0) == STAFETO_WINDOW_BUFFER(0));
+    CHECK(stafeto_window_free_buffers(1) == STAFETO_WINDOW_BUFFER(1));
+    CHECK(stafeto_window_free_buffers(2) == 0);
+    CHECK(stafeto_window_shown(0, WITHIN) == 0);
+    CHECK(settle(3) == 0);
+    fill(&b, 1, 80, 50, 0x0000A0A0u);
+    CHECK(stafeto_window_post(1, 1, NULL, 0) == 0);
+    CHECK(only_window_frees(1, STAFETO_WINDOW_BUFFER(0)) == 0);
+    CHECK(stafeto_window_free_buffers(0) == STAFETO_WINDOW_BUFFER(0));
+    CHECK(stafeto_window_free_buffers(1) == STAFETO_WINDOW_BUFFER(0));
+    CHECK(stafeto_window_shown(1, WITHIN) == 0);
+    printf("posix-window: the bits of each window go to that window, and a wait across windows tells which\n");
+
+    /* Title and application id. */
+    CHECK(stafeto_window_set_title(1, "probe window") == 0);
+    CHECK(stafeto_window_set_app_id(1, "posix-window") == 0);
+    CHECK(stafeto_window_set_title(1, "") == 0);
+    CHECK(stafeto_window_set_title(1, "\xd0\x9f\xd1\x80\xd0\xbe\xd0\xb1\xd0\xb0") == 0);
+    memset(long_text, 'x', sizeof long_text - 1);
+    long_text[64] = 0;
+    CHECK(stafeto_window_set_title(1, long_text) == 0);
+    long_text[65] = 0;
+    long_text[64] = 'x';
+    errno = 0;
+    CHECK(stafeto_window_set_title(1, long_text) == -1 && errno == EINVAL);
+    errno = 0;
+    CHECK(stafeto_window_set_app_id(1, "\xff\xfe") == -1 && errno == EINVAL);
+    errno = 0;
+    CHECK(stafeto_window_set_title(1, NULL) == -1 && errno == EINVAL);
+    errno = 0;
+    CHECK(stafeto_window_set_title(5, "x") == -1 && errno == EBADF);
+    errno = 0;
+    CHECK(stafeto_window_set_app_id(3, "x") == -1 && errno == EBADF);
+    printf("posix-window: title and application id go to the service, which refuses what is not UTF-8\n");
+
+    /* Resize: the capacity, the refusals, then the new size with the next post. */
+    CHECK(stafeto_window_capacity(1, &cw, &ch) == 0 && cw == SCREEN_W && ch == SCREEN_H);
+    /* A window of 50 by 50 holds the lines of its three pages. */
+    CHECK(stafeto_window_capacity(2, &cw, &ch) == 0 && cw == 50 && ch == 61);
+    CHECK(stafeto_window_capacity(0, NULL, NULL) == 0);
+    errno = 0;
+    CHECK(stafeto_window_capacity(3, &cw, &ch) == -1 && errno == EBADF);
+    errno = 0;
+    CHECK(stafeto_window_resize(1, SCREEN_W + 1, 10, 0) == -1 && errno == EINVAL);
+    errno = 0;
+    CHECK(stafeto_window_resize(1, 0, 10, 0) == -1 && errno == EINVAL);
+    errno = 0;
+    CHECK(stafeto_window_resize(1, 10, SCREEN_H + 1, 0) == -1 && errno == EINVAL);
+    /* Inside the capacity and outside the screen: the service refuses. */
+    errno = 0;
+    CHECK(stafeto_window_resize(1, 500, 100, 0) == -1 && errno == EINVAL);
+    errno = 0;
+    CHECK(stafeto_window_resize(2, 51, 50, 0) == -1 && errno == EINVAL);
+    errno = 0;
+    CHECK(stafeto_window_resize(2, 50, 62, 0) == -1 && errno == EINVAL);
+    errno = 0;
+    CHECK(stafeto_window_resize(3, 10, 10, 0) == -1 && errno == EBADF);
+    {
+        struct stafeto_window now;
+        CHECK(stafeto_window_info(1, &now) == 0 && now.width == 80 && now.height == 50);
+        CHECK(stafeto_window_info(2, &now) == 0 && now.width == 50 && now.height == 50);
+    }
+    /* A size the capacity of window 2 holds (the lines of its pages) is taken
+     * by the service and by the library, and given back. */
+    CHECK(stafeto_window_resize(2, 50, 61, 0) == 0);
+    {
+        struct stafeto_window now;
+        CHECK(stafeto_window_info(2, &now) == 0 && now.height == 61);
+    }
+    CHECK(stafeto_window_resize(2, 50, 50, 0) == 0);
+    /* Window 1 grows to 120 by 70: the size of the next post, whose
+     * rectangle is already in the new size. */
+    CHECK(stafeto_window_resize(1, 120, 70, 0) == 0);
+    {
+        struct stafeto_window now;
+        CHECK(stafeto_window_info(1, &now) == 0);
+        CHECK(now.width == 120 && now.height == 70 && now.stride == SCREEN_W * 4);
+    }
+    fill(&b, 0, 120, 70, 0x00C0C020u);
+    CHECK(stafeto_window_post(1, 0, &whole_b, 1) == 0);
+    CHECK(stafeto_window_shown(1, WITHIN) == 0);
+    {
+        struct patch seen[3] = {
+            {20, 20, 60, 40, 0x0020C030u},
+            {200, 30, 120, 70, 0x00C0C020u},
+            {400, 200, 50, 50, 0x00E0E0E0u},
+        };
+        snapshot("resized", patches_crc(seen, 3));
+    }
+    printf("posix-window: a window is resized inside its capacity and shows the new size with the next post\n");
+
+    /* Closing the windows one by one: the wait across the rest still works,
+     * and with none left it says so. */
+    CHECK(stafeto_window_close(0) == 0);
+    CHECK(stafeto_window_close(1) == 0);
+    errno = 0;
+    CHECK(stafeto_window_wait(1, 0, NULL) == -1 && errno == EBADF);
+    CHECK(stafeto_window_free_buffers(2) == 0);
+    CHECK(stafeto_window_close(2) == 0);
+    errno = 0;
+    CHECK(stafeto_windows_wait(0, bits) == -1 && errno == EBADF);
+    return 0;
+}
+
+/* ---- threads that wait while windows open and close ---- */
+
+static volatile uint32_t seen_bits[STAFETO_WINDOWS_MAX];
+static volatile int stop_waiter;
+static volatile int closed_rc, closed_errno;
+static volatile long closed_after_ms;
+
+static long now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* Waits across the windows and keeps every bit it is told of. */
+static void *waiter(void *arg) {
+    uint32_t bits[STAFETO_WINDOWS_MAX];
+    (void)arg;
+    while (!stop_waiter) {
+        int mask = stafeto_windows_wait(SECOND / 5, bits);
+        if (mask > 0) {
+            for (int k = 0; k < STAFETO_WINDOWS_MAX; k++) seen_bits[k] |= bits[k];
+        } else if (errno != ETIMEDOUT) {
+            struct timespec pause = {0, 10000000};
+            nanosleep(&pause, NULL);
+        }
+    }
+    return NULL;
+}
+
+/* Waits on one window for a long time; the window is closed under it. */
+static void *closed_under(void *arg) {
+    uint32_t bits = 0;
+    long start = now_ms();
+    (void)arg;
+    errno = 0;
+    closed_rc = stafeto_window_wait(1, 20 * SECOND, &bits);
+    closed_errno = errno;
+    closed_after_ms = now_ms() - start;
+    return NULL;
+}
+
+static int waiting_threads(void) {
+    struct stafeto_window a, b;
+    pthread_t t;
+    /* A window opens, and posts, while another thread waits across the
+     * windows: its bits (the events and the freed buffer) reach that wait. */
+    CHECK(stafeto_window_open(20, 20, 60, 40, STAFETO_WINDOW_XRGB8888, 1, 0, &a) == 0);
+    CHECK(pthread_create(&t, NULL, waiter, NULL) == 0);
+    {
+        struct timespec pause = {0, 300000000};
+        nanosleep(&pause, NULL);
+    }
+    CHECK(stafeto_window_open(300, 100, 50, 50, STAFETO_WINDOW_XRGB8888, 2, 0, &b) == 1);
+    fill(&b, 0, 50, 50, 0x00A0A0A0u);
+    fill(&b, 1, 50, 50, 0x0050A050u);
+    CHECK(stafeto_window_post(1, 0, NULL, 0) == 0);
+    CHECK(stafeto_window_post(1, 1, NULL, 0) == 0);
+    for (int i = 0; i < 100; i++) {
+        struct timespec pause = {0, 100000000};
+        if ((seen_bits[1] & STAFETO_WINDOW_BUFFER(0)) && (seen_bits[1] & STAFETO_WINDOW_EVENTS))
+            break;
+        nanosleep(&pause, NULL);
+    }
+    stop_waiter = 1;
+    CHECK(pthread_join(t, NULL) == 0);
+    CHECK(seen_bits[1] & STAFETO_WINDOW_BUFFER(0));
+    CHECK(seen_bits[1] & STAFETO_WINDOW_EVENTS);
+    /* A window closed while a thread waits on it ends that wait with EBADF. */
+    CHECK(pthread_create(&t, NULL, closed_under, NULL) == 0);
+    {
+        struct timespec pause = {0, 500000000};
+        nanosleep(&pause, NULL);
+    }
+    CHECK(stafeto_window_close(1) == 0);
+    CHECK(pthread_join(t, NULL) == 0);
+    CHECK(closed_rc == -1 && closed_errno == EBADF && closed_after_ms < 10000);
+    CHECK(stafeto_window_close(0) == 0);
+    printf("posix-window: a window opens and posts while another thread waits, and a close ends a wait on it\n");
+    return 0;
+}
+
+/* Four windows made and left open, then exec: the new image opens four
+ * windows again, which the service allows only when exec closed the old
+ * ones. */
+static int exec_role(void) {
+    struct stafeto_window w[4], extra;
+    for (int k = 0; k < 4; k++)
+        CHECK(stafeto_window_open(10 + 20 * k, 300, 10, 10, STAFETO_WINDOW_XRGB8888, 1, 0, &w[k]) ==
+              k);
+    errno = 0;
+    CHECK(stafeto_window_open(0, 0, 10, 10, STAFETO_WINDOW_XRGB8888, 1, 0, &extra) == -1 &&
+          errno == EAGAIN);
+    {
+        char *argv[] = {"posix-window", "after-exec", NULL};
+        fflush(stdout);
+        execv("/bin/posix-window", argv);
+    }
+    printf("posix-window: check failed: exec returned (errno %d)\n", errno);
+    return 22;
+}
+
+static int after_exec_role(void) {
+    struct stafeto_window w[4], again;
+    /* The new image has no windows. */
+    CHECK(stafeto_window_free_buffers(0) == 0);
+    errno = 0;
+    CHECK(stafeto_windows_wait(0, NULL) == -1 && errno == EBADF);
+    for (int k = 0; k < 4; k++)
+        CHECK(stafeto_window_open(10 + 20 * k, 300, 10, 10, STAFETO_WINDOW_XRGB8888, 1, 0, &w[k]) ==
+              k);
+    errno = 0;
+    CHECK(stafeto_window_open(0, 0, 10, 10, STAFETO_WINDOW_XRGB8888, 1, 0, &again) == -1 &&
+          errno == EAGAIN);
+    for (int k = 0; k < 4; k++) CHECK(stafeto_window_close(k) == 0);
+    printf("posix-window: exec closes every window of the old image\n");
     return 0;
 }
 
@@ -420,6 +809,7 @@ static int first(void) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "run") == 0) return run_role();
+    if (argc > 1 && strcmp(argv[1], "after-exec") == 0) return after_exec_role();
     int status = first();
     if (status == 0) printf("posix-window: ok\n");
     return status;

@@ -37,6 +37,22 @@ pub const EVENT_MOVE: u16 = 2;
 pub const EVENT_BUTTON: u16 = 3;
 pub const EVENT_FOCUS_IN: u16 = 4;
 pub const EVENT_FOCUS_OUT: u16 = 5;
+/// `STAFETO_WINDOW_EVENT_CONFIGURE` and `_CLOSE_REQUEST`.
+pub const EVENT_CONFIGURE: u16 = 8;
+pub const EVENT_CLOSE_REQUEST: u16 = 9;
+/// `STAFETO_WINDOW_STATE_MAXIMIZED`, `_FULLSCREEN` and `_RESIZING`: the state
+/// bits of a CONFIGURE event's `code`.
+pub const STATE_MAXIMIZED: u32 = 1;
+pub const STATE_FULLSCREEN: u32 = 2;
+pub const STATE_RESIZING: u32 = 4;
+/// The most bytes of a title or an application id, and SET_TEXT's `which`
+/// for each (`proto_comp::TEXT_MAX`, `TEXT_TITLE`, `TEXT_APP`).
+pub const TEXT_MAX: usize = 64;
+pub const TEXT_TITLE: u32 = 1;
+pub const TEXT_APP: u32 = 2;
+/// `STAFETO_WINDOW_RESIZABLE`: the flag of `stafeto_window_open` that gives the
+/// window buffers of the capacity of the whole screen.
+pub const RESIZABLE: u32 = 1;
 
 /// `struct stafeto_screen`.
 #[repr(C)]
@@ -115,6 +131,13 @@ const _: () = {
     assert!(EVENT_BUTTON == proto_comp::BUTTON);
     assert!(EVENT_FOCUS_IN == proto_comp::FOCUS_IN);
     assert!(EVENT_FOCUS_OUT == proto_comp::FOCUS_OUT);
+    assert!(EVENT_CONFIGURE == proto_comp::CONFIGURE);
+    assert!(EVENT_CLOSE_REQUEST == proto_comp::CLOSE_REQUEST);
+    assert!(TEXT_MAX == proto_comp::TEXT_MAX);
+    assert!(TEXT_TITLE == proto_comp::TEXT_TITLE && TEXT_APP == proto_comp::TEXT_APP);
+    assert!(STATE_MAXIMIZED == proto_comp::STATE_MAXIMIZED);
+    assert!(STATE_FULLSCREEN == proto_comp::STATE_FULLSCREEN);
+    assert!(STATE_RESIZING == proto_comp::STATE_RESIZING);
 };
 
 #[cfg(test)]
