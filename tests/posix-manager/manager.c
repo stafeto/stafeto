@@ -282,6 +282,12 @@ static int manager_role(void) {
     printf("posix-manager: a call before the subscription is EBADF, a second subscription EBUSY, "
            "an id that names no window EINVAL\n");
 
+    /* The session with the manager's mark would move to the new image, so exec
+     * is refused while the process is a manager. */
+    errno = 0;
+    CHECK(execv("/bin/posix-manager", argv) == -1 && errno == EPERM);
+    printf("posix-manager: exec is refused with EPERM while the process is a manager\n");
+
     CHECK(posix_spawn(&pid, "/bin/posix-manager", NULL, NULL, argv, environ) == 0);
 
     /* The manager's ring tells a wait across the windows (the manager has none

@@ -17,9 +17,10 @@
  * A process is a manager only when the init table gives its session the
  * manager's mark (a table of an image names the program); the service
  * answers every other session, a child's clone of the manager's among
- * them, with EPERM here. One session holds the subscription at a time. A
- * manager never calls exec: the session and its mark move with the
- * process image.
+ * them, with EPERM at stafeto_manager_subscribe. One session holds the
+ * subscription at a time. A manager never calls exec: the session and its
+ * mark move with the process image, so exec returns EPERM in a process that
+ * has subscribed.
  *
  * Windows are named by the id the service gave them: the `value` of the
  * CREATE and CLOSE events, the `id` of a listed window, and
@@ -29,7 +30,10 @@
  *
  * Every function returns 0, a count, or -1 with errno. Besides the errno
  * each lists:
- *   EPERM   the session is not the manager's;
+ *   EPERM   (the calls after the subscription) a property of the window the
+ *           call names, listed with each call, or the service refusing the
+ *           manager's calls because a scene's holder has subscribed or
+ *           committed a scene (the scene is then the one manager);
  *   EBADF   (every call but stafeto_manager_subscribe and
  *           stafeto_window_id) the process has not subscribed;
  *   ENODEV  the service ended;
@@ -146,10 +150,10 @@ STAFETO_MANAGER_ASSERT(offsetof(struct stafeto_manager_info, reserved) == 142);
  * stafeto_manager_focus. 0, or -1 with errno:
  *   EPERM   the session is not the manager's;
  *   EBUSY   the process subscribed already, or another session holds the
- *           subscription;
+ *           subscription (a manager that restarts gets this until the
+ *           service has seen the old session go: it tries again);
  *   ENODEV  the process has no display service, or the service ended;
- *   ENOMEM  the process has no room for the channel;
- *   EINTR   a signal ended a wait for the service. */
+ *   ENOMEM  the process has no room for the channel. */
 int stafeto_manager_subscribe(void);
 
 /* Takes up to max events of the manager's ring without waiting: the count,
@@ -199,11 +203,12 @@ int stafeto_manager_visible(uint32_t id, int shown);
  * client's answer if the window would reach outside the screen. EINVAL when
  * no window has the id, a side is past the screen's (and past 65535), only
  * one side is 0, or a state bit is unknown. EPERM for a window of the first
- * revision. */
+ * revision and for a mask (STAFETO_WINDOW_A8). */
 int stafeto_manager_configure(uint32_t id, uint32_t w, uint32_t h, uint32_t states);
 
 /* Asks window id to close itself (the window gets a CLOSE_REQUEST event and
- * decides). The manager is told of the window's end by a CLOSE event. */
+ * decides). The manager is told of the window's end by a CLOSE event. EPERM
+ * for a window of the first revision, which cannot be asked to close. */
 int stafeto_manager_close(uint32_t id);
 
 /* Ties window follower, one of the manager's own windows, to window leader of

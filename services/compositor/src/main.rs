@@ -2749,9 +2749,8 @@ impl Compositor {
         let id = self.scene.place_of(a).unwrap_or(usize::MAX);
         let result = match op {
             manage::SUBSCRIBE => {
-                if !compositor::subscribe_allowed(self.holder(), scene)
-                    || (scene && self.manager.is_some() && self.manager_label != r.label())
-                {
+                let same = self.manager.is_some() && self.manager_label == r.label();
+                if !compositor::subscribe_allowed(self.holder(), scene, same) {
                     return Answer::Status(proto_comp::code(proto_comp::BUSY));
                 }
                 let Ok(notify) = r.handles.take::<Channel>(0) else {

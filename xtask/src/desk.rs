@@ -67,8 +67,9 @@ pub const PROGRAMS: [ImageProgram; 12] = [
 ];
 
 /// The lines of the probe, each a check that passed and each said once.
-const LINES: [&str; 11] = [
+const LINES: [&str; 12] = [
     "posix-manager: a call before the subscription is EBADF, a second subscription EBUSY, an id that names no window EINVAL",
+    "posix-manager: exec is refused with EPERM while the process is a manager",
     "posix-manager: a child of the manager is refused with EPERM",
     "posix-manager: the client's window is created and the manager gives it the focus",
     "posix-manager: the title and the kind of the program come by INFO",

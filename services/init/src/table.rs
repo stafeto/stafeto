@@ -157,8 +157,8 @@ pub const COMP_MANAGERS: &[&str] = &["wm", "focus-wm", "top-wm", "desk"];
 /// here, by init, as a CONNECT of the record's program asks it, so the mark
 /// needs nothing of the process service. The sessions the manager gives its
 /// children (`posix_spawn`) are clones, which carry no mark (the compositor's
-/// CLONE), and `exec` moves the session with its mark to the new image: `desk`
-/// never calls exec.
+/// CLONE), and `exec` moves the session with its mark to the new image, so the
+/// window layer refuses `exec` (EPERM) in a process that subscribed as the manager.
 pub const COMP_POSIX_MANAGERS: &[&str] = &["desk"];
 /// The programs that inject events as a device would: the probes only.
 pub const COMP_INJECTORS: &[&str] = &["focus-inject", "wm-inject", "lvgl-inject", "frame-load"];
@@ -4402,6 +4402,21 @@ mod tests {
                     .iter()
                     .any(|t| t.iter().any(|r| r.name == *name)),
                 "{name}"
+            );
+        }
+    }
+
+    /// A record named `desk` (the one that gets the manager's mark as a process
+    /// of POSIX) is in the desk image alone.
+    #[test]
+    fn a_record_named_desk_is_in_the_desk_image_alone() {
+        for table in all_tables() {
+            let has = table.iter().any(|r| r.name == "desk");
+            assert_eq!(
+                has,
+                std::ptr::eq(table, desk::TABLE),
+                "{:?}",
+                table.first().map(|r| r.name)
             );
         }
     }

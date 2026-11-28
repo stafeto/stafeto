@@ -551,6 +551,11 @@ fn opened(win: i32) -> Result<&'static Win, i32> {
     Ok(w)
 }
 
+/// The process subscribed as the window manager (`exec` is refused then).
+pub(crate) fn manager_subscribed() -> bool {
+    MANAGER_LABEL.load(Ordering::Acquire) != 0
+}
+
 /// Some window is open.
 fn any_open() -> Result<(), i32> {
     if MANAGER_LABEL.load(Ordering::Acquire) != 0

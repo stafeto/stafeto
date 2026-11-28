@@ -32,14 +32,15 @@
 //! is held back only by threads at its own level or below.
 
 use super::ramfs::{PIPE, POSIX, POSIX_ABI_TABLE, PROCS_QUOTA, RAM_FIFO_CLOCKED};
-use super::{Record, comp, entropy, focus, input};
+use super::{Record, Restart, comp, entropy, focus, input};
 use crate::PAGE;
 
 /// The pages of the window buffers the manager and the clients it starts have
 /// open at once, as in `window.rs`: a resizable XRGB8888 window of 640 by 400
 /// is 250 pages a buffer (two buffers, 500) and the small windows add about 40.
 /// The manager's record and the POSIX service's record, which pays for the
-/// clients, carry it.
+/// clients, carry it. The sum is sized for the C probe of step 4; the manager of
+/// the desk (step 5) measures its own.
 const WINDOW_PAGES: u64 = 540;
 
 /// The compositor of the desk: the display driver, the keyboard's driver and the
@@ -50,7 +51,9 @@ pub const COMPOSITOR: Record = Record {
 };
 
 /// The window manager: a process of POSIX at level 22, ceiling 23 (the program is
-/// the C probe of the manager's calls until `apps/desk` takes its place).
+/// the C probe of the manager's calls until `apps/desk` takes its place). It is
+/// not restarted while it runs the probe, which ends with code 0; step 5 sets
+/// `Restart::Always` for the manager of the desk.
 pub const DESK: Record = Record {
     name: "desk",
     program: "posix-manager",
@@ -59,6 +62,7 @@ pub const DESK: Record = Record {
     priority: 22,
     ceiling: 23,
     root: true,
+    restart: Restart::Never,
     quota: PROCS_QUOTA + WINDOW_PAGES * PAGE,
     ..POSIX
 };

@@ -22,7 +22,7 @@ pub const EVENT_CREATE: u16 = proto_comp::CREATE;
 pub const EVENT_CLOSE: u16 = proto_comp::CLOSE;
 pub const EVENT_TITLE: u16 = proto_comp::TITLE;
 pub const EVENT_RESIZED: u16 = proto_comp::RESIZED;
-/// `STAFETO_MANAGER_TEXT_TITLE` and `_APP_ID`: what a TITLE event's `x` says
+/// `STAFETO_MANAGER_TITLE` and `_APP_ID`: what a TITLE event's `x` says
 /// changed.
 pub const CHANGED_TITLE: i32 = 1;
 pub const CHANGED_APP: i32 = 2;

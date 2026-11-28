@@ -394,9 +394,11 @@ nothing loops in the library.
 - With a manager subscribed the service gives a new window neither the focus nor the top
   place: the manager decides, and the CREATE for every window already there comes after the
   subscription, so a manager that starts late learns of them from its ring.
-- The refusals the header lists: EPERM (no mark, or a window of the first revision that
-  cannot be moved or configured), EBADF (a call before the subscription), EBUSY (a second
-  subscription, in the process or another session), EINVAL (an id that names no window, a
+- The refusals the header lists: EPERM (no mark, at the subscription; later a window of the
+  first revision or a mask that cannot be moved, configured or asked to close, or a scene's
+  holder that has the service; `exec` in a subscribed process too), EBADF (a call before the subscription), EBUSY (a second
+  subscription, in the process or in another session while that one is alive, so a restarting
+  manager retries until the old session has gone), EINVAL (an id that names no window, a
   move or LINK the service refuses), ENODEV (the service ended). An id of a window that went
   is a race the manager expects and goes on from.
 
